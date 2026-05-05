@@ -30,13 +30,54 @@ pub fn MyStore() -> Element {
 fn NoIdentity() -> Element {
     rsx! {
         div { class: "card empty-state",
-            p { "No ghostkey identities found." }
             p {
-                "To create a store, you need a ghostkey identity. Visit the "
-                "Ghostkey Manager to import or create one via a Freenet donation."
+                "Harvest needs a ghostkey identity to sign your store listings."
+            }
+            p {
+                "If you've already created one, share it with Harvest below. "
+                "Otherwise, visit the Ghostkey Vault to create one."
+            }
+            div { style: "margin-top: 16px;",
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| connect_ghostkey(),
+                    "Connect a ghostkey"
+                }
             }
         }
     }
+}
+
+/// Send a `RequestAnyAccess` request to the ghostkey delegate. The
+/// delegate emits a `RequestUserInput` that the gateway shell-page
+/// renders as an overlay; the user picks one of their stored
+/// ghostkeys (or denies). On approval the delegate replies with a
+/// one-element `GhostKeyList` for the chosen key, which the response
+/// handler folds into APP_STATE.ghostkeys -- our `IdentityList`
+/// renders as soon as it appears.
+fn connect_ghostkey() {
+    use ghostkey_common::GhostkeyRequest;
+    let key = match APP_STATE.read().ghostkey_delegate_key.clone() {
+        Some(k) => k,
+        None => {
+            dioxus::logger::tracing::warn!(
+                "Ghostkey delegate not yet registered; cannot request access"
+            );
+            return;
+        }
+    };
+    spawn(async move {
+        let payload = match ghostkey_common::to_cbor(&GhostkeyRequest::RequestAnyAccess) {
+            Ok(p) => p,
+            Err(e) => {
+                dioxus::logger::tracing::error!("Failed to encode RequestAnyAccess: {e}");
+                return;
+            }
+        };
+        if let Err(e) = crate::gateway::send_delegate_message(&key, payload).await {
+            dioxus::logger::tracing::error!("Failed to send RequestAnyAccess: {e}");
+        }
+    });
 }
 
 #[component]

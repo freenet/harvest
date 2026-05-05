@@ -24,6 +24,31 @@ pub use mailbox::{ConversationId, EncryptedMessage, MailboxParameters, MailboxSt
 pub use reputation::{FeedbackEntry, ReputationParameters, ReputationStateV1};
 pub use store::{StoreParameters, StoreStateV1};
 
+/// Stable contract id of the published Harvest webapp container. Used as
+/// the `expected_requestor` when verifying ghostkey-signed listings and
+/// store info: every signature must have been produced by a delegate
+/// call originating from this webapp, ensuring an app the user has
+/// granted ghostkey access to (Harvest itself or another) cannot mint
+/// signatures that pass Harvest's contract verifiers.
+///
+/// The id is stable across Harvest releases because the underlying web
+/// container contract WASM rarely changes; releases ship by updating
+/// the container's *state* (the bundled UI bytes), not the container
+/// code. If the container code is ever rebuilt with a different hash,
+/// this constant will need to be updated and old stores re-published.
+pub const HARVEST_WEBAPP_CONTRACT_ID: &str = "6FzSeAUKcqJrveKyU8RJgGKc5jRB1Z2juvxXtwTA4Em9";
+
+/// Build the runtime-attested `SignatureRequestor` value that signatures
+/// produced for Harvest must carry. Verifiers compare the requestor
+/// embedded in the `ScopedPayload` against this; mismatch is a hard fail.
+#[cfg(feature = "ghostkey")]
+pub fn expected_harvest_requestor() -> ghostkey_common::SignatureRequestor {
+    use freenet_stdlib::prelude::ContractInstanceId;
+    let id = ContractInstanceId::from_bytes(HARVEST_WEBAPP_CONTRACT_ID)
+        .expect("HARVEST_WEBAPP_CONTRACT_ID must parse as a valid ContractInstanceId");
+    ghostkey_common::SignatureRequestor::WebApp(id)
+}
+
 /// Serialize a value to CBOR bytes.
 pub fn to_cbor<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();

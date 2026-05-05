@@ -48,25 +48,20 @@ pub fn App() -> Element {
                     }
                 }
 
-                // Step 3: Register the ghostkey delegate
+                // Step 3: Register the ghostkey delegate. We deliberately
+                // do NOT call `ListGhostKeys` on startup any more: the
+                // vault now auto-grants only the importing webapp (the
+                // Ghostkey Vault itself) on key import, so for any other
+                // webapp `ListGhostKeys` returns an empty list until the
+                // user explicitly approves a `RequestAnyAccess` prompt.
+                // The "Connect a ghostkey" button on the My Store empty
+                // state triggers that prompt; the response folds the
+                // shared key into APP_STATE.ghostkeys.
                 let gk_wasm = include_bytes!("../../public/contracts/ghostkey_delegate.wasm");
                 match crate::gateway::register_delegate(gk_wasm).await {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Ghostkey delegate registered: {:?}", key);
-                        crate::gateway::APP_STATE.write().ghostkey_delegate_key = Some(key.clone());
-
-                        // Request the list of ghostkeys
-                        let list_request = ghostkey_common::GhostkeyRequest::ListGhostKeys;
-                        if let Ok(payload) = ghostkey_common::to_cbor(&list_request) {
-                            if let Err(e) =
-                                crate::gateway::send_delegate_message(&key, payload).await
-                            {
-                                dioxus::logger::tracing::error!(
-                                    "Failed to request ghostkey list: {}",
-                                    e
-                                );
-                            }
-                        }
+                        crate::gateway::APP_STATE.write().ghostkey_delegate_key = Some(key);
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(

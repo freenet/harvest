@@ -96,10 +96,19 @@ impl AuthorizedListing {
 
 /// Verify a ghostkey delegate signature (ScopedPayload format).
 ///
-/// 1. Parse the 64-byte Ed25519 signature
-/// 2. Verify the signature over the scoped_payload bytes
-/// 3. Deserialize the ScopedPayload and verify the inner payload matches
-///    the CBOR encoding of the expected data
+/// 1. Parse the 64-byte Ed25519 signature.
+/// 2. Verify the signature over the scoped_payload bytes.
+/// 3. Deserialize the ScopedPayload, check the inner payload matches the
+///    CBOR encoding of `expected_data`, AND check the embedded
+///    runtime-attested requestor matches the Harvest webapp contract id
+///    (`expected_harvest_requestor()`).
+///
+/// The requestor pin is what stops a third-party app the user has
+/// granted ghostkey access to from minting Harvest-shaped signatures.
+/// The ghostkey delegate binds the runtime-attested
+/// `MessageOrigin::WebApp(contract_id)` into every signature it
+/// produces; an app whose grant came from a different prompt has its
+/// own contract id baked in, so its signatures fail this check.
 pub fn verify_scoped_signature<T: serde::Serialize>(
     scoped_payload: &[u8],
     signature_bytes: &[u8],
@@ -119,9 +128,8 @@ pub fn verify_scoped_signature<T: serde::Serialize>(
         .verify(scoped_payload, &signature)
         .map_err(|e| format!("signature verification failed: {e}"))?;
 
-    // Verify the inner payload matches the expected data.
-    // The scoped_payload is CBOR-encoded ScopedPayload { requestor, payload }.
-    // We need to extract the payload field and compare it.
+    // Verify the inner payload matches the expected data, AND the
+    // embedded requestor is the Harvest webapp.
     #[cfg(feature = "ghostkey")]
     {
         let scoped: ghostkey_common::ScopedPayload = crate::from_cbor(scoped_payload)
@@ -133,9 +141,19 @@ pub fn verify_scoped_signature<T: serde::Serialize>(
         if scoped.payload != expected_bytes {
             return Err("scoped payload content does not match expected data".into());
         }
+
+        let expected_requestor = crate::expected_harvest_requestor();
+        if scoped.requestor != expected_requestor {
+            return Err(format!(
+                "signature requestor pin mismatch: expected Harvest webapp, got {:?}",
+                scoped.requestor
+            ));
+        }
     }
 
-    // Without ghostkey-common, extract the payload from the raw CBOR structure.
+    // Without ghostkey-common, extract the payload AND requestor from
+    // the raw CBOR structure. The contract id is compared as bytes
+    // against `HARVEST_WEBAPP_CONTRACT_ID` decoded from base58.
     #[cfg(not(feature = "ghostkey"))]
     {
         let value: ciborium::Value = crate::from_cbor(scoped_payload)
@@ -149,6 +167,15 @@ pub fn verify_scoped_signature<T: serde::Serialize>(
 
         if payload_bytes != expected_bytes {
             return Err("scoped payload content does not match expected data".into());
+        }
+
+        let requestor_bytes = extract_webapp_requestor_bytes_from_cbor(&value)
+            .ok_or("scoped payload requestor is not WebApp(_) -- mismatched delegate version?")?;
+        let expected_id_bytes = bs58::decode(crate::HARVEST_WEBAPP_CONTRACT_ID)
+            .into_vec()
+            .map_err(|e| format!("HARVEST_WEBAPP_CONTRACT_ID decode: {e}"))?;
+        if requestor_bytes != expected_id_bytes {
+            return Err("signature requestor pin mismatch: expected Harvest webapp".into());
         }
     }
 
@@ -171,6 +198,31 @@ fn extract_payload_from_cbor(value: &ciborium::Value) -> Option<Vec<u8>> {
     None
 }
 
+/// Extract the contract id bytes of a `WebApp(_)` requestor from a CBOR-
+/// encoded ScopedPayload. Returns `None` for any other requestor variant
+/// (e.g. `Delegate(_)`), which Harvest's verifier should reject.
+#[cfg(not(feature = "ghostkey"))]
+fn extract_webapp_requestor_bytes_from_cbor(value: &ciborium::Value) -> Option<Vec<u8>> {
+    let outer = value.as_map()?;
+    // `requestor` field on the outer ScopedPayload struct.
+    let requestor = outer
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("requestor"))
+        .map(|(_, v)| v)?;
+    // serde-default externally-tagged enum: `{ "WebApp": <ContractInstanceId> }`.
+    let requestor_map = requestor.as_map()?;
+    let (variant, payload) = requestor_map.first()?;
+    if variant.as_text() != Some("WebApp") {
+        return None;
+    }
+    // ContractInstanceId is `[u8; 32]` with `serde_as`, which encodes as
+    // a CBOR array of 32 unsigned-int values. Walk and collect.
+    let arr = payload.as_array()?;
+    arr.iter()
+        .map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
+        .collect::<Option<Vec<u8>>>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,9 +230,15 @@ mod tests {
 
     /// Helper to create a signed listing for testing.
     ///
-    /// Constructs the ScopedPayload manually via CBOR to avoid cross-version
-    /// ContractInstanceId issues (ghostkey-common uses stdlib 0.3.5, we use 0.6).
-    fn make_authorized_listing(signing_key: &SigningKey) -> AuthorizedListing {
+    /// Constructs the ScopedPayload manually via CBOR (avoiding the
+    /// `freenet-stdlib` `ContractInstanceId` constructor) so the test
+    /// can inject any `WebApp(id)` bytes — including the
+    /// `HARVEST_WEBAPP_CONTRACT_ID` the verifier now requires, and an
+    /// arbitrary mismatched id for the negative test.
+    fn make_authorized_listing_with_requestor(
+        signing_key: &SigningKey,
+        requestor_id: [u8; 32],
+    ) -> AuthorizedListing {
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
             id: ListingId::new("abc123", &ts, "Widget"),
@@ -194,9 +252,6 @@ mod tests {
             created_at: ts,
         };
 
-        // Build a ScopedPayload-shaped struct manually to avoid the
-        // cross-stdlib-version ContractInstanceId mismatch.
-        // In production, the ghostkey delegate constructs this.
         #[derive(serde::Serialize)]
         struct TestScopedPayload {
             requestor: TestRequestor,
@@ -209,7 +264,7 @@ mod tests {
 
         let listing_bytes = crate::to_cbor(&listing).unwrap();
         let scoped = TestScopedPayload {
-            requestor: TestRequestor::WebApp([0u8; 32]),
+            requestor: TestRequestor::WebApp(requestor_id),
             payload: listing_bytes,
         };
         let scoped_bytes = crate::to_cbor(&scoped).unwrap();
@@ -221,6 +276,21 @@ mod tests {
             signature: signature.to_bytes().to_vec(),
             certificate_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".into(),
         }
+    }
+
+    /// Returns the 32-byte contract id that signatures must carry to
+    /// verify under Harvest's pinned requestor.
+    fn harvest_requestor_bytes() -> [u8; 32] {
+        let v = bs58::decode(crate::HARVEST_WEBAPP_CONTRACT_ID)
+            .into_vec()
+            .expect("HARVEST_WEBAPP_CONTRACT_ID must decode as base58");
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&v);
+        a
+    }
+
+    fn make_authorized_listing(signing_key: &SigningKey) -> AuthorizedListing {
+        make_authorized_listing_with_requestor(signing_key, harvest_requestor_bytes())
     }
 
     #[test]
@@ -266,5 +336,35 @@ mod tests {
         // Tamper with the listing title after signing
         authorized.listing.title = "Tampered".into();
         assert!(authorized.verify(&verifying_key).is_err());
+    }
+
+    /// Regression test: a signature whose runtime-attested requestor is
+    /// some other webapp must NOT verify, even though the signature
+    /// itself is mathematically valid and the payload matches. This is
+    /// the "Sign grant on a shared key shouldn't impersonate Harvest"
+    /// invariant — the ghostkey delegate binds the calling app's
+    /// contract id into every signature, and Harvest's verifier pins
+    /// that id to the published webapp's id.
+    #[test]
+    fn test_authorized_listing_wrong_requestor_fails() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        // Same valid signature, same payload, but signed under a
+        // hostile webapp's contract id.
+        let mut hostile_id = harvest_requestor_bytes();
+        hostile_id[0] ^= 0xff;
+        let authorized = make_authorized_listing_with_requestor(&signing_key, hostile_id);
+
+        let result = authorized.verify(&verifying_key);
+        assert!(
+            result.is_err(),
+            "verifier must reject signatures whose requestor isn't the Harvest webapp; got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("requestor"),
+            "error must mention the requestor pin; got: {err}"
+        );
     }
 }

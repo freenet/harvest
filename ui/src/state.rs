@@ -364,6 +364,27 @@ impl AppState {
                 self.pending_listing = None;
             }
 
+            // The user denied a `RequestAnyAccess` prompt. Surface a
+            // clear notification so the empty-state isn't silently
+            // stuck after the prompt closed; without this branch the
+            // `_ => Unhandled` fallthrough below would just log.
+            ghostkey_common::GhostkeyResponse::AccessDenied { .. } => {
+                self.notifications.push(
+                    "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
+                );
+            }
+
+            // The vault has no ghostkeys at all. Tell the user where to
+            // go to create one.
+            ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
+                self.notifications.push(
+                    "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
+                );
+            }
+
+            // Catch-all for response variants Harvest doesn't act on
+            // (PermissionGranted / PermissionRevoked / etc -- vault-only).
+            #[allow(clippy::wildcard_enum_match_arm)]
             _ => {
                 info!("Unhandled ghostkey response: {:?}", response);
             }
