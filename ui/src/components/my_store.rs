@@ -7,13 +7,14 @@ use crate::gateway::APP_STATE;
 #[component]
 pub fn MyStore() -> Element {
     let app_state = APP_STATE.read();
+    let in_flight = app_state.request_any_access_in_flight;
 
     rsx! {
         div {
             h2 { "My Store" }
 
             if app_state.ghostkeys.is_empty() {
-                NoIdentity {}
+                NoIdentity { in_flight: in_flight }
             } else {
                 IdentityList {
                     ghostkeys: app_state.ghostkeys.clone(),
@@ -21,13 +22,14 @@ pub fn MyStore() -> Element {
                     rsa_keys: app_state.rsa_public_keys.clone(),
                     has_harvest_delegate: app_state.harvest_delegate_key.is_some(),
                 }
+                ConnectAnother { in_flight: in_flight }
             }
         }
     }
 }
 
 #[component]
-fn NoIdentity() -> Element {
+fn NoIdentity(in_flight: bool) -> Element {
     rsx! {
         div { class: "card empty-state",
             p {
@@ -40,9 +42,28 @@ fn NoIdentity() -> Element {
             div { style: "margin-top: 16px;",
                 button {
                     class: "btn btn-primary",
+                    disabled: in_flight,
                     onclick: move |_| connect_ghostkey(),
-                    "Connect a ghostkey"
+                    if in_flight { "Waiting for vault…" } else { "Connect a ghostkey" }
                 }
+            }
+        }
+    }
+}
+
+/// Lets a user with one or more already-connected ghostkeys request
+/// access to ANOTHER one. Without this, the empty-state's "Connect"
+/// button disappears after the first successful share and there's no
+/// path to add a second identity.
+#[component]
+fn ConnectAnother(in_flight: bool) -> Element {
+    rsx! {
+        div { style: "margin-top: 16px;",
+            button {
+                class: "btn",
+                disabled: in_flight,
+                onclick: move |_| connect_ghostkey(),
+                if in_flight { "Waiting for vault…" } else { "Connect another ghostkey" }
             }
         }
     }
@@ -57,25 +78,47 @@ fn NoIdentity() -> Element {
 /// renders as soon as it appears.
 fn connect_ghostkey() {
     use ghostkey_common::GhostkeyRequest;
-    let key = match APP_STATE.read().ghostkey_delegate_key.clone() {
-        Some(k) => k,
-        None => {
-            dioxus::logger::tracing::warn!(
-                "Ghostkey delegate not yet registered; cannot request access"
+
+    // Snapshot delegate key + check the in-flight flag in a single
+    // borrow. If we're already mid-request, drop the click so rapid
+    // double-clicks don't queue duplicate prompts (and overwrite each
+    // other's GhostKeyList responses on completion).
+    let key = {
+        let state = APP_STATE.read();
+        if state.request_any_access_in_flight {
+            dioxus::logger::tracing::info!(
+                "RequestAnyAccess already in flight; ignoring duplicate click"
             );
             return;
         }
+        match state.ghostkey_delegate_key.clone() {
+            Some(k) => k,
+            None => {
+                dioxus::logger::tracing::warn!(
+                    "Ghostkey delegate not yet registered; cannot request access"
+                );
+                APP_STATE
+                    .write()
+                    .notifications
+                    .push("Still connecting to the gateway — please try again in a moment.".into());
+                return;
+            }
+        }
     };
+
+    APP_STATE.write().request_any_access_in_flight = true;
     spawn(async move {
         let payload = match ghostkey_common::to_cbor(&GhostkeyRequest::RequestAnyAccess) {
             Ok(p) => p,
             Err(e) => {
                 dioxus::logger::tracing::error!("Failed to encode RequestAnyAccess: {e}");
+                APP_STATE.write().request_any_access_in_flight = false;
                 return;
             }
         };
         if let Err(e) = crate::gateway::send_delegate_message(&key, payload).await {
             dioxus::logger::tracing::error!("Failed to send RequestAnyAccess: {e}");
+            APP_STATE.write().request_any_access_in_flight = false;
         }
     });
 }

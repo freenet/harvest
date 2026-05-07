@@ -33,8 +33,17 @@ pub struct AppState {
     /// Our own stores (ghostkey fingerprint -> list of registrations).
     pub my_stores: HashMap<String, Vec<StoreRegistration>>,
 
-    /// Ghostkey identities available to us.
+    /// Ghostkey identities available to us. Each successful
+    /// `RequestAnyAccess` response merges (deduped by fingerprint) into
+    /// this list rather than replacing it, so users can connect a
+    /// second key without losing visibility into the first.
     pub ghostkeys: Vec<ghostkey_common::GhostKeyInfo>,
+
+    /// Set while a `RequestAnyAccess` is in flight, so the UI can
+    /// disable the "Connect" button and rapid double-clicks don't queue
+    /// multiple delegate prompts. Cleared on every terminal response
+    /// (GhostKeyList success, AccessDenied, NoIdentityAvailable, Error).
+    pub request_any_access_in_flight: bool,
 
     /// RSA public keys for our identities (fingerprint -> DER bytes).
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
@@ -282,7 +291,23 @@ impl AppState {
                         }
                     }
                 }
-                self.ghostkeys = keys;
+                // Merge new keys into the existing list (dedup by
+                // fingerprint, prefer the newer entry). Wholesale
+                // replacement would drop previously-connected keys
+                // when a second `RequestAnyAccess` returns a single
+                // newly-shared key.
+                for key in keys {
+                    if let Some(slot) = self
+                        .ghostkeys
+                        .iter_mut()
+                        .find(|k| k.fingerprint == key.fingerprint)
+                    {
+                        *slot = key;
+                    } else {
+                        self.ghostkeys.push(key);
+                    }
+                }
+                self.request_any_access_in_flight = false;
             }
 
             ghostkey_common::GhostkeyResponse::SignResult {
@@ -362,28 +387,55 @@ impl AppState {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
                 self.pending_listing = None;
+                self.request_any_access_in_flight = false;
             }
 
             // The user denied a `RequestAnyAccess` prompt. Surface a
-            // clear notification so the empty-state isn't silently
-            // stuck after the prompt closed; without this branch the
-            // `_ => Unhandled` fallthrough below would just log.
+            // notification, clear the in-flight flag so the button is
+            // enabled again, and clear any pending listing/store
+            // creation that was waiting on this grant. Without this
+            // cleanup, a subsequent successful SignResult would
+            // consume the stale pending listing.
             ghostkey_common::GhostkeyResponse::AccessDenied { .. } => {
                 self.notifications.push(
                     "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
                 );
+                self.request_any_access_in_flight = false;
+                self.pending_listing = None;
+                self.pending_store_creation = None;
             }
 
-            // The vault has no ghostkeys at all. Tell the user where to
-            // go to create one.
+            // The vault has no ghostkeys at all. Tell the user where
+            // to go to create one. Same cleanup as AccessDenied.
             ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
                 self.notifications.push(
                     "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
                 );
+                self.request_any_access_in_flight = false;
+                self.pending_listing = None;
+                self.pending_store_creation = None;
             }
 
-            // Catch-all for response variants Harvest doesn't act on
-            // (PermissionGranted / PermissionRevoked / etc -- vault-only).
+            // Per-fingerprint denial: the user denied a specific-key
+            // prompt, or the vault revoked the grant between connect
+            // and sign. Same cleanup as the access-denial arms.
+            ghostkey_common::GhostkeyResponse::PermissionDenied { fingerprint, .. } => {
+                self.notifications
+                    .push(format!("Ghostkey access denied for {fingerprint}."));
+                self.request_any_access_in_flight = false;
+                self.pending_listing = None;
+                self.pending_store_creation = None;
+            }
+
+            // Vault-only responses Harvest doesn't act on. The
+            // explicit arms above cover every user-visible failure
+            // mode in the current ghostkey-common protocol; this
+            // wildcard is just for vault-management responses
+            // (PermissionGranted / PermissionRevoked / PermissionList /
+            // KeyNotFound / VerifyResult / Deleted / LabelSet, etc).
+            // A future response variant with a failure semantic
+            // would slip through here -- worth re-auditing on every
+            // ghostkey-common bump.
             #[allow(clippy::wildcard_enum_match_arm)]
             _ => {
                 info!("Unhandled ghostkey response: {:?}", response);
