@@ -20,7 +20,7 @@ repository = "https://github.com/freenet/harvest"
 harvest-common = { path = "common" }
 
 # Freenet ecosystem
-freenet-stdlib = { version = "0.6", features = ["contract"] }
+freenet-stdlib = { version = "0.8", features = ["contract"] }
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
 ghostkey-common = "0.2.3"
