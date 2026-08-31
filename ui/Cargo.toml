@@ -40,7 +40,7 @@ aes-gcm = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
-getrandom = { version = "0.2", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
+getrandom = { version = "0.4", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # Freenet
 freenet-stdlib = { workspace = true, features = ["net"] }
