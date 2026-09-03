@@ -44,6 +44,12 @@ on:
     # matters as much as `labeled`: removing the acknowledgement has to turn the
     # check red again rather than leaving a stale green.
     types: [opened, synchronize, reopened, labeled, unlabeled]
+    # The paths filter applies to every activity type, label events included.
+    # That is the behaviour we want: labelling a PR that touches none of these
+    # paths cannot have moved an address, so the job does not need to run and
+    # does not. The filter is not a hole in the gate either -- a PR that DOES
+    # touch them always runs the job on its own push, so the label event is
+    # only ever re-evaluating a check that already ran.
     paths:
       # Everything that can change the compiled bytes. `ui/**` is absent on
       # purpose: the UI is not a dependency of the contracts or the delegate.
@@ -191,7 +197,7 @@ jobs:
               echo "unchanged: $a  $h"
               echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | unchanged |" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "::error::$a RE-KEYS: $b -> $h"
+              echo "::error::$a RE-KEYS: $b -> $h  (see the job summary; label this PR contract-rekey-acknowledged if the re-key is intended)"
               echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | :warning: **MOVED** |" >> "$GITHUB_STEP_SUMMARY"
               moved=1
             fi
@@ -202,6 +208,11 @@ jobs:
             echo "No address moved." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
+          # Say the remedy in the log too, not only in the job summary. Someone
+          # reading a red check should not have to open the workflow file to
+          # find out what to do about it.
+          echo "::error::At least one contract or delegate address moved. State stored under the old address is not reachable from the new one. If the re-key is UNINTENDED, pin the dependency so the bytes stay put. If it is INTENDED, plan the migration and then add the label 'contract-rekey-acknowledged' to this PR -- applying it re-runs this check, no push needed."
 
           {
             echo "A moved code hash means the contract or delegate lives at a new address."
@@ -240,7 +251,7 @@ jobs:
             exit 0
           fi
           echo "::error::this PR changes: $changed"
-          echo "Both determine the compiled bytes, so every contract and delegate address moves."
+          echo "::error::Both determine the compiled bytes, so every contract and delegate address moves. If that is intended, add the label 'contract-rekey-acknowledged' to this PR -- applying it re-runs this check, no push needed."
           if [ "$ACKNOWLEDGED" = "true" ]; then
             echo "::warning::acknowledged via the contract-rekey-acknowledged label"
             exit 0
