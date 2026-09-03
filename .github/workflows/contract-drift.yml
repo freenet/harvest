@@ -83,7 +83,11 @@ jobs:
           esac
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
           echo "pinned toolchain: $channel"
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component rustfmt,clippy --target wasm32-unknown-unknown && rustup show
+      # Installed by explicit name rather than by reading rust-toolchain.toml,
+      # because the base worktree built below may pin something different (or
+      # nothing) and both sides must use the same compiler. RUSTUP_TOOLCHAIN
+      # overrides rust-toolchain.toml for every later step.
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown && rustup show
       - uses: Swatinem/rust-cache@v2
       - name: install b3sum
         run: command -v b3sum || cargo install b3sum --locked
