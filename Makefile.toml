@@ -11,31 +11,30 @@ KEY_FILE = "${HOME}/.config/harvest/web-container-keys.toml"
 
 # --- Build tasks ---
 
-[tasks.build-delegate]
-description = "Build the harvest delegate WASM"
-command = "cargo"
-args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "harvest-delegate"]
+# The contract and delegate WASMs are built by scripts/build-contract-wasm.sh
+# and nowhere else. That script pins the flags that keep the build byte-
+# reproducible, and CI's contract-drift guard runs the same script -- so the
+# addresses CI reports are the addresses a publish deploys. A second `cargo
+# build` for these crates here would quietly produce different bytes, which is
+# to say a different contract, so the two build tasks that used to live here
+# are gone rather than kept as convenience aliases.
+#
+# It also builds all four in ONE cargo invocation, which the old split into
+# build-delegate + build-contracts did not: cargo unifies features across the
+# packages named in a single invocation, so the split could resolve different
+# features and produce different bytes.
 
-[tasks.build-contracts]
-description = "Build all contract WASMs"
-command = "cargo"
-args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "reputation-contract", "-p", "store-contract", "-p", "mailbox-contract"]
+[tasks.build-contract-wasm]
+description = "Build the contract + delegate WASMs and print their BLAKE3 code hashes"
+script = "./scripts/build-contract-wasm.sh"
 
 [tasks.sync-wasm]
-description = "Copy built WASMs to UI public dir for embedding"
-dependencies = ["build-delegate", "build-contracts"]
-script = '''
-mkdir -p ui/public/contracts
-cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/harvest_delegate.wasm ui/public/contracts/
-cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/store_contract.wasm ui/public/contracts/
-cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/reputation_contract.wasm ui/public/contracts/
-cp target/${CONTRACT_TARGET}/${BUILD_PROFILE}/mailbox_contract.wasm ui/public/contracts/
-echo "Synced all WASMs to ui/public/contracts/"
-'''
+description = "Build the contract + delegate WASMs and copy them into the UI public dir"
+script = "./scripts/build-contract-wasm.sh --sync"
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["sync-wasm", "build-contracts"]
+dependencies = ["sync-wasm"]
 script = '''
 set -e
 cd ui && dx build --${BUILD_PROFILE}

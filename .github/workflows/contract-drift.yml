@@ -1,0 +1,236 @@
+name: contract drift
+
+# FAILS A PULL REQUEST THAT MOVES A CONTRACT OR DELEGATE ADDRESS.
+#
+# In Freenet the compiled WASM is the identity: a contract lives at
+# `BLAKE3(BLAKE3(wasm) || parameters)`, and a delegate likewise. So anything
+# that changes codegen re-keys the artifact and strands whatever state lived at
+# the old address. The dangerous property is that NONE of it looks like a
+# re-key in the diff:
+#
+#   * a direct dependency bump in Cargo.toml
+#   * a TRANSITIVE bump, visible only as churn in Cargo.lock
+#   * a rustc change in rust-toolchain.toml
+#   * a change to the build flags in scripts/build-contract-wasm.sh
+#
+# Dependabot is enabled on this repository and delivers a steady stream of
+# routine-LOOKING PRs of exactly the first two kinds. This job rebuilds the
+# contracts and the delegate on both sides of the PR and compares the BLAKE3
+# code hashes, so a re-key is a red check with the old and new addresses
+# printed, instead of something discovered after a publish.
+#
+# HOW TO PASS IT WHEN THE RE-KEY IS INTENDED: label the PR
+# `contract-rekey-acknowledged`. The job still runs and still prints every
+# moved address; the label records that a human read them and decided. There
+# is deliberately no way to pass without either leaving the addresses alone or
+# saying out loud that they moved.
+#
+# WHAT THIS JOB DOES NOT CHECK: whether the artifacts committed under
+# `ui/public/contracts/` match the current source. They do not, today -- they
+# were built with an older toolchain and older dependency versions and are not
+# reproducible (they carry absolute paths from the machine that built them).
+# Refreshing them is a deliberate re-key that has to be decided, not smuggled
+# into a CI change, so it is filed separately. This job is a RELATIVE check:
+# it answers "does this PR move the address", which is the question a
+# dependency bump raises.
+
+on:
+  pull_request:
+    paths:
+      # Everything that can change the compiled bytes. `ui/**` is absent on
+      # purpose: the UI is not a dependency of the contracts or the delegate.
+      # `ui/public/contracts/**` IS here, because editing a committed artifact
+      # is a re-key by definition.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "common/**"
+      - "contracts/**"
+      - "delegates/**"
+      - "ui/public/contracts/**"
+      - "scripts/build-contract-wasm.sh"
+      - ".github/workflows/contract-drift.yml"
+  workflow_dispatch:
+
+# Note there is no `push: main` trigger. After a merge the comparison has
+# nothing actionable left to say -- the PR is the gate. That does mean a direct
+# push to main bypasses this check entirely, which is an argument for requiring
+# this check in branch protection (main is unprotected as of this writing).
+
+jobs:
+  wasm-address-drift:
+    name: no contract or delegate address moved
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the merge base is present for the second build.
+          fetch-depth: 0
+
+      - name: pin the toolchain for BOTH builds
+        run: |
+          set -euo pipefail
+          # Both sides are built with the toolchain THIS PR pins, so the
+          # comparison isolates the source/dependency change. A change to the
+          # pin itself is caught by the separate step below rather than by this
+          # comparison -- otherwise raising the pin would rebuild both sides
+          # with the new compiler and hide the re-key it causes.
+          channel="$(sed -n 's/^ *channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)"
+          case "$channel" in
+            ""|*[!0-9A-Za-z.-]*)
+              echo "::error::could not read a plausible channel from rust-toolchain.toml (got '$channel')"
+              exit 1 ;;
+          esac
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "pinned toolchain: $channel"
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --component rustfmt,clippy --target wasm32-unknown-unknown && rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: install b3sum
+        run: command -v b3sum || cargo install b3sum --locked
+
+      - name: build the contracts and delegate at this PR's HEAD
+        run: |
+          set -euo pipefail
+          ./scripts/build-contract-wasm.sh | tee /tmp/head.log
+          mkdir -p /tmp/head
+          cp target/wasm32-unknown-unknown/release/*.wasm /tmp/head/
+
+      - name: report the current addresses (manual runs)
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Contract and delegate code hashes at this commit"
+            echo
+            echo '```'
+            sed -n '/BLAKE3 code hashes/,$p' /tmp/head.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: build the contracts and delegate at the merge base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # A separate worktree rather than `git checkout` in place: each side
+          # gets its own target dir, so neither build can be contaminated by
+          # the other's artifacts. The absolute paths differ between the two
+          # trees, which is harmless ONLY because build-contract-wasm.sh
+          # remaps them -- if that remapping is ever removed this comparison
+          # becomes noise, so the script's path is in this workflow's `paths:`
+          # filter and a change to it requires the acknowledgement label.
+          base_dir="$RUNNER_TEMP/base"
+          # `fetch-depth: 0` normally leaves the base commit present, but a
+          # narrow fetch configuration would not. Fetch it explicitly rather
+          # than letting `worktree add` fail with an opaque message.
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+            || git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git worktree add --detach "$base_dir" "$BASE_SHA"
+
+          # Build the base tree with THIS PR's build procedure and toolchain
+          # pin. Using the base's own copies would let a PR that edits the
+          # script or the pin rebuild both sides under the new rules and hide
+          # the re-key; those two files are guarded by the separate step below
+          # instead.
+          mkdir -p "$base_dir/scripts"
+          cp scripts/build-contract-wasm.sh "$base_dir/scripts/"
+          cp rust-toolchain.toml "$base_dir/"
+
+          # The base may predate the committed Cargo.lock (it does for the PR
+          # that introduces it). An unpinned resolve is not a meaningful
+          # baseline, so say so loudly rather than comparing silently.
+          if [ ! -f "$base_dir/Cargo.lock" ]; then
+            echo "::warning::merge base has no Cargo.lock; its baseline build resolves dependencies fresh and is only approximate"
+            export HARVEST_ALLOW_UNLOCKED=1
+          fi
+
+          ( cd "$base_dir" && ./scripts/build-contract-wasm.sh | tee /tmp/base.log )
+          mkdir -p /tmp/base
+          cp "$base_dir/target/wasm32-unknown-unknown/release/"*.wasm /tmp/base/
+
+      - name: compare addresses
+        if: github.event_name == 'pull_request'
+        env:
+          ACKNOWLEDGED: ${{ contains(github.event.pull_request.labels.*.name, 'contract-rekey-acknowledged') }}
+        run: |
+          set -uo pipefail
+          moved=0
+          {
+            echo "## Contract and delegate code hashes"
+            echo
+            echo "| artifact | merge base | this PR | |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
+            # Missing on either side is a failure, never a silent skip: a
+            # renamed or dropped artifact would otherwise pass this job by
+            # having nothing to compare.
+            if [ ! -f "/tmp/base/$a.wasm" ] || [ ! -f "/tmp/head/$a.wasm" ]; then
+              echo "::error::$a.wasm is missing from one side of the comparison"
+              echo "| \`$a\` | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"
+              moved=1
+              continue
+            fi
+            b="$(b3sum "/tmp/base/$a.wasm" | cut -d' ' -f1)"
+            h="$(b3sum "/tmp/head/$a.wasm" | cut -d' ' -f1)"
+            if [ "$b" = "$h" ]; then
+              echo "unchanged: $a  $h"
+              echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | unchanged |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$a RE-KEYS: $b -> $h"
+              echo "| \`$a\` | \`${b:0:16}…\` | \`${h:0:16}…\` | :warning: **MOVED** |" >> "$GITHUB_STEP_SUMMARY"
+              moved=1
+            fi
+          done
+
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ "$moved" = 0 ]; then
+            echo "No address moved." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "A moved code hash means the contract or delegate lives at a new address."
+            echo "State stored under the old address is not reachable from the new one."
+            echo
+            echo "Before merging, decide which this is:"
+            echo
+            echo "* **Unintended** (the usual case for a dependency bump) — close the PR,"
+            echo "  or pin the dependency so the bytes stay put."
+            echo "* **Intended** — plan the migration, then add the"
+            echo "  \`contract-rekey-acknowledged\` label to this PR to record the decision"
+            echo "  and let it merge."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ACKNOWLEDGED" = "true" ]; then
+            echo "::warning::addresses moved, but the PR carries contract-rekey-acknowledged"
+            echo
+            echo "_Acknowledged via the \`contract-rekey-acknowledged\` label._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit 1
+
+      - name: a toolchain or build-procedure change re-keys everything
+        if: always() && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ACKNOWLEDGED: ${{ contains(github.event.pull_request.labels.*.name, 'contract-rekey-acknowledged') }}
+        run: |
+          set -uo pipefail
+          # The comparison above deliberately builds both sides under THIS PR's
+          # toolchain and build script, so a change to either is invisible to
+          # it -- and both re-key every artifact. Check them directly.
+          changed="$(git diff --name-only "$BASE_SHA" HEAD -- rust-toolchain.toml scripts/build-contract-wasm.sh)"
+          if [ -z "$changed" ]; then
+            echo "toolchain pin and build procedure unchanged"
+            exit 0
+          fi
+          echo "::error::this PR changes: $changed"
+          echo "Both determine the compiled bytes, so every contract and delegate address moves."
+          if [ "$ACKNOWLEDGED" = "true" ]; then
+            echo "::warning::acknowledged via the contract-rekey-acknowledged label"
+            exit 0
+          fi
+          exit 1

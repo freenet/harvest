@@ -9,11 +9,16 @@ use std::cell::RefCell;
 const APP_NAME: &str = "Harvest";
 
 thread_local! {
-    static LAST_TITLE: RefCell<String> = RefCell::new(String::new());
+    static LAST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Set the document title, notifying the parent Freenet shell via postMessage.
 pub fn set_title(title: &str) {
+    // Everything below is wasm32-only; on the host build the parameter is
+    // genuinely unused, and CI lints with -D warnings.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = title;
+
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::prelude::*;

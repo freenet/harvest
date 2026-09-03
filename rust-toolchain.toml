@@ -1,0 +1,27 @@
+# Pinned because the compiled WASM's hash IS the on-network address of every
+# Harvest contract and delegate. rustc codegen changes between releases, so an
+# unpinned toolchain silently re-keys `store-contract`, `reputation-contract`,
+# `mailbox-contract` and `harvest-delegate` the next time anyone rebuilds --
+# no source change, no dependency change, no diff, a different address.
+#
+# 1.94.1 is the toolchain that produced the artifacts currently committed under
+# `ui/public/contracts/`, so this pin is a record of fact, not a preference.
+#
+# RAISING THIS PIN IS NOT A ROUTINE BUMP. Two things must happen first:
+#
+#   1. `harvest-delegate` does NOT link on 1.95+. Its dependency graph enables
+#      `getrandom`'s `custom` feature and nothing registers an implementation,
+#      so `env.__getrandom_custom` is undefined. Up to 1.94.1 rust-lld turned
+#      that into a wasm import and linked anyway; newer rust-lld rejects it.
+#      The import is a live defect either way -- the Freenet runtime registers
+#      no `env` module, so the deployed delegate cannot instantiate. Tracked in
+#      freenet/harvest#7 (which lists this import alongside chrono's wasmbind
+#      JS `Date` imports). Fix #7 before raising the pin; the newer toolchain's
+#      strictness is the correct behaviour, not the obstacle.
+#   2. Every contract and delegate address moves. Decide the migration before
+#      the bump, not after. The `contract-drift` workflow will fail the PR and
+#      requires the `contract-rekey-acknowledged` label to pass.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

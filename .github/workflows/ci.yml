@@ -1,0 +1,62 @@
+name: CI
+
+# Harvest had no CI at all until this workflow. That is worth stating plainly:
+# Dependabot is enabled on this repository, so dependency PRs were arriving
+# with ZERO checks -- nothing built them, nothing ran the tests, and nothing
+# noticed that a bump had moved a contract address. The companion workflow
+# `contract-drift.yml` covers the address question; this one covers the
+# ordinary "does it still build and pass" question.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action and no version named here: rust-toolchain.toml
+      # pins the channel, the components and the wasm target, and
+      # `rustup toolchain install` with no argument installs exactly that.
+      # Naming a version here as well would let the two drift, and every
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # --locked everywhere: a Dependabot PR edits Cargo.toml, and without
+      # --locked cargo would quietly re-resolve and test a dependency set that
+      # is not the one in Cargo.lock. The lockfile is what a contract build
+      # uses, so it has to be what CI tests.
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked --workspace
+
+  wasm:
+    name: contracts and delegate build to wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: install b3sum
+        run: command -v b3sum || cargo install b3sum --locked
+
+      # The contracts and the delegate are wasm32-only artifacts and are NOT
+      # covered by the native job above -- `cargo test` compiles them for the
+      # host, which links differently. A dependency bump can compile clean on
+      # the host and fail to link for wasm32 (that is exactly how the currently
+      # committed delegate ended up with an unresolvable `env.__getrandom_custom`
+      # import; see freenet/harvest#7). Build them for the real target.
+      - name: build contract and delegate wasm
+        run: ./scripts/build-contract-wasm.sh

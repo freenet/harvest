@@ -33,6 +33,25 @@ harvest/
 cargo check --workspace
 ```
 
+The contract and delegate WASMs are built by one script, and only by it:
+
+```bash
+./scripts/build-contract-wasm.sh          # build, print BLAKE3 code hashes
+./scripts/build-contract-wasm.sh --sync   # also refresh ui/public/contracts/
+```
+
+A Freenet contract lives at `BLAKE3(BLAKE3(wasm) || parameters)`, so the
+compiled bytes are the address. The script pins the flags that keep the build
+byte-reproducible across machines, and CI runs the same script on both sides of
+every pull request and fails it when an address moves — including when the
+cause is only a transitive dependency bump in `Cargo.lock`. If a re-key is
+intended, label the PR `contract-rekey-acknowledged` after planning the
+migration.
+
+`Cargo.lock` is committed for the same reason: the resolved dependency versions
+are an input to the address, so leaving them to float means the contracts have
+no stable identity.
+
 ## License
 
 MIT OR Apache-2.0
