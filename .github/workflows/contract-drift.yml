@@ -36,6 +36,14 @@ name: contract drift
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` are here because the acknowledgement escape hatch is
+    # read from the event payload, and the default trigger types would leave a
+    # freshly-applied label invisible until the next push -- `gh run rerun`
+    # does not help either, since a re-run replays the ORIGINAL payload. Without
+    # these two types the label would be unusable in practice, and `unlabeled`
+    # matters as much as `labeled`: removing the acknowledgement has to turn the
+    # check red again rather than leaving a stale green.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       # Everything that can change the compiled bytes. `ui/**` is absent on
       # purpose: the UI is not a dependency of the contracts or the delegate.
