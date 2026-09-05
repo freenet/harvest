@@ -56,7 +56,7 @@ bs58 = "0.5"
 rsa = "0.9"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 # Utilities
 # default-features = false is load-bearing, not tidiness. chrono's default
