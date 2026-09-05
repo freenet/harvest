@@ -1887,7 +1887,7 @@ dependencies = [
  "hex",
  "rsa 0.9.10",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1908,7 +1908,7 @@ dependencies = [
  "ripemd",
  "rsa 0.9.10",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3274,7 +3274,7 @@ dependencies = [
  "harvest-common",
  "rsa 0.9.10",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
