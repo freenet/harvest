@@ -136,6 +136,42 @@ set -e
 export FREENET_NODE_URL
 echo "Publishing to $FREENET_NODE_URL"
 
+# The Bitcoin ADDRESSING constants are pinned at build time (the gateway CSP
+# forbids asking a bridge at runtime -- harvest#29), so a contract rebuild
+# re-keys them and this build goes quietly wrong. That happened: harvest#30,
+# stale by five generations, and it did NOT fail silent. The superseded tip
+# contract still exists and still holds its last state, so the published app
+# showed a chain tip ~400 blocks old as though it were live, and every invoice
+# named an address contract that was never published.
+#
+# So check before publishing, which is the moment the cost is incurred. This
+# cannot live in CI -- there is no bridge there.
+#
+# Exit 2 means "could not check" (no bridge reachable) and is NOT treated as a
+# pass, because recording "I could not look" as "it is fine" is the exact
+# defect being guarded against. Override deliberately if you must.
+set +e
+./scripts/check-bitcoin-constants.sh
+CHECK_RC=$?
+set -e
+if [ "$CHECK_RC" -eq 1 ]; then
+  echo "" >&2
+  echo "error: refusing to publish -- see the mismatch above." >&2
+  exit 1
+elif [ "$CHECK_RC" -eq 2 ]; then
+  if [ "${HARVEST_SKIP_BRIDGE_CHECK:-}" = "1" ]; then
+    echo "WARNING: publishing WITHOUT having checked the Bitcoin constants" >&2
+    echo "         (HARVEST_SKIP_BRIDGE_CHECK=1). If they are stale, this build" >&2
+    echo "         will show stale chain data as live. See harvest#30." >&2
+  else
+    echo "" >&2
+    echo "error: could not verify the Bitcoin constants against a bridge, so" >&2
+    echo "       refusing to publish. Start a bridge, set HARVEST_BRIDGE_URL," >&2
+    echo "       or set HARVEST_SKIP_BRIDGE_CHECK=1 to publish unverified." >&2
+    exit 1
+  fi
+fi
+
 # fdev EXITS 0 ON A FAILED PUBLISH -- observed 2026-09-06, printing
 # "Error: Failed to receive response" and returning 0. So `set -e` does not
 # catch it and the success line below would print over a failure. Confirm from
