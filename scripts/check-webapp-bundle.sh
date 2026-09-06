@@ -38,7 +38,7 @@
 # distinguish from the live one.
 set -euo pipefail
 
-ARCHIVE="${1:?usage: check-webapp-bundle.sh <webapp.tar.xz>}"
+ARCHIVE="${1:?usage: check-webapp-bundle.sh <webapp.tar.xz> [build-dir]}"
 [ -f "$ARCHIVE" ] || { echo "FAILED: no such archive: $ARCHIVE"; exit 1; }
 # Absolute: the checks below run from inside a temp extraction dir.
 ARCHIVE="$(cd "$(dirname "$ARCHIVE")" && pwd)/$(basename "$ARCHIVE")"
@@ -164,8 +164,26 @@ done
 # Staleness guard: if the build output this archive was made from is still on
 # disk, the archive must describe it. Catches a gate inspecting a tarball from
 # an earlier build -- a gate that ran, but not against the thing being
-# published. Skipped when the tree is absent.
-BUILD_DIR="$(dirname "$ARCHIVE")/../dx/harvest-ui/release/web/public"
+# published.
+#
+# The build directory is passed in by the caller ($2) rather than guessed,
+# because guessing it means guessing the build profile. delta's original
+# hardcoded "release"; under any other profile that path simply would not
+# exist, and the `-d` test below would SKIP the guard silently rather than
+# report that it could not run -- a guard that measures nothing while looking
+# like it passed. compress-webapp passes the directory it actually tarred.
+#
+# When $2 IS given the directory must exist: the caller just built it, so its
+# absence is a real error rather than a reason to skip. The guess-and-skip path
+# is kept only for running this script by hand against an archive fetched from
+# elsewhere, where there is no build tree to compare against.
+if [ -n "${2:-}" ]; then
+    BUILD_DIR="$2"
+    [ -d "$BUILD_DIR" ] || fail "build directory $BUILD_DIR does not exist -- cannot verify the archive matches the build it came from"
+else
+    BUILD_DIR="$(dirname "$ARCHIVE")/../dx/harvest-ui/release/web/public"
+    [ -d "$BUILD_DIR" ] || echo "note: no build tree at $BUILD_DIR; skipping the staleness comparison"
+fi
 if [ -d "$BUILD_DIR" ]; then
     on_disk="$(find "$BUILD_DIR" -type f -printf '%P\n' | sort)"
     in_archive="$(printf '%s\n' "${ALL[@]}")"

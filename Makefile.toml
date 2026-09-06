@@ -93,7 +93,8 @@ echo "Compressed webapp to target/webapp/webapp.tar.xz"
 # a clean step can be skipped, reordered, or quietly broken by a later edit,
 # whereas a gate that refuses the archive cannot be skipped silently. The clean
 # is the fix; this is the thing that notices when the fix stops working.
-./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
+./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz \
+  "target/dx/harvest-ui/${BUILD_PROFILE}/web/public"
 '''
 
 [tasks.sign-webapp]
