@@ -98,15 +98,20 @@ on:
   workflow_dispatch:
 
 # Note there is no `push: main` trigger. After a merge the comparison has
-# nothing actionable left to say -- the PR is the gate. That does mean a direct
-# push to main bypasses this check entirely.
+# nothing actionable left to say -- the PR is the gate.
 #
-# The repository ruleset "Ensure CI passes before merge" now lists this job's
-# name among its required status checks, which closes that gap for anything
-# arriving through a pull request. It is also what makes the absence of a
-# `paths:` filter above load-bearing rather than merely wasteful: required and
-# path-filtered are a combination that blocks every pull request the filter
-# excludes.
+# The repository ruleset "Ensure CI passes before merge" lists this job's name
+# among its required status checks, targets `~DEFAULT_BRANCH`, is `active`, and
+# has an empty `bypass_actors`. An earlier version of this note said a direct
+# push to main "bypasses this check entirely"; that was written before the
+# ruleset existed and is not asserted here, because it has not been tested
+# against it and required status checks are not only a pull-request mechanism.
+# What this job is designed around, and what is verified, is the pull-request
+# path.
+#
+# The ruleset is also what makes the absence of a `paths:` filter above
+# load-bearing rather than merely wasteful: required and path-filtered are a
+# combination that blocks every pull request the filter excludes.
 
 jobs:
   wasm-address-drift:
