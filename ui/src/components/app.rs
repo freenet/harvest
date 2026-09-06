@@ -107,20 +107,60 @@ pub fn App() -> Element {
                     }
                 }
 
-                // Step 3: Register the ghostkey delegate. We deliberately
-                // do NOT call `ListGhostKeys` on startup any more: the
-                // vault now auto-grants only the importing webapp (the
-                // Ghostkey Vault itself) on key import, so for any other
-                // webapp `ListGhostKeys` returns an empty list until the
-                // user explicitly approves a `RequestAnyAccess` prompt.
-                // The "Connect a ghostkey" button on the My Store empty
-                // state triggers that prompt; the response folds the
-                // shared key into APP_STATE.ghostkeys.
+                // Step 3: Register the ghostkey delegate, then ASK IT WHAT WE
+                // ALREADY HAVE.
+                //
+                // An earlier version deliberately skipped `ListGhostKeys` here,
+                // reasoning that the vault auto-grants only the importing
+                // webapp, so for any other webapp the list is empty until the
+                // user approves a `RequestAnyAccess` prompt. The premise is
+                // true. The conclusion does not follow, and skipping the call
+                // is what made the user re-approve on EVERY page load.
+                //
+                // Approving `RequestAnyAccess` PERSISTS a grant: the delegate
+                // calls `permissions::grant_third_party`, which saves
+                // `{ReadPublic, Sign}` for this requestor against that
+                // fingerprint. `handle_list` then returns exactly the keys the
+                // requestor holds `ReadPublic` on. The grant is keyed by
+                // `SignatureRequestor::WebApp(ContractInstanceId)`, and this
+                // app's contract id is fixed, so it survives a reload.
+                //
+                // So the list is empty only BEFORE the first approval -- when
+                // an empty answer is exactly right and the My Store empty state
+                // offers "Connect a ghostkey". Afterwards it returns the shared
+                // key with no prompt at all.
+                //
+                // `RequestAnyAccess` raises a user prompt every single time by
+                // construction; it is the wrong thing to call when you only
+                // want to know what you already have. Ask first, prompt only if
+                // the answer is empty.
                 let gk_wasm = include_bytes!("../../public/contracts/ghostkey_delegate.wasm");
                 match crate::gateway::register_delegate(gk_wasm).await {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Ghostkey delegate registered: {:?}", key);
-                        crate::gateway::APP_STATE.write().ghostkey_delegate_key = Some(key);
+                        crate::gateway::APP_STATE.write().ghostkey_delegate_key = Some(key.clone());
+
+                        // Restore any identity already shared with this app.
+                        // Failure is not user-facing: an empty or failed list
+                        // leaves the My Store empty state offering "Connect a
+                        // ghostkey", which is the same place the user would
+                        // have started anyway.
+                        match ghostkey_common::to_cbor(
+                            &ghostkey_common::GhostkeyRequest::ListGhostKeys,
+                        ) {
+                            Ok(payload) => {
+                                if let Err(e) =
+                                    crate::gateway::send_delegate_message(&key, payload).await
+                                {
+                                    dioxus::logger::tracing::warn!(
+                                        "Could not ask the vault for already-shared identities: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => dioxus::logger::tracing::error!(
+                                "Failed to encode ListGhostKeys: {e}"
+                            ),
+                        }
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
