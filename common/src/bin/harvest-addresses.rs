@@ -102,9 +102,28 @@ fn run() -> Result<(), String> {
     // artifact whose address nothing watches -- the same failure this binary
     // exists to close, one level up.
     //
-    // `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
-    // freenet/ghostkeys rather than built here, so nothing in this workspace
-    // can move it.
+    // `ghostkey_delegate.wasm` is absent because this binary answers "did THIS
+    // pull request move an address", and nothing in this workspace can move a
+    // vendored artifact. That is true, and it is also the wrong question to
+    // stop at.
+    //
+    // The risk for a vendored delegate is not that WE move it -- it is that
+    // freenet/ghostkeys moves and we do not follow. A delegate's identity is
+    // BLAKE3(BLAKE3(wasm) || params), so falling behind puts Harvest on a
+    // DIFFERENT delegate instance with its own, empty secret store, while the
+    // user's ghostkeys stay under the current one.
+    //
+    // That happened, and nothing here noticed for six generations (harvest#5).
+    // The symptom was not an error: the vendored delegate could not even
+    // deserialize `RequestAnyAccess`, so it never replied, and "Connect a
+    // ghostkey" spun on "Waiting for vault..." indefinitely.
+    //
+    // A relative HEAD-vs-base comparison structurally cannot catch this,
+    // because both sides are equally stale. Catching it needs an ABSOLUTE
+    // check against upstream -- ghostkeys publishes a pointer record naming
+    // its current delegate code hash, at HYBCmCSGKjr4jUUoTzivZ48UynjLscwA3nvnpKQAwi3a,
+    // readable over the node like any other contract. Resolving that instead
+    // of vendoring is harvest#5's actual fix.
     let artifacts: Vec<(&str, Kind, Vec<u8>)> = vec![
         (
             "reputation_contract",
