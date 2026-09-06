@@ -126,14 +126,44 @@ description = "Publish the Harvest UI to the Freenet network"
 dependencies = ["sign-webapp"]
 script = '''
 set -e
-fdev publish \
+# `encodingProtocol=native` is REQUIRED and its absence does not look like a
+# configuration error. Without it the node answers in a different encoding and
+# fdev misparses the reply as `invalid value: integer 12, expected Ok or Err`,
+# which reads like a version mismatch between client and node. It is not; a
+# matching fdev fails identically. The UI sets the same parameter
+# (`ui/src/gateway/connection.rs`).
+: "${FREENET_NODE_URL:=ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native}"
+export FREENET_NODE_URL
+echo "Publishing to $FREENET_NODE_URL"
+
+# fdev EXITS 0 ON A FAILED PUBLISH -- observed 2026-09-06, printing
+# "Error: Failed to receive response" and returning 0. So `set -e` does not
+# catch it and the success line below would print over a failure. Confirm from
+# the output instead, and treat anything else as failure.
+OUT=$(fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata
+  --webapp-metadata target/webapp/webapp.metadata 2>&1) || true
+echo "$OUT"
+if ! echo "$OUT" | grep -q "Contract published successfully"; then
+  echo "" >&2
+  echo "error: publish did NOT succeed -- fdev reported no success line." >&2
+  echo "       Do NOT commit published-contract/last-version." >&2
+  exit 1
+fi
 echo ""
 echo "Published Harvest to Freenet"
+echo "VERIFY IT: a 200 from the node proves nothing -- the node serves the"
+echo "  PREVIOUS bundle until re-extraction. Compare the served asset hash"
+echo "  against the built one:"
+echo "    curl -s 'http://127.0.0.1:7509/v1/contract/web/<contract-id>/?__sandbox=1' \\"
+echo "      | grep -oE 'harvest-ui-dxh[a-f0-9]+[.]js'"
+echo "    ls target/dx/harvest-ui/release/web/public/assets/"
+echo "  If they differ, the publish did not take effect."
+echo ""
+echo "REMEMBER: commit published-contract/last-version now that it succeeded."
 '''
 
 # --- Testing ---
