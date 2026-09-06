@@ -170,6 +170,20 @@ elif [ "$CHECK_RC" -eq 2 ]; then
     echo "       or set HARVEST_SKIP_BRIDGE_CHECK=1 to publish unverified." >&2
     exit 1
   fi
+elif [ "$CHECK_RC" -ne 0 ]; then
+  # ANY other exit code means the check did not run to a verdict at all: not
+  # executable (126), not found or bad interpreter (127), killed by a signal
+  # (128+n). Without this branch those fall through to publish, which is the
+  # precise failure the check exists to prevent -- "I could not look" recorded
+  # as "it is fine" -- reintroduced one level up in the wrapper that calls it.
+  #
+  # Found in review. Trigger is mundane: a checkout that drops the executable
+  # bit (core.fileMode=false) silently defeats the entire gate.
+  echo "" >&2
+  echo "error: scripts/check-bitcoin-constants.sh did not run to a verdict" >&2
+  echo "       (exit $CHECK_RC). Refusing to publish rather than assuming the" >&2
+  echo "       constants are fine. Check the script is present and executable." >&2
+  exit 1
 fi
 
 # fdev EXITS 0 ON A FAILED PUBLISH -- observed 2026-09-06, printing
