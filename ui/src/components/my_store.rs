@@ -762,23 +762,63 @@ fn extract_created_date(info: &str) -> Option<String> {
 /// Not `serde_json`: the value is a certificate field written by another
 /// project, so the failure that matters is an unexpected shape, and every
 /// caller here already treats "could not read it" as a normal outcome rather
-/// than an error. A parser that returns `None` on anything surprising is the
+/// than an error. A reader that returns `None` on anything surprising is the
 /// right shape for that, and it cannot panic on a malformed certificate.
+///
+/// Matches the key only at the TOP LEVEL of the object. An earlier version
+/// took the first textual match, so `{"nested":{"amount":42},"amount":7}`
+/// answered 42 -- the wrong donation, reported confidently. The field is flat
+/// in practice and notary-issued rather than seller-chosen, so that input is
+/// not expected; it is refused anyway, because a wrong answer here misstates a
+/// seller's standing while `None` merely declines to.
 fn extract_json_field<'a>(info: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = info.as_bytes();
     let pat = format!("\"{key}\"");
-    let pos = info.find(&pat)?;
-    let after = info[pos + pat.len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    if let Some(rest) = after.strip_prefix('"') {
-        let end = rest.find('"')?;
-        Some(&rest[..end])
-    } else {
-        let end = after.find(|c: char| !c.is_ascii_digit())?;
-        if end == 0 {
-            return None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
         }
-        Some(&after[..end])
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            '"' => {
+                // A key sits at depth 1 and is followed by a colon.
+                if depth == 1 && info[i..].starts_with(&pat) {
+                    let after = info[i + pat.len()..].trim_start();
+                    if let Some(after) = after.strip_prefix(':') {
+                        let after = after.trim_start();
+                        return if let Some(rest) = after.strip_prefix('"') {
+                            rest.find('"').map(|end| &rest[..end])
+                        } else {
+                            let end = after.find(|c: char| !c.is_ascii_digit())?;
+                            if end == 0 {
+                                None
+                            } else {
+                                Some(&after[..end])
+                            }
+                        };
+                    }
+                }
+                in_string = true;
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    None
 }
 
 fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
@@ -924,6 +964,32 @@ mod notary_info_tests {
                 "{info:?} is not a readable donation but rendered as {shown:?}"
             );
         }
+    }
+
+    /// A nested object must not shadow the real field. An earlier version of
+    /// the reader took the first textual match and answered 42 here -- the
+    /// wrong donation, reported confidently, which is worse than declining.
+    #[test]
+    fn a_nested_amount_does_not_shadow_the_top_level_one() {
+        let info = r#"{"nested":{"amount":42},"amount":7}"#;
+        assert_eq!(describe_notary_info(info), "$7 donated");
+    }
+
+    /// A key that only appears nested has no top-level answer, so none is
+    /// given -- the certificate passes through as-is rather than being
+    /// described by a number lifted out of a sub-object.
+    #[test]
+    fn an_amount_that_exists_only_nested_is_not_claimed() {
+        let info = r#"{"nested":{"amount":42}}"#;
+        assert_eq!(describe_notary_info(info), info);
+    }
+
+    /// The key appearing inside a STRING value must not be mistaken for the
+    /// key itself.
+    #[test]
+    fn the_key_inside_a_string_value_is_not_matched() {
+        let info = r#"{"note":"beware \"amount\": 99","amount":3}"#;
+        assert_eq!(describe_notary_info(info), "$3 donated");
     }
 
     /// A date without an amount still tells a buyer how old the identity is,
