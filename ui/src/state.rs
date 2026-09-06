@@ -4095,59 +4095,17 @@ impl AppState {
             ghostkey_common::GhostkeyResponse::GhostKeyList { keys } => {
                 info!("Received {} ghostkeys", keys.len());
 
-                // Learning which identities we can act for is the first
-                // moment we can ask the delegate what stores each of them
-                // owns. We can't do this at startup: `ListStores` is
-                // scoped to a fingerprint, and no fingerprint is known
-                // until the vault shares one -- Harvest deliberately does
-                // not call `ListGhostKeys` any more (see the comment in
-                // `components::App`). Without this, `my_stores` stays
-                // empty after every page reload and the seller is offered
-                // "Create Store" for a store they already have.
-                #[cfg(target_arch = "wasm32")]
-                for fingerprint in keys.iter().map(|k| k.fingerprint.clone()) {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) =
-                            crate::gateway::store_ops::list_stores(fingerprint.clone()).await
-                        {
-                            dioxus::logger::tracing::error!(
-                                "Failed to list stores for {fingerprint}: {e}"
-                            );
-                        }
-                    });
-                }
-
-                // Learning the verifying key is also the first moment the
-                // store and mailbox contracts' addresses can be derived --
-                // for the current generation and for every superseded one --
-                // so this is where their migration starts. It deliberately
-                // does NOT wait for `ListStores`: the delegate's registry
-                // names the instance a store was CREATED at, and that
-                // registry is itself lost whenever the delegate re-keys.
-                // Deriving from the ghostkey needs neither.
+                // CLEARED FIRST, and deliberately not last.
                 //
-                // Started unconditionally, once per (instance, current code
-                // hash). Nothing here asks whether the current instance is
-                // empty -- see `crate::migrate`'s module docs for why that
-                // gate is the shape that silently disables a migration.
-                #[cfg(target_arch = "wasm32")]
-                for key in &keys {
-                    if let Some(vk) = key.verifying_key_bytes.as_ref() {
-                        crate::gateway::migrate_ops::start_identity_migration(&key.fingerprint, vk);
-                    }
-                }
+                // The vault has answered; that is the whole meaning of this
+                // flag. Everything below is follow-up work, and while the flag
+                // sat at the END of this arm a failure in any of it left the
+                // button reading "Waiting for vault..." forever, for a request
+                // that had demonstrably completed. That is what happened on
+                // 2026-09-06: the follow-up panicked and the user was told the
+                // vault had not replied, when it had.
+                self.request_any_access_in_flight = false;
 
-                // And the messaging key. Idempotent at the delegate, so a
-                // reconnect costs one round trip and cannot mint a second key
-                // -- which would strand every message already encrypted to
-                // the first. Asked for unconditionally rather than only at
-                // store creation, because a seller whose store predates the
-                // key needs one before they can repair it.
-                for fingerprint in keys.iter().map(|k| k.fingerprint.clone()) {
-                    if !self.encryption_public_keys.contains_key(&fingerprint) {
-                        crate::components::ensure_encryption_key(fingerprint);
-                    }
-                }
                 // If any ghostkey has verifying_key_bytes and we have a pending
                 // store creation for it, fill in the key
                 for key in &keys {
@@ -4168,6 +4126,20 @@ impl AppState {
                         }
                     }
                 }
+
+                // What the follow-up work needs, captured BEFORE the merge
+                // consumes `keys`. Only plain data crosses into the task below;
+                // nothing holding a borrow does.
+                let newly_shared: Vec<(String, Option<Vec<u8>>)> = keys
+                    .iter()
+                    .map(|k| (k.fingerprint.clone(), k.verifying_key_bytes.clone()))
+                    .collect();
+                let needs_encryption_key: Vec<String> = keys
+                    .iter()
+                    .map(|k| k.fingerprint.clone())
+                    .filter(|f| !self.encryption_public_keys.contains_key(f))
+                    .collect();
+
                 // Merge new keys into the existing list (dedup by
                 // fingerprint, prefer the newer entry). Wholesale
                 // replacement would drop previously-connected keys
@@ -4185,30 +4157,73 @@ impl AppState {
                     }
                 }
 
-                // Retry the reputation migration for every identity we now
-                // know a verifying key for. Both halves of
-                // `ReputationParameters` have to be present at once, and the
-                // two arrive from DIFFERENT delegates in no fixed order: the
-                // RSA key from the harvest delegate, the verifying key from
-                // the ghostkey vault. Whichever lands second has to be the one
-                // that starts the probe, so both call sites try and the one
-                // that is still missing an input returns without starting
-                // anything. Without this the whole reputation migration is
-                // silently skipped whenever the RSA response happens to arrive
-                // first -- and it does, for an identity that already has keys.
-                //
-                // A no-op when a probe for the same lineage is already running
-                // or already sealed.
-                let fingerprints: Vec<String> = self
+                // Reputation migration retries for EVERY identity we know a
+                // verifying key for, not just the ones just shared: both halves
+                // of `ReputationParameters` must be present at once and they
+                // arrive from DIFFERENT delegates in no fixed order, so whichever
+                // lands second has to start the probe. Collected after the merge
+                // so a key shared in this very response is included.
+                let all_identities: Vec<(String, Vec<u8>)> = self
                     .ghostkeys
                     .iter()
-                    .map(|k| k.fingerprint.clone())
+                    .filter_map(|k| {
+                        k.verifying_key_bytes
+                            .clone()
+                            .map(|vk| (k.fingerprint.clone(), vk))
+                    })
                     .collect();
-                for fingerprint in fingerprints {
-                    self.start_reputation_migration(&fingerprint);
-                }
 
-                self.request_any_access_in_flight = false;
+                // EVERYTHING BELOW RUNS OUTSIDE THIS BORROW, AND MUST.
+                //
+                // This handler is invoked as
+                // `apply_delegate_response(&mut APP_STATE.write(), ..)`
+                // (`gateway::response_handler`), so a write guard on APP_STATE is
+                // held for the whole call. Any `APP_STATE.read()` reached from
+                // here panics with `AlreadyBorrowedMut` -- and under
+                // `panic = "abort"` that trap kills the rest of the handler.
+                //
+                // Spawning is NOT by itself enough: `spawn_local` polls the
+                // future eagerly up to its first await, so a task that touches
+                // APP_STATE before awaiting still runs inside the guard. That is
+                // exactly how `store_ops::list_stores` -- already spawned --
+                // panicked at its opening `APP_STATE.read()`. The timer await is
+                // therefore load-bearing: it yields to the event loop, by which
+                // point the guard is long dropped.
+                //
+                // Three call sites panicked this way on the first ghostkey ever
+                // connected (migrate_ops.rs:258, migrate_ops.rs:421,
+                // store_ops.rs:530), because this whole path is wasm-only and
+                // nothing had ever executed it.
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(0).await;
+
+                    for (fingerprint, vk) in newly_shared {
+                        if let Err(e) =
+                            crate::gateway::store_ops::list_stores(fingerprint.clone()).await
+                        {
+                            dioxus::logger::tracing::error!(
+                                "Failed to list stores for {fingerprint}: {e}"
+                            );
+                        }
+                        if let Some(vk) = vk.as_ref() {
+                            crate::gateway::migrate_ops::start_identity_migration(&fingerprint, vk);
+                        }
+                    }
+
+                    for (fingerprint, vk) in all_identities {
+                        crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+                    }
+
+                    for fingerprint in needs_encryption_key {
+                        crate::components::ensure_encryption_key(fingerprint);
+                    }
+                });
+
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = (newly_shared, needs_encryption_key, all_identities);
+                }
             }
 
             ghostkey_common::GhostkeyResponse::SignResult {
@@ -6440,6 +6455,74 @@ mod tests {
     /// publishing a store without one, which is only safe because every
     /// response meaning "no certificate is coming" clears the pending
     /// creation. A ghostkey `Error` is one of those, and it has to survive
+    /// The follow-up work in the `GhostKeyList` arm must never be able to
+    /// strand the "Waiting for vault..." button.
+    ///
+    /// On 2026-09-06 the flag was cleared as the LAST statement of that arm,
+    /// and the follow-up above it panicked -- `AlreadyBorrowedMut`, because the
+    /// arm runs inside `apply_delegate_response(&mut APP_STATE.write(), ..)`
+    /// and the migration code it called took another borrow. Under
+    /// `panic = "abort"` the trap killed the rest of the handler, so the flag
+    /// stayed true and the user was told the vault had not answered when it
+    /// had, for a request that had completed.
+    ///
+    /// Two orderings are pinned, and both matter:
+    ///
+    /// 1. the flag is cleared BEFORE the spawned follow-up, so nothing that
+    ///    happens later can strand it;
+    /// 2. the follow-up is spawned at all, rather than called inline -- calling
+    ///    it inline is what re-enters the borrow.
+    ///
+    /// Pinned by reading the source because the invariant is an ORDERING, and
+    /// reproducing the failure needs a held write guard plus a wasm-only call
+    /// chain, neither of which exists on the host. A behavioural test here
+    /// would pass just as happily under the bug, which is the trap this repo
+    /// keeps walking into.
+    #[test]
+    fn the_vault_flag_is_cleared_before_any_follow_up_work() {
+        let source = include_str!("state.rs");
+        let arm = source
+            .split("GhostkeyResponse::GhostKeyList { keys } => {")
+            .nth(1)
+            .expect("the GhostKeyList arm must still exist");
+
+        let clear = arm
+            .find("self.request_any_access_in_flight = false;")
+            .expect("the GhostKeyList arm must clear the in-flight flag");
+        let spawn = arm.find("spawn_local").expect(
+            "the follow-up work must be SPAWNED, not called inline: \
+                    calling it inline re-enters the APP_STATE write borrow this \
+                    arm already holds",
+        );
+
+        assert!(
+            clear < spawn,
+            "request_any_access_in_flight must be cleared BEFORE the spawned \
+             follow-up work. Cleared at {clear}, spawn at {spawn}. With the \
+             clear afterwards, any failure in the follow-up leaves the UI \
+             reading \"Waiting for vault...\" for a request that succeeded."
+        );
+
+        // Scoped to the code AFTER the spawn, not the whole arm: the
+        // explanatory comment above names `list_stores` too, and matching that
+        // made an earlier version of this assertion fail for the wrong reason.
+        let task = &arm[spawn..];
+        let yield_at = task
+            .find("TimeoutFuture")
+            .expect("the spawned task must yield before touching APP_STATE");
+        let first_state_touch = task
+            .find("list_stores(")
+            .expect("the spawned task should still list stores");
+        assert!(
+            yield_at < first_state_touch,
+            "the spawned task must yield (TimeoutFuture) BEFORE touching \
+             APP_STATE: spawn_local polls eagerly up to the first await, so a \
+             task that reads state before awaiting still runs inside the write \
+             borrow this arm holds. Yield at {yield_at}, first touch at \
+             {first_state_touch}."
+        );
+    }
+
     /// the trip through the router to do its job.
     #[test]
     fn a_ghostkey_error_clears_a_waiting_store_creation() {
