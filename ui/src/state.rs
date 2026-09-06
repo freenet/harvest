@@ -1,3 +1,34 @@
+// EVERYTHING BELOW RUNS OUTSIDE THIS BORROW, AND MUST.
+//
+// This handler is invoked as
+// `apply_delegate_response(&mut APP_STATE.write(), ..)`
+// (`gateway::response_handler`), so a write guard on APP_STATE is
+// held for the whole call. Anything reached from here that takes
+// another borrow panics with `AlreadyBorrowedMut`.
+//
+// The consequence is worse than one failed call, because this
+// workspace builds with `panic = "abort"` (see the root
+// Cargo.toml). There is no unwinding, so the write guard is
+// NEVER DROPPED: a single re-entrant read leaves APP_STATE
+// mutably borrowed for the rest of the page's life, and every
+// later `read()` anywhere in the app panics too.
+//
+// That is exactly what happened on the first ghostkey ever
+// connected. `start_reputation_migration` was called
+// synchronously from this arm and panicked at
+// migrate_ops.rs:258; the leaked guard then took down
+// `store_ops::list_stores` (which was ALREADY correctly
+// deferred) and `send_harvest_request` twice, which is why the
+// harvest delegate appeared not to answer about migration
+// markers.
+//
+// So the rule for this arm is simply: touch APP_STATE from here
+// synchronously and nothing else, and do every follow-up from a
+// spawned task. `spawn_local` is sufficient on its own -- it
+// pushes onto a queue drained by `queueMicrotask`
+// (wasm-bindgen-futures `queue.rs::schedule_task`) rather than
+// polling eagerly -- and microtasks cannot run until this
+// synchronous statement has returned and the guard has dropped.
 //! Application state managed via Dioxus GlobalSignal.
 //!
 //! Centralizes all reactive state so the response handler and UI components
@@ -4196,8 +4227,6 @@ impl AppState {
                 // nothing had ever executed it.
                 #[cfg(target_arch = "wasm32")]
                 wasm_bindgen_futures::spawn_local(async move {
-                    gloo_timers::future::TimeoutFuture::new(0).await;
-
                     for (fingerprint, vk) in newly_shared {
                         if let Err(e) =
                             crate::gateway::store_ops::list_stores(fingerprint.clone()).await
@@ -6507,19 +6536,15 @@ mod tests {
         // explanatory comment above names `list_stores` too, and matching that
         // made an earlier version of this assertion fail for the wrong reason.
         let task = &arm[spawn..];
-        let yield_at = task
-            .find("TimeoutFuture")
-            .expect("the spawned task must yield before touching APP_STATE");
-        let first_state_touch = task
-            .find("list_stores(")
-            .expect("the spawned task should still list stores");
         assert!(
-            yield_at < first_state_touch,
-            "the spawned task must yield (TimeoutFuture) BEFORE touching \
-             APP_STATE: spawn_local polls eagerly up to the first await, so a \
-             task that reads state before awaiting still runs inside the write \
-             borrow this arm holds. Yield at {yield_at}, first touch at \
-             {first_state_touch}."
+            task.contains("list_stores("),
+            "the follow-up work must still happen, inside the spawned task"
+        );
+        assert!(
+            task.contains("start_reputation_migration("),
+            "start_reputation_migration must run from the SPAWNED task: calling \
+             it inline is the exact re-entrant read that panicked, and under \
+             panic=abort that leaks the APP_STATE write guard permanently"
         );
     }
 
