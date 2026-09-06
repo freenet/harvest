@@ -1,34 +1,3 @@
-// EVERYTHING BELOW RUNS OUTSIDE THIS BORROW, AND MUST.
-//
-// This handler is invoked as
-// `apply_delegate_response(&mut APP_STATE.write(), ..)`
-// (`gateway::response_handler`), so a write guard on APP_STATE is
-// held for the whole call. Anything reached from here that takes
-// another borrow panics with `AlreadyBorrowedMut`.
-//
-// The consequence is worse than one failed call, because this
-// workspace builds with `panic = "abort"` (see the root
-// Cargo.toml). There is no unwinding, so the write guard is
-// NEVER DROPPED: a single re-entrant read leaves APP_STATE
-// mutably borrowed for the rest of the page's life, and every
-// later `read()` anywhere in the app panics too.
-//
-// That is exactly what happened on the first ghostkey ever
-// connected. `start_reputation_migration` was called
-// synchronously from this arm and panicked at
-// migrate_ops.rs:258; the leaked guard then took down
-// `store_ops::list_stores` (which was ALREADY correctly
-// deferred) and `send_harvest_request` twice, which is why the
-// harvest delegate appeared not to answer about migration
-// markers.
-//
-// So the rule for this arm is simply: touch APP_STATE from here
-// synchronously and nothing else, and do every follow-up from a
-// spawned task. `spawn_local` is sufficient on its own -- it
-// pushes onto a queue drained by `queueMicrotask`
-// (wasm-bindgen-futures `queue.rs::schedule_task`) rather than
-// polling eagerly -- and microtasks cannot run until this
-// synchronous statement has returned and the guard has dropped.
 //! Application state managed via Dioxus GlobalSignal.
 //!
 //! Centralizes all reactive state so the response handler and UI components
@@ -4100,6 +4069,20 @@ impl AppState {
     /// which one arrives depends on whether the identity already had keys.
     /// Starting twice is a no-op: `migrate_ops` keys in-flight probes by their
     /// marker.
+    /// SAFE TO CALL FROM A RESPONSE HANDLER, and it has to be.
+    ///
+    /// Every caller of this is inside
+    /// `apply_delegate_response(&mut APP_STATE.write(), ..)`, so a write guard
+    /// is held. `migrate_ops::start_reputation_migration` opens with an
+    /// `APP_STATE.read()` (migrate_ops.rs:257), and taking that second borrow
+    /// panics -- which, under this workspace's `panic = "abort"`, never drops
+    /// the guard and leaves APP_STATE borrowed for the rest of the page's life.
+    /// One such call bricks the whole app, not just itself.
+    ///
+    /// So the lookup happens here, against the `&self` we already hold, and
+    /// only the call that needs its own borrow is deferred. `spawn_local`
+    /// queues onto a `queueMicrotask`-drained queue, which cannot run until
+    /// this synchronous statement has returned and the guard has dropped.
     pub fn start_reputation_migration(&self, _ghostkey_fingerprint: &str) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -4116,7 +4099,10 @@ impl AppState {
                 // key response.
                 return;
             };
-            crate::gateway::migrate_ops::start_reputation_migration(_ghostkey_fingerprint, &vk);
+            let fingerprint = _ghostkey_fingerprint.to_string();
+            wasm_bindgen_futures::spawn_local(async move {
+                crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+            });
         }
     }
 
@@ -4209,22 +4195,31 @@ impl AppState {
                 // This handler is invoked as
                 // `apply_delegate_response(&mut APP_STATE.write(), ..)`
                 // (`gateway::response_handler`), so a write guard on APP_STATE is
-                // held for the whole call. Any `APP_STATE.read()` reached from
-                // here panics with `AlreadyBorrowedMut` -- and under
-                // `panic = "abort"` that trap kills the rest of the handler.
+                // held for the whole call. Anything reached from here that takes
+                // another borrow panics with `AlreadyBorrowedMut`.
                 //
-                // Spawning is NOT by itself enough: `spawn_local` polls the
-                // future eagerly up to its first await, so a task that touches
-                // APP_STATE before awaiting still runs inside the guard. That is
-                // exactly how `store_ops::list_stores` -- already spawned --
-                // panicked at its opening `APP_STATE.read()`. The timer await is
-                // therefore load-bearing: it yields to the event loop, by which
-                // point the guard is long dropped.
+                // The consequence is worse than one failed call, because this
+                // workspace builds with `panic = "abort"` (root Cargo.toml).
+                // There is no unwinding, so the write guard is NEVER DROPPED: a
+                // single re-entrant read leaves APP_STATE mutably borrowed for
+                // the rest of the page's life, and every later `read()` anywhere
+                // in the app panics too. One such call bricks the whole app.
                 //
-                // Three call sites panicked this way on the first ghostkey ever
-                // connected (migrate_ops.rs:258, migrate_ops.rs:421,
-                // store_ops.rs:530), because this whole path is wasm-only and
-                // nothing had ever executed it.
+                // That is what happened on the first ghostkey ever connected.
+                // `start_reputation_migration` was called synchronously from
+                // this arm and panicked at migrate_ops.rs:257; the leaked guard
+                // then took down `store_ops::list_stores` -- which was ALREADY
+                // correctly deferred -- and `send_harvest_request` twice, which
+                // is why the harvest delegate appeared not to answer about
+                // migration markers.
+                //
+                // `spawn_local` alone is sufficient and no extra yield is
+                // needed: it pushes onto a queue drained by `queueMicrotask`
+                // (wasm-bindgen-futures `queue.rs::schedule_task`) rather than
+                // polling eagerly, and a microtask cannot run until this
+                // synchronous statement has returned and the guard has dropped.
+                // An earlier version of this comment claimed the opposite and
+                // added a timer to compensate; both were wrong and are gone.
                 #[cfg(target_arch = "wasm32")]
                 wasm_bindgen_futures::spawn_local(async move {
                     for (fingerprint, vk) in newly_shared {
@@ -6518,7 +6513,11 @@ mod tests {
         let clear = arm
             .find("self.request_any_access_in_flight = false;")
             .expect("the GhostKeyList arm must clear the in-flight flag");
-        let spawn = arm.find("spawn_local").expect(
+        // Anchored on the CALL, not the bare word: "spawn_local" also appears in
+        // the explanatory comment above it, and matching a comment instead of
+        // code is how an earlier assertion in this very test passed for the
+        // wrong reason.
+        let spawn = arm.find("wasm_bindgen_futures::spawn_local(").expect(
             "the follow-up work must be SPAWNED, not called inline: \
                     calling it inline re-enters the APP_STATE write borrow this \
                     arm already holds",
