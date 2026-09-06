@@ -212,16 +212,33 @@ elif [ "$CHECK_RC" -ne 0 ]; then
   exit 1
 fi
 
-# fdev EXITS 0 ON A FAILED PUBLISH -- observed 2026-09-06, printing
-# "Error: Failed to receive response" and returning 0. So `set -e` does not
-# catch it and the success line below would print over a failure. Confirm from
-# the output instead, and treat anything else as failure.
-OUT=$(fdev publish \
+# CORRECTION (2026-09-06). An earlier version of this comment asserted that
+# "fdev EXITS 0 ON A FAILED PUBLISH". That is FALSE for fdev 0.3.295 and was my
+# error, not fdev's: I read the exit status of a PIPELINE ending in `tail`,
+# which is tail's status, and attributed it to fdev. Reproduced both ways
+# against a dead port -- `fdev publish ...; echo $?` gives 1; the same command
+# `| tail -1; echo $?` gives 0.
+#
+# What fdev actually does (src/main.rs:52-72, src/commands.rs:298-307): a
+# ResponseTimeout exits 3, a conformance violation exits 4, and everything else
+# -- including "Failed to receive response" -- is a plain Err and exits 1.
+#
+# The guard below stays, for a better reason than the false one. fdev has TWO
+# success arms and several failure arms, so the exit code alone does not answer
+# "did the contract actually land": exit 3 in particular means "submitted, may
+# have succeeded". The output check is what distinguishes them, and it fails
+# closed on wording it does not recognise. Keeping the exit code as well means
+# a timeout can be reported honestly instead of as a flat failure.
+if OUT=$(fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata 2>&1) || true
+  --webapp-metadata target/webapp/webapp.metadata 2>&1); then
+  FDEV_RC=0
+else
+  FDEV_RC=$?
+fi
 echo "$OUT"
 # BOTH strings are successes and both must be accepted. fdev's `put()` has two
 # success arms (fdev-0.3.295 src/commands.rs:287 and :295), each returning
@@ -243,6 +260,14 @@ if ! echo "$OUT" | grep -qE "Contract (published|updated) successfully"; then
   echo "       \"Contract published successfully\" nor \"Contract updated" >&2
   echo "       successfully\"." >&2
   echo "       Do NOT commit published-contract/last-version." >&2
+  if [ "$FDEV_RC" -eq 3 ]; then
+    echo "" >&2
+    echo "       NOTE: fdev exited 3, which is its dedicated code for a response" >&2
+    echo "       TIMEOUT (main.rs:52, EXIT_RESPONSE_TIMEOUT) -- the request was" >&2
+    echo "       submitted and MAY have succeeded. Do not assume it failed." >&2
+    echo "       Settle it by comparing the served asset hash against the built" >&2
+    echo "       one, as described below, rather than by re-publishing blind." >&2
+  fi
   exit 1
 fi
 echo ""

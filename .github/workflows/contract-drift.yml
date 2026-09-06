@@ -87,14 +87,26 @@ on:
     # request, builds both sides to identical bytes and reports green, which is
     # the correct answer rather than the absent one.
     #
-    # The cost is real (two contract builds) and is paid on pull requests that
-    # cannot have moved an address. It is accepted here rather than reintroduced
-    # as skip-logic: this repository's characteristic defect is a guard that
-    # reports success while measuring nothing, and a hand-written path
-    # comparison inside the job would be exactly that shape -- one wrong pattern
-    # and a real re-key merges under a green check. `Swatinem/rust-cache`
-    # absorbs most of the cost, and dependabot's pull requests touch
-    # `Cargo.lock`, so they would run the job under either arrangement.
+    # The cost is real and measured: 2:00-2:25 per run with a warm
+    # `Swatinem/rust-cache`, sampled across the fifteen most recent runs.
+    #
+    # Note it is paid per EVENT, not per pull request. `labeled` and `unlabeled`
+    # are in `types:` above, so every label added or removed on any pull request
+    # now triggers a full double build -- previously the `paths:` filter gated
+    # those too. Dependabot applies labels on open, so its pull requests cost
+    # more than one run each. There is deliberately no `concurrency:` group: on
+    # a REQUIRED check, `cancel-in-progress` leaves a cancelled, non-success
+    # check behind and blocks the merge, which is a worse failure than a few
+    # wasted runner-minutes.
+    #
+    # The cost is accepted rather than reintroduced as skip-logic: this
+    # repository's characteristic defect is a guard that reports success while
+    # measuring nothing, and a hand-written path comparison inside the job would
+    # be exactly that shape -- one wrong pattern and a real re-key merges under
+    # a green check. This repo has already been bitten by an incomplete
+    # enumeration of "what can change the bytes" once: see the StoreParameters
+    # note at the top of this file, where a parameter-struct edit re-keyed every
+    # published store with the WASM byte-identical.
   workflow_dispatch:
 
 # Note there is no `push: main` trigger. After a merge the comparison has

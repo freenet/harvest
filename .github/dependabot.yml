@@ -84,10 +84,27 @@ updates:
 # contract and strand existing user data. ANY wasm change moves the address: a
 # direct bump, a transitive bump, or a rustc upgrade.
 #
-# This repo has NO migration or wasm-hash guard workflow, so nothing here will
-# turn red when that happens. Before merging a cargo PR, rebuild and compare the
-# contract key, and ship a migration if it moved. See the `freenet-app-migration`
-# skill and `.claude/rules/` in the freenet tree.
+# CI DOES turn red when that happens, and this comment used to say the opposite.
+# It was written before the guards existed and was left in place after they
+# landed, telling readers to do by hand what CI now does -- which is the exact
+# defect these guards are for, sitting in the file that warns about it.
+#
+# Two workflows cover it, and they are complementary rather than redundant:
+#
+#   * `.github/workflows/contract-drift.yml` -- "no contract or delegate address
+#     moved". Builds the contracts and the delegate on BOTH sides of the PR and
+#     compares their ADDRESSES, so it catches a transitive bump visible only as
+#     Cargo.lock churn, and a parameter-struct edit that re-keys with the WASM
+#     byte-identical. It runs on every pull request and is a REQUIRED check.
+#
+#   * `.github/workflows/ci.yml` -- "committed contract wasm matches a fresh
+#     build". Rebuilds and compares the committed artifacts, which is the
+#     different question of whether the checked-in bytes are stale.
+#
+# So a re-key is a red check with the old and new addresses printed. What still
+# needs a human is the DECISION: when the re-key is intended, label the PR
+# `contract-rekey-acknowledged`, and ship a migration if state was stranded. See
+# the `freenet-app-migration` skill and `.claude/rules/` in the freenet tree.
 #
 # Dependabot does not create this hazard -- a hand-run `cargo update` does the
 # same thing -- but it does deliver a steady stream of routine-LOOKING PRs, and
