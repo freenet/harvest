@@ -87,8 +87,17 @@ on:
     # request, builds both sides to identical bytes and reports green, which is
     # the correct answer rather than the absent one.
     #
-    # The cost is real and measured: 2:00-2:25 per run with a warm
-    # `Swatinem/rust-cache`, sampled across the fifteen most recent runs.
+    # The cost is real. Measured across the 20 most recent completed runs of
+    # this workflow (`gh run list --workflow "contract drift"`, wall-clock from
+    # createdAt to updatedAt): **0:59 to 2:32, median 2:18**.
+    #
+    # The spread is bimodal -- a cluster near 1:25 and a cluster near 2:20 --
+    # so quote the range, not an average. Do not restate this as a narrow band:
+    # an earlier version of this comment claimed "2:00-2:25", which review
+    # falsified against the actual run history, and it was wrong because it was
+    # repeated from someone else's summary instead of being measured. In a
+    # comment block whose subject is guards that misreport, that is the one
+    # mistake worth not making twice.
     #
     # Note it is paid per EVENT, not per pull request. `labeled` and `unlabeled`
     # are in `types:` above, so every label added or removed on any pull request
