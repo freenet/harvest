@@ -37,6 +37,19 @@ description = "Build the Dioxus UI"
 dependencies = ["sync-wasm"]
 script = '''
 set -e
+# WIPE THE OUTPUT DIRECTORY FIRST.
+#
+# dx writes CONTENT-HASHED asset filenames, so a rebuild lands BESIDE its
+# predecessor instead of replacing it. Nothing prunes the old one and
+# compress-webapp tars the whole directory, so without this the bundle is
+# append-only across builds -- it grows a full UI wasm on every publish. The
+# live container was measured carrying TEN copies, 37.7 MB uncompressed, where
+# Delta and River carry one each (harvest#4).
+#
+# Safe to wipe: everything here is regenerated. dx re-copies ui/public/* (which
+# is where sync-wasm stages contracts/), and the two fixed-name assets are
+# re-copied below.
+rm -rf target/dx/harvest-ui/${BUILD_PROFILE}/web/public
 cd ui && dx build --${BUILD_PROFILE}
 # dx doesn't copy CSS from assets/ to the build output root, so copy
 # manually. Path is relative to `ui/` because we cd'd above and the
@@ -68,7 +81,19 @@ dependencies = ["build-ui"]
 script = '''
 mkdir -p target/webapp
 cd target/dx/harvest-ui/${BUILD_PROFILE}/web/public && tar -cJf ../../../../../webapp/webapp.tar.xz *
+cd - > /dev/null
 echo "Compressed webapp to target/webapp/webapp.tar.xz"
+
+# Gate the ARCHIVE, not the build directory, and do it here so a bad archive
+# can never reach sign-webapp -- an archive that has been signed has already
+# been given an identity, and refusing it afterwards is a worse place to find
+# out.
+#
+# The clean above should make this unnecessary. That is exactly why it is here:
+# a clean step can be skipped, reordered, or quietly broken by a later edit,
+# whereas a gate that refuses the archive cannot be skipped silently. The clean
+# is the fix; this is the thing that notices when the fix stops working.
+./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
 '''
 
 [tasks.sign-webapp]
