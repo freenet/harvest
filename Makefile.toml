@@ -247,13 +247,28 @@ echo "$OUT"
 #   PutResponse    -> "Contract published successfully"
 #   UpdateResponse -> "Contract updated successfully"
 #
-# The node answers UpdateResponse when it ALREADY HOSTS the contract, which is
-# every publish after the first -- the normal case for updating the deployed
-# site. Matching only the Put wording reports a successful update as a failure
-# and refuses to commit last-version, from the next publish onward.
+# WHICH arm you get depends on the node MODE, not on whether the contract is
+# already hosted -- an earlier version of this comment said "every publish after
+# the first" and that is wrong. Corrected by the republish on 2026-09-06, which
+# went to an already-hosted contract on the network-mode node and still logged
+# "Contract published successfully".
 #
-# Caught in review. The first publish took the Put path, so having watched this
-# guard work once proved nothing about the case it would actually meet.
+#   `freenet network` -- the PUT operation replies PutResponse
+#                        (operations/put/op_ctx_task.rs), so the Put wording,
+#                        every time, hosted or not.
+#   `freenet local`   -- a re-PUT into a contract the node already holds goes
+#                        through the executor's merge path
+#                        (contract/executor/runtime/contract_ops.rs, whose own
+#                        comment names "client-initiated puts (e.g. fdev
+#                        publish)"), which replies UpdateResponse.
+#
+# So the arm that would have been misreported is the ordinary `freenet local`
+# dev workflow rather than this one. Both are successes, so both are accepted;
+# the failure direction was always safe, only the message was wrong.
+#
+# Caught in review, and worth keeping the reason: the guard had been watched
+# working exactly once, on a first publish taking the Put path, which is not
+# evidence about any other path.
 if ! echo "$OUT" | grep -qE "Contract (published|updated) successfully"; then
   echo "" >&2
   echo "error: publish did NOT succeed -- fdev reported neither" >&2
