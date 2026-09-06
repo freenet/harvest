@@ -43,6 +43,23 @@ ARCHIVE="${1:?usage: check-webapp-bundle.sh <webapp.tar.xz> [build-dir]}"
 # Absolute: the checks below run from inside a temp extraction dir.
 ARCHIVE="$(cd "$(dirname "$ARCHIVE")" && pwd)/$(basename "$ARCHIVE")"
 
+# The build directory needs the SAME treatment, for the same reason, and
+# forgetting it is how this script first failed in anger: the caller passes a
+# path relative to the repo root, the script then cd's into $WORK, and the
+# relative path resolves against the temp directory instead. The staleness
+# check reported "build directory does not exist" on a directory that plainly
+# did, and refused the publish.
+#
+# It refused rather than skipping, which is the whole design working, but the
+# lesson is that ONE absolute-path conversion is never the whole fix -- every
+# caller-supplied path crossing that `cd` needs it.
+if [ -n "${2:-}" ]; then
+    [ -d "$2" ] || { echo "FAILED: build directory $2 does not exist -- cannot verify the archive matches the build it came from"; exit 1; }
+    BUILD_DIR_ARG="$(cd "$2" && pwd)"
+else
+    BUILD_DIR_ARG=""
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 tar -xJf "$ARCHIVE" -C "$WORK"
@@ -177,9 +194,8 @@ done
 # absence is a real error rather than a reason to skip. The guess-and-skip path
 # is kept only for running this script by hand against an archive fetched from
 # elsewhere, where there is no build tree to compare against.
-if [ -n "${2:-}" ]; then
-    BUILD_DIR="$2"
-    [ -d "$BUILD_DIR" ] || fail "build directory $BUILD_DIR does not exist -- cannot verify the archive matches the build it came from"
+if [ -n "$BUILD_DIR_ARG" ]; then
+    BUILD_DIR="$BUILD_DIR_ARG"
 else
     BUILD_DIR="$(dirname "$ARCHIVE")/../dx/harvest-ui/release/web/public"
     [ -d "$BUILD_DIR" ] || echo "note: no build tree at $BUILD_DIR; skipping the staleness comparison"
