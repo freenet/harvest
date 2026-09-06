@@ -64,32 +64,49 @@ on:
     # matters as much as `labeled`: removing the acknowledgement has to turn the
     # check red again rather than leaving a stale green.
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    # The paths filter applies to every activity type, label events included.
-    # That is the behaviour we want: labelling a PR that touches none of these
-    # paths cannot have moved an address, so the job does not need to run and
-    # does not. The filter is not a hole in the gate either -- a PR that DOES
-    # touch them always runs the job on its own push, so the label event is
-    # only ever re-evaluating a check that already ran.
-    paths:
-      # Everything that can change the compiled bytes. `ui/**` is absent on
-      # purpose: the UI is not a dependency of the contracts or the delegate.
-      # `ui/public/contracts/**` IS here, because editing a committed artifact
-      # is a re-key by definition.
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "common/**"
-      - "contracts/**"
-      - "delegates/**"
-      - "ui/public/contracts/**"
-      - "scripts/build-contract-wasm.sh"
-      - ".github/workflows/contract-drift.yml"
+    # THERE IS DELIBERATELY NO `paths:` FILTER, and adding one back breaks every
+    # unrelated pull request.
+    #
+    # This job's name is a REQUIRED status check in the repository ruleset
+    # "Ensure CI passes before merge". A required check that never reports is
+    # not treated as satisfied -- it is treated as missing, and GitHub reports
+    # the pull request as BLOCKED with no failing check to point at. A `paths:`
+    # filter makes the job not run at all on a pull request that touches none
+    # of those paths, so such a pull request can never merge.
+    #
+    # That is not hypothetical: the filter and the ruleset coexisted for a day,
+    # and PR #27 (a Makefile-only change) sat MERGEABLE with four green checks
+    # and mergeStateStatus BLOCKED, because the fifth required check had no
+    # reason to run and so never reported.
+    #
+    # The earlier reasoning here was sound in isolation -- a pull request that
+    # touches no build input cannot have moved an address, so the work is
+    # pointless -- and it is still true. It is just not a reason to SKIP the
+    # job, because "pointless work" and "check that never reports" are settled
+    # by different mechanisms. The job now always runs and, on such a pull
+    # request, builds both sides to identical bytes and reports green, which is
+    # the correct answer rather than the absent one.
+    #
+    # The cost is real (two contract builds) and is paid on pull requests that
+    # cannot have moved an address. It is accepted here rather than reintroduced
+    # as skip-logic: this repository's characteristic defect is a guard that
+    # reports success while measuring nothing, and a hand-written path
+    # comparison inside the job would be exactly that shape -- one wrong pattern
+    # and a real re-key merges under a green check. `Swatinem/rust-cache`
+    # absorbs most of the cost, and dependabot's pull requests touch
+    # `Cargo.lock`, so they would run the job under either arrangement.
   workflow_dispatch:
 
 # Note there is no `push: main` trigger. After a merge the comparison has
 # nothing actionable left to say -- the PR is the gate. That does mean a direct
-# push to main bypasses this check entirely, which is an argument for requiring
-# this check in branch protection (main is unprotected as of this writing).
+# push to main bypasses this check entirely.
+#
+# The repository ruleset "Ensure CI passes before merge" now lists this job's
+# name among its required status checks, which closes that gap for anything
+# arriving through a pull request. It is also what makes the absence of a
+# `paths:` filter above load-bearing rather than merely wasteful: required and
+# path-filtered are a combination that blocks every pull request the filter
+# excludes.
 
 jobs:
   wasm-address-drift:
@@ -168,8 +185,10 @@ jobs:
           # the other's artifacts. The absolute paths differ between the two
           # trees, which is harmless ONLY because build-contract-wasm.sh
           # remaps them -- if that remapping is ever removed this comparison
-          # becomes noise, so the script's path is in this workflow's `paths:`
-          # filter and a change to it requires the acknowledgement label.
+          # becomes noise. A change to that script is therefore itself a build
+          # input: it runs this job (which now runs on every pull request) and,
+          # if the remapping change moves an address, needs the acknowledgement
+          # label like any other re-key.
           base_dir="$RUNNER_TEMP/base"
           # `fetch-depth: 0` normally leaves the base commit present, but a
           # narrow fetch configuration would not. Fetch it explicitly rather
