@@ -40,12 +40,43 @@
 //!
 //! **This is a stopgap and it has the exact staleness problem the constant was
 //! meant to avoid**: a contract rebuild re-keys the tip contract and this file
-//! goes quietly wrong. The durable fix is a POINTER RECORD -- a fixed-address,
-//! author-signed contract naming the current code hash, read over the
-//! WebSocket like any other contract, which is what `freenet-migrate`'s
-//! pointer mechanism exists for and what ghostkeys already does. Until that is
-//! in place, treat the constants below as needing an update whenever
-//! `legacy_contracts.toml` gains an entry.
+//! goes quietly wrong.
+//!
+//! That is not a warning about the future. It HAPPENED, and was found on
+//! 2026-09-06 (harvest#30): both constants below were stale, one of them by
+//! five generations. Record what the failure actually looked like, because it
+//! is not what this file predicted:
+//!
+//!   * It did NOT report "this network has no data yet". The superseded tip
+//!     contract still exists on the network and still holds the last state it
+//!     was given, so the published app rendered a chain tip ~400 blocks old,
+//!     frozen three days, indistinguishable from live data.
+//!   * The stale address code hash was stamped onto every invoice issued,
+//!     naming an address contract that was never published -- so a payment
+//!     could never be observed, and nothing about the invoice looked wrong.
+//!   * The trusted-bridge constant was CORRECT throughout. Trust was right and
+//!     addressing was wrong, which is why nothing errored: the app believed the
+//!     right signer and looked in the wrong places.
+//!
+//! **A stale content-addressed constant does not fail quiet, it fails
+//! plausible.** The old address is a real contract holding real, once-valid
+//! state. That is worse than an empty panel and is the reason "only
+//! well-formedness is asserted" was an expensive gap.
+//!
+//! The durable fix is a POINTER RECORD -- a fixed-address, author-signed
+//! contract naming the current code hash, read over the WebSocket like any
+//! other contract, which is what `freenet-migrate`'s pointer mechanism exists
+//! for and what ghostkeys already does. Ghostkeys is a working reference: it
+//! carries `pointer-records.toml`, `scripts/sign-pointer-records.sh`, and a CI
+//! `check-pointer-freshness` job that fails the PR when an artifact's WASM
+//! changed and no new record was signed. That CI gate is precisely what is
+//! missing here. `freenet-bitcoin` already ships `generation/pointer-v1.wasm`
+//! but has no records config yet.
+//!
+//! Until that is in place, treat the constants below as needing an update
+//! whenever `freenet-bitcoin`'s `legacy/` registries gain an entry -- and note
+//! that appending to those registries is exactly what a re-key does, so an
+//! entry appearing there IS the signal that this file is now wrong.
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
@@ -60,7 +91,19 @@ pub fn well_known_tip_contract_id(network: BitcoinNetwork) -> Option<&'static st
         // bridge] } plus the tip contract's code hash.
         //
         // Re-derive with: curl -s <bridge>/v1/status
-        BitcoinNetwork::Signet => Some("B24HMUFasG3Yd1EJxfzb3qTPos1tLMiKo5gYiKwaihqT"),
+        //
+        // UPDATED 2026-09-06. The previous value, B24HMUFasG3Yd1EJxfzb3qTPos1t
+        // LMiKo5gYiKwaihqT, had been superseded and the failure was NOT the
+        // "this network has no data yet" the module docs predicted. That old
+        // contract still exists on the network and still holds the last state
+        // it was given, so the published app rendered a chain tip ~400 blocks
+        // stale, frozen three days, as if it were current -- while the bridge
+        // was at height 320955. See harvest#30.
+        //
+        // A stale address here does not go quiet. It points at a real contract
+        // holding real, once-valid, now-frozen state, and confirmation depth is
+        // measured against that tip.
+        BitcoinNetwork::Signet => Some("FXFgLKfuMm3NPtzWg3Ghgt5otv4Yo7N4CWGDvHpVeZMm"),
         BitcoinNetwork::Regtest => None,
     }
 }
@@ -109,8 +152,15 @@ pub const TRUSTED_BRIDGE_ID_BS58: &str = "4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1
 /// Needed to compute a watched address's contract id locally, since the
 /// gateway CSP rules out asking the bridge. Goes stale on any contract
 /// rebuild -- see the module docs on the pointer-record fix.
+///
+/// UPDATED 2026-09-06 from `3b5f1df2...`, which `freenet-bitcoin`'s
+/// `legacy/address_contract.toml` lists as generation **A3** -- a file whose
+/// header states it records ONLY superseded generations. The deployed bridge
+/// reports A8. So this build was stamping five-generations-old code hashes
+/// onto every invoice it issued, naming an address contract that was never
+/// published. See harvest#30.
 pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
-    "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f";
+    "cd2ae7418e3b29c2770fab549763b8a268d54787a86a9bfad5b59ca3d2023555";
 
 /// Which networks this build can actually settle a payment on.
 ///
@@ -193,6 +243,18 @@ mod tests {
     /// a rebuild of a contract this workspace does not build -- and it cannot
     /// be checked here, because the artifact is not bundled. Only well-formedness
     /// is asserted.
+    ///
+    /// **That gap was not hypothetical and it has since been paid.** On
+    /// 2026-09-06 both constants were found stale against the deployed bridge
+    /// (harvest#30) -- well-formed throughout, so this test passed the entire
+    /// time. The paragraph above described the failure accurately in advance
+    /// and nothing acted on it, which is the argument for closing it with a
+    /// pointer record rather than a sharper comment.
+    ///
+    /// Do not be tempted to "fix" this by asserting the constants equal
+    /// specific literals: that tests the file against itself and would also
+    /// have passed. The check has to compare against something outside this
+    /// repository -- the bridge, or a pointer record resolved over the node.
     #[test]
     fn the_builds_bitcoin_constants_parse() {
         let bridges = default_trusted_bridges(default_network())
