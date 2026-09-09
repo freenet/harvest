@@ -106,6 +106,13 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 <h1>A Harvest Transaction, Step by Step</h1>
 <p class="subtitle">Alice sells hot sauce. Bob buys a $50 bottle. At each step: what Bob sees, what Alice sees, and what the system is doing underneath — and why.</p>
 
+<div class="card warning">
+<h3>Status, 9 September 2026</h3>
+<p>Rewritten for <strong>on-chain Bitcoin</strong>. An earlier version of this document was built around Lightning throughout, including a clipboard flow for passing a payment secret back; that is gone, and the aside below says why the choice went the other way.</p>
+<p>Also updated: a <strong>ghostkey is required to file a complaint, not to buy</strong>, and store links carry a <strong>twelve-character code</strong> used directly as the contract's parameters.</p>
+<p>Where this disagrees with <code>incentive-mechanism.md</code>, that document wins. Two things described here are <strong>not built</strong>: the standing and capacity arithmetic, and the confession together with the complaint, cure and window that depend on it.</p>
+</div>
+
 <div class="card insight">
 <h3>The one idea underneath everything</h3>
 <p>Harvest has no operator, no arbitrator, and no way to reverse a payment. Nothing can ever establish who was telling the truth about a delivery — there is no oracle for "did the parcel arrive".</p>
@@ -142,6 +149,7 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 
 <div class="step">
 <h3><span class="num">1</span> Bob decides whether Alice is good for it</h3>
+<p>Bob arrived by a link ending in <code>#store=</code> and twelve characters — a base58 prefix of Alice's verifying key, used directly as the contract's parameters. His client derives the contract key locally from that prefix plus the public contract code, so there is no lookup, no directory, and no index of stores anywhere. Twelve rather than ten characters is a deliberate margin against a seller grinding a key that collides with someone else's prefix.</p>
 <div class="actors">
   <div class="actor bob">
     <span class="who">Bob</span>
@@ -221,44 +229,53 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
   </div>
   <div class="actor alice">
     <span class="who">Alice</span>
-    <p>Creates a $50 invoice in her Lightning wallet and pastes it into Harvest. Harvest handles the rest.</p>
-    <span class="screen">Invoice attached ✓ Amount and order matched.</span>
+    <p>Nothing by hand. Her delegate derives a fresh Bitcoin address for this order alone, from her payment xpub, offline.</p>
+    <span class="screen">Address issued ✓ Amount and order matched.</span>
   </div>
 </div>
 <div class="under">
   <span class="who">Underneath</span>
-  <p>Harvest reads the invoice locally and pulls out its payment hash and amount, checking they match the order. Alice's software then signs a <strong>claim</strong> — a statement in her own name reading <em>"I failed to deliver order N, amount $50"</em> — and sends it privately to Bob along with the invoice.</p>
+  <p>Alice's software signs a <strong>confession</strong> — a statement in her own name reading <em>"I failed to deliver order N, amount $50"</em> — and sends it privately to Bob along with the address. The order id is a hash over the whole order including the payment script and the amount, so the confession is bound to that address and that amount for free.</p>
   <span class="why">Why the seller signs a confession in advance</span>
   <p>There is no oracle for delivery and never will be, so no third party can ever attest that Alice failed. The only unforgeable evidence available is a statement <strong>Alice wrote herself, beforehand</strong>. She cannot dispute it later, because it carries her signature.</p>
-  <span class="why">Why it is tied to the invoice</span>
-  <p>The confession is useless on its own. It only becomes usable together with the secret that Lightning releases when the invoice is paid — so <strong>the ability to damage Alice costs exactly $50</strong>.</p>
+  <span class="why">Why it takes two halves</span>
+  <p>The confession is useless on its own. It only becomes usable together with proof that this buyer actually paid — so <strong>the ability to damage Alice costs exactly $50</strong>.</p>
+  <span class="why">Why the confession is not simply part of the public commitment</span>
+  <p>Both are Alice-signed statements about the same order, made at the same moment, and she signs a confession on every order rather than only ones she expects to fail. So they look like one thing split in two, and the reason they are not is specific to paying on chain: <strong>proof of payment is public</strong>. Anyone watching the chain sees the payment land. So the confession is the only half that <em>can</em> be private, and folding it into the public commitment would make complaints free for strangers again. Lightning would have supplied the private half from the payment rail itself; on chain it has to be this message.</p>
   <span class="why">Without that tie</span>
   <p>Complaints would be free. Anyone could open a hundred conversations, collect a hundred signed confessions, pay for none, and file them all — destroying any seller at no cost. That was the fatal flaw in the earlier version of this design.</p>
 </div>
 </div>
 
-<h2>An aside: how any of this reaches Lightning</h2>
+<h2>An aside: how any of this reaches Bitcoin</h2>
 
 <p>The obvious objection is that Freenet cannot talk to a payment network. That is correct, and more absolutely than you might expect — but it turns out not to matter. The steps resume afterwards.</p>
 
 <div class="card warning">
 <h3>Nothing inside Freenet can make a network call</h3>
 <p><strong>Contracts and delegates have no network capability whatsoever</strong> — the runtime grants six host functions covering storage, secrets, logging, randomness and time, and nothing else. A delegate could hold a wallet key and sign a transaction, but could never broadcast it.</p>
-<p><strong>The web interface cannot either.</strong> The gateway runs it in a sandbox permitted to contact only its own origin — so no request to a Lightning node, not even one on the same machine.</p>
+<p><strong>The web interface cannot either.</strong> The gateway runs it in a sandbox permitted to contact only its own origin — so no request to an outside payment service, not even one on the same machine.</p>
 </div>
 
 <div class="card insight">
-<h3>But the protocol never needs one</h3>
-<p>The only things that ever cross the boundary are an invoice going out and a short secret coming back. Crucially, <strong>Alice learns she has been paid by looking at her own wallet</strong>, exactly as any merchant with a payment page does. Nothing in the design requires software to detect a settlement.</p>
-<p>And because a Lightning invoice is self-describing, Harvest can read the amount and payment hash straight out of the pasted text — no network call — and check them against the order automatically.</p>
+<h3>This is why the rail is on-chain, not Lightning</h3>
+<p>A Lightning invoice has to be <em>minted</em> by a node at the moment of sale, and minting is a network call. So Lightning would have required the seller, or some service acting for them, to be reachable and responsive every time anyone places an order, permanently.</p>
+<p>An on-chain address is different: <strong>it can be derived offline, from a key the delegate already holds</strong>, with no network and nobody awake. That is what keeps automatic, delegate-side acceptance of orders reachable at all. Foreclosing it was the decisive argument against Lightning, not a detail.</p>
+</div>
+
+<div class="card insight">
+<h3>And the protocol still never needs a network call</h3>
+<p>Alice publishes a commitment: pure Freenet. Her delegate derives the address: local computation. She signs a confession: pure Freenet. Bob pays: his wallet, outside. <strong>Alice learns she has been paid by looking at her own wallet</strong>, exactly as any merchant with a payment page does. Nothing inside Freenet has to reach out and detect a settlement.</p>
+<p>What crosses the boundary is a <strong>bridge</strong>: a party that watches Bitcoin and publishes signed observations onto the network, where a contract reads them as ordinary data.</p>
 </div>
 
 <table>
-<tr><th>How the two values move</th><th>Experience</th><th>Status</th></tr>
-<tr><td>A <code>lightning:</code> link plus the clipboard</td><td>Works, slightly manual</td><td>Available today; the gateway explicitly grants the sandbox clipboard access, which reads as the sanctioned pattern</td></tr>
-<tr><td>WebLN — a wallet extension pays and hands back the secret</td><td>Smooth, no manual step</td><td>Not blocked in principle, but whether extensions reach this particular sandbox is untested. Cheap experiment, worth doing early.</td></tr>
-<tr><td>Give delegates controlled network access</td><td>Fully automatic</td><td>A platform change, already an open question in the original design</td></tr>
+<tr><th>What the bridge is trusted for</th><th>What it cannot do</th></tr>
+<tr><td>Chain state: which blocks exist, their heights, where the tip is. Nothing verifies this against Bitcoin itself, so a holder of a trusted bridge key could settle an order nobody paid.</td><td>Misreport what a real transaction paid, or to whom. Each claim is checked against the transaction its txid commits to and is bound to this order's own script and network.</td></tr>
+<tr><td>This is not a new trusted party — the transition to <code>Paid</code> already rests on it, so a successful purchase depends on the bridge exactly as a complaint does.</td><td>Repoint somebody else's payment at this order.</td></tr>
 </table>
+
+<p>The trusted-bridge list is therefore part of what the seller signs, <em>per order</em>, and the interface flags bridges the build does not recognise.</p>
 
 <h2>Back to the transaction</h2>
 
@@ -277,7 +294,7 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 </div>
 <div class="under">
   <span class="who">Underneath</span>
-  <p>Settling the payment releases a secret that travels back to Bob's wallet. Harvest checks it matches the invoice and stores it alongside the signed confession. <strong>Nothing is published.</strong> Bob now holds a complete, usable complaint, and could not have obtained it without paying.</p>
+  <p>Bob pays the address from any wallet. A bridge publishes signed claims about that address, and the order's move to <code>Paid</code> is authorised by that evidence and signed by nobody — any peer can verify it, so any peer can submit it, and Bob's own client normally does. Bob now holds a complete, usable complaint: Alice's confession, plus a payment he can point to. He could not have obtained the second half without paying.</p>
 </div>
 </div>
 
@@ -339,7 +356,9 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 </div>
 <div class="under">
   <span class="who">Underneath</span>
-  <p>Bob publishes Alice's own signed confession together with the payment secret. The network checks her signature, checks the secret matches the invoice, and checks the amounts agree — all pure arithmetic, no clock, nothing fetched from elsewhere. Every reader now computes $500 − (2 × $50) = $400.</p>
+  <p>Bob presents a <strong>ghostkey</strong> — the only point in the whole flow where a buyer needs one, since buying is anonymous and free — and publishes Alice's own signed confession together with the proof of payment. The network checks her signature, checks the proof against the order's address and amount, and checks the amounts agree — all pure arithmetic, no clock, nothing fetched from elsewhere. Every reader now computes $500 − (2 × $50) = $400.</p>
+  <span class="why">Why a ghostkey to complain, but not to buy</span>
+  <p>A ghostkey costs a donation, and that cost is what limits repeated extortion: the history accrues to it across sellers. Requiring one to <em>buy</em> would charge every honest buyer for a problem only a dishonest one creates.</p>
   <span class="why">Why a $50 theft costs $100 of bond</span>
   <p>If a complaint cost exactly what was stolen, the crime would fund itself — steal $50, lose $50, top up with the stolen $50, break even. The multiplier must exceed one, and in fact must exceed one divided by the share of victims who actually bother to complain. If only half do, it needs to be above two.</p>
   <span class="why">Why this counts as a fine when nobody collects it</span>
@@ -357,7 +376,7 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
   </div>
   <div class="actor alice">
     <span class="who">Alice</span>
-    <p>Pays Bob's refund invoice from her wallet.</p>
+    <p>Sends Bob a refund on chain, and publishes proof of it.</p>
     <span class="screen">Bond restored: $400 → $500</span>
   </div>
 </div>
@@ -376,7 +395,7 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 <table>
 <tr><th>Problem</th><th>How it is addressed</th></tr>
 <tr><td>Seller takes the money and vanishes</td><td>Open orders can never exceed the bond, so the maximum haul is always less than the bond destroyed. Unprofitable at any size.</td></tr>
-<tr><td>Complaints as free ammunition</td><td>A complaint needs the payment secret, so it costs the order value to obtain.</td></tr>
+<tr><td>Complaints as free ammunition</td><td>A complaint needs both Alice's private confession and proof of payment, so it costs the order value to obtain.</td></tr>
 <tr><td>"Two complaints" — out of how many?</td><td>The question stops mattering. Complaints are withdrawals from a stated balance, not a rate needing a denominator.</td></tr>
 <tr><td>Faking a good reputation</td><td>The only way to raise a bond is to burn real money. The signal <em>is</em> the cost.</td></tr>
 <tr><td>Abandoning a damaged identity</td><td>Pointless — a complained-about identity is not tainted, just poorer, and a fresh one costs what the old one cost.</td></tr>
@@ -404,10 +423,11 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border
 <h3>What this honestly does not fix</h3>
 <p>A buyer who receives his goods and demands a refund anyway still gets away with roughly the order value, once. His identity accumulates a visible history of complaints, which limits repetition, but it cannot be driven to zero — that follows from having no way to tell a real victim from a false one.</p>
 <p>And a genuine victim of a seller who is <em>deliberately leaving</em> still loses their money. The complaint they file destroys a bond the seller had already written off.</p>
+<p>Three more, specific to taking payment on chain. <strong>The bridge is trusted for chain state</strong> — a holder of a trusted bridge key could settle an order nobody paid, and nothing here checks its word against Bitcoin. <strong>Proof of payment is public</strong>, so the whole mechanism rests on a confession reaching exactly one buyer privately before they pay; a leaked confession is a complaint anyone watching the chain could file, and Lightning's preimage would have prevented that for free. <strong>And an order reveals what was bought</strong>, because the commitment names its listing and listings are public — so the public ledger is itemised, not merely valued.</p>
 </div>
 
 <footer>
-Walkthrough of the claims-as-spends design for Harvest, 29 August 2026. Companion document on what this publishes to the network: <code>harvest-privacy.html</code>. Prepared with AI assistance — Claude.
+Walkthrough of the claims-as-spends design for Harvest, 29 August 2026; rewritten for on-chain payment 9 September 2026. Companion document on what this publishes to the network: <code>harvest-privacy.html</code>. Prepared with AI assistance — Claude.
 </footer>
 
 </body>
