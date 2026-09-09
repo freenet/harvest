@@ -71,7 +71,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "allo
 getrandom = { version = "0.2", features = ["custom"] }
 
 # Dioxus UI
-dioxus = { version = "=0.7.3", features = ["web"] }
+dioxus = { version = "=0.7.10", features = ["web"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 # No "Storage" feature: the one thing that used it was the migration marker,
