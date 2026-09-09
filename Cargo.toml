@@ -55,7 +55,7 @@ bs58 = "0.5"
 # RSA blind signatures for feedback tokens (RFC 9474)
 rsa = "0.9"
 sha2 = "0.10"
-x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets", "getrandom"] }
 aes-gcm = "0.10"
 
 # Utilities
