@@ -3271,6 +3271,7 @@ name = "reputation-contract"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "ed25519-dalek",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "harvest-common",

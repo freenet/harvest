@@ -15,6 +15,18 @@ rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 
+[dev-dependencies]
+# The contract's entry points take `ReputationParameters`, which can only be
+# built through `ReputationParameters::new` from a real `VerifyingKey` -- that
+# is the single construction site on purpose, because the field set is hashed
+# into the reputation contract's address. A test therefore needs a key, and
+# only a test does. Same reasoning, and same dependency, as
+# `contracts/mailbox-contract`.
+#
+# A dev-dependency is not linked into the `cdylib`, so this does not move the
+# code hash. Verified with `cargo make code-hashes` rather than assumed.
+ed25519-dalek = { workspace = true }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
