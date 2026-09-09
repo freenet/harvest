@@ -267,6 +267,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // the issuer -- and it calls the shared address derivation
                 // instead of holding a second copy of it.
                 "8884c7258f9547743367a1b440f3803b216c09903148407c7f6f5a2af84ae785",
+                // V10, from `git show 83521fc:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the canonical set-encoding fix; this artifact
+                // moves only because `harvest-common` is compiled into it.
+                "a758603acd00ecd1394c9d6d017bebfec7b3e0720511b1e56259154f9290ff36",
             ],
         ),
         (
@@ -291,6 +295,13 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the buy flow; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "152a12dcf119e72d9b4a909033dcc367b0c9e57a1395c7fa02f5463131499dae",
+                // V10, from `git show 83521fc:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by the canonical
+                // set-encoding fix, and for THIS artifact the cause is its
+                // own: `ReputationStateV1.used_nonces` is STATE and was a
+                // `HashSet`, whose CBOR order is drawn from a per-instance
+                // random seed.
+                "3c55af21e5658f03121bbeccfe347d4d530b57139251048767089596145e0594",
             ],
         ),
         (
@@ -316,6 +327,12 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the buy flow; for THIS artifact the cause
                 // is `harvest-common` gaining `order_binding_from_secret`.
                 "08d0e54aceaa2a5a40226f371d3d1fd9dfd85cbd3694a7afdddb40ad89becd8f",
+                // V10, from `git show 83521fc:ui/public/contracts/\
+                // mailbox_contract.wasm`. Superseded by the canonical
+                // set-encoding fix; for THIS artifact the cause is
+                // `MailboxSummaryV2`, which is a summary and not state, so
+                // nothing stored at V9 changes shape.
+                "29e874557b99730efb7a863d7d393ea8f5444d066144cf354582c23c60b11404",
             ],
         ),
     ];
@@ -724,6 +741,12 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // parameters. `StoreParameters` is field-for-field what it was, diffed
     // against V8 rather than assumed, so the encoding is still 56 bytes.
     (9, false),
+    // V10: the canonical set-encoding fix. It touches `reputation.rs` and
+    // `mailbox.rs` in `harvest-common` and nothing else, so `StoreParameters`
+    // is field-for-field what it was -- confirmed by `cargo make code-hashes`
+    // still reporting 56B of store params after the change, rather than
+    // assumed from the diff.
+    (10, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.

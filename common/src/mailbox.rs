@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// How many messages one mailbox contract will hold.
 ///
@@ -627,7 +627,12 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// delegate store on receipt AND paying only after the write is confirmed,
 /// which is recorded in `docs/buyer-conversation-persistence.md` and not built
 /// here.
-pub type MailboxSummaryV2 = HashSet<[u8; 32]>;
+/// **`BTreeSet`, not `HashSet`.** A summary is encoded and sent, so its
+/// bytes must be a function of its contents alone; a `HashSet` iterates in an
+/// order derived from a per-instance random seed and so encodes differently on
+/// every call, for the same contents, in the same process. Pinned by
+/// `mailbox_summary_encoding_is_deterministic`.
+pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 
 /// Delta: new messages to add. Unchanged in shape -- it always carried whole
 /// messages, and only what counts as "already held" moved.
@@ -1214,6 +1219,46 @@ mod determinism_tests {
             crate::to_cbor(&dribbled).unwrap(),
             "the same messages delivered in different batch sizes must produce \
              identical bytes"
+        );
+    }
+
+    /// **A summary must encode as a function of its contents alone.**
+    ///
+    /// The two tests above pin the STATE bytes and were the only determinism
+    /// guards here; the SUMMARY had none, and [`MailboxSummaryV2`] was a
+    /// `HashSet` -- which draws a fresh random seed per instance, so it
+    /// encoded differently on every call for the same contents.
+    ///
+    /// [`MailboxStateV1::summarize`] rebuilds the set with `collect()` each
+    /// time, so under the defect even summarising ONE state twice differed.
+    /// This still uses two independently-built states, to match the shape the
+    /// reputation contract is forced into -- there `summarize` returns a
+    /// `clone()`, and cloning a `HashSet` copies its hasher, so the
+    /// same-state form is green under the defect and pins nothing. Keeping
+    /// one shape across both files means the weaker form cannot be copied
+    /// here by someone reading this as the template.
+    #[test]
+    fn mailbox_summary_encoding_is_deterministic() {
+        let base = 1_700_000_000;
+        let forward: Vec<_> = (0..12u32).map(|i| indexed(i, base + i as i64)).collect();
+        let backward: Vec<_> = forward.iter().rev().cloned().collect();
+
+        let mut a = MailboxStateV1::default();
+        a.apply_delta(&Some(forward)).unwrap();
+
+        let mut b = MailboxStateV1::default();
+        b.apply_delta(&Some(backward)).unwrap();
+
+        assert_eq!(
+            a.summarize(),
+            b.summarize(),
+            "the two mailboxes must hold the same digests, or this test is \
+             measuring the wrong thing"
+        );
+        assert_eq!(
+            crate::to_cbor(&a.summarize()).unwrap(),
+            crate::to_cbor(&b.summarize()).unwrap(),
+            "two peers holding the same messages must send the same summary bytes"
         );
     }
 
