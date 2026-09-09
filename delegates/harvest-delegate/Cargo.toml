@@ -50,7 +50,7 @@ x25519-dalek = { version = "2.0", default-features = false, features = ["alloc",
 # Bech32 encoding for the P2WPKH addresses derivation produces. The address
 # string and the scriptPubKey are derived together here, in one place, because
 # an Order carries both and they must denote the same output.
-bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+bech32 = { version = "0.12", default-features = false, features = ["alloc"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
