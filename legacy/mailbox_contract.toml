@@ -91,6 +91,6 @@ code_hash = "08d0e54aceaa2a5a40226f371d3d1fd9dfd85cbd3694a7afdddb40ad89becd8f"
 
 [[entry]]
 version = "V10"
-description = "Superseded by the canonical set-encoding fix: `MailboxSummaryV2` moved from `HashSet` to `BTreeSet`. The summary is not part of the state, so nothing stored at V9 changes shape and the fold is unaffected"
+description = "Superseded by the canonical set-encoding fix: `MailboxSummaryV2` moved from `HashSet` to `BTreeSet`. The summary is not part of the state, so nothing stored at V9 changes shape and the fold is unaffected. See the reputation V10 row for why the mechanism is a per-construction counter rather than randomness, which is what it is on wasm32."
 date = "2026-09-09"
 code_hash = "29e874557b99730efb7a863d7d393ea8f5444d066144cf354582c23c60b11404"

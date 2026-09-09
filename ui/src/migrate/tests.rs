@@ -299,8 +299,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // reputation_contract.wasm`. Superseded by the canonical
                 // set-encoding fix, and for THIS artifact the cause is its
                 // own: `ReputationStateV1.used_nonces` is STATE and was a
-                // `HashSet`, whose CBOR order is drawn from a per-instance
-                // random seed.
+                // `HashSet`, whose CBOR order follows a key bumped on every
+                // `RandomState` construction. See the registry row for why
+                // that is a counter rather than randomness on wasm32.
                 "3c55af21e5658f03121bbeccfe347d4d530b57139251048767089596145e0594",
             ],
         ),
@@ -741,9 +742,9 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // parameters. `StoreParameters` is field-for-field what it was, diffed
     // against V8 rather than assumed, so the encoding is still 56 bytes.
     (9, false),
-    // V10: the canonical set-encoding fix. It touches `reputation.rs` and
-    // `mailbox.rs` in `harvest-common` and nothing else, so `StoreParameters`
-    // is field-for-field what it was -- confirmed by `cargo make code-hashes`
+    // V10: the canonical set-encoding fix. The only Rust it changes under
+    // `common/` is `reputation.rs` and `mailbox.rs`, so `StoreParameters` is
+    // field-for-field what it was -- confirmed by `cargo make code-hashes`
     // still reporting 56B of store params after the change, rather than
     // assumed from the diff.
     (10, false),

@@ -627,11 +627,16 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// delegate store on receipt AND paying only after the write is confirmed,
 /// which is recorded in `docs/buyer-conversation-persistence.md` and not built
 /// here.
-/// **`BTreeSet`, not `HashSet`.** A summary is encoded and sent, so its
-/// bytes must be a function of its contents alone; a `HashSet` iterates in an
-/// order derived from a per-instance random seed and so encodes differently on
-/// every call, for the same contents, in the same process. Pinned by
-/// `mailbox_summary_encoding_is_deterministic`.
+/// ---
+///
+/// **`BTreeSet`, not `HashSet`.** A summary is encoded and sent, so its bytes
+/// must be a function of its contents alone. `RandomState::new` bumps a
+/// per-thread counter on every construction, and `summarize` below rebuilds
+/// the set with `collect()` on every call, so under a `HashSet` this encoded
+/// differently each time for the same messages. Pinned by
+/// `mailbox_summary_encoding_is_deterministic`. See
+/// [`crate::reputation::ReputationStateV1::used_nonces`] for why the mechanism
+/// is a counter rather than randomness, which is what it is on wasm32.
 pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 
 /// Delta: new messages to add. Unchanged in shape -- it always carried whole

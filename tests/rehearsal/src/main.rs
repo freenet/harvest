@@ -460,6 +460,21 @@ const ENCODING_BY_GENERATION: &[(u32, bool)] = &[
     // V7: visibility-only change to `StoreParameters`, so the encoding is
     // unchanged at 56 bytes. See the same table in `ui/src/migrate/tests.rs`.
     (7, false),
+    // V8, V9 and V10 were added on 2026-09-09, having been missed when each
+    // generation was recorded. The table went stale at V8 (2026-09-06) and the
+    // harness has been panicking on the length assertion below ever since,
+    // unnoticed because it needs a live node and does not run in CI. Note what
+    // that says about the reassurance above: looking generations up BY NUMBER
+    // did fix the index-shift bug it was written for, and it does not stop
+    // this table needing a row per generation. Adding one is still part of
+    // recording a generation.
+    //
+    // All three are `false` for the same reason V8 and V9 are in the sibling
+    // table: none of them touched `StoreParameters`, whose encoding is still
+    // 56 bytes.
+    (8, false),
+    (9, false),
+    (10, false),
 ];
 
 fn assert_candidate_addresses(

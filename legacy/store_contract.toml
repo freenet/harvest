@@ -101,6 +101,6 @@ code_hash = "8884c7258f9547743367a1b440f3803b216c09903148407c7f6f5a2af84ae785"
 
 [[entry]]
 version = "V10"
-description = "Superseded by the canonical set-encoding fix: `harvest-common` moved the reputation state/summary and the mailbox summary from `HashSet` to `BTreeSet`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed"
+description = "Superseded by the canonical set-encoding fix: `harvest-common` moved the reputation state/summary and the mailbox summary from `HashSet` to `BTreeSet`, and it is compiled into every artifact here, so the bytes moved. Nothing this contract itself does changed. Note the delegate did NOT move on the same change, so `harvest-common` re-keying every artifact is not automatic; it depends on whether the changed code is reachable."
 date = "2026-09-09"
 code_hash = "a758603acd00ecd1394c9d6d017bebfec7b3e0720511b1e56259154f9290ff36"
