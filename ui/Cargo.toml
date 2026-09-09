@@ -95,7 +95,7 @@ freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 # chain of their own rather than needing one Freenet issued. Pinned to what
 # `ghostkey_lib` itself depends on -- a second version would be a second,
 # incompatible `SecretKey` type.
-blind-rsa-signatures = "=0.15.1"
+blind-rsa-signatures = "=0.17.2"
 
 [build-dependencies]
 chrono = "0.4"
