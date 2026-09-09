@@ -4,6 +4,15 @@ What works, and — more usefully — what does not, including pre-existing
 Harvest gaps that block the full buyer-side scenario and are unrelated to
 Bitcoin.
 
+> **Two claims in this document were false and are corrected in place below,
+> on 9 September 2026.** It said no path in the UI issues an order, and that
+> buyer-seller messaging is not implemented with no callers outside its own
+> tests. Both had been overtaken by the code and neither was updated, so a
+> reader using this file to decide what to build next was being pointed at work
+> already done. Corrected rather than deleted, because the gap between a status
+> document and the tree is the thing worth recording: a status file nobody
+> re-checks is worse than no status file, since it is read as current.
+
 ## Working
 
 - Orders in the store contract, with a monotonic status lattice and merge laws
@@ -55,11 +64,12 @@ mutable *state* instead would have been worse: `OrdersV1::verify` re-checks
 every order on every state validation, so rotating a shared mutable list would
 retroactively invalidate the whole historical order book.
 
-**What remains open is a different gap:** no path in the UI issues an order at
-all, so nothing yet chooses a bridge set at invoice time. When that path is
-built it has to supply one; an order that names none is unpayable, exactly as
-before, but now that is a per-invoice mistake rather than a permanent property
-of the store.
+**This is no longer open, and the text above is corrected.** It said no path in
+the UI issues an order at all. There are now two live call sites for
+`store_ops::submit_order_by_id` (`ui/src/state.rs:2863` and `:4390`), so orders
+are issued and a bridge set is chosen at invoice time. The requirement it named
+still holds: an order that names no bridges is unpayable, and that is now a
+per-invoice mistake rather than a permanent property of the store.
 
 The buyer side of the same move is already in place. Because the bridge set is
 per-invoice, checking a store's address once no longer tells a buyer who will
@@ -94,18 +104,24 @@ Note this does **not** affect order-driven payment watching end to end: the
 tip contract and any address contract whose id is already known are subscribed
 over the gateway like any other contract, and that path works.
 
-### 3. Buyer-seller messaging is not implemented
+### 3. Buyer-seller messaging — IMPLEMENTED (this section was wrong)
 
-`messaging::encrypt_message`/`decrypt_message` have no callers outside their
-own tests, and nothing sends anything to a mailbox contract. The missing piece
-is the seller's X25519 public key: `StoreInfoV1` publishes a certificate and a
-reputation contract id and no encryption key, so a buyer has nothing to derive
-a conversation key against.
+This section said messaging was not implemented, that
+`messaging::encrypt_message`/`decrypt_message` had no callers outside their own
+tests, and that `StoreInfoV1` publishes no encryption key. All three are false
+and were false when written or shortly after.
 
-`MessageView` used to claim "Messages are end-to-end encrypted" while
-discarding whatever was typed; it now says messaging is unavailable. The
-mailbox contract itself is real and stores messages — nothing in this app can
-put one there or read one back.
+`StoreInfoV1::encryption_public_key` exists (`common/src/store.rs:114`), and
+the message functions have production callers: `ui/src/messaging.rs:547`, `:709`
+and `:861`, plus `ui/src/state.rs:10422`. The conversation path is real, using
+X25519 plus AES-GCM with a direction-separated key per side, and the mailbox
+contract it writes to has a real capacity cap.
+
+What is genuinely still missing in this area is narrower and lives elsewhere:
+the pre-signed confession the complaint path needs is not built, and neither is
+anything that files, cures or expires a complaint. See
+`design/incentive-mechanism.md`, whose Part 5 marks what exists and what does
+not.
 
 ### 4. No migration registry — this change re-keys the store contract
 

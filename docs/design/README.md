@@ -17,6 +17,8 @@ because each still contains material the explainer cut for length:
 
 - **[transaction-walkthrough.html](transaction-walkthrough.html)** — the Alice-and-Bob
   purchase in full, step by step, with what each party sees at each point.
+  Rewritten 9 September 2026 for on-chain payment; it no longer describes the
+  Lightning flow.
 - **[privacy-analysis.html](privacy-analysis.html)** — what the design publishes to
   the world, and what that means for real people. The transparency is load-bearing:
   it is what makes the exit-scam protection work, so it cannot be optimised away
@@ -55,45 +57,15 @@ which `incentive-mechanism.md` Part 3 shows fails in three independent ways.
 GitHub issue #8 has the same problem. It was filed as the v1 epic but records the
 superseded design, not this one.
 
-## Two things the explainer says that are now out of date
+## Corrections that used to live here
 
-**Lightning is not required.** The explainer states that proof of payment needs a
-Lightning preimage, because "an on-chain Bitcoin payment produces no such secret".
-That was true when it was written. Since then `freenet-bitcoin` has grown a working
-SPV implementation — a pure function checking a claimed Bitcoin payment against the
-raw transaction, a Merkle branch, and the target each block header names. Combined
-with the unique per-order address each order already gets, an on-chain payment now
-yields a proof close enough to what the design needs: it cannot exist unless a
-trusted bridge signed it, and it fixes the amount and destination against a real
-transaction rather than against the bridge's word. It is not trustless — nothing
-anchors a header to Bitcoin, so a trusted bridge could assert a payment that never
-happened — but it does not require the seller's cooperation, which is the property
-the mechanism actually rests on.
+This file used to carry three corrections to `incentive-mechanism.md`: that
+Lightning is not required, that order commitments must be identity-level rather
+than per-store, and that a block anchor can be backdated. **All three are now
+folded into `incentive-mechanism.md` itself**, at the steps they affect.
 
-What is genuinely lost is that a preimage is *secret* while an on-chain proof is
-*public*, so Lightning additionally protects against a leaked confession. That is a
-narrower risk than the latency and fee costs of requiring Lightning for every sale.
-
-**Order commitments must be identity-level, not per-store.** The explainer says
-commitments go into "Alice's public record", which is right. The implementation puts
-them in the per-store contract, and one ghostkey may create unlimited stores — so a
-buyer counting a seller's outstanding orders sees a fraction of what the bond backs,
-which defeats the exposure cap entirely.
-
-**The block anchor can be backdated.** The explainer argues that a commitment cannot
-be made to look old, "because looking old requires having published early, which is
-exactly the behaviour being forced". This is wrong, and it matters, because the
-complaint window rests on it. A block hash proves a commitment was signed *no earlier*
-than that block — a lower bound only — and every past block hash is public. So a
-seller can anchor a fresh commitment to an old block, have readers close it
-immediately, and read zero exposure while taking orders.
-
-Two rules neutralise it. A buyer pays only if the anchor is within about six blocks of
-the tip. And a *paid* order takes its clock from the payment's own block height, which
-comes from the bridge-signed claim rather than from the seller; the anchor then governs
-only unpaid orders, where backdating merely closes a phantom nobody paid for. Note the
-height is the bridge's assertion, not something the SPV proof establishes — a block
-header does not carry its own height — so this moves the trust from the seller to the
-bridge rather than removing it.
-
-See issue #8 for the full contract topology this implies.
+They were moved on 9 September 2026 because keeping a correction in a different
+file from the claim it corrects does not work. Anyone reading the design of
+record in order got the superseded design, and the file that would have told
+them otherwise is one they had no reason to open. That failure is the reason
+this section now says where the corrections went instead of repeating them.
