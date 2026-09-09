@@ -81,7 +81,7 @@ wasm-bindgen-futures = "0.4"
 # where this app actually runs.
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlInputElement", "HtmlElement", "Location", "WebSocket", "BinaryType", "Blob", "FileReader", "CloseEvent", "ErrorEvent", "MessageEvent"] }
 js-sys = "0.3"
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 futures = "0.3"
 
 [profile.release]
