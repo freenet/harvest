@@ -829,8 +829,24 @@ pub fn order_for_invoice(
     derived: &harvest_common::DerivedAddress,
     anchor: Option<freenet_bitcoin_common::BlockAnchor>,
     created_at: chrono::DateTime<chrono::Utc>,
+    address_generation: &crate::bitcoin_generation::Generation,
 ) -> Result<harvest_common::payment::Order, String> {
     use harvest_common::payment::Order;
+
+    // Which address contract this order's payment is watched and settled
+    // through: `Order::bitcoin_address_instance_id` derives it from this hash,
+    // and an order whose id does not derive is neither subscribed to nor ever
+    // settled, so it can never reach `Paid`. The hash comes from the bridge's
+    // signed generation pointer, never a constant this build carries, because
+    // a constant goes stale on the bridge's next deploy and then names a
+    // contract nobody writes to. Refused here, like a missing anchor, rather
+    // than issued naming the wrong contract or none.
+    let address_code_hash = address_generation.0.clone().map_err(|why| {
+        format!(
+            "this invoice could not name where its payment will be proven: {}",
+            why.explain()
+        )
+    })?;
 
     let trusted_bridges = crate::gateway::bitcoin_config::default_trusted_bridges(derived.network)?;
     // Refused rather than published without, and refused HERE rather than at
@@ -860,7 +876,7 @@ pub fn order_for_invoice(
         // in Harvest issues yet.
         payment_hash: None,
         trusted_bridges,
-        bitcoin_address_code_hash: crate::gateway::bitcoin_config::address_contract_code_hash(),
+        bitcoin_address_code_hash: Some(address_code_hash),
         anchor: Some(anchor),
         // Copied from the request verbatim. An invoice written unprompted has
         // none, and no buyer will pay one through the buy flow.
@@ -3774,7 +3790,13 @@ impl AppState {
             .tips
             .get(&derived.network)
             .and_then(|tip| tip.current_anchor());
-        let order = match order_for_invoice(&invoice, &derived, anchor, created_at) {
+        let order = match order_for_invoice(
+            &invoice,
+            &derived,
+            anchor,
+            created_at,
+            &self.bitcoin.address_generation,
+        ) {
             Ok(order) => order,
             Err(e) => {
                 self.notifications
@@ -5083,6 +5105,14 @@ pub struct BitcoinState {
     /// key configured" from "we have not asked yet", so the seller is not
     /// prompted to add one before we know whether they already have.
     pub payment_xpub_loaded: bool,
+    /// Which generation of the bridge's address contract an invoice names,
+    /// resolved from the pointer the bridge signs. It decides which contract
+    /// every order's payment is watched and settled through, so there is no
+    /// build-time default: see `crate::bitcoin_generation`.
+    pub address_generation: crate::bitcoin_generation::Generation,
+    /// Which generation of the bridge's request inbox to ask it to watch
+    /// through, resolved the same way.
+    pub inbox_generation: crate::bitcoin_generation::Generation,
     /// Bitcoin delegate request ids awaiting a response, so a specific
     /// button can show "watching..." rather than a global spinner.
     pub in_flight: HashSet<u64>,
@@ -6859,6 +6889,13 @@ mod invoice_tests {
         }
     }
 
+    /// The address contract generation a bridge's pointer resolved to. A
+    /// stand-in value: what matters is that it came from resolution, and that
+    /// an invoice names exactly it.
+    pub(super) fn resolved_address_generation() -> crate::bitcoin_generation::Generation {
+        crate::bitcoin_generation::Generation::resolved([0xc2; 32])
+    }
+
     /// A seller who owns `STORE_ID` and has a payment key configured.
     fn seller_with_a_store() -> AppState {
         let mut state = AppState::default();
@@ -6886,6 +6923,10 @@ mod invoice_tests {
             .bitcoin
             .tips
             .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        // Likewise the address contract generation, which `order_for_invoice`
+        // refuses to issue without, pinned by
+        // `a_seller_whose_bridge_generation_has_not_resolved_cannot_issue_an_invoice`.
+        state.bitcoin.address_generation = resolved_address_generation();
         state
     }
 
@@ -6964,6 +7005,7 @@ mod invoice_tests {
             &derived(0),
             Some(anchor(800_000)),
             chrono::Utc::now(),
+            &resolved_address_generation(),
         )
         .expect("the build's constants must be usable");
 
@@ -6979,9 +7021,10 @@ mod invoice_tests {
         // is optional by design, but the build knows its own value, so an
         // invoice that omits it has silently lost the store contract's
         // related-contract cross-check.
-        assert!(
-            order.bitcoin_address_code_hash.is_some(),
-            "the build knows the address contract's code hash; an invoice should carry it"
+        assert_eq!(
+            order.bitcoin_address_code_hash,
+            resolved_address_generation().code_hash(),
+            "an invoice names the address contract generation the bridge's pointer resolved"
         );
     }
 
@@ -7051,6 +7094,52 @@ mod invoice_tests {
         );
     }
 
+    /// **No invoice until the bridge's address contract generation resolves.**
+    ///
+    /// The code hash an invoice carries decides which contract its payment is
+    /// watched and settled through (`Order::bitcoin_address_instance_id`), and
+    /// an order whose contract does not derive is neither subscribed to nor
+    /// ever settled. A build used to carry that hash as a constant, which on
+    /// 2026-09-16 named the generation replaced that day, so every invoice it
+    /// issued could have been paid on chain and never proven paid. It now
+    /// comes only from the bridge's signed pointer, and until that answers,
+    /// for any reason, nothing reaches the signing queue and the seller is
+    /// told why.
+    ///
+    /// Goes through the real invoice flow rather than `order_for_invoice`
+    /// alone, so it also pins that the flow passes the resolved generation
+    /// from state and not something else.
+    #[test]
+    fn a_seller_whose_bridge_generation_has_not_resolved_cannot_issue_an_invoice() {
+        use crate::bitcoin_generation::{Generation, Unresolved};
+        for why in [
+            Unresolved::Pending,
+            Unresolved::Unreachable,
+            Unresolved::NeverPublished,
+            Unresolved::Refused("not signed by this bridge".into()),
+            Unresolved::Withdrawn,
+        ] {
+            let mut state = seller_with_a_store();
+            state.bitcoin.address_generation = Generation(Err(why.clone()));
+            state.issue_invoice(invoice()).expect("accepted");
+            let request_id = *state.pending_invoices.keys().next().expect("one entry");
+            state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+
+            assert!(
+                state.pending_signatures.is_empty(),
+                "{why:?}: an invoice naming no address contract must not reach the signing queue"
+            );
+            let notice = state
+                .notifications
+                .last()
+                .expect("the seller must be told why nothing was issued");
+            assert!(
+                notice.contains(&why.explain()),
+                "{why:?}: the notice must say why: {notice}"
+            );
+        }
+    }
+
     /// The address the delegate derived has to be the one the invoice
     /// actually asks the buyer to pay, in BOTH forms -- verification uses the
     /// script and the buyer reads the address.
@@ -7062,6 +7151,7 @@ mod invoice_tests {
             &derived,
             Some(anchor(800_000)),
             chrono::Utc::now(),
+            &resolved_address_generation(),
         )
         .expect("build");
 
@@ -7375,10 +7465,22 @@ mod invoice_tests {
         anonymous.buyer_fingerprint = String::new();
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
 
-        let one =
-            order_for_invoice(&anonymous, &derived(0), Some(anchor(800_000)), now).expect("build");
-        let other =
-            order_for_invoice(&anonymous, &derived(1), Some(anchor(800_000)), now).expect("build");
+        let one = order_for_invoice(
+            &anonymous,
+            &derived(0),
+            Some(anchor(800_000)),
+            now,
+            &resolved_address_generation(),
+        )
+        .expect("build");
+        let other = order_for_invoice(
+            &anonymous,
+            &derived(1),
+            Some(anchor(800_000)),
+            now,
+            &resolved_address_generation(),
+        )
+        .expect("build");
 
         assert_ne!(one.payment_address, other.payment_address);
         assert_ne!(
@@ -7396,8 +7498,14 @@ mod invoice_tests {
     #[test]
     fn an_issued_invoice_carries_the_id_its_terms_give() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let order =
-            order_for_invoice(&invoice(), &derived(0), Some(anchor(800_000)), now).expect("build");
+        let order = order_for_invoice(
+            &invoice(),
+            &derived(0),
+            Some(anchor(800_000)),
+            now,
+            &resolved_address_generation(),
+        )
+        .expect("build");
         assert_eq!(
             order.id,
             harvest_common::payment::OrderId::from_terms(&order)
@@ -9942,7 +10050,7 @@ mod nonce_collision_tests {
 /// then pays.
 #[cfg(test)]
 mod buy_flow_tests {
-    use super::invoice_tests::{anchor, tip_at, TIP_HEIGHT};
+    use super::invoice_tests::{anchor, resolved_address_generation, tip_at, TIP_HEIGHT};
     use super::*;
     use crate::messaging::{BuyerConversation, ConversationKeys};
     use ed25519_dalek::{Signer, SigningKey};
@@ -10250,6 +10358,9 @@ mod buy_flow_tests {
             .bitcoin
             .tips
             .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        // An invoice is refused until the bridge's address contract generation
+        // resolves; a seller able to accept a request has it.
+        state.bitcoin.address_generation = resolved_address_generation();
 
         let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
         let tag = buyer.buyer_public_key;

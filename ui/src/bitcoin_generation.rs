@@ -91,6 +91,59 @@ impl Unresolved {
     fn retryable(&self) -> bool {
         !matches!(self, Unresolved::Withdrawn | Unresolved::Pending)
     }
+
+    /// Why nothing can be derived yet, in words a seller can act on.
+    pub fn explain(&self) -> String {
+        match self {
+            Unresolved::Pending => {
+                "the bridge's contract generation is still being looked up; wait a moment and \
+                 try again"
+                    .into()
+            }
+            Unresolved::Unreachable => {
+                "the bridge's contract generation could not be looked up, because its pointer \
+                 did not answer; this is retried automatically"
+                    .into()
+            }
+            Unresolved::NeverPublished => {
+                "the bridge has not published which contract generation it uses; this is \
+                 retried automatically"
+                    .into()
+            }
+            Unresolved::Refused(why) => format!(
+                "the bridge's contract generation could not be trusted ({why}); this is retried \
+                 automatically"
+            ),
+            Unresolved::Withdrawn => {
+                "the bridge has withdrawn this contract, so nothing can be paid through it".into()
+            }
+        }
+    }
+}
+
+/// What the app knows of one artifact's generation, as plain data it can keep
+/// in state, render, and pass to code that must not reach for the network.
+///
+/// The resolver itself stays with the gateway: it is not `Clone`, and nothing
+/// in the view should drive it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Generation(pub Result<[u8; 32], Unresolved>);
+
+impl Default for Generation {
+    /// Not yet resolved. There is deliberately no default code hash.
+    fn default() -> Self {
+        Generation(Err(Unresolved::Pending))
+    }
+}
+
+impl Generation {
+    pub fn resolved(code_hash: [u8; 32]) -> Self {
+        Generation(Ok(code_hash))
+    }
+
+    pub fn code_hash(&self) -> Option<[u8; 32]> {
+        self.0.as_ref().ok().copied()
+    }
 }
 
 #[derive(Debug)]
@@ -99,11 +152,29 @@ enum Slot {
         id: ContractInstanceId,
         resolver: Box<PointerResolver>,
         asked: bool,
+        /// Which attempt this is. See [`PointerRequest::attempt`].
+        attempt: u32,
     },
     Resolved {
         code_hash: [u8; 32],
     },
     Failed(Unresolved),
+}
+
+/// A pointer contract to GET, and the attempt the GET belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerRequest {
+    pub id: ContractInstanceId,
+    /// Unique across every attempt this resolution makes, for either pointer.
+    ///
+    /// A pointer's id is the same on every attempt, and the resolver matches
+    /// answers on the id alone, so a timeout armed for one attempt cannot tell
+    /// from the id that a retry has since replaced it. Without this, a first
+    /// attempt answered quickly with "not found" and retried would have its
+    /// retry declared unreachable by the FIRST attempt's timer, well before the
+    /// retry had its own chance to answer. So a timeout carries the attempt it
+    /// was armed for, and is ignored once that attempt is not the current one.
+    pub attempt: u32,
 }
 
 /// The resolution of one bridge's address and inbox pointers.
@@ -112,17 +183,23 @@ pub struct BridgeGenerations {
     bridge: BridgeId,
     address: Slot,
     inbox: Slot,
+    next_attempt: u32,
 }
 
 impl BridgeGenerations {
     /// Begin resolving `bridge`'s pointers. Nothing is sent until
-    /// [`Self::to_request`] is asked for the ids to GET.
+    /// [`Self::requests_due`] is asked for what to GET.
     pub fn new(bridge: BridgeId) -> Self {
-        BridgeGenerations {
-            address: asking(&bridge, Resolve::Address),
-            inbox: asking(&bridge, Resolve::Inbox),
+        let mut g = BridgeGenerations {
             bridge,
-        }
+            // Placeholders, replaced at once below.
+            address: Slot::Failed(Unresolved::Pending),
+            inbox: Slot::Failed(Unresolved::Pending),
+            next_attempt: 0,
+        };
+        g.address = g.begin(Resolve::Address);
+        g.inbox = g.begin(Resolve::Inbox);
+        g
     }
 
     /// The pointer contracts to GET now, each marked as asked.
@@ -130,20 +207,24 @@ impl BridgeGenerations {
     /// The two may be in flight together: Harvest's node replies name the
     /// contract they are about, `NotFound` included, so an answer is never
     /// attributed to the wrong pointer.
-    pub fn to_request(&mut self) -> Vec<ContractInstanceId> {
+    pub fn requests_due(&mut self) -> Vec<PointerRequest> {
         let mut out = Vec::new();
         for slot in [&mut self.address, &mut self.inbox] {
             if let Slot::Asking {
                 id,
                 resolver,
                 asked,
+                attempt,
             } = slot
             {
                 if !*asked {
                     // Arms the resolver: it accepts no answer it has not asked for.
                     let _ = resolver.next_action();
                     *asked = true;
-                    out.push(*id);
+                    out.push(PointerRequest {
+                        id: *id,
+                        attempt: *attempt,
+                    });
                 }
             }
         }
@@ -153,18 +234,24 @@ impl BridgeGenerations {
     /// A pointer contract's state. Returns which artifact it settled, or
     /// `None` if the id is not a pointer this is waiting on, in which case the
     /// caller should treat the bytes as the ordinary contract state they are.
+    ///
+    /// Accepted from any attempt: the record is checked against the bridge's
+    /// signature either way, so a late answer to an earlier GET is as good as
+    /// an answer to the current one.
     pub fn on_state(&mut self, id: ContractInstanceId, bytes: &[u8]) -> Option<Resolve> {
-        self.deliver(id, |r| r.on_response(id, bytes))
+        self.deliver(id, None, |r| r.on_response(id, bytes))
     }
 
     /// The node's positive answer that nothing is stored at `id`.
     pub fn on_absent(&mut self, id: ContractInstanceId) -> Option<Resolve> {
-        self.deliver(id, |r| r.on_absent(id))
+        self.deliver(id, None, |r| r.on_absent(id))
     }
 
-    /// No answer for `id` in time. Never treated as absence.
-    pub fn on_unreachable(&mut self, id: ContractInstanceId) -> Option<Resolve> {
-        self.deliver(id, |r| r.on_unreachable(id))
+    /// No answer to `request` in time. Never treated as absence, and ignored
+    /// if a later attempt has replaced it: see [`PointerRequest::attempt`].
+    pub fn on_unreachable(&mut self, request: PointerRequest) -> Option<Resolve> {
+        let id = request.id;
+        self.deliver(id, Some(request.attempt), |r| r.on_unreachable(id))
     }
 
     /// The code hash to derive `artifact`'s address from, or why there is none.
@@ -181,24 +268,36 @@ impl BridgeGenerations {
         self.status(artifact).ok()
     }
 
+    /// `artifact`'s resolution as plain data for app state.
+    pub fn generation(&self, artifact: Resolve) -> Generation {
+        Generation(self.status(artifact))
+    }
+
     /// Start `artifact` over after a failure worth retrying. Returns whether a
-    /// new request is now due from [`Self::to_request`]. A withdrawal is never
-    /// retried, and neither is anything resolved or still in flight.
+    /// new request is now due from [`Self::requests_due`]. A withdrawal is
+    /// never retried, and neither is anything resolved or still in flight.
     pub fn retry(&mut self, artifact: Resolve) -> bool {
-        let bridge = self.bridge;
-        let slot = self.slot_mut(artifact);
-        match slot {
-            Slot::Failed(why) if why.retryable() => {
-                *slot = asking(&bridge, artifact);
-                matches!(slot, Slot::Asking { .. })
-            }
-            _ => false,
+        let retryable = matches!(self.slot(artifact), Slot::Failed(why) if why.retryable());
+        if !retryable {
+            return false;
         }
+        let fresh = self.begin(artifact);
+        let due = matches!(fresh, Slot::Asking { .. });
+        *self.slot_mut(artifact) = fresh;
+        due
+    }
+
+    /// A new attempt at `artifact`, numbered after every attempt before it.
+    fn begin(&mut self, artifact: Resolve) -> Slot {
+        let attempt = self.next_attempt;
+        self.next_attempt += 1;
+        asking(&self.bridge, artifact, attempt)
     }
 
     fn deliver(
         &mut self,
         id: ContractInstanceId,
+        only_attempt: Option<u32>,
         feed: impl FnOnce(&mut PointerResolver) -> bool,
     ) -> Option<Resolve> {
         for artifact in Resolve::ALL {
@@ -206,6 +305,7 @@ impl BridgeGenerations {
             let Slot::Asking {
                 id: slot_id,
                 resolver,
+                attempt,
                 ..
             } = slot
             else {
@@ -213,6 +313,9 @@ impl BridgeGenerations {
             };
             if *slot_id != id {
                 continue;
+            }
+            if only_attempt.is_some_and(|a| a != *attempt) {
+                return None;
             }
             if !feed(resolver) {
                 return None;
@@ -247,7 +350,7 @@ impl BridgeGenerations {
 /// For Harvest that is worse than stale display: an invoice issued meanwhile
 /// would name a contract the bridge has moved off. Persisting the floor closes
 /// it and is a follow-up, not part of this change.
-fn asking(bridge: &BridgeId, artifact: Resolve) -> Slot {
+fn asking(bridge: &BridgeId, artifact: Resolve, attempt: u32) -> Slot {
     match freenet_bitcoin_generation::resolver(
         bridge,
         artifact.artifact(),
@@ -257,6 +360,7 @@ fn asking(bridge: &BridgeId, artifact: Resolve) -> Slot {
             id: resolver.pointer_id(),
             resolver: Box::new(resolver),
             asked: false,
+            attempt,
         },
         // Only a bridge id that is not a valid Ed25519 point gets here, and
         // such a bridge could never have signed anything.
@@ -323,15 +427,18 @@ mod tests {
         .to_vec()
     }
 
-    fn id_of(g: &mut BridgeGenerations, artifact: Resolve) -> ContractInstanceId {
-        let expected = freenet_bitcoin_generation::pointer_id(&bridge(), artifact.artifact())
-            .expect("the pointer id derives");
-        let asked = g.to_request();
-        assert!(
-            asked.contains(&expected),
-            "the pointer is among those requested"
-        );
-        expected
+    /// Ask for both pointers, and return each one's request, found by the id
+    /// derived independently rather than by position.
+    fn ask(g: &mut BridgeGenerations) -> (PointerRequest, PointerRequest) {
+        let due = g.requests_due();
+        let find = |artifact: Artifact| {
+            let id = freenet_bitcoin_generation::pointer_id(&bridge(), artifact)
+                .expect("the pointer id derives");
+            *due.iter()
+                .find(|r| r.id == id)
+                .expect("the pointer is among those requested")
+        };
+        (find(Artifact::Address), find(Artifact::Inbox))
     }
 
     /// The decision this module turns on: before a pointer answers, there is no
@@ -348,10 +455,13 @@ mod tests {
     #[test]
     fn a_record_the_bridge_signed_names_the_generation() {
         let mut g = BridgeGenerations::new(bridge());
-        let address = id_of(&mut g, Resolve::Address);
+        let (address, _) = ask(&mut g);
         let hash = [0x42; 32];
 
-        let settled = g.on_state(address, &record(&bridge_key(), Artifact::Address, 3, hash));
+        let settled = g.on_state(
+            address.id,
+            &record(&bridge_key(), Artifact::Address, 3, hash),
+        );
         assert_eq!(settled, Some(Resolve::Address));
         assert_eq!(g.code_hash(Resolve::Address), Some(hash));
         assert_eq!(
@@ -366,11 +476,11 @@ mod tests {
     #[test]
     fn a_record_signed_by_anyone_else_is_refused() {
         let mut g = BridgeGenerations::new(bridge());
-        let address = id_of(&mut g, Resolve::Address);
+        let (address, _) = ask(&mut g);
         let impostor = SigningKey::from_bytes(&[1u8; 32]);
 
         g.on_state(
-            address,
+            address.id,
             &record(&impostor, Artifact::Address, 3, [0x42; 32]),
         );
         assert!(matches!(
@@ -387,10 +497,10 @@ mod tests {
     #[test]
     fn the_inbox_record_cannot_stand_in_for_the_address() {
         let mut g = BridgeGenerations::new(bridge());
-        let address = id_of(&mut g, Resolve::Address);
+        let (address, _) = ask(&mut g);
 
         g.on_state(
-            address,
+            address.id,
             &record(&bridge_key(), Artifact::Inbox, 1, [0x77; 32]),
         );
         assert!(matches!(
@@ -402,21 +512,20 @@ mod tests {
     #[test]
     fn silence_and_absence_derive_nothing_and_are_asked_again() {
         let mut g = BridgeGenerations::new(bridge());
-        let address = id_of(&mut g, Resolve::Address);
-        let inbox = freenet_bitcoin_generation::pointer_id(&bridge(), Artifact::Inbox).unwrap();
+        let (address, inbox) = ask(&mut g);
 
         g.on_unreachable(address);
         assert_eq!(g.status(Resolve::Address), Err(Unresolved::Unreachable));
-        g.on_absent(inbox);
+        g.on_absent(inbox.id);
         assert_eq!(g.status(Resolve::Inbox), Err(Unresolved::NeverPublished));
 
         assert!(g.retry(Resolve::Address), "silence is asked again");
         assert!(g.retry(Resolve::Inbox), "absence is asked again");
-        let again = g.to_request();
-        assert!(again.contains(&address) && again.contains(&inbox));
+        let (address_again, inbox_again) = ask(&mut g);
+        assert_eq!((address_again.id, inbox_again.id), (address.id, inbox.id));
 
         g.on_state(
-            address,
+            address.id,
             &record(&bridge_key(), Artifact::Address, 3, [0x42; 32]),
         );
         assert_eq!(
@@ -424,6 +533,52 @@ mod tests {
             Some([0x42; 32]),
             "and resolves once answered"
         );
+    }
+
+    /// The race the attempt number exists for. A first GET is answered quickly
+    /// with "not found" and retried; the first GET's timeout is still armed and
+    /// fires while the retry is waiting. It must not end the retry, which has
+    /// had no chance to answer, and the retry must still resolve afterwards.
+    #[test]
+    fn a_timeout_from_an_earlier_attempt_does_not_end_a_later_one() {
+        let mut g = BridgeGenerations::new(bridge());
+        let (first, _) = ask(&mut g);
+
+        g.on_absent(first.id);
+        assert!(g.retry(Resolve::Address));
+        // Only the address was retried; the inbox is still in flight from the
+        // first ask, so it is correctly not due again.
+        let due = g.requests_due();
+        assert_eq!(due.len(), 1, "only the retried pointer is due");
+        let second = due[0];
+        assert_eq!(second.id, first.id, "the same pointer");
+        assert_ne!(second.attempt, first.attempt, "but a different attempt");
+
+        assert_eq!(
+            g.on_unreachable(first),
+            None,
+            "the first attempt's timer is ignored"
+        );
+        assert_eq!(
+            g.status(Resolve::Address),
+            Err(Unresolved::Pending),
+            "the retry is still waiting"
+        );
+
+        g.on_state(
+            first.id,
+            &record(&bridge_key(), Artifact::Address, 3, [0x42; 32]),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x42; 32]));
+    }
+
+    /// And the current attempt's own timer is not ignored.
+    #[test]
+    fn the_current_attempts_timeout_counts() {
+        let mut g = BridgeGenerations::new(bridge());
+        let (address, _) = ask(&mut g);
+        assert_eq!(g.on_unreachable(address), Some(Resolve::Address));
+        assert_eq!(g.status(Resolve::Address), Err(Unresolved::Unreachable));
     }
 
     /// Both pointers are in flight together, so either may answer first. The
@@ -434,11 +589,10 @@ mod tests {
     #[test]
     fn either_pointer_may_answer_first() {
         let mut g = BridgeGenerations::new(bridge());
-        assert_eq!(g.to_request().len(), 2, "both are asked at once");
-        let inbox = freenet_bitcoin_generation::pointer_id(&bridge(), Artifact::Inbox).unwrap();
+        let (_, inbox) = ask(&mut g);
 
         let settled = g.on_state(
-            inbox,
+            inbox.id,
             &record(&bridge_key(), Artifact::Inbox, 1, [0x77; 32]),
         );
         assert_eq!(settled, Some(Resolve::Inbox));
@@ -454,15 +608,15 @@ mod tests {
     #[test]
     fn a_withdrawal_derives_nothing_and_is_not_asked_again() {
         let mut g = BridgeGenerations::new(bridge());
-        let address = id_of(&mut g, Resolve::Address);
+        let (address, _) = ask(&mut g);
 
         g.on_state(
-            address,
+            address.id,
             &record(&bridge_key(), Artifact::Address, 4, TOMBSTONE_CODE_HASH),
         );
         assert_eq!(g.status(Resolve::Address), Err(Unresolved::Withdrawn));
         assert!(!g.retry(Resolve::Address));
-        assert!(g.to_request().is_empty());
+        assert!(g.requests_due().is_empty());
     }
 
     /// State for any other contract is not a pointer's, and must reach the rest
@@ -479,7 +633,7 @@ mod tests {
             None,
             "not accepted before it was asked"
         );
-        g.to_request();
+        ask(&mut g);
         assert_eq!(
             g.on_state(ContractInstanceId::new([5u8; 32]), &bytes),
             None,

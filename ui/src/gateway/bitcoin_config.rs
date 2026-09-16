@@ -63,20 +63,20 @@
 //! state. That is worse than an empty panel and is the reason "only
 //! well-formedness is asserted" was an expensive gap.
 //!
-//! The durable fix is a POINTER RECORD -- a fixed-address, author-signed
+//! The durable fix is a POINTER RECORD: a fixed-address, bridge-signed
 //! contract naming the current code hash, read over the WebSocket like any
-//! other contract, which is what `freenet-migrate`'s pointer mechanism exists
-//! for and what ghostkeys already does. Ghostkeys is a working reference: it
-//! carries `pointer-records.toml`, `scripts/sign-pointer-records.sh`, and a CI
-//! `check-pointer-freshness` job that fails the PR when an artifact's WASM
-//! changed and no new record was signed. That CI gate is precisely what is
-//! missing here. `freenet-bitcoin` already ships `generation/pointer-v1.wasm`
-//! but has no records config yet.
+//! other contract. For the ADDRESS contract that fix is now in place. The code
+//! hash an invoice carries comes from the bridge's signed pointer, resolved in
+//! `crate::bitcoin_generation`, and the constant that used to live here is
+//! gone rather than kept as a fallback: on 2026-09-16 it named the generation
+//! replaced on nova that day, and a fallback would have stamped exactly that
+//! onto invoices.
 //!
-//! Until that is in place, treat the constants below as needing an update
-//! whenever `freenet-bitcoin`'s `legacy/` registries gain an entry -- and note
-//! that appending to those registries is exactly what a re-key does, so an
-//! entry appearing there IS the signal that this file is now wrong.
+//! The TIP contract's id below is still a build-time constant, with the
+//! staleness problem described above. It is correct today, and it will go
+//! quietly wrong on the next re-key of the tip contract. Resolving it needs
+//! the tip contract's parameters derived here as well as its pointer; that is
+//! the remaining half of harvest#30.
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
@@ -147,21 +147,6 @@ pub fn default_bridge_url() -> &'static str {
 /// silently at runtime.
 pub const TRUSTED_BRIDGE_ID_BS58: &str = "4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL";
 
-/// Code hash of the `BitcoinAddressContract` build this app derives keys from.
-///
-/// Needed to compute a watched address's contract id locally, since the
-/// gateway CSP rules out asking the bridge. Goes stale on any contract
-/// rebuild -- see the module docs on the pointer-record fix.
-///
-/// UPDATED 2026-09-06 from `3b5f1df2...`, which `freenet-bitcoin`'s
-/// `legacy/address_contract.toml` lists as generation **A3** -- a file whose
-/// header states it records ONLY superseded generations. The deployed bridge
-/// reports A8. So this build was stamping five-generations-old code hashes
-/// onto every invoice it issued, naming an address contract that was never
-/// published. See harvest#30.
-pub const ADDRESS_CONTRACT_CODE_HASH_HEX: &str =
-    "cd2ae7418e3b29c2770fab549763b8a268d54787a86a9bfad5b59ca3d2023555";
-
 /// Which networks this build can actually settle a payment on.
 ///
 /// [`TRUSTED_BRIDGE_ID_BS58`] is one bridge observing ONE network. Naming it
@@ -215,57 +200,29 @@ pub fn default_trusted_bridges(
         .map_err(|e| format!("the build's trusted bridge id is unusable: {e}"))
 }
 
-/// [`ADDRESS_CONTRACT_CODE_HASH_HEX`] as the 32 bytes an `Order` carries.
-///
-/// `None` for a malformed constant rather than an error, because this field is
-/// genuinely optional: it drives only the store contract's additive-only
-/// related-contract cross-check, and `None` skips that check and forfeits
-/// nothing else (the embedded payment proof stays authoritative either way).
-/// So an unusable constant must not block issuing an invoice -- unlike the
-/// bridge list above, which decides whether the invoice can ever be settled.
-pub fn address_contract_code_hash() -> Option<[u8; 32]> {
-    let bytes = hex::decode(ADDRESS_CONTRACT_CODE_HASH_HEX).ok()?;
-    <[u8; 32]>::try_from(bytes).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Both constants are hand-maintained (see the module docs on why they
-    /// cannot be discovered at runtime), so a typo in either is a real
-    /// possibility -- and the consequence of a bad bridge id is an invoice
-    /// that can never be proven paid.
+    /// The trusted bridge id is hand-maintained, so a typo is a real
+    /// possibility, and the consequence of a bad one is an invoice that can
+    /// never be proven paid.
     ///
-    /// Note what this does NOT check: that
-    /// `ADDRESS_CONTRACT_CODE_HASH_HEX` is the hash of the address contract
-    /// actually deployed. That is the way it really goes wrong -- silently, on
-    /// a rebuild of a contract this workspace does not build -- and it cannot
-    /// be checked here, because the artifact is not bundled. Only well-formedness
-    /// is asserted.
+    /// This used to assert the address contract's code hash was well-formed
+    /// too. That check passed the whole time the hash was stale (harvest#30),
+    /// which is why the hash is now resolved from the bridge's signed pointer
+    /// instead of carried here, and the assertion went with it.
     ///
-    /// **That gap was not hypothetical and it has since been paid.** On
-    /// 2026-09-06 both constants were found stale against the deployed bridge
-    /// (harvest#30) -- well-formed throughout, so this test passed the entire
-    /// time. The paragraph above described the failure accurately in advance
-    /// and nothing acted on it, which is the argument for closing it with a
-    /// pointer record rather than a sharper comment.
-    ///
-    /// Do not be tempted to "fix" this by asserting the constants equal
-    /// specific literals: that tests the file against itself and would also
-    /// have passed. The check has to compare against something outside this
-    /// repository -- the bridge, or a pointer record resolved over the node.
+    /// Do not be tempted to "fix" a constant check by asserting it equals a
+    /// specific literal: that tests the file against itself and would also
+    /// have passed. A check that means anything compares against something
+    /// outside this repository, the bridge or a pointer resolved over the node.
     #[test]
     fn the_builds_bitcoin_constants_parse() {
         let bridges = default_trusted_bridges(default_network())
             .expect("the trusted bridge id must parse for the default network");
         assert_eq!(bridges.len(), 1);
         assert_eq!(bridges[0].to_bs58(), TRUSTED_BRIDGE_ID_BS58);
-
-        assert!(
-            address_contract_code_hash().is_some(),
-            "the address contract code hash must be 32 hex-encoded bytes"
-        );
     }
 
     /// An invoice for a network no bridge watches can never be shown to have

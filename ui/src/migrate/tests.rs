@@ -271,6 +271,12 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the canonical set-encoding fix; this artifact
                 // moves only because `harvest-common` is compiled into it.
                 "a758603acd00ecd1394c9d6d017bebfec7b3e0720511b1e56259154f9290ff36",
+                // V11, from `git show bc99be7:ui/public/contracts/store_contract.wasm`.
+                // Superseded by moving `freenet-bitcoin-common` 0e5b9d9 ->
+                // a037181 with NO source change: the store WASM embeds the git
+                // checkout path, whose commit segment the build does not remap
+                // (harvest#60). See the registry row.
+                "97db0a2e4b10de814b760459b2db611285a5b26f49e3db02282b3a8565751392",
             ],
         ),
         (
@@ -748,6 +754,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // still reporting 56B of store params after the change, rather than
     // assumed from the diff.
     (10, false),
+    // V11: `freenet-bitcoin-common` moved 0e5b9d9 -> a037181 with no source
+    // change, and the store re-keyed only through an embedded checkout path.
+    // `StoreParameters` did not move: `cargo make code-hashes` reported 56B of
+    // store params after the bump, checked rather than assumed.
+    (11, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
