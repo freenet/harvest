@@ -5,6 +5,8 @@
 pub mod bitcoin_address;
 pub mod bitcoin_bridge_http;
 pub mod bitcoin_config;
+#[cfg(target_arch = "wasm32")]
+pub mod bitcoin_generation_ops;
 pub mod bitcoin_ops;
 mod connection;
 mod delegate_api;

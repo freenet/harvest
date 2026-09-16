@@ -42,6 +42,11 @@ pub fn App() -> Element {
                 // neither delegate to read a store.
                 crate::store_link::open_store_from_url();
 
+                // Find out which generation of the bridge's address contract and
+                // request inbox to use. Needs only the websocket, and no invoice
+                // can be issued until the address generation resolves.
+                crate::gateway::bitcoin_generation_ops::start();
+
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
                 match crate::gateway::register_delegate(harvest_wasm).await {
                     Ok(key) => {

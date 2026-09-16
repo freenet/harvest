@@ -58,6 +58,14 @@ fn handle_contract_response(response: ContractResponse) {
                 return;
             }
 
+            // Likewise the bridge's generation pointers: a pointer record is not
+            // store, reputation or mailbox state, and must not reach
+            // `on_contract_state` as though it were.
+            #[cfg(target_arch = "wasm32")]
+            if super::bitcoin_generation_ops::deliver_state(key.id(), &state_bytes) {
+                return;
+            }
+
             // Check if this is a store state -- if so, we need to follow
             // the reputation contract link
             let reputation_to_subscribe = check_for_reputation_link(&state_bytes);
@@ -107,6 +115,11 @@ fn handle_contract_response(response: ContractResponse) {
             // can never seal over a predecessor that was merely unreachable.
             #[cfg(target_arch = "wasm32")]
             let _consumed = super::migrate_ops::deliver_absent(&instance_id);
+            // And to the generation pointers, for which it is equally the one
+            // signal that may be read as absence. Their ids never collide with
+            // a probe's, so at most one of the two takes it.
+            #[cfg(target_arch = "wasm32")]
+            let _pointer = super::bitcoin_generation_ops::deliver_absent(&instance_id);
 
             // Nothing else acts on it. `AppState` already has a
             // `store_state_unavailable` set that this could feed, and feeding
