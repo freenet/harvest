@@ -2,6 +2,7 @@
 // reports them as unused, which is expected.
 #![allow(dead_code, unused_imports)]
 
+mod bitcoin_inbox;
 mod components;
 mod document_title;
 mod gateway;

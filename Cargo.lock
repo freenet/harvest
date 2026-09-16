@@ -343,6 +343,17 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
@@ -350,6 +361,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -411,6 +435,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -1511,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-common"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#0e5b9d91d15053f86f5d784ceab7036f7c99c150"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
 dependencies = [
  "blake3",
  "bs58",
@@ -1522,6 +1547,40 @@ dependencies = [
  "hex",
  "serde",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "freenet-bitcoin-generation"
+version = "0.1.0"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+dependencies = [
+ "blake3",
+ "bs58",
+ "ed25519-dalek",
+ "freenet-bitcoin-common",
+ "freenet-migrate",
+ "freenet-stdlib",
+]
+
+[[package]]
+name = "freenet-bitcoin-inbox"
+version = "0.1.0"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+dependencies = [
+ "blake3",
+ "blind-rsa-signatures",
+ "chacha20poly1305",
+ "ciborium",
+ "ed25519-dalek",
+ "freenet-bitcoin-common",
+ "freenet-stdlib",
+ "getrandom 0.2.17",
+ "ghostkey-common",
+ "ghostkey_lib",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "serde",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1926,6 +1985,8 @@ dependencies = [
  "dioxus",
  "ed25519-dalek",
  "freenet-bitcoin-common",
+ "freenet-bitcoin-generation",
+ "freenet-bitcoin-inbox",
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
@@ -2956,6 +3017,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3156,7 +3228,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]

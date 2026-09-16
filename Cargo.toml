@@ -22,6 +22,13 @@ harvest-common = { path = "common" }
 # dependency before this leaves one machine -- a path dep does not survive a
 # clone, and CI would fail on it.
 freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
+# The bridge's request inbox, and the generation pointers that locate it and
+# the address contract. From the same repository and branch as the crate above
+# on purpose: one git source resolves to one commit, so every `BridgeId` and
+# `BitcoinNetwork` these three name is the same type. Split them across revs and
+# they stop being.
+freenet-bitcoin-inbox = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
+freenet-bitcoin-generation = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
 hex = "0.4"
 
 # Freenet ecosystem
