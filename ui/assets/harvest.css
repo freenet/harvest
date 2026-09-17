@@ -349,6 +349,14 @@ h4 {
  * the page: headings that read as subheadings rather than competing with the
  * store's name, and blocks that do not inherit a paragraph's bottom margin
  * twice. */
+/* One space-free 5 KB "word" would otherwise push the page's own chrome --
+ * including the line saying whether the seller's certificate checks out --
+ * off screen. */
+.store-desc,
+.listing-desc {
+  overflow-wrap: anywhere;
+}
+
 .store-desc > :first-child,
 .listing-desc > :first-child {
   margin-top: 0;
@@ -594,6 +602,7 @@ h4 {
  * person checks character by character. */
 .copy-field {
   width: 100%;
+  overflow-wrap: anywhere;
   padding: 0.45rem 0.6rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);

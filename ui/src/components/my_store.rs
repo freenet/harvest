@@ -298,7 +298,12 @@ fn IdentityCard(
                                 class: "copy-field",
                                 readonly: true,
                                 spellcheck: false,
-                                aria_label: "Store link, select to copy",
+                                // Named, because `aria-label` REPLACES the
+                                // visible label beside it: a seller with two
+                                // stores would otherwise hear the same string
+                                // for both, which is the distinction the row
+                                // above exists to draw.
+                                aria_label: "{card.label} store link, select to copy",
                                 value: "{link}",
                             }
                         }

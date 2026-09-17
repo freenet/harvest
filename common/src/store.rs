@@ -99,7 +99,7 @@ pub struct StoreInfoV1 {
     /// therefore changes the preimage of every signature taken before it
     /// existed, and the store contract rejects the seller's own published
     /// details with "store info signature invalid". Pinned by
-    /// `wire_compat_tests::a_store_info_that_predates_the_encryption_key_re_encodes_unchanged`,
+    /// `wire_compat_tests::a_store_info_re_encodes_to_its_signed_bytes_but_for_the_removed_field`,
     /// which was observed red against the naive `#[serde(default)]`-only
     /// form.
     ///
@@ -2424,6 +2424,7 @@ mod wire_compat_tests {
             store_name: String,
             description: String,
             payment_instructions: String,
+            encryption_public_key: Option<[u8; 32]>,
         }
         let old = OldStoreInfo {
             version: 3,
@@ -2433,14 +2434,18 @@ mod wire_compat_tests {
             store_name: "Bean Shop".into(),
             description: "Coffee".into(),
             payment_instructions: "BTC: bc1q...".into(),
+            // The shape a store published since the messaging work actually
+            // has, rather than the pre-messaging one.
+            encryption_public_key: Some([9u8; 32]),
         };
         let decoded: StoreInfoV1 = crate::from_cbor(&crate::to_cbor(&old).unwrap())
             .expect("a store published before the removal must still be readable");
         assert_eq!(decoded.store_name, "Bean Shop");
         assert_eq!(decoded.description, "Coffee");
         assert_eq!(
-            decoded.encryption_public_key, None,
-            "and the field that IS optional is still absent"
+            decoded.encryption_public_key,
+            Some([9u8; 32]),
+            "and the fields it shares with today's shape survive"
         );
     }
 
@@ -2587,13 +2592,20 @@ mod wire_compat_tests {
             "an absent optional field must not serialize, or every signature \
              made before it existed stops verifying"
         );
-        let missing = V1_STORE_INFO_CBOR.len() - re_encoded.len();
+        // Byte-exact, not a length check. A length check passes a
+        // LENGTH-PRESERVING change to the preimage -- switching
+        // `reputation_contract_id` to `serde_bytes` turns `0x98 0x20`
+        // (array(32)) into `0x58 0x20` (bytes(32)), same two bytes, every
+        // signature dead -- and the doc on that field flags it as exactly the
+        // change somebody will try.
+        //
+        // The removed key was the LAST entry, so what should remain is the
+        // literal minus its final 22 bytes (`0x74`, 20 characters, `0x60`)
+        // with a map header one entry smaller.
+        assert_eq!(re_encoded[0], 0xa6, "one fewer entry than the V1 literal");
         assert_eq!(
-            missing,
-            // `0x74` text(20), the 20-character key, and `0x60` for the empty
-            // string it held in this literal. The map header stays one byte
-            // (`0xa7` -> `0xa6`), so that is the whole difference.
-            1 + 20 + 1,
+            &re_encoded[1..],
+            &V1_STORE_INFO_CBOR[1..V1_STORE_INFO_CBOR.len() - 22],
             "the only difference should be the removed key and its value"
         );
     }

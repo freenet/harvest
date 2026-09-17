@@ -426,7 +426,7 @@ fn example_listings_section() -> Element {
                             span { class: "badge {kind_badge_class(&kind)}", "{kind_label(&kind)}" }
                         }
                         crate::markdown::Markdown {
-                            source: desc.clone(),
+                            source: desc,
                             class: "listing-desc",
                         }
                         if let Some(ref p) = price {

@@ -558,12 +558,19 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 // sandboxed iframe, where the clipboard API is not reliably
                 // available, and a copy button that silently does nothing is
                 // worse than a field that visibly works.
-                input {
+                // A textarea rather than an input, so the whole address is
+                // visible at once. In an input, 42-62 characters of bech32
+                // scroll sideways at this width: a buyer cannot check the
+                // destination they are paying, and a partial selection pastes
+                // a truncated address, which sends coin nowhere an order can
+                // recognise. That is the failure this panel exists to avoid.
+                textarea {
                     class: "copy-field",
                     readonly: true,
                     spellcheck: false,
+                    rows: 2,
                     aria_label: "Payment address, select to copy",
-                    value: "{o.payment_address}",
+                    "{o.payment_address}"
                 }
             } else {
                 p { class: "text-warning",
