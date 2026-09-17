@@ -306,7 +306,6 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use freenet_bitcoin_common::spv::testing::payment_proof;
     use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash, Claim, OutPoint};
-    use harvest_common::listing::ListingId;
     use harvest_common::payment::{
         AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus,
     };
@@ -352,10 +351,8 @@ mod tests {
 
     fn make_order(script: &[u8], code_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let listing_id = ListingId::from_label("Widget");
         Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             buyer_fingerprint: "buyer-fp".into(),
             seller_fingerprint: "seller-fp".into(),
             amount_sats: 50_000,

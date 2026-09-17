@@ -900,6 +900,7 @@ fn unanswered_requests(
     let mut requests: Vec<PendingRequest> = Vec::new();
     for entry in entries {
         let MailboxEntry::Readable {
+            conversation,
             content:
                 MessageContent::OrderRequest {
                     listing_id,
@@ -913,13 +914,33 @@ fn unanswered_requests(
         else {
             continue;
         };
-        // Already answered, decided from the seller's OWN published state
-        // rather than from anything in the mailbox: a commitment carrying
-        // this request's binding and listing is the answer to it, and the
-        // buyer cannot forge or withdraw one.
-        let answered = published.iter().any(|order| {
-            order.order.order_binding == Some(*order_binding)
-                && order.order.listing_id == *listing_id
+        // Already answered: this conversation holds an acceptance naming this
+        // request's listing, for an order the seller has published under this
+        // request's binding. The published order no longer says which listing
+        // it is for (harvest#57), so the acceptance is what says it, and the
+        // published order is what makes it real. A buyer could seal an
+        // acceptance into their own thread, but a forged one only hides their
+        // own request from the seller, and cannot conjure the published order
+        // it has to point at.
+        let answered = entries.iter().any(|other| match other {
+            MailboxEntry::Readable {
+                conversation: same,
+                addressing: crate::messaging::Addressing::ToBuyer,
+                content:
+                    MessageContent::OrderAccepted {
+                        order_id,
+                        listing_id: Some(accepted),
+                    },
+                ..
+            } => {
+                same == conversation
+                    && accepted == listing_id
+                    && published.iter().any(|order| {
+                        order.order.id == *order_id
+                            && order.order.order_binding == Some(*order_binding)
+                    })
+            }
+            _ => false,
         });
         if answered {
             continue;
@@ -1092,7 +1113,7 @@ fn describe(content: &MessageContent) -> String {
             }
             described
         }
-        MessageContent::OrderAccepted { order_id } => {
+        MessageContent::OrderAccepted { order_id, .. } => {
             format!("Accepted -- invoice {} is published.", order_id.short())
         }
     }
@@ -1133,6 +1154,23 @@ mod inbox_tests {
         }
     }
 
+    /// The seller's acceptance of order `[n; 32]` for `listing_id`, in the
+    /// conversation `conversation`.
+    fn accepted(n: u8, listing_id: ListingId, conversation: u8) -> MailboxEntry {
+        MailboxEntry::Readable {
+            conversation: vec![conversation; 32],
+            conversation_id: harvest_common::mailbox::ConversationId([2u8; 32]),
+            addressing: crate::messaging::Addressing::ToBuyer,
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest: [0xac; 32],
+            content: MessageContent::OrderAccepted {
+                order_id: harvest_common::payment::OrderId([n; 32]),
+                listing_id: Some(listing_id),
+            },
+        }
+    }
+
     fn request(listing_id: ListingId, quantity: u32, digest: [u8; 32]) -> MailboxEntry {
         readable(
             MessageContent::OrderRequest {
@@ -1146,18 +1184,14 @@ mod inbox_tests {
         )
     }
 
-    /// A published commitment answering `listing_id` under `binding`, built
+    /// A published commitment with order id `[n; 32]` under `binding`, built
     /// by hand: only the two fields the answered-check reads matter here, and
     /// signing one would test the signature path instead.
-    fn published(
-        listing_id: ListingId,
-        binding: Option<[u8; 32]>,
-    ) -> harvest_common::payment::AuthorizedOrder {
+    fn published(n: u8, binding: Option<[u8; 32]>) -> harvest_common::payment::AuthorizedOrder {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
-                id: harvest_common::payment::OrderId([0u8; 32]),
-                listing_id,
+                id: harvest_common::payment::OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
                 amount_sats: 1,
@@ -1254,62 +1288,106 @@ mod inbox_tests {
     /// order, burning a second derivation index and leaving the buyer with
     /// two cards they could reasonably pay both of.
     ///
-    /// "Answered" is decided from the seller's OWN published state, which the
-    /// buyer can neither forge nor withdraw.
+    /// "Answered" means an acceptance in this conversation naming this
+    /// request's listing, for an order the seller has actually published
+    /// under this request's binding. The published order no longer names its
+    /// listing (harvest#57), so the acceptance says which one.
     #[test]
     fn a_request_already_answered_is_not_offered_again() {
         let id = ListingId([9u8; 32]);
-        let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let asked = vec![request(id.clone(), 1, [2u8; 32])];
 
         assert_eq!(
-            unanswered_requests(&entries, &listings, &[]).len(),
+            unanswered_requests(&asked, &listings, &[]).len(),
             1,
             "unanswered while nothing is published"
         );
+        let answered = vec![asked[0].clone(), accepted(7, id.clone(), 1)];
         assert!(
-            unanswered_requests(&entries, &listings, &[published(id.clone(), Some(BINDING))])
-                .is_empty(),
-            "a commitment carrying this request's binding and listing IS the answer to it"
+            unanswered_requests(&answered, &listings, &[published(7, Some(BINDING))]).is_empty(),
+            "an acceptance for this listing, pointing at a published order under this binding, \
+             IS the answer"
         );
     }
 
-    /// **Somebody else's commitment does not answer this request.**
+    /// **Nothing short of that answers the request.**
     ///
-    /// The pair is what identifies the answer: a commitment for the same
-    /// listing bound to another buyer, or one bound to this buyer for a
-    /// different listing, leaves the request outstanding.
+    /// Each part is needed: the published order must exist and carry this
+    /// request's binding, and the acceptance must name this listing and be in
+    /// this conversation.
     #[test]
-    fn another_buyers_commitment_does_not_answer_this_request() {
+    fn a_request_is_answered_only_by_its_own_acceptance_and_order() {
         let id = ListingId([9u8; 32]);
-        let entries = vec![request(id.clone(), 1, [2u8; 32])];
         let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let request = request(id.clone(), 1, [2u8; 32]);
+        let still_open = |entries: Vec<MailboxEntry>, orders: &[_], why: &str| {
+            assert_eq!(
+                unanswered_requests(&entries, &listings, orders).len(),
+                1,
+                "{why}"
+            );
+        };
 
-        assert_eq!(
-            unanswered_requests(
-                &entries,
-                &listings,
-                &[published(id.clone(), Some([0x11; 32]))]
-            )
-            .len(),
-            1,
-            "same listing, another buyer's binding"
+        still_open(
+            vec![request.clone(), accepted(7, id.clone(), 1)],
+            &[published(7, Some([0x11; 32]))],
+            "the order is bound to another buyer",
         );
-        assert_eq!(
-            unanswered_requests(
-                &entries,
-                &listings,
-                &[published(ListingId([8u8; 32]), Some(BINDING))]
-            )
-            .len(),
-            1,
-            "this buyer's binding, another listing"
+        still_open(
+            vec![request.clone(), accepted(7, ListingId([8u8; 32]), 1)],
+            &[published(7, Some(BINDING))],
+            "the acceptance names another listing",
         );
-        assert_eq!(
-            unanswered_requests(&entries, &listings, &[published(id, None)]).len(),
-            1,
-            "an unbound commitment answers nobody"
+        still_open(
+            vec![request.clone(), accepted(7, id.clone(), 1)],
+            &[published(7, None)],
+            "an unbound order answers nobody",
         );
+        still_open(
+            vec![request.clone(), accepted(7, id.clone(), 1)],
+            &[],
+            "an acceptance for an order never published",
+        );
+        still_open(
+            vec![request.clone(), accepted(6, id.clone(), 1)],
+            &[published(7, Some(BINDING))],
+            "an acceptance pointing at a different order",
+        );
+        still_open(
+            vec![request.clone(), accepted(7, id.clone(), 3)],
+            &[published(7, Some(BINDING))],
+            "an acceptance in another conversation",
+        );
+        still_open(
+            vec![request, readable_acceptance_from_the_buyer(7, id.clone())],
+            &[published(7, Some(BINDING))],
+            "an acceptance sealed in the buyer's direction",
+        );
+    }
+
+    fn readable_acceptance_from_the_buyer(n: u8, listing_id: ListingId) -> MailboxEntry {
+        let MailboxEntry::Readable {
+            conversation,
+            conversation_id,
+            timestamp,
+            nonce,
+            digest,
+            content,
+            ..
+        } = accepted(n, listing_id, 1)
+        else {
+            unreachable!("accepted builds a readable entry");
+        };
+        MailboxEntry::Readable {
+            conversation,
+            conversation_id,
+            addressing: crate::messaging::Addressing::ToSeller,
+            timestamp,
+            nonce,
+            digest,
+            content,
+        }
     }
 
     /// **Which request is offered first is not decided by the sender's

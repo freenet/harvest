@@ -33,10 +33,11 @@ pub struct PriceInfo {
 /// It is 32 anyway for two reasons that are about the change rather than the
 /// threat. The cost is zero at this boundary and nonzero at every later one,
 /// which is the whole argument for doing the order's now. And a `ListingId`
-/// sits inside every `Order` and therefore inside the order id's own
-/// preimage, so leaving the two at different widths would invite exactly the
-/// "why is this one 16?" question at the next audit, with no answer better
-/// than "nobody widened it on the night the wire was open".
+/// then sat inside every `Order` and therefore inside the order id's own
+/// preimage, so leaving the two at different widths would have invited exactly
+/// the "why is this one 16?" question at the next audit. (Orders no longer
+/// carry it since harvest#57; the listing an order is for travels only in the
+/// encrypted conversation.)
 ///
 /// **What it costs is different from the order's, and it is the part to
 /// weigh.** An order published at the old width does not decode into this
@@ -103,8 +104,7 @@ impl ListingId {
     ///
     /// It exists for two honest uses: a fixture that needs *an* id without
     /// building a whole listing, and a reference to a listing this code does
-    /// not hold. `crate::payment::Order::listing_id` is a reference of
-    /// exactly that kind.
+    /// not hold, such as the listing named in a buyer's request.
     ///
     /// Domain-separated from [`Self::from_terms`], so a label can never
     /// collide with a real listing's id.

@@ -304,7 +304,7 @@ This is more exposed than it sounds. On Freenet, a monitor does not have to scra
 
 Aggregated, that yields the entire economics of the marketplace — total volume, seller count, growth rate, failure rates — continuously, to anyone.
 
-For buyers the picture is uneven, though it is important to be precise about what is exposed. Buying leaks nothing: a successful order records only an amount, with no indication of who bought.
+For buyers the picture is uneven, though it is important to be precise about what is exposed. Buying leaks nothing: a successful order records only an amount, with no indication of who bought or which listing it was for. (Orders once named the listing, which turned the ledger into a per-product sales record; harvest#57 removed it.)
 
 Complaining is different, but what it publishes is a **ghostkey — an anonymous pseudonym, not a person's name**. Nobody learns who the buyer is. What becomes public is that *this pseudonym* transacted with *that seller* for *that amount* on *that date*.
 

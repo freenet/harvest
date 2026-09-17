@@ -277,6 +277,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // checkout path, whose commit segment the build does not remap
                 // (harvest#60). See the registry row.
                 "97db0a2e4b10de814b760459b2db611285a5b26f49e3db02282b3a8565751392",
+                // V12, from `git show 8271d21:ui/public/contracts/store_contract.wasm`.
+                // Superseded by removing `listing_id` from `Order` (harvest#57),
+                // a real record change: order ids and signature preimages move.
+                "52107dcfcc21b96990b8403a37408258f8349335bab42dea9d630672156d4f40",
             ],
         ),
         (
@@ -400,6 +404,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // conversation secret and deliberately not from the
             // Diffie-Hellman shared secret, which the seller also holds.
             "73f5761fc6dfa2602d3b683473209a44b1f649d507c3187a05e7dcef02e051e8".to_string(),
+            // V12, from `git show 84ac54e:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by removing `listing_id` from `Order` (harvest#57).
+            // Codegen only: this delegate's source and wire types did not
+            // change.
+            "4739e01954ab57d866840f9542fe87bb35910057bcee793c0a6a27a8c9536397".to_string(),
         ],
     );
 }
@@ -759,6 +768,9 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // `StoreParameters` did not move: `cargo make code-hashes` reported 56B of
     // store params after the bump, checked rather than assumed.
     (11, false),
+    // V12: `listing_id` removed from `Order` (harvest#57). `StoreParameters`
+    // did not move: still 56 bytes per `cargo make code-hashes`.
+    (12, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.

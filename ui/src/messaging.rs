@@ -191,10 +191,24 @@ pub enum MessageContent {
     /// have written itself.
     ///
     /// The id has to be told rather than derived:
-    /// `harvest_common::payment::OrderId::new` hashes a
-    /// `created_at` the seller stamps, so a buyer cannot compute it.
+    /// `harvest_common::payment::OrderId::from_terms` hashes terms the seller
+    /// chooses, including a `created_at` they stamp, so a buyer cannot
+    /// compute it.
+    ///
+    /// # Which listing it answers
+    ///
+    /// `listing_id` says which of the buyer's requests this order answers. It
+    /// is here, inside the AEAD, and not on the published order, because a
+    /// published listing lets anyone who can read the store join orders to
+    /// the store's listings and read off a per-product sales record
+    /// (harvest#57). It is the seller's assertion in a private conversation,
+    /// readable only by the two parties, which is all the published field ever
+    /// was: only the seller could sign that either. `None` in an acceptance
+    /// written before this field existed.
     OrderAccepted {
         order_id: harvest_common::payment::OrderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        listing_id: Option<harvest_common::listing::ListingId>,
     },
 }
 
@@ -668,6 +682,7 @@ pub fn seal_order_accepted(
     buyer_public_key: &[u8],
     conversation_id: &ConversationId,
     order_id: &harvest_common::payment::OrderId,
+    listing_id: &harvest_common::listing::ListingId,
 ) -> Result<EncryptedMessage, String> {
     let tag: [u8; 32] = buyer_public_key.try_into().map_err(|_| {
         format!(
@@ -681,6 +696,7 @@ pub fn seal_order_accepted(
         conversation_id,
         MessageContent::OrderAccepted {
             order_id: order_id.clone(),
+            listing_id: Some(listing_id.clone()),
         },
     )
 }
@@ -1879,8 +1895,8 @@ mod buy_flow_tests {
     /// **The buyer learns which published commitment is theirs, and from
     /// which direction.**
     ///
-    /// The order id is not something a buyer can derive: `OrderId::new`
-    /// hashes a `created_at` the seller stamps. So the acceptance has to name
+    /// The order id is not something a buyer can derive: `OrderId::from_terms`
+    /// hashes terms the seller chooses, including a `created_at` they stamp. So the acceptance has to name
     /// it, and it has to arrive addressed TO THE BUYER -- a buyer counting
     /// their own outbound messages as acceptances would let anything they
     /// composed point them at an order.
@@ -1899,6 +1915,7 @@ mod buy_flow_tests {
             &buyer.buyer_public_key,
             &buyer.conversation_id,
             &order,
+            &ListingId([4u8; 32]),
         )
         .expect("seal the acceptance");
 
@@ -1910,7 +1927,17 @@ mod buy_flow_tests {
             "an acceptance the buyer wrote themselves is not an acceptance"
         );
         match &thread[0].content {
-            MessageContent::OrderAccepted { order_id } => assert_eq!(order_id, &order),
+            MessageContent::OrderAccepted {
+                order_id,
+                listing_id,
+            } => {
+                assert_eq!(order_id, &order);
+                assert_eq!(
+                    listing_id.as_ref(),
+                    Some(&ListingId([4u8; 32])),
+                    "and the listing it answers"
+                );
+            }
             other => panic!("expected an acceptance, got {other:?}"),
         }
     }

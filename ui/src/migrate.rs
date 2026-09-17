@@ -1782,7 +1782,6 @@ mod uncarried_tests {
         let order = Order {
             // Not `with_derived_id`, for the same reason as the listing above.
             id: OrderId([0xCD; 32]),
-            listing_id: ListingId([1u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
             amount_sats: 50_000,

@@ -493,11 +493,9 @@ mod tests {
     fn order(seller: &str, minutes: i64) -> AuthorizedOrder {
         let created_at =
             chrono::DateTime::from_timestamp(1_700_000_000 + minutes * 60, 0).expect("timestamp");
-        let listing_id = ListingId::from_label("Widget");
         AuthorizedOrder {
             order: Order {
                 id: OrderId([0u8; 32]),
-                listing_id,
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),
                 amount_sats: 1_000,

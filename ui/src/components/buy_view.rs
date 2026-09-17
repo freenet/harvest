@@ -25,10 +25,11 @@
 //! * **The commitment is not private, and the accept control says so.** The
 //!   design document describes a commitment carrying "the amount and a recent
 //!   Bitcoin block hash" and nothing else. What is actually published is an
-//!   `AuthorizedOrder`, which also carries the listing id and the payment
-//!   address -- so WHAT was bought is public even though WHO bought it is
-//!   not. Closing that means separating the countable commitment from the
-//!   payable invoice, which is the ledger contract in issue 8. Until then the
+//!   `AuthorizedOrder`, which also carries the payment address, linking the
+//!   order to a chain transaction. It no longer names the listing
+//!   (harvest#57), so WHAT was bought is not public, nor WHO bought it.
+//!   Separating the countable commitment from the payable invoice is the
+//!   ledger contract in issue 8. Until then the
 //!   seller is told what they are publishing rather than reassured about it.
 //!   Recorded in `docs/untested-invariants.md`.
 
@@ -317,9 +318,9 @@ pub fn AcceptRequest(
             h5 { style: "margin-bottom: 0.25rem;", "{quantity} x {listing_title}" }
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
-                "carries the amount, the listing, the payment address, a recent block, the "
-                "confirmations you require and the bridges you trust. It does NOT carry who "
-                "asked or where they want it sent -- those stay in this conversation."
+                "carries the amount, the payment address, a recent block, the confirmations you "
+                "require and the bridges you trust. It does NOT carry which listing it is for, "
+                "who asked, or where they want it sent -- those stay in this conversation."
             }
             div { class: "form-group",
                 label { class: "form-label",

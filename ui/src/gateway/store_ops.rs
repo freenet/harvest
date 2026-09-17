@@ -656,10 +656,8 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes(&[11u8; 32]);
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let listing_id = ListingId::from_label("Widget");
         let order = Order {
             id: OrderId([0u8; 32]),
-            listing_id,
             buyer_fingerprint: "buyer-fp".to_string(),
             seller_fingerprint: "seller-fp".to_string(),
             amount_sats: 50_000,
