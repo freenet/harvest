@@ -238,9 +238,6 @@ fn IdentityCard(
                     details: StoreDetails {
                         store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
                         description: info.map(|i| i.description.clone()).unwrap_or_default(),
-                        payment_instructions: info
-                            .map(|i| i.payment_instructions.clone())
-                            .unwrap_or_default(),
                     },
                     details_resolved: app_state
                         .store_details_are_resolved(&store.store_contract_id),
@@ -294,9 +291,14 @@ fn IdentityCard(
                     div { class: "store-share-row",
                         span { class: "store-share-label", "{card.label}" }
                         if let Some(ref link) = card.link {
+                            // Styled as a value to copy rather than a form
+                            // field: it is readonly, and dressed as an input
+                            // it read as something to edit.
                             input {
-                                class: "form-input",
+                                class: "copy-field",
                                 readonly: true,
+                                spellcheck: false,
+                                aria_label: "Store link, select to copy",
                                 value: "{link}",
                             }
                         }
@@ -426,7 +428,6 @@ fn StoreDetailsForm(
 ) -> Element {
     let mut store_name = use_signal(|| initial.store_name.clone());
     let mut description = use_signal(|| initial.description.clone());
-    let mut payment_instructions = use_signal(|| initial.payment_instructions.clone());
 
     rsx! {
         div { class: "card",
@@ -453,19 +454,6 @@ fn StoreDetailsForm(
                 }
             }
 
-            // NOT "how should buyers pay". An invoice names the address, a
-            // fresh one each time, so this is only whatever else the seller
-            // wants to say.
-            div { class: "form-group",
-                label { class: "form-label", "Notes for buyers" }
-                textarea {
-                    class: "form-textarea",
-                    placeholder: "e.g. ships within 2 days, or ask me before ordering",
-                    value: "{payment_instructions}",
-                    oninput: move |e| payment_instructions.set(e.value()),
-                }
-            }
-
             button {
                 class: "btn btn-primary",
                 disabled: store_name().trim().is_empty(),
@@ -473,7 +461,6 @@ fn StoreDetailsForm(
                     on_submit.call(StoreDetails {
                         store_name: store_name().trim().to_string(),
                         description: description().trim().to_string(),
-                        payment_instructions: payment_instructions().trim().to_string(),
                     });
                 },
                 "{submit_label}"
@@ -566,7 +553,6 @@ fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
                 certificate_pem: String::new(),
                 store_name: details.store_name,
                 description: details.description,
-                payment_instructions: details.payment_instructions,
                 rsa_public_key_der: None,
                 // Filled by `EncryptionKeyReady` below. Creation does not
                 // wait for it -- see the field's own documentation.

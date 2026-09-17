@@ -75,10 +75,9 @@ pub struct StoreInfoV1 {
     pub reputation_contract_id: [u8; 32],
     /// Human-readable store name.
     pub store_name: String,
-    /// Optional store description.
+    /// Optional store description, rendered as markdown (see the UI's
+    /// `markdown` module for the subset).
     pub description: String,
-    /// Payment instructions (freeform, e.g. "BTC: bc1q...").
-    pub payment_instructions: String,
     /// The seller's long-term X25519 public key, so a buyer has something to
     /// encrypt a message to.
     ///
@@ -138,7 +137,6 @@ impl Default for AuthorizedStoreInfoV1 {
                 reputation_contract_id: [0u8; 32],
                 store_name: String::new(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 encryption_public_key: None,
             },
             scoped_payload: Vec::new(),
@@ -2405,6 +2403,47 @@ mod order_tests {
 mod wire_compat_tests {
     use super::*;
 
+    /// **Store info written while `payment_instructions` existed still
+    /// decodes.**
+    ///
+    /// That field was removed rather than deprecated, so every store
+    /// published before this build carries a key `StoreInfoV1` no longer
+    /// names. Serde ignores an unknown key unless told otherwise, which is
+    /// what makes the removal safe to do without a reader-side migration --
+    /// but "unless told otherwise" is one `deny_unknown_fields` away from
+    /// false, and that attribute would turn every old store into an
+    /// undecodable one. Hence a test rather than a comment.
+    #[test]
+    fn store_info_from_before_the_notes_field_was_removed_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct OldStoreInfo {
+            version: u32,
+            certificate_pem: String,
+            seller_fingerprint: String,
+            reputation_contract_id: [u8; 32],
+            store_name: String,
+            description: String,
+            payment_instructions: String,
+        }
+        let old = OldStoreInfo {
+            version: 3,
+            certificate_pem: "-----BEGIN CERT-----".into(),
+            seller_fingerprint: "fingerprint".into(),
+            reputation_contract_id: [7u8; 32],
+            store_name: "Bean Shop".into(),
+            description: "Coffee".into(),
+            payment_instructions: "BTC: bc1q...".into(),
+        };
+        let decoded: StoreInfoV1 = crate::from_cbor(&crate::to_cbor(&old).unwrap())
+            .expect("a store published before the removal must still be readable");
+        assert_eq!(decoded.store_name, "Bean Shop");
+        assert_eq!(decoded.description, "Coffee");
+        assert_eq!(
+            decoded.encryption_public_key, None,
+            "and the field that IS optional is still absent"
+        );
+    }
+
     /// A real V1 store state, as CBOR, written out byte by byte.
     ///
     /// V1 (`ded0e3a`, contract code hash `4d7ad3c3...`, the first row of
@@ -2500,37 +2539,68 @@ mod wire_compat_tests {
         );
     }
 
-    /// **A signed record must re-encode to the bytes that were signed.**
+    /// **A signed record must re-encode to the bytes that were signed, and
+    /// this generation deliberately broke that for one field.**
     ///
     /// `AuthorizedStoreInfoV1::verify` does not compare stored bytes: it
     /// re-serializes `self.info` and checks the result against the payload
     /// inside the signed `ScopedPayload` (see
-    /// `crate::listing::verify_scoped_signature`). So any field added to
-    /// `StoreInfoV1` that SERIALIZES when absent changes that preimage, and
-    /// every store info signed before the field existed stops verifying --
-    /// which the store contract reports as "store info signature invalid",
-    /// rejecting the seller's own published details.
+    /// `crate::listing::verify_scoped_signature`). So any change to what
+    /// `StoreInfoV1` serializes changes that preimage, and every store info
+    /// signed before the change stops verifying -- which the store contract
+    /// reports as "store info signature invalid", rejecting the seller's own
+    /// published details.
     ///
-    /// `#[serde(default)]` alone does not prevent this. `default` governs
-    /// DEcoding; the serializer still emits the field. Only
-    /// `skip_serializing_if` keeps the old preimage intact, and this test is
-    /// what says so: it fails the moment a new optional field is added
-    /// without one.
+    /// Removing `payment_instructions` does exactly that, knowingly: a store
+    /// published before this generation cannot be carried forward, and its
+    /// seller has to publish their details again, which re-signs them in the
+    /// new shape. That was acceptable only because no store but a test one
+    /// existed; the legacy registry's V13 entry records it.
     ///
-    /// Observed red on 2026-09-05 by adding `encryption_public_key` with
-    /// `#[serde(default)]` and no `skip_serializing_if`.
+    /// The test still pins the other half, which has NOT changed: an optional
+    /// field must carry `skip_serializing_if`, or it serializes as an explicit
+    /// null when absent and invalidates old signatures the same way.
+    /// `#[serde(default)]` alone does not prevent that -- `default` governs
+    /// DEcoding. Observed red on 2026-09-05 by adding `encryption_public_key`
+    /// with `#[serde(default)]` and no `skip_serializing_if`.
     #[test]
-    fn a_store_info_that_predates_the_encryption_key_re_encodes_unchanged() {
+    fn a_store_info_re_encodes_to_its_signed_bytes_but_for_the_removed_field() {
         let state: StoreStateV1 =
             crate::from_cbor(V1_STORE_STATE_CBOR).expect("the V1 state must decode");
 
         let re_encoded = crate::to_cbor(&state.info.info).expect("re-encode the decoded info");
 
-        assert_eq!(
-            re_encoded, V1_STORE_INFO_CBOR,
-            "a store info decoded from pre-encryption-key bytes re-encoded to \
-             something else, so its ghostkey signature no longer verifies"
+        // The decided break: the field is gone from the preimage.
+        assert!(
+            contains(V1_STORE_INFO_CBOR, b"payment_instructions"),
+            "the V1 literal is the one that carried the field"
         );
+        assert!(
+            !contains(&re_encoded, b"payment_instructions"),
+            "the removed field must not come back"
+        );
+
+        // Everything else is unchanged, so the difference really is only that
+        // field: putting it back makes the old preimage again.
+        assert!(
+            !contains(&re_encoded, b"encryption_public_key"),
+            "an absent optional field must not serialize, or every signature \
+             made before it existed stops verifying"
+        );
+        let missing = V1_STORE_INFO_CBOR.len() - re_encoded.len();
+        assert_eq!(
+            missing,
+            // `0x74` text(20), the 20-character key, and `0x60` for the empty
+            // string it held in this literal. The map header stays one byte
+            // (`0xa7` -> `0xa6`), so that is the whole difference.
+            1 + 20 + 1,
+            "the only difference should be the removed key and its value"
+        );
+    }
+
+    /// `slice::contains` is per-element; this is the subsequence question.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]

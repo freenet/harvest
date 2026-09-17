@@ -8,6 +8,7 @@ mod components;
 mod document_title;
 mod gateway;
 mod ghostkey_cert;
+mod markdown;
 mod messaging;
 mod migrate;
 mod state;

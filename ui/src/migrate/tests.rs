@@ -281,6 +281,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by removing `listing_id` from `Order` (harvest#57),
                 // a real record change: order ids and signature preimages move.
                 "52107dcfcc21b96990b8403a37408258f8349335bab42dea9d630672156d4f40",
+                // V13, from `git show 5320beb:ui/public/contracts/store_contract.wasm`.
+                // Superseded by removing `payment_instructions` from
+                // `StoreInfoV1`, which changes what the store's signed details
+                // re-encode to, so a predecessor's info no longer verifies.
+                "ddac8dd508819052c3771d23aaff9078e52c84ca17e62ae7e68ce356770b3a67",
             ],
         ),
         (
@@ -771,6 +776,10 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // V12: `listing_id` removed from `Order` (harvest#57). `StoreParameters`
     // did not move: still 56 bytes per `cargo make code-hashes`.
     (12, false),
+    // V13: `payment_instructions` removed from `StoreInfoV1`, which is STATE.
+    // `StoreParameters` did not move: still 56 bytes per
+    // `cargo make code-hashes` after the removal, checked rather than assumed.
+    (13, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.

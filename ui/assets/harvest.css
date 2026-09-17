@@ -33,6 +33,7 @@
   /* Typography */
   --font-display: 'Libre Baskerville', Georgia, serif;
   --font-body: 'Source Sans 3', 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
 
   /* Spacing */
   --space-xs: 0.25rem;
@@ -343,6 +344,78 @@ h4 {
   line-height: 1.5;
 }
 
+/* A description is a seller's own markdown (see the UI's `markdown` module for
+ * the subset). These keep it looking like part of the page: headings that read
+ * as subheadings under the store's name rather than competing with it, and
+ * blocks that do not inherit a paragraph's bottom margin twice. */
+.store-desc > :first-child {
+  margin-top: 0;
+}
+
+.store-desc > :last-child {
+  margin-bottom: 0;
+}
+
+.store-desc h4,
+.store-desc h5,
+.store-desc h6 {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  margin: var(--space-sm) 0 var(--space-xs);
+}
+
+.store-desc p {
+  margin: 0 0 var(--space-xs);
+}
+
+.store-desc ul,
+.store-desc ol {
+  margin: 0 0 var(--space-xs);
+  padding-left: 1.25rem;
+}
+
+.store-desc li {
+  margin: 0.1rem 0;
+}
+
+.store-desc code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-card-hover);
+  padding: 0.05rem 0.25rem;
+  border-radius: 3px;
+}
+
+.store-desc pre {
+  background: var(--bg-card-hover);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.65rem;
+  overflow-x: auto;
+  margin: 0 0 var(--space-xs);
+}
+
+.store-desc pre code {
+  background: none;
+  padding: 0;
+}
+
+.store-desc blockquote {
+  margin: 0 0 var(--space-xs);
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border);
+  color: var(--text-muted);
+}
+
+.store-desc hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: var(--space-sm) 0;
+}
+
+.store-desc a {
+  color: var(--accent);
+}
+
 .store-meta {
   text-align: right;
   flex-shrink: 0;
@@ -493,6 +566,32 @@ h4 {
 .form-input:focus, .form-textarea:focus, .form-select:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* A value to copy, not a field to fill in.
+ *
+ * A readonly `input` is still the right element: it gives select-all, and it
+ * works in the gateway's sandboxed iframe where the clipboard API does not
+ * (see `bitcoin_view`'s note on why there is no copy button). But wearing
+ * `.form-input` it looked editable, which is what a store's share link and an
+ * invoice's payment address are not. Monospace because both are strings a
+ * person checks character by character. */
+.copy-field {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  background: var(--bg-card-hover);
+  cursor: text;
+}
+
+.copy-field:focus {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--text-primary);
 }
 
 .form-textarea {

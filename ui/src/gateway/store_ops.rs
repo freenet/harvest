@@ -151,7 +151,6 @@ pub async fn create_store_contracts(
     let crate::state::StoreDetails {
         store_name,
         description,
-        payment_instructions,
     } = details;
     use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::{ReadableExt, WritableExt};
@@ -311,7 +310,6 @@ pub async fn create_store_contracts(
             .ok_or("reputation contract id is not 32 bytes -- cannot publish store details")?,
         store_name,
         description,
-        payment_instructions,
         // The delegate's answer to `InitEncryptionKey`, which the UI sends
         // alongside `InitReputationKeys` when creation starts. `None` here is
         // not fatal and is not silent: `state::store_details_gap` reports the
@@ -742,7 +740,6 @@ mod tests {
             reputation_contract_id: [2u8; 32],
             store_name: "Bean Shop".to_string(),
             description: "Coffee".to_string(),
-            payment_instructions: "BTC: bc1q...".to_string(),
             encryption_public_key: None,
         };
 

@@ -302,7 +302,6 @@ pub struct PendingStoreCreation {
     pub certificate_pem: String,
     pub store_name: String,
     pub description: String,
-    pub payment_instructions: String,
     /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
     /// `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
@@ -334,7 +333,6 @@ fn spawn_store_creation(pending: PendingStoreCreation) {
         certificate_pem,
         store_name,
         description,
-        payment_instructions,
         rsa_public_key_der,
         encryption_public_key,
     } = pending;
@@ -353,7 +351,6 @@ fn spawn_store_creation(pending: PendingStoreCreation) {
             StoreDetails {
                 store_name,
                 description,
-                payment_instructions,
             },
             encryption_public_key,
         )
@@ -624,7 +621,6 @@ fn spawn_order_signature(pending: PendingOrder) {
 pub struct StoreDetails {
     pub store_name: String,
     pub description: String,
-    pub payment_instructions: String,
 }
 
 /// Why a store the seller owns needs its details published.
@@ -782,7 +778,6 @@ impl PendingStoreEdit {
             reputation_contract_id: self.reputation_contract_id,
             store_name: self.details.store_name.clone(),
             description: self.details.description.clone(),
-            payment_instructions: self.details.payment_instructions.clone(),
             encryption_public_key,
         }
     }
@@ -6183,7 +6178,6 @@ mod tests {
                 reputation_contract_id: [0u8; 32],
                 store_name: name.to_string(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 encryption_public_key: None,
             }),
             ..Default::default()
@@ -6377,7 +6371,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            payment_instructions: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
         }
@@ -6492,7 +6485,6 @@ mod tests {
             reputation_contract_id,
             store_name: name.to_string(),
             description: String::new(),
-            payment_instructions: String::new(),
             encryption_public_key: None,
         }
     }
@@ -6517,7 +6509,6 @@ mod tests {
         StoreDetails {
             store_name: "Bean Shop".to_string(),
             description: "Coffee".to_string(),
-            payment_instructions: "BTC: bc1q...".to_string(),
         }
     }
 
@@ -6654,7 +6645,6 @@ mod tests {
         assert_eq!(info.version, 1, "version 0 is the unverified state");
         assert_eq!(info.store_name, "Bean Shop");
         assert_eq!(info.description, "Coffee");
-        assert_eq!(info.payment_instructions, "BTC: bc1q...");
         assert_eq!(info.seller_fingerprint, FINGERPRINT);
         assert_eq!(info.certificate_pem, "-----BEGIN CERT-----");
     }
@@ -7354,7 +7344,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            payment_instructions: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
         });
@@ -7388,7 +7377,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            payment_instructions: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
         });
@@ -7469,7 +7457,6 @@ mod tests {
             reputation_contract_id: [0u8; 32],
             store_name: "Loaded".to_string(),
             description: String::new(),
-            payment_instructions: String::new(),
             encryption_public_key: None,
         });
 
@@ -8944,7 +8931,6 @@ mod mailbox_read_tests {
                 certificate_pem: String::new(),
                 store_name: String::new(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 rsa_public_key_der: None,
                 encryption_public_key: None,
             }),
@@ -9294,7 +9280,6 @@ mod delegate_correlation_tests {
                 certificate_pem: String::new(),
                 store_name: "Theirs".to_string(),
                 description: String::new(),
-                payment_instructions: String::new(),
                 rsa_public_key_der: None,
                 encryption_public_key: None,
             }),

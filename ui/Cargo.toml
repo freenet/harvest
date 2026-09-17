@@ -23,6 +23,9 @@ freenet-bitcoin-generation = { workspace = true }
 
 # UI Framework
 dioxus = { workspace = true }
+# Markdown in a store description, parsed to elements rather than to an HTML
+# string. See `markdown.rs` for why the HTML route is not an option here.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Web
 web-sys = { workspace = true }

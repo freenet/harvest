@@ -608,7 +608,6 @@ mod tests {
             reputation_contract_id: [0u8; 32],
             store_name: "TestStore".into(),
             description: "".into(),
-            payment_instructions: "".into(),
             encryption_public_key: None,
         };
         let info_bytes = crate::to_cbor(&info).unwrap();
@@ -667,7 +666,6 @@ mod tests {
             reputation_contract_id: [0u8; 32],
             store_name: "TestStore".into(),
             description: "".into(),
-            payment_instructions: "".into(),
             encryption_public_key: None,
         };
         let info_bytes = crate::to_cbor(&info).unwrap();

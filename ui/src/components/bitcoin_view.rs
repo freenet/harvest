@@ -559,8 +559,10 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 // available, and a copy button that silently does nothing is
                 // worse than a field that visibly works.
                 input {
-                    class: "form-input",
+                    class: "copy-field",
                     readonly: true,
+                    spellcheck: false,
+                    aria_label: "Payment address, select to copy",
                     value: "{o.payment_address}",
                 }
             } else {

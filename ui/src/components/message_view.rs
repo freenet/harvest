@@ -332,9 +332,14 @@ fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Eleme
                 "conversation, and can use it to complain about this seller as though they "
                 "were you. It is not a password you can change: it is the conversation."
             }
+            // Also a value to copy rather than a field to edit, and the one
+            // here matters most: a mistyped character makes the backup
+            // useless, and nothing would say so until it was needed.
             textarea {
-                class: "form-textarea",
+                class: "form-textarea copy-field",
                 readonly: true,
+                spellcheck: false,
+                aria_label: "Conversation backup, select to copy",
                 rows: 3,
                 value: "{backup}",
             }
