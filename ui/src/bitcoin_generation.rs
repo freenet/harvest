@@ -225,6 +225,11 @@ impl BridgeGenerations {
         g
     }
 
+    /// The bridge whose pointers these are.
+    pub fn bridge(&self) -> BridgeId {
+        self.bridge
+    }
+
     /// The pointer contracts to GET now, each marked as asked.
     ///
     /// The two may be in flight together: Harvest's node replies name the

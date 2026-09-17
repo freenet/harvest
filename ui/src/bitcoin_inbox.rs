@@ -31,7 +31,8 @@
 use freenet_bitcoin_common::{to_cbor, BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::{
     sender_height, Action, ByteBuf, EntryKey, GhostkeyId, InboxDelta, InboxEntryBody,
-    InboxParameters, InboxRequest, InboxStateV1, SignedFloor, WireEntry, MAX_SCRIPTS_PER_REQUEST,
+    InboxParameters, InboxRequest, InboxStateV1, SignedFloor, WireEntry, MAX_ENTRIES_PER_GHOSTKEY,
+    MAX_SCRIPTS_PER_REQUEST,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractKey, Parameters};
 
@@ -159,6 +160,8 @@ pub struct SentWatch {
     /// its fate in the inbox is read back by.
     pub entry_key: EntryKey,
     pub mainnet_height: u32,
+    /// The Ghost Key that sent it, whose allowance of unread entries it uses.
+    pub ghostkey: GhostkeyId,
     /// Whether this tab has seen the bridge remove the entry, which it does
     /// when it reads it.
     ///
@@ -177,6 +180,7 @@ impl SentWatch {
             sent_at_ms: now_ms,
             entry_key: entry.entry.key(),
             mainnet_height: entry.entry.mainnet_height,
+            ghostkey: entry.entry.ghostkey,
             read: false,
         }
     }
@@ -214,35 +218,207 @@ pub fn watch_due(sent: Option<&SentWatch>, inbox: &InboxStateV1, now_ms: u64) ->
     !inbox.entries.contains_key(&sent.entry_key)
 }
 
+/// A script a seller wants the bridge to watch, because an unpaid order of
+/// theirs pays to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchWanted {
+    pub network: BitcoinNetwork,
+    pub script: Vec<u8>,
+    /// The height the order was anchored at. No payment to a freshly derived
+    /// address can predate it, so it is where the bridge may start scanning.
+    pub anchor_height: Option<u32>,
+}
+
+/// A request prepared and handed to the ghostkey delegate, waiting on its
+/// signature before it can be submitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInboxEntry {
+    pub fingerprint: String,
+    pub ghostkey: GhostkeyId,
+    /// The inbox it goes to, fixed when it was prepared: the entry is sealed
+    /// to that inbox's bridge and dated against its floor.
+    pub contract_key: ContractKey,
+    /// The floor it was dated against, sent with it so a peer whose floor lags
+    /// takes the floor first (see [`InboxDelta::submission`]).
+    pub floor: SignedFloor,
+    pub network: BitcoinNetwork,
+    pub scripts: Vec<Vec<u8>>,
+    /// What the delegate is asked to sign, and so what its answer is matched by.
+    pub signing_payload: Vec<u8>,
+}
+
+/// One bridge inbox as this tab sees it, and what this tab has sent to it.
+///
+/// In memory only. After a reload nothing is remembered, so every wanted
+/// script is sent once more: a renewal early, which costs the bridge one read
+/// and the seller nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboxTracker {
+    pub bridge: BridgeId,
+    pub contract_key: ContractKey,
+    /// The inbox's latest state, once the node has served it.
+    pub state: Option<InboxStateV1>,
+    /// Keyed by network and script: one address on two networks is two watches.
+    pub sent: std::collections::HashMap<(BitcoinNetwork, Vec<u8>), SentWatch>,
+    last_made_at_ms: Option<u64>,
+}
+
+impl InboxTracker {
+    pub fn new(bridge: BridgeId, contract_key: ContractKey) -> Self {
+        InboxTracker {
+            bridge,
+            contract_key,
+            state: None,
+            sent: Default::default(),
+            last_made_at_ms: None,
+        }
+    }
+
+    /// Take a newly served state, noting any request it shows the bridge read.
+    pub fn on_state(&mut self, state: InboxStateV1) {
+        for sent in self.sent.values_mut() {
+            sent.observe(&state);
+        }
+        self.state = Some(state);
+    }
+
+    /// The requests `ghostkey` should send now for `wanted`, most urgent first.
+    ///
+    /// `wanted` is taken in the caller's order, so a caller puts the newest
+    /// orders first: when the allowance is short those are the ones a buyer is
+    /// most likely paying now. `awaiting` is what this Ghost Key already has
+    /// waiting on the delegate, which is neither due again nor free to use the
+    /// allowance.
+    ///
+    /// Empty until the inbox has been served with a floor: an entry is dated
+    /// against the floor, and one dated without it is dropped at once.
+    pub fn plan(
+        &mut self,
+        ghostkey: GhostkeyId,
+        wanted: &[WatchWanted],
+        awaiting: &[&PendingInboxEntry],
+        now_ms: u64,
+    ) -> Vec<InboxRequest> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        if state.floor.is_none() {
+            return Vec::new();
+        }
+
+        // A Ghost Key's third unread entry is dropped on arrival, so count
+        // what already holds its places: unread entries in the inbox, entries
+        // sent but not yet seen landing, and entries not yet signed.
+        let in_inbox: std::collections::BTreeSet<EntryKey> = state
+            .entries
+            .iter()
+            .filter(|(_, e)| e.ghostkey == ghostkey)
+            .map(|(k, _)| *k)
+            .collect();
+        let landing: std::collections::BTreeSet<EntryKey> = self
+            .sent
+            .values()
+            .filter(|s| {
+                s.ghostkey == ghostkey
+                    && !s.read
+                    && now_ms.saturating_sub(s.sent_at_ms) < LAND_GRACE_MS
+                    && !in_inbox.contains(&s.entry_key)
+                    && !state.is_removed(&s.entry_key, s.mainnet_height)
+            })
+            .map(|s| s.entry_key)
+            .collect();
+        let held = in_inbox.len() + landing.len() + awaiting.len();
+        let slots = MAX_ENTRIES_PER_GHOSTKEY.saturating_sub(held);
+        if slots == 0 {
+            return Vec::new();
+        }
+
+        let mut due: Vec<&WatchWanted> = Vec::new();
+        for w in wanted {
+            let key = (w.network, w.script.clone());
+            let signing = awaiting
+                .iter()
+                .any(|p| p.network == w.network && p.scripts.contains(&w.script));
+            let repeated = due
+                .iter()
+                .any(|d| d.network == w.network && d.script == w.script);
+            if !signing && !repeated && watch_due(self.sent.get(&key), state, now_ms) {
+                due.push(w);
+            }
+        }
+
+        // One request per network, up to a request's worth of scripts each,
+        // networks in the order their first script was wanted.
+        let mut networks: Vec<BitcoinNetwork> = Vec::new();
+        for w in &due {
+            if !networks.contains(&w.network) {
+                networks.push(w.network);
+            }
+        }
+        let mut requests = Vec::new();
+        for network in networks {
+            let scripts: Vec<&WatchWanted> = due
+                .iter()
+                .copied()
+                .filter(|w| w.network == network)
+                .collect();
+            for batch in scripts.chunks(MAX_SCRIPTS_PER_REQUEST) {
+                if requests.len() == slots {
+                    return requests;
+                }
+                let made_at_ms = next_made_at_ms(now_ms, self.last_made_at_ms);
+                self.last_made_at_ms = Some(made_at_ms);
+                requests.push(InboxRequest {
+                    action: Action::Watch,
+                    network,
+                    scripts: batch.iter().map(|w| ByteBuf(w.script.clone())).collect(),
+                    scan_from_height: batch.iter().filter_map(|w| w.anchor_height).min(),
+                    made_at_ms,
+                });
+            }
+        }
+        requests
+    }
+
+    /// Record that `entry`, signed for `pending`, has been sent.
+    pub fn record_sent(&mut self, pending: &PendingInboxEntry, entry: &WireEntry, now_ms: u64) {
+        let sent = SentWatch::sent(entry, now_ms);
+        for script in &pending.scripts {
+            self.sent
+                .insert((pending.network, script.clone()), sent.clone());
+        }
+    }
+}
+
+/// Real inbox pieces under a throwaway Ghost Key authority, shared with the
+/// app state tests so they drive the same contract logic these do.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use freenet_bitcoin_common::from_cbor;
     use freenet_bitcoin_inbox::test_support::{TestAuthority, TestGhostkey};
-    use freenet_bitcoin_inbox::{InboxStateV1, WINDOW_BLOCKS};
-    use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
+    use freenet_stdlib::prelude::ContractInstanceId;
     use ghostkey_common::{ScopedPayload, SignatureRequestor};
     use std::sync::OnceLock;
 
-    const FLOOR: u32 = 900_000;
+    pub const FLOOR: u32 = 900_000;
 
     /// Minting a notary key costs an RSA key generation, so once per binary.
-    fn authority() -> &'static TestAuthority {
+    pub fn authority() -> &'static TestAuthority {
         static A: OnceLock<TestAuthority> = OnceLock::new();
         A.get_or_init(TestAuthority::new)
     }
 
-    fn bridge_key() -> SigningKey {
+    pub fn bridge_key() -> SigningKey {
         SigningKey::from_bytes(&[3u8; 32])
     }
 
-    fn bridge() -> BridgeId {
+    pub fn bridge() -> BridgeId {
         BridgeId(bridge_key().verifying_key().to_bytes())
     }
 
     /// An inbox the test bridge has opened at `FLOOR`, under the test authority.
-    fn open_inbox() -> InboxStateV1 {
+    pub fn open_inbox() -> InboxStateV1 {
         let mut s = InboxStateV1::default();
         s.apply_delta(
             &authority().params(bridge()),
@@ -256,17 +432,51 @@ mod tests {
         s
     }
 
-    /// What the ghostkey delegate does with `signing_payload`: wrap it in a
-    /// scoped payload naming the web app that asked, and sign that.
-    fn signed(gk: &TestGhostkey, signing_payload: Vec<u8>) -> WireEntry {
+    /// What the ghostkey delegate returns for `signing_payload`: the payload
+    /// wrapped in a scoped payload naming the web app that asked, and a
+    /// signature over that.
+    pub fn sign_result(gk: &TestGhostkey, signing_payload: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
         let scoped = to_cbor(&ScopedPayload {
             requestor: SignatureRequestor::WebApp(ContractInstanceId::new([7u8; 32])),
             payload: signing_payload,
         })
         .expect("scoped payload encodes");
         let sig = gk.sk.sign(&scoped).to_bytes().to_vec();
+        (scoped, sig)
+    }
+
+    /// [`sign_result`], formed into the entry the UI submits.
+    pub fn signed(gk: &TestGhostkey, signing_payload: Vec<u8>) -> WireEntry {
+        let (scoped, sig) = sign_result(gk, signing_payload);
         WireEntry::from_sign_result(gk.pem.clone(), scoped, sig).expect("a signed entry forms")
     }
+
+    /// Submit through the same bytes the UI would send, as the contract would
+    /// receive them.
+    pub fn submit(state: &mut InboxStateV1, floor: &SignedFloor, entry: WireEntry) {
+        let bytes = submission_bytes(floor, entry).expect("submission encodes");
+        let delta: InboxDelta =
+            freenet_bitcoin_common::from_cbor(&bytes).expect("submission decodes");
+        state
+            .apply_delta(&authority().params(bridge()), &delta)
+            .expect("the inbox accepts the update");
+    }
+
+    /// A contract key for the test inbox. Its code hash is arbitrary: nothing
+    /// in these tests fetches the contract.
+    pub fn inbox_key() -> ContractKey {
+        inbox_contract_key(bridge(), CodeHash::new([0x38; 32])).expect("the inbox key derives")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use freenet_bitcoin_common::from_cbor;
+    use freenet_bitcoin_inbox::test_support::TestGhostkey;
+    use freenet_bitcoin_inbox::{InboxStateV1, WINDOW_BLOCKS};
+    use freenet_stdlib::prelude::ContractCode;
 
     fn watch_one() -> InboxRequest {
         watch_requests(
@@ -277,16 +487,6 @@ mod tests {
         )
         .pop()
         .expect("one request")
-    }
-
-    /// Submit through the same bytes the UI would send, as the contract would
-    /// receive them.
-    fn submit(state: &mut InboxStateV1, floor: &SignedFloor, entry: WireEntry) {
-        let bytes = submission_bytes(floor, entry).expect("submission encodes");
-        let delta: InboxDelta = from_cbor(&bytes).expect("submission decodes");
-        state
-            .apply_delta(&authority().params(bridge()), &delta)
-            .expect("the inbox accepts the update");
     }
 
     /// The whole path, end to end on real pieces: prepared here, signed as the
@@ -591,5 +791,244 @@ mod tests {
             T0 + RENEW_AFTER_MS - 1
         ));
         assert!(watch_due(Some(&sent), &open_inbox(), T0 + RENEW_AFTER_MS));
+    }
+
+    fn wanted(network: BitcoinNetwork, n: u8, anchor: u32) -> WatchWanted {
+        WatchWanted {
+            network,
+            script: vec![0x00, 0x14, n],
+            anchor_height: Some(anchor),
+        }
+    }
+
+    fn tracker_on(inbox: InboxStateV1) -> InboxTracker {
+        let mut t = InboxTracker::new(bridge(), inbox_key());
+        t.on_state(inbox);
+        t
+    }
+
+    /// Sign and send `request` as `gk`, landing it in `inbox`, and record it
+    /// in `tracker` as the UI does.
+    fn send(
+        tracker: &mut InboxTracker,
+        inbox: &mut InboxStateV1,
+        gk: &TestGhostkey,
+        request: &InboxRequest,
+        now_ms: u64,
+    ) -> WireEntry {
+        let floor = inbox.floor.clone().expect("an open inbox");
+        let prepared = prepare_entry(bridge(), gk.id(), &floor, request).expect("prepares");
+        let entry = signed(gk, prepared.signing_payload.clone());
+        let pending = PendingInboxEntry {
+            fingerprint: "seller".into(),
+            ghostkey: gk.id(),
+            contract_key: inbox_key(),
+            floor: floor.clone(),
+            network: request.network,
+            scripts: request.scripts.iter().map(|s| s.0.clone()).collect(),
+            signing_payload: prepared.signing_payload,
+        };
+        tracker.record_sent(&pending, &entry, now_ms);
+        submit(inbox, &floor, entry.clone());
+        tracker.on_state(inbox.clone());
+        entry
+    }
+
+    #[test]
+    fn nothing_is_planned_before_the_inbox_is_served() {
+        let gk = authority().mint();
+        let mut t = InboxTracker::new(bridge(), inbox_key());
+        let w = [wanted(BitcoinNetwork::Signet, 1, 10)];
+        assert!(t.plan(gk.id(), &w, &[], T0).is_empty());
+        t.on_state(InboxStateV1::default());
+        assert!(
+            t.plan(gk.id(), &w, &[], T0).is_empty(),
+            "an inbox with no floor cannot date an entry"
+        );
+    }
+
+    #[test]
+    fn a_first_plan_asks_for_every_wanted_script_scanning_from_the_oldest_anchor() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let w = [
+            wanted(BitcoinNetwork::Signet, 1, 120),
+            wanted(BitcoinNetwork::Signet, 2, 100),
+            wanted(BitcoinNetwork::Signet, 1, 120),
+        ];
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, Action::Watch);
+        assert_eq!(
+            plan[0].scripts,
+            vec![ByteBuf(w[0].script.clone()), ByteBuf(w[1].script.clone())],
+            "each script once"
+        );
+        assert_eq!(plan[0].scan_from_height, Some(100));
+        plan[0].check().expect("a well-formed request");
+    }
+
+    #[test]
+    fn made_at_strictly_increases_across_plans_in_one_millisecond() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let a = t.plan(gk.id(), &[wanted(BitcoinNetwork::Signet, 1, 1)], &[], T0);
+        let b = t.plan(gk.id(), &[wanted(BitcoinNetwork::Signet, 2, 1)], &[], T0);
+        assert!(b[0].made_at_ms > a[0].made_at_ms);
+    }
+
+    #[test]
+    fn each_network_gets_its_own_request() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let plan = t.plan(
+            gk.id(),
+            &[
+                wanted(BitcoinNetwork::Signet, 1, 1),
+                wanted(BitcoinNetwork::Testnet4, 1, 1),
+            ],
+            &[],
+            T0,
+        );
+        let networks: Vec<_> = plan.iter().map(|r| r.network).collect();
+        assert_eq!(
+            networks,
+            vec![BitcoinNetwork::Signet, BitcoinNetwork::Testnet4]
+        );
+    }
+
+    /// More than two requests' worth of scripts: the inbox would drop a
+    /// third entry from one Ghost Key, so only two are sent now, newest
+    /// orders first, and the rest wait for the bridge to read those.
+    #[test]
+    fn a_ghost_key_never_sends_more_entries_than_the_inbox_keeps() {
+        let gk = authority().mint();
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let w: Vec<WatchWanted> = (0..70u8)
+            .map(|n| wanted(BitcoinNetwork::Signet, n, 1))
+            .collect();
+
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        assert_eq!(plan.len(), MAX_ENTRIES_PER_GHOSTKEY);
+        assert_eq!(plan[0].scripts[0], ByteBuf(w[0].script.clone()));
+        assert_eq!(plan[0].scripts.len(), MAX_SCRIPTS_PER_REQUEST);
+
+        for r in &plan {
+            send(&mut t, &mut inbox, &gk, r, T0);
+        }
+        assert_eq!(
+            inbox.entries.len(),
+            MAX_ENTRIES_PER_GHOSTKEY,
+            "both admitted"
+        );
+        assert!(
+            t.plan(gk.id(), &w, &[], T0 + 60_000).is_empty(),
+            "both places are held by unread entries"
+        );
+
+        let other = authority().mint();
+        let others: Vec<WatchWanted> = (100..170u8)
+            .map(|n| wanted(BitcoinNetwork::Signet, n, 1))
+            .collect();
+        assert_eq!(
+            t.plan(other.id(), &others, &[], T0 + 60_000).len(),
+            MAX_ENTRIES_PER_GHOSTKEY,
+            "another Ghost Key's allowance is its own"
+        );
+    }
+
+    #[test]
+    fn a_request_still_landing_holds_its_place() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let w = [
+            wanted(BitcoinNetwork::Signet, 1, 1),
+            wanted(BitcoinNetwork::Signet, 2, 1),
+        ];
+        let first = t.plan(gk.id(), &w[..1], &[], T0);
+        // Sent, but the node has not yet served a state that includes it.
+        let floor = SignedFloor::sign(&bridge_key(), FLOOR);
+        let prepared = prepare_entry(bridge(), gk.id(), &floor, &first[0]).expect("prepares");
+        let entry = signed(&gk, prepared.signing_payload.clone());
+        let pending = PendingInboxEntry {
+            fingerprint: "seller".into(),
+            ghostkey: gk.id(),
+            contract_key: inbox_key(),
+            floor,
+            network: BitcoinNetwork::Signet,
+            scripts: vec![w[0].script.clone()],
+            signing_payload: prepared.signing_payload,
+        };
+        t.record_sent(&pending, &entry, T0);
+
+        let now = T0 + 1_000;
+        let plan = t.plan(gk.id(), &w, &[&pending, &pending], now);
+        assert!(
+            plan.is_empty(),
+            "one landing and two awaiting a signature is over the allowance"
+        );
+        // Enough still wanted to fill both places, so only the allowance
+        // limits what is sent.
+        let mut more = w.to_vec();
+        more.extend((10..80u8).map(|n| wanted(BitcoinNetwork::Signet, n, 1)));
+        let plan = t.plan(gk.id(), &more, &[], now);
+        assert_eq!(plan.len(), 1, "one place is left while the first lands");
+        assert_eq!(plan[0].scripts[0], ByteBuf(w[1].script.clone()));
+        assert!(
+            !plan[0].scripts.contains(&ByteBuf(w[0].script.clone())),
+            "the landing script is not asked for again"
+        );
+    }
+
+    #[test]
+    fn a_script_awaiting_its_signature_is_not_asked_for_again() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let w = [
+            wanted(BitcoinNetwork::Signet, 1, 1),
+            wanted(BitcoinNetwork::Signet, 2, 1),
+        ];
+        let awaiting = PendingInboxEntry {
+            fingerprint: "seller".into(),
+            ghostkey: gk.id(),
+            contract_key: inbox_key(),
+            floor: SignedFloor::sign(&bridge_key(), FLOOR),
+            network: BitcoinNetwork::Signet,
+            scripts: vec![w[0].script.clone()],
+            signing_payload: vec![],
+        };
+        let plan = t.plan(gk.id(), &w, &[&awaiting], T0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].scripts, vec![ByteBuf(w[1].script.clone())]);
+    }
+
+    /// The lifecycle on real pieces: sent, admitted, read by the bridge, the
+    /// evidence pruned by the floor, and renewed when the watch needs it.
+    #[test]
+    fn a_watch_is_sent_once_and_renewed_only_when_due() {
+        let gk = authority().mint();
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        let entry = send(&mut t, &mut inbox, &gk, &plan[0], T0);
+        assert!(
+            t.plan(gk.id(), &w, &[], T0 + 10 * 60_000).is_empty(),
+            "waiting"
+        );
+
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone());
+        floor_passes(&mut inbox, &entry);
+        t.on_state(inbox.clone());
+        assert!(
+            t.plan(gk.id(), &w, &[], T0 + 60 * 60_000).is_empty(),
+            "read, so not sent again once the evidence is pruned"
+        );
+        let renewal = t.plan(gk.id(), &w, &[], T0 + RENEW_AFTER_MS);
+        assert_eq!(renewal.len(), 1, "renewed before the watch lapses");
+        assert!(renewal[0].made_at_ms > plan[0].made_at_ms);
     }
 }

@@ -29,8 +29,14 @@ const POINTER_TIMEOUT_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as
 /// How long to wait before asking again after a failure worth retrying.
 const RETRY_AFTER_MS: u32 = 30_000;
 
+/// How often to look for watch requests that have come due with nothing else
+/// changing: a renewal, or a request whose time to land has passed. Only
+/// local work happens unless something is due.
+const WATCH_CHECK_EVERY_MS: u32 = 60_000;
+
 thread_local! {
     static GENERATIONS: RefCell<Option<BridgeGenerations>> = const { RefCell::new(None) };
+    static WATCH_CHECK: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
 }
 
 /// Begin resolving the trusted bridge's pointers.
@@ -60,6 +66,13 @@ pub fn start() {
         app.bitcoin.inbox_generation = refused;
         return;
     }
+    WATCH_CHECK.with(|timer| {
+        timer.borrow_mut().get_or_insert_with(|| {
+            gloo_timers::callback::Interval::new(WATCH_CHECK_EVERY_MS, || {
+                APP_STATE.write().send_due_watch_requests();
+            })
+        });
+    });
     send_due();
 }
 
@@ -139,8 +152,15 @@ fn settle(settled: Option<Resolve>) -> bool {
                 "the bridge's {artifact:?} generation resolved: {}",
                 hex::encode(&code_hash[..8])
             );
-            if artifact == Resolve::Tip {
-                register_tip(code_hash);
+            match artifact {
+                Resolve::Tip => register_tip(code_hash),
+                Resolve::Inbox => {
+                    let bridge = GENERATIONS.with(|g| g.borrow().as_ref().map(|g| g.bridge()));
+                    if let Some(bridge) = bridge {
+                        APP_STATE.write().register_inbox_contract(bridge, code_hash);
+                    }
+                }
+                Resolve::Address => {}
             }
         }
         Some(Err(why)) => {
