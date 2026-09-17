@@ -95,8 +95,9 @@ anyway (#29).
   signs it with the wrong key, that key is not asked again until the page is
   reloaded, and the seller is told once. A listed key's grant includes signing,
   so no prompt appears in normal use. A grant revoked while the tab is open is
-  the exception: the key is still listed here, so the vault prompts, once, and
-  then the key is stopped. A withdrawn inbox is told to the seller too.
+  the exception: the key is still listed here, so the vault prompts once. If
+  the seller allows it, the grant is back and watching continues; otherwise
+  the key is stopped. A withdrawn inbox is told to the seller too.
 
 Known limits:
 
@@ -106,12 +107,14 @@ Known limits:
   about a minute of the invoice and the bridge polls its inbox every 30
   seconds, but that is not a bound: the seller's own signing, a key the vault
   refused, or a request the network dropped all delay it.
-- **A request that is never read is noticed, not repaired.** If one of this
-  tab's requests sits unread for two hours, the seller is told once. Nothing is
-  resent: the usual causes are a node serving a copy of the inbox it has
-  stopped following, whose floor every up-to-date peer has passed, or a bridge
-  that is not running, and resending helps with neither. Reloading the page
-  fetches and subscribes again.
+- **Requests that are never read are noticed, not repaired.** A request that
+  leaves the inbox unread is sent again, but nothing more is done about it.
+  If a key's requests go unread for two hours, either because each expires
+  unread and is sent again or because entries sit in this node's copy of the
+  inbox, the seller is told, once for as long as it lasts. The causes (a
+  request that never reaches the bridge's node, a node serving a copy it has
+  stopped following, a bridge that is not running) are outside what the tab
+  can fix.
 - **Tracking is in memory.** A reload sends every wanted request once more,
   which is an early renewal. Pointer floors are not persisted either, so on the
   first resolve after a load a peer could serve a genuine but superseded

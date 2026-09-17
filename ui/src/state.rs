@@ -5296,10 +5296,11 @@ impl AppState {
     ///   Ghost Key is not asked again this session: a vault that does not
     ///   answer a key this app holds a grant for is most likely showing a
     ///   prompt, because the grant was revoked.
-    /// * The seller is told, once, if one of this tab's requests has sat
-    ///   unread past [`crate::bitcoin_inbox::UNREAD_NOTICE_MS`].
     /// * Nothing more happens unless this node has an order to watch, so a
     ///   buyer's tab never touches the inbox.
+    /// * The seller is told, once for as long as it lasts, if their keys'
+    ///   requests have gone unread past
+    ///   [`crate::bitcoin_inbox::UNREAD_NOTICE_MS`].
     /// * The inbox is fetched when it has never arrived or has not been heard
     ///   from lately (see [`crate::bitcoin_inbox::InboxTracker::fetch_due`]).
     /// * Nothing is queued while the seller has a signature of their own under
@@ -5340,25 +5341,29 @@ impl AppState {
         let Some(bridge) = self.bitcoin.inbox.as_ref().map(|inbox| inbox.bridge) else {
             return work;
         };
-        let mut unread = false;
-        if let Some(inbox) = self.bitcoin.inbox.as_mut() {
-            if inbox.request_long_unread(now_ms) && !inbox.unread_notified {
-                inbox.unread_notified = true;
-                unread = true;
-            }
-        }
-        if unread {
-            warn!("a watch request has sat unread in the bridge inbox for hours");
-            self.notifications.push(
-                "A request asking the Bitcoin bridge to watch your invoices' payment addresses has \
-                 not been read in over two hours. This node may not be following the bridge's \
-                 inbox, or the bridge may not be running. Reloading the page may help."
-                    .to_string(),
-            );
-        }
         let groups = self.watches_wanted(bridge);
         if groups.is_empty() {
             return work;
+        }
+        let ghostkeys: Vec<freenet_bitcoin_inbox::GhostkeyId> =
+            groups.iter().map(|(_, ghostkey, _)| *ghostkey).collect();
+        let mut unread = false;
+        if let Some(inbox) = self.bitcoin.inbox.as_mut() {
+            if inbox.request_long_unread(&ghostkeys, now_ms) {
+                unread = !std::mem::replace(&mut inbox.unread_notified, true);
+            } else {
+                inbox.unread_notified = false;
+            }
+        }
+        if unread {
+            warn!("watch requests have gone unread in the bridge inbox for hours");
+            self.notifications.push(
+                "Harvest's requests asking the Bitcoin bridge to watch your invoices' payment \
+                 addresses have not been read in over two hours. The bridge may not be running, \
+                 or this node may not be reaching it or following its inbox. Payments to your \
+                 invoices may not be seen until that is resolved."
+                    .to_string(),
+            );
         }
         if let Some(inbox) = self.bitcoin.inbox.as_mut() {
             if inbox.fetch_due(now_ms) {
@@ -5458,9 +5463,6 @@ impl AppState {
             || self.request_any_access_in_flight
     }
 
-    /// Whether a refusal from the ghostkey delegate can only be about a watch
-    /// request: nothing of the seller's is outstanding, and a watch request is,
-    /// for `fingerprint` if the refusal names one.
     /// Whether a refusal naming `fingerprint` is to be taken as a watch
     /// request's.
     ///
@@ -5481,6 +5483,9 @@ impl AppState {
                 && !self.user_signature_under_way())
     }
 
+    /// Whether a refusal from the ghostkey delegate can only be about a watch
+    /// request: nothing of the seller's is outstanding, and a watch request is,
+    /// for `fingerprint` if the refusal names one.
     fn only_watch_signatures_outstanding(&self, fingerprint: Option<&str>) -> bool {
         !self.user_signature_under_way()
             && self.pending_signatures.iter().any(|pending| {
@@ -13667,17 +13672,25 @@ mod buy_flow_tests {
     /// clearing state and telling the seller again.
     #[test]
     fn a_late_refusal_for_a_stopped_key_is_ignored() {
-        let gk = inbox::authority().mint();
-        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
-        serve_inbox(&mut state, &inbox::open_inbox());
-        state.queue_due_watch_requests(now_ms() + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS);
-        assert_eq!(state.notifications.len(), 1);
-        state.request_any_access_in_flight = false;
-        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::PermissionDenied {
-            fingerprint: "seller-fp".into(),
-            requestor: harvest_common::expected_harvest_requestor(),
-        });
-        assert_eq!(state.notifications.len(), 1, "no second notice");
+        let late_refusals = [
+            ghostkey_common::GhostkeyResponse::PermissionDenied {
+                fingerprint: "seller-fp".into(),
+                requestor: harvest_common::expected_harvest_requestor(),
+            },
+            ghostkey_common::GhostkeyResponse::KeyNotFound {
+                fingerprint: "seller-fp".into(),
+            },
+        ];
+        for refusal in late_refusals {
+            let what = format!("{refusal:?}");
+            let gk = inbox::authority().mint();
+            let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+            serve_inbox(&mut state, &inbox::open_inbox());
+            state.queue_due_watch_requests(now_ms() + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS);
+            assert_eq!(state.notifications.len(), 1, "{what}");
+            state.on_ghostkey_response(refusal);
+            assert_eq!(state.notifications.len(), 1, "{what}: no second notice");
+        }
     }
 
     /// **The refusal of a background prompt stops its key even while the
@@ -13735,6 +13748,54 @@ mod buy_flow_tests {
             .filter(|n| n.contains("not been read"))
             .count();
         assert_eq!(told, 1);
+        assert!(
+            state
+                .bitcoin
+                .inbox
+                .as_ref()
+                .expect("tracked")
+                .unread_notified
+        );
+
+        // Once it is read, the notice re-arms for a later fault.
+        let entry = inbox_state
+            .entries
+            .values()
+            .next()
+            .expect("the entry")
+            .clone();
+        let mut removed = std::collections::BTreeSet::new();
+        removed.insert(entry.key().removal_prefix());
+        inbox_state
+            .apply_delta(
+                &inbox::authority().params(inbox::bridge()),
+                &freenet_bitcoin_inbox::InboxDelta {
+                    floor: None,
+                    entries: vec![],
+                    removals: vec![freenet_bitcoin_inbox::RemovalBatch::sign(
+                        &inbox::bridge_key(),
+                        entry.mainnet_height,
+                        &removed,
+                    )],
+                },
+            )
+            .expect("the bridge reads it");
+        let read_at = later + 120_000;
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .expect("tracked")
+            .on_state(inbox_state, read_at);
+        state.queue_due_watch_requests(read_at);
+        assert!(
+            !state
+                .bitcoin
+                .inbox
+                .as_ref()
+                .expect("tracked")
+                .unread_notified
+        );
     }
 
     fn inbox_pending_for(

@@ -171,6 +171,10 @@ pub struct SentWatch {
     /// request the bridge read looks exactly like one that was dropped unread,
     /// and without this every order would be re-requested every half hour.
     pub read: bool,
+    /// Since when this script has been asked for without the bridge being seen
+    /// to read it: the first of a run of requests that each went unread. See
+    /// [`InboxTracker::request_long_unread`].
+    pub unread_since_ms: u64,
 }
 
 impl SentWatch {
@@ -182,6 +186,7 @@ impl SentWatch {
             mainnet_height: entry.entry.mainnet_height,
             ghostkey: entry.entry.ghostkey,
             read: false,
+            unread_since_ms: now_ms,
         }
     }
 
@@ -287,17 +292,22 @@ pub const INBOX_REFETCH_MS: u64 = 10 * 60 * 1000;
 /// each further fetch without a state up to [`INBOX_REFETCH_MS`].
 pub const INBOX_FETCH_RETRY_MS: u64 = 60 * 1000;
 
-/// How long one of this tab's requests may sit unread in the inbox before the
-/// seller is told something is wrong.
+/// How long a Ghost Key's requests may go unread before the seller is told
+/// something is wrong.
 ///
-/// Nothing is sent again because of it: a request dated against a copy of the
-/// inbox this node has stopped following is dropped by every peer that has
-/// moved on, however often it is sent, and a bridge that is not running reads
-/// nothing either way. Resending only spent signatures and, by losing ties
-/// against its own earlier entries, could leave the Ghost Key's places held
-/// for good. An entry can sit unread for a while legitimately, since the bridge
-/// defers a sender past its share of a read budget and the floor passes an
-/// entry only after a few blocks, so the notice waits well beyond that.
+/// Unread in either of two ways, and both count: a request of this tab's that
+/// was sent, went unread, was passed by the floor and sent again, over and
+/// over; or any entry of the key's, whoever sent it, sitting in this node's
+/// copy of the inbox. The first is a request that never reaches the bridge's
+/// node, or that the bridge will not read; the second is a node serving a copy
+/// it has stopped following, or a bridge that is not running. In a working
+/// system an entry is read within a minute, so two hours is well past the
+/// bridge's legitimate deferrals (a sender past its share of a read budget, a
+/// few blocks before the floor passes an entry).
+///
+/// Nothing is done about it but telling the seller. Resending sooner cannot
+/// help any of these, and against a stale copy it could only fill the key's
+/// places with its own earlier entries.
 pub const UNREAD_NOTICE_MS: u64 = 2 * 60 * 60 * 1000;
 
 /// How long the seller's own signing may hold watch requests back.
@@ -345,10 +355,10 @@ pub struct InboxTracker {
     fetches_without_state: u32,
     /// Since when the seller's own signing has been holding requests back.
     pub held_since_ms: Option<u64>,
-    /// Every entry this tab has sent that may still be in the inbox, and when.
-    /// Kept apart from `sent`, which holds only the latest per script.
-    sent_entries: std::collections::BTreeMap<EntryKey, u64>,
-    /// Whether the seller has been told a request is going unread.
+    /// When each entry now in the inbox was first seen here, and whose it is.
+    first_seen: std::collections::BTreeMap<EntryKey, (GhostkeyId, u64)>,
+    /// Whether the seller has been told requests are going unread, so they are
+    /// told once for as long as it lasts.
     pub unread_notified: bool,
 }
 
@@ -364,7 +374,7 @@ impl InboxTracker {
             last_fetch_ms: None,
             fetches_without_state: 0,
             held_since_ms: None,
-            sent_entries: Default::default(),
+            first_seen: Default::default(),
             unread_notified: false,
         }
     }
@@ -375,23 +385,28 @@ impl InboxTracker {
             sent.observe(&state);
         }
         self.fetches_without_state = 0;
-        // An entry no longer in the inbox, and past its time to land, is gone.
-        self.sent_entries.retain(|key, sent_at| {
-            state.entries.contains_key(key) || now_ms < sent_at.saturating_add(LAND_GRACE_MS)
-        });
+        self.first_seen
+            .retain(|key, _| state.entries.contains_key(key));
+        for (key, entry) in &state.entries {
+            self.first_seen
+                .entry(*key)
+                .or_insert((entry.ghostkey, now_ms));
+        }
         self.state = Some(state);
         self.state_received_ms = Some(now_ms);
     }
 
-    /// Whether one of this tab's requests has sat unread in the inbox past
-    /// [`UNREAD_NOTICE_MS`].
-    pub fn request_long_unread(&self, now_ms: u64) -> bool {
-        let Some(state) = self.state.as_ref() else {
-            return false;
-        };
-        self.sent_entries.iter().any(|(key, sent_at)| {
-            state.entries.contains_key(key) && now_ms.saturating_sub(*sent_at) >= UNREAD_NOTICE_MS
-        })
+    /// Whether any of `ghostkeys`' requests has gone unread past
+    /// [`UNREAD_NOTICE_MS`], in either of the ways described there.
+    pub fn request_long_unread(&self, ghostkeys: &[GhostkeyId], now_ms: u64) -> bool {
+        let old = |since: u64| now_ms.saturating_sub(since) >= UNREAD_NOTICE_MS;
+        self.sent
+            .values()
+            .any(|s| !s.read && ghostkeys.contains(&s.ghostkey) && old(s.unread_since_ms))
+            || self
+                .first_seen
+                .values()
+                .any(|(ghostkey, seen)| ghostkeys.contains(ghostkey) && old(*seen))
     }
 
     /// Whether to fetch the inbox now: never served, or not heard from in
@@ -533,11 +548,16 @@ impl InboxTracker {
 
     /// Record that `entry`, signed for `pending`, has been sent.
     pub fn record_sent(&mut self, pending: &PendingInboxEntry, entry: &WireEntry, now_ms: u64) {
-        self.sent_entries.insert(entry.entry.key(), now_ms);
         let sent = SentWatch::sent(entry, now_ms);
         for script in &pending.scripts {
-            self.sent
-                .insert((pending.network, script.clone()), sent.clone());
+            let key = (pending.network, script.clone());
+            let mut this = sent.clone();
+            // A request sent while the last is still not seen read continues
+            // the run; one sent after a read starts afresh.
+            if let Some(previous) = self.sent.get(&key).filter(|p| !p.read) {
+                this.unread_since_ms = previous.unread_since_ms;
+            }
+            self.sent.insert(key, this);
         }
     }
 }
@@ -1323,41 +1343,91 @@ mod tests {
         );
     }
 
-    /// **A request left unread is not sent again, and after long enough it is
-    /// noticed.** Resending cannot help a node serving a stale copy, and could
-    /// only fill the Ghost Key's places with its own earlier entries.
+    /// **A request sitting unread holds its place, is not sent again however
+    /// long it sits, and is noticed after long enough.**
     #[test]
     fn a_request_left_unread_holds_its_place_and_is_noticed() {
         let gk = authority().mint();
+        let other = authority().mint();
         let mut inbox = open_inbox();
         let mut t = tracker_on(inbox.clone());
         let w: Vec<WatchWanted> = (0..70u8)
             .map(|n| wanted(BitcoinNetwork::Signet, n, 1))
             .collect();
         let plan = t.plan(gk.id(), &w, &[], T0);
-        let mut first = None;
         for r in &plan {
-            let e = send(&mut t, &mut inbox, &gk, r, T0);
-            first.get_or_insert(e);
+            send(&mut t, &mut inbox, &gk, r, T0);
         }
         let hours = T0 + UNREAD_NOTICE_MS;
+        for at in [hours - 1, hours, hours + 60 * 60 * 1000] {
+            t.on_state(inbox.clone(), at);
+            assert!(
+                t.plan(gk.id(), &w, &[], at).is_empty(),
+                "not resent at {at}"
+            );
+        }
         t.on_state(inbox.clone(), hours - 1);
-        assert!(!t.request_long_unread(hours - 1));
-        assert!(t.plan(gk.id(), &w, &[], hours - 1).is_empty(), "not resent");
-        t.on_state(inbox.clone(), hours);
-        assert!(t.request_long_unread(hours));
-
-        // A second entry for a script already sent does not hide the first.
-        let first = first.expect("sent");
-        assert!(inbox.entries.contains_key(&first.entry.key()));
-        bridge_reads(&mut inbox, &first);
-        t.on_state(inbox.clone(), hours + 1);
-        let second_only = inbox.entries.len();
-        assert_eq!(second_only, 1);
+        assert!(!t.request_long_unread(&[gk.id()], hours - 1));
+        assert!(t.request_long_unread(&[gk.id()], hours));
         assert!(
-            t.request_long_unread(hours + 1),
-            "the other is still unread"
+            !t.request_long_unread(&[other.id()], hours),
+            "only the keys asked about"
         );
+    }
+
+    /// **A request that keeps expiring unread is noticed**, though each one is
+    /// pruned by the floor before it has sat for long. A read ends the run.
+    #[test]
+    fn a_request_that_keeps_expiring_unread_is_noticed() {
+        let gk = authority().mint();
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let mut at = T0;
+        let mut floor = FLOOR;
+        while at < T0 + UNREAD_NOTICE_MS {
+            let plan = t.plan(gk.id(), &w, &[], at);
+            assert_eq!(plan.len(), 1, "sent again once the last expired");
+            send(&mut t, &mut inbox, &gk, &plan[0], at);
+            assert!(!t.request_long_unread(&[gk.id()], at));
+            // Three blocks pass; the entry, unread, falls below the floor.
+            at += 30 * 60 * 1000;
+            floor += 3;
+            raise_floor(&mut inbox, floor);
+            t.on_state(inbox.clone(), at);
+        }
+        assert!(t.request_long_unread(&[gk.id()], at));
+
+        let plan = t.plan(gk.id(), &w, &[], at);
+        let entry = send(&mut t, &mut inbox, &gk, &plan[0], at);
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone(), at + 1);
+        assert!(!t.request_long_unread(&[gk.id()], at + 1), "read");
+    }
+
+    /// **Entries left from before a reload are noticed too.** A new tracker
+    /// knows nothing it sent, but a stale copy still holds the key's places.
+    #[test]
+    fn entries_this_tab_did_not_send_are_noticed_when_they_sit_unread() {
+        let gk = authority().mint();
+        let w: Vec<WatchWanted> = (0..70u8)
+            .map(|n| wanted(BitcoinNetwork::Signet, n, 1))
+            .collect();
+        let mut inbox = open_inbox();
+        let mut before_reload = tracker_on(inbox.clone());
+        for r in &before_reload.plan(gk.id(), &w, &[], T0) {
+            send(&mut before_reload, &mut inbox, &gk, r, T0);
+        }
+
+        let mut t = tracker_on(inbox.clone());
+        assert!(
+            t.plan(gk.id(), &w, &[], T0).is_empty(),
+            "the places are held"
+        );
+        assert!(!t.request_long_unread(&[gk.id()], T0 + 1));
+        let later = T0 + UNREAD_NOTICE_MS;
+        t.on_state(inbox, later);
+        assert!(t.request_long_unread(&[gk.id()], later));
     }
 
     /// **A floor that stands still does not stop requests.** The bridge still
