@@ -452,6 +452,16 @@ impl BridgeGenerations {
     }
 }
 
+/// The wait before retry number `failures` (from 1) of a pointer that did not
+/// resolve: doubling from `first_ms`, capped at `max_ms`, then scaled by
+/// `jitter`, which the caller draws from `0.8..=1.2` so many tabs do not ask in
+/// step.
+pub fn retry_delay_ms(failures: u32, first_ms: u32, max_ms: u32, jitter: f64) -> u32 {
+    let doublings = failures.saturating_sub(1).min(8);
+    let base = first_ms.saturating_mul(1 << doublings).min(max_ms);
+    (f64::from(base) * jitter.clamp(0.8, 1.2)) as u32
+}
+
 /// A resolution for one artifact, from `prior`'s floor if it has settled
 /// before in this tab.
 ///
@@ -978,5 +988,18 @@ mod tests {
             assert!(g.is_pointer(&id));
         }
         assert!(!g.is_pointer(&ContractInstanceId::new([5u8; 32])));
+    }
+
+    #[test]
+    fn a_pointer_retry_waits_longer_each_time_up_to_a_cap_with_bounded_jitter() {
+        let delay = |n, j| retry_delay_ms(n, 30_000, 600_000, j);
+        assert_eq!(delay(1, 1.0), 30_000);
+        assert_eq!(delay(2, 1.0), 60_000);
+        assert_eq!(delay(3, 1.0), 120_000);
+        assert_eq!(delay(6, 1.0), 600_000, "capped");
+        assert_eq!(delay(u32::MAX, 1.0), 600_000, "no overflow");
+        assert_eq!(delay(1, 0.8), 24_000);
+        assert_eq!(delay(1, 1.2), 36_000);
+        assert_eq!(delay(1, 5.0), 36_000, "jitter is bounded");
     }
 }

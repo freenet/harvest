@@ -194,14 +194,25 @@ impl SentWatch {
 }
 
 /// Whether a watch request for a script should be sent now, given what this
-/// tab last sent about it (`None` if nothing) and the inbox as the node serves
-/// it.
+/// tab last sent about it (`None` if nothing), the inbox as the node serves it,
+/// and when that state arrived.
 ///
 /// Due when it was never sent, when the last request is old enough to renew,
 /// or when the last request left the inbox without the bridge having read it.
 /// Not due while a request is still waiting in the inbox, once the bridge is
 /// seen to have read it, or while a just-sent request may still be landing.
-pub fn watch_due(sent: Option<&SentWatch>, inbox: &InboxStateV1, now_ms: u64) -> bool {
+///
+/// "Still landing" is judged by the state, not the clock: a request is taken
+/// to have left unread only when a state that arrived [`LAND_GRACE_MS`] or more
+/// after it was sent does not hold it. Judged by the clock, a quiet inbox whose
+/// state has not changed since before the send would read every new request
+/// as dropped, and it would be sent again into the Ghost Key's second place.
+pub fn watch_due(
+    sent: Option<&SentWatch>,
+    inbox: &InboxStateV1,
+    state_received_ms: u64,
+    now_ms: u64,
+) -> bool {
     let Some(sent) = sent else {
         return true;
     };
@@ -212,7 +223,7 @@ pub fn watch_due(sent: Option<&SentWatch>, inbox: &InboxStateV1, now_ms: u64) ->
     if sent.read || inbox.is_removed(&sent.entry_key, sent.mainnet_height) {
         return false;
     }
-    if age < LAND_GRACE_MS {
+    if state_received_ms < sent.sent_at_ms.saturating_add(LAND_GRACE_MS) {
         return false;
     }
     !inbox.entries.contains_key(&sent.entry_key)
@@ -261,17 +272,41 @@ pub struct PendingInboxEntry {
 pub const SIGNATURE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// How old the inbox state may be and still be planned against. The floor
-/// advances about once a block, and an entry dated against a floor three
-/// blocks behind is dropped on arrival, so a state not heard from in this long
-/// may be one the entry would be dropped against.
+/// advances about once a mainnet block, and an entry dated against a floor
+/// three blocks behind is dropped on arrival, so a state not heard from in this
+/// long may be one the entry would be dropped against.
 pub const INBOX_STATE_FRESH_MS: u64 = 15 * 60 * 1000;
 
 /// How often the inbox is fetched again even with its subscription apparently
-/// live. A subscription can end without a word, and nothing else would notice.
+/// live. A subscription can end without a word, and a fetch re-subscribes. It
+/// does not prove the copy is current, since the node may answer from a copy
+/// it has stopped following: [`FLOOR_STALE_MS`] is what catches that.
 pub const INBOX_REFETCH_MS: u64 = 10 * 60 * 1000;
 
-/// How soon a fetch that brought nothing back may be tried again.
+/// How soon a fetch that brought nothing back may be tried again, doubled on
+/// each further fetch without a state up to [`INBOX_REFETCH_MS`].
 pub const INBOX_FETCH_RETRY_MS: u64 = 60 * 1000;
+
+/// How long the inbox floor may stand still before this tab's view of it is
+/// taken to be frozen.
+///
+/// The floor follows the mainnet tip, whatever network is being settled, and
+/// the bridge advances it about once a mainnet block. A node answers a read
+/// from the copy it holds, so a subscription that has quietly ended serves the
+/// same old floor for ever, and entries dated against it are dropped by every
+/// peer that has moved on while this tab sees them sitting in its own copy.
+/// Ninety minutes without a mainnet block happens about once in ten thousand
+/// windows; a bridge that has stopped is the other reason, and both deserve
+/// the same answer: stop sending, say so, and fetch again.
+pub const FLOOR_STALE_MS: u64 = 90 * 60 * 1000;
+
+/// How long the seller's own signing may hold watch requests back.
+///
+/// Watch requests wait while the seller signs something, because the
+/// delegate's refusals name no request. But some of the seller's pending
+/// states have no expiry, and one that never clears would otherwise stop every
+/// watch for the session without a word.
+pub const MAX_HOLD_FOR_USER_MS: u64 = 10 * 60 * 1000;
 
 /// The first wait after the delegate refuses to sign a watch request, doubled
 /// on each refusal after it up to [`MAX_SIGN_BACKOFF_MS`].
@@ -308,15 +343,28 @@ pub struct InboxTracker {
     last_made_at_ms: Option<u64>,
     /// When `state` last arrived.
     state_received_ms: Option<u64>,
-    /// When the inbox was last asked for.
+    /// When the inbox was last asked for, and how many times since a state
+    /// last arrived.
     last_fetch_ms: Option<u64>,
-    /// Consecutive refusals to sign, and the time before which nothing is
-    /// planned because of them.
-    sign_failures: u32,
+    fetches_without_state: u32,
+    /// The floor height last seen, and when it last went up.
+    floor_height: Option<u32>,
+    floor_advanced_ms: Option<u64>,
+    /// Whether the seller has been told the inbox looks frozen.
+    pub stale_notified: bool,
+    /// Refusals to sign, per Ghost Key, so one key that cannot sign neither
+    /// holds back nor resets another.
+    failures: std::collections::HashMap<GhostkeyId, SignFailures>,
+    /// Since when the seller's own signing has been holding requests back.
+    pub held_since_ms: Option<u64>,
+}
+
+/// One Ghost Key's refusals to sign a watch request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SignFailures {
+    count: u32,
     blocked_until_ms: u64,
-    /// Whether the seller has been told their watch requests are failing, so
-    /// they are told once rather than at every attempt.
-    pub failure_notified: bool,
+    notified: bool,
 }
 
 impl InboxTracker {
@@ -329,9 +377,12 @@ impl InboxTracker {
             last_made_at_ms: None,
             state_received_ms: None,
             last_fetch_ms: None,
-            sign_failures: 0,
-            blocked_until_ms: 0,
-            failure_notified: false,
+            fetches_without_state: 0,
+            floor_height: None,
+            floor_advanced_ms: None,
+            stale_notified: false,
+            failures: Default::default(),
+            held_since_ms: None,
         }
     }
 
@@ -340,43 +391,83 @@ impl InboxTracker {
         for sent in self.sent.values_mut() {
             sent.observe(&state);
         }
+        let height = state.floor.as_ref().map(|f| f.height);
+        if height.is_some() && height > self.floor_height {
+            self.floor_height = height;
+            self.floor_advanced_ms = Some(now_ms);
+            self.fetches_without_state = 0;
+            self.stale_notified = false;
+        } else if self.floor_advanced_ms.is_none() {
+            // The first state, or a state with no floor yet: the clock starts
+            // here so a floor that never appears is also found frozen.
+            self.floor_advanced_ms = Some(now_ms);
+        }
         self.state = Some(state);
         self.state_received_ms = Some(now_ms);
+    }
+
+    /// Whether the floor has stood still for [`FLOOR_STALE_MS`], so this tab's
+    /// copy of the inbox is not to be trusted to date an entry.
+    pub fn floor_stale(&self, now_ms: u64) -> bool {
+        self.floor_advanced_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) >= FLOOR_STALE_MS)
     }
 
     /// Whether to fetch the inbox now: never served, or not heard from in
     /// [`INBOX_REFETCH_MS`], and not already asked within
     /// [`INBOX_FETCH_RETRY_MS`]. A fetch that fails, or a node that has not
     /// found the inbox yet, is simply asked again.
+    ///
+    /// Also due, on the same spacing, while the floor looks frozen, since a
+    /// fetch re-subscribes. Fetches that bring nothing back are spaced further
+    /// apart each time, up to [`INBOX_REFETCH_MS`], so an inbox the network
+    /// cannot find yet is not asked for every minute.
     pub fn fetch_due(&self, now_ms: u64) -> bool {
-        let stale = self
+        let unheard = self
             .state_received_ms
             .is_none_or(|at| now_ms.saturating_sub(at) >= INBOX_REFETCH_MS);
+        let spacing = INBOX_FETCH_RETRY_MS
+            .saturating_mul(1u64 << self.fetches_without_state.min(8))
+            .min(INBOX_REFETCH_MS);
         let asked_recently = self
             .last_fetch_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) < INBOX_FETCH_RETRY_MS);
-        stale && !asked_recently
+            .is_some_and(|at| now_ms.saturating_sub(at) < spacing);
+        (unheard || self.floor_stale(now_ms)) && !asked_recently
     }
 
     pub fn note_fetch(&mut self, now_ms: u64) {
+        if self
+            .last_fetch_ms
+            .is_some_and(|at| self.state_received_ms.is_none_or(|got| got < at))
+        {
+            self.fetches_without_state = self.fetches_without_state.saturating_add(1);
+        }
         self.last_fetch_ms = Some(now_ms);
     }
 
-    /// The delegate would not sign, or signed with the wrong key. Hold off,
-    /// longer each time, rather than asking again at every look.
-    pub fn note_sign_failure(&mut self, now_ms: u64) {
-        let doublings = self.sign_failures.min(16);
-        self.sign_failures = self.sign_failures.saturating_add(1);
+    /// `ghostkey` would not sign, or signed with the wrong key. Hold its
+    /// requests off, longer each time. Returns whether the seller should be
+    /// told, which is only the first time until a signature succeeds.
+    pub fn note_sign_failure(&mut self, ghostkey: GhostkeyId, now_ms: u64) -> bool {
+        let f = self.failures.entry(ghostkey).or_default();
+        let doublings = f.count.min(16);
+        f.count = f.count.saturating_add(1);
         let wait = SIGN_BACKOFF_MS
             .saturating_mul(1u64 << doublings)
             .min(MAX_SIGN_BACKOFF_MS);
-        self.blocked_until_ms = now_ms.saturating_add(wait);
+        f.blocked_until_ms = now_ms.saturating_add(wait);
+        !std::mem::replace(&mut f.notified, true)
     }
 
-    pub fn note_sign_success(&mut self) {
-        self.sign_failures = 0;
-        self.blocked_until_ms = 0;
-        self.failure_notified = false;
+    pub fn note_sign_success(&mut self, ghostkey: GhostkeyId) {
+        self.failures.remove(&ghostkey);
+    }
+
+    /// Whether `ghostkey`'s requests are being held off after a refusal.
+    pub fn backing_off(&self, ghostkey: GhostkeyId, now_ms: u64) -> bool {
+        self.failures
+            .get(&ghostkey)
+            .is_some_and(|f| now_ms < f.blocked_until_ms)
     }
 
     /// The requests `ghostkey` should send now for `wanted`, most urgent first.
@@ -390,7 +481,9 @@ impl InboxTracker {
     /// Empty until the inbox has been served with a floor, and again whenever
     /// the served state is older than [`INBOX_STATE_FRESH_MS`]: an entry is
     /// dated against the floor, and one dated against a floor that has moved on
-    /// is dropped at once. Empty too while backing off after a refusal to sign.
+    /// is dropped at once. Empty too while the floor looks frozen (see
+    /// [`FLOOR_STALE_MS`]), and while this Ghost Key is backing off after a
+    /// refusal to sign.
     pub fn plan(
         &mut self,
         ghostkey: GhostkeyId,
@@ -398,15 +491,15 @@ impl InboxTracker {
         awaiting: &[&PendingInboxEntry],
         now_ms: u64,
     ) -> Vec<InboxRequest> {
-        if now_ms < self.blocked_until_ms {
+        if self.backing_off(ghostkey, now_ms) || self.floor_stale(now_ms) {
             return Vec::new();
         }
-        let fresh = self
+        let Some(received_ms) = self
             .state_received_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) < INBOX_STATE_FRESH_MS);
-        if !fresh {
+            .filter(|at| now_ms.saturating_sub(*at) < INBOX_STATE_FRESH_MS)
+        else {
             return Vec::new();
-        }
+        };
         let Some(state) = self.state.as_ref() else {
             return Vec::new();
         };
@@ -429,7 +522,7 @@ impl InboxTracker {
             .filter(|s| {
                 s.ghostkey == ghostkey
                     && !s.read
-                    && now_ms.saturating_sub(s.sent_at_ms) < LAND_GRACE_MS
+                    && received_ms < s.sent_at_ms.saturating_add(LAND_GRACE_MS)
                     && !in_inbox.contains(&s.entry_key)
                     && !state.is_removed(&s.entry_key, s.mainnet_height)
             })
@@ -450,7 +543,7 @@ impl InboxTracker {
             let repeated = due
                 .iter()
                 .any(|d| d.network == w.network && d.script == w.script);
-            if !signing && !repeated && watch_due(self.sent.get(&key), state, now_ms) {
+            if !signing && !repeated && watch_due(self.sent.get(&key), state, received_ms, now_ms) {
                 due.push(w);
             }
         }
@@ -568,6 +661,21 @@ pub(crate) mod test_support {
         state
             .apply_delta(&authority().params(bridge()), &delta)
             .expect("the inbox accepts the update");
+    }
+
+    /// The bridge moving its floor up to `height`, as it does each mainnet
+    /// block.
+    pub fn raise_floor(state: &mut InboxStateV1, height: u32) {
+        state
+            .apply_delta(
+                &authority().params(bridge()),
+                &InboxDelta {
+                    floor: Some(SignedFloor::sign(&bridge_key(), height)),
+                    entries: vec![],
+                    removals: vec![],
+                },
+            )
+            .expect("the bridge raises its floor");
     }
 
     /// A contract key for the test inbox. Its code hash is arbitrary: nothing
@@ -800,7 +908,7 @@ mod tests {
 
     #[test]
     fn a_script_never_asked_for_is_due() {
-        assert!(watch_due(None, &open_inbox(), T0));
+        assert!(watch_due(None, &open_inbox(), T0, T0));
     }
 
     #[test]
@@ -813,7 +921,12 @@ mod tests {
             entry.clone(),
         );
         let sent = SentWatch::sent(&entry, T0);
-        assert!(!watch_due(Some(&sent), &inbox, T0 + 10 * 60 * 1000));
+        assert!(!watch_due(
+            Some(&sent),
+            &inbox,
+            T0 + 10 * 60 * 1000,
+            T0 + 10 * 60 * 1000
+        ));
     }
 
     #[test]
@@ -821,7 +934,7 @@ mod tests {
         let entry = a_sent_entry();
         let sent = SentWatch::sent(&entry, T0);
         assert!(
-            !watch_due(Some(&sent), &open_inbox(), T0 + 1_000),
+            !watch_due(Some(&sent), &open_inbox(), T0 + 1_000, T0 + 1_000),
             "not in the inbox yet, but only a second old"
         );
     }
@@ -837,7 +950,12 @@ mod tests {
         );
         bridge_reads(&mut inbox, &entry);
         let sent = SentWatch::sent(&entry, T0);
-        assert!(!watch_due(Some(&sent), &inbox, T0 + 10 * 60 * 1000));
+        assert!(!watch_due(
+            Some(&sent),
+            &inbox,
+            T0 + 10 * 60 * 1000,
+            T0 + 10 * 60 * 1000
+        ));
     }
 
     #[test]
@@ -845,7 +963,12 @@ mod tests {
         let entry = a_sent_entry();
         let sent = SentWatch::sent(&entry, T0);
         assert!(
-            watch_due(Some(&sent), &open_inbox(), T0 + 10 * 60 * 1000),
+            watch_due(
+                Some(&sent),
+                &open_inbox(),
+                T0 + 10 * 60 * 1000,
+                T0 + 10 * 60 * 1000
+            ),
             "past the grace period, not in the inbox, never seen read"
         );
     }
@@ -879,11 +1002,11 @@ mod tests {
             "the floor has erased every trace of it"
         );
         assert!(
-            !watch_due(Some(&observed), &inbox, later),
+            !watch_due(Some(&observed), &inbox, later, later),
             "seen read: not resent"
         );
         assert!(
-            watch_due(Some(&unobserved), &inbox, later),
+            watch_due(Some(&unobserved), &inbox, later, later),
             "the same history, unobserved, would be resent"
         );
     }
@@ -896,9 +1019,15 @@ mod tests {
         assert!(!watch_due(
             Some(&sent),
             &open_inbox(),
+            T0 + RENEW_AFTER_MS - 1,
             T0 + RENEW_AFTER_MS - 1
         ));
-        assert!(watch_due(Some(&sent), &open_inbox(), T0 + RENEW_AFTER_MS));
+        assert!(watch_due(
+            Some(&sent),
+            &open_inbox(),
+            T0 + RENEW_AFTER_MS,
+            T0 + RENEW_AFTER_MS
+        ));
     }
 
     fn wanted(network: BitcoinNetwork, n: u8, anchor: u32) -> WatchWanted {
@@ -1138,6 +1267,7 @@ mod tests {
             t.plan(gk.id(), &w, &[], T0 + 60 * 60_000).is_empty(),
             "read, so not sent again once the evidence is pruned"
         );
+        raise_floor(&mut inbox, FLOOR + 72);
         t.on_state(inbox.clone(), T0 + RENEW_AFTER_MS);
         let renewal = t.plan(gk.id(), &w, &[], T0 + RENEW_AFTER_MS);
         assert_eq!(renewal.len(), 1, "renewed before the watch lapses");
@@ -1183,32 +1313,71 @@ mod tests {
         let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
         let mut t = tracker_on(open_inbox());
 
-        t.note_sign_failure(T0);
+        assert!(t.note_sign_failure(gk.id(), T0), "told the first time");
         assert!(t
             .plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS - 1)
             .is_empty());
         t.on_state(open_inbox(), T0 + SIGN_BACKOFF_MS);
         assert_eq!(t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).len(), 1);
 
-        t.note_sign_failure(T0);
+        assert!(!t.note_sign_failure(gk.id(), T0), "not told again");
         t.on_state(open_inbox(), T0 + SIGN_BACKOFF_MS);
         assert!(
             t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).is_empty(),
             "doubled"
         );
 
-        t.note_sign_success();
-        assert!(!t.failure_notified);
+        t.note_sign_success(gk.id());
         assert_eq!(t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).len(), 1);
+        assert!(
+            t.note_sign_failure(gk.id(), T0),
+            "told again after a signature has worked"
+        );
 
         for _ in 0..40 {
-            t.note_sign_failure(T0);
+            t.note_sign_failure(gk.id(), T0);
         }
-        t.on_state(open_inbox(), T0 + MAX_SIGN_BACKOFF_MS);
+        let mut later = open_inbox();
+        raise_floor(&mut later, FLOOR + 36);
+        t.on_state(later, T0 + MAX_SIGN_BACKOFF_MS);
         assert_eq!(
             t.plan(gk.id(), &w, &[], T0 + MAX_SIGN_BACKOFF_MS).len(),
             1,
             "capped"
+        );
+    }
+
+    /// **One Ghost Key that cannot sign neither holds back nor resets
+    /// another.**
+    #[test]
+    fn a_refusal_backs_off_only_the_ghost_key_refused() {
+        let broken = authority().mint();
+        let healthy = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        t.note_sign_failure(broken.id(), T0);
+
+        assert!(t
+            .plan(
+                broken.id(),
+                &[wanted(BitcoinNetwork::Signet, 1, 1)],
+                &[],
+                T0
+            )
+            .is_empty());
+        assert_eq!(
+            t.plan(
+                healthy.id(),
+                &[wanted(BitcoinNetwork::Signet, 2, 1)],
+                &[],
+                T0
+            )
+            .len(),
+            1
+        );
+        t.note_sign_success(healthy.id());
+        assert!(
+            !t.note_sign_failure(broken.id(), T0),
+            "the healthy key's success does not reset the broken key's notice"
         );
     }
 
@@ -1227,5 +1396,68 @@ mod tests {
 
         let plan = t.plan(gk.id(), &w, &[], T0 + 1_000);
         assert_eq!(plan.len(), 1, "one place left, not none");
+    }
+
+    /// **Absence is judged by a state that arrived after the send had time to
+    /// land**, not by the clock. A quiet inbox whose last state predates the
+    /// send says nothing about whether the request arrived.
+    #[test]
+    fn a_request_is_not_taken_as_dropped_on_a_state_older_than_its_landing() {
+        let entry = a_sent_entry();
+        let sent = SentWatch::sent(&entry, T0);
+        let later = T0 + 30 * 60 * 1000;
+        assert!(
+            !watch_due(Some(&sent), &open_inbox(), T0 + LAND_GRACE_MS - 1, later),
+            "the only state seen could not have held it yet"
+        );
+        assert!(
+            watch_due(Some(&sent), &open_inbox(), T0 + LAND_GRACE_MS, later),
+            "a state that should hold it and does not"
+        );
+    }
+
+    /// **A floor that stands still is not trusted to date an entry**, and the
+    /// inbox is fetched again while it stands still.
+    #[test]
+    fn a_frozen_floor_pauses_planning_and_is_fetched_again() {
+        let gk = authority().mint();
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        t.note_fetch(T0);
+
+        let still = T0 + FLOOR_STALE_MS;
+        t.on_state(inbox.clone(), still);
+        assert!(t.floor_stale(still), "the same floor, served afresh");
+        assert!(t.plan(gk.id(), &w, &[], still).is_empty());
+        assert!(t.fetch_due(still), "fetched again though a state just came");
+
+        raise_floor(&mut inbox, FLOOR + 1);
+        t.on_state(inbox, still + 1);
+        assert!(!t.floor_stale(still + 1));
+        assert_eq!(t.plan(gk.id(), &w, &[], still + 1).len(), 1);
+    }
+
+    #[test]
+    fn fetches_that_bring_nothing_back_are_spaced_further_apart() {
+        let mut t = InboxTracker::new(bridge(), inbox_key());
+        t.note_fetch(T0);
+        let second = T0 + INBOX_FETCH_RETRY_MS;
+        assert!(t.fetch_due(second));
+        t.note_fetch(second);
+        assert!(
+            !t.fetch_due(second + INBOX_FETCH_RETRY_MS),
+            "the second wait is longer than the first"
+        );
+        assert!(t.fetch_due(second + 2 * INBOX_FETCH_RETRY_MS));
+
+        let mut at = second;
+        for _ in 0..20 {
+            at += INBOX_REFETCH_MS;
+            assert!(t.fetch_due(at), "never spaced past the refetch interval");
+            t.note_fetch(at);
+        }
+        t.on_state(open_inbox(), at + 1);
+        assert!(!t.fetch_due(at + INBOX_FETCH_RETRY_MS), "served");
     }
 }

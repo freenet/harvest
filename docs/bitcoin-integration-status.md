@@ -82,31 +82,40 @@ anyway (#29).
   generation resolves, `order_for_invoice` refuses to issue an invoice (#30).
 - **What is sent.** `state::AppState::watches_wanted` picks the seller's own
   unpaid, anchored orders that name the bridge, up to a day of blocks past the
-  payable window. `bitcoin_inbox::InboxTracker::plan` batches them. Each request
-  is sealed to the store's verified seller key, signed by the ghostkey delegate,
-  and submitted with the floor it was dated against. It is renewed every 12h,
+  payable window, and only under a Ghost Key the vault has listed for this app,
+  so signing never raises a prompt. `bitcoin_inbox::InboxTracker::plan` batches
+  them. Each request is sealed to the bridge, bound to the store's verified
+  seller key, signed by the ghostkey delegate, and submitted with the floor it
+  was dated against. It is renewed every 12h,
   since a watch lasts about a day, and sent again if it left the inbox unread.
 - **What it leaves alone.** The inbox is fetched only by a node with an order
-  to watch. Background signing waits while the seller signs anything of their
-  own. A refusal that can only be about a watch request is handled without
-  touching the seller's work, is shown once, and backs off.
+  to watch. Background signing waits, for up to ten minutes, while the seller
+  signs anything of their own. A refusal that can only be about a watch request
+  is handled without touching the seller's work, is shown once per Ghost Key,
+  and backs that key off. An inbox whose floor has not moved for 90 minutes is
+  not sent to, since a node can keep serving a copy it has stopped following,
+  and the seller is told.
 
 Known limits:
 
 - **A payment mined before the bridge reads the request is not found.** The
   request carries the order's anchor as `scan_from_height`, but the bridge does
-  not act on it yet (freenet-bitcoin#7). In practice the request goes out within
-  about a minute of the invoice, and the bridge reads its inbox each block.
+  not act on it yet (freenet-bitcoin#7). Typically the request goes out within
+  about a minute of the invoice and the bridge polls its inbox every 30
+  seconds, but that is not a bound: a backoff after a refusal, the seller's own
+  signing, or a paused inbox all delay it.
 - **Tracking is in memory.** A reload sends every wanted request once more,
   which is an early renewal. Pointer floors are not persisted either, so on the
-  first resolve after a load a peer could serve a genuine but superseded pointer
-  until the next refresh.
+  first resolve after a load a peer could serve a genuine but superseded
+  pointer. A refresh may not correct that promptly: the node can answer it from
+  the copy it holds.
 - **What the inbox makes public.** The scripts are sealed to the bridge.
   Each entry names the Ghost Key that signed it, which is the store's public
   seller key, and the ciphertext length gives the number of scripts. So an
   observer can link a store to the bridge it uses and see when the seller's tab
-  sends requests. The payment addresses themselves were already public in the
-  store contract.
+  sends requests. Since only a node with open invoices fetches the inbox, its
+  subscription also tells peers on that path that this node has some. The
+  payment addresses themselves were already public in the store contract.
 
 **Manual watches are still not sent.** `WatchForm` builds a `WatchedPayment`,
 the delegate persists it privately, and nothing asks a bridge to synchronize

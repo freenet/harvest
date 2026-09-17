@@ -80,12 +80,11 @@ pub fn start() {
             gloo_timers::callback::Interval::new(WATCH_CHECK_EVERY_MS, || {
                 // Taking the state for writing re-renders the app, so only when
                 // this node could have something to send.
-                let idle = {
+                let could_act = {
                     use dioxus::prelude::ReadableExt;
-                    let app = APP_STATE.peek();
-                    app.bitcoin.inbox.is_none() || app.my_stores.is_empty()
+                    APP_STATE.peek().watch_check_could_act()
                 };
-                if !idle {
+                if could_act {
                     APP_STATE.write().send_due_watch_requests();
                 }
             })
@@ -204,6 +203,15 @@ fn settle(settled: Option<Resolve>) -> bool {
                 Resolve::Address => {}
             }
         }
+        Some(Err(Unresolved::Withdrawn)) => {
+            // Authoritative, and not retried: only a newer record, found by a
+            // refresh, lifts it.
+            warn!("the bridge has withdrawn its {artifact:?} contract");
+            FAILURES.with(|f| f.borrow_mut().remove(&artifact));
+            if artifact == Resolve::Inbox {
+                APP_STATE.write().withdraw_inbox();
+            }
+        }
         Some(Err(why)) => {
             warn!("the bridge's {artifact:?} generation did not resolve: {why:?}");
             let failures = FAILURES.with(|f| {
@@ -228,15 +236,14 @@ fn settle(settled: Option<Resolve>) -> bool {
     true
 }
 
-/// The wait before retry number `failures`: doubling from [`RETRY_AFTER_MS`],
-/// capped, then spread by up to a fifth either way.
+/// The wait before retry number `failures` of a pointer.
 fn retry_after_ms(failures: u32) -> u32 {
-    let doublings = failures.saturating_sub(1).min(8);
-    let base = RETRY_AFTER_MS
-        .saturating_mul(1 << doublings)
-        .min(MAX_RETRY_AFTER_MS);
-    let jitter = 0.8 + 0.4 * js_sys::Math::random();
-    (f64::from(base) * jitter) as u32
+    crate::bitcoin_generation::retry_delay_ms(
+        failures,
+        RETRY_AFTER_MS,
+        MAX_RETRY_AFTER_MS,
+        0.8 + 0.4 * js_sys::Math::random(),
+    )
 }
 
 /// Subscribe to the tip contract the resolved tip generation names, for every
