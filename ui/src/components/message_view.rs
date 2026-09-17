@@ -645,7 +645,7 @@ fn Unavailable(why: String) -> Element {
         p { class: "text-warning", "{why}" }
         p { class: "text-muted",
             style: "font-size: 0.85rem;",
-            "Use whatever contact route the store's notes give you instead."
+            "Use whatever contact route the store's description gives you instead."
         }
     }
 }

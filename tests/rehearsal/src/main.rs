@@ -197,7 +197,6 @@ fn make_info(sk: &SigningKey, fingerprint: &str, name: &str, version: u32) -> Au
         reputation_contract_id: [0xABu8; 32],
         store_name: name.to_string(),
         description: "A store planted at a predecessor generation".into(),
-        payment_instructions: "BTC: tb1qrehearsal".into(),
         encryption_public_key: None,
     };
     let (scoped_payload, signature) = scoped_sign(sk, &info);

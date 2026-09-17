@@ -452,6 +452,17 @@ fn StoreDetailsForm(
                     value: "{description}",
                     oninput: move |e| description.set(e.value()),
                 }
+                // Said here because a feature nobody is told about is one
+                // nobody uses, and this is the only field a store has.
+                p { class: "text-muted", style: "font-size: 0.8rem;",
+                    "Markdown works here: "
+                    code { "# heading" }
+                    ", "
+                    code { "- list" }
+                    ", "
+                    code { "**bold**" }
+                    ", and links."
+                }
             }
 
             button {

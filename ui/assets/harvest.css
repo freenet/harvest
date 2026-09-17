@@ -344,41 +344,52 @@ h4 {
   line-height: 1.5;
 }
 
-/* A description is a seller's own markdown (see the UI's `markdown` module for
- * the subset). These keep it looking like part of the page: headings that read
- * as subheadings under the store's name rather than competing with it, and
- * blocks that do not inherit a paragraph's bottom margin twice. */
-.store-desc > :first-child {
+/* A store's or a listing's description is a seller's own markdown (see the
+ * UI's `markdown` module for the subset). These keep it looking like part of
+ * the page: headings that read as subheadings rather than competing with the
+ * store's name, and blocks that do not inherit a paragraph's bottom margin
+ * twice. */
+.store-desc > :first-child,
+.listing-desc > :first-child {
   margin-top: 0;
 }
 
-.store-desc > :last-child {
+.store-desc > :last-child,
+.listing-desc > :last-child {
   margin-bottom: 0;
 }
 
 .store-desc h4,
 .store-desc h5,
-.store-desc h6 {
+.store-desc h6,
+.listing-desc h4,
+.listing-desc h5,
+.listing-desc h6 {
   color: var(--text-primary);
   font-size: 0.95rem;
   margin: var(--space-sm) 0 var(--space-xs);
 }
 
-.store-desc p {
+.store-desc p,
+.listing-desc p {
   margin: 0 0 var(--space-xs);
 }
 
 .store-desc ul,
-.store-desc ol {
+.store-desc ol,
+.listing-desc ul,
+.listing-desc ol {
   margin: 0 0 var(--space-xs);
   padding-left: 1.25rem;
 }
 
-.store-desc li {
+.store-desc li,
+.listing-desc li {
   margin: 0.1rem 0;
 }
 
-.store-desc code {
+.store-desc code,
+.listing-desc code {
   font-family: var(--font-mono);
   font-size: 0.85em;
   background: var(--bg-card-hover);
@@ -386,7 +397,8 @@ h4 {
   border-radius: 3px;
 }
 
-.store-desc pre {
+.store-desc pre,
+.listing-desc pre {
   background: var(--bg-card-hover);
   border-radius: var(--radius);
   padding: 0.5rem 0.65rem;
@@ -394,25 +406,29 @@ h4 {
   margin: 0 0 var(--space-xs);
 }
 
-.store-desc pre code {
+.store-desc pre code,
+.listing-desc pre code {
   background: none;
   padding: 0;
 }
 
-.store-desc blockquote {
+.store-desc blockquote,
+.listing-desc blockquote {
   margin: 0 0 var(--space-xs);
   padding-left: 0.75rem;
   border-left: 2px solid var(--border);
   color: var(--text-muted);
 }
 
-.store-desc hr {
+.store-desc hr,
+.listing-desc hr {
   border: none;
   border-top: 1px solid var(--border);
   margin: var(--space-sm) 0;
 }
 
-.store-desc a {
+.store-desc a,
+.listing-desc a {
   color: var(--accent);
 }
 

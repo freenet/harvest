@@ -294,7 +294,10 @@ fn ListingCard(
                     "This listing's ghostkey certificate is not this seller's."
                 }
             }
-            p { class: "listing-desc", "{l.description}" }
+            crate::markdown::Markdown {
+                source: l.description.clone(),
+                class: "listing-desc",
+            }
             div { class: "listing-footer",
                 if let Some(ref price) = l.price {
                     span { class: "listing-price", "{price.amount} {price.currency}" }
@@ -422,7 +425,10 @@ fn example_listings_section() -> Element {
                             h4 { "{title}" }
                             span { class: "badge {kind_badge_class(&kind)}", "{kind_label(&kind)}" }
                         }
-                        p { class: "listing-desc", "{desc}" }
+                        crate::markdown::Markdown {
+                            source: desc.clone(),
+                            class: "listing-desc",
+                        }
                         if let Some(ref p) = price {
                             p { class: "listing-price", "{p.amount} {p.currency}" }
                         }
