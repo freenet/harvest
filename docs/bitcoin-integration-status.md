@@ -83,18 +83,21 @@ anyway (#29).
 - **What is sent.** `state::AppState::watches_wanted` picks the seller's own
   unpaid, anchored orders that name the bridge, up to a day of blocks past the
   payable window, and only under a Ghost Key the vault has listed for this app,
-  so signing never raises a prompt. `bitcoin_inbox::InboxTracker::plan` batches
-  them. Each request is sealed to the bridge, bound to the store's verified
-  seller key, signed by the ghostkey delegate, and submitted with the floor it
-  was dated against. It is renewed every 12h,
-  since a watch lasts about a day, and sent again if it left the inbox unread.
+  whose grant includes signing, so signing raises no prompt.
+  `bitcoin_inbox::InboxTracker::plan` batches them. Each request is sealed to
+  the bridge, bound to the store's verified seller key, signed by the ghostkey
+  delegate, and submitted with the floor it was dated against. It is renewed
+  every 12h, since a watch lasts about a day. It is sent again if it left the
+  inbox unread, or has sat there unread for half an hour, which the bridge
+  (polling every 30 seconds) would not allow if it could read it.
 - **What it leaves alone.** The inbox is fetched only by a node with an order
-  to watch. Background signing waits, for up to ten minutes, while the seller
-  signs anything of their own. A refusal that can only be about a watch request
-  is handled without touching the seller's work, is shown once per Ghost Key,
-  and backs that key off. An inbox whose floor has not moved for 90 minutes is
-  not sent to, since a node can keep serving a copy it has stopped following,
-  and the seller is told.
+  to watch. Background signing waits, for up to ten minutes at a stretch, while
+  the seller signs anything of their own, and goes one Ghost Key at a time. If
+  the vault refuses a watch request, does not answer it, or signs it with the
+  wrong key, that key is not asked again until the page is reloaded, and the
+  seller is told once. The usual cause is a grant revoked while the tab was
+  open, and asking again would put the vault's dialog in front of the seller
+  over and over. A withdrawn inbox is told to the seller too.
 
 Known limits:
 
@@ -102,8 +105,8 @@ Known limits:
   request carries the order's anchor as `scan_from_height`, but the bridge does
   not act on it yet (freenet-bitcoin#7). Typically the request goes out within
   about a minute of the invoice and the bridge polls its inbox every 30
-  seconds, but that is not a bound: a backoff after a refusal, the seller's own
-  signing, or a paused inbox all delay it.
+  seconds, but that is not a bound: the seller's own signing, a key the vault
+  refused, or a request the network dropped all delay it.
 - **Tracking is in memory.** A reload sends every wanted request once more,
   which is an early renewal. Pointer floors are not persisted either, so on the
   first resolve after a load a peer could serve a genuine but superseded

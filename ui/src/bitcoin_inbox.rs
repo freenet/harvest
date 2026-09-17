@@ -198,7 +198,8 @@ impl SentWatch {
 /// and when that state arrived.
 ///
 /// Due when it was never sent, when the last request is old enough to renew,
-/// or when the last request left the inbox without the bridge having read it.
+/// when the last request left the inbox without the bridge having read it, or
+/// when it has sat there unread past [`UNREAD_TOO_LONG_MS`].
 /// Not due while a request is still waiting in the inbox, once the bridge is
 /// seen to have read it, or while a just-sent request may still be landing.
 ///
@@ -226,7 +227,7 @@ pub fn watch_due(
     if state_received_ms < sent.sent_at_ms.saturating_add(LAND_GRACE_MS) {
         return false;
     }
-    !inbox.entries.contains_key(&sent.entry_key)
+    !inbox.entries.contains_key(&sent.entry_key) || age >= UNREAD_TOO_LONG_MS
 }
 
 /// A script a seller wants the bridge to watch, because an unpaid order of
@@ -267,8 +268,10 @@ pub struct PendingInboxEntry {
 }
 
 /// How long a request may wait on the delegate's signature before it is given
-/// up. Longer than a person takes to answer a prompt, and short enough that a
-/// lost answer does not stop a seller's watches for the rest of the session.
+/// up. Longer than a person takes to answer a prompt. A signature with a grant
+/// in place comes back at once, so a wait this long means the vault is showing
+/// a prompt or the answer was lost, and the key is not asked again this session
+/// (see `AppState::stop_watch_requests_for`).
 pub const SIGNATURE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// How old the inbox state may be and still be planned against. The floor
@@ -278,40 +281,35 @@ pub const SIGNATURE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const INBOX_STATE_FRESH_MS: u64 = 15 * 60 * 1000;
 
 /// How often the inbox is fetched again even with its subscription apparently
-/// live. A subscription can end without a word, and a fetch re-subscribes. It
-/// does not prove the copy is current, since the node may answer from a copy
-/// it has stopped following: [`FLOOR_STALE_MS`] is what catches that.
+/// live. A subscription can end without a word, and a fetch re-subscribes.
 pub const INBOX_REFETCH_MS: u64 = 10 * 60 * 1000;
 
 /// How soon a fetch that brought nothing back may be tried again, doubled on
 /// each further fetch without a state up to [`INBOX_REFETCH_MS`].
 pub const INBOX_FETCH_RETRY_MS: u64 = 60 * 1000;
 
-/// How long the inbox floor may stand still before this tab's view of it is
-/// taken to be frozen.
+/// How long one of this tab's requests may sit unread in the inbox before it
+/// is taken not to be read at all, and sent again.
 ///
-/// The floor follows the mainnet tip, whatever network is being settled, and
-/// the bridge advances it about once a mainnet block. A node answers a read
-/// from the copy it holds, so a subscription that has quietly ended serves the
-/// same old floor for ever, and entries dated against it are dropped by every
-/// peer that has moved on while this tab sees them sitting in its own copy.
-/// Ninety minutes without a mainnet block happens about once in ten thousand
-/// windows; a bridge that has stopped is the other reason, and both deserve
-/// the same answer: stop sending, say so, and fetch again.
-pub const FLOOR_STALE_MS: u64 = 90 * 60 * 1000;
+/// The bridge polls its inbox every 30 seconds, so a request unread for this
+/// long is one it is not going to read: the floor has passed it everywhere but
+/// in this node's copy, which can keep serving a copy it has stopped following,
+/// or the bridge is not running. Left counted, two such entries would hold the
+/// Ghost Key's places for ever and no request would go out again. Sent again,
+/// the cost is one signature every half hour while the fault lasts. Nothing is
+/// paused on a floor that stands still: the bridge still reads entries dated
+/// against its floor while its mainnet node is down, and pausing would lose
+/// exactly those watches.
+pub const UNREAD_TOO_LONG_MS: u64 = 30 * 60 * 1000;
 
 /// How long the seller's own signing may hold watch requests back.
 ///
-/// Watch requests wait while the seller signs something, because the
+/// Watch requests wait while the seller signs something, because most of the
 /// delegate's refusals name no request. But some of the seller's pending
 /// states have no expiry, and one that never clears would otherwise stop every
-/// watch for the session without a word.
+/// watch for the session without a word. The hold is continuous: it restarts
+/// whenever a check finds nothing of the seller's under way.
 pub const MAX_HOLD_FOR_USER_MS: u64 = 10 * 60 * 1000;
-
-/// The first wait after the delegate refuses to sign a watch request, doubled
-/// on each refusal after it up to [`MAX_SIGN_BACKOFF_MS`].
-pub const SIGN_BACKOFF_MS: u64 = 5 * 60 * 1000;
-pub const MAX_SIGN_BACKOFF_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// One bridge inbox as this tab sees it, and what this tab has sent to it.
 ///
@@ -347,24 +345,8 @@ pub struct InboxTracker {
     /// last arrived.
     last_fetch_ms: Option<u64>,
     fetches_without_state: u32,
-    /// The floor height last seen, and when it last went up.
-    floor_height: Option<u32>,
-    floor_advanced_ms: Option<u64>,
-    /// Whether the seller has been told the inbox looks frozen.
-    pub stale_notified: bool,
-    /// Refusals to sign, per Ghost Key, so one key that cannot sign neither
-    /// holds back nor resets another.
-    failures: std::collections::HashMap<GhostkeyId, SignFailures>,
     /// Since when the seller's own signing has been holding requests back.
     pub held_since_ms: Option<u64>,
-}
-
-/// One Ghost Key's refusals to sign a watch request.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SignFailures {
-    count: u32,
-    blocked_until_ms: u64,
-    notified: bool,
 }
 
 impl InboxTracker {
@@ -378,10 +360,6 @@ impl InboxTracker {
             state_received_ms: None,
             last_fetch_ms: None,
             fetches_without_state: 0,
-            floor_height: None,
-            floor_advanced_ms: None,
-            stale_notified: false,
-            failures: Default::default(),
             held_since_ms: None,
         }
     }
@@ -391,26 +369,9 @@ impl InboxTracker {
         for sent in self.sent.values_mut() {
             sent.observe(&state);
         }
-        let height = state.floor.as_ref().map(|f| f.height);
-        if height.is_some() && height > self.floor_height {
-            self.floor_height = height;
-            self.floor_advanced_ms = Some(now_ms);
-            self.fetches_without_state = 0;
-            self.stale_notified = false;
-        } else if self.floor_advanced_ms.is_none() {
-            // The first state, or a state with no floor yet: the clock starts
-            // here so a floor that never appears is also found frozen.
-            self.floor_advanced_ms = Some(now_ms);
-        }
+        self.fetches_without_state = 0;
         self.state = Some(state);
         self.state_received_ms = Some(now_ms);
-    }
-
-    /// Whether the floor has stood still for [`FLOOR_STALE_MS`], so this tab's
-    /// copy of the inbox is not to be trusted to date an entry.
-    pub fn floor_stale(&self, now_ms: u64) -> bool {
-        self.floor_advanced_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) >= FLOOR_STALE_MS)
     }
 
     /// Whether to fetch the inbox now: never served, or not heard from in
@@ -418,10 +379,9 @@ impl InboxTracker {
     /// [`INBOX_FETCH_RETRY_MS`]. A fetch that fails, or a node that has not
     /// found the inbox yet, is simply asked again.
     ///
-    /// Also due, on the same spacing, while the floor looks frozen, since a
-    /// fetch re-subscribes. Fetches that bring nothing back are spaced further
-    /// apart each time, up to [`INBOX_REFETCH_MS`], so an inbox the network
-    /// cannot find yet is not asked for every minute.
+    /// Fetches that bring nothing back are spaced further apart each time, up
+    /// to [`INBOX_REFETCH_MS`], so an inbox the network cannot find yet is not
+    /// asked for every minute.
     pub fn fetch_due(&self, now_ms: u64) -> bool {
         let unheard = self
             .state_received_ms
@@ -432,7 +392,7 @@ impl InboxTracker {
         let asked_recently = self
             .last_fetch_ms
             .is_some_and(|at| now_ms.saturating_sub(at) < spacing);
-        (unheard || self.floor_stale(now_ms)) && !asked_recently
+        unheard && !asked_recently
     }
 
     pub fn note_fetch(&mut self, now_ms: u64) {
@@ -443,31 +403,6 @@ impl InboxTracker {
             self.fetches_without_state = self.fetches_without_state.saturating_add(1);
         }
         self.last_fetch_ms = Some(now_ms);
-    }
-
-    /// `ghostkey` would not sign, or signed with the wrong key. Hold its
-    /// requests off, longer each time. Returns whether the seller should be
-    /// told, which is only the first time until a signature succeeds.
-    pub fn note_sign_failure(&mut self, ghostkey: GhostkeyId, now_ms: u64) -> bool {
-        let f = self.failures.entry(ghostkey).or_default();
-        let doublings = f.count.min(16);
-        f.count = f.count.saturating_add(1);
-        let wait = SIGN_BACKOFF_MS
-            .saturating_mul(1u64 << doublings)
-            .min(MAX_SIGN_BACKOFF_MS);
-        f.blocked_until_ms = now_ms.saturating_add(wait);
-        !std::mem::replace(&mut f.notified, true)
-    }
-
-    pub fn note_sign_success(&mut self, ghostkey: GhostkeyId) {
-        self.failures.remove(&ghostkey);
-    }
-
-    /// Whether `ghostkey`'s requests are being held off after a refusal.
-    pub fn backing_off(&self, ghostkey: GhostkeyId, now_ms: u64) -> bool {
-        self.failures
-            .get(&ghostkey)
-            .is_some_and(|f| now_ms < f.blocked_until_ms)
     }
 
     /// The requests `ghostkey` should send now for `wanted`, most urgent first.
@@ -481,9 +416,7 @@ impl InboxTracker {
     /// Empty until the inbox has been served with a floor, and again whenever
     /// the served state is older than [`INBOX_STATE_FRESH_MS`]: an entry is
     /// dated against the floor, and one dated against a floor that has moved on
-    /// is dropped at once. Empty too while the floor looks frozen (see
-    /// [`FLOOR_STALE_MS`]), and while this Ghost Key is backing off after a
-    /// refusal to sign.
+    /// is dropped at once.
     pub fn plan(
         &mut self,
         ghostkey: GhostkeyId,
@@ -491,9 +424,6 @@ impl InboxTracker {
         awaiting: &[&PendingInboxEntry],
         now_ms: u64,
     ) -> Vec<InboxRequest> {
-        if self.backing_off(ghostkey, now_ms) || self.floor_stale(now_ms) {
-            return Vec::new();
-        }
         let Some(received_ms) = self
             .state_received_ms
             .filter(|at| now_ms.saturating_sub(*at) < INBOX_STATE_FRESH_MS)
@@ -509,11 +439,20 @@ impl InboxTracker {
 
         // A Ghost Key's third unread entry is dropped on arrival, so count
         // what already holds its places: unread entries in the inbox, entries
-        // sent but not yet seen landing, and entries not yet signed.
+        // sent but not yet seen landing, and entries not yet signed. An entry
+        // of this tab's left unread past `UNREAD_TOO_LONG_MS` is not counted:
+        // see there. One from another tab or device is, since its age is not
+        // known here.
+        let abandoned: std::collections::BTreeSet<EntryKey> = self
+            .sent
+            .values()
+            .filter(|s| now_ms.saturating_sub(s.sent_at_ms) >= UNREAD_TOO_LONG_MS)
+            .map(|s| s.entry_key)
+            .collect();
         let in_inbox: std::collections::BTreeSet<EntryKey> = state
             .entries
             .iter()
-            .filter(|(_, e)| e.ghostkey == ghostkey)
+            .filter(|(k, e)| e.ghostkey == ghostkey && !abandoned.contains(k))
             .map(|(k, _)| *k)
             .collect();
         let landing: std::collections::BTreeSet<EntryKey> = self
@@ -1307,80 +1246,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_refusal_to_sign_holds_off_longer_each_time_until_one_succeeds() {
-        let gk = authority().mint();
-        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
-        let mut t = tracker_on(open_inbox());
-
-        assert!(t.note_sign_failure(gk.id(), T0), "told the first time");
-        assert!(t
-            .plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS - 1)
-            .is_empty());
-        t.on_state(open_inbox(), T0 + SIGN_BACKOFF_MS);
-        assert_eq!(t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).len(), 1);
-
-        assert!(!t.note_sign_failure(gk.id(), T0), "not told again");
-        t.on_state(open_inbox(), T0 + SIGN_BACKOFF_MS);
-        assert!(
-            t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).is_empty(),
-            "doubled"
-        );
-
-        t.note_sign_success(gk.id());
-        assert_eq!(t.plan(gk.id(), &w, &[], T0 + SIGN_BACKOFF_MS).len(), 1);
-        assert!(
-            t.note_sign_failure(gk.id(), T0),
-            "told again after a signature has worked"
-        );
-
-        for _ in 0..40 {
-            t.note_sign_failure(gk.id(), T0);
-        }
-        let mut later = open_inbox();
-        raise_floor(&mut later, FLOOR + 36);
-        t.on_state(later, T0 + MAX_SIGN_BACKOFF_MS);
-        assert_eq!(
-            t.plan(gk.id(), &w, &[], T0 + MAX_SIGN_BACKOFF_MS).len(),
-            1,
-            "capped"
-        );
-    }
-
-    /// **One Ghost Key that cannot sign neither holds back nor resets
-    /// another.**
-    #[test]
-    fn a_refusal_backs_off_only_the_ghost_key_refused() {
-        let broken = authority().mint();
-        let healthy = authority().mint();
-        let mut t = tracker_on(open_inbox());
-        t.note_sign_failure(broken.id(), T0);
-
-        assert!(t
-            .plan(
-                broken.id(),
-                &[wanted(BitcoinNetwork::Signet, 1, 1)],
-                &[],
-                T0
-            )
-            .is_empty());
-        assert_eq!(
-            t.plan(
-                healthy.id(),
-                &[wanted(BitcoinNetwork::Signet, 2, 1)],
-                &[],
-                T0
-            )
-            .len(),
-            1
-        );
-        t.note_sign_success(healthy.id());
-        assert!(
-            !t.note_sign_failure(broken.id(), T0),
-            "the healthy key's success does not reset the broken key's notice"
-        );
-    }
-
     /// **An entry that has landed holds one place, not two**, though it is
     /// also still within its landing grace.
     #[test]
@@ -1416,28 +1281,6 @@ mod tests {
         );
     }
 
-    /// **A floor that stands still is not trusted to date an entry**, and the
-    /// inbox is fetched again while it stands still.
-    #[test]
-    fn a_frozen_floor_pauses_planning_and_is_fetched_again() {
-        let gk = authority().mint();
-        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
-        let mut inbox = open_inbox();
-        let mut t = tracker_on(inbox.clone());
-        t.note_fetch(T0);
-
-        let still = T0 + FLOOR_STALE_MS;
-        t.on_state(inbox.clone(), still);
-        assert!(t.floor_stale(still), "the same floor, served afresh");
-        assert!(t.plan(gk.id(), &w, &[], still).is_empty());
-        assert!(t.fetch_due(still), "fetched again though a state just came");
-
-        raise_floor(&mut inbox, FLOOR + 1);
-        t.on_state(inbox, still + 1);
-        assert!(!t.floor_stale(still + 1));
-        assert_eq!(t.plan(gk.id(), &w, &[], still + 1).len(), 1);
-    }
-
     #[test]
     fn fetches_that_bring_nothing_back_are_spaced_further_apart() {
         let mut t = InboxTracker::new(bridge(), inbox_key());
@@ -1459,5 +1302,62 @@ mod tests {
         }
         t.on_state(open_inbox(), at + 1);
         assert!(!t.fetch_due(at + INBOX_FETCH_RETRY_MS), "served");
+        let unheard = at + 1 + INBOX_REFETCH_MS;
+        assert!(t.fetch_due(unheard));
+        t.note_fetch(unheard);
+        assert!(
+            t.fetch_due(unheard + INBOX_FETCH_RETRY_MS),
+            "a state resets the spacing, so a new silence is retried promptly"
+        );
+    }
+
+    /// **A request left unread too long is sent again, and stops holding its
+    /// place.** A node serving a copy it stopped following would otherwise
+    /// keep the Ghost Key's two places filled for ever.
+    #[test]
+    fn a_request_left_unread_too_long_is_sent_again() {
+        let gk = authority().mint();
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let w: Vec<WatchWanted> = (0..70u8)
+            .map(|n| wanted(BitcoinNetwork::Signet, n, 1))
+            .collect();
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        for r in &plan {
+            send(&mut t, &mut inbox, &gk, r, T0);
+        }
+        let before = T0 + UNREAD_TOO_LONG_MS - 1;
+        t.on_state(inbox.clone(), before);
+        assert!(t.plan(gk.id(), &w, &[], before).is_empty(), "still waiting");
+
+        let after = T0 + UNREAD_TOO_LONG_MS;
+        t.on_state(inbox.clone(), after);
+        let again = t.plan(gk.id(), &w, &[], after);
+        assert_eq!(
+            again.len(),
+            MAX_ENTRIES_PER_GHOSTKEY,
+            "both places free again"
+        );
+        assert_eq!(again[0].scripts[0], ByteBuf(w[0].script.clone()), "resent");
+    }
+
+    /// **A floor that stands still does not stop requests.** The bridge still
+    /// reads entries dated against its floor while its mainnet node is down.
+    #[test]
+    fn a_floor_that_stands_still_does_not_stop_requests() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let hours_later = T0 + 6 * 60 * 60 * 1000;
+        t.on_state(open_inbox(), hours_later);
+        assert_eq!(
+            t.plan(
+                gk.id(),
+                &[wanted(BitcoinNetwork::Signet, 1, 1)],
+                &[],
+                hours_later
+            )
+            .len(),
+            1
+        );
     }
 }
