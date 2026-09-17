@@ -1233,6 +1233,113 @@ mod tests {
         }
     }
 
+    /// **A host that cannot be judged as written is not linked.**
+    ///
+    /// A browser percent-decodes the host before parsing it, so the text here
+    /// is not the host it will use: `%31%32%37.0.0.1` is 127.0.0.1, and
+    /// `%EF%BD%8C…` is `localhost` in fullwidth, which also walks past an
+    /// is-ASCII check because the URL text is ASCII. Judged against a real
+    /// WHATWG parser during review.
+    #[test]
+    fn a_host_written_so_it_cannot_be_judged_is_refused() {
+        for url in [
+            "http://%31%32%37.0.0.1:50509/",
+            "http://%31%32%37%2e0%2e0%2e1/",
+            "http://loc%61lhost/",
+            "http://%6c%6f%63%61%6c%68%6f%73%74:7509/",
+            "http://%EF%BD%8C%EF%BD%8F%EF%BD%83%EF%BD%81%EF%BD%8C%EF%BD%88%EF%BD%8F%EF%BD%93%EF%BD%94/",
+            // `host_of` splits on punctuation but not spaces, so this used to
+            // hand back a sentence as the "host" -- which then rendered in
+            // the app's own note style, in words the seller chose.
+            "https://Verified seller. Payment is safe.",
+            "https://this link was checked by Harvest",
+        ] {
+            assert_eq!(safe_href(url), None, "{url} cannot be judged as written");
+        }
+    }
+
+    /// The same families are refused in both address versions.
+    #[test]
+    fn ipv6_link_local_and_unique_local_are_refused_like_their_v4_kin() {
+        for url in [
+            "https://[fe80::1]/",
+            "https://[fd00::1]/",
+            "https://[fc00::1]/",
+        ] {
+            assert_eq!(safe_href(url), None, "{url}");
+        }
+        assert_eq!(safe_href("http://169.254.1.1/"), None, "the v4 equivalent");
+        // A public v6 address is still fine.
+        assert!(safe_href("https://[2606:4700::1111]/").is_some());
+    }
+
+    /// **The note must not cry wolf.** An indicator that fires on a version
+    /// number teaches a buyer to ignore it on the one that matters.
+    #[test]
+    fn ordinary_dotted_link_text_says_nothing() {
+        for text in [
+            "1.2.3",
+            "v1.2.3",
+            "etc.",
+            "$4.99",
+            "U.S.A.",
+            "e.g.",
+            "Fig.1",
+            "Ch.4",
+            "No.1",
+            "3.5mm",
+            "2026.09.17",
+            "see p.14",
+        ] {
+            let source = format!("[{text}](https://example.com/releases)");
+            let rendered = format!("{:?}", parse(&source));
+            assert!(
+                !rendered.contains("goes to"),
+                "{text:?} is not a claim about where the link goes: {rendered}"
+            );
+        }
+    }
+
+    /// And it must not fall silent for the phrasings a spoof would use.
+    #[test]
+    fn an_address_inside_a_sentence_or_written_with_a_lookalike_dot_still_counts() {
+        for source in [
+            "[Pay at https://freenet.org](https://evil.example/pay)",
+            // Fullwidth, ideographic and one-dot-leader full stops: all read
+            // as a domain, none of them ASCII `.`.
+            "[freenet\u{ff0e}org](https://evil.example/pay)",
+            "[freenet\u{3002}org](https://evil.example/pay)",
+            "[freenet\u{2024}org](https://evil.example/pay)",
+        ] {
+            let rendered = format!("{:?}", parse(source));
+            assert!(
+                rendered.contains("goes to evil.example"),
+                "{source} said nothing: {rendered}"
+            );
+        }
+    }
+
+    /// **Flattening is not the same claim as cutting**, and the marker used
+    /// to make the wrong one: every character survives a flatten.
+    #[test]
+    fn flattened_nesting_does_not_claim_the_text_was_cut() {
+        let deep = format!("{}deep words survive", ">".repeat(40));
+        let blocks = parse(&deep);
+        let rendered = format!("{blocks:?}");
+        assert!(
+            rendered.contains("deep words survive"),
+            "nothing was lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("too deeply nested"),
+            "and the reader is told why it reads differently: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the rest of this description is not shown"),
+            "but not told something was cut, because nothing was: {rendered}"
+        );
+    }
+
     /// **A link whose text claims one address and goes to another says so.**
     #[test]
     fn a_link_that_disagrees_with_its_own_text_names_its_destination() {
