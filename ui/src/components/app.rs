@@ -42,11 +42,6 @@ pub fn App() -> Element {
                 // neither delegate to read a store.
                 crate::store_link::open_store_from_url();
 
-                // Find out which generation of the bridge's address contract and
-                // request inbox to use. Needs only the websocket, and no invoice
-                // can be issued until the address generation resolves.
-                crate::gateway::bitcoin_generation_ops::start();
-
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
                 match crate::gateway::register_delegate(harvest_wasm).await {
                     Ok(key) => {
@@ -165,6 +160,15 @@ pub fn App() -> Element {
                         );
                     }
                 }
+
+                // Find out which generation of the bridge's address contract,
+                // request inbox and tip to use. Needs only the websocket, and no
+                // invoice can be issued until the address generation resolves.
+                // Started here, just before the loop that reads the answers,
+                // because a pointer GET's timeout starts when it is sent: begun
+                // before the delegates above were registered, a slow
+                // registration would time every first attempt out unanswered.
+                crate::gateway::bitcoin_generation_ops::start();
 
                 dioxus::logger::tracing::info!("Starting response loop");
                 while let Some(response) = rx.next().await {

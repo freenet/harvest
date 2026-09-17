@@ -26,8 +26,15 @@ use super::APP_STATE;
 /// advice for a GET of a small contract.
 const POINTER_TIMEOUT_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as u32;
 
-/// How long to wait before asking again after a failure worth retrying.
+/// How long to wait before asking again after the first failure worth
+/// retrying. Doubled on each consecutive failure of the same pointer, up to
+/// [`MAX_RETRY_AFTER_MS`], with jitter so many tabs do not ask in step.
 const RETRY_AFTER_MS: u32 = 30_000;
+const MAX_RETRY_AFTER_MS: u32 = 10 * 60_000;
+
+/// How often every settled pointer is asked again, so a bridge that redeploys
+/// while this tab is open is followed. See `BridgeGenerations::refresh`.
+const REFRESH_EVERY_MS: u32 = 10 * 60_000;
 
 /// How often to look for watch requests that have come due with nothing else
 /// changing: a renewal, or a request whose time to land has passed. Only
@@ -37,6 +44,8 @@ const WATCH_CHECK_EVERY_MS: u32 = 60_000;
 thread_local! {
     static GENERATIONS: RefCell<Option<BridgeGenerations>> = const { RefCell::new(None) };
     static WATCH_CHECK: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
+    static REFRESH: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
+    static FAILURES: RefCell<std::collections::HashMap<Resolve, u32>> = RefCell::new(Default::default());
 }
 
 /// Begin resolving the trusted bridge's pointers.
@@ -69,7 +78,32 @@ pub fn start() {
     WATCH_CHECK.with(|timer| {
         timer.borrow_mut().get_or_insert_with(|| {
             gloo_timers::callback::Interval::new(WATCH_CHECK_EVERY_MS, || {
-                APP_STATE.write().send_due_watch_requests();
+                // Taking the state for writing re-renders the app, so only when
+                // this node could have something to send.
+                let idle = {
+                    use dioxus::prelude::ReadableExt;
+                    let app = APP_STATE.peek();
+                    app.bitcoin.inbox.is_none() || app.my_stores.is_empty()
+                };
+                if !idle {
+                    APP_STATE.write().send_due_watch_requests();
+                }
+            })
+        });
+    });
+    REFRESH.with(|timer| {
+        timer.borrow_mut().get_or_insert_with(|| {
+            gloo_timers::callback::Interval::new(REFRESH_EVERY_MS, || {
+                let due = GENERATIONS.with(|g| {
+                    g.borrow_mut().as_mut().is_some_and(|g| {
+                        Resolve::ALL
+                            .into_iter()
+                            .fold(false, |due, artifact| g.refresh(artifact) || due)
+                    })
+                });
+                if due {
+                    send_due();
+                }
             })
         });
     });
@@ -82,13 +116,19 @@ pub fn start() {
 pub fn deliver_state(id: &ContractInstanceId, bytes: &[u8]) -> bool {
     let settled =
         GENERATIONS.with(|g| g.borrow_mut().as_mut().and_then(|g| g.on_state(*id, bytes)));
-    settle(settled)
+    settle(settled) || is_pointer(id)
 }
 
 /// Offer the node's positive answer that nothing is stored at `id`.
 pub fn deliver_absent(id: &ContractInstanceId) -> bool {
     let settled = GENERATIONS.with(|g| g.borrow_mut().as_mut().and_then(|g| g.on_absent(*id)));
-    settle(settled)
+    settle(settled) || is_pointer(id)
+}
+
+/// A pointer's answer that settles nothing, arriving late or unasked, is still
+/// a pointer record and not app state.
+fn is_pointer(id: &ContractInstanceId) -> bool {
+    GENERATIONS.with(|g| g.borrow().as_ref().is_some_and(|g| g.is_pointer(id)))
 }
 
 fn deliver_unreachable(request: PointerRequest) {
@@ -148,6 +188,7 @@ fn settle(settled: Option<Resolve>) -> bool {
     let status = GENERATIONS.with(|g| g.borrow().as_ref().map(|g| g.status(artifact)));
     match status {
         Some(Ok(code_hash)) => {
+            FAILURES.with(|f| f.borrow_mut().remove(&artifact));
             info!(
                 "the bridge's {artifact:?} generation resolved: {}",
                 hex::encode(&code_hash[..8])
@@ -165,7 +206,13 @@ fn settle(settled: Option<Resolve>) -> bool {
         }
         Some(Err(why)) => {
             warn!("the bridge's {artifact:?} generation did not resolve: {why:?}");
-            gloo_timers::callback::Timeout::new(RETRY_AFTER_MS, move || {
+            let failures = FAILURES.with(|f| {
+                let mut f = f.borrow_mut();
+                let n = f.entry(artifact).or_insert(0);
+                *n = n.saturating_add(1);
+                *n
+            });
+            gloo_timers::callback::Timeout::new(retry_after_ms(failures), move || {
                 // `retry` declines a withdrawal, so this asks again only when
                 // asking again could change the answer.
                 let due = GENERATIONS
@@ -179,6 +226,17 @@ fn settle(settled: Option<Resolve>) -> bool {
         None => {}
     }
     true
+}
+
+/// The wait before retry number `failures`: doubling from [`RETRY_AFTER_MS`],
+/// capped, then spread by up to a fifth either way.
+fn retry_after_ms(failures: u32) -> u32 {
+    let doublings = failures.saturating_sub(1).min(8);
+    let base = RETRY_AFTER_MS
+        .saturating_mul(1 << doublings)
+        .min(MAX_RETRY_AFTER_MS);
+    let jitter = 0.8 + 0.4 * js_sys::Math::random();
+    (f64::from(base) * jitter) as u32
 }
 
 /// Subscribe to the tip contract the resolved tip generation names, for every

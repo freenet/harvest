@@ -43,7 +43,7 @@ use freenet_migrate::pointer::{PointerFloor, PointerOutcome, PointerResolver};
 use freenet_stdlib::prelude::ContractInstanceId;
 
 /// The bridge contracts Harvest needs a generation for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Resolve {
     /// Where the bridge publishes what it has seen paid to an address.
     Address,
@@ -174,11 +174,48 @@ enum Slot {
         asked: bool,
         /// Which attempt this is. See [`PointerRequest::attempt`].
         attempt: u32,
+        /// What was settled before this attempt, for a refresh. It stays in
+        /// force while the refresh is out, and again if the refresh learns
+        /// nothing: a pointer that did not answer this time has not been
+        /// withdrawn.
+        prior: Option<Settled>,
     },
     Resolved {
         code_hash: [u8; 32],
+        floor: PointerFloor,
+    },
+    Withdrawn {
+        floor: PointerFloor,
     },
     Failed(Unresolved),
+}
+
+/// A settled answer, kept while a refresh asks again.
+#[derive(Clone, Copy, Debug)]
+enum Settled {
+    Resolved {
+        code_hash: [u8; 32],
+        floor: PointerFloor,
+    },
+    Withdrawn {
+        floor: PointerFloor,
+    },
+}
+
+impl Settled {
+    fn into_slot(self) -> Slot {
+        match self {
+            Settled::Resolved { code_hash, floor } => Slot::Resolved { code_hash, floor },
+            Settled::Withdrawn { floor } => Slot::Withdrawn { floor },
+        }
+    }
+
+    fn status(&self) -> Result<[u8; 32], Unresolved> {
+        match self {
+            Settled::Resolved { code_hash, .. } => Ok(*code_hash),
+            Settled::Withdrawn { .. } => Err(Unresolved::Withdrawn),
+        }
+    }
 }
 
 /// A pointer contract to GET, and the attempt the GET belongs to.
@@ -243,6 +280,7 @@ impl BridgeGenerations {
                 resolver,
                 asked,
                 attempt,
+                ..
             } = slot
             {
                 if !*asked {
@@ -285,9 +323,13 @@ impl BridgeGenerations {
     /// The code hash to derive `artifact`'s address from, or why there is none.
     pub fn status(&self, artifact: Resolve) -> Result<[u8; 32], Unresolved> {
         match self.slot(artifact) {
-            Slot::Resolved { code_hash } => Ok(*code_hash),
+            Slot::Resolved { code_hash, .. } => Ok(*code_hash),
+            Slot::Withdrawn { .. } => Err(Unresolved::Withdrawn),
             Slot::Failed(why) => Err(why.clone()),
-            Slot::Asking { .. } => Err(Unresolved::Pending),
+            Slot::Asking {
+                prior: Some(prior), ..
+            } => prior.status(),
+            Slot::Asking { prior: None, .. } => Err(Unresolved::Pending),
         }
     }
 
@@ -315,11 +357,48 @@ impl BridgeGenerations {
         due
     }
 
+    /// Ask again about an artifact that has settled, from the floor it settled
+    /// at. Returns whether a request is now due.
+    ///
+    /// Without this a tab resolves each pointer once and keeps the answer for
+    /// as long as it is open. A bridge that redeploys meanwhile would leave it
+    /// issuing invoices naming the address contract the bridge has moved off,
+    /// and sending watch requests to an inbox nothing reads any more.
+    ///
+    /// Asked from the settled floor, so an older record a peer serves is
+    /// refused as stale rather than adopted, and a withdrawal is superseded
+    /// only by a newer record. Anything else leaves the settled answer
+    /// standing.
+    pub fn refresh(&mut self, artifact: Resolve) -> bool {
+        let prior = match self.slot(artifact) {
+            Slot::Resolved { code_hash, floor } => Settled::Resolved {
+                code_hash: *code_hash,
+                floor: *floor,
+            },
+            Slot::Withdrawn { floor } => Settled::Withdrawn { floor: *floor },
+            _ => return false,
+        };
+        let attempt = self.next_attempt;
+        self.next_attempt += 1;
+        let fresh = asking(&self.bridge, artifact, attempt, Some(prior));
+        let due = matches!(fresh, Slot::Asking { .. });
+        *self.slot_mut(artifact) = fresh;
+        due
+    }
+
+    /// Whether `id` is one of this bridge's pointer contracts, answered or not.
+    /// A late answer to a pointer is still a pointer record, not app state.
+    pub fn is_pointer(&self, id: &ContractInstanceId) -> bool {
+        Resolve::ALL
+            .iter()
+            .any(|&artifact| pointer_id(&self.bridge, artifact).as_ref() == Some(id))
+    }
+
     /// A new attempt at `artifact`, numbered after every attempt before it.
     fn begin(&mut self, artifact: Resolve) -> Slot {
         let attempt = self.next_attempt;
         self.next_attempt += 1;
-        asking(&self.bridge, artifact, attempt)
+        asking(&self.bridge, artifact, attempt, None)
     }
 
     fn deliver(
@@ -334,6 +413,7 @@ impl BridgeGenerations {
                 id: slot_id,
                 resolver,
                 attempt,
+                prior,
                 ..
             } = slot
             else {
@@ -349,7 +429,7 @@ impl BridgeGenerations {
                 return None;
             }
             let outcome = resolver.take_outcome()?;
-            *slot = interpret(outcome);
+            *slot = interpret(outcome, *prior);
             return Some(artifact);
         }
         None
@@ -372,25 +452,27 @@ impl BridgeGenerations {
     }
 }
 
-/// A fresh resolution for one artifact.
+/// A resolution for one artifact, from `prior`'s floor if it has settled
+/// before in this tab.
 ///
-/// The floor is `never_resolved` because nothing here persists one across a
-/// reload. The exposure that leaves is a peer serving a genuine but superseded
-/// record, which would name an older generation of the bridge's own contracts.
-/// For Harvest that is worse than stale display: an invoice issued meanwhile
-/// would name a contract the bridge has moved off. Persisting the floor closes
-/// it and is a follow-up, not part of this change.
-fn asking(bridge: &BridgeId, artifact: Resolve, attempt: u32) -> Slot {
-    match freenet_bitcoin_generation::resolver(
-        bridge,
-        artifact.artifact(),
-        PointerFloor::never_resolved(),
-    ) {
+/// A first resolution starts from `never_resolved`, because nothing here
+/// persists a floor across a reload. The exposure that leaves is a peer
+/// serving a genuine but superseded record on the first ask after a load,
+/// which would name an older generation of the bridge's own contracts until
+/// the next refresh finds the newer one. Persisting the floor closes it and is
+/// a follow-up, not part of this change.
+fn asking(bridge: &BridgeId, artifact: Resolve, attempt: u32, prior: Option<Settled>) -> Slot {
+    let floor = match prior {
+        Some(Settled::Resolved { floor, .. } | Settled::Withdrawn { floor }) => floor,
+        None => PointerFloor::never_resolved(),
+    };
+    match freenet_bitcoin_generation::resolver(bridge, artifact.artifact(), floor) {
         Ok(resolver) => Slot::Asking {
             id: resolver.pointer_id(),
             resolver: Box::new(resolver),
             asked: false,
             attempt,
+            prior,
         },
         // Only a bridge id that is not a valid Ed25519 point gets here, and
         // such a bridge could never have signed anything.
@@ -400,15 +482,48 @@ fn asking(bridge: &BridgeId, artifact: Resolve, attempt: u32) -> Slot {
     }
 }
 
-fn interpret(outcome: Result<PointerOutcome, freenet_migrate::pointer::PointerError>) -> Slot {
+/// The pointer contract's id for `artifact`, or `None` for a bridge id that is
+/// not a signing key.
+fn pointer_id(bridge: &BridgeId, artifact: Resolve) -> Option<ContractInstanceId> {
+    freenet_bitcoin_generation::resolver(
+        bridge,
+        artifact.artifact(),
+        PointerFloor::never_resolved(),
+    )
+    .ok()
+    .map(|r| r.pointer_id())
+}
+
+/// What an outcome settles the slot to. A refresh that learned nothing new
+/// (no answer, an older record, a competing one, a refusal) leaves `prior`
+/// standing.
+fn interpret(
+    outcome: Result<PointerOutcome, freenet_migrate::pointer::PointerError>,
+    prior: Option<Settled>,
+) -> Slot {
+    if let Ok(outcome) = &outcome {
+        if let Some(floor) = outcome.next_floor() {
+            return match outcome.resolved() {
+                Some(r) => Slot::Resolved {
+                    code_hash: r.code_hash(),
+                    floor,
+                },
+                None => Slot::Withdrawn { floor },
+            };
+        }
+    }
+    if let Some(prior) = prior {
+        return prior.into_slot();
+    }
     let outcome = match outcome {
         Ok(o) => o,
         Err(e) => return Slot::Failed(Unresolved::Refused(e.to_string())),
     };
     match outcome {
-        PointerOutcome::Resolved(r) | PointerOutcome::Unchanged(r) => Slot::Resolved {
-            code_hash: r.code_hash(),
-        },
+        // Unreachable in practice: both carry a floor and returned above.
+        PointerOutcome::Resolved(_) | PointerOutcome::Unchanged(_) => Slot::Failed(
+            Unresolved::Refused("a resolved record carried no floor".into()),
+        ),
         PointerOutcome::Withdrawn { .. } => Slot::Failed(Unresolved::Withdrawn),
         PointerOutcome::NeverPublished => Slot::Failed(Unresolved::NeverPublished),
         PointerOutcome::Unavailable => Slot::Failed(Unresolved::Unreachable),
@@ -722,5 +837,146 @@ mod tests {
             b58(Artifact::Tip),
             "G9brbHSKXEdFZW8jKtfMHYT2GcrvJH6jhebkykN35mo9"
         );
+    }
+
+    /// The address request due after a refresh.
+    fn asked_again(g: &mut BridgeGenerations) -> PointerRequest {
+        let id = freenet_bitcoin_generation::pointer_id(&bridge(), Artifact::Address)
+            .expect("the pointer id derives");
+        *g.requests_due()
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the address pointer is asked again")
+    }
+
+    fn resolved_at(version: u32, hash: [u8; 32]) -> BridgeGenerations {
+        let mut g = BridgeGenerations::new(bridge());
+        let (address, _) = ask(&mut g);
+        g.on_state(
+            address.id,
+            &record(&bridge_key(), Artifact::Address, version, hash),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some(hash));
+        g
+    }
+
+    /// **A redeploy while the tab is open is followed.** Without a refresh the
+    /// first answer stood for the life of the tab, and invoices kept naming the
+    /// contract the bridge had moved off.
+    #[test]
+    fn a_refresh_follows_the_bridge_to_a_new_generation() {
+        let mut g = resolved_at(3, [0x42; 32]);
+        assert!(g.refresh(Resolve::Address));
+        let request = asked_again(&mut g);
+        assert_eq!(
+            g.code_hash(Resolve::Address),
+            Some([0x42; 32]),
+            "the settled generation stays in force while the refresh is out"
+        );
+
+        g.on_state(
+            request.id,
+            &record(&bridge_key(), Artifact::Address, 4, [0x43; 32]),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x43; 32]));
+    }
+
+    /// **A refresh never goes backwards.** A genuine older record served by a
+    /// peer is refused against the settled floor.
+    #[test]
+    fn a_refresh_does_not_adopt_an_older_record() {
+        let mut g = resolved_at(4, [0x43; 32]);
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_state(
+            request.id,
+            &record(&bridge_key(), Artifact::Address, 3, [0x42; 32]),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x43; 32]));
+    }
+
+    /// **A refresh that learns nothing keeps what was settled.** A pointer
+    /// that did not answer this time has not been withdrawn.
+    #[test]
+    fn a_refresh_that_fails_keeps_the_settled_generation() {
+        let mut g = resolved_at(4, [0x43; 32]);
+
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_unreachable(request);
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x43; 32]), "silence");
+
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_absent(request.id);
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x43; 32]), "absence");
+
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        let impostor = SigningKey::from_bytes(&[1u8; 32]);
+        g.on_state(
+            request.id,
+            &record(&impostor, Artifact::Address, 9, [0x66; 32]),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x43; 32]), "a forgery");
+    }
+
+    /// **A withdrawal is final until the bridge publishes past it.** The
+    /// refresh asks from the withdrawal's floor, so a replayed pre-withdrawal
+    /// record does not revive it and a newer record does.
+    #[test]
+    fn a_withdrawal_is_lifted_only_by_a_newer_record() {
+        let mut g = resolved_at(4, [0x43; 32]);
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_state(
+            request.id,
+            &record(&bridge_key(), Artifact::Address, 5, TOMBSTONE_CODE_HASH),
+        );
+        assert_eq!(g.status(Resolve::Address), Err(Unresolved::Withdrawn));
+        assert!(!g.retry(Resolve::Address), "not retried as a failure");
+
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_state(
+            request.id,
+            &record(&bridge_key(), Artifact::Address, 4, [0x43; 32]),
+        );
+        assert_eq!(
+            g.status(Resolve::Address),
+            Err(Unresolved::Withdrawn),
+            "a replay of the record it withdrew"
+        );
+
+        g.refresh(Resolve::Address);
+        let request = asked_again(&mut g);
+        g.on_state(
+            request.id,
+            &record(&bridge_key(), Artifact::Address, 6, [0x44; 32]),
+        );
+        assert_eq!(g.code_hash(Resolve::Address), Some([0x44; 32]));
+    }
+
+    #[test]
+    fn only_a_settled_artifact_is_refreshed() {
+        let mut g = BridgeGenerations::new(bridge());
+        assert!(!g.refresh(Resolve::Address), "still asking");
+        let (address, _) = ask(&mut g);
+        g.on_unreachable(address);
+        assert!(
+            !g.refresh(Resolve::Address),
+            "a failure is retried, not refreshed"
+        );
+    }
+
+    #[test]
+    fn every_pointer_id_is_recognised_answered_or_not() {
+        let g = BridgeGenerations::new(bridge());
+        for artifact in [Artifact::Address, Artifact::Inbox, Artifact::Tip] {
+            let id = freenet_bitcoin_generation::pointer_id(&bridge(), artifact)
+                .expect("the pointer id derives");
+            assert!(g.is_pointer(&id));
+        }
+        assert!(!g.is_pointer(&ContractInstanceId::new([5u8; 32])));
     }
 }

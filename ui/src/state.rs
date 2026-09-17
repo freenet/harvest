@@ -396,12 +396,6 @@ fn request_certificate(fingerprint: String) {
     });
 }
 
-/// Ask the ghostkey delegate to sign a store's details.
-///
-/// The request is already queued by the time this runs, because the answer
-/// can arrive as soon as the send returns and an answer matching nothing is
-/// dropped. If the send itself fails, withdraw it again: nothing will ever
-/// answer it.
 /// How long past its anchor an order's payment address stays watched.
 ///
 /// A buyer pays only while the anchor is within
@@ -410,6 +404,20 @@ fn request_certificate(fingerprint: String) {
 /// the payable window is ample for that and bounds how long a seller keeps
 /// asking about an invoice nobody paid.
 pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS + 144;
+
+/// Milliseconds since the Unix epoch by this machine's clock.
+fn now_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+}
+
+/// What the watch-request loop should do now.
+#[derive(Debug, Default, PartialEq)]
+pub struct WatchWork {
+    /// Fetch, and subscribe to, the inbox.
+    pub fetch: Option<freenet_stdlib::prelude::ContractInstanceId>,
+    /// Requests queued for the delegate's signature.
+    pub sign: Vec<crate::bitcoin_inbox::PendingInboxEntry>,
+}
 
 /// Ask the ghostkey delegate to sign a watch request queued by
 /// `AppState::queue_due_watch_requests`.
@@ -455,6 +463,12 @@ fn spawn_inbox_entry_signature(pending: crate::bitcoin_inbox::PendingInboxEntry)
     });
 }
 
+/// Ask the ghostkey delegate to sign a store's details.
+///
+/// The request is already queued by the time this runs, because the answer
+/// can arrive as soon as the send returns and an answer matching nothing is
+/// dropped. If the send itself fails, withdraw it again: nothing will ever
+/// answer it.
 #[cfg(target_arch = "wasm32")]
 fn spawn_store_info_signature(fingerprint: String, pending: PendingStoreInfo) {
     wasm_bindgen_futures::spawn_local(async move {
@@ -1751,8 +1765,9 @@ impl AppState {
                 &state_bytes,
             ) {
                 Ok(inbox_state) => {
+                    let now_ms = now_ms();
                     if let Some(inbox) = self.bitcoin.inbox.as_mut() {
-                        inbox.on_state(inbox_state);
+                        inbox.on_state(inbox_state, now_ms);
                     }
                     // A new floor, or a request read or pruned, is what makes
                     // a watch request due, so this is when to look.
@@ -4600,6 +4615,14 @@ impl AppState {
                 self.start_store_edit_if_ready();
             }
 
+            ghostkey_common::GhostkeyResponse::Error { message }
+                if self.only_watch_signatures_outstanding() =>
+            {
+                // Only a background watch request can be what was refused, so
+                // nothing of the seller's is cleared or interrupted.
+                self.watch_signature_failed(&message);
+            }
+
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
@@ -4620,6 +4643,14 @@ impl AppState {
             // creation that was waiting on this grant. Without this
             // cleanup, a subsequent successful SignResult would
             // consume the stale pending listing.
+            ghostkey_common::GhostkeyResponse::AccessDenied { .. }
+                if self.only_watch_signatures_outstanding() =>
+            {
+                // Only a background watch request can be what was refused, so
+                // nothing of the seller's is cleared or interrupted.
+                self.watch_signature_failed("access was denied");
+            }
+
             ghostkey_common::GhostkeyResponse::AccessDenied { .. } => {
                 self.notifications.push(
                     "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
@@ -4632,6 +4663,14 @@ impl AppState {
 
             // The vault has no ghostkeys at all. Tell the user where
             // to go to create one. Same cleanup as AccessDenied.
+            ghostkey_common::GhostkeyResponse::NoIdentityAvailable
+                if self.only_watch_signatures_outstanding() =>
+            {
+                // Only a background watch request can be what was refused, so
+                // nothing of the seller's is cleared or interrupted.
+                self.watch_signature_failed("no Ghost Key is available");
+            }
+
             ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
                 self.notifications.push(
                     "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
@@ -4645,6 +4684,14 @@ impl AppState {
             // Per-fingerprint denial: the user denied a specific-key
             // prompt, or the vault revoked the grant between connect
             // and sign. Same cleanup as the access-denial arms.
+            ghostkey_common::GhostkeyResponse::PermissionDenied { fingerprint, .. }
+                if self.only_watch_signatures_outstanding() =>
+            {
+                // Only a background watch request can be what was refused, so
+                // nothing of the seller's is cleared or interrupted.
+                self.watch_signature_failed(&format!("access denied for {fingerprint}"));
+            }
+
             ghostkey_common::GhostkeyResponse::PermissionDenied { fingerprint, .. } => {
                 self.notifications
                     .push(format!("Ghostkey access denied for {fingerprint}."));
@@ -4659,6 +4706,14 @@ impl AppState {
             // nothing is left to wait for. This used to fall into the
             // wildcard below and clear nothing, which left a seller's store
             // creation pending forever with no message.
+            ghostkey_common::GhostkeyResponse::KeyNotFound { fingerprint }
+                if self.only_watch_signatures_outstanding() =>
+            {
+                // Only a background watch request can be what was refused, so
+                // nothing of the seller's is cleared or interrupted.
+                self.watch_signature_failed(&format!("Ghost Key {fingerprint} was not found"));
+            }
+
             ghostkey_common::GhostkeyResponse::KeyNotFound { fingerprint } => {
                 self.notifications.push(format!(
                     "Ghostkey {fingerprint} was not found in the vault."
@@ -5041,10 +5096,14 @@ impl AppState {
         }
     }
 
-    /// Subscribe to `bridge`'s request inbox at the generation its pointer
-    /// names. A different generation replaces the old one, along with what
-    /// was sent to it: requests in an inbox the bridge no longer reads were
-    /// never read.
+    /// Track `bridge`'s request inbox at the generation its pointer names. A
+    /// different generation replaces the old one, along with what was sent to
+    /// it: requests in an inbox the bridge no longer reads were never read, and
+    /// counting them would hold the Ghost Key's places for ever.
+    ///
+    /// Nothing is fetched here. [`Self::queue_due_watch_requests`] fetches the
+    /// inbox only once this node has an order to watch, so a buyer's tab never
+    /// subscribes to it.
     pub fn register_inbox_contract(
         &mut self,
         bridge: freenet_bitcoin_common::BridgeId,
@@ -5070,15 +5129,6 @@ impl AppState {
         }
         info!("using the bridge's request inbox {}", key.id());
         self.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(bridge, key));
-        let bytes = key.id().as_bytes().to_vec();
-        if self.bitcoin.subscribed.insert(bytes.clone()) {
-            #[cfg(target_arch = "wasm32")]
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
-                    dioxus::logger::tracing::error!("Failed to subscribe the bridge inbox: {e}");
-                }
-            });
-        }
     }
 
     /// The payment scripts each of this node's sellers needs `bridge` to
@@ -5091,7 +5141,8 @@ impl AppState {
     /// buried, which [`WATCH_PAST_ANCHOR_BLOCKS`] allows a day for. Without a
     /// view of the chain the age is unknown, so the order is kept: asking the
     /// bridge to watch an expired address costs a read, and not asking for a
-    /// live one costs the sale.
+    /// live one costs the sale. An order with no anchor is never payable, so it
+    /// is not watched.
     ///
     /// Only stores in `my_stores`, and only orders issued under the
     /// fingerprint that owns the store, so no node asks on behalf of anyone
@@ -5137,7 +5188,10 @@ impl AppState {
                             (Some(tip), Some(anchor)) => {
                                 tip.saturating_sub(anchor.height) <= WATCH_PAST_ANCHOR_BLOCKS
                             }
-                            _ => true,
+                            (None, Some(_)) => true,
+                            // No buyer pays an order with no anchor, so there
+                            // is nothing to watch for, now or later.
+                            (_, None) => false,
                         }
                     })
                     .collect();
@@ -5166,17 +5220,48 @@ impl AppState {
         groups
     }
 
-    /// Prepare every watch request due now and queue each for signature.
-    /// Returns what was queued, which the caller sends to the delegate.
-    pub fn queue_due_watch_requests(
-        &mut self,
-        now_ms: u64,
-    ) -> Vec<crate::bitcoin_inbox::PendingInboxEntry> {
+    /// Decide what the watch-request loop does now, queueing for signature
+    /// every request that is due.
+    ///
+    /// In order:
+    ///
+    /// * A request that has waited on the delegate past
+    ///   [`crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS`] is given up, so a lost
+    ///   answer does not hold one of the Ghost Key's two places for ever.
+    /// * Nothing more happens unless this node has an order to watch, so a
+    ///   buyer's tab never touches the inbox.
+    /// * The inbox is fetched when it has never arrived, or has not been heard
+    ///   from lately (see [`crate::bitcoin_inbox::InboxTracker::fetch_due`]).
+    /// * Nothing is queued while the seller has a signature of their own under
+    ///   way. The delegate's refusals name no request, so a refusal arriving
+    ///   while both are outstanding cannot be told apart, and the seller's own
+    ///   work must not be put at risk by a background request.
+    pub fn queue_due_watch_requests(&mut self, now_ms: u64) -> WatchWork {
+        let mut work = WatchWork::default();
+        self.pending_signatures.retain(|pending| match pending {
+            PendingSignature::InboxEntry(entry) => {
+                now_ms.saturating_sub(entry.queued_at_ms)
+                    < crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS
+            }
+            _ => true,
+        });
         let Some(bridge) = self.bitcoin.inbox.as_ref().map(|inbox| inbox.bridge) else {
-            return Vec::new();
+            return work;
         };
-        let mut queued = Vec::new();
-        for (fingerprint, ghostkey, wanted) in self.watches_wanted(bridge) {
+        let groups = self.watches_wanted(bridge);
+        if groups.is_empty() {
+            return work;
+        }
+        if let Some(inbox) = self.bitcoin.inbox.as_mut() {
+            if inbox.fetch_due(now_ms) {
+                inbox.note_fetch(now_ms);
+                work.fetch = Some(*inbox.contract_key.id());
+            }
+        }
+        if self.user_signature_under_way() {
+            return work;
+        }
+        for (fingerprint, ghostkey, wanted) in groups {
             let awaiting: Vec<crate::bitcoin_inbox::PendingInboxEntry> = self
                 .pending_signatures
                 .iter()
@@ -5189,7 +5274,7 @@ impl AppState {
                 .collect();
             let awaiting: Vec<&crate::bitcoin_inbox::PendingInboxEntry> = awaiting.iter().collect();
             let Some(inbox) = self.bitcoin.inbox.as_mut() else {
-                return queued;
+                return work;
             };
             let requests = inbox.plan(ghostkey, &wanted, &awaiting, now_ms);
             let Some(floor) = inbox.state.as_ref().and_then(|s| s.floor.clone()) else {
@@ -5207,33 +5292,86 @@ impl AppState {
                             network: request.network,
                             scripts: request.scripts.iter().map(|s| s.0.clone()).collect(),
                             signing_payload: prepared.signing_payload,
+                            queued_at_ms: now_ms,
                         };
                         self.pending_signatures
                             .push_back(PendingSignature::InboxEntry(Box::new(pending.clone())));
-                        queued.push(pending);
+                        work.sign.push(pending);
                     }
                     Err(e) => warn!("could not prepare a watch request for the bridge: {e}"),
                 }
             }
         }
-        queued
+        work
     }
 
-    /// [`Self::queue_due_watch_requests`] at the current time, each sent to
-    /// the ghostkey delegate for signature.
+    /// Whether the seller has a signature of their own outstanding: anything
+    /// queued that is not a watch request, a store being created or edited, or
+    /// an access prompt.
+    fn user_signature_under_way(&self) -> bool {
+        self.pending_signatures
+            .iter()
+            .any(|pending| !matches!(pending, PendingSignature::InboxEntry(_)))
+            || self.pending_store_creation.is_some()
+            || self.pending_store_edit.is_some()
+            || self.request_any_access_in_flight
+    }
+
+    /// Whether a refusal from the ghostkey delegate can only be about a watch
+    /// request: one is outstanding and nothing of the seller's is.
+    fn only_watch_signatures_outstanding(&self) -> bool {
+        !self.pending_signatures.is_empty() && !self.user_signature_under_way()
+    }
+
+    /// The delegate refused to sign a watch request. Drop the outstanding
+    /// requests, back off, and tell the seller once rather than at every try.
+    fn watch_signature_failed(&mut self, reason: &str) {
+        warn!("the ghostkey delegate did not sign a watch request: {reason}");
+        self.pending_signatures.clear();
+        self.note_watch_request_failure(now_ms(), reason);
+    }
+
+    fn note_watch_request_failure(&mut self, now_ms: u64, reason: &str) {
+        let Some(inbox) = self.bitcoin.inbox.as_mut() else {
+            return;
+        };
+        inbox.note_sign_failure(now_ms);
+        if !inbox.failure_notified {
+            inbox.failure_notified = true;
+            self.notifications.push(format!(
+                "Harvest could not ask the Bitcoin bridge to watch your invoices' payment \
+                 addresses ({reason}). Payments to them may not be seen until this works; it is \
+                 retried automatically."
+            ));
+        }
+    }
+
+    /// [`Self::queue_due_watch_requests`] at the current time, carried out:
+    /// the inbox fetched if due, and each queued request sent for signature.
     pub fn send_due_watch_requests(&mut self) {
-        let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-        let queued = self.queue_due_watch_requests(now_ms);
+        let work = self.queue_due_watch_requests(now_ms());
         #[cfg(target_arch = "wasm32")]
-        for pending in queued {
-            spawn_inbox_entry_signature(pending);
+        {
+            if let Some(id) = work.fetch {
+                wasm_bindgen_futures::spawn_local(async move {
+                    // A failure needs no handling here: with no state arriving,
+                    // the fetch is due again shortly.
+                    if let Err(e) = crate::gateway::get_contract(&id, true).await {
+                        dioxus::logger::tracing::warn!("could not fetch the bridge inbox: {e}");
+                    }
+                });
+            }
+            for pending in work.sign {
+                spawn_inbox_entry_signature(pending);
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = queued;
+        let _ = work;
     }
 
     /// Take the delegate's signature on a watch request: record it as sent
-    /// and submit it to the inbox. Returns the bytes submitted.
+    /// and return the bytes to submit to the inbox. `None` if there is nothing
+    /// worth sending.
     fn on_inbox_entry_signed(
         &mut self,
         pending: crate::bitcoin_inbox::PendingInboxEntry,
@@ -5250,6 +5388,7 @@ impl AppState {
             Ok(entry) => entry,
             Err(e) => {
                 warn!("the signed watch request is unusable: {e}");
+                self.note_watch_request_failure(now_ms, "the signature could not be used");
                 return None;
             }
         };
@@ -5261,13 +5400,26 @@ impl AppState {
                  seller key -- not sending it",
                 pending.fingerprint
             );
+            self.note_watch_request_failure(
+                now_ms,
+                "your Ghost Key is not the one this store was created with",
+            );
             return None;
         }
-        if let Some(inbox) = self.bitcoin.inbox.as_mut() {
-            if inbox.contract_key == pending.contract_key {
-                inbox.record_sent(&pending, &entry, now_ms);
-            }
-        }
+        // Prepared for an inbox this tab has since stopped using: sealed to it
+        // and dated against its floor, so there is nowhere useful to send it.
+        // Whatever it asked for is due again against the current inbox.
+        let Some(inbox) = self
+            .bitcoin
+            .inbox
+            .as_mut()
+            .filter(|inbox| inbox.contract_key == pending.contract_key)
+        else {
+            info!("a watch request was signed for an inbox no longer in use; not sending it");
+            return None;
+        };
+        inbox.record_sent(&pending, &entry, now_ms);
+        inbox.note_sign_success();
         match crate::bitcoin_inbox::submission_bytes(&pending.floor, entry) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
@@ -5332,6 +5484,11 @@ pub fn friendly_bridge_error(raw: &str) -> String {
 ///   refused by the content-security policy. That is why the bridge's
 ///   contracts are now found through the pointers it signs, read over the
 ///   node, rather than asked for over HTTP.
+///
+/// The route that does exist is the bridge's request inbox, a contract the
+/// page writes to over the node. An invoice's payment address is sent that way
+/// (`AppState::queue_due_watch_requests`), but a manual watch is not: see
+/// `docs/bitcoin-integration-status.md` for why that is a separate decision.
 ///
 /// So a manual watch keeps `contract_id: None` and `bridge_synced: false`
 /// forever, `register_watch_contract` returns immediately because there is no
@@ -6358,6 +6515,36 @@ mod tests {
         state.on_contract_state(
             STORE_ID.to_vec(),
             harvest_common::to_cbor(store_state).expect("store state encodes"),
+        );
+    }
+
+    /// **A store's state arriving runs the watch-request loop.** Observed
+    /// through the one thing the loop does before it needs a verified seller
+    /// key: giving up a signature request that has waited too long.
+    #[test]
+    fn store_state_arriving_runs_the_watch_request_loop() {
+        let mut state = AppState::default();
+        state
+            .pending_signatures
+            .push_back(PendingSignature::InboxEntry(Box::new(
+                crate::bitcoin_inbox::PendingInboxEntry {
+                    fingerprint: "seller-fp".into(),
+                    ghostkey: freenet_bitcoin_inbox::GhostkeyId([1u8; 32]),
+                    contract_key: crate::bitcoin_inbox::test_support::inbox_key(),
+                    floor: freenet_bitcoin_inbox::SignedFloor::sign(
+                        &crate::bitcoin_inbox::test_support::bridge_key(),
+                        crate::bitcoin_inbox::test_support::FLOOR,
+                    ),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    scripts: vec![vec![0x00, 0x14]],
+                    signing_payload: vec![1, 2, 3],
+                    queued_at_ms: 0,
+                },
+            )));
+        ingest(&mut state, &store_state_with("", vec![]));
+        assert!(
+            state.pending_signatures.is_empty(),
+            "the stale request was given up, so the loop ran"
         );
     }
 
@@ -12699,6 +12886,211 @@ mod buy_flow_tests {
             browsing.watches_wanted(inbox::bridge()).is_empty(),
             "a store this node only browses is not its to ask about"
         );
+    }
+
+    /// **Registering the same inbox again changes nothing; a new generation
+    /// starts over.** Requests sent to an inbox the bridge has left would
+    /// otherwise hold the Ghost Key's places for ever.
+    #[test]
+    fn a_new_inbox_generation_replaces_what_was_sent_to_the_old() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        state.bitcoin.inbox = None;
+        state.register_inbox_contract(inbox::bridge(), [0x38; 32]);
+        let key = state.bitcoin.inbox.as_ref().expect("tracked").contract_key;
+        assert_eq!(key, inbox::inbox_key());
+        serve_inbox(&mut state, &inbox::open_inbox());
+        assert!(state
+            .bitcoin
+            .inbox
+            .as_ref()
+            .expect("tracked")
+            .state
+            .is_some());
+
+        state.register_inbox_contract(inbox::bridge(), [0x38; 32]);
+        assert!(
+            state
+                .bitcoin
+                .inbox
+                .as_ref()
+                .expect("tracked")
+                .state
+                .is_some(),
+            "the same generation keeps what it knows"
+        );
+
+        state.register_inbox_contract(inbox::bridge(), [0x39; 32]);
+        let tracker = state.bitcoin.inbox.as_ref().expect("tracked");
+        assert_ne!(tracker.contract_key, key);
+        assert!(tracker.state.is_none(), "a new generation starts over");
+    }
+
+    /// **A buyer's tab never touches the inbox**, and a seller's fetches it
+    /// once, again only after a pause if nothing came back.
+    #[test]
+    fn the_inbox_is_fetched_only_for_a_node_with_orders_to_watch() {
+        let gk = inbox::authority().mint();
+        let mut buyer = a_seller_selling(vec![], gk.id().0);
+        assert_eq!(buyer.queue_due_watch_requests(1_000), WatchWork::default());
+
+        let mut seller = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        let work = seller.queue_due_watch_requests(1_000);
+        assert_eq!(work.fetch, Some(*inbox::inbox_key().id()));
+        assert!(work.sign.is_empty(), "nothing to date an entry against yet");
+        assert_eq!(
+            seller.queue_due_watch_requests(2_000).fetch,
+            None,
+            "not asked again at once"
+        );
+        assert!(
+            seller
+                .queue_due_watch_requests(1_000 + crate::bitcoin_inbox::INBOX_FETCH_RETRY_MS)
+                .fetch
+                .is_some(),
+            "asked again when nothing came back"
+        );
+    }
+
+    /// **Nothing is queued while the seller is signing something of their
+    /// own**, because a refusal names no request.
+    #[test]
+    fn no_watch_request_is_queued_while_the_seller_is_signing() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        state.request_any_access_in_flight = true;
+        serve_inbox(&mut state, &inbox::open_inbox());
+        assert!(queued_watch_requests(&state).is_empty());
+
+        state.request_any_access_in_flight = false;
+        state.send_due_watch_requests();
+        assert_eq!(queued_watch_requests(&state).len(), 1);
+    }
+
+    /// **A refusal that can only be about a watch request clears nothing of
+    /// the seller's, tells them once, and holds off.**
+    #[test]
+    fn a_refused_watch_signature_is_contained() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        state.pending_store_creation = None;
+        serve_inbox(&mut state, &inbox::open_inbox());
+        assert_eq!(queued_watch_requests(&state).len(), 1);
+
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::PermissionDenied {
+            fingerprint: "seller-fp".into(),
+            requestor: harvest_common::expected_harvest_requestor(),
+        });
+        assert!(queued_watch_requests(&state).is_empty());
+        assert_eq!(state.notifications.len(), 1, "told once");
+
+        state.send_due_watch_requests();
+        assert!(
+            queued_watch_requests(&state).is_empty(),
+            "held off rather than asked again at once"
+        );
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::PermissionDenied {
+            fingerprint: "seller-fp".into(),
+            requestor: harvest_common::expected_harvest_requestor(),
+        });
+        let about_watching = state
+            .notifications
+            .iter()
+            .filter(|n| n.contains("Bitcoin bridge"))
+            .count();
+        assert_eq!(
+            about_watching, 1,
+            "the watch-request notice is not repeated"
+        );
+    }
+
+    /// **With the seller's own signature outstanding, a refusal is theirs to
+    /// see**, handled exactly as before.
+    #[test]
+    fn a_refusal_with_the_sellers_own_signature_outstanding_is_theirs() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        state.request_any_access_in_flight = true;
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::PermissionDenied {
+            fingerprint: "seller-fp".into(),
+            requestor: harvest_common::expected_harvest_requestor(),
+        });
+        assert!(
+            !state.request_any_access_in_flight,
+            "the ordinary handling ran"
+        );
+        assert!(
+            !state
+                .bitcoin
+                .inbox
+                .as_ref()
+                .expect("tracked")
+                .failure_notified,
+            "and it was not counted against the watch requests"
+        );
+    }
+
+    /// **A signature request that never comes back is given up**, so it does
+    /// not hold one of the Ghost Key's two places for the rest of the session.
+    #[test]
+    fn a_watch_signature_that_never_returns_is_given_up() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        let mut pending = inbox_pending_for(&gk);
+        pending.queued_at_ms = 1_000;
+        state
+            .pending_signatures
+            .push_back(PendingSignature::InboxEntry(Box::new(pending)));
+        state.queue_due_watch_requests(1_000 + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS - 1);
+        assert_eq!(queued_watch_requests(&state).len(), 1, "still waiting");
+        state.queue_due_watch_requests(1_000 + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS);
+        assert!(queued_watch_requests(&state).is_empty());
+    }
+
+    /// **A signature for an inbox this tab has left is not sent.**
+    #[test]
+    fn a_watch_request_for_a_replaced_inbox_is_not_sent() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        let queued = queued_watch_requests(&state).remove(0);
+        state.register_inbox_contract(inbox::bridge(), [0x39; 32]);
+
+        let (scoped_payload, signature) = inbox::sign_result(&gk, queued.signing_payload.clone());
+        assert!(state
+            .on_inbox_entry_signed(queued, gk.pem.clone(), scoped_payload, signature, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn an_order_with_no_anchor_is_not_watched() {
+        let gk = inbox::authority().mint();
+        let mut order = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
+        order.order.trusted_bridges.push(inbox::bridge());
+        let order = resigned(order, &seller_signing_key());
+        let mut state = a_seller_selling(vec![order], gk.id().0);
+        assert!(state.watches_wanted(inbox::bridge()).is_empty());
+        state.bitcoin.tips.clear();
+        assert!(
+            state.watches_wanted(inbox::bridge()).is_empty(),
+            "nor without a tip"
+        );
+    }
+
+    fn inbox_pending_for(
+        gk: &freenet_bitcoin_inbox::test_support::TestGhostkey,
+    ) -> crate::bitcoin_inbox::PendingInboxEntry {
+        crate::bitcoin_inbox::PendingInboxEntry {
+            fingerprint: "seller-fp".into(),
+            ghostkey: gk.id(),
+            contract_key: inbox::inbox_key(),
+            floor: freenet_bitcoin_inbox::SignedFloor::sign(&inbox::bridge_key(), inbox::FLOOR),
+            network: BitcoinNetwork::Signet,
+            scripts: vec![vec![0x00, 0x14, 0x99]],
+            signing_payload: vec![9, 9, 9],
+            queued_at_ms: 0,
+        }
     }
 
     fn long_expired_again() -> AuthorizedOrder {

@@ -67,32 +67,53 @@ observe their payment, so `OrderCard` reads it per order and warns when an
 invoice names a bridge this build does not recognise
 (`components::bitcoin_view::unrecognised_bridges`).
 
-### 2. A watch is recorded and nothing is ever asked to synchronize it
+### 2. Asking the bridge to watch an address
 
-`WatchForm` builds a `WatchedPayment`, the delegate persists it and answers
-`Ok`, and that is the end of it. No bridge is sent a `WatchRequest`, so
-`contract_id` stays `None`, no `BitcoinAddressContract` is subscribed, and no
-transaction can appear for a manually watched address.
+**Order-driven watching is done (#59).** Nothing used to tell the bridge an
+invoice's payment address existed, so no order could reach Paid. Now the
+seller's tab sends the request through the bridge's request inbox, a Freenet
+contract. There is no HTTP path, which the published app's CSP would refuse
+anyway (#29).
 
-Both places the request could be made are closed:
+- **Which contracts.** The bridge signs a generation pointer for its address
+  contract, its inbox and its tip contract. `bitcoin_generation` resolves them,
+  and refreshes them every ten minutes, so a bridge that redeploys while a tab
+  is open is followed. There is no build-time fallback. Until the address
+  generation resolves, `order_for_invoice` refuses to issue an invoice (#30).
+- **What is sent.** `state::AppState::watches_wanted` picks the seller's own
+  unpaid, anchored orders that name the bridge, up to a day of blocks past the
+  payable window. `bitcoin_inbox::InboxTracker::plan` batches them. Each request
+  is sealed to the store's verified seller key, signed by the ghostkey delegate,
+  and submitted with the floor it was dated against. It is renewed every 12h,
+  since a watch lasts about a day, and sent again if it left the inbox unread.
+- **What it leaves alone.** The inbox is fetched only by a node with an order
+  to watch. Background signing waits while the seller signs anything of their
+  own. A refusal that can only be about a watch request is handled without
+  touching the seller's work, is shown once, and backs off.
 
-- **The delegate cannot.** `OutboundDelegateMsg` has no HTTP variant — the
-  whole set is application messages, user input, context, and contract
-  GET/PUT/UPDATE/SUBSCRIBE. A delegate has no outbound HTTP capability at all.
-- **The page cannot, once published.** A webapp is served with `connect-src`
-  limited to its own gateway, so `fetch` to a bridge URL is refused. This is
-  the same refusal that turned the tip-contract id into a build-time constant
-  (see `gateway::bitcoin_config`'s module docs). It works under `dx serve`,
-  where no CSP applies, which is why `bitcoin_bridge_http` exists at all.
+Known limits:
 
-The UI now says so rather than showing "Waiting for bridge to sync…"
-indefinitely (`state::WatchSyncStatus`). Actually closing it needs a route
-from a published webapp to a bridge — a contract-mediated request queue, or a
-gateway-side proxy — not a smaller change to either side.
+- **A payment mined before the bridge reads the request is not found.** The
+  request carries the order's anchor as `scan_from_height`, but the bridge does
+  not act on it yet (freenet-bitcoin#7). In practice the request goes out within
+  about a minute of the invoice, and the bridge reads its inbox each block.
+- **Tracking is in memory.** A reload sends every wanted request once more,
+  which is an early renewal. Pointer floors are not persisted either, so on the
+  first resolve after a load a peer could serve a genuine but superseded pointer
+  until the next refresh.
+- **What the inbox makes public.** The scripts are sealed to the bridge.
+  Each entry names the Ghost Key that signed it, which is the store's public
+  seller key, and the ciphertext length gives the number of scripts. So an
+  observer can link a store to the bridge it uses and see when the seller's tab
+  sends requests. The payment addresses themselves were already public in the
+  store contract.
 
-Note this does **not** affect order-driven payment watching end to end: the
-tip contract and any address contract whose id is already known are subscribed
-over the gateway like any other contract, and that path works.
+**Manual watches are still not sent.** `WatchForm` builds a `WatchedPayment`,
+the delegate persists it privately, and nothing asks a bridge to synchronize
+it, so `contract_id` stays `None`. The UI says so (`state::WatchSyncStatus`)
+rather than waiting forever. The inbox route above could carry these too.
+Whether it should is a privacy question: an order's address is public anyway,
+and a private watch list's is not.
 
 ### 3. Buyer-seller messaging is not implemented
 
@@ -152,8 +173,6 @@ mechanical beforehand and a data-loss incident afterwards. See the
 
 - The bridge is loopback-only with open authorization. Public exposure needs
   Ghost Key auth, rate limiting, and a TLS route first.
-- No canonical bridge URL is published, so first run defaults to the user's own
-  machine.
 - `ui/assets/harvest.css` imports Google Fonts, which the gateway CSP blocks —
   so production Harvest has been falling back to default fonts app-wide. Real,
   pre-existing, and outside this change's scope.
