@@ -122,7 +122,7 @@ delegate_key = "56a736db8cf836b3d12003d242ced9cc5637a41c3c1a0c51b0f2119f5f5558f2
 
 [[entry]]
 version = "V12"
-description = "Superseded by replacing `listing_id` on `Order` with a conversation-keyed `listing_tag` (harvest#57). No source this delegate compiles changed behaviour, and none of its wire types changed: the delegate uses only `OrderId`, which is unchanged. What moved is codegen. Comparing the two builds' strings, one monomorphized `ciborium` `CollectionSerializer::serialize_field` instance is gone, the generic instance that shrank with `Order`'s field set in `harvest-common`, which is compiled into every artifact here. The parameter structs are unchanged, so no derivation split is needed. Pre-launch: no user holds data under this delegate, so the re-key moves nothing a person owns."
+description = "Superseded by replacing `listing_id` on `Order` with a conversation-keyed `listing_tag` (harvest#57). No source this delegate compiles changed behaviour, and none of its wire types changed: the delegate uses only `OrderId`, which is unchanged. What moved is codegen. Comparing the two builds' strings, the only difference is that one monomorphized `ciborium` `CollectionSerializer::serialize_field` instance is gone; the precise reason it is no longer emitted was not established, beyond `harvest-common`, which is compiled into every artifact here, having changed. The parameter structs are unchanged, so no derivation split is needed. Pre-launch: no user holds data under this delegate, so the re-key moves nothing a person owns."
 date = "2026-09-17"
 code_hash = "4739e01954ab57d866840f9542fe87bb35910057bcee793c0a6a27a8c9536397"
 delegate_key = "4537b03aecf10d7a00202d8c20de1da7023233fe8e06952c62e74954dbbab71f"

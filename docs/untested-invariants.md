@@ -648,10 +648,27 @@ address and its `scriptPubKey`, so the address links the order to a chain
 transaction. It no longer carries the `listing_id` (harvest#57). It carries a
 listing TAG keyed by the conversation, which only the buyer and seller can
 compute, so a reader of the store cannot test a listing against it. **What can
-still be inferred:** the amount is public, so an order whose amount matches a
-uniquely priced listing (a price in BTC, or a store with one listing near that
-amount) still reveals the listing to anyone who compares prices. Only
-bucketed amounts or the ledger contract below would close that.
+still be inferred, or is lost:**
+
+- The amount is public, and amount is price times quantity, so an order whose
+  amount is a multiple of a uniquely priced listing (a BTC price exactly, a
+  fiat price approximately at the anchor's exchange rate) still reveals the
+  listing. Only bucketed amounts or the ledger contract below would close that.
+- Orders from one conversation share a binding, and two of them with equal
+  tags were for the same listing, so a repeat buyer's pattern (same item again
+  or something else) is visible, though not which item.
+- Which listing an order was for is now checkable by its two parties only. It
+  used to be a public, signed claim. Either party can still show it to a third
+  party by revealing the conversation's tag key
+  (`harvest_common::mailbox::listing_tag_key`), which decrypts nothing.
+- What to ship is read from the buyer's request, which lives in the mailbox. A
+  seller whose copy of that request is lost or evicted still sees the order is
+  answered, but has only the tag, testable against their listings with the
+  conversation keys, to recover which listing it was. An unprompted invoice
+  (no request) records no listing at all.
+- The buyer's `CommitmentNotRequested` check compares against the requests in
+  their own thread; if those have been evicted (a funded flood, see the mailbox
+  gaps) the check has nothing to compare and does not fire.
 
 Who bought is not published -- `buyer_fingerprint` is empty for every order
 the buy flow produces, and the buyer has no identity to name -- and the

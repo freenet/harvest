@@ -1780,8 +1780,8 @@ mod order_wire_compat_tests {
     /// The same order at today's width, as CBOR, written out byte by byte.
     ///
     /// Twelve fields; `payment_hash` and `bitcoin_address_code_hash`
-    /// present and null; `anchor` and `order_binding` ABSENT, which is the
-    /// property this pins. Regenerated when harvest#57 removed `listing_id`,
+    /// present and null; `anchor`, `order_binding` and `listing_tag` ABSENT,
+    /// which is the property this pins. Regenerated when harvest#57 removed `listing_id`,
     /// which also moved the id.
     ///
     /// ```text

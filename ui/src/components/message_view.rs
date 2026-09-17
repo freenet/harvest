@@ -1103,7 +1103,7 @@ fn describe(content: &MessageContent) -> String {
             }
             described
         }
-        MessageContent::OrderAccepted { order_id, .. } => {
+        MessageContent::OrderAccepted { order_id } => {
             format!("Accepted -- invoice {} is published.", order_id.short())
         }
     }

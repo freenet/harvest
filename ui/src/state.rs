@@ -2826,7 +2826,7 @@ impl AppState {
         let mut purchases: Vec<BuyerPurchase> = Vec::new();
         for conversation in &store.conversations {
             for message in conversation.read(&store.mailbox_messages) {
-                let MessageContent::OrderAccepted { order_id, .. } = message.content else {
+                let MessageContent::OrderAccepted { order_id } = message.content else {
                     continue;
                 };
                 // Addressed to the buyer, or it is something the buyer could
@@ -3876,6 +3876,18 @@ impl AppState {
                  nowhere for the buyer to pay"
                     .to_string(),
             );
+        }
+        // An invoice answering a request must carry that conversation's listing
+        // tag, which needs its key. Refused here, before a derivation index is
+        // spent on an address, rather than when the order is built.
+        if let Some(tag) = invoice.reply_to {
+            if !self.conversation_keys.contains_key(tag.as_slice()) {
+                return Err(
+                    "your delegate has not produced this conversation's key yet, so the \
+                     invoice could not say which listing it is for; try again in a moment"
+                        .to_string(),
+                );
+            }
         }
 
         // Register before sending, and un-register if the send fails: the
@@ -7986,6 +7998,40 @@ mod invoice_tests {
         );
     }
 
+    /// **Accepting a request, end to end, publishes the conversation's tag.**
+    /// Drives the real issue path, so the key is looked up where it is in the
+    /// app rather than handed in by the test.
+    #[test]
+    fn an_invoice_for_a_request_publishes_that_conversations_listing_tag() {
+        let mut state = seller_with_a_store();
+        let tag = [0xcd; 32];
+        let keys = crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]);
+        let mut answering = invoice();
+        answering.reply_to = Some(tag);
+
+        assert!(
+            state.issue_invoice(answering.clone()).is_err(),
+            "refused before an address is requested while the key is missing"
+        );
+        assert!(
+            state.pending_invoices.is_empty(),
+            "and nothing is in flight"
+        );
+
+        state.conversation_keys.insert(
+            tag.to_vec(),
+            crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]),
+        );
+        state.issue_invoice(answering).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, 3));
+
+        assert_eq!(
+            queued_order(&state).listing_tag,
+            Some(keys.listing_tag(&listing_id()))
+        );
+    }
+
     /// The correlation that matters. Two invoices can be in flight at once,
     /// and an address grafted onto the wrong one would ask a buyer to pay
     /// against another buyer's order.
@@ -11356,7 +11402,7 @@ mod buy_flow_tests {
         let plaintext = crate::messaging::decrypt_message(sealed, &keys.from_seller).ok()?;
         let _ = tag;
         match plaintext.content {
-            crate::messaging::MessageContent::OrderAccepted { order_id, .. } => Some(order_id),
+            crate::messaging::MessageContent::OrderAccepted { order_id } => Some(order_id),
             _ => None,
         }
     }
@@ -11672,6 +11718,31 @@ mod buy_flow_tests {
     /// above it. A condition that decides whether money can ever be recovered
     /// belongs in the same list as everything else that decides whether to
     /// pay.
+    /// **A conversation restored through the delegate tags listings exactly as
+    /// the seller does.** The seller's key comes from its own Diffie-Hellman;
+    /// a recalled buyer conversation takes the delegate's derived key. If the
+    /// two ever used different halves, every honest order would be refused.
+    #[test]
+    fn a_recalled_conversation_computes_the_sellers_listing_tag() {
+        let recalled =
+            crate::messaging::BuyerConversation::recalled(&harvest_common::RecalledConversation {
+                buyer_public_key: [5u8; 32],
+                conversation_id: [6u8; 32],
+                buyer_to_seller: [7u8; 32],
+                seller_to_buyer: [8u8; 32],
+                order_binding: [9u8; 32],
+                created_at: 1,
+                imported: false,
+                backed_up: false,
+            });
+        let seller = crate::messaging::ConversationKeys {
+            to_seller: [7u8; 32],
+            from_seller: [8u8; 32],
+        };
+        let listing = ListingId([3u8; 32]);
+        assert_eq!(recalled.listing_tag(&listing), seller.listing_tag(&listing));
+    }
+
     #[test]
     fn an_invoice_naming_no_bridge_is_refused() {
         let mut order = commitment(

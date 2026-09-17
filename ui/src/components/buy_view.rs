@@ -27,9 +27,9 @@
 //!   Bitcoin block hash" and nothing else. What is actually published is an
 //!   `AuthorizedOrder`, which also carries the payment address, linking the
 //!   order to a chain transaction. It names the listing only as a tag the
-//!   two parties can read (harvest#57), so neither WHO bought nor WHAT is
-//!   published, though an amount matching a uniquely priced listing still
-//!   gives the listing away.
+//!   two parties can read (harvest#57), so WHO bought is not published and
+//!   WHAT is not published directly, though an amount matching a uniquely
+//!   priced listing can still give the listing away.
 //!   Separating the countable commitment from the payable invoice is the
 //!   ledger contract in issue 8. Until then the
 //!   seller is told what they are publishing rather than reassured about it.
