@@ -50,7 +50,7 @@
 //! with a 1 MiB stack and a stack overflow there is an unrecoverable trap, not
 //! a catchable panic: it kills the whole app, and since the text lives in
 //! contract state, reloading re-reads it and dies again. Two kilobytes of
-//! `>>>>` nests fifty thousand deep, so [`MAX_DEPTH`] flattens past a depth no
+//! `>` nests as deep as it is long, so [`MAX_DEPTH`] flattens past a depth no
 //! honest description reaches, [`MAX_SOURCE_BYTES`] bounds the input, and
 //! [`MAX_NODES`] bounds what one description can put in the page. Runs of text
 //! are also coalesced, because the parser emits an event per unmatched
@@ -69,7 +69,12 @@ pub const MAX_SOURCE_BYTES: usize = 16 * 1024;
 /// time.
 pub const MAX_DEPTH: usize = 16;
 
-/// The most nodes one description may put in the page.
+/// The budget for nodes that carry CONTENT.
+///
+/// Not a hard ceiling on the tree: a container whose children are already
+/// counted is never refused, because dropping it drops them too. Measured
+/// worst case at the other caps is about ten thousand nodes in a couple of
+/// milliseconds, from a document that interleaves quotes and list items.
 pub const MAX_NODES: usize = 4096;
 
 /// A run of text inside a block.
@@ -188,10 +193,14 @@ fn names_a_local_host(lowered_url: &str) -> bool {
         // where `http:////127.0.0.1/` used to get through.
         return true;
     };
-    // A host outside ASCII is refused rather than compared: a homograph of a
-    // real domain reads as the real one, and an IDN maps to ASCII by rules
-    // this does not implement (fullwidth `ｌｏｃａｌｈｏｓｔ` is `localhost`).
-    if !host.is_ascii() {
+    // A host this cannot judge as written is refused, which is the only
+    // honest answer: a browser percent-decodes the host BEFORE parsing it, so
+    // `http://%31%32%37.0.0.1/` is 127.0.0.1 and `http://loc%61lhost/` is
+    // localhost, and comparing the undecoded text sees neither. Decoding here
+    // would mean reimplementing the URL host parser, including the
+    // domain-to-ASCII mapping that turns fullwidth characters into ASCII, so
+    // anything outside the plain host character set is simply not linked.
+    if !host_is_plain(host) {
         return true;
     }
     // `localhost.` and `localhost` are the same name.
@@ -204,13 +213,43 @@ fn names_a_local_host(lowered_url: &str) -> bool {
         .and_then(|rest| rest.strip_suffix(']'))
         .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
     {
-        return v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4().is_some_and(local_v4);
+        let segments = v6.segments();
+        // Unique-local (fc00::/7) and link-local (fe80::/10) have no stable
+        // std predicate yet, and without them the two address versions
+        // disagreed: 169.254/16 was refused while [fe80::1] was not.
+        let unique_local = segments[0] & 0xfe00 == 0xfc00;
+        let link_local = segments[0] & 0xffc0 == 0xfe80;
+        return v6.is_loopback()
+            || v6.is_unspecified()
+            || unique_local
+            || link_local
+            || v6.to_ipv4().is_some_and(local_v4);
     }
     match parse_v4(host) {
         Some(v4) => local_v4(v4),
         // A name that is not an address and not local.
         None => false,
     }
+}
+
+/// Whether a host is written plainly enough to be judged as it stands.
+///
+/// Letters, digits, dots and hyphens, or a bracketed IPv6 literal. Not a
+/// percent sign (a browser decodes those before parsing, so the text here is
+/// not the host it will use), not a space (which `host_of` would otherwise
+/// hand back as a "host", letting a seller word the app's own note), and
+/// nothing outside ASCII.
+fn host_is_plain(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return !inner.is_empty()
+            && inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+    }
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
 /// An IPv4 address in any spelling a browser accepts: dotted quad, but also
@@ -221,7 +260,7 @@ fn parse_v4(host: &str) -> Option<std::net::Ipv4Addr> {
         return Some(addr);
     }
     let parts: Vec<&str> = host.split('.').collect();
-    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+    if parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
         return None;
     }
     let numbers: Vec<u32> = parts.iter().filter_map(|p| parse_v4_part(p)).collect();
@@ -274,13 +313,19 @@ fn local_v4(addr: std::net::Ipv4Addr) -> bool {
 /// `[https://freenet.org](https://evil.example)` is a lie the reader cannot
 /// see. Returns the text to put inside the link, as a [`Inline::Note`].
 fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
-    let claim = flatten_text(children).trim().to_ascii_lowercase();
-    // Does the text look like an address at all? A bare domain counts: most
-    // people write `freenet.org`, not `https://freenet.org`.
-    let looks_like_a_url = claim.contains("://")
-        || claim.starts_with("www.")
-        || (claim.contains('.') && !claim.contains(' ') && claim.split('.').count() >= 2);
-    if !looks_like_a_url || claim.contains(char::is_whitespace) {
+    let shown = flatten_text(children).to_lowercase();
+    // The dots people use to make a domain that is not one: fullwidth,
+    // ideographic, one-dot leader. Normalised so `freenet．org` is judged as
+    // the address it reads as.
+    let shown = shown.replace(['\u{ff0e}', '\u{3002}', '\u{2024}'], ".");
+    // A sentence can carry an address: "Pay at https://freenet.org" said
+    // nothing while the whole claim had to be the address.
+    let claim = shown
+        .split_whitespace()
+        .find(|token| looks_like_an_address(token))?
+        .trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\''))
+        .to_string();
+    if !looks_like_an_address(&claim) {
         return None;
     }
     let destination = destination_label(href)?;
@@ -306,6 +351,27 @@ fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
         || destination.strip_prefix("www.") == Some(claimed)
         || claimed.strip_prefix("www.") == Some(destination.as_str());
     (!same).then(|| format!(" (goes to {destination})"))
+}
+
+/// Whether a run of text reads as an address rather than as prose.
+///
+/// A scheme or `www.` is unambiguous. A bare domain is how most people write
+/// link text, but requiring only a dot fired on `v1.2.3`, `readme.md`,
+/// `$4.99` and `Fig.1` -- and an indicator that cries wolf on a version
+/// number teaches a buyer to ignore it. So the last label has to look like a
+/// suffix: letters, at least two of them.
+fn looks_like_an_address(token: &str) -> bool {
+    if token.contains("://") || token.starts_with("www.") {
+        return true;
+    }
+    let host = token.split(['/', '?', '#']).next().unwrap_or(token);
+    let mut labels = host.split('.');
+    let last = labels.next_back().unwrap_or("");
+    host.matches('.').count() >= 1
+        && last.len() >= 2
+        && last.chars().all(|c| c.is_ascii_alphabetic())
+        && labels.clone().count() >= 1
+        && labels.all(|label| !label.is_empty())
 }
 
 /// Where a link actually goes, in a word: the host, or what kind of thing it
@@ -374,9 +440,13 @@ struct Builder {
     nodes: usize,
     /// Containers refused for depth, so their `End` is refused to match.
     suppressed: usize,
-    /// Set when a cap cut something, so the reader is told rather than left
+    /// Set when a cap CUT something, so the reader is told rather than left
     /// wondering where the rest went.
     truncated: bool,
+    /// Set when the depth cap FLATTENED something. Every character survives,
+    /// so saying the rest is not shown would be false; the two were one flag
+    /// and the marker claimed a cut that had not happened.
+    flattened: bool,
 }
 
 impl Builder {
@@ -430,7 +500,7 @@ impl Builder {
         // Past the cap the container is refused and its children land in
         // whatever holds it, so the text survives and the nesting does not.
         if self.depth() >= MAX_DEPTH {
-            self.truncated = true;
+            self.flattened = true;
             self.suppressed += 1;
             return;
         }
@@ -535,7 +605,7 @@ impl Builder {
     fn start_block_container(&mut self) {
         self.flush_implicit();
         if self.depth() >= MAX_DEPTH {
-            self.truncated = true;
+            self.flattened = true;
             self.suppressed += 1;
             return;
         }
@@ -553,13 +623,19 @@ impl Builder {
 
     fn finish(mut self) -> Vec<Block> {
         self.flush_implicit();
-        if self.truncated {
+        let note = match (self.truncated, self.flattened) {
+            (true, _) => Some("\u{2026} the rest of this description is not shown"),
+            // Everything is here, just not nested as deeply as it was written.
+            (false, true) => {
+                Some("\u{2026} some of this description was too deeply nested to show as written")
+            }
+            (false, false) => None,
+        };
+        if let Some(note) = note {
             // `first_mut`, not `last_mut`: the marker belongs to the document,
             // and anything still open is about to be discarded with it.
             if let Some(document) = self.blocks.first_mut() {
-                document.push(Block::Paragraph(vec![Inline::Note(
-                    "\u{2026} the rest of this description is not shown".to_string(),
-                )]));
+                document.push(Block::Paragraph(vec![Inline::Note(note.to_string())]));
             }
         }
         self.blocks.into_iter().next().unwrap_or_default()
@@ -607,7 +683,7 @@ pub fn parse(source: &str) -> Vec<Block> {
             Event::Start(Tag::List(first)) => {
                 b.flush_implicit();
                 if b.depth() >= MAX_DEPTH {
-                    b.truncated = true;
+                    b.flattened = true;
                     b.suppressed += 1;
                 } else {
                     b.lists.push((first.is_some(), Vec::new()));
@@ -951,8 +1027,8 @@ mod tests {
     /// on a 1 MiB wasm stack where an overflow is an unrecoverable trap
     /// rather than a panic: it would kill the whole app, and since the text
     /// lives in contract state, reloading would kill it again. Two kilobytes
-    /// of `>` nests fifty thousand deep, so this cap is what stands between a
-    /// store link and a visitor's app.
+    /// of `>` nests as deep as it is long, so this cap is what stands between
+    /// a store link and a visitor's app.
     #[test]
     fn deep_nesting_is_flattened_and_never_recursed() {
         fn depth(blocks: &[Block]) -> usize {
