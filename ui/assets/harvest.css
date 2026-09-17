@@ -349,6 +349,16 @@ h4 {
  * the page: headings that read as subheadings rather than competing with the
  * store's name, and blocks that do not inherit a paragraph's bottom margin
  * twice. */
+/* The app's own voice inside a seller's text: the note naming where a link
+ * really goes, and the marker for a description that was cut. Styled so it
+ * does not read as the seller's own words, which is also why it is its own
+ * node rather than text they could reproduce. */
+.md-note {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.9em;
+}
+
 /* One space-free 5 KB "word" would otherwise push the page's own chrome --
  * including the line saying whether the seller's certificate checks out --
  * off screen. */

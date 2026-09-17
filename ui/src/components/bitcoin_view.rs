@@ -570,7 +570,10 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                     spellcheck: false,
                     rows: 2,
                     aria_label: "Payment address, select to copy",
-                    "{o.payment_address}"
+                    // `value`, not a text child: a text child is the initial
+                    // content, and this card re-renders with a different
+                    // address when another invoice is issued.
+                    value: "{o.payment_address}",
                 }
             } else {
                 p { class: "text-warning",

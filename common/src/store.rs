@@ -2603,9 +2603,12 @@ mod wire_compat_tests {
         // literal minus its final 22 bytes (`0x74`, 20 characters, `0x60`)
         // with a map header one entry smaller.
         assert_eq!(re_encoded[0], 0xa6, "one fewer entry than the V1 literal");
+        // `0x74` text(20), the key itself, and `0x60` for the empty string it
+        // held, worked out here rather than left as a number in a comment.
+        let removed = 1 + "payment_instructions".len() + 1;
         assert_eq!(
             &re_encoded[1..],
-            &V1_STORE_INFO_CBOR[1..V1_STORE_INFO_CBOR.len() - 22],
+            &V1_STORE_INFO_CBOR[1..V1_STORE_INFO_CBOR.len() - removed],
             "the only difference should be the removed key and its value"
         );
     }

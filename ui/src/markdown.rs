@@ -85,6 +85,11 @@ pub enum Inline {
         children: Vec<Inline>,
     },
     Break,
+    /// The app speaking, not the seller: the truncation marker, and the note
+    /// naming where a link really goes. Its own node so it can carry its own
+    /// style -- written as plain text by a seller it looks like what it is,
+    /// seller's text, rather than like the app vouching for something.
+    Note(String),
 }
 
 /// One block of a description.
@@ -129,21 +134,33 @@ pub fn safe_href(raw: &str) -> Option<String> {
 }
 
 /// The host part of an http(s) URL, lowercased, without userinfo or port.
+///
+/// `None` for a URL with no http(s) scheme (a `mailto:`, say). For an http(s)
+/// URL whose authority cannot be read, callers must fail CLOSED: see
+/// [`names_a_local_host`].
 fn host_of(lowered_url: &str) -> Option<&str> {
     let after_scheme = lowered_url
         .strip_prefix("http://")
         .or_else(|| lowered_url.strip_prefix("https://"))?;
+    // A browser skips redundant slashes and backslashes after a special
+    // scheme, so `http:////127.0.0.1/` is the loopback address. Reading the
+    // authority without doing the same made one extra slash a bypass.
+    let after_scheme = after_scheme.trim_start_matches(['/', '\\']);
     let authority = after_scheme
-        .split(['/', '?', '#'])
+        .split(['/', '\\', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
     // `https://freenet.org@evil.example/` is evil.example.
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    // An IPv6 literal loses its brackets here, so compare against `::1`
-    // rather than `[::1]`.
-    let host = match host.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(rest),
-        None => host.split(':').next().unwrap_or(host),
+    // An IPv6 literal keeps its brackets, so a caller can tell `[::1]` from a
+    // name; the port is what comes after the closing one.
+    let host = if host.starts_with('[') {
+        match host.find(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        }
+    } else {
+        host.split(':').next().unwrap_or(host)
     };
     (!host.is_empty()).then_some(host)
 }
@@ -162,34 +179,91 @@ fn host_of(lowered_url: &str) -> Option<&str> {
 /// origin is only known at runtime. What it does cover is the shape every
 /// local node has.
 fn names_a_local_host(lowered_url: &str) -> bool {
-    let Some(host) = host_of(lowered_url) else {
+    // Not an http(s) URL at all (`mailto:`), so there is no host to judge.
+    if !lowered_url.starts_with("http://") && !lowered_url.starts_with("https://") {
         return false;
+    }
+    let Some(host) = host_of(lowered_url) else {
+        // An http(s) URL whose authority cannot be read: fail closed. This is
+        // where `http:////127.0.0.1/` used to get through.
+        return true;
     };
-    if host == "localhost" || host == "0.0.0.0" {
+    // A host outside ASCII is refused rather than compared: a homograph of a
+    // real domain reads as the real one, and an IDN maps to ASCII by rules
+    // this does not implement (fullwidth `ｌｏｃａｌｈｏｓｔ` is `localhost`).
+    if !host.is_ascii() {
         return true;
     }
-    // IPv6 loopback, in the spellings a URL can carry.
-    if host == "::1" || host == "0:0:0:0:0:0:0:1" || host == "::ffff:127.0.0.1" {
+    // `localhost.` and `localhost` are the same name.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         return true;
     }
-    if host.ends_with(".localhost") || host.ends_with(".local") {
-        return true;
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+    {
+        return v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4().is_some_and(local_v4);
     }
-    // 127/8, 10/8, 192.168/16, 172.16/12 and link-local 169.254/16.
-    if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") {
-        return true;
+    match parse_v4(host) {
+        Some(v4) => local_v4(v4),
+        // A name that is not an address and not local.
+        None => false,
     }
-    if host.starts_with("169.254.") {
-        return true;
+}
+
+/// An IPv4 address in any spelling a browser accepts: dotted quad, but also
+/// the decimal, octal and hex forms (`2130706433`, `0177.0.0.1`, `0x7f000001`)
+/// that all resolve to 127.0.0.1.
+fn parse_v4(host: &str) -> Option<std::net::Ipv4Addr> {
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(addr);
     }
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(octet) = second.parse::<u8>() {
-                return (16..=31).contains(&octet);
-            }
-        }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
     }
-    false
+    let numbers: Vec<u32> = parts.iter().filter_map(|p| parse_v4_part(p)).collect();
+    if numbers.len() != parts.len() {
+        return None;
+    }
+    // The last part fills whatever octets the earlier ones did not, which is
+    // what makes `http://2130706433/` and `http://127.1/` work in a browser.
+    let last = *numbers.last()?;
+    let leading = &numbers[..numbers.len() - 1];
+    if leading.iter().any(|n| *n > 255) {
+        return None;
+    }
+    let filled = 4 - leading.len();
+    if filled < 4 && last >= 1u32 << (8 * filled) {
+        return None;
+    }
+    let mut value: u32 = last;
+    for (i, part) in leading.iter().enumerate() {
+        value |= part << (8 * (3 - i));
+    }
+    Some(std::net::Ipv4Addr::from(value))
+}
+
+fn parse_v4_part(part: &str) -> Option<u32> {
+    if let Some(hex) = part.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        return u32::from_str_radix(&part[1..], 8).ok();
+    }
+    part.parse::<u32>().ok()
+}
+
+/// Loopback, private, link-local or unspecified: all of them the machine the
+/// app is running on, or its network.
+fn local_v4(addr: std::net::Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
 }
 
 /// A note naming the real destination, when a link's TEXT claims a different
@@ -198,33 +272,65 @@ fn names_a_local_host(lowered_url: &str) -> bool {
 /// Only when the text itself looks like an address: `[my shop](https://x)` is
 /// ordinary and says nothing about where it goes, while
 /// `[https://freenet.org](https://evil.example)` is a lie the reader cannot
-/// see. Returns the text to append inside the link.
+/// see. Returns the text to put inside the link, as a [`Inline::Note`].
 fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
-    let text: String = children
-        .iter()
-        .map(|inline| match inline {
-            Inline::Text(t) | Inline::Code(t) => t.as_str(),
-            _ => "",
-        })
-        .collect();
-    let claim = text.trim().to_ascii_lowercase();
-    // Does the text look like an address at all?
-    let looks_like_a_url = claim.contains("://") || claim.starts_with("www.");
+    let claim = flatten_text(children).trim().to_ascii_lowercase();
+    // Does the text look like an address at all? A bare domain counts: most
+    // people write `freenet.org`, not `https://freenet.org`.
+    let looks_like_a_url = claim.contains("://")
+        || claim.starts_with("www.")
+        || (claim.contains('.') && !claim.contains(' ') && claim.split('.').count() >= 2);
     if !looks_like_a_url || claim.contains(char::is_whitespace) {
         return None;
     }
-    let claimed = host_of(&claim).or_else(|| {
-        claim
-            .strip_prefix("www.")
-            .and_then(|rest| rest.split(['/', '?', '#']).next())
-    })?;
-    let lowered_href = href.to_ascii_lowercase();
-    let real = host_of(&lowered_href)?;
+    let destination = destination_label(href)?;
+    // Userinfo in the CLAIM is the spoof itself: what a reader sees first in
+    // `https://freenet.org@evil.example` is freenet.org. Never suppress the
+    // note for it -- reading the host the way a browser does is exactly what
+    // hides it.
+    let after_scheme = match claim.split_once("://") {
+        Some((_, rest)) => rest,
+        None => claim.as_str(),
+    };
+    let claimed_authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if claimed_authority.contains('@') {
+        return Some(format!(" (goes to {destination})"));
+    }
+    let claimed = claimed_authority.split(':').next().unwrap_or("");
+    let claimed = claimed.strip_suffix('.').unwrap_or(claimed);
+    if claimed.is_empty() {
+        return None;
+    }
     // `www.` is not a different site than the bare host.
-    let same = real == claimed
-        || real.strip_prefix("www.") == Some(claimed)
-        || claimed.strip_prefix("www.") == Some(real);
-    (!same).then(|| format!(" (goes to {real})"))
+    let same = destination == claimed
+        || destination.strip_prefix("www.") == Some(claimed)
+        || claimed.strip_prefix("www.") == Some(destination.as_str());
+    (!same).then(|| format!(" (goes to {destination})"))
+}
+
+/// Where a link actually goes, in a word: the host, or what kind of thing it
+/// is when there is no host to name.
+fn destination_label(href: &str) -> Option<String> {
+    let lowered = href.to_ascii_lowercase();
+    if lowered.starts_with("mailto:") {
+        return Some("a mail address".to_string());
+    }
+    host_of(&lowered).map(|host| host.to_string())
+}
+
+/// All the text a run of inlines shows, including inside emphasis: two
+/// asterisks used to be enough to hide a link's claim from the check above.
+fn flatten_text(inlines: &[Inline]) -> String {
+    inlines
+        .iter()
+        .map(|inline| match inline {
+            Inline::Text(t) | Inline::Code(t) => t.clone(),
+            Inline::Emphasis(children) | Inline::Strong(children) => flatten_text(children),
+            // A nested link cannot happen in markdown, and a note is this
+            // module's own voice rather than the seller's claim.
+            Inline::Link { .. } | Inline::Note(_) | Inline::Break => String::new(),
+        })
+        .collect()
 }
 
 /// What an inline container becomes when it closes.
@@ -281,6 +387,17 @@ impl Builder {
         }
     }
 
+    /// Push a block that carries new content, subject to the node budget.
+    fn push_content(&mut self, block: Block) {
+        if !self.room() {
+            return;
+        }
+        self.push_block(block);
+    }
+
+    /// Push a block, counting it. Used directly only for a container whose
+    /// children are already counted, which must not be dropped for budget:
+    /// dropping it loses them too.
     fn push_block(&mut self, block: Block) {
         self.nodes += 1;
         self.blocks
@@ -370,13 +487,13 @@ impl Builder {
         let finished = match kind {
             Some(InlineKind::Heading(level)) => {
                 if !children.is_empty() {
-                    self.push_block(Block::Heading { level, children });
+                    self.push_content(Block::Heading { level, children });
                 }
                 return;
             }
             Some(InlineKind::Paragraph) | Some(InlineKind::ImplicitParagraph) => {
                 if !children.is_empty() {
-                    self.push_block(Block::Paragraph(children));
+                    self.push_content(Block::Paragraph(children));
                 }
                 return;
             }
@@ -388,7 +505,7 @@ impl Builder {
                 // got. A link does not, and this is the screen where somebody
                 // decides whether to send money to a stranger.
                 if let Some(note) = disagreeing_host_note(&href, &children) {
-                    children.push(Inline::Text(note));
+                    children.push(Inline::Note(note));
                 }
                 vec![Inline::Link { href, children }]
             }
@@ -402,7 +519,7 @@ impl Builder {
             // Emphasis outside any block: keep it rather than drop it.
             None => {
                 if !finished.is_empty() {
-                    self.push_block(Block::Paragraph(finished));
+                    self.push_content(Block::Paragraph(finished));
                 }
             }
         }
@@ -437,9 +554,13 @@ impl Builder {
     fn finish(mut self) -> Vec<Block> {
         self.flush_implicit();
         if self.truncated {
-            self.push_block(Block::Paragraph(vec![Inline::Text(
-                "[\u{2026} the rest of this description is not shown]".to_string(),
-            )]));
+            // `first_mut`, not `last_mut`: the marker belongs to the document,
+            // and anything still open is about to be discarded with it.
+            if let Some(document) = self.blocks.first_mut() {
+                document.push(Block::Paragraph(vec![Inline::Note(
+                    "\u{2026} the rest of this description is not shown".to_string(),
+                )]));
+            }
         }
         self.blocks.into_iter().next().unwrap_or_default()
     }
@@ -464,11 +585,12 @@ pub fn parse(source: &str) -> Vec<Block> {
     };
     b.truncated = cut;
 
+    // Note there is no early `break` here. Leaving the loop with containers
+    // open abandoned whatever they held AND the marker, because both go to
+    // the innermost open container while `finish` returns the outermost: a
+    // 2048-item list rendered as nothing at all. The budget stops new
+    // CONTENT instead, and the stream is allowed to close what it opened.
     for event in Parser::new_ext(source, Options::empty()) {
-        if b.nodes >= MAX_NODES {
-            b.truncated = true;
-            break;
-        }
         match event {
             Event::Start(Tag::Paragraph) => b.start_inline(InlineKind::Paragraph),
             Event::Start(Tag::Heading { level, .. }) => {
@@ -535,7 +657,7 @@ pub fn parse(source: &str) -> Vec<Block> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(text) = b.code.take() {
-                    b.push_block(Block::Code(text));
+                    b.push_content(Block::Code(text));
                 }
             }
 
@@ -549,7 +671,7 @@ pub fn parse(source: &str) -> Vec<Block> {
             Event::HardBreak => b.push_inline(Inline::Break),
             Event::Rule => {
                 b.flush_implicit();
-                b.push_block(Block::Rule);
+                b.push_content(Block::Rule);
             }
 
             // The tree has no node for markup, so a seller's tags arrive as
@@ -640,6 +762,7 @@ fn render_inline(inline: &Inline) -> Element {
             }
         },
         Inline::Break => rsx! { br {} },
+        Inline::Note(text) => rsx! { span { class: "md-note", "{text}" } },
     }
 }
 
@@ -846,7 +969,10 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let quotes = parse(&">".repeat(50_000));
+        // With a trailing character, so the quotes are not empty: empty ones
+        // are dropped by `End(BlockQuote)` whether or not the cap exists,
+        // which made this half of the test pass with `MAX_DEPTH` removed.
+        let quotes = parse(&format!("{}x", ">".repeat(4_000)));
         assert!(
             depth(&quotes) <= MAX_DEPTH + 2,
             "{} levels deep, which recursion cannot be trusted with",
@@ -909,6 +1035,93 @@ mod tests {
         assert!(!whole.contains("not shown"), "an untouched one must not");
     }
 
+    /// **Hitting the node budget inside a list or a quote does not throw it
+    /// away.**
+    ///
+    /// It did: the loop broke out with containers still open, and both their
+    /// contents and the marker went to the innermost open container while
+    /// `finish` returned the outermost. A 2048-item list rendered as nothing
+    /// at all, which is the same silent loss this module fixed for HTML
+    /// blocks.
+    #[test]
+    fn reaching_the_node_budget_inside_a_container_keeps_what_fits() {
+        fn text_of(blocks: &[Block]) -> String {
+            blocks
+                .iter()
+                .map(|block| match block {
+                    Block::Paragraph(i) | Block::Heading { children: i, .. } => flatten_text(i),
+                    Block::Quote(inner) => text_of(inner),
+                    Block::List { items, .. } => items.iter().map(|item| text_of(item)).collect(),
+                    Block::Code(t) => t.clone(),
+                    Block::Rule => String::new(),
+                })
+                .collect()
+        }
+
+        // Comfortably past the budget: at exactly MAX_NODES nothing is cut,
+        // and a test that asserts a cut which did not happen teaches nothing.
+        for source in [
+            "> a\n>\n".repeat(4096),
+            "- a\n".repeat(4096),
+            "a\n\n".repeat(4096),
+        ] {
+            let blocks = parse(&source);
+            let kept = text_of(&blocks);
+            assert!(
+                kept.contains('a'),
+                "everything was dropped for {} bytes of input",
+                source.len()
+            );
+            let rendered = format!("{blocks:?}");
+            assert!(
+                rendered.contains("not shown"),
+                "the reader must be told something was cut: {} bytes in, kept {}",
+                source.len(),
+                kept.len()
+            );
+        }
+    }
+
+    /// The truncation marker and the destination note are the app speaking,
+    /// so they are their own node rather than text a seller can reproduce.
+    #[test]
+    fn the_apps_own_words_are_not_plain_text() {
+        let forged = parse("[\u{2026} the rest of this description is not shown]");
+        let rendered = format!("{forged:?}");
+        assert!(
+            !rendered.contains("Note("),
+            "a seller typing the marker must not get the app's own node: {rendered}"
+        );
+    }
+
+    /// **The evasions that made the destination note silent.**
+    #[test]
+    fn a_disagreeing_link_cannot_hide_behind_emphasis_or_a_bare_domain() {
+        for source in [
+            // Two asterisks used to be enough: the check only read top-level
+            // text.
+            "[**https://freenet.org**](https://evil.example/pay)",
+            // Most people write a bare domain as link text.
+            "[freenet.org](https://evil.example/pay)",
+            // Reading the host the way a browser does is what hides userinfo:
+            // what a reader sees first here is freenet.org.
+            "[https://freenet.org@evil.example](https://evil.example/pay)",
+        ] {
+            let rendered = format!("{:?}", parse(source));
+            assert!(
+                rendered.contains("goes to evil.example"),
+                "{source} said nothing: {rendered}"
+            );
+        }
+
+        // A mail link has no host, and said nothing at all before.
+        let mail = format!(
+            "{:?}",
+            parse("[https://freenet.org](mailto:evil@example.com)")
+        );
+        assert!(mail.contains("a mail address"), "{mail}");
+    }
+
     /// **A link to the machine the app runs on is refused.**
     ///
     /// A relative link is refused because it resolves inside the app's own
@@ -956,7 +1169,9 @@ mod tests {
         };
         assert_eq!(
             children.last(),
-            Some(&text(" (goes to evil.example)")),
+            // A Note, not Text: the app's own voice carries its own node, so
+            // a seller typing the same words does not get the same style.
+            Some(&Inline::Note(" (goes to evil.example)".to_string())),
             "{children:?}"
         );
 
