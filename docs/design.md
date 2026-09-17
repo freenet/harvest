@@ -2,9 +2,15 @@
 
 *Design document -- April 2026*
 
-> **The accountability mechanism described here is superseded.** This document's
-> account of stores, listings, messaging and the overall shape of the application
-> is still accurate. Its **blind-signature feedback tokens are not** — see
+> **The accountability mechanism described here is superseded, and so is its
+> account of payment.** This document's account of stores, listings, messaging
+> and the overall shape of the application is still accurate. Payment is no
+> longer out of band and no longer payment-agnostic: Harvest bills in on-chain
+> Bitcoin, one fresh address per invoice, and a bridge publishes signed
+> evidence of the payment into Freenet (see the Open Questions entry below, and
+> `bitcoin-integration-status.md`). Every "whatever method the seller
+> specifies" below is the original design, kept as history. Its
+> **blind-signature feedback tokens are not** — see
 > [design/incentive-mechanism.md](design/incentive-mechanism.md), whose Part 3
 > shows that design fails in three independent ways, and which replaces it with
 > seller standing and complaints-as-withdrawals. GitHub issue #8 records the
@@ -14,7 +20,7 @@ Harvest is a decentralized marketplace application for [Freenet](https://freenet
 
 ## Overview
 
-Harvest lets users create **stores** (analogous to River's chat rooms) where they list products or services. Buyers discover stores via shared links, negotiate purchases through encrypted messaging, and pay using whatever method the seller specifies. A cryptographic feedback system holds both parties accountable without revealing their identities.
+Harvest lets users create **stores** (analogous to River's chat rooms) where they list products or services. Buyers discover stores via shared links, negotiate purchases through encrypted messaging, and pay an invoice in Bitcoin, which a bridge attests on chain so neither party has to be taken at their word. A cryptographic feedback system holds both parties accountable without revealing their identities.
 
 The system is built on two layers:
 
@@ -67,6 +73,10 @@ The ghostkey delegate is a general-purpose Freenet component (not Harvest-specif
 - **No built-in discovery** -- stores are shared via links, the same way River rooms are shared today
 
 ### How a Transaction Works
+
+*As originally designed. Payment steps 3, 5 and 6 are superseded: an invoice
+names a fresh Bitcoin address and a bridge attests the payment, rather than the
+seller handing over instructions and watching their own wallet.*
 
 **Setup:** Alice is a seller with a \$100 ghostkey. She runs a Harvest store listing handmade goods. Bob is a buyer with a \$50 ghostkey.
 
@@ -316,7 +326,7 @@ The marketplace application built on top of ghostkeys.
 
 ## Open Questions
 
-- **Payment integration:** SETTLED, and no longer out of band. Harvest bills in on-chain Bitcoin: each invoice takes a fresh address derived from the seller's account public key, and a bridge publishes signed evidence of the payment into Freenet, which is what moves an order to Paid. Neither the delegate nor the page needs an external network call for it, because the watch request reaches the bridge through a Freenet contract. What stays out of band is the buyer's wallet: Harvest holds no keys and broadcasts no transactions, and does not want to.
+- **Payment integration:** ANSWERED, and no longer out of band. Harvest bills in on-chain Bitcoin: each invoice takes a fresh address derived from the seller's account public key, and a bridge publishes signed evidence of the payment into Freenet, which is what moves an order to Paid. Neither the delegate nor the page needs an external network call for it, because the watch request reaches the bridge through a Freenet contract. What stays out of band is the buyer's wallet: Harvest holds no keys and broadcasts no transactions, and does not want to. One limit is still open: freenet-bitcoin#7, a payment mined before the bridge reads the watch request is not backfilled.
 - **Transaction count visibility:** Can we make the number of issued feedback tokens verifiable without revealing counterparties? This lets observers distinguish "2 negatives out of 500 transactions" from "2 out of 3."
 - **Token expiry:** Should feedback tokens have a time limit?
 - **Dispute resolution:** No mechanism for resolving honest disagreements. Is mutual deterrence sufficient?
