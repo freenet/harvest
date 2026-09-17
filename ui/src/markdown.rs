@@ -37,7 +37,8 @@
 //!   is a request to a third party from every viewer's browser, which is a
 //!   tracking pixel and a deanonymiser in an app whose point is pseudonymity.
 //! * **Lists, emphasis, code, quotes and rules** carry no such risk and are
-//!   rendered as they read.
+//!   rendered as they read. A fenced block's language is dropped rather than
+//!   put in a class, since the class would be seller-controlled.
 //! * **A link whose text is a different address than its target says so.**
 //!   Plain text made a URL inert; a link does not, and this is the screen
 //!   where somebody decides whether to send money to a stranger.
@@ -969,6 +970,34 @@ mod tests {
             let rendered = format!("{:?}", parse(source));
             assert!(!rendered.contains("goes to"), "{source}: {rendered}");
         }
+    }
+
+    /// **The renderer's half of the safety property, which no test here can
+    /// execute.**
+    ///
+    /// Every other test in this file checks the TREE. The property is jointly
+    /// owned: a future edit that renders a node through Dioxus's raw-HTML
+    /// attribute, or drops `rel` from an anchor, passes all of them.
+    /// Rendering needs a DOM, so this reads the source instead, with needles
+    /// split so they are not satisfied by their own text -- and naming the
+    /// attribute in this very comment is what made the count two on the first
+    /// run, which is the trap in miniature.
+    #[test]
+    fn the_renderer_builds_elements_and_never_html() {
+        let src = include_str!("markdown.rs");
+        let sink = concat!("dangerous_inner", "_html");
+        assert_eq!(
+            src.matches(sink).count(),
+            1,
+            "the only mention of {sink} should be the module doc explaining \
+             why this module does not use it"
+        );
+        assert!(
+            src.contains(concat!("rel: \"noopener ", "noreferrer nofollow\"")),
+            "an anchor built here must carry rel: noopener stops a seller's \
+             link getting a handle on this page, noreferrer stops the store \
+             URL leaking to them"
+        );
     }
 
     #[test]

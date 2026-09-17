@@ -102,7 +102,6 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         "{certificate_warning(&store.certificate_status)}"
                     }
                 }
-
             }
 
             // Contact seller button
