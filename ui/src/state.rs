@@ -5343,25 +5343,39 @@ impl AppState {
         };
         let groups = self.watches_wanted(bridge);
         if groups.is_empty() {
+            // Nothing is going unread that anyone wants, so a later fault is
+            // a new one to tell.
+            if let Some(inbox) = self.bitcoin.inbox.as_mut() {
+                inbox.unread_notified = false;
+            }
             return work;
         }
         let ghostkeys: Vec<freenet_bitcoin_inbox::GhostkeyId> =
             groups.iter().map(|(_, ghostkey, _)| *ghostkey).collect();
+        let wanted: std::collections::HashSet<(BitcoinNetwork, Vec<u8>)> = groups
+            .iter()
+            .flat_map(|(_, _, w)| w.iter().map(|w| (w.network, w.script.clone())))
+            .collect();
         let mut unread = false;
         if let Some(inbox) = self.bitcoin.inbox.as_mut() {
-            if inbox.request_long_unread(&ghostkeys, now_ms) {
-                unread = !std::mem::replace(&mut inbox.unread_notified, true);
-            } else {
-                inbox.unread_notified = false;
+            inbox.note_check(now_ms);
+            // Judged only on a recent state: after the tab has not been
+            // running, the first look must not be at hours-old evidence.
+            if inbox.state_fresh(now_ms) {
+                if inbox.request_long_unread(&ghostkeys, &wanted, now_ms) {
+                    unread = !std::mem::replace(&mut inbox.unread_notified, true);
+                } else {
+                    inbox.unread_notified = false;
+                }
             }
         }
         if unread {
             warn!("watch requests have gone unread in the bridge inbox for hours");
             self.notifications.push(
                 "Harvest's requests asking the Bitcoin bridge to watch your invoices' payment \
-                 addresses have not been read in over two hours. The bridge may not be running, \
-                 or this node may not be reaching it or following its inbox. Payments to your \
-                 invoices may not be seen until that is resolved."
+                 addresses have not been read in over two hours. The bridge may not be running \
+                 or may be refusing them, or this node may not be reaching it or following its \
+                 inbox. Payments to your invoices may not be seen until that is resolved."
                     .to_string(),
             );
         }
@@ -13733,7 +13747,8 @@ mod buy_flow_tests {
             .apply_delta(&inbox::authority().params(inbox::bridge()), &delta)
             .expect("admitted");
         let later = sent_at + crate::bitcoin_inbox::UNREAD_NOTICE_MS;
-        for at in [later, later + 60_000] {
+        // Looked at every minute, as a running tab does.
+        for at in (sent_at..=later + 60_000).step_by(60_000) {
             state
                 .bitcoin
                 .inbox
@@ -13796,6 +13811,143 @@ mod buy_flow_tests {
                 .expect("tracked")
                 .unread_notified
         );
+
+        // Nothing wanted for a while re-arms it too.
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .expect("tracked")
+            .unread_notified = true;
+        let orders = std::mem::take(
+            &mut state
+                .browsing_stores
+                .get_mut(STORE)
+                .expect("the store")
+                .orders,
+        );
+        state.queue_due_watch_requests(read_at + 1);
+        assert!(
+            !state
+                .bitcoin
+                .inbox
+                .as_ref()
+                .expect("tracked")
+                .unread_notified
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = orders;
+    }
+
+    /// **A second fault after the first cleared is told again**, and nothing is
+    /// judged on a stale state.
+    #[test]
+    fn a_later_unread_fault_is_told_again_and_stale_state_is_not_judged() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
+        let mut inbox_state = inbox::open_inbox();
+        serve_inbox(&mut state, &inbox_state);
+        let queued = queued_watch_requests(&state).remove(0);
+        state.pending_signatures.clear();
+        let (scoped_payload, signature) = inbox::sign_result(&gk, queued.signing_payload.clone());
+        let start = now_ms();
+        let bytes = state
+            .on_inbox_entry_signed(queued, gk.pem.clone(), scoped_payload, signature, start)
+            .expect("a submission");
+        let delta: freenet_bitcoin_inbox::InboxDelta =
+            freenet_bitcoin_common::from_cbor(&bytes).expect("decodes");
+        inbox_state
+            .apply_delta(&inbox::authority().params(inbox::bridge()), &delta)
+            .expect("admitted");
+        let told = |state: &AppState| {
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("not been read"))
+                .count()
+        };
+        fn tracker(state: &mut AppState) -> &mut crate::bitcoin_inbox::InboxTracker {
+            state.bitcoin.inbox.as_mut().expect("tracked")
+        }
+
+        // Checked every minute, so no gap restarts the clocks.
+        let mut at = start;
+        let end = start + crate::bitcoin_inbox::UNREAD_NOTICE_MS;
+        tracker(&mut state).on_state(inbox_state.clone(), at);
+        while at < end {
+            at += 60_000;
+            state.queue_due_watch_requests(at);
+        }
+        assert_eq!(
+            told(&state),
+            0,
+            "the state is stale by now, so nothing is judged"
+        );
+        tracker(&mut state).on_state(inbox_state.clone(), at);
+        state.queue_due_watch_requests(at);
+        assert_eq!(told(&state), 1);
+
+        // Read, then a second fault on a new request.
+        let entry = inbox_state.entries.values().next().expect("entry").clone();
+        let mut removed = std::collections::BTreeSet::new();
+        removed.insert(entry.key().removal_prefix());
+        inbox_state
+            .apply_delta(
+                &inbox::authority().params(inbox::bridge()),
+                &freenet_bitcoin_inbox::InboxDelta {
+                    floor: None,
+                    entries: vec![],
+                    removals: vec![freenet_bitcoin_inbox::RemovalBatch::sign(
+                        &inbox::bridge_key(),
+                        entry.mainnet_height,
+                        &removed,
+                    )],
+                },
+            )
+            .expect("read");
+        at += 60_000;
+        tracker(&mut state).on_state(inbox_state.clone(), at);
+        state.queue_due_watch_requests(at);
+        assert!(!tracker(&mut state).unread_notified, "re-armed");
+
+        let mut late = an_order_naming_the_test_bridge(2);
+        late.order.payment_script_pubkey = vec![0x00, 0x14, 0x77];
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders
+            .push(late);
+        let resumed = at + 60_000;
+        let mut stuck = inbox_state.clone();
+        tracker(&mut state).on_state(stuck.clone(), resumed);
+        let work = state.queue_due_watch_requests(resumed);
+        let pending = work
+            .sign
+            .into_iter()
+            .next()
+            .expect("the new order is asked for");
+        state.pending_signatures.clear();
+        let (scoped_payload, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        let bytes = state
+            .on_inbox_entry_signed(pending, gk.pem.clone(), scoped_payload, signature, resumed)
+            .expect("a submission");
+        let delta: freenet_bitcoin_inbox::InboxDelta =
+            freenet_bitcoin_common::from_cbor(&bytes).expect("decodes");
+        stuck
+            .apply_delta(&inbox::authority().params(inbox::bridge()), &delta)
+            .expect("admitted");
+        let mut at = resumed;
+        let end = resumed + crate::bitcoin_inbox::UNREAD_NOTICE_MS;
+        while at < end {
+            at += 60_000;
+            tracker(&mut state).on_state(stuck.clone(), at);
+            state.queue_due_watch_requests(at);
+        }
+        assert_eq!(told(&state), 2, "told again");
     }
 
     fn inbox_pending_for(

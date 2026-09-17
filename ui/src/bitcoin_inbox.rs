@@ -308,7 +308,16 @@ pub const INBOX_FETCH_RETRY_MS: u64 = 60 * 1000;
 /// Nothing is done about it but telling the seller. Resending sooner cannot
 /// help any of these, and against a stale copy it could only fill the key's
 /// places with its own earlier entries.
+/// Only scripts still wanted count, so an order paid or expired mid-fault does
+/// not leave a run that never ends. After this tab has not looked for longer
+/// than [`CHECK_GAP_MS`] (a laptop asleep), every clock restarts: what could not
+/// be observed meanwhile is not evidence of anything.
 pub const UNREAD_NOTICE_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// A gap between checks this long means the tab was not running (asleep,
+/// suspended) rather than that nothing was due: checks come about once a
+/// minute while anything is wanted.
+pub const CHECK_GAP_MS: u64 = 5 * 60 * 1000;
 
 /// How long the seller's own signing may hold watch requests back.
 ///
@@ -360,6 +369,8 @@ pub struct InboxTracker {
     /// Whether the seller has been told requests are going unread, so they are
     /// told once for as long as it lasts.
     pub unread_notified: bool,
+    /// When the watch-request loop last looked.
+    last_check_ms: Option<u64>,
 }
 
 impl InboxTracker {
@@ -376,6 +387,7 @@ impl InboxTracker {
             held_since_ms: None,
             first_seen: Default::default(),
             unread_notified: false,
+            last_check_ms: None,
         }
     }
 
@@ -396,17 +408,48 @@ impl InboxTracker {
         self.state_received_ms = Some(now_ms);
     }
 
-    /// Whether any of `ghostkeys`' requests has gone unread past
-    /// [`UNREAD_NOTICE_MS`], in either of the ways described there.
-    pub fn request_long_unread(&self, ghostkeys: &[GhostkeyId], now_ms: u64) -> bool {
+    /// Note that the watch-request loop is looking now. After a gap longer than
+    /// [`CHECK_GAP_MS`] every unread clock restarts, since reads that happened
+    /// while the tab was not running may have left no trace by now.
+    pub fn note_check(&mut self, now_ms: u64) {
+        if self
+            .last_check_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) > CHECK_GAP_MS)
+        {
+            for sent in self.sent.values_mut().filter(|s| !s.read) {
+                sent.unread_since_ms = now_ms;
+            }
+            for (_, seen) in self.first_seen.values_mut() {
+                *seen = now_ms;
+            }
+        }
+        self.last_check_ms = Some(now_ms);
+    }
+
+    /// Whether the served state is recent enough to judge anything by.
+    pub fn state_fresh(&self, now_ms: u64) -> bool {
+        self.state_received_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) < INBOX_STATE_FRESH_MS)
+    }
+
+    /// Whether any of `ghostkeys`' requests for a script in `wanted` has gone
+    /// unread past [`UNREAD_NOTICE_MS`], in either of the ways described there.
+    pub fn request_long_unread(
+        &self,
+        ghostkeys: &[GhostkeyId],
+        wanted: &std::collections::HashSet<(BitcoinNetwork, Vec<u8>)>,
+        now_ms: u64,
+    ) -> bool {
         let old = |since: u64| now_ms.saturating_sub(since) >= UNREAD_NOTICE_MS;
-        self.sent
+        self.sent.iter().any(|(key, s)| {
+            !s.read
+                && ghostkeys.contains(&s.ghostkey)
+                && wanted.contains(key)
+                && old(s.unread_since_ms)
+        }) || self
+            .first_seen
             .values()
-            .any(|s| !s.read && ghostkeys.contains(&s.ghostkey) && old(s.unread_since_ms))
-            || self
-                .first_seen
-                .values()
-                .any(|(ghostkey, seen)| ghostkeys.contains(ghostkey) && old(*seen))
+            .any(|(ghostkey, seen)| ghostkeys.contains(ghostkey) && old(*seen))
     }
 
     /// Whether to fetch the inbox now: never served, or not heard from in
@@ -1009,6 +1052,10 @@ mod tests {
         }
     }
 
+    fn wanted_set(w: &[WatchWanted]) -> std::collections::HashSet<(BitcoinNetwork, Vec<u8>)> {
+        w.iter().map(|w| (w.network, w.script.clone())).collect()
+    }
+
     fn tracker_on(inbox: InboxStateV1) -> InboxTracker {
         let mut t = InboxTracker::new(bridge(), inbox_key());
         t.on_state(inbox, T0);
@@ -1367,10 +1414,10 @@ mod tests {
             );
         }
         t.on_state(inbox.clone(), hours - 1);
-        assert!(!t.request_long_unread(&[gk.id()], hours - 1));
-        assert!(t.request_long_unread(&[gk.id()], hours));
+        assert!(!t.request_long_unread(&[gk.id()], &wanted_set(&w), hours - 1));
+        assert!(t.request_long_unread(&[gk.id()], &wanted_set(&w), hours));
         assert!(
-            !t.request_long_unread(&[other.id()], hours),
+            !t.request_long_unread(&[other.id()], &wanted_set(&w), hours),
             "only the keys asked about"
         );
     }
@@ -1389,20 +1436,23 @@ mod tests {
             let plan = t.plan(gk.id(), &w, &[], at);
             assert_eq!(plan.len(), 1, "sent again once the last expired");
             send(&mut t, &mut inbox, &gk, &plan[0], at);
-            assert!(!t.request_long_unread(&[gk.id()], at));
+            assert!(!t.request_long_unread(&[gk.id()], &wanted_set(&w), at));
             // Three blocks pass; the entry, unread, falls below the floor.
             at += 30 * 60 * 1000;
             floor += 3;
             raise_floor(&mut inbox, floor);
             t.on_state(inbox.clone(), at);
         }
-        assert!(t.request_long_unread(&[gk.id()], at));
+        assert!(t.request_long_unread(&[gk.id()], &wanted_set(&w), at));
 
         let plan = t.plan(gk.id(), &w, &[], at);
         let entry = send(&mut t, &mut inbox, &gk, &plan[0], at);
         bridge_reads(&mut inbox, &entry);
         t.on_state(inbox.clone(), at + 1);
-        assert!(!t.request_long_unread(&[gk.id()], at + 1), "read");
+        assert!(
+            !t.request_long_unread(&[gk.id()], &wanted_set(&w), at + 1),
+            "read"
+        );
     }
 
     /// **Entries left from before a reload are noticed too.** A new tracker
@@ -1424,10 +1474,10 @@ mod tests {
             t.plan(gk.id(), &w, &[], T0).is_empty(),
             "the places are held"
         );
-        assert!(!t.request_long_unread(&[gk.id()], T0 + 1));
+        assert!(!t.request_long_unread(&[gk.id()], &wanted_set(&w), T0 + 1));
         let later = T0 + UNREAD_NOTICE_MS;
         t.on_state(inbox, later);
-        assert!(t.request_long_unread(&[gk.id()], later));
+        assert!(t.request_long_unread(&[gk.id()], &wanted_set(&w), later));
     }
 
     /// **A floor that stands still does not stop requests.** The bridge still
@@ -1447,6 +1497,86 @@ mod tests {
             )
             .len(),
             1
+        );
+    }
+
+    /// **A renewal after a read starts a new run**, so a healthy watch renewed
+    /// every twelve hours is not reported as unread.
+    #[test]
+    fn a_renewal_after_a_read_starts_a_fresh_unread_run() {
+        let gk = authority().mint();
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        let entry = send(&mut t, &mut inbox, &gk, &plan[0], T0);
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone(), T0 + 1);
+
+        let renew = T0 + RENEW_AFTER_MS;
+        raise_floor(&mut inbox, FLOOR + 72);
+        t.on_state(inbox.clone(), renew);
+        let plan = t.plan(gk.id(), &w, &[], renew);
+        assert_eq!(plan.len(), 1, "renewed");
+        send(&mut t, &mut inbox, &gk, &plan[0], renew);
+        assert!(
+            !t.request_long_unread(&[gk.id()], &wanted_set(&w), renew + 60_000),
+            "the run starts at the renewal, not at the first request"
+        );
+    }
+
+    /// **A script no longer wanted does not count**, so an order paid or
+    /// expired while its request was going unread leaves no run behind.
+    #[test]
+    fn a_script_no_longer_wanted_is_not_reported_unread() {
+        let gk = authority().mint();
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        send(&mut t, &mut inbox, &gk, &plan[0], T0);
+        // The entry expires unread, and the order stops being wanted.
+        raise_floor(&mut inbox, FLOOR + 3);
+        let later = T0 + UNREAD_NOTICE_MS;
+        t.on_state(inbox, later);
+        assert!(t.request_long_unread(&[gk.id()], &wanted_set(&w), later));
+        assert!(!t.request_long_unread(&[gk.id()], &Default::default(), later));
+    }
+
+    /// **After the tab has not been running, the clocks restart**: reads that
+    /// happened meanwhile may have left no trace.
+    #[test]
+    fn a_gap_in_checking_restarts_the_unread_clocks() {
+        let gk = authority().mint();
+        let w = [wanted(BitcoinNetwork::Signet, 1, 1)];
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        t.note_check(T0);
+        let plan = t.plan(gk.id(), &w, &[], T0);
+        send(&mut t, &mut inbox, &gk, &plan[0], T0);
+
+        let woke = T0 + 8 * 60 * 60 * 1000;
+        t.note_check(woke);
+        t.on_state(inbox, woke);
+        assert!(
+            !t.request_long_unread(&[gk.id()], &wanted_set(&w), woke),
+            "neither the send nor the entry is taken as hours unread"
+        );
+        assert!(t.request_long_unread(&[gk.id()], &wanted_set(&w), woke + UNREAD_NOTICE_MS));
+
+        let mut steady = tracker_on(open_inbox());
+        steady.note_check(T0);
+        let mut inbox = open_inbox();
+        let plan = steady.plan(gk.id(), &w, &[], T0);
+        send(&mut steady, &mut inbox, &gk, &plan[0], T0);
+        let mut at = T0;
+        while at < T0 + UNREAD_NOTICE_MS {
+            at += 60_000;
+            steady.note_check(at);
+        }
+        assert!(
+            steady.request_long_unread(&[gk.id()], &wanted_set(&w), at),
+            "checking every minute restarts nothing"
         );
     }
 }
