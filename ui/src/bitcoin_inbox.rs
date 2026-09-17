@@ -30,8 +30,8 @@
 
 use freenet_bitcoin_common::{to_cbor, BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::{
-    sender_height, Action, ByteBuf, GhostkeyId, InboxDelta, InboxEntryBody, InboxParameters,
-    InboxRequest, SignedFloor, WireEntry, MAX_SCRIPTS_PER_REQUEST,
+    sender_height, Action, ByteBuf, EntryKey, GhostkeyId, InboxDelta, InboxEntryBody,
+    InboxParameters, InboxRequest, InboxStateV1, SignedFloor, WireEntry, MAX_SCRIPTS_PER_REQUEST,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractKey, Parameters};
 
@@ -138,6 +138,80 @@ pub fn prepare_entry(
 /// entry only alongside a floor it can check the date against.
 pub fn submission_bytes(floor: &SignedFloor, entry: WireEntry) -> Result<Vec<u8>, String> {
     to_cbor(&InboxDelta::submission(Some(floor.clone()), entry))
+}
+
+/// How long after a watch request is sent before it is renewed. A bridge lets
+/// a watch lapse about a day after the request that last asked for it, so this
+/// renews with half a day to spare.
+pub const RENEW_AFTER_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// How long a just-sent request is given to land in the inbox before its
+/// absence is read as its having been dropped.
+pub const LAND_GRACE_MS: u64 = 2 * 60 * 1000;
+
+/// What this tab has sent the bridge about one script, and what it has seen
+/// happen to that request since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentWatch {
+    /// When it was sent, by this tab's clock.
+    pub sent_at_ms: u64,
+    /// The entry that carried it and the height it was dated at, which is what
+    /// its fate in the inbox is read back by.
+    pub entry_key: EntryKey,
+    pub mainnet_height: u32,
+    /// Whether this tab has seen the bridge remove the entry, which it does
+    /// when it reads it.
+    ///
+    /// Remembered because the evidence does not last. About half an hour after
+    /// the bridge reads an entry, the inbox floor passes its height, and the
+    /// entry and the record of its removal are both pruned. From then on a
+    /// request the bridge read looks exactly like one that was dropped unread,
+    /// and without this every order would be re-requested every half hour.
+    pub read: bool,
+}
+
+impl SentWatch {
+    /// A request just sent in `entry`.
+    pub fn sent(entry: &WireEntry, now_ms: u64) -> Self {
+        SentWatch {
+            sent_at_ms: now_ms,
+            entry_key: entry.entry.key(),
+            mainnet_height: entry.entry.mainnet_height,
+            read: false,
+        }
+    }
+
+    /// Record it if `inbox` shows the bridge has read this request.
+    pub fn observe(&mut self, inbox: &InboxStateV1) {
+        if inbox.is_removed(&self.entry_key, self.mainnet_height) {
+            self.read = true;
+        }
+    }
+}
+
+/// Whether a watch request for a script should be sent now, given what this
+/// tab last sent about it (`None` if nothing) and the inbox as the node serves
+/// it.
+///
+/// Due when it was never sent, when the last request is old enough to renew,
+/// or when the last request left the inbox without the bridge having read it.
+/// Not due while a request is still waiting in the inbox, once the bridge is
+/// seen to have read it, or while a just-sent request may still be landing.
+pub fn watch_due(sent: Option<&SentWatch>, inbox: &InboxStateV1, now_ms: u64) -> bool {
+    let Some(sent) = sent else {
+        return true;
+    };
+    let age = now_ms.saturating_sub(sent.sent_at_ms);
+    if age >= RENEW_AFTER_MS {
+        return true;
+    }
+    if sent.read || inbox.is_removed(&sent.entry_key, sent.mainnet_height) {
+        return false;
+    }
+    if age < LAND_GRACE_MS {
+        return false;
+    }
+    !inbox.entries.contains_key(&sent.entry_key)
 }
 
 #[cfg(test)]
@@ -363,5 +437,159 @@ mod tests {
         let ours = inbox_contract_key(bridge(), *code.hash()).expect("key builds");
         assert_eq!(ours.id(), the_bridges.id(), "same instance id");
         assert_eq!(ours.code_hash(), the_bridges.code_hash(), "same code hash");
+    }
+
+    const T0: u64 = 1_700_000_000_000;
+
+    /// A signed entry for one watch, as sent, and the bridge's floor it was
+    /// dated against.
+    fn a_sent_entry() -> WireEntry {
+        let gk = authority().mint();
+        let floor = SignedFloor::sign(&bridge_key(), FLOOR);
+        let prepared = prepare_entry(bridge(), gk.id(), &floor, &watch_one()).expect("prepares");
+        signed(&gk, prepared.signing_payload)
+    }
+
+    fn apply(inbox: &mut InboxStateV1, delta: InboxDelta) {
+        inbox
+            .apply_delta(&authority().params(bridge()), &delta)
+            .expect("the inbox accepts the update");
+    }
+
+    /// The bridge reading `entry`: it signs a batch removing it.
+    fn bridge_reads(inbox: &mut InboxStateV1, entry: &WireEntry) {
+        let mut removed = std::collections::BTreeSet::new();
+        removed.insert(entry.entry.key().removal_prefix());
+        apply(
+            inbox,
+            InboxDelta {
+                floor: Some(SignedFloor::sign(&bridge_key(), FLOOR)),
+                entries: vec![],
+                removals: vec![freenet_bitcoin_inbox::RemovalBatch::sign(
+                    &bridge_key(),
+                    entry.entry.mainnet_height,
+                    &removed,
+                )],
+            },
+        );
+    }
+
+    /// The bridge's floor moving past `entry`, which prunes it and any record
+    /// of its removal.
+    fn floor_passes(inbox: &mut InboxStateV1, entry: &WireEntry) {
+        apply(
+            inbox,
+            InboxDelta {
+                floor: Some(SignedFloor::sign(
+                    &bridge_key(),
+                    entry.entry.mainnet_height + 1,
+                )),
+                entries: vec![],
+                removals: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn a_script_never_asked_for_is_due() {
+        assert!(watch_due(None, &open_inbox(), T0));
+    }
+
+    #[test]
+    fn a_request_still_waiting_in_the_inbox_is_not_due() {
+        let entry = a_sent_entry();
+        let mut inbox = open_inbox();
+        submit(
+            &mut inbox,
+            &SignedFloor::sign(&bridge_key(), FLOOR),
+            entry.clone(),
+        );
+        let sent = SentWatch::sent(&entry, T0);
+        assert!(!watch_due(Some(&sent), &inbox, T0 + 10 * 60 * 1000));
+    }
+
+    #[test]
+    fn a_just_sent_request_is_given_time_to_land() {
+        let entry = a_sent_entry();
+        let sent = SentWatch::sent(&entry, T0);
+        assert!(
+            !watch_due(Some(&sent), &open_inbox(), T0 + 1_000),
+            "not in the inbox yet, but only a second old"
+        );
+    }
+
+    #[test]
+    fn a_request_the_bridge_read_is_not_due() {
+        let entry = a_sent_entry();
+        let mut inbox = open_inbox();
+        submit(
+            &mut inbox,
+            &SignedFloor::sign(&bridge_key(), FLOOR),
+            entry.clone(),
+        );
+        bridge_reads(&mut inbox, &entry);
+        let sent = SentWatch::sent(&entry, T0);
+        assert!(!watch_due(Some(&sent), &inbox, T0 + 10 * 60 * 1000));
+    }
+
+    #[test]
+    fn a_request_that_left_the_inbox_unread_is_due_again() {
+        let entry = a_sent_entry();
+        let sent = SentWatch::sent(&entry, T0);
+        assert!(
+            watch_due(Some(&sent), &open_inbox(), T0 + 10 * 60 * 1000),
+            "past the grace period, not in the inbox, never seen read"
+        );
+    }
+
+    /// The trap this type exists for. Once the bridge has read a request, the
+    /// floor passing it erases both the entry and the record that it was read,
+    /// so read and dropped look the same. A watch whose read was observed is
+    /// not asked for again; the same history unobserved would be, every half
+    /// hour, for every order.
+    #[test]
+    fn a_request_seen_read_is_not_resent_once_the_floor_erases_the_evidence() {
+        let entry = a_sent_entry();
+        let mut inbox = open_inbox();
+        submit(
+            &mut inbox,
+            &SignedFloor::sign(&bridge_key(), FLOOR),
+            entry.clone(),
+        );
+        bridge_reads(&mut inbox, &entry);
+
+        let mut observed = SentWatch::sent(&entry, T0);
+        observed.observe(&inbox);
+        assert!(observed.read, "the removal was seen");
+        let unobserved = SentWatch::sent(&entry, T0);
+
+        floor_passes(&mut inbox, &entry);
+        let later = T0 + 40 * 60 * 1000;
+        assert!(
+            !inbox.is_removed(&entry.entry.key(), entry.entry.mainnet_height)
+                && !inbox.entries.contains_key(&entry.entry.key()),
+            "the floor has erased every trace of it"
+        );
+        assert!(
+            !watch_due(Some(&observed), &inbox, later),
+            "seen read: not resent"
+        );
+        assert!(
+            watch_due(Some(&unobserved), &inbox, later),
+            "the same history, unobserved, would be resent"
+        );
+    }
+
+    #[test]
+    fn a_watch_is_renewed_before_the_bridge_lets_it_lapse() {
+        let entry = a_sent_entry();
+        let mut sent = SentWatch::sent(&entry, T0);
+        sent.read = true;
+        assert!(!watch_due(
+            Some(&sent),
+            &open_inbox(),
+            T0 + RENEW_AFTER_MS - 1
+        ));
+        assert!(watch_due(Some(&sent), &open_inbox(), T0 + RENEW_AFTER_MS));
     }
 }
