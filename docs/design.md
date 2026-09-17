@@ -316,7 +316,7 @@ The marketplace application built on top of ghostkeys.
 
 ## Open Questions
 
-- **Payment integration:** Delegates currently can't make external network calls (no HTTP, no TCP). Payment is out of band for now -- the seller specifies payment instructions and the buyer pays externally. Should Freenet add controlled external service access for delegates? A simple Bitcoin wallet in a delegate could construct and sign transactions but can't broadcast them.
+- **Payment integration:** SETTLED, and no longer out of band. Harvest bills in on-chain Bitcoin: each invoice takes a fresh address derived from the seller's account public key, and a bridge publishes signed evidence of the payment into Freenet, which is what moves an order to Paid. Neither the delegate nor the page needs an external network call for it, because the watch request reaches the bridge through a Freenet contract. What stays out of band is the buyer's wallet: Harvest holds no keys and broadcasts no transactions, and does not want to.
 - **Transaction count visibility:** Can we make the number of issued feedback tokens verifiable without revealing counterparties? This lets observers distinguish "2 negatives out of 500 transactions" from "2 out of 3."
 - **Token expiry:** Should feedback tokens have a time limit?
 - **Dispute resolution:** No mechanism for resolving honest disagreements. Is mutual deterrence sufficient?

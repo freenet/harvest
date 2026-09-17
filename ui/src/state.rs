@@ -660,9 +660,9 @@ impl StoreDetailsGap {
         match self {
             StoreDetailsGap::NeverPublished => {
                 "This store's details were never published. Buyers who open your link see a \
-                 storefront with no name, no description and no payment instructions, and your \
-                 reputation record cannot be reached from it. Publishing the details below fixes \
-                 all three."
+                 storefront with no name, no description and no notes, and your reputation \
+                 record cannot be reached from it. Publishing the details below fixes all \
+                 three."
             }
             StoreDetailsGap::NoName => {
                 "This store has no name. Buyers who open your link see an unnamed storefront. \

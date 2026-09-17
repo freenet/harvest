@@ -99,9 +99,13 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         "{certificate_warning(&store.certificate_status)}"
                     }
                 }
+                // The seller's own words, and nothing to pay against: what a
+                // buyer pays is the address on an invoice, which is a fresh
+                // one each time. Headed "Payment" this read as the place the
+                // money goes.
                 if !info.payment_instructions.is_empty() {
                     p { class: "payment-info",
-                        strong { "Payment: " }
+                        strong { "From the seller: " }
                         "{info.payment_instructions}"
                     }
                 }
