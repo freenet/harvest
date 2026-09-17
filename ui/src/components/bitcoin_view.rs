@@ -119,9 +119,9 @@ enum BridgeHealth {
     /// expected, not an error -- say so plainly rather than looking broken.
     NotConfigured,
     /// A bridge is configured but we haven't yet learned its tip contract
-    /// id (still waiting on `GetBridge`, or the `/v1/status` fetch is in
-    /// flight or hasn't resolved), or we have the id but no data has
-    /// arrived from the subscription yet.
+    /// id (still waiting on `GetBridge`, or the bridge's tip pointer has not
+    /// resolved), or we have the id but no data has arrived from the
+    /// subscription yet.
     WaitingForData,
     Online,
     Stale,

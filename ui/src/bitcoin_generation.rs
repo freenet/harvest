@@ -37,34 +37,54 @@
 //!
 //! No I/O happens here, so resolution is tested against real signed records.
 
-use freenet_bitcoin_common::BridgeId;
+use freenet_bitcoin_common::{BitcoinNetwork, BitcoinTipParameters, BridgeId};
 use freenet_bitcoin_generation::Artifact;
 use freenet_migrate::pointer::{PointerFloor, PointerOutcome, PointerResolver};
 use freenet_stdlib::prelude::ContractInstanceId;
 
 /// The bridge contracts Harvest needs a generation for.
-///
-/// Not the tip contract: Harvest still addresses that by a well-known id, and
-/// resolving it would also need the tip contract's parameters derived here. A
-/// separate type makes asking this module for the tip a compile error rather
-/// than a silent `None`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resolve {
     /// Where the bridge publishes what it has seen paid to an address.
     Address,
     /// Where the bridge takes requests to watch an address.
     Inbox,
+    /// Where the bridge publishes the chain tip, which every invoice's anchor
+    /// and every payment's depth is measured against.
+    Tip,
 }
 
 impl Resolve {
-    pub const ALL: [Resolve; 2] = [Resolve::Address, Resolve::Inbox];
+    pub const ALL: [Resolve; 3] = [Resolve::Address, Resolve::Inbox, Resolve::Tip];
 
     pub const fn artifact(self) -> Artifact {
         match self {
             Resolve::Address => Artifact::Address,
             Resolve::Inbox => Artifact::Inbox,
+            Resolve::Tip => Artifact::Tip,
         }
     }
+}
+
+/// The tip contract for `network`, at the generation `code_hash` names.
+///
+/// Its parameters are the network and the bridges it trusts, encoded with the
+/// bridge's own encoder, since the address is a hash over those bytes. This is
+/// what replaces the tip contract id Harvest used to carry as a constant, which
+/// was once found three days and ~400 blocks stale, rendering as live (#30).
+pub fn tip_contract_id(
+    code_hash: &[u8; 32],
+    network: BitcoinNetwork,
+    trusted_bridges: &[BridgeId],
+) -> Result<ContractInstanceId, String> {
+    let params = freenet_bitcoin_common::to_cbor(&BitcoinTipParameters {
+        network,
+        trusted_bridges: trusted_bridges.to_vec(),
+    })?;
+    Ok(crate::migrate::current_id(
+        code_hash,
+        &freenet_stdlib::prelude::Parameters::from(params),
+    ))
 }
 
 /// Why an artifact has no code hash to derive from.
@@ -177,12 +197,13 @@ pub struct PointerRequest {
     pub attempt: u32,
 }
 
-/// The resolution of one bridge's address and inbox pointers.
+/// The resolution of one bridge's address, inbox and tip pointers.
 #[derive(Debug)]
 pub struct BridgeGenerations {
     bridge: BridgeId,
     address: Slot,
     inbox: Slot,
+    tip: Slot,
     next_attempt: u32,
 }
 
@@ -195,10 +216,12 @@ impl BridgeGenerations {
             // Placeholders, replaced at once below.
             address: Slot::Failed(Unresolved::Pending),
             inbox: Slot::Failed(Unresolved::Pending),
+            tip: Slot::Failed(Unresolved::Pending),
             next_attempt: 0,
         };
         g.address = g.begin(Resolve::Address);
         g.inbox = g.begin(Resolve::Inbox);
+        g.tip = g.begin(Resolve::Tip);
         g
     }
 
@@ -209,7 +232,7 @@ impl BridgeGenerations {
     /// attributed to the wrong pointer.
     pub fn requests_due(&mut self) -> Vec<PointerRequest> {
         let mut out = Vec::new();
-        for slot in [&mut self.address, &mut self.inbox] {
+        for slot in [&mut self.address, &mut self.inbox, &mut self.tip] {
             if let Slot::Asking {
                 id,
                 resolver,
@@ -331,6 +354,7 @@ impl BridgeGenerations {
         match artifact {
             Resolve::Address => &self.address,
             Resolve::Inbox => &self.inbox,
+            Resolve::Tip => &self.tip,
         }
     }
 
@@ -338,6 +362,7 @@ impl BridgeGenerations {
         match artifact {
             Resolve::Address => &mut self.address,
             Resolve::Inbox => &mut self.inbox,
+            Resolve::Tip => &mut self.tip,
         }
     }
 }
@@ -646,6 +671,28 @@ mod tests {
     /// bridge publishes to, taken from its own journal on 2026-09-16. If they
     /// differed, Harvest would look for the generation somewhere the bridge
     /// never writes, and every artifact would stay unresolved.
+    /// The tip contract this derives from the live bridge's tip pointer is the
+    /// contract that bridge publishes the signet tip to. The code hash is the
+    /// one its tip pointer named on 2026-09-16 (`DUtUZJER...`), and the contract
+    /// id is the one its journal reported (`tip contract network=Signet
+    /// contract=FXFgLKfu...`). Derived from the pointer, it matches without any
+    /// constant in the build.
+    #[test]
+    fn the_live_signet_tip_contract_is_derived_from_its_pointers_code_hash() {
+        let live = BridgeId::from_bs58(crate::gateway::bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
+            .expect("the trusted bridge id parses");
+        let code_hash: [u8; 32] =
+            hex::decode("b97120c8b8e9644defc4f9a0230576ac4a3449ce30a6e68d7cfa47ad0df1664c")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let id = tip_contract_id(&code_hash, BitcoinNetwork::Signet, &[live]).expect("derives");
+        assert_eq!(
+            bs58::encode(id.as_bytes()).into_string(),
+            "FXFgLKfuMm3NPtzWg3Ghgt5otv4Yo7N4CWGDvHpVeZMm"
+        );
+    }
+
     #[test]
     fn the_live_bridges_pointers_are_where_the_bridge_publishes_them() {
         let live = BridgeId::from_bs58(crate::gateway::bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
@@ -665,6 +712,10 @@ mod tests {
         assert_eq!(
             b58(Artifact::Inbox),
             "EJFxTePBSFXQpAHyf5w6iK4SUZGwKP2fQN5uFco4SLau"
+        );
+        assert_eq!(
+            b58(Artifact::Tip),
+            "G9brbHSKXEdFZW8jKtfMHYT2GcrvJH6jhebkykN35mo9"
         );
     }
 }

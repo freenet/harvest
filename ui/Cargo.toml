@@ -25,11 +25,7 @@ freenet-bitcoin-generation = { workspace = true }
 dioxus = { workspace = true }
 
 # Web
-# "Response" added for the bridge's public /v1/status HTTP endpoint (see
-# gateway/bitcoin_bridge_http.rs) -- a plain browser `fetch`, not a Freenet
-# gateway call, since that's the one piece of bridge discovery the delegate
-# cannot do for us (delegates have no outbound-HTTP capability at all).
-web-sys = { workspace = true, features = ["Response"] }
+web-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }

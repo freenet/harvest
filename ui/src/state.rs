@@ -1681,7 +1681,7 @@ impl AppState {
 
         // Try Bitcoin tip / address contracts first. Which one a contract id
         // names is decided when we start subscribing to it (see
-        // `register_tip_contract` / `register_watch_contract`), not by
+        // `register_tip_contract_with_id` / `register_watch_contract`), not by
         // guessing from the bytes -- a tip and an address state are both
         // small single-field composables and could in principle both fail
         // to deserialize as each other only by luck of field naming.
@@ -4637,40 +4637,11 @@ impl AppState {
             BitcoinDelegateResponse::Bridge { endpoint } => {
                 self.bitcoin.bridge_loaded = true;
                 self.bitcoin.bridge = endpoint.clone();
-                if let Some(ep) = endpoint {
-                    // Covers the (currently hypothetical) case of a
-                    // well-known/pinned deployment -- see
-                    // `gateway::bitcoin_config`.
-                    self.register_tip_contract(ep.network);
-                    // The real discovery path today: ask the bridge itself
-                    // over plain HTTP, which the delegate cannot do on our
-                    // behalf (no outbound-HTTP host function exists for
-                    // delegates). See `gateway::bitcoin_bridge_http`.
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let url = ep.url.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            crate::gateway::bitcoin_bridge_http::refresh_bridge_status(url).await;
-                        });
-                    }
-                } else {
-                    // No bridge configured yet -- true first run. Try the
-                    // default, which is the user's OWN machine.
-                    //
-                    // This is what makes the first-run panel show live Bitcoin
-                    // data with no credential and no configuration, for anyone
-                    // running their own bridge. If none is running the fetch
-                    // fails and the panel keeps saying no bridge is
-                    // configured, which is the honest outcome; it never
-                    // invents data.
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let url = crate::gateway::bitcoin_config::default_bridge_url().to_string();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            crate::gateway::bitcoin_bridge_http::refresh_bridge_status(url).await;
-                        });
-                    }
-                }
+                // Nothing is registered from here any more. The tip contract
+                // comes from the bridge's signed tip pointer once it resolves
+                // (`gateway::bitcoin_generation_ops`), and the HTTP status
+                // lookup that used to run here went with the bridge's HTTP
+                // listener.
             }
 
             BitcoinDelegateResponse::PaymentXpubSet { request_id, result } => {
@@ -4914,32 +4885,10 @@ impl AppState {
         }
     }
 
-    /// Ensure the given network's chain-tip contract is subscribed, if we
-    /// know its contract id from a well-known/pinned deployment.
-    ///
-    /// `crate::gateway::bitcoin_config` supplies that id, and it is no longer
-    /// empty: signet names the tip contract of the bridge deployed on nova,
-    /// so this is a real subscription on that network and a no-op on the
-    /// other three. That constant is a stopgap and goes silently stale on any
-    /// contract rebuild -- see that module's docs, which explain why the
-    /// runtime `/v1/status` lookup this was meant to replace is refused by
-    /// the gateway's content-security policy, and why a pointer record is the
-    /// durable fix.
-    ///
-    /// `register_tip_contract_with_id` is the other entry point, taking an id
-    /// discovered at runtime from the bridge's `/v1/status` self-report (see
-    /// `gateway::bitcoin_bridge_http::refresh_bridge_status`), which works
-    /// under `dx serve` where no CSP applies.
-    pub fn register_tip_contract(&mut self, network: BitcoinNetwork) {
-        let Some(id_bs58) = crate::gateway::bitcoin_config::well_known_tip_contract_id(network)
-        else {
-            return;
-        };
-        self.register_tip_contract_with_id(network, id_bs58);
-    }
-
-    /// Register a network's chain-tip contract id, from wherever it was
-    /// discovered, and subscribe to it if we haven't already.
+    /// Register a network's chain-tip contract id and subscribe to it if we
+    /// haven't already. The id is derived from the tip generation the bridge's
+    /// signed pointer names (`gateway::bitcoin_generation_ops`); nothing in
+    /// this build carries one.
     pub fn register_tip_contract_with_id(&mut self, network: BitcoinNetwork, id_bs58: &str) {
         let Ok(bytes) = bs58::decode(id_bs58).into_vec() else {
             dioxus::logger::tracing::warn!(
@@ -5025,9 +4974,9 @@ pub fn friendly_bridge_error(raw: &str) -> String {
 ///   did, not a claim that a bridge was told.
 /// * The page cannot make it either, once published. A webapp is served with
 ///   `connect-src` limited to its own gateway, so `fetch` to a bridge URL is
-///   refused by the content-security policy. `gateway::bitcoin_config`'s
-///   module docs record the same refusal for `/v1/status`, which is why the
-///   tip contract id became a build-time constant.
+///   refused by the content-security policy. That is why the bridge's
+///   contracts are now found through the pointers it signs, read over the
+///   node, rather than asked for over HTTP.
 ///
 /// So a manual watch keeps `contract_id: None` and `bridge_synced: false`
 /// forever, `register_watch_contract` returns immediately because there is no

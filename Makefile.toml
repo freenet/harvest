@@ -162,55 +162,14 @@ set -e
 export FREENET_NODE_URL
 echo "Publishing to $FREENET_NODE_URL"
 
-# The Bitcoin ADDRESSING constants are pinned at build time (the gateway CSP
-# forbids asking a bridge at runtime -- harvest#29), so a contract rebuild
-# re-keys them and this build goes quietly wrong. That happened: harvest#30,
-# stale by five generations, and it did NOT fail silent. The superseded tip
-# contract still exists and still holds its last state, so the published app
-# showed a chain tip ~400 blocks old as though it were live, and every invoice
-# named an address contract that was never published.
-#
-# So check before publishing, which is the moment the cost is incurred. This
-# cannot live in CI -- there is no bridge there.
-#
-# Exit 2 means "could not check" (no bridge reachable) and is NOT treated as a
-# pass, because recording "I could not look" as "it is fine" is the exact
-# defect being guarded against. Override deliberately if you must.
-set +e
-./scripts/check-bitcoin-constants.sh
-CHECK_RC=$?
-set -e
-if [ "$CHECK_RC" -eq 1 ]; then
-  echo "" >&2
-  echo "error: refusing to publish -- see the mismatch above." >&2
-  exit 1
-elif [ "$CHECK_RC" -eq 2 ]; then
-  if [ "${HARVEST_SKIP_BRIDGE_CHECK:-}" = "1" ]; then
-    echo "WARNING: publishing WITHOUT having checked the Bitcoin constants" >&2
-    echo "         (HARVEST_SKIP_BRIDGE_CHECK=1). If they are stale, this build" >&2
-    echo "         will show stale chain data as live. See harvest#30." >&2
-  else
-    echo "" >&2
-    echo "error: could not verify the Bitcoin constants against a bridge, so" >&2
-    echo "       refusing to publish. Start a bridge, set HARVEST_BRIDGE_URL," >&2
-    echo "       or set HARVEST_SKIP_BRIDGE_CHECK=1 to publish unverified." >&2
-    exit 1
-  fi
-elif [ "$CHECK_RC" -ne 0 ]; then
-  # ANY other exit code means the check did not run to a verdict at all: not
-  # executable (126), not found or bad interpreter (127), killed by a signal
-  # (128+n). Without this branch those fall through to publish, which is the
-  # precise failure the check exists to prevent -- "I could not look" recorded
-  # as "it is fine" -- reintroduced one level up in the wrapper that calls it.
-  #
-  # Found in review. Trigger is mundane: a checkout that drops the executable
-  # bit (core.fileMode=false) silently defeats the entire gate.
-  echo "" >&2
-  echo "error: scripts/check-bitcoin-constants.sh did not run to a verdict" >&2
-  echo "       (exit $CHECK_RC). Refusing to publish rather than assuming the" >&2
-  echo "       constants are fine. Check the script is present and executable." >&2
-  exit 1
-fi
+# No Bitcoin addressing check runs here any more, and that is not an
+# oversight. The values it compared against a bridge (harvest#30) are no
+# longer compiled in: the address contract, tip contract and request inbox
+# generations are resolved at runtime from the pointers the bridge signs
+# (ui/src/bitcoin_generation.rs), so a build cannot go stale against a
+# redeployed bridge, and there is nothing left to compare. The check could not
+# run anyway: it asked the bridge's HTTP `/v1/status`, and bridges no longer
+# have an HTTP listener, so it refused every publish unless overridden.
 
 # CORRECTION (2026-09-06). An earlier version of this comment asserted that
 # "fdev EXITS 0 ON A FAILED PUBLISH". That is FALSE for fdev 0.3.295 and was my

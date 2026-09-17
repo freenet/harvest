@@ -134,10 +134,15 @@ fn settle(settled: Option<Resolve>) -> bool {
     mirror();
     let status = GENERATIONS.with(|g| g.borrow().as_ref().map(|g| g.status(artifact)));
     match status {
-        Some(Ok(code_hash)) => info!(
-            "the bridge's {artifact:?} generation resolved: {}",
-            hex::encode(&code_hash[..8])
-        ),
+        Some(Ok(code_hash)) => {
+            info!(
+                "the bridge's {artifact:?} generation resolved: {}",
+                hex::encode(&code_hash[..8])
+            );
+            if artifact == Resolve::Tip {
+                register_tip(code_hash);
+            }
+        }
         Some(Err(why)) => {
             warn!("the bridge's {artifact:?} generation did not resolve: {why:?}");
             gloo_timers::callback::Timeout::new(RETRY_AFTER_MS, move || {
@@ -154,6 +159,33 @@ fn settle(settled: Option<Resolve>) -> bool {
         None => {}
     }
     true
+}
+
+/// Subscribe to the tip contract the resolved tip generation names, for every
+/// network this build can settle on.
+///
+/// This is what replaces the tip contract id Harvest used to carry as a
+/// constant. Each is derived under that network's trusted bridges, the same
+/// list an invoice on it carries, so the tip an invoice is anchored to and the
+/// tip its payment depth is measured against are one contract. Every
+/// settleable network gets one, not only the default: a network offered for
+/// settlement with no tip could never date a payment.
+fn register_tip(code_hash: [u8; 32]) {
+    for &network in super::bitcoin_config::settleable_networks() {
+        let id = super::bitcoin_config::default_trusted_bridges(network).and_then(|bridges| {
+            crate::bitcoin_generation::tip_contract_id(&code_hash, network, &bridges)
+        });
+        match id {
+            Ok(id) => {
+                let id_bs58 = bs58::encode(id.as_bytes()).into_string();
+                info!("subscribing to the {network:?} tip contract {id_bs58}");
+                APP_STATE
+                    .write()
+                    .register_tip_contract_with_id(network, &id_bs58);
+            }
+            Err(e) => warn!("cannot derive the {network:?} tip contract: {e}"),
+        }
+    }
 }
 
 /// Copy each artifact's resolution into app state.

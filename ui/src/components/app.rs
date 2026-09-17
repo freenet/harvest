@@ -94,15 +94,6 @@ pub fn App() -> Element {
                                 .bitcoin
                                 .payment_xpub_loaded = true;
                         }
-                        // No bridge may be configured for the active/default
-                        // network yet, in which case there's nothing to
-                        // subscribe to until one is. Try the default network
-                        // directly too, so the first-run panel gets live
-                        // data even before any watch or bridge config exists.
-                        let default_network = crate::gateway::bitcoin_config::default_network();
-                        crate::gateway::APP_STATE
-                            .write()
-                            .register_tip_contract(default_network);
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
