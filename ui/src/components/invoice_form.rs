@@ -178,12 +178,12 @@ fn invoices_issued_by(
 #[component]
 pub fn PaymentWatchNote() -> Element {
     rsx! {
-        p { class: "text-muted",
+        p { class: "text-warning",
             "Harvest asks a Bitcoin bridge to watch each invoice\u{2019}s address, and the "
-            "invoice shows Paid once the bridge sees the payment. The seller\u{2019}s Harvest "
+            "invoice shows Paid once the bridge sees the payment confirmed. The seller\u{2019}s Harvest "
             "renews that request while it is open, and the bridge stops watching about a "
             "day after the last renewal. A payment made while it is not watching is not "
-            "picked up later, so a seller waiting to be paid should open Harvest at least "
+            "picked up later, so a seller waiting to be paid should open Harvest more than "
             "once a day."
         }
     }
