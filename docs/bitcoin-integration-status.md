@@ -114,12 +114,15 @@ Known limits:
   whose requests keep expiring unread, or any entry of the key's sitting unread
   in this node's copy of the inbox. The second is not limited to scripts still
   wanted, because an entry's scripts are sealed to the bridge, and because an
-  entry that sits unread that long means the inbox is not being read. The causes (a request that never reaches the bridge's node, a bridge
-  that refuses it, a node serving a copy it has stopped following, a bridge
-  that is not running) are outside what the tab can fix. After the tab has not
-  been running (a laptop asleep) the two hours start again, since a read that
-  happened meanwhile may have left no trace. Requests that cannot be sent at
-  all, because the inbox is never served, are not covered by this notice.
+  entry that sits unread that long means the inbox is not being read. The
+  causes (a request that never reaches the bridge's node, a bridge that
+  refuses it, a node serving a copy it has stopped following, a bridge that is
+  not running) are outside what the tab can fix. After the tab has not been
+  running (a laptop asleep) the two hours start again, since a read that
+  happened meanwhile may have left no trace. Not covered: requests that cannot
+  be sent at all because the inbox is never served, or stops being served at a
+  moment when nothing is waiting in it. No request then goes unread; the next
+  renewal simply is not sent.
 - **Tracking is in memory.** A reload sends every wanted request once more,
   which is an early renewal. Pointer floors are not persisted either, so on the
   first resolve after a load a peer could serve a genuine but superseded

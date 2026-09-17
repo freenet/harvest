@@ -308,8 +308,10 @@ pub const INBOX_FETCH_RETRY_MS: u64 = 60 * 1000;
 /// Nothing is done about it but telling the seller. Resending sooner cannot
 /// help any of these, and against a stale copy it could only fill the key's
 /// places with its own earlier entries.
-/// Only scripts still wanted count, so an order paid or expired mid-fault does
-/// not leave a run that never ends. After this tab has not looked for longer
+/// A run of this tab's own requests counts only for scripts still wanted, so an
+/// order paid or expired mid-fault does not leave a run that never ends. An
+/// entry sitting in the inbox counts whatever it asked for: see
+/// [`InboxTracker::request_long_unread`]. After this tab has not looked for longer
 /// than [`CHECK_GAP_MS`] (a laptop asleep), every clock restarts: what could not
 /// be observed meanwhile is not evidence of anything.
 pub const UNREAD_NOTICE_MS: u64 = 2 * 60 * 60 * 1000;
