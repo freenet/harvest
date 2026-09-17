@@ -26,8 +26,10 @@
 //!   design document describes a commitment carrying "the amount and a recent
 //!   Bitcoin block hash" and nothing else. What is actually published is an
 //!   `AuthorizedOrder`, which also carries the payment address, linking the
-//!   order to a chain transaction. It no longer names the listing
-//!   (harvest#57), so WHAT was bought is not public, nor WHO bought it.
+//!   order to a chain transaction. It names the listing only as a tag the
+//!   two parties can read (harvest#57), so neither WHO bought nor WHAT is
+//!   published, though an amount matching a uniquely priced listing still
+//!   gives the listing away.
 //!   Separating the countable commitment from the payable invoice is the
 //!   ledger contract in issue 8. Until then the
 //!   seller is told what they are publishing rather than reassured about it.
@@ -319,8 +321,9 @@ pub fn AcceptRequest(
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
                 "carries the amount, the payment address, a recent block, the confirmations you "
-                "require and the bridges you trust. It does NOT carry which listing it is for, "
-                "who asked, or where they want it sent -- those stay in this conversation."
+                "require and the bridges you trust. It does NOT say which listing it is for "
+                "(though an amount matching a unique price can give that away), who asked, or "
+                "where they want it sent -- those stay in this conversation."
             }
             div { class: "form-group",
                 label { class: "form-label",

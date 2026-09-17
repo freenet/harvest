@@ -367,6 +367,7 @@ mod tests {
             bitcoin_address_code_hash: code_hash,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at: ts,
         }
         .with_derived_id()

@@ -1794,6 +1794,7 @@ mod uncarried_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         };
         let message = harvest_common::to_cbor(&order).expect("serialize");

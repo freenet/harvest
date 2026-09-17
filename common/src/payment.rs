@@ -306,11 +306,10 @@ const _: () = assert!(
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Order {
     pub id: OrderId,
-    // No listing. Which listing an order is for travels only inside the
-    // encrypted conversation (`OrderRequest` and `OrderAccepted` in the UI's
-    // messaging), never in this published record: anyone who can read the
-    // store could otherwise join it to the store's public listings and read
-    // off a per-product sales record (harvest#57).
+    // No listing id: anyone who can read the store could join it to the
+    // store's public listings and read off a per-product sales record
+    // (harvest#57). `listing_tag` below says which listing it is, to the two
+    // parties only.
     /// Ghostkey fingerprint of the buyer this invoice was issued to.
     pub buyer_fingerprint: String,
     pub seller_fingerprint: String,
@@ -473,6 +472,19 @@ pub struct Order {
     /// than matching everyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_binding: Option<[u8; 32]>,
+    /// Which listing this order is for, as only its buyer and seller can tell:
+    /// [`crate::mailbox::listing_tag`] over the conversation's key and the
+    /// listing id. `None` for an invoice that answers no request.
+    ///
+    /// Published and signed, like `order_binding` beside it, because "which
+    /// request does this order answer" has to rest on the seller's published
+    /// record: a mailbox message can be lost or evicted, and a seller who could
+    /// not see their own answer would be offered to publish a second order.
+    ///
+    /// `#[serde(default, skip_serializing_if)]` for the same reason as the
+    /// fields above: an order without it must encode exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_tag: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1593,6 +1605,7 @@ mod lightning_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at: ts,
         }
         .with_derived_id()
@@ -1867,6 +1880,7 @@ mod order_identity_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         }
     }
@@ -2008,6 +2022,7 @@ mod order_identity_tests {
             bitcoin_address_code_hash: None,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         };
         assert_eq!(
@@ -2113,6 +2128,7 @@ mod address_instance_tests {
             bitcoin_address_code_hash: code_hash,
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         }
         .with_derived_id()
@@ -2205,6 +2221,7 @@ mod proof_assembly_tests {
             bitcoin_address_code_hash: Some([4u8; 32]),
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         }
         .with_derived_id()

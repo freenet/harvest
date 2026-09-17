@@ -194,21 +194,8 @@ pub enum MessageContent {
     /// `harvest_common::payment::OrderId::from_terms` hashes terms the seller
     /// chooses, including a `created_at` they stamp, so a buyer cannot
     /// compute it.
-    ///
-    /// # Which listing it answers
-    ///
-    /// `listing_id` says which of the buyer's requests this order answers. It
-    /// is here, inside the AEAD, and not on the published order, because a
-    /// published listing lets anyone who can read the store join orders to
-    /// the store's listings and read off a per-product sales record
-    /// (harvest#57). It is the seller's assertion in a private conversation,
-    /// readable only by the two parties, which is all the published field ever
-    /// was: only the seller could sign that either. `None` in an acceptance
-    /// written before this field existed.
     OrderAccepted {
         order_id: harvest_common::payment::OrderId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        listing_id: Option<harvest_common::listing::ListingId>,
     },
 }
 
@@ -233,6 +220,12 @@ impl ConversationKeys {
             to_seller: conversation_key_from_dh(shared_secret, MessageDirection::BuyerToSeller),
             from_seller: conversation_key_from_dh(shared_secret, MessageDirection::SellerToBuyer),
         }
+    }
+
+    /// The tag a published order carries for `listing` in this conversation.
+    /// See [`harvest_common::mailbox::listing_tag`].
+    pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        harvest_common::mailbox::listing_tag(&self.from_seller, listing)
     }
 }
 
@@ -390,6 +383,11 @@ impl BuyerConversation {
     /// The value a commitment must carry to be this buyer's.
     pub fn order_binding(&self) -> [u8; 32] {
         self.order_binding
+    }
+
+    /// The tag an order this conversation asked for carries, for `listing`.
+    pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        self.keys.listing_tag(listing)
     }
 
     /// The ephemeral secret, for this crate's tests only.
@@ -682,7 +680,6 @@ pub fn seal_order_accepted(
     buyer_public_key: &[u8],
     conversation_id: &ConversationId,
     order_id: &harvest_common::payment::OrderId,
-    listing_id: &harvest_common::listing::ListingId,
 ) -> Result<EncryptedMessage, String> {
     let tag: [u8; 32] = buyer_public_key.try_into().map_err(|_| {
         format!(
@@ -696,7 +693,6 @@ pub fn seal_order_accepted(
         conversation_id,
         MessageContent::OrderAccepted {
             order_id: order_id.clone(),
-            listing_id: Some(listing_id.clone()),
         },
     )
 }
@@ -1915,7 +1911,6 @@ mod buy_flow_tests {
             &buyer.buyer_public_key,
             &buyer.conversation_id,
             &order,
-            &ListingId([4u8; 32]),
         )
         .expect("seal the acceptance");
 
@@ -1927,17 +1922,7 @@ mod buy_flow_tests {
             "an acceptance the buyer wrote themselves is not an acceptance"
         );
         match &thread[0].content {
-            MessageContent::OrderAccepted {
-                order_id,
-                listing_id,
-            } => {
-                assert_eq!(order_id, &order);
-                assert_eq!(
-                    listing_id.as_ref(),
-                    Some(&ListingId([4u8; 32])),
-                    "and the listing it answers"
-                );
-            }
+            MessageContent::OrderAccepted { order_id } => assert_eq!(order_id, &order),
             other => panic!("expected an acceptance, got {other:?}"),
         }
     }

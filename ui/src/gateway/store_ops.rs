@@ -670,6 +670,7 @@ mod tests {
             bitcoin_address_code_hash: Some([4u8; 32]),
             anchor: None,
             order_binding: None,
+            listing_tag: None,
             created_at,
         }
         .with_derived_id();
