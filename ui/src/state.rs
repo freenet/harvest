@@ -11708,16 +11708,6 @@ mod buy_flow_tests {
         assert_eq!(recalled.order_binding(), [9u8; 32]);
     }
 
-    /// **An invoice naming no Bitcoin bridge is refused, not footnoted.**
-    ///
-    /// Found in review. `verify_payment_proof` returns `NoTrustedBridges` for
-    /// such an order permanently, so no payment to it can EVER be proven --
-    /// and `trusted_bridges` is per-order and seller-chosen, so a malicious
-    /// seller picks it. The card said so in smaller text underneath the
-    /// sentence saying the order checked out, with the payment address shown
-    /// above it. A condition that decides whether money can ever be recovered
-    /// belongs in the same list as everything else that decides whether to
-    /// pay.
     /// **A conversation restored through the delegate tags listings exactly as
     /// the seller does.** The seller's key comes from its own Diffie-Hellman;
     /// a recalled buyer conversation takes the delegate's derived key. If the
@@ -11743,6 +11733,16 @@ mod buy_flow_tests {
         assert_eq!(recalled.listing_tag(&listing), seller.listing_tag(&listing));
     }
 
+    /// **An invoice naming no Bitcoin bridge is refused, not footnoted.**
+    ///
+    /// Found in review. `verify_payment_proof` returns `NoTrustedBridges` for
+    /// such an order permanently, so no payment to it can EVER be proven --
+    /// and `trusted_bridges` is per-order and seller-chosen, so a malicious
+    /// seller picks it. The card said so in smaller text underneath the
+    /// sentence saying the order checked out, with the payment address shown
+    /// above it. A condition that decides whether money can ever be recovered
+    /// belongs in the same list as everything else that decides whether to
+    /// pay.
     #[test]
     fn an_invoice_naming_no_bridge_is_refused() {
         let mut order = commitment(
