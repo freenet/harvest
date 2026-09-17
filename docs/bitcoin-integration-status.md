@@ -82,22 +82,21 @@ anyway (#29).
   generation resolves, `order_for_invoice` refuses to issue an invoice (#30).
 - **What is sent.** `state::AppState::watches_wanted` picks the seller's own
   unpaid, anchored orders that name the bridge, up to a day of blocks past the
-  payable window, and only under a Ghost Key the vault has listed for this app,
-  whose grant includes signing, so signing raises no prompt.
+  payable window, and only under a Ghost Key the vault has listed for this app.
   `bitcoin_inbox::InboxTracker::plan` batches them. Each request is sealed to
   the bridge, bound to the store's verified seller key, signed by the ghostkey
   delegate, and submitted with the floor it was dated against. It is renewed
-  every 12h, since a watch lasts about a day. It is sent again if it left the
-  inbox unread, or has sat there unread for half an hour, which the bridge
-  (polling every 30 seconds) would not allow if it could read it.
+  every 12h, since a watch lasts about a day, and sent again if it left the
+  inbox unread.
 - **What it leaves alone.** The inbox is fetched only by a node with an order
   to watch. Background signing waits, for up to ten minutes at a stretch, while
   the seller signs anything of their own, and goes one Ghost Key at a time. If
-  the vault refuses a watch request, does not answer it, or signs it with the
-  wrong key, that key is not asked again until the page is reloaded, and the
-  seller is told once. The usual cause is a grant revoked while the tab was
-  open, and asking again would put the vault's dialog in front of the seller
-  over and over. A withdrawn inbox is told to the seller too.
+  the vault refuses a watch request, does not answer it within five minutes, or
+  signs it with the wrong key, that key is not asked again until the page is
+  reloaded, and the seller is told once. A listed key's grant includes signing,
+  so no prompt appears in normal use. A grant revoked while the tab is open is
+  the exception: the key is still listed here, so the vault prompts, once, and
+  then the key is stopped. A withdrawn inbox is told to the seller too.
 
 Known limits:
 
@@ -107,6 +106,12 @@ Known limits:
   about a minute of the invoice and the bridge polls its inbox every 30
   seconds, but that is not a bound: the seller's own signing, a key the vault
   refused, or a request the network dropped all delay it.
+- **A request that is never read is noticed, not repaired.** If one of this
+  tab's requests sits unread for two hours, the seller is told once. Nothing is
+  resent: the usual causes are a node serving a copy of the inbox it has
+  stopped following, whose floor every up-to-date peer has passed, or a bridge
+  that is not running, and resending helps with neither. Reloading the page
+  fetches and subscribes again.
 - **Tracking is in memory.** A reload sends every wanted request once more,
   which is an early renewal. Pointer floors are not persisted either, so on the
   first resolve after a load a peer could serve a genuine but superseded
