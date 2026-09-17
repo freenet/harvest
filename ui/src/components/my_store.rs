@@ -453,13 +453,9 @@ fn StoreDetailsForm(
                 }
             }
 
-            // NOT "how should buyers pay". Harvest bills in on-chain Bitcoin
-            // and derives a fresh address per invoice from the seller's
-            // account key, so there is nowhere for a store-wide address to
-            // live -- and an address pasted here invites the one payment
-            // route Harvest cannot prove: no order covers it, so no bridge is
-            // asked to watch it, nothing reaches Paid, and neither party has
-            // evidence or a complaint to attach it to.
+            // NOT "how should buyers pay". An invoice names the address, a
+            // fresh one each time, so this is only whatever else the seller
+            // wants to say.
             div { class: "form-group",
                 label { class: "form-label", "Notes for buyers" }
                 textarea {
@@ -467,11 +463,6 @@ fn StoreDetailsForm(
                     placeholder: "e.g. ships within 2 days, or ask me before ordering",
                     value: "{payment_instructions}",
                     oninput: move |e| payment_instructions.set(e.value()),
-                }
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "Harvest bills in Bitcoin and takes a fresh address for every invoice, so "
-                    "there is no address to put here. A payment sent anywhere else cannot be "
-                    "shown as paid."
                 }
             }
 
