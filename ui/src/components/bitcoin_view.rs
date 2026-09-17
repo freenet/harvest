@@ -840,15 +840,14 @@ fn WatchForm(network: BitcoinNetwork, has_ghostkey: bool) -> Element {
     rsx! {
         div { class: "card",
             h4 { "Watch a Bitcoin address" }
-            // Said before the click, not after it. A watch is recorded
-            // privately and that is all it is: nothing asks a bridge to
-            // synchronize the script, so no transactions follow. See
-            // `state::WatchSyncStatus` for why that cannot be done from
-            // either the delegate or the page today.
+            // Said before the click, not after it. A manual watch is recorded
+            // privately and that is all it is: only invoice addresses are sent
+            // to a bridge, so no transactions follow. See
+            // `state::WatchSyncStatus`.
             p { class: "text-muted",
-                "This records the address privately on this device. Harvest has no route "
-                "to a bridge from inside a published app, so nothing will be synchronized "
-                "and no transactions will appear for it yet."
+                "This records the address privately on this device. Harvest asks a bridge "
+                "to watch invoice addresses only, so no transactions will appear for an "
+                "address added here."
             }
             div { class: "form-group",
                 input {

@@ -12,16 +12,15 @@
 //!
 //! # What the seller has to be told, and is
 //!
-//! **A published invoice does not update itself when it is paid.** Making it
-//! do so means a bridge being told which script to watch, and today the only
-//! path for that is an HTTP call the gateway's Content-Security-Policy
-//! forbids a webapp from making (see `gateway::bitcoin_config`); the
-//! replacement -- the delegate putting an encrypted watch request into a
-//! contract the bridge subscribes to -- is blocked on freenet-core#5542. So
-//! an invoice sits at "Awaiting payment" even after the coin has arrived,
-//! unless something else is already watching that address. Saying so is the
-//! whole of [`PaymentWatchNote`]; a status that silently never changes would
-//! otherwise read as a payment that never came.
+//! **An invoice reaches Paid only while a bridge is watching its address, and
+//! that watch has to be kept alive.** Harvest asks the bridge through its
+//! request inbox when the invoice is issued, and renews the request while the
+//! seller has Harvest open (`AppState::queue_due_watch_requests`). The bridge
+//! drops a watch about a day after the request that last asked for it, and it
+//! does not look back over blocks it scanned while not watching
+//! (freenet-bitcoin#7), so a payment made during a lapse is never picked up.
+//! [`PaymentWatchNote`] says that, because otherwise an invoice stuck at
+//! "Awaiting payment" would read as a payment that never came.
 
 use dioxus::prelude::*;
 use freenet_bitcoin_common::BitcoinNetwork;
@@ -172,16 +171,20 @@ fn invoices_issued_by(
     mine
 }
 
-/// The one honest thing an invoice list has to say today: nothing here is
-/// watching the chain for you.
+/// What keeps an invoice's status honest, said wherever invoices are listed.
+///
+/// Shown to buyers too: a buyer about to pay is the one who loses out if the
+/// seller has not opened Harvest in days.
 #[component]
 pub fn PaymentWatchNote() -> Element {
     rsx! {
-        p { class: "text-warning",
-            "Harvest is not yet watching these addresses for you. An invoice stays at "
-            "\u{201c}Awaiting payment\u{201d} even once the coin has arrived, unless a "
-            "Bitcoin bridge has been told about the address by some other means. Check "
-            "your own wallet to see whether a buyer has paid."
+        p { class: "text-muted",
+            "Harvest asks a Bitcoin bridge to watch each invoice\u{2019}s address, and the "
+            "invoice shows Paid once the bridge sees the payment. The seller\u{2019}s Harvest "
+            "renews that request while it is open, and the bridge stops watching about a "
+            "day after the last renewal. A payment made while it is not watching is not "
+            "picked up later, so a seller waiting to be paid should open Harvest at least "
+            "once a day."
         }
     }
 }
