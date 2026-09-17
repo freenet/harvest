@@ -5358,15 +5358,14 @@ impl AppState {
             .collect();
         let mut unread = false;
         if let Some(inbox) = self.bitcoin.inbox.as_mut() {
+            // After the tab has not been running, this restarts the clocks
+            // before anything is judged. A state is not required: a node that
+            // has stopped serving the inbox is one of the faults to tell.
             inbox.note_check(now_ms);
-            // Judged only on a recent state: after the tab has not been
-            // running, the first look must not be at hours-old evidence.
-            if inbox.state_fresh(now_ms) {
-                if inbox.request_long_unread(&ghostkeys, &wanted, now_ms) {
-                    unread = !std::mem::replace(&mut inbox.unread_notified, true);
-                } else {
-                    inbox.unread_notified = false;
-                }
+            if inbox.request_long_unread(&ghostkeys, &wanted, now_ms) {
+                unread = !std::mem::replace(&mut inbox.unread_notified, true);
+            } else {
+                inbox.unread_notified = false;
             }
         }
         if unread {
@@ -13842,10 +13841,10 @@ mod buy_flow_tests {
             .orders = orders;
     }
 
-    /// **A second fault after the first cleared is told again**, and nothing is
-    /// judged on a stale state.
+    /// **A second fault after the first cleared is told again**, and a node
+    /// that stops serving the inbox is told too.
     #[test]
-    fn a_later_unread_fault_is_told_again_and_stale_state_is_not_judged() {
+    fn a_later_unread_fault_is_told_again_even_with_no_new_state() {
         let gk = inbox::authority().mint();
         let mut state = a_seller_selling(vec![an_order_naming_the_test_bridge(3)], gk.id().0);
         let mut inbox_state = inbox::open_inbox();
@@ -13883,12 +13882,13 @@ mod buy_flow_tests {
         }
         assert_eq!(
             told(&state),
-            0,
-            "the state is stale by now, so nothing is judged"
+            1,
+            "told though no state has come since: a node that stopped serving the inbox is a \
+             fault too"
         );
         tracker(&mut state).on_state(inbox_state.clone(), at);
         state.queue_due_watch_requests(at);
-        assert_eq!(told(&state), 1);
+        assert_eq!(told(&state), 1, "once");
 
         // Read, then a second fault on a new request.
         let entry = inbox_state.entries.values().next().expect("entry").clone();

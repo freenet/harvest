@@ -426,14 +426,13 @@ impl InboxTracker {
         self.last_check_ms = Some(now_ms);
     }
 
-    /// Whether the served state is recent enough to judge anything by.
-    pub fn state_fresh(&self, now_ms: u64) -> bool {
-        self.state_received_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) < INBOX_STATE_FRESH_MS)
-    }
-
-    /// Whether any of `ghostkeys`' requests for a script in `wanted` has gone
-    /// unread past [`UNREAD_NOTICE_MS`], in either of the ways described there.
+    /// Whether any of `ghostkeys`' requests has gone unread past
+    /// [`UNREAD_NOTICE_MS`], in either of the ways described there.
+    ///
+    /// A run of this tab's requests counts only for a script in `wanted`. An
+    /// entry sitting in the inbox counts whatever it asked for: its scripts are
+    /// sealed to the bridge, and one unread for that long means the inbox is not
+    /// being read, which matters to every script the key still wants.
     pub fn request_long_unread(
         &self,
         ghostkeys: &[GhostkeyId],

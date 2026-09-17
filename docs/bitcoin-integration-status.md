@@ -109,10 +109,12 @@ Known limits:
   refused, or a request the network dropped all delay it.
 - **Requests that are never read are noticed, not repaired.** A request that
   leaves the inbox unread is sent again, but nothing more is done about it.
-  If a key's requests for scripts it still wants go unread for two hours,
-  either because each expires unread and is sent again or because entries sit
-  in this node's copy of the inbox, the seller is told, once for as long as it
-  lasts. The causes (a request that never reaches the bridge's node, a bridge
+  The seller is told, once for as long as it lasts, if a key with anything
+  still to watch has requests unread for two hours: a script it still wants
+  whose requests keep expiring unread, or any entry of the key's sitting unread
+  in this node's copy of the inbox. The second is not limited to scripts still
+  wanted, because an entry's scripts are sealed to the bridge, and because an
+  entry that sits unread that long means the inbox is not being read. The causes (a request that never reaches the bridge's node, a bridge
   that refuses it, a node serving a copy it has stopped following, a bridge
   that is not running) are outside what the tab can fix. After the tab has not
   been running (a laptop asleep) the two hours start again, since a read that
