@@ -346,16 +346,30 @@ fn IdentityCard(
                                 class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
                                 onclick: {
                                     let id = card.contract_id.clone();
+                                    let details = card.details.clone();
+                                    let gap = card.gap;
                                     move |_| {
                                         let id = id.clone();
-                                        if editing_store() == Some(id.clone()) {
-                                            editing_store.set(None);
-                                        } else {
-                                            editing_store.set(Some(id));
+                                        match store_details_button_action(gap) {
+                                            // See `store_details_button_action`
+                                            // for why this publishes instead
+                                            // of opening the form (#78).
+                                            StoreDetailsAction::PublishNow => {
+                                                publish_store_details(id, details.clone());
+                                            }
+                                            StoreDetailsAction::ToggleForm => {
+                                                if editing_store() == Some(id.clone()) {
+                                                    editing_store.set(None);
+                                                } else {
+                                                    editing_store.set(Some(id));
+                                                }
+                                            }
                                         }
                                     }
                                 },
-                                if editing_store() == Some(card.contract_id.clone()) {
+                                if store_details_button_action(card.gap) == StoreDetailsAction::PublishNow {
+                                    "Publish details"
+                                } else if editing_store() == Some(card.contract_id.clone()) {
                                     "Cancel"
                                 } else if card.gap.is_some() {
                                     "Publish details"
@@ -482,6 +496,42 @@ fn StoreDetailsForm(
                 "{submit_label}"
             }
         }
+    }
+}
+
+/// What clicking the store-details button should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreDetailsAction {
+    /// Publish the details already on record, unchanged.
+    PublishNow,
+    /// Open (or close) the edit/repair form so the seller can type something.
+    ToggleForm,
+}
+
+/// Decide what the store-details button does, given the gap (if any) a
+/// store's published details currently have.
+///
+/// # Why `NoEncryptionKey` is special (#78)
+///
+/// `StoreDetailsGap::NoEncryptionKey`'s own message says publishing "adds the
+/// key your delegate already holds; nothing else about the store changes" --
+/// the key comes from the delegate, not from anything the seller types, so
+/// there is nothing to fill in and nothing to review. Before this fix every
+/// gap opened the same edit form and made the seller click a SECOND,
+/// undisclosed "Publish" button inside it to actually publish. For this one
+/// gap that meant clicking the button labelled "Publish details" produced no
+/// network call, no vault prompt, and no notification -- indistinguishable
+/// from the button being broken, and exactly what was reported in #78.
+///
+/// Every other gap (`NeverPublished`, `NoName`, `NoReputationLink`) needs the
+/// seller to actually provide something -- at minimum a store name -- so
+/// those still open the form, as does an ordinary "Edit details" click
+/// (`gap` is `None`).
+fn store_details_button_action(gap: Option<StoreDetailsGap>) -> StoreDetailsAction {
+    if gap == Some(StoreDetailsGap::NoEncryptionKey) {
+        StoreDetailsAction::PublishNow
+    } else {
+        StoreDetailsAction::ToggleForm
     }
 }
 
@@ -913,6 +963,54 @@ fn truncate_fingerprint(fp: &str) -> String {
         format!("{}...", &fp[..12])
     } else {
         fp.to_string()
+    }
+}
+
+#[cfg(test)]
+mod store_details_button_tests {
+    use super::{store_details_button_action, StoreDetailsAction};
+    use crate::state::StoreDetailsGap;
+
+    /// The regression test for #78. Before the fix, this function did not
+    /// exist -- the button always toggled the form open -- so clicking
+    /// "Publish details" for a store missing only its encryption key never
+    /// reached the delegate: no vault prompt, no notification, no change.
+    /// Reverting the fix (making this always return `ToggleForm`) makes this
+    /// fail.
+    #[test]
+    fn no_encryption_key_gap_publishes_immediately() {
+        assert_eq!(
+            store_details_button_action(Some(StoreDetailsGap::NoEncryptionKey)),
+            StoreDetailsAction::PublishNow
+        );
+    }
+
+    /// Every other gap needs the seller to type something -- at minimum a
+    /// store name -- so those still open the form rather than republishing
+    /// blank or stale fields.
+    #[test]
+    fn gaps_needing_seller_input_open_the_form() {
+        for gap in [
+            StoreDetailsGap::NeverPublished,
+            StoreDetailsGap::NoName,
+            StoreDetailsGap::NoReputationLink,
+        ] {
+            assert_eq!(
+                store_details_button_action(Some(gap)),
+                StoreDetailsAction::ToggleForm,
+                "{gap:?} should still open the form"
+            );
+        }
+    }
+
+    /// An ordinary "Edit details" click (no gap at all) is unaffected: it
+    /// still opens the form so the seller can change something on purpose.
+    #[test]
+    fn no_gap_opens_the_edit_form() {
+        assert_eq!(
+            store_details_button_action(None),
+            StoreDetailsAction::ToggleForm
+        );
     }
 }
 
