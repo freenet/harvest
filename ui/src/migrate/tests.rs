@@ -287,10 +287,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // re-encode to, so a predecessor's info no longer verifies.
                 "ddac8dd508819052c3771d23aaff9078e52c84ca17e62ae7e68ce356770b3a67",
                 // V14, from `git show 7fb733e:ui/public/contracts/store_contract.wasm`.
-                // Superseded by refusing to settle an order with a payment
-                // that confirmed at or before its anchor (harvest#77), which
-                // makes verification stricter, so a predecessor holding such
-                // an order no longer verifies.
+                // Superseded by settling an order only with a payment that
+                // confirmed inside its window after the anchor (harvest#77),
+                // which makes verification stricter, so a predecessor
+                // holding such an order no longer verifies.
                 "3f47ab79e985659f7c03728d907f05e9321037aa23c1ff7c7e569512a445489a",
             ],
         ),
@@ -791,7 +791,7 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // `StoreParameters` did not move: still 56 bytes per
     // `cargo make code-hashes` after the removal, checked rather than assumed.
     (13, false),
-    // V14: the pre-order payment rule (harvest#77), a change to verification
+    // V14: the payment-window rule (harvest#77), a change to verification
     // only. `StoreParameters` did not move: still 56 bytes per
     // `scripts/check-code-hashes.sh` after the rebuild, checked rather than
     // assumed.
