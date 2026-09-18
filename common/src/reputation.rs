@@ -148,15 +148,8 @@ impl FeedbackEntry {
     pub fn verify(&self, rsa_key: &rsa::pss::VerifyingKey<sha2::Sha256>) -> Result<(), String> {
         use rsa::signature::Verifier;
 
-        let token_bytes =
-            crate::to_cbor(&self.token).map_err(|e| format!("serialize token: {e}"))?;
-        let signature = rsa::pss::Signature::try_from(self.signature.as_slice())
-            .map_err(|e| format!("invalid RSA signature bytes: {e}"))?;
-        rsa_key
-            .verify(&token_bytes, &signature)
-            .map_err(|e| format!("feedback signature invalid: {e}"))?;
-
-        // The slot must be bound to the key, or the seller (who can sign any
+        // First, because it is one hash and the RSA check is not (PR #82
+        // re-review). The slot must be bound to the key, or the seller (who can sign any
         // token) could mint one for a buyer's published slot with a key of its
         // own. See `FeedbackToken::nonce`.
         let bound = FeedbackToken::nonce_for(&self.token.entry_key);
@@ -165,6 +158,14 @@ impl FeedbackEntry {
         if bound != self.token.nonce {
             return Err("feedback token nonce is not derived from its entry key".into());
         }
+
+        let token_bytes =
+            crate::to_cbor(&self.token).map_err(|e| format!("serialize token: {e}"))?;
+        let signature = rsa::pss::Signature::try_from(self.signature.as_slice())
+            .map_err(|e| format!("invalid RSA signature bytes: {e}"))?;
+        rsa_key
+            .verify(&token_bytes, &signature)
+            .map_err(|e| format!("feedback signature invalid: {e}"))?;
 
         let entry_key = VerifyingKey::from_bytes(&self.token.entry_key)
             .map_err(|e| format!("invalid feedback entry key: {e}"))?;
@@ -690,6 +691,80 @@ mod tests {
                 "the buyer's entry must survive, in either order"
             );
         }
+    }
+
+    /// **A weak entry key cannot be used to forge an entry** (PR #82
+    /// re-review). The identity point is a valid encoding that
+    /// `VerifyingKey::from_bytes` accepts, and under it the signature
+    /// `R = identity, s = 0` verifies for ANY message with the non-strict
+    /// check. A token issued for such a key -- by a buggy client, or minted
+    /// by the seller, who can blind-sign any token -- would let anyone write
+    /// its entry. `verify_strict` refuses small-order keys; this pins it.
+    #[test]
+    fn an_entry_under_a_small_order_key_is_refused() {
+        use ed25519_dalek::Verifier;
+        use rsa::pss::BlindedSigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let (private, params) = key_pair();
+        let rsa_key = params.rsa_verifying_key().expect("key");
+        let seller_rsa = BlindedSigningKey::<Sha256>::new(private);
+
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut identity_signbit = identity;
+        identity_signbit[31] = 0x80;
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity, s = 0
+
+        for key in [identity, identity_signbit] {
+            let token = FeedbackToken::new([5u8; 32], key);
+            let rsa_signature = seller_rsa
+                .sign_with_rng(
+                    &mut rsa::rand_core::OsRng,
+                    &crate::to_cbor(&token).expect("encode token"),
+                )
+                .to_vec();
+            let entry = FeedbackEntry {
+                token,
+                signature: rsa_signature,
+                category: FeedbackCategory::Other("forged".to_string()),
+                comment: "written by someone without a key".to_string(),
+                submitted_at: timestamp(),
+                entry_signature: forged.to_vec(),
+            };
+            let vk = VerifyingKey::from_bytes(&key).expect("the weak key decodes");
+            assert!(
+                vk.verify(
+                    &entry.signing_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&forged)
+                )
+                .is_ok(),
+                "precondition: the non-strict check accepts the forgery"
+            );
+            let err = entry
+                .verify(&rsa_key)
+                .expect_err("an entry under a small-order key must be refused");
+            assert!(err.contains("entry signature"), "got: {err}");
+        }
+    }
+
+    /// The nonce binding is checked before the RSA signature, so an entry
+    /// that fails it costs one hash rather than an RSA verification (PR #82
+    /// re-review). Observable as which error comes back for an entry that
+    /// fails both.
+    #[test]
+    fn the_cheap_nonce_check_runs_before_the_rsa_check() {
+        let (_, params) = key_pair();
+        let mut entry = entry(vec![0u8; 8], 1); // RSA signature: garbage
+        entry.token.nonce = [0u8; 32]; // not derived from the key
+        let err = entry
+            .verify(&params.rsa_verifying_key().expect("key"))
+            .expect_err("fails both");
+        assert!(
+            err.contains("not derived"),
+            "the nonce check must run first; got: {err}"
+        );
     }
 
     /// Every field is covered, not only the ones the attack above changes.

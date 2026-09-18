@@ -156,9 +156,19 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        // Version 0 is the default (empty/uninitialized) state -- skip verification
+        // Version 0 is "no details published", and it must be exactly the
+        // default. Nothing signs a version-0 info, so skipping verification
+        // for it (as this did until the PR #82 re-review) let anyone put a
+        // name, a certificate and an encryption key into a store whose
+        // seller had not published yet -- and since `apply_delta` ignores an
+        // incoming version that is not higher, two such injections never
+        // converged.
         if self.info.version == 0 {
-            return Ok(());
+            return if *self == Self::default() {
+                Ok(())
+            } else {
+                Err("store info at version 0 must be empty: nothing signs it".into())
+            };
         }
         verify_scoped_signature(
             &self.scoped_payload,
@@ -534,6 +544,42 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     }
 }
 
+/// 32 bytes that encode as ONE CBOR byte string rather than serde's default
+/// for `[u8; 32]`, which is an array of 32 integers.
+///
+/// Used for the order summary's id and digest (PR #82 re-review). The summary
+/// carries one entry per order, up to `MAX_ORDERS`, and is sent on every
+/// exchange; as integer arrays each 32-byte value cost about 50 bytes on the
+/// wire, and a byte string costs 34. Only the summary uses it: `OrderId`
+/// itself keeps its encoding, because it is inside every signed order and
+/// changing it would move every order's id and signature preimage.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Bytes32(pub [u8; 32]);
+
+impl Serialize for Bytes32 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes32 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Bytes32;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a 32-byte byte string")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Bytes32, E> {
+                <[u8; 32]>::try_from(v)
+                    .map(Bytes32)
+                    .map_err(|_| E::invalid_length(v.len(), &self))
+            }
+        }
+        deserializer.deserialize_bytes(Visitor)
+    }
+}
+
 /// The set of orders placed against this store, keyed by [`OrderId`].
 ///
 /// # Merge model
@@ -567,12 +613,13 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     /// not as a resend of every order that happens to hash into the same
     /// bucket. Instead this is bounded the way `MAX_CLAIMS` bounds
     /// `ClaimSetV1`: capped at a fixed number of entries rather than a fixed
-    /// number of bytes. At 65 bytes an entry (32-byte id, 1-byte rank,
-    /// 32-byte digest) this is still tiny next to a single order's own
+    /// number of bytes. At about 71 encoded bytes an entry (a 32-byte id and a
+    /// 32-byte digest as CBOR byte strings, see [`Bytes32`], plus a 1-byte
+    /// rank) this is still tiny next to a single order's own
     /// encoded size once it carries an `OrderPaymentProof` -- an order can
     /// run into the hundreds of bytes to multiple KB; a summary entry never
     /// does.
-    type Summary = Vec<(OrderId, u8, [u8; 32])>;
+    type Summary = Vec<(Bytes32, u8, Bytes32)>;
     /// Full replacement records for whichever orders are new, ahead in rank,
     /// or -- at an exact rank tie -- differ in content (see `delta`).
     type Delta = Vec<AuthorizedOrder>;
@@ -609,9 +656,9 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             .iter()
             .map(|(id, record)| {
                 (
-                    id.clone(),
+                    Bytes32(id.0),
                     record.status.rank(),
-                    order_content_digest(record),
+                    Bytes32(order_content_digest(record)),
                 )
             })
             .collect()
@@ -623,9 +670,9 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let old: BTreeMap<&OrderId, (u8, [u8; 32])> = old_state_summary
+        let old: BTreeMap<[u8; 32], (u8, [u8; 32])> = old_state_summary
             .iter()
-            .map(|(id, rank, digest)| (id, (*rank, *digest)))
+            .map(|(id, rank, digest)| (id.0, (*rank, digest.0)))
             .collect();
 
         // Send an order whenever the requester's summary can't already
@@ -642,7 +689,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             .iter()
             .filter(|(id, record)| {
                 let our_rank = record.status.rank();
-                match old.get(id) {
+                match old.get(&id.0) {
                     None => true,
                     Some((their_rank, their_digest)) => {
                         our_rank > *their_rank
@@ -2644,6 +2691,35 @@ mod order_tests {
         });
     }
 
+    /// **The order summary at the cap stays small** (PR #82 re-review). Its
+    /// id and digest encode as CBOR byte strings: 71 bytes an entry, so
+    /// `MAX_ORDERS` entries come to about 284 KiB, where the default integer
+    /// arrays made it about 512 KiB. And it survives the round trip a peer
+    /// puts it through.
+    #[test]
+    fn the_order_summary_at_the_cap_is_byte_strings() {
+        use freenet_scaffold::ComposableState;
+        let orders = OrdersV1 {
+            orders: full_of_old_orders(),
+        };
+        let summary = orders.summarize(&StoreStateV1::default(), &params(&seller_key()));
+        let bytes = crate::to_cbor(&summary).expect("encode");
+        assert!(
+            bytes.len() <= MAX_ORDERS * 72,
+            "summary of {} bytes for {MAX_ORDERS} orders",
+            bytes.len()
+        );
+        let back: Vec<(Bytes32, u8, Bytes32)> = crate::from_cbor(&bytes).expect("decode");
+        assert_eq!(back, summary);
+        // One entry, byte for byte: array(3), bytes(32) id, rank, bytes(32).
+        let one = crate::to_cbor(&summary[0]).expect("encode");
+        assert_eq!(
+            &one[..3],
+            &[0x83, 0x58, 0x20],
+            "the id is a 32-byte byte string"
+        );
+    }
+
     /// The cap keeps the newest orders by their signed `created_at`, whatever
     /// their status. See `enforce_order_cap` for why status cannot take part.
     #[test]
@@ -3028,6 +3104,38 @@ mod order_tests {
             1,
             "the same listing twice in one delta must be stored once"
         );
+    }
+
+    /// **Version 0 carries nothing** (PR #82 re-review). `verify` used to
+    /// skip version 0 entirely, so a state whose version-0 info held any
+    /// unsigned name, description or encryption key validated, anyone could
+    /// inject one into a store whose seller had not published details, and
+    /// two different injections never converged (`apply_delta` ignores an
+    /// incoming version that is not higher). Version 0 must now be exactly
+    /// the default.
+    #[test]
+    fn version_zero_info_must_be_the_default() {
+        use freenet_scaffold::ComposableState;
+        let p = params(&seller_key());
+        let parent = StoreStateV1::default();
+        AuthorizedStoreInfoV1::default()
+            .verify(&parent, &p)
+            .expect("the default verifies");
+
+        let mut named = AuthorizedStoreInfoV1::default();
+        named.info.store_name = "Totally Legit Farm".into();
+        let mut keyed = AuthorizedStoreInfoV1::default();
+        keyed.info.encryption_public_key = Some([0xAA; 32]);
+        let padded = AuthorizedStoreInfoV1 {
+            signature: vec![1],
+            ..Default::default()
+        };
+        for (what, info) in [("a name", named), ("a key", keyed), ("a signature", padded)] {
+            assert!(
+                info.verify(&parent, &p).is_err(),
+                "version-0 info carrying {what} must not verify"
+            );
+        }
     }
 
     /// Three listings in id order.

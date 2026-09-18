@@ -2032,7 +2032,19 @@ impl AppState {
         let store_err =
             match harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(&state_bytes) {
                 Err(e) => e,
-                Ok(store_state) => {
+                Ok(mut store_state) => {
+                    // Version 0 is "no details published". Nothing signs it,
+                    // so nothing in it may be believed: until the PR #82
+                    // re-review the contract accepted ANY content at version
+                    // 0, so a third party could put a name, a certificate, a
+                    // reputation id and an encryption key into a store whose
+                    // seller had not published yet, and buyers would have
+                    // encrypted to that key. The contract now refuses it, and
+                    // this is the second half: whatever a node serves, a
+                    // version-0 info is read as the empty default.
+                    if store_state.info.info.version == 0 {
+                        store_state.info = Default::default();
+                    }
                     info!(
                         "Received store state for {:?}",
                         &contract_id[..8.min(contract_id.len())]
@@ -2078,7 +2090,9 @@ impl AppState {
                     store.certificate_status = certificate_status;
                     store.seller_verifying_key = seller_verifying_key;
                     store.unverified_listings = unverified_listings;
-                    store.info = Some(store_state.info.info);
+                    // Only signed details are details.
+                    store.info =
+                        (store_state.info.info.version > 0).then_some(store_state.info.info);
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.reputation_contract_id = Some(reputation_id.clone());
@@ -7960,6 +7974,37 @@ mod tests {
         state.on_contract_state(
             STORE_ID.to_vec(),
             harvest_common::to_cbor(store_state).expect("store state encodes"),
+        );
+    }
+
+    /// **Unsigned version-0 store details are never believed** (PR #82
+    /// re-review). The contract used to accept any content at version 0, so
+    /// a third party could give a store that had not published yet a name
+    /// and, worse, an encryption key that buyers would then encrypt to.
+    /// Whatever a node serves, version 0 reads as "no details published":
+    /// no info, and so no key to buy with.
+    #[test]
+    fn version_zero_store_details_are_not_believed() {
+        let mut state = AppState::default();
+        let mut injected = harvest_common::store::StoreStateV1::default();
+        injected.info.info.store_name = "Totally Legit Farm".into();
+        injected.info.info.encryption_public_key = Some([0xAA; 32]);
+        injected.info.info.reputation_contract_id = [0xBB; 32];
+        ingest(&mut state, &injected);
+
+        let store = state
+            .browsing_stores
+            .get(STORE_ID.as_slice())
+            .expect("the store is still shown");
+        assert!(
+            store.info.is_none(),
+            "version 0 is no details, not these details"
+        );
+        assert!(
+            !state
+                .reputation_to_store
+                .contains_key([0xBB; 32].as_slice()),
+            "an unsigned reputation id must not be followed"
         );
     }
 

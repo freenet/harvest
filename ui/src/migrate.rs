@@ -919,15 +919,12 @@ pub(crate) fn merge_mailbox_reporting_drops(
     // commutativity is precisely what `FoldAllAck` is minted against
     // (`fold_all_policy`, and the crate's own `assert_merge_commutative`).
     //
-    // Symmetry could have been restored in either direction. Dropping is the
-    // right one, and the reason is convergence rather than tidiness. Until
-    // harvest#85 `verify` tolerated an oversized message, so a folded state
-    // carrying one WOULD have been accepted by `validate_state` and PUT
-    // successfully -- and then every peer that merged it would run
-    // `apply_delta`, refuse that message, and end up with a different state.
-    // Since harvest#85 `verify` refuses such a state outright, so keeping the
-    // message would make the fold's own PUT fail. Either way, dropping it is
-    // the only direction that lands on what the network can hold.
+    // Symmetry could have been restored in either direction; dropping is the
+    // only one that works. `verify` refuses a state holding an oversized
+    // message (harvest#85), so a fold that kept one could not be PUT at all.
+    // Before harvest#85 it could, and was worse: every peer that merged it
+    // refused the message in `apply_delta`, leaving this node holding an
+    // entry no other peer had, for good.
     //
     // No published generation ever enforced a size limit -- `MAX_MESSAGE_BYTES`
     // and the send-side refusal both arrive on this branch, after the commit
