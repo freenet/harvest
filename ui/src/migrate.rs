@@ -817,7 +817,9 @@ impl ProbeStateOps for MailboxOps {
 /// Folding an older generation can push the mailbox over
 /// `harvest_common::mailbox::MAX_MESSAGES` or
 /// `harvest_common::mailbox::MAX_MAILBOX_BYTES`. `apply_delta` runs
-/// `enforce_message_cap` on every call, which enforces BOTH and keeps the
+/// `enforce_message_cap` on every call, which enforces the count cap and a
+/// count cap per size class (which is how the byte bound is met since
+/// harvest#85) and keeps the
 /// highest-ranked messages by `(timestamp, nonce, entry_digest)` -- a total
 /// order and a pure function of message content, so the fold result is trimmed
 /// to exactly the subset any peer would keep from the same bytes.
@@ -1024,13 +1026,17 @@ fn merge_mailbox(base: MailboxStateV1, other: &MailboxStateV1) -> MailboxStateV1
 /// `MAX_MESSAGE_BYTES`, `MAX_MESSAGES` and `MAX_MAILBOX_BYTES`, so they cannot
 /// fall behind a retuned constant a fourth time.
 ///
-/// The order-invariance failure was real and is fixed in
-/// `harvest_common::mailbox::enforce_message_cap`, which now SKIPS a message
-/// that will not fit instead of stopping at it. Under the old prefix walk the
-/// surviving set depended on which large message happened to block the walk --
-/// a property of the fold order rather than of the byte set -- so removing the
+/// The order-invariance failure was real. It was first fixed by making
+/// `harvest_common::mailbox::enforce_message_cap` SKIP a message that would not
+/// fit instead of stopping at it: under the prefix walk the surviving set
+/// depended on which large message happened to block the walk, so removing the
 /// blocker let a smaller message behind it fit, and a re-run of the migration
-/// was not a fixed point.
+/// was not a fixed point. The skip was not a complete fix: `fdev verify-merge`
+/// later found the merge still not associative (harvest#85), because a message
+/// skipped while one merge had the budget full never came back. Since
+/// harvest#85 the byte bound is met by a count cap per size class instead,
+/// which is a matroid, so the greedy pick is path independent and the fold is
+/// order invariant by construction.
 ///
 /// Fold-all matters here rather than being a free upgrade: Harvest has re-keyed
 /// repeatedly -- `legacy/store_contract.toml` records five superseded store

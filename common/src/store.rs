@@ -5,7 +5,7 @@ use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 
 use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
-use crate::payment::{AuthorizedOrder, OrderId, OrderStatus};
+use crate::payment::{AuthorizedOrder, OrderId};
 
 /// Immutable parameters for a store contract, set at creation time.
 ///
@@ -382,7 +382,7 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
 /// Merge one already-verified incoming order record into `orders`.
 ///
 /// Keeps whichever of the existing and incoming record has the higher
-/// [`OrderStatus::rank`]. On an exact rank tie -- which happens when two
+/// [`crate::payment::OrderStatus::rank`]. On an exact rank tie -- which happens when two
 /// peers each independently assemble a different, but individually valid,
 /// proof for the same transition (e.g. two different sets of bridge claims
 /// that both establish `Paid`) -- the tie is broken by comparing the CBOR
@@ -484,43 +484,49 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
     }
 }
 
-/// Drop the least-relevant orders if `orders` is over [`MAX_ORDERS`].
+/// Drop the oldest orders if `orders` is over [`MAX_ORDERS`].
 ///
-/// Priority for keeping an order is, from least to most important: first,
-/// whether its status is terminal (`Cancelled`, `PaymentReversed` --
-/// nothing further will ever happen to it); second,
-/// how old it is (`Order::created_at`); third, its id, purely as a
-/// tie-breaker so the ordering is total. Terminal orders are dropped before
-/// any order still awaiting resolution, and within a tier the oldest goes
-/// first.
+/// Keeps the `MAX_ORDERS` orders with the newest `Order::created_at`, with the
+/// id as a tie-break so the order is total. Both come from the order's signed
+/// TERMS, which `OrderId` is derived from, so every version of one order ranks
+/// the same however far its status has moved.
 ///
-/// This ranking is a pure function of the *content* of `orders`, not of the
-/// sequence in which entries were inserted, so two replicas that converge
-/// to the same set of orders always prune to the same subset -- which is
-/// exactly what the associated test checks.
+/// # Why status takes no part (harvest#85)
+///
+/// This used to drop terminal orders (`Cancelled`, `PaymentReversed`) before
+/// active ones. That made the merge non-associative, which `fdev
+/// verify-merge` found. Terminal-ness is not monotone in the status rank
+/// `merge_order` maximises (Awaiting 0 active, Cancelled 1 terminal, Paid 2
+/// active, Reversed 3 terminal), so an order's keep-priority changed as it
+/// merged. And a key pruned on one peer came back from a peer that still held
+/// an older version of it, at a different priority. With P = {x Awaiting,
+/// newest}, Q = {x Cancelled} and R = a full cap of older orders, `(P+Q)+R`
+/// dropped x while `P+(Q+R)` kept it.
+///
+/// Top-N over a ranking that the per-key merge cannot change is associative:
+/// a key cut from one side ranks below that side's N-th key, so it ranks below
+/// the N-th key of any union containing that side and is cut again, whichever
+/// version of it comes back. So is a key kept: if it is in the top N of the
+/// union it was in the top N of each side that held it, so no side's version
+/// of it was lost to that side's own cap. Pinned by
+/// `the_order_cap_is_associative_when_a_status_changes_at_the_cap` and
+/// `the_order_cap_obeys_the_merge_laws_at_the_cap`.
+///
+/// What it costs: an old `Paid` order can now be dropped before a newer
+/// `Cancelled` one. Only the seller can sign an order, so only the seller can
+/// push old orders out, by creating more than `MAX_ORDERS` new ones.
 fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     if orders.len() <= MAX_ORDERS {
         return;
     }
-    let mut ranked: Vec<(bool, i64, OrderId)> = orders
+    let mut ranked: Vec<(i64, OrderId)> = orders
         .iter()
-        .map(|(id, record)| {
-            let terminal = matches!(
-                record.status,
-                OrderStatus::Cancelled | OrderStatus::PaymentReversed
-            );
-            // `!terminal` sorts terminal orders (false) ahead of active ones
-            // (true), so they are the first candidates dropped below.
-            (
-                !terminal,
-                record.order.created_at.timestamp_millis(),
-                id.clone(),
-            )
-        })
+        .map(|(id, record)| (record.order.created_at.timestamp_millis(), id.clone()))
         .collect();
+    // Ascending, so the oldest come first and are the ones dropped below.
     ranked.sort();
     let excess = orders.len() - MAX_ORDERS;
-    for (_, _, id) in ranked.into_iter().take(excess) {
+    for (_, id) in ranked.into_iter().take(excess) {
         orders.remove(&id);
     }
 }
@@ -531,7 +537,7 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
 ///
 /// This is neither grow-only (like a claim set) nor last-writer-wins by an
 /// explicit version counter (like [`AuthorizedStoreInfoV1`]). It is a
-/// **per-key monotonic maximum on [`OrderStatus::rank`]**, the same shape as
+/// **per-key monotonic maximum on [`crate::payment::OrderStatus::rank`]**, the same shape as
 /// `freenet_bitcoin_common::address_state::ClaimSetV1`'s per-bridge scan
 /// watermark: merging two versions of the same order keeps whichever has
 /// the higher rank. A maximum over a total order is always associative,
@@ -711,7 +717,7 @@ mod order_tests {
         ClaimBody, OutPoint, SignedClaim, SignedTipEntry, TipEntryBody,
     };
 
-    use crate::payment::{Order, OrderPaymentProof};
+    use crate::payment::{Order, OrderPaymentProof, OrderStatus};
 
     fn seller_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])
@@ -2346,37 +2352,166 @@ mod order_tests {
         )
     }
 
-    #[test]
-    fn pruning_drops_terminal_orders_before_active_ones() {
-        let mut orders: BTreeMap<OrderId, AuthorizedOrder> = BTreeMap::new();
-        let (id_active, rec_active) = synthetic_order(1, 1_000, OrderStatus::AwaitingPayment);
-        let (id_terminal, rec_terminal) = synthetic_order(2, 2_000, OrderStatus::Cancelled);
-        orders.insert(id_active.clone(), rec_active);
-        orders.insert(id_terminal.clone(), rec_terminal);
-
-        // Force the cap down to 1 for this test by pruning a 2-entry map
-        // down to `MAX_ORDERS - 1` worth of headroom is impractical to set
-        // up directly (MAX_ORDERS is a real constant), so instead call the
-        // pruning logic's underlying comparison directly by filling past
-        // the real cap with cheap synthetic entries sharing the terminal
-        // one's profile, then checking the terminal-tier one is gone and
-        // the active one survives.
-        for i in 3..(MAX_ORDERS as u16 + 3) {
-            let (id, rec) =
-                synthetic_order((i % 256) as u8, 3_000 + i as i64, OrderStatus::Cancelled);
-            orders.insert(id, rec);
+    /// What `OrdersV1::apply_delta` does once every incoming record has
+    /// verified: fold each into `base` by `merge_order`, then prune. The
+    /// synthetic records below are unsigned, so the merge laws are pinned at
+    /// this layer rather than through `apply_delta`.
+    fn merge_maps(
+        base: &BTreeMap<OrderId, AuthorizedOrder>,
+        other: &BTreeMap<OrderId, AuthorizedOrder>,
+    ) -> BTreeMap<OrderId, AuthorizedOrder> {
+        let mut out = base.clone();
+        for record in other.values() {
+            merge_order(&mut out, record.clone());
         }
-        assert!(orders.len() > MAX_ORDERS);
+        enforce_order_cap(&mut out);
+        out
+    }
+
+    /// `MAX_ORDERS` Awaiting orders, all older than anything else these
+    /// tests build.
+    fn full_of_old_orders() -> BTreeMap<OrderId, AuthorizedOrder> {
+        (0..MAX_ORDERS as u32)
+            .map(|i| {
+                synthetic_order(
+                    (i % 256) as u8,
+                    1_000 + i as i64,
+                    OrderStatus::AwaitingPayment,
+                )
+            })
+            .collect()
+    }
+
+    /// **The cap is associative (harvest#85).**
+    ///
+    /// The counterexample `fdev verify-merge` found against the old cap, which
+    /// dropped TERMINAL orders first: terminal-ness is not monotone in the
+    /// status rank the per-key merge maximises (Awaiting 0 active, Cancelled
+    /// 1 terminal, Paid 2 active, Reversed 3 terminal), so an order's
+    /// keep-priority changed as it merged, and a key pruned on one side came
+    /// back from a side that still held an older version of it.
+    ///
+    /// P = {x Awaiting, newest}, Q = {x Cancelled}, R = `MAX_ORDERS` older
+    /// Awaiting orders. Under the old cap `(P+Q)+R` dropped x (Cancelled,
+    /// terminal, dropped first) while `P+(Q+R)` kept x as Awaiting (Q+R
+    /// dropped the Cancelled x, and P brought the Awaiting one back as the
+    /// newest active order).
+    #[test]
+    fn the_order_cap_is_associative_when_a_status_changes_at_the_cap() {
+        let (_, x_awaiting) = synthetic_order(7, 1_000_000, OrderStatus::AwaitingPayment);
+        let (_, x_cancelled) = synthetic_order(7, 1_000_000, OrderStatus::Cancelled);
+        assert_eq!(
+            x_awaiting.order.id, x_cancelled.order.id,
+            "precondition: one order"
+        );
+        let p: BTreeMap<_, _> = [(x_awaiting.order.id.clone(), x_awaiting)].into();
+        let q: BTreeMap<_, _> = [(x_cancelled.order.id.clone(), x_cancelled)].into();
+        let r = full_of_old_orders();
+
+        let left = merge_maps(&merge_maps(&p, &q), &r);
+        let right = merge_maps(&p, &merge_maps(&q, &r));
+        assert_eq!(left.len(), MAX_ORDERS);
+        assert_eq!(
+            crate::to_cbor(&left).expect("encode"),
+            crate::to_cbor(&right).expect("encode"),
+            "(P+Q)+R and P+(Q+R) must be the same bytes"
+        );
+    }
+
+    /// The same laws over a spread of statuses and ages at the cap, so the
+    /// test above is not the only shape checked: every status on both sides
+    /// of the boundary, and keys held at different statuses by different
+    /// peers.
+    #[test]
+    fn the_order_cap_obeys_the_merge_laws_at_the_cap() {
+        let statuses = [
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+        ];
+        let base = full_of_old_orders();
+        // Twelve keys straddling the oldest end of `base` and the newest,
+        // each held at a different status by each of three peers.
+        let keys: Vec<(u8, i64)> = (0..12u8)
+            .map(|k| {
+                (
+                    200u8.wrapping_add(k),
+                    if k % 2 == 0 {
+                        500 + k as i64
+                    } else {
+                        5_000_000 + k as i64
+                    },
+                )
+            })
+            .collect();
+        let peer = |shift: usize, with_base: bool| {
+            let mut m = if with_base {
+                base.clone()
+            } else {
+                BTreeMap::new()
+            };
+            for (i, (seed, secs)) in keys.iter().enumerate() {
+                if (i + shift).is_multiple_of(3) {
+                    continue;
+                }
+                let (id, rec) = synthetic_order(*seed, *secs, statuses[(i + shift) % 4]);
+                m.insert(id, rec);
+            }
+            enforce_order_cap(&mut m);
+            m
+        };
+        // Plus the shape of the counterexample above: the same key newest and
+        // Awaiting on one peer, Cancelled on another.
+        let (_, x_awaiting) = synthetic_order(7, 1_000_000, OrderStatus::AwaitingPayment);
+        let (_, x_cancelled) = synthetic_order(7, 1_000_000, OrderStatus::Cancelled);
+        let states = [
+            peer(0, true),
+            peer(1, false),
+            [(x_awaiting.order.id.clone(), x_awaiting)].into(),
+            [(x_cancelled.order.id.clone(), x_cancelled)].into(),
+            BTreeMap::new(),
+        ];
+        let enc = |m: &BTreeMap<OrderId, AuthorizedOrder>| crate::to_cbor(m).expect("encode");
+        for a in &states {
+            assert_eq!(enc(&merge_maps(a, a)), enc(a), "idempotence");
+            for b in &states {
+                assert_eq!(
+                    enc(&merge_maps(a, b)),
+                    enc(&merge_maps(b, a)),
+                    "commutativity"
+                );
+                for c in &states {
+                    assert_eq!(
+                        enc(&merge_maps(&merge_maps(a, b), c)),
+                        enc(&merge_maps(a, &merge_maps(b, c))),
+                        "associativity"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The cap keeps the newest orders by their signed `created_at`, whatever
+    /// their status. See `enforce_order_cap` for why status cannot take part.
+    #[test]
+    fn pruning_drops_the_oldest_orders_whatever_their_status() {
+        let mut orders = full_of_old_orders();
+        let (id_old_paid, old_paid) = synthetic_order(250, 10, OrderStatus::Paid);
+        let (id_new_cancelled, new_cancelled) =
+            synthetic_order(251, 9_000_000, OrderStatus::Cancelled);
+        orders.insert(id_old_paid.clone(), old_paid);
+        orders.insert(id_new_cancelled.clone(), new_cancelled);
 
         enforce_order_cap(&mut orders);
         assert_eq!(orders.len(), MAX_ORDERS);
         assert!(
-            orders.contains_key(&id_active),
-            "the only active (non-terminal) order must survive pruning"
+            orders.contains_key(&id_new_cancelled),
+            "the newest order survives"
         );
         assert!(
-            !orders.contains_key(&id_terminal),
-            "the oldest terminal order must be dropped before newer terminal ones"
+            !orders.contains_key(&id_old_paid),
+            "the oldest order goes, even Paid"
         );
     }
 

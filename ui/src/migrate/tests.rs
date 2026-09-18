@@ -365,7 +365,8 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // nothing stored at V9 changes shape.
                 "29e874557b99730efb7a863d7d393ea8f5444d066144cf354582c23c60b11404",
                 // V11, from `git show f46bbf0:ui/public/contracts/mailbox_contract.wasm`.
-                // Codegen only: `harvest-common` moved underneath it.
+                // Superseded by harvest#85: size-class caps instead of a
+                // byte budget, and a `verify` that requires canonical state.
                 "5c0145d2421ebcae41ae8ee5591907c7f015502400b939e46dcbd8f128051854",
             ],
         ),

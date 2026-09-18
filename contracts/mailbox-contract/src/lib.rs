@@ -41,6 +41,13 @@ impl ContractInterface for Contract {
         let _parameters = from_reader::<MailboxParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        // Zero bytes in and nothing but zero bytes merged in is zero bytes
+        // out, not the encoded default: the two are one state, and answering
+        // one with the other made `merge(A, A) != A` for the empty state
+        // (`fdev verify-merge`, harvest#55). Anything non-empty arriving
+        // switches this off, so merging an encoded default in is still that
+        // encoding, whichever side it is on.
+        let mut nothing_here = state.as_ref().is_empty();
         let mut mailbox_state = if state.as_ref().is_empty() {
             MailboxStateV1::default()
         } else {
@@ -59,6 +66,7 @@ impl ContractInterface for Contract {
                     if new_state.as_ref().is_empty() {
                         continue;
                     }
+                    nothing_here = false;
                     let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Everything, and `apply_delta` decides what is already
@@ -95,6 +103,7 @@ impl ContractInterface for Contract {
                     if d.as_ref().is_empty() {
                         continue;
                     }
+                    nothing_here = false;
                     let delta = from_reader::<MailboxDelta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     mailbox_state.apply_delta(&Some(delta)).map_err(|e| {
@@ -107,6 +116,10 @@ impl ContractInterface for Contract {
                     return Err(ContractError::InvalidUpdate);
                 }
             }
+        }
+
+        if nothing_here {
+            return Ok(UpdateModification::valid(State::from(vec![])));
         }
 
         let mut updated_state = vec![];
@@ -844,5 +857,71 @@ mod tests {
                 found.push(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_state_tests {
+    use super::*;
+    use harvest_common::mailbox::MailboxStateV1;
+
+    fn parameters() -> Parameters<'static> {
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        let mut bytes = vec![];
+        into_writer(&MailboxParameters::new(owner), &mut bytes).expect("encode");
+        Parameters::from(bytes)
+    }
+
+    /// **The empty state merged with itself is the empty state** (harvest#55,
+    /// found by `fdev verify-merge`). `update_state` answered zero bytes with
+    /// the encoded default, so `merge(A, A) != A` for the empty state. And an
+    /// encoded default merged in from either side stays that encoding, so
+    /// the rule does not break commutativity instead.
+    #[test]
+    fn the_empty_state_is_idempotent_and_the_rule_is_commutative() {
+        let merge = |state: Vec<u8>, other: Vec<u8>| -> Vec<u8> {
+            <Contract as ContractInterface>::update_state(
+                parameters(),
+                State::from(state),
+                vec![UpdateData::State(State::from(other))],
+            )
+            .expect("merge")
+            .unwrap_valid()
+            .as_ref()
+            .to_vec()
+        };
+        assert!(
+            merge(vec![], vec![]).is_empty(),
+            "merge(empty, empty) must be empty"
+        );
+        let mut default = vec![];
+        into_writer(&MailboxStateV1::default(), &mut default).expect("encode");
+        assert_eq!(merge(vec![], default.clone()), default);
+        assert_eq!(merge(default.clone(), vec![]), default);
+    }
+
+    /// A non-empty delta applied to the empty state is an update, so the
+    /// result is the encoded state, not zero bytes. Without this the
+    /// empty-state rule above would swallow a delta's content.
+    #[test]
+    fn a_delta_applied_to_the_empty_state_is_encoded() {
+        let mut delta = vec![];
+        into_writer(
+            &Vec::<harvest_common::mailbox::EncryptedMessage>::new(),
+            &mut delta,
+        )
+        .expect("encode");
+        let out = <Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(vec![]),
+            vec![UpdateData::Delta(StateDelta::from(delta))],
+        )
+        .expect("update")
+        .unwrap_valid()
+        .as_ref()
+        .to_vec();
+        let mut default = vec![];
+        into_writer(&MailboxStateV1::default(), &mut default).expect("encode");
+        assert_eq!(out, default);
     }
 }

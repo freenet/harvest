@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 /// How many messages one mailbox contract will hold.
 ///
@@ -85,6 +85,64 @@ pub const MAX_MESSAGE_BYTES: usize =
 /// has flooded (see `docs/messaging-privacy.md`).
 pub const MAX_MAILBOX_BYTES: usize = 4 * 1024 * 1024;
 
+/// How many messages of each size class a mailbox keeps, one entry per
+/// [`SIZE_BUCKETS`] entry.
+///
+/// A message's size class is the smallest bucket whose full message
+/// ([`size_class_limit`]) it fits in. This is what bounds the mailbox in
+/// bytes: a class holds at most its cap times its limit, and the sum is
+/// asserted below to fit in [`MAX_MAILBOX_BYTES`].
+///
+/// # Why per-class counts and not a byte budget (harvest#85)
+///
+/// A byte budget met by walking messages in rank order is not associative,
+/// whichever way the walk treats a message that does not fit. Skipping it
+/// (the rule until harvest#85) loses a message for good once a merge skips
+/// it, even if a later merge frees the room; `fdev verify-merge` found
+/// `(P+Q)+R` and `P+(Q+R)` disagreeing on exactly that. Stopping at it (the
+/// rule before 2026-09-05) lets a large message block smaller ones below it
+/// only while it is present, so it fails the same law another way. A size
+/// budget over variable sizes is a knapsack constraint, and a greedy pick
+/// over a fixed ranking is path independent only when the constraint is a
+/// matroid. A count cap per size class, under an overall count cap, is one:
+/// see [`enforce_message_cap`].
+///
+/// Text traffic sits in the smallest class, which keeps the whole of
+/// [`MAX_MESSAGES`], so honest use never meets a class cap.
+pub const SIZE_CLASS_CAPS: [usize; 4] = [MAX_MESSAGES, 128, 64, 24];
+
+/// The largest [`message_bytes`] a message in size class `class` may have:
+/// a full message whose ciphertext is that bucket plus its tag.
+pub const fn size_class_limit(class: usize) -> usize {
+    MESSAGE_ENVELOPE_BYTES + SENDER_KEY_BYTES + SIZE_BUCKETS[class] + AEAD_TAG_BYTES
+}
+
+/// The size class of a message, or `None` if it is over [`MAX_MESSAGE_BYTES`].
+pub fn size_class(message: &EncryptedMessage) -> Option<usize> {
+    let bytes = message_bytes(message);
+    (0..SIZE_BUCKETS.len()).find(|&class| bytes <= size_class_limit(class))
+}
+
+#[cfg(test)]
+fn size_class_caps() -> [usize; 4] {
+    SIZE_CLASS_CAPS
+}
+
+const _: () = {
+    assert!(SIZE_CLASS_CAPS.len() == SIZE_BUCKETS.len());
+    assert!(size_class_limit(SIZE_BUCKETS.len() - 1) == MAX_MESSAGE_BYTES);
+    let mut total = 0;
+    let mut class = 0;
+    while class < SIZE_CLASS_CAPS.len() {
+        total += SIZE_CLASS_CAPS[class] * size_class_limit(class);
+        class += 1;
+    }
+    assert!(
+        total <= MAX_MAILBOX_BYTES,
+        "the size-class caps must bound the mailbox within MAX_MAILBOX_BYTES"
+    );
+};
+
 /// The bytes of a message that are authenticated but not encrypted.
 ///
 /// # Why every field except the ciphertext is bound in
@@ -153,11 +211,12 @@ pub fn message_aad_for(message: &EncryptedMessage) -> Vec<u8> {
 
 /// **No single message may consume the mailbox.**
 ///
-/// The fact `enforce_message_cap`'s prefix rule rests on, held by the
-/// compiler rather than by a test: if one message could fill the budget, and
-/// it ranked first -- which is free, because timestamps are unsigned -- the
-/// mailbox would prune to nothing behind it. Retuning either constant into
-/// that corner fails the BUILD rather than a test somebody might not run.
+/// Held by the compiler rather than by a test. It mattered most under the
+/// prefix walk `enforce_message_cap` used before 2026-09-05, where one message
+/// filling the budget and ranking first (free, because timestamps are
+/// unsigned) pruned the mailbox to nothing behind it. Under the size-class
+/// caps a message can only displace messages of its own class, so this is no
+/// longer load-bearing, but retuning into that corner still fails the BUILD.
 const _: () = assert!(
     MAX_MESSAGE_BYTES * 2 <= MAX_MAILBOX_BYTES,
     "one message must not be able to crowd out every other"
@@ -739,6 +798,12 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// was invalid for exactly that reason: single-mutation survival is symmetric
 /// and attributes nothing.
 ///
+/// **Superseded by harvest#85, kept for the record.** Since then
+/// `enforce_message_cap` sorts by rank on every call, so the order this sort
+/// leaves never reaches the end of `apply_delta`, and `apply_delta`'s final
+/// sort is the only mechanism deciding it: removing that one alone now turns
+/// five tests red. The matrix above describes the code before that change.
+///
 /// **The one real exposure is deleting both.** No test objects to either
 /// deletion on its own, so two changes months apart, each individually
 /// justified by a green suite, end in a silent permanent divergence. This
@@ -753,79 +818,44 @@ fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
     messages.dedup_by_key(|message| entry_digest(message));
 }
 
-/// Drop the lowest-ranked messages until `messages` satisfies BOTH
-/// [`MAX_MESSAGES`] and [`MAX_MAILBOX_BYTES`].
+/// Keep the highest-ranked messages that fit [`MAX_MESSAGES`] and each size
+/// class's cap in [`SIZE_CLASS_CAPS`], which together bound the mailbox
+/// within [`MAX_MAILBOX_BYTES`].
 ///
 /// Rank is `(timestamp, nonce, entry_digest)`, highest kept. Every field is
 /// chosen by whoever wrote the message, so this ordering is grindable and is
-/// not offered
-/// as a defence -- see [`MailboxStateV1::apply_delta`] for what the caps do
-/// and do not buy. What it has to be is *total* and a pure function of
-/// message content, so that two replicas holding the same set of messages keep
-/// the same subset. Ranking by anything else available here has the same
-/// property and the same weakness, and `(timestamp, nonce)` at least leaves a
-/// mailbox carrying only honest traffic behaving as a recency window, which is
-/// what the age-based rule it replaces was for.
+/// not offered as a defence -- see [`MailboxStateV1::apply_delta`] for what
+/// the caps do and do not buy. What it has to be is *total* and a pure
+/// function of message content.
 ///
-/// # Why both caps are one pass, and why the walk SKIPS rather than stopping
+/// # Why this is associative, and the byte walk was not (harvest#85)
 ///
-/// The walk takes messages in rank order and skips any that will not fit,
-/// continuing to the next. **This was a prefix walk -- stopping at the first
-/// message that did not fit -- until 2026-09-05, and the prefix rule was
-/// wrong.** The argument for it was that "both peers keep the same prefix of
-/// the same total order" is a simpler convergence story than a greedy pack,
-/// and that the simpler story is worth more than the extra bytes because
-/// divergence here is silent and permanent.
+/// The walk takes messages in rank order and keeps each one unless its size
+/// class is full or the mailbox is. Those constraints are a laminar matroid
+/// (class counts nested inside an overall count), and a greedy pick over a
+/// fixed ranking under a matroid is path independent: a message it drops is
+/// dropped because higher-ranked messages already fill a constraint it
+/// belongs to, and those messages are present in any union containing its
+/// side, so it is dropped there too. So `cap(cap(X) + Y) == cap(X + Y)`,
+/// which is what makes the merge associative and a migration fold
+/// order-invariant.
 ///
-/// The simplicity was real; the conclusion did not follow. Both rules are pure
-/// functions of the SET, so both converge between two peers holding the same
-/// messages -- that was never the difference. What the prefix rule broke is
-/// **fold ORDER-invariance**, which is one of the properties
-/// `FoldAllAck` is minted against, and which `ui/src/migrate.rs`'s
-/// `fold_all_policy` asserts through freenet-migrate's own
-/// `assert_fold_order_invariant`. Under a prefix walk, which messages survive
-/// depends on *which large message happened to be present to block the walk*,
-/// and that is a property of the fold order rather than of the byte set:
-/// remove the blocker and a smaller message behind it now fits. Absorption
-/// failed the same way, so re-running the migration was not a fixed point and
-/// the state could flap between two sizes, each flap a PUT.
+/// The byte budget this replaces was met by skipping any message that did
+/// not fit the remaining bytes. That is not a matroid, and `fdev
+/// verify-merge` found `(P+Q)+R` and `P+(Q+R)` disagreeing: a message
+/// skipped while one merge had the budget full never came back when a
+/// later merge freed the room. See [`SIZE_CLASS_CAPS`] for why a prefix walk
+/// is not the fix either.
 ///
-/// Skipping restores both, and it is the same one pass: `retain` in rank
-/// order, keeping what fits. Two consequences worth stating rather than
-/// discovering:
+/// # What a flood can still do
 ///
-/// * **A lower-ranked message can now survive while a higher-ranked one is
-///   dropped.** That is the thing the prefix rule was protecting, and it turns
-///   out to be a benefit: an honest small message now survives a flood of
-///   maximum-size entries that would previously have blocked the walk and
-///   taken it. The byte-budget flood route is materially weaker for it -- see
-///   `the_byte_route_no_longer_evicts_a_small_honest_message`.
-/// * **The count route is unaffected**, so flooding is not defeated, only made
-///   to go the cheaper way it already went
-///   (`known_gap_a_funded_flood_still_evicts_every_honest_message`).
-///
-/// The prefix rule's one failure mode is now gone as well: it could keep
-/// NOTHING if the first message did not fit. [`MAX_MESSAGE_BYTES`] is still far
-/// below [`MAX_MAILBOX_BYTES`] and [`MailboxStateV1::apply_delta`] still
-/// refuses an oversized message on the way in, because a single entry must
-/// still be bounded -- but neither is now load-bearing against "one message
-/// empties the mailbox", because a skipping walk cannot do that.
+/// Fill a class. A flood of small messages evicts small honest messages
+/// (`known_gap_a_funded_flood_still_evicts_every_honest_message`), but no
+/// longer touches a larger class, and a flood of large messages can no longer
+/// evict small ones at all.
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
-    let over_count = messages.len() > MAX_MESSAGES;
-    let over_bytes = messages.iter().map(message_bytes).sum::<usize>() > MAX_MAILBOX_BYTES;
-    if !over_count && !over_bytes {
-        return;
-    }
-
-    // Descending. `(timestamp, nonce)` stopped being a total order the moment
-    // two entries could share both, so the digest is appended to close it.
-    //
-    // No test fails without this tiebreak, and it is redundant to BOTH of the
-    // mechanisms named on `dedupe_identical_entries` -- removing those two
-    // kills the suite whether or not this one is present. It is here so the
-    // ranking is self-sufficient rather than resting on a precondition about
-    // what ran before it. Kept, unobservable, and saying so rather than
-    // claiming a property it does not carry.
+    // Descending by rank. The digest closes the order, since two entries can
+    // share a timestamp and a nonce.
     messages.sort_by(|a, b| {
         b.timestamp
             .cmp(&a.timestamp)
@@ -833,39 +863,56 @@ fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
             .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
     });
 
-    let mut bytes = 0usize;
     let mut kept = 0usize;
+    let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
     messages.retain(|message| {
-        if kept == MAX_MESSAGES {
+        let Some(class) = size_class(message) else {
+            // Over `MAX_MESSAGE_BYTES`. `apply_delta` refuses these on the
+            // way in and `verify` refuses a state holding one, so this is
+            // only reachable from state nothing verified.
+            return false;
+        };
+        if kept == MAX_MESSAGES || per_class[class] == SIZE_CLASS_CAPS[class] {
             return false;
         }
-        let with_this = bytes + message_bytes(message);
-        if with_this > MAX_MAILBOX_BYTES {
-            // Skip, do not stop. Stopping made the surviving set depend on
-            // which large message happened to block the walk, which is a
-            // property of the fold order rather than of the byte set, and it
-            // broke `FoldAllAck`'s order-invariance and absorption.
-            return false;
-        }
-        bytes = with_this;
+        per_class[class] += 1;
         kept += 1;
         true
     });
 }
 
+/// The canonical order of a mailbox's messages: by nonce, then by
+/// [`entry_digest`], which makes it total. [`MailboxStateV1::apply_delta`]
+/// leaves messages in this order and [`MailboxStateV1::verify`] requires it.
+pub fn canonical_order(a: &EncryptedMessage, b: &EncryptedMessage) -> std::cmp::Ordering {
+    a.nonce
+        .cmp(&b.nonce)
+        .then_with(|| entry_digest(a).cmp(&entry_digest(b)))
+}
+
 impl MailboxStateV1 {
-    /// Verify state: no duplicate nonces, and no more than [`MAX_MESSAGES`]
-    /// messages.
+    /// Verify state: the mailbox is exactly what [`Self::apply_delta`] would
+    /// leave behind. Every message within [`MAX_MESSAGE_BYTES`], no more
+    /// than [`MAX_MESSAGES`] and no size class over its cap, and the messages
+    /// strictly ascending in [`canonical_order`], which also rules out a
+    /// message held twice.
     ///
-    /// Age is deliberately not checked here, and the cap deliberately is. The
-    /// distinction is whether a state can turn invalid while nobody touches
-    /// it. A TTL check used to live here and made a mailbox permanently
-    /// invalid the moment any single message aged out: `verify` rejected the
-    /// WHOLE state rather than pruning, so the mailbox could never shed
-    /// anything and never recover. Being over the cap is a property of the
-    /// bytes rather than of the passage of time -- [`Self::apply_delta`] never
-    /// produces such a state -- so rejecting it cannot strand an honest
-    /// mailbox, and it is what stops a peer being handed one directly.
+    /// Anything weaker lets a peer be handed a state that is not equal to
+    /// itself merged with itself, and one that two peers holding the same
+    /// messages encode differently (harvest#85, the mailbox form of #26). A
+    /// message `apply_delta` would refuse but `verify` accepted survived a
+    /// merge on one side and not the other.
+    ///
+    /// Age is deliberately not checked here. The distinction is whether a
+    /// state can turn invalid while nobody touches it. A TTL check used to
+    /// live here and made a mailbox permanently invalid the moment any single
+    /// message aged out: `verify` rejected the WHOLE state rather than
+    /// pruning, so the mailbox could never shed anything and never recover.
+    /// Everything checked now is a property of the bytes rather than of the
+    /// passage of time -- [`Self::apply_delta`] never produces a state that
+    /// fails it -- so rejecting it cannot strand an honest mailbox. That holds
+    /// across the harvest#85 re-key too: the new generation starts empty, and
+    /// the migration fold builds its state through `apply_delta`.
     pub fn verify(&self) -> Result<(), String> {
         if self.messages.len() > MAX_MESSAGES {
             return Err(format!(
@@ -873,15 +920,33 @@ impl MailboxStateV1 {
                 self.messages.len()
             ));
         }
-        // Duplicate ENTRIES, not duplicate nonces. The nonce is chosen by
-        // whoever wrote the message, so rejecting on it made a legal pair --
-        // two different messages that happen to share one -- permanently
-        // invalid, and that is what turned a nonce collision into a way of
-        // destroying somebody else's message. See [`entry_digest`].
-        let mut seen = HashSet::new();
+        let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
         for msg in &self.messages {
-            if !seen.insert(entry_digest(msg)) {
-                return Err("duplicate message".into());
+            let Some(class) = size_class(msg) else {
+                return Err(format!(
+                    "message of {} bytes is over MAX_MESSAGE_BYTES ({MAX_MESSAGE_BYTES})",
+                    message_bytes(msg)
+                ));
+            };
+            per_class[class] += 1;
+        }
+        for (class, (&held, &cap)) in per_class.iter().zip(SIZE_CLASS_CAPS.iter()).enumerate() {
+            if held > cap {
+                return Err(format!(
+                    "mailbox holds {held} messages in size class {class}, cap is {cap}"
+                ));
+            }
+        }
+        // Strictly ascending. Duplicate ENTRIES, not duplicate nonces: the
+        // nonce is chosen by whoever wrote the message, so rejecting on it
+        // made a legal pair -- two different messages that happen to share
+        // one -- permanently invalid. See [`entry_digest`].
+        for pair in self.messages.windows(2) {
+            if canonical_order(&pair[0], &pair[1]) != std::cmp::Ordering::Less {
+                return Err(
+                    "messages are not in canonical order (unsorted, or a message held twice)"
+                        .into(),
+                );
             }
         }
         Ok(())
@@ -989,10 +1054,10 @@ impl MailboxStateV1 {
                 // Refused rather than stored and pruned. Storing it first
                 // would put it at the head of the eviction ranking (its
                 // timestamp is free to choose) and prune the mailbox to
-                // nothing behind it -- see `enforce_message_cap`. Dropping an
-                // incoming message is recoverable in a way that invalidating
-                // existing state is not, which is the same reason `verify`
-                // does not check the byte budget at all.
+                // nothing behind it -- see `enforce_message_cap`. It has no
+                // size class, and `verify` refuses a state holding one, so
+                // refusing it here is what keeps the merge commutative
+                // (harvest#85).
                 if message_bytes(msg) > MAX_MESSAGE_BYTES {
                     continue;
                 }
@@ -1014,31 +1079,17 @@ impl MailboxStateV1 {
         dedupe_identical_entries(&mut self.messages);
         enforce_message_cap(&mut self.messages);
 
-        // Normalisation, and ONE OF TWO mechanisms that make a same-nonce
-        // pair converge; `dedupe_identical_entries` is the other, and carries
-        // the full mutation matrix. The digest tiebreak is what makes this a
-        // total order.
-        //
-        // Convergence itself IS pinned: delete both mechanisms and three
-        // tests fail (`two_different_messages_sharing_a_nonce_converge_and_\
-        // both_survive`, `a_nonce_collision_inside_one_delta_converges_and_\
-        // keeps_both`, `a_retraction_that_arrives_first_does_not_keep_the_\
-        // original_out`). What is NOT pinned is this mechanism's own
-        // necessity: either alone suffices, so deleting this one on its own
-        // leaves the workspace green. Do not read that as evidence it is
-        // dead code -- read the twin comment first.
-        //
-        // This comment has been wrong twice, in opposite directions, which is
-        // why it is careful now. It first said "sort deterministically by
-        // nonce for CRDT convergence" (it was not the only such mechanism),
-        // then said it carried nothing at all (it is one of the two that do).
-        // A comment attributing a property to the wrong mechanism is how the
-        // next person deletes the mechanism that actually provides it.
-        self.messages.sort_by(|a, b| {
-            a.nonce
-                .cmp(&b.nonce)
-                .then_with(|| entry_digest(a).cmp(&entry_digest(b)))
-        });
+        // Normalisation into `canonical_order`, which `verify` requires
+        // (harvest#85). Since harvest#85 this sort is the ONLY thing that
+        // decides the final order: `enforce_message_cap` now always sorts by
+        // rank, so the order `dedupe_identical_entries` leaves behind no
+        // longer survives to here. Removing it turns five tests red, measured
+        // (among them `two_different_messages_sharing_a_nonce_converge_and_\
+        // both_survive` and `verify_refuses_non_canonical_order`). The
+        // comment this replaces described it as one of two mutually redundant
+        // mechanisms, which was true before the cap started sorting every
+        // time; see the note on `dedupe_identical_entries`.
+        self.messages.sort_by(canonical_order);
 
         Ok(())
     }
@@ -1495,11 +1546,11 @@ mod retention_security_tests {
     /// This test was added on 2026-09-05 asserting the opposite, and the
     /// assertion is inverted here rather than the test deleted, exactly as its
     /// own failure message instructed. What changed is
-    /// [`enforce_message_cap`]: it skips a message that will not fit instead of
-    /// stopping at it, so a small honest message now survives in the gap that
-    /// a flood of maximum-size entries leaves at the end of the budget. That
-    /// change was made for `FoldAllAck`'s order-invariance, and this is a
-    /// second, unlooked-for benefit of it.
+    /// [`enforce_message_cap`]. It first began skipping a message that did not
+    /// fit instead of stopping at it (2026-09-05), and since harvest#85 it caps
+    /// each size class by count instead of the mailbox by bytes, so a flood of
+    /// maximum-size entries fills only the top class and a small honest message
+    /// is in a different class altogether.
     ///
     /// **The flood is NOT defeated**, and nothing here should be read as
     /// saying so. The count route still evicts everything
@@ -1542,10 +1593,10 @@ mod retention_security_tests {
 
         assert!(
             state.messages.contains(&honest),
-            "an honest message was evicted by a byte-budget flood. That was true until \
-             `enforce_message_cap` began skipping rather than stopping; if the prefix walk \
-             has been restored, this test and the reasoning on `enforce_message_cap` and in \
-             docs/buyer-conversation-persistence.md all need revisiting together"
+            "an honest message was evicted by a flood of large messages. The size-class caps \
+             in `enforce_message_cap` should put them in a different class; if a shared byte \
+             budget has been restored, this test and the reasoning on `enforce_message_cap` \
+             and in docs/buyer-conversation-persistence.md all need revisiting together"
         );
     }
 
@@ -1770,9 +1821,9 @@ mod byte_budget_tests {
 
     /// **One oversized message must not empty the mailbox.**
     ///
-    /// Pruning keeps a prefix of the ranking, so if the highest-ranked
-    /// message did not fit, nothing after it would be reached and the mailbox
-    /// would prune to nothing. An attacker who can pick a timestamp can put
+    /// Under the prefix walk `enforce_message_cap` used before 2026-09-05, if
+    /// the highest-ranked message did not fit, nothing after it would be
+    /// reached and the mailbox would prune to nothing. An attacker who can pick a timestamp can put
     /// their message at the top of that ranking for free, so this would have
     /// been a cheaper and more total attack than the unbounded growth the
     /// budget exists to stop.
@@ -1873,39 +1924,30 @@ mod byte_budget_tests {
         assert!(m.messages.is_empty());
     }
 
-    /// **`verify` deliberately does NOT check the byte budget.**
+    /// **`verify` now refuses a state over the size bound (harvest#85).**
     ///
-    /// The count cap IS checked there, and the argument given for it is that
-    /// `apply_delta` never produces an over-cap state, so only a hand-built
-    /// state is rejected. That argument does not transfer, and the difference
-    /// is what this test exists to hold: the count cap has been enforced
-    /// since the mailbox existed, so no honest state was ever over it. The
-    /// byte budget is NEW. Mailboxes already on the network were produced by
-    /// an honest `apply_delta` under the old rules and may exceed it, and a
-    /// `verify` that rejected them would make them permanently invalid --
-    /// never convergeable again, with no way back. That is a worse failure
-    /// than the unbounded growth being fixed, and this repository has already
-    /// been bitten by exactly it once (the TTL check that rejected a whole
-    /// mailbox because one message had aged out).
-    ///
-    /// So an over-budget state is accepted and pruned on the next merge,
-    /// which only ever shrinks it.
-    ///
-    /// **Residual, stated rather than discovered later:** between arriving
-    /// and the next update, a peer may hold an over-budget state. Nothing
-    /// here bounds that; the node's own maximum state size does.
+    /// Until harvest#85 it deliberately did NOT, and this test pinned that:
+    /// the byte budget was new, mailboxes already on the network were built
+    /// under the old rules and could exceed it, and a `verify` rejecting them
+    /// would have stranded them for good. That argument was about state
+    /// already held at the SAME address. The harvest#85 re-key moves every
+    /// mailbox to a new address that starts empty, and the migration fold
+    /// fills it through `apply_delta`, which never produces a state over the
+    /// bound. So nothing honest can be stranded, and a state the cap would
+    /// prune is one that is not equal to itself merged with itself, which is
+    /// the merge-law violation `fdev verify-merge` reported.
     #[test]
-    fn verify_accepts_an_over_budget_state_so_an_existing_mailbox_is_never_stranded() {
-        let m = MailboxStateV1 {
-            messages: over_budget_but_under_count(),
-        };
+    fn verify_refuses_an_over_budget_state_now_the_rekey_starts_empty() {
+        let mut messages = over_budget_but_under_count();
+        messages.sort_by(canonical_order);
+        let m = MailboxStateV1 { messages };
         assert!(
             total_bytes(&m) > MAX_MAILBOX_BYTES,
             "precondition: the fixture is over budget"
         );
         assert!(
-            m.verify().is_ok(),
-            "a state that was legal when it was written must not become permanently invalid"
+            m.verify().is_err(),
+            "a state the cap would prune must not verify"
         );
     }
 
@@ -1973,8 +2015,8 @@ mod byte_budget_tests {
                 assert_eq!(
                     survivors,
                     honest.len(),
-                    "a byte-budget flood evicted honest messages again -- `enforce_message_cap` \
-                     skips rather than stopping, so they should fit in the gap it leaves"
+                    "a flood of large messages evicted small honest messages again -- \
+                     `enforce_message_cap` caps each size class separately, so it should not"
                 );
             }
             wire
@@ -1983,10 +2025,10 @@ mod byte_budget_tests {
         // Route A: fill the COUNT cap with the smallest messages there are.
         // This still evicts everything; it is the route that works.
         let by_count = cost(flood(MAX_MESSAGES, 64), true);
-        // Route B: fill the BYTE budget with the largest. Since
-        // `enforce_message_cap` began skipping rather than stopping, this no
-        // longer evicts a smaller honest message at all -- it is both more
-        // expensive AND less effective.
+        // Route B: fill the BYTE budget with the largest. Since harvest#85
+        // capped each size class separately, this fills only the top class
+        // and does not evict a smaller honest message at all -- it is both
+        // more expensive AND less effective.
         let by_bytes = cost(
             flood(
                 MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES + 1,
@@ -2281,9 +2323,9 @@ mod entry_identity_tests {
     /// permanently un-removable -- a funded flood still evicts it, at about
     /// 122 KiB across 512 entries filling the COUNT cap
     /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). The
-    /// byte-budget route is both more expensive and, since
-    /// `enforce_message_cap` began skipping rather than stopping, no longer
-    /// effective against a smaller message
+    /// byte-budget route is both more expensive and, since harvest#85 capped
+    /// each size class separately, no longer effective against a smaller
+    /// message
     /// (`the_byte_route_no_longer_evicts_a_small_honest_message`). **The count
     /// route is ONE update**, so there is no window to be quick in -- which is
     /// why Phase 2's answer is an ordering (persist, confirm, then pay) rather
@@ -2368,9 +2410,10 @@ mod entry_identity_tests {
         let one = message([7u8; 24], b"first", 1_700_000_000);
         let other = message([7u8; 24], b"second", 1_700_000_000);
 
-        let shared_nonce = MailboxStateV1 {
-            messages: vec![one.clone(), other],
-        };
+        // In canonical order, which `verify` also requires (harvest#85).
+        let mut pair = vec![one.clone(), other];
+        pair.sort_by(canonical_order);
+        let shared_nonce = MailboxStateV1 { messages: pair };
         shared_nonce
             .verify()
             .expect("two different messages sharing a nonce is a legal state");
@@ -2450,5 +2493,183 @@ mod entry_identity_tests {
             "two peers pruned the same set to different bytes"
         );
         assert_eq!(one.messages.len(), MAX_MESSAGES);
+    }
+}
+
+/// The merge laws the network relies on, pinned in-process (harvest#85).
+///
+/// `fdev verify-merge` checks the same laws against the built WASM; these keep
+/// a regression visible in `cargo test`.
+#[cfg(test)]
+mod merge_law_tests {
+    use super::*;
+
+    /// A message whose total charge (`message_bytes`) is exactly `bytes`,
+    /// distinct by `i`. Sizes need not be bucket sizes: `apply_delta` refuses
+    /// only what is over `MAX_MESSAGE_BYTES`.
+    fn charged(i: u32, secs: i64, bytes: usize) -> EncryptedMessage {
+        let mut nonce = [0u8; 24];
+        nonce[..4].copy_from_slice(&i.to_be_bytes());
+        EncryptedMessage {
+            conversation_id: ConversationId([2u8; 32]),
+            sender_public_key: vec![9u8; SENDER_KEY_BYTES],
+            ciphertext: vec![0u8; bytes - MESSAGE_ENVELOPE_BYTES - SENDER_KEY_BYTES],
+            timestamp: DateTime::from_timestamp(secs, 0).unwrap(),
+            nonce,
+        }
+    }
+
+    /// A state as a peer would hold it: whatever `apply_delta` makes of these.
+    fn state_of(messages: Vec<EncryptedMessage>) -> MailboxStateV1 {
+        let mut s = MailboxStateV1::default();
+        s.apply_delta(&Some(messages)).expect("apply");
+        s
+    }
+
+    fn merge(a: &MailboxStateV1, b: &MailboxStateV1) -> MailboxStateV1 {
+        let mut out = a.clone();
+        out.apply_delta(&Some(b.messages.clone())).expect("apply");
+        out
+    }
+
+    fn enc(s: &MailboxStateV1) -> Vec<u8> {
+        crate::to_cbor(s).expect("encode")
+    }
+
+    fn assert_merge_laws(states: &[MailboxStateV1]) {
+        for (ia, a) in states.iter().enumerate() {
+            assert_eq!(enc(&merge(a, a)), enc(a), "idempotence on state {ia}");
+            for (ib, b) in states.iter().enumerate() {
+                assert_eq!(
+                    enc(&merge(a, b)),
+                    enc(&merge(b, a)),
+                    "commutativity on states {ia}, {ib}"
+                );
+                for (ic, c) in states.iter().enumerate() {
+                    assert_eq!(
+                        enc(&merge(&merge(a, b), c)),
+                        enc(&merge(a, &merge(b, c))),
+                        "associativity on states {ia}, {ib}, {ic}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The counterexample `fdev verify-merge` found against the skipping
+    /// byte walk.** P fills the byte budget to within 500 bytes, Q is one old
+    /// 600-byte message x, R one new 600-byte message. `(P+Q)+R` lost x,
+    /// because it was skipped while P alone filled the budget and never came
+    /// back; `P+(Q+R)` kept it, because r1 pushed out one of P's larger
+    /// messages and left room.
+    #[test]
+    fn the_byte_bound_is_associative_at_the_budget() {
+        let base = 1_700_000_000;
+        let target = MAX_MAILBOX_BYTES - 500;
+        let mut p: Vec<EncryptedMessage> = (0..500u32)
+            .map(|i| charged(i, base + 10 + i as i64, 8_370))
+            .collect();
+        p.push(charged(500, base + 600, target - 500 * 8_370));
+        let p = state_of(p);
+        let q = state_of(vec![charged(9_000, base, 600)]);
+        let r = state_of(vec![charged(9_001, base + 10_000, 600)]);
+        assert_merge_laws(&[p, q, r]);
+    }
+
+    /// The shape that also defeats a PREFIX walk (stop at the first message
+    /// that does not fit), which is why the fix is not to go back to one: a
+    /// large message in the middle of the ranking blocks a smaller one below
+    /// it only while it is present, so a merge that drops it early lets the
+    /// smaller one in and a merge that meets it late does not.
+    #[test]
+    fn the_byte_bound_is_associative_with_a_large_message_mid_ranking() {
+        let base = 1_700_000_000;
+        let big = MAX_MESSAGE_BYTES;
+        let fill: Vec<EncryptedMessage> = (0..(MAX_MAILBOX_BYTES / big) as u32)
+            .map(|i| charged(i, base + 1_000 + i as i64, big))
+            .collect();
+        let states = [
+            state_of(fill),
+            state_of(vec![charged(7_000, base + 500, big)]),
+            state_of(vec![charged(7_001, base + 100, 1_000)]),
+            state_of(vec![charged(7_002, base + 5_000, 4_000)]),
+        ];
+        assert_merge_laws(&states);
+    }
+
+    fn sorted_messages() -> Vec<EncryptedMessage> {
+        state_of(
+            (0..4u32)
+                .map(|i| charged(i, 1_700_000_000 + i as i64, 1_000))
+                .collect(),
+        )
+        .messages
+    }
+
+    /// **`verify` refuses a mailbox that is not in canonical form** (the #26
+    /// defect, in the mailbox). Each of these used to verify, so a peer
+    /// handed one whole held different bytes from a peer that reached the
+    /// same messages through deltas, and a state was not equal to itself
+    /// merged with itself.
+    #[test]
+    fn verify_refuses_non_canonical_order() {
+        let sorted = sorted_messages();
+        MailboxStateV1 {
+            messages: sorted.clone(),
+        }
+        .verify()
+        .expect("the canonical form verifies");
+
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        let err = MailboxStateV1 { messages: reversed }
+            .verify()
+            .expect_err("unsorted messages must not verify");
+        assert!(err.contains("canonical order"), "got: {err}");
+
+        let repeated = vec![sorted[0].clone(), sorted[0].clone()];
+        MailboxStateV1 { messages: repeated }
+            .verify()
+            .expect_err("a message held twice must not verify");
+    }
+
+    /// **`verify` refuses a message `apply_delta` would refuse.** Otherwise
+    /// the oversized message survived a merge on the side that already held
+    /// it and was dropped on the side it arrived at, so the merge was not
+    /// commutative.
+    #[test]
+    fn verify_refuses_an_oversized_message() {
+        let base = 1_700_000_000;
+        let ok = charged(1, base, MAX_MESSAGE_BYTES);
+        MailboxStateV1 {
+            messages: vec![ok.clone()],
+        }
+        .verify()
+        .expect("a message at the limit verifies");
+
+        let mut too_big = ok;
+        too_big.ciphertext.push(0);
+        let err = MailboxStateV1 {
+            messages: vec![too_big],
+        }
+        .verify()
+        .expect_err("a message over the limit must not verify");
+        assert!(err.contains("MAX_MESSAGE_BYTES"), "got: {err}");
+    }
+
+    /// **`verify` refuses a mailbox `apply_delta` would prune.** A state the
+    /// cap would change is a state not equal to itself merged with itself.
+    #[test]
+    fn verify_refuses_a_state_the_cap_would_prune() {
+        let base = 1_700_000_000;
+        let over: Vec<EncryptedMessage> = (0..(size_class_caps()[3] + 1) as u32)
+            .map(|i| charged(i, base + i as i64, MAX_MESSAGE_BYTES))
+            .collect();
+        let mut canonical = MailboxStateV1 { messages: over };
+        canonical.messages.sort_by(canonical_order);
+        let err = canonical
+            .verify()
+            .expect_err("more top-class messages than the class cap must not verify");
+        assert!(err.contains("size class"), "got: {err}");
     }
 }

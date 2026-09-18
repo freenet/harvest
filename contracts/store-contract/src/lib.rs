@@ -212,6 +212,13 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        // Zero bytes in and nothing but zero bytes merged in is zero bytes
+        // out, not the encoded default: the two are one state, and answering
+        // one with the other made `merge(A, A) != A` for the empty state
+        // (`fdev verify-merge`, harvest#55). Anything non-empty arriving
+        // switches this off, so merging an encoded default in is still that
+        // encoding, whichever side it is on.
+        let mut nothing_here = state.as_ref().is_empty();
         let mut store_state = if state.as_ref().is_empty() {
             StoreStateV1::default()
         } else {
@@ -222,6 +229,14 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
+                    // Zero bytes means "there is no state here", the
+                    // convention every other entry point uses (harvest#55).
+                    // Decoding it failed, so a peer handed the valid empty
+                    // state to merge answered with a decode error.
+                    if new_state.as_ref().is_empty() {
+                        continue;
+                    }
+                    nothing_here = false;
                     let new_state = from_reader::<StoreStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
@@ -234,6 +249,7 @@ impl ContractInterface for Contract {
                     if d.as_ref().is_empty() {
                         continue;
                     }
+                    nothing_here = false;
                     let delta = from_reader::<StoreStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
@@ -252,6 +268,10 @@ impl ContractInterface for Contract {
         // nothing, so a stored state that is not canonical would otherwise be
         // written back as it came (harvest#26).
         store_state.listings.normalize();
+
+        if nothing_here {
+            return Ok(UpdateModification::valid(State::from(vec![])));
+        }
 
         let mut updated_state = vec![];
         into_writer(&store_state, &mut updated_state)
@@ -710,5 +730,77 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "the written state must be sorted by id");
+    }
+
+    /// **Merging a zero-byte state is a no-op, not a decode error
+    /// (harvest#55).** Zero bytes is a valid state (`validate_state` says
+    /// so), so a peer can be handed one to merge; the `State` arm decoded it
+    /// unconditionally and failed. The mailbox contract already guarded this.
+    #[test]
+    fn merging_a_zero_byte_state_changes_nothing() {
+        let held = state_with_details();
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller_key())),
+            held.clone(),
+            vec![UpdateData::State(State::from(vec![]))],
+        )
+        .expect("a zero-byte state must merge");
+        assert_eq!(out.unwrap_valid().as_ref(), held.as_ref());
+    }
+    /// **The empty state merged with itself is the empty state** (harvest#55,
+    /// found by `fdev verify-merge`). `update_state` answered zero bytes with
+    /// the encoded default, so `merge(A, A) != A` for the empty state. And an
+    /// encoded default merged in from either side stays that encoding, so
+    /// the rule does not break commutativity instead.
+    #[test]
+    fn the_empty_state_is_idempotent_and_the_rule_is_commutative() {
+        let merge = |state: Vec<u8>, other: Vec<u8>| -> Vec<u8> {
+            Contract::update_state(
+                Parameters::from(params_bytes(&seller_key())),
+                State::from(state),
+                vec![UpdateData::State(State::from(other))],
+            )
+            .expect("merge")
+            .unwrap_valid()
+            .as_ref()
+            .to_vec()
+        };
+        assert!(
+            merge(vec![], vec![]).is_empty(),
+            "merge(empty, empty) must be empty"
+        );
+        let mut default = vec![];
+        into_writer(&StoreStateV1::default(), &mut default).expect("encode");
+        assert_eq!(merge(vec![], default.clone()), default);
+        assert_eq!(merge(default.clone(), vec![]), default);
+    }
+
+    /// A non-empty delta applied to the empty state is an update, so the
+    /// result is the encoded state, not zero bytes. Without this the
+    /// empty-state rule above would swallow a delta's content.
+    #[test]
+    fn a_delta_applied_to_the_empty_state_is_encoded() {
+        let mut delta = vec![];
+        into_writer(
+            &StoreStateV1Delta {
+                info: None,
+                listings: None,
+                orders: None,
+            },
+            &mut delta,
+        )
+        .expect("encode");
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller_key())),
+            State::from(vec![]),
+            vec![UpdateData::Delta(StateDelta::from(delta))],
+        )
+        .expect("update")
+        .unwrap_valid()
+        .as_ref()
+        .to_vec();
+        let mut default = vec![];
+        into_writer(&StoreStateV1::default(), &mut default).expect("encode");
+        assert_eq!(out, default);
     }
 }

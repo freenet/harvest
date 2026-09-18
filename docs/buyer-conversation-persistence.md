@@ -551,10 +551,10 @@ not a claim that should rest on one.
 *A footnote, because it changed twice in one day and someone will otherwise
 re-derive it:* the byte-budget route was briefly measured as a cheaper path,
 64 maximum-size entries rather than 512 small ones. It is not one any more.
-`enforce_message_cap` now skips a message that will not fit rather than
-stopping at it -- changed to restore the migration fold's order-invariance, not
-for this -- and a small honest message therefore survives in the gap a
-maximum-size flood leaves (`the_byte_route_no_longer_evicts_a_small_honest_message`).
+Since harvest#85 `enforce_message_cap` caps each size class by count instead
+of the mailbox by bytes -- changed so the merge is associative, not for this --
+and a maximum-size flood therefore fills only the top class and cannot reach a
+small honest message (`the_byte_route_no_longer_evicts_a_small_honest_message`).
 The count route still works, is cheaper anyway at about 122 KiB, and is still
 one update. **None of that changes the argument below**, which depends only on
 the flood being one update, and would hold even if every route were closed.

@@ -169,13 +169,14 @@ Four consequences, all deliberate:
 
   A second correction, in the other direction: the byte-budget route was
   briefly measured as a cheaper way to the same result (64 maximum-size entries
-  rather than 512 small ones). It is not one any more. `enforce_message_cap`
-  now SKIPS a message that will not fit instead of stopping at it -- changed
-  for an unrelated reason, to restore the migration fold's order-invariance --
-  and a small honest message consequently survives in the gap a flood of
-  maximum-size entries leaves
+  rather than 512 small ones). It is not one any more. Since harvest#85
+  `enforce_message_cap` meets the byte bound with a count cap per size class
+  (`SIZE_CLASS_CAPS`) rather than a shared byte budget, which it had to for
+  the merge to be associative, so a flood of maximum-size entries fills only
+  the top class and cannot reach a small honest message
   (`the_byte_route_no_longer_evicts_a_small_honest_message`). The count route
-  still works and is cheaper anyway, so the flood is narrowed, not closed.
+  within the smallest class still works and is cheaper anyway, so the flood is
+  narrowed, not closed.
 
   A buyer's recourse must survive a seller willing to spend that, so the
   confession needs a home outside the mailbox. **That is now settled** (Ian,
@@ -322,6 +323,10 @@ carrying their tag:
 |---|---|
 | 512 entries at the 1 KiB bucket (632 KiB — the count cap binds) | **3.2 ms** |
 | 63 entries at the top bucket (3.95 MiB — the byte budget binds) | **20.7 ms** |
+
+Since harvest#85 the top size class is capped at 24 entries (about 1.5 MiB),
+and a mailbox at every class cap is about 3.7 MiB, so the second row is now an
+upper bound rather than a reachable state; it was not re-measured.
 
 Both are measured at the real cap, through the real pruning, rather than
 extrapolated. The second figure was **193 ms** before `MAX_MAILBOX_BYTES`
