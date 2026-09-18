@@ -50,6 +50,36 @@ set -e
 # is where sync-wasm stages contracts/), and the two fixed-name assets are
 # re-copied below.
 rm -rf target/dx/harvest-ui/${BUILD_PROFILE}/web/public
+
+# Pin dx (dioxus-cli) to the exact version the check below was verified
+# against, and fail loudly on a mismatch.
+#
+# The wasm-opt-failure detection a few lines down works by grepping dx's own
+# log text ("wasm-opt failed"), which is an internal string from
+# dioxus-cli 0.7.3's src/wasm_opt.rs -- not a stable, documented interface.
+# A later dx release could reword that message with no announcement, which
+# would silently disarm the guard: the build would go back to shipping
+# unoptimized wasm with a green `cargo make`, and nothing in CI runs `dx` at
+# all to catch it. That is exactly the false-green failure mode harvest#34
+# itself warned about: "a check that only greps for the error string would
+# pass the moment the message changes." Pinning the version turns that
+# silent drift into a loud one, at the one place that can actually detect it.
+EXPECTED_DX_VERSION="dioxus 0.7.3 "
+DX_VERSION_OUTPUT="$(dx --version 2>&1)"
+case "$DX_VERSION_OUTPUT" in
+  "$EXPECTED_DX_VERSION"*) ;;
+  *)
+    echo "ERROR: expected \`dx --version\` to start with '${EXPECTED_DX_VERSION}', got:" >&2
+    echo "  $DX_VERSION_OUTPUT" >&2
+    echo "The wasm-opt-failure detection below was verified against 0.7.3's exact log" >&2
+    echo "wording (harvest#34, harvest#86) and MUST be RE-VERIFIED before this pin" >&2
+    echo "moves: rebuild with the new dx, deliberately break wasm-opt (force" >&2
+    echo "--debug-symbols true), confirm the grep below still fires, then update" >&2
+    echo "EXPECTED_DX_VERSION." >&2
+    exit 1
+    ;;
+esac
+
 cd ui
 # --debug-symbols false: a release UI has no use for wasm debuginfo, and
 # keeping it is what breaks the optimizer (harvest#34). With debug symbols on
@@ -65,6 +95,16 @@ cd ui
 # choke on -- optimization actually runs. Verified: with this flag, no
 # wasm-opt error, the emitted wasm has no .debug_* sections, and it is
 # smaller than the unoptimized build.
+#
+# Separately: this build's wasm carries no wasm-bindgen "name" section
+# either way, with or without this flag -- verified by forcing
+# --debug-symbols true and inspecting the (unoptimized, since wasm-opt still
+# aborted) output: still no "name" custom section, only the DWARF ones. dx
+# only retains names for --wasm-split or hotpatch ("fat") builds, neither of
+# which this is, so panic traces in production already show
+# `wasm-function[N]` rather than Rust symbol names regardless of
+# --debug-symbols. Accepted for production; this flag only controls the
+# DWARF debuginfo, which is what was actually breaking wasm-opt.
 #
 # Because dx exits 0 either way, `cargo make` cannot see the difference
 # between a real optimization pass and the silent fallback on its own exit
@@ -96,7 +136,12 @@ cp assets/harvest-logo.svg ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/h
 # for this repo, not a runtime asset, and the publish bundle gate
 # (check-webapp-bundle.sh) requires every shipped file to be either
 # content-hashed or explicitly listed as required.
-rm -rf ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts
+#
+# No `rm -rf` needed here: `public/` (including any fonts/ inside it) was
+# already wiped in full at the top of this task, and nothing between there
+# and here recreates it -- dx doesn't know this directory exists. `mkdir -p`
+# is still required, though: `cp` won't create a missing destination
+# directory for us.
 mkdir -p ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts
 cp assets/fonts/*.woff2 ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts/
 echo "CSS and fonts copied to build output"
