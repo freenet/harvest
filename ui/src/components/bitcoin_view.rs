@@ -535,11 +535,19 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
             .flatten();
         let late = reading
             .after_window
-            .is_some_and(|height| state.another_own_order_window_holds(&o.id, height));
+            .is_some_and(|height| !state.orders_whose_window_holds(&o.id, &[height]).is_empty());
         // Only when it is actually possible: the payment this order was
         // settled on confirmed inside another own order's window too.
-        let paid_maybe_twins = order.status == OrderStatus::Paid
-            && state.payment_may_be_anothers(&o.id, &reading.in_window_heights);
+        let paid_maybe_twins: String = if order.status == OrderStatus::Paid {
+            state
+                .orders_whose_window_holds(&o.id, &reading.in_window_heights)
+                .iter()
+                .map(|id| id.short())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
         (hold, late, paid_maybe_twins)
     };
     let (status_class, status_text) = status_pill(order.status, &reading, hold.is_some());
@@ -558,7 +566,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 }
             }
             if let Some(hold) = hold {
-                p { class: "text-warning", "{hold.explain()}" }
+                p { class: "text-warning",
+                    "{hold.explain(o.amount_sats, reading.in_window_sats)}"
+                }
                 button {
                     class: "btn btn-sm btn-primary",
                     onclick: move |_| {
@@ -567,12 +577,12 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                     "Confirm paid"
                 }
             }
-            if paid_maybe_twins {
-                p { class: "text-muted",
-                    "Another of your invoices uses this same address, and the payment that \
-                     settled this one also falls inside that invoice's window. One payment \
-                     cannot pay for both invoices: check your wallet for a separate payment \
-                     per invoice before shipping both."
+            if !paid_maybe_twins.is_empty() {
+                p { class: "text-warning",
+                    "Your invoice {paid_maybe_twins} uses this same address, and \
+                     the payment that settled this one also falls inside its window. One \
+                     payment cannot pay for both invoices: check your wallet for a separate \
+                     payment per invoice before shipping both."
                 }
             }
             // The address is only offered when it is the script that settles

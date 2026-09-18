@@ -283,13 +283,12 @@ pub struct AppState {
     /// For each of this seller's own orders, the OTHER own orders on the same
     /// payment address and network that are not cancelled, with their payment
     /// windows. Output of [`AppState::refresh_same_address_orders`].
-    pub same_address_orders: HashMap<
-        harvest_common::payment::OrderId,
-        Vec<(
-            harvest_common::payment::OrderId,
-            std::ops::RangeInclusive<u32>,
-        )>,
-    >,
+    pub same_address_orders: HashMap<harvest_common::payment::OrderId, Vec<SameAddressOrder>>,
+    /// Ghost Key fingerprints whose `ListStores` has been answered this
+    /// session. Until every listed identity's has, a store it owns could be
+    /// missing from `my_stores`, so settlements are withheld
+    /// ([`AppState::unloaded_stores`]).
+    pub store_lists_answered: HashSet<String>,
     /// Settlements a proof exists for but that were not auto-published
     /// (see [`AppState::settlement_hold`]), by order, with their store, so
     /// the seller can confirm them from the card.
@@ -1018,34 +1017,58 @@ pub fn order_for_invoice(
 pub enum SettlementHold {
     /// Other own orders on the same address have overlapping windows, so one
     /// payment would prove them all and nothing on the chain says whose it is.
-    Twins(Vec<harvest_common::payment::OrderId>),
-    /// Not every store this seller owns has loaded, so a twin could be
-    /// sitting in one that has not.
-    StoresNotLoaded,
+    Twins(Vec<SameAddressOrder>),
+    /// Not everything this seller owns has loaded, so a twin could be in what
+    /// has not; each entry names it (see [`AppState::unloaded_stores`]).
+    StoresNotLoaded(Vec<String>),
+}
+
+/// Another own, uncancelled order on the same address and network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SameAddressOrder {
+    pub id: harvest_common::payment::OrderId,
+    pub window: std::ops::RangeInclusive<u32>,
+    pub amount_sats: u64,
+    pub status: harvest_common::payment::OrderStatus,
 }
 
 impl SettlementHold {
-    pub fn explain(&self) -> String {
-        match self {
+    /// What the card says above "Confirm paid". `amount_sats` is this
+    /// invoice's, `in_window_sats` the confirmed value inside its window.
+    /// Twins are listed with amount and status, Paid marked, so a seller does
+    /// not confirm an abandoned twin on a payment that already settled its
+    /// sibling (PR #83 round 5, Should Fix 1).
+    pub fn explain(&self, amount_sats: u64, in_window_sats: u64) -> String {
+        let reason = match self {
             SettlementHold::Twins(twins) => format!(
-                "A payment at this address proves this invoice, but your invoice{} {} use{} \
-                 the same address, and one payment cannot pay for both invoices. Harvest \
-                 will not mark this one paid on its own. Check your wallet for a separate \
-                 payment per invoice, then confirm.",
-                if twins.len() == 1 { "" } else { "s" },
+                "Your other invoice(s) on this same address: {}. One payment cannot pay for \
+                 more than one invoice.",
                 twins
                     .iter()
-                    .map(|id| id.short())
+                    .map(|twin| format!(
+                        "{} for {} sats ({})",
+                        twin.id.short(),
+                        twin.amount_sats,
+                        match twin.status {
+                            harvest_common::payment::OrderStatus::Paid => "ALREADY PAID",
+                            harvest_common::payment::OrderStatus::PaymentReversed => "reversed",
+                            _ => "awaiting payment",
+                        }
+                    ))
                     .collect::<Vec<_>>()
-                    .join(", "),
-                if twins.len() == 1 { "s" } else { "" },
+                    .join("; ")
             ),
-            SettlementHold::StoresNotLoaded => "A payment at this address proves this \
-                 invoice, but not all of your stores have loaded, so Harvest cannot rule \
-                 out another invoice on the same address, and one payment cannot pay for \
-                 both invoices. Check your wallet, then confirm."
-                .to_string(),
-        }
+            SettlementHold::StoresNotLoaded(what) => format!(
+                "Not everything you own has loaded ({}), so Harvest cannot rule out another \
+                 invoice on this address. One payment cannot pay for more than one invoice.",
+                what.join("; ")
+            ),
+        };
+        format!(
+            "This invoice is for {amount_sats} sats, and {in_window_sats} sats confirmed at its \
+             address inside its payment window. {reason} Harvest will not mark it paid on its \
+             own: check your wallet for a separate payment per invoice, then confirm."
+        )
     }
 }
 
@@ -1666,6 +1689,8 @@ impl AppState {
         }
         self.migrated_contract_ids
             .insert(predecessor.to_vec(), successor.clone());
+        self.withheld_settlements
+            .retain(|_, (store, _)| store.as_slice() != predecessor);
 
         for stores in self.my_stores.values_mut() {
             for registration in stores.iter_mut() {
@@ -2077,6 +2102,7 @@ impl AppState {
                     // in hand before the order is, or the other way round.
                     self.refresh_same_address_orders();
                     self.publish_settled_orders(&contract_id);
+                    self.republish_withheld();
 
                     // And ask the bridge to watch the payment address of any
                     // new order this seller issued. Nothing else tells the
@@ -3110,9 +3136,8 @@ impl AppState {
     /// not payments), cancelled orders ignored, and orders with no anchor
     /// ignored (no window). Stored because the card reads it on every render.
     pub fn refresh_same_address_orders(&mut self) {
-        use harvest_common::payment::{OrderId, OrderStatus};
-        type Entry = (OrderId, std::ops::RangeInclusive<u32>);
-        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<Entry>> = HashMap::new();
+        use harvest_common::payment::OrderStatus;
+        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<SameAddressOrder>> = HashMap::new();
         let mut seen = HashSet::new();
         for registration in self.my_stores.values().flatten() {
             let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
@@ -3130,56 +3155,80 @@ impl AppState {
                     by_script
                         .entry((order.network, order.payment_script_pubkey.as_slice()))
                         .or_default()
-                        .push((order.id.clone(), window));
+                        .push(SameAddressOrder {
+                            id: order.id.clone(),
+                            window,
+                            amount_sats: order.amount_sats,
+                            status: record.status,
+                        });
                 }
             }
         }
         let mut map = HashMap::new();
         for orders in by_script.values().filter(|orders| orders.len() > 1) {
-            for (id, _) in orders {
+            for order in orders {
                 let others = orders
                     .iter()
-                    .filter(|(other, _)| other != id)
+                    .filter(|o| o.id != order.id)
                     .cloned()
                     .collect();
-                map.insert(id.clone(), others);
+                map.insert(order.id.clone(), others);
             }
         }
         self.same_address_orders = map;
     }
 
-    /// Whether another own, uncancelled order on the same address and
-    /// network has a payment window containing `height`.
-    pub fn another_own_order_window_holds(
-        &self,
-        order_id: &harvest_common::payment::OrderId,
-        height: u32,
-    ) -> bool {
-        self.same_address_orders
-            .get(order_id)
-            .is_some_and(|others| others.iter().any(|(_, window)| window.contains(&height)))
-    }
-
-    /// Whether a payment confirmed at any of `heights` (an order's in-window
-    /// confirmations) also falls in another own order's window, i.e. whether
-    /// a Paid order may have been settled on another invoice's payment.
-    pub fn payment_may_be_anothers(
+    /// The other own, uncancelled orders on the same address and network
+    /// whose payment window contains any of `heights`: for a Paid order's
+    /// in-window payment heights, the invoices whose payment it may have
+    /// been; for a late payment's height, whose it may be instead.
+    pub fn orders_whose_window_holds(
         &self,
         order_id: &harvest_common::payment::OrderId,
         heights: &[u32],
-    ) -> bool {
-        heights
-            .iter()
-            .any(|&height| self.another_own_order_window_holds(order_id, height))
+    ) -> Vec<harvest_common::payment::OrderId> {
+        self.same_address_orders
+            .get(order_id)
+            .into_iter()
+            .flatten()
+            .filter(|other| heights.iter().any(|h| other.window.contains(h)))
+            .map(|other| other.id.clone())
+            .collect()
     }
 
-    /// Whether every store this seller owns has been read from the network.
-    pub fn owned_stores_loaded(&self) -> bool {
-        self.my_stores.values().flatten().all(|registration| {
-            self.browsing_stores
-                .get(&registration.store_contract_id)
-                .is_some_and(|store| store.info.is_some())
-        })
+    /// What this seller owns that has not loaded, named for the card: store
+    /// lists not yet answered for a Ghost Key the vault lists (or whose
+    /// request failed, which is the same absence), and owned stores whose
+    /// state has not arrived. Empty when everything has.
+    ///
+    /// A store the node gave up on (`store_state_unavailable`) is still
+    /// counted, and named as unreachable, rather than dropped: it could hold
+    /// a twin, and auto-publishing past it is the one direction that cannot
+    /// be taken back. The seller sees which store it is and can confirm by
+    /// hand (PR #83 round 5, Should Fix 3).
+    pub fn unloaded_stores(&self) -> Vec<String> {
+        let mut unloaded: Vec<String> = self
+            .ghostkeys
+            .iter()
+            .filter(|key| !self.store_lists_answered.contains(&key.fingerprint))
+            .map(|key| format!("the store list for Ghost Key {}", key.fingerprint))
+            .collect();
+        for registration in self.my_stores.values().flatten() {
+            let id = &registration.store_contract_id;
+            if self
+                .browsing_stores
+                .get(id)
+                .is_none_or(|store| store.info.is_none())
+            {
+                let short: String = bs58::encode(id).into_string().chars().take(8).collect();
+                unloaded.push(if self.store_state_unavailable.contains(id) {
+                    format!("store {short}, which did not answer")
+                } else {
+                    format!("store {short}")
+                });
+            }
+        }
+        unloaded
     }
 
     /// Why a provable payment for `order` should not be published as Paid
@@ -3188,10 +3237,10 @@ impl AppState {
     /// Only when nothing is ambiguous: no other own, uncancelled order on the
     /// same address and network with an overlapping window (a Paid one
     /// counts: its payment may be the very one proving this order), and
-    /// every owned store loaded (a twin could be in one that has not).
-    /// Everything else goes to the seller with the reason in front of them;
-    /// the contract accepts `Paid` on the evidence alone, so a confirmation
-    /// needs no new trust.
+    /// everything owned loaded (a twin could be in what has not). Everything
+    /// else goes to the seller with the reason in front of them; the contract
+    /// accepts `Paid` on the evidence alone, so a confirmation needs no new
+    /// trust.
     pub fn settlement_hold(
         &self,
         order: &harvest_common::payment::Order,
@@ -3202,13 +3251,30 @@ impl AppState {
             .get(&order.id)
             .into_iter()
             .flatten()
-            .filter(|(_, other)| window.start().max(other.start()) <= window.end().min(other.end()))
-            .map(|(id, _)| id.clone())
+            .filter(|other| {
+                window.start().max(other.window.start()) <= window.end().min(other.window.end())
+            })
+            .cloned()
             .collect();
         if !twins.is_empty() {
             return Some(SettlementHold::Twins(twins));
         }
-        (!self.owned_stores_loaded()).then_some(SettlementHold::StoresNotLoaded)
+        let unloaded = self.unloaded_stores();
+        (!unloaded.is_empty()).then_some(SettlementHold::StoresNotLoaded(unloaded))
+    }
+
+    /// Re-run the publish for every owned store holding a withheld
+    /// settlement, so one whose hold has just cleared is published now rather
+    /// than at the next address re-read (PR #83 round 5, Should Fix 4).
+    pub fn republish_withheld(&mut self) {
+        let stores: HashSet<Vec<u8>> = self
+            .withheld_settlements
+            .values()
+            .map(|(store, _)| store.clone())
+            .collect();
+        for store in stores {
+            self.publish_settled_orders(&store);
+        }
     }
 
     /// A settlement update that did not reach the node.
@@ -3317,6 +3383,10 @@ impl AppState {
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
             if self.settlement_hold(&settled.order).is_some() {
+                // Already confirmed and sent: do not offer it again.
+                if self.settlements_submitted.contains(&settled.order.id) {
+                    continue;
+                }
                 self.withheld_settlements.insert(
                     settled.order.id.clone(),
                     (store_contract_id.to_vec(), settled),
@@ -5109,8 +5179,11 @@ impl AppState {
                     stores.len(),
                     ghostkey_fingerprint
                 );
+                self.store_lists_answered
+                    .insert(ghostkey_fingerprint.clone());
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
                 self.refresh_same_address_orders();
+                self.republish_withheld();
 
                 // Nothing else re-fetches these after a reload: the seller's
                 // own store is subscribed at creation time and never again,
@@ -9465,7 +9538,7 @@ mod invoice_tests {
             a: &harvest_common::payment::AuthorizedOrder,
             b: harvest_common::payment::AuthorizedOrder,
             elsewhere: bool,
-        ) -> Option<SettlementHold> {
+        ) -> Option<Vec<harvest_common::payment::OrderId>> {
             let mut state = seller_with_a_store();
             let store = if elsewhere {
                 vec![0x77; 32]
@@ -9484,11 +9557,16 @@ mod invoice_tests {
                 .orders
                 .push(b);
             state.refresh_same_address_orders();
-            state.settlement_hold(&a.order)
+            match state.settlement_hold(&a.order) {
+                Some(SettlementHold::Twins(twins)) => {
+                    Some(twins.into_iter().map(|t| t.id).collect())
+                }
+                _ => None,
+            }
         }
         let a = anchored(100, 1);
         let late = anchored(100 + PAYMENT_WINDOW_BLOCKS - 1, 2);
-        let twins = Some(SettlementHold::Twins(vec![late.order.id.clone()]));
+        let twins = Some(vec![late.order.id.clone()]);
         assert_eq!(
             twins_of(&a, late.clone(), false),
             twins,
@@ -9523,12 +9601,21 @@ mod invoice_tests {
             .expect("store")
             .orders = vec![a.clone(), apart, unrelated];
         state.refresh_same_address_orders();
-        assert!(state.another_own_order_window_holds(&a.order.id, 100 + PAYMENT_WINDOW_BLOCKS + 1));
-        // A Paid order's note: only when one of its own payment heights is in
-        // the other order's window.
-        assert!(state.payment_may_be_anothers(&a.order.id, &[150, 100 + PAYMENT_WINDOW_BLOCKS + 1]));
-        assert!(!state.payment_may_be_anothers(&a.order.id, &[150]));
-        assert!(!state.another_own_order_window_holds(&a.order.id, 100 + 3 * PAYMENT_WINDOW_BLOCKS));
+        let apart_id = state.browsing_stores[STORE_ID.as_slice()].orders[1]
+            .order
+            .id
+            .clone();
+        assert_eq!(
+            state.orders_whose_window_holds(&a.order.id, &[150, 100 + PAYMENT_WINDOW_BLOCKS + 1]),
+            vec![apart_id],
+            "only the same-address order whose window holds a height is named"
+        );
+        assert!(state
+            .orders_whose_window_holds(&a.order.id, &[150])
+            .is_empty());
+        assert!(state
+            .orders_whose_window_holds(&a.order.id, &[100 + 3 * PAYMENT_WINDOW_BLOCKS])
+            .is_empty());
     }
 
     /// **Round 2, Should Fix 6.** Two invoices handed the same address: the
@@ -14121,11 +14208,112 @@ mod buy_flow_tests {
             }],
         );
         assert!(state.publish_settled_orders(STORE).is_empty());
-        assert_eq!(
-            state.settlement_hold(&order.order),
-            Some(SettlementHold::StoresNotLoaded)
-        );
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert_eq!(what.len(), 1, "{what:?}");
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
         assert!(state.confirm_paid(&order.order.id).is_some());
+    }
+
+    /// **Round 5, Should Fix 1.** The copy above "Confirm paid" gives this
+    /// invoice's amount, the confirmed value in its window, and each twin's
+    /// amount and status with a Paid twin marked.
+    #[test]
+    fn the_confirm_copy_names_the_amounts_and_a_paid_twin() {
+        let (state, order) = seller_holding_a_paid_order(Some(OrderStatus::Paid));
+        let hold = state.settlement_hold(&order.order).expect("held");
+        let text = hold.explain(order.order.amount_sats, 1234);
+        assert!(
+            text.contains(&format!("{} sats", order.order.amount_sats)),
+            "{text}"
+        );
+        assert!(text.contains("1234 sats confirmed"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{} sats (ALREADY PAID)",
+                order.order.amount_sats + 1
+            )),
+            "{text}"
+        );
+    }
+
+    /// **Round 5, Should Fix 2 and 4.** A Ghost Key the vault lists whose
+    /// store list has not been answered holds settlements, named; when the
+    /// answer arrives, every withheld store is published again at once.
+    #[test]
+    fn an_unanswered_store_list_holds_until_it_arrives_then_publishes() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "seller-fp".to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        assert!(state.publish_settled_orders(STORE).is_empty());
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("seller-fp"), "{what:?}")
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: "seller-fp".to_string(),
+            stores: Vec::new(),
+        });
+        assert!(
+            state.settlements_submitted.contains(&order.order.id),
+            "the hold cleared and nothing published it"
+        );
+        assert!(state.withheld_settlements.is_empty());
+    }
+
+    /// **Round 5, Should Fix 3.** A store the node gave up on still holds
+    /// settlements, and is named as not answering rather than left as a wait.
+    #[test]
+    fn a_store_that_did_not_answer_is_named() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state
+            .my_stores
+            .get_mut("seller-fp")
+            .expect("seller")
+            .push(StoreRegistration {
+                store_contract_id: vec![0x5e; 32],
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            });
+        state.store_state_unavailable.insert(vec![0x5e; 32]);
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("did not answer"), "{what:?}")
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
+    }
+
+    /// **Round 5, Should Fix 5, and Consider.** A confirmed settlement is not
+    /// offered again by the next publish run; and withheld entries for a
+    /// store that migrated away are dropped.
+    #[test]
+    fn a_confirmed_settlement_is_not_offered_again_and_migration_drops_entries() {
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        state.publish_settled_orders(STORE);
+        assert!(state.confirm_paid(&order.order.id).is_some());
+        state.publish_settled_orders(STORE);
+        assert!(
+            !state.withheld_settlements.contains_key(&order.order.id),
+            "Confirm paid came back after it was sent"
+        );
+
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        state.publish_settled_orders(STORE);
+        assert!(state.withheld_settlements.contains_key(&order.order.id));
+        state.adopt_migrated_contract_id(STORE, vec![0x99; 32]);
+        assert!(state.withheld_settlements.is_empty());
     }
 
     /// **An order whose payment has not confirmed is not settled.**
