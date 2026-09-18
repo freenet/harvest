@@ -5303,11 +5303,21 @@ impl AppState {
                     }
                     Err(e) => {
                         // Unreachable by way of an unverifiable claim, which
-                        // the filter above has already removed. Whatever is
-                        // left, the view is kept as it stands: refusing an
-                        // update costs a late settlement, and replacing the
-                        // view with something that could not be folded costs
-                        // a payment.
+                        // the filter above has already removed -- it is the
+                        // same check `from_claims` makes, against the same
+                        // parameters. Kept because the alternative on an
+                        // error nobody has foreseen should be to change
+                        // nothing: refusing an update costs a late
+                        // settlement, and replacing the view with something
+                        // that could not be folded costs a payment.
+                        //
+                        // Note this is NOT the path taken when everything
+                        // fails to verify. That leaves an empty union, which
+                        // folds successfully to an empty state and does
+                        // overwrite the view -- correctly, since the held
+                        // claims were re-verified too, so the only way to
+                        // reach it is a view built where no parameters were
+                        // available to check anything against.
                         warn!(
                             "could not fold an address state for {:?} into the one held, keeping \
                              what is held: {e}",
@@ -13349,6 +13359,76 @@ mod buy_flow_tests {
             state.settled_orders(STORE).len(),
             1,
             "and the order is still settleable"
+        );
+    }
+
+    /// **A payment still lands when it arrives beside an unverifiable claim.**
+    ///
+    /// The other half of filtering rather than refusing, and the half that
+    /// makes it worth doing: dropping the bad claim keeps the good one, where
+    /// giving up on the fold would ignore a payment that had genuinely
+    /// arrived. Without this test, deleting the filter and relying on the
+    /// error path passes everything else -- the erasure test is satisfied by
+    /// changing nothing at all, which is precisely what the error path does.
+    #[test]
+    fn a_payment_arriving_beside_a_bad_claim_still_settles() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, OutPoint};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // Nothing seen yet, so there is a view to fold into.
+        let nothing_yet = address_state_carrying(&order, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&nothing_yet).expect("cbor"),
+        );
+        assert!(state.settled_orders(STORE).is_empty(), "nothing yet");
+
+        // Then the payment, arriving alongside a claim signed by nobody.
+        let mut answer = address_state_carrying(&order, claims);
+        let stranger = SigningKey::from_bytes(&[78u8; 32]);
+        let junk = freenet_bitcoin_common::SignedClaim::sign(
+            &stranger,
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::MempoolOutput {
+                    outpoint: OutPoint {
+                        txid: freenet_bitcoin_common::Txid([11u8; 32]),
+                        vout: 0,
+                    },
+                    value_sats: 999_999,
+                },
+            },
+        )
+        .expect("sign");
+        answer.claims.claims.insert(
+            freenet_bitcoin_common::address_state::ClaimKey(junk.digest()),
+            junk,
+        );
+
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&answer).expect("cbor"),
+        );
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the good claim was kept and the order settles"
         );
     }
 
