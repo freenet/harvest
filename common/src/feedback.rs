@@ -18,8 +18,27 @@ pub enum FeedbackCategory {
 pub struct FeedbackToken {
     /// Which reputation contract this token targets (ContractInstanceId bytes).
     pub target_reputation_contract: [u8; 32],
-    /// Unique nonce to prevent replay. One token carries at most one piece of
-    /// feedback, and this is how the reputation contract names that slot.
+    /// Names the token's one feedback slot, and prevents replay. It is NOT
+    /// chosen freely: it must be [`FeedbackToken::nonce_for`] the token's
+    /// `entry_key`, and the reputation contract refuses any token where it is
+    /// not. Build tokens with [`FeedbackToken::new`].
+    ///
+    /// # Why the slot is bound to the key (PR #82 review, Must Fix 1)
+    ///
+    /// The seller holds the RSA key, so the seller can blind-sign a token of
+    /// its own at any time. While the nonce was free, the seller could mint a
+    /// token carrying a buyer's PUBLISHED nonce and the seller's own
+    /// `entry_key`, sign a neutered entry with it, and grind that key until
+    /// the entry's encoding sorted first -- and the one-entry-per-slot
+    /// tie-break would then pick the seller's entry on every peer. Deriving
+    /// the nonce from the key makes the slot a function of the key: reaching
+    /// a published slot with a different key needs a BLAKE3 preimage, so only
+    /// the holder of the original key can put a second entry in it.
+    ///
+    /// Keying slots by the whole token's digest was the alternative. It closes
+    /// the same hole, but it gives up "one token, one slot": the replay check
+    /// and the tie-break would then apply only to byte-identical tokens,
+    /// which is a weaker statement to reason about than a slot per key.
     pub nonce: [u8; 32],
     /// Ed25519 verifying key of a keypair the buyer generates fresh for this
     /// token and keeps the secret half of.
@@ -36,6 +55,24 @@ pub struct FeedbackToken {
     /// unblinded until the feedback is published, and a key reused across
     /// tokens would tie a buyer's feedback together.
     pub entry_key: [u8; 32],
+}
+
+impl FeedbackToken {
+    /// The nonce a token with this `entry_key` must carry: a domain-separated
+    /// BLAKE3 of the key. See the `nonce` field.
+    pub fn nonce_for(entry_key: &[u8; 32]) -> [u8; 32] {
+        blake3::derive_key("harvest feedback token nonce v1", entry_key)
+    }
+
+    /// A token for `target_reputation_contract` whose slot is bound to
+    /// `entry_key`.
+    pub fn new(target_reputation_contract: [u8; 32], entry_key: [u8; 32]) -> Self {
+        Self {
+            target_reputation_contract,
+            nonce: Self::nonce_for(&entry_key),
+            entry_key,
+        }
+    }
 }
 
 /// Protocol messages for the feedback token exchange, sent via encrypted mailbox.

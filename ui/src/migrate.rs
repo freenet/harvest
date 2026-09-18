@@ -847,6 +847,16 @@ pub(crate) struct MailboxFold {
     /// message that could not be carried, not two. Counting the raw drops
     /// double-counted it.
     pub(crate) dropped_oversized: usize,
+    /// DISTINCT messages that fit the size bound but were pruned by the count
+    /// caps (`MAX_MESSAGES` and the per-size-class caps, harvest#85) when the
+    /// two sides were combined (PR #82 review, Should Fix 7).
+    ///
+    /// A fold is where a mailbox is most likely to go over a cap: two
+    /// generations' messages meet for the first time. Pruning there is the
+    /// same deterministic prune any peer would run, so it is not a defect,
+    /// but it is a loss, and a loss during migration is reported rather than
+    /// swallowed.
+    pub(crate) pruned_by_cap: usize,
     /// The whole predecessor generation was refused. See [`FoldOutcome`].
     pub(crate) discarded: bool,
 }
@@ -863,16 +873,28 @@ impl MailboxFold {
     /// trap. So the count and the wording are pinned and the call is not,
     /// which is stated here rather than left to be assumed.
     pub(crate) fn unfoldable_warning(&self) -> Option<String> {
-        (self.dropped_oversized > 0).then(|| {
-            format!(
+        let mut said = Vec::new();
+        if self.dropped_oversized > 0 {
+            said.push(format!(
                 "migration fold: {} message(s) exceed MAX_MESSAGE_BYTES ({}) and were NOT \
                  carried into the new generation. They cannot be: the successor contract's \
                  own apply_delta refuses them, so keeping one would leave this node holding \
                  an entry no peer has. This is how a message goes missing silently.",
                 self.dropped_oversized,
                 harvest_common::mailbox::MAX_MESSAGE_BYTES
-            )
-        })
+            ));
+        }
+        if self.pruned_by_cap > 0 {
+            said.push(format!(
+                "migration fold: {} message(s) were pruned because the combined mailbox went \
+                 over its count caps (MAX_MESSAGES {} and the per-size-class caps {:?}); the \
+                 lowest-ranked go first, the same prune every peer runs.",
+                self.pruned_by_cap,
+                harvest_common::mailbox::MAX_MESSAGES,
+                harvest_common::mailbox::SIZE_CLASS_CAPS
+            ));
+        }
+        (!said.is_empty()).then(|| said.join(" "))
     }
 }
 
@@ -898,15 +920,14 @@ pub(crate) fn merge_mailbox_reporting_drops(
     // (`fold_all_policy`, and the crate's own `assert_merge_commutative`).
     //
     // Symmetry could have been restored in either direction. Dropping is the
-    // right one, and the reason is convergence rather than tidiness: `verify`
-    // deliberately tolerates an over-budget state, so a folded state carrying
-    // an oversized message WOULD be accepted by `validate_state` and PUT
+    // right one, and the reason is convergence rather than tidiness. Until
+    // harvest#85 `verify` tolerated an oversized message, so a folded state
+    // carrying one WOULD have been accepted by `validate_state` and PUT
     // successfully -- and then every peer that merged it would run
     // `apply_delta`, refuse that message, and end up with a different state.
-    // This node would hold an entry no other peer has, for good, with nothing
-    // reporting it. Keeping the message is data preservation that survives
-    // exactly as far as the first merge; dropping it moves this node toward
-    // what the network actually holds.
+    // Since harvest#85 `verify` refuses such a state outright, so keeping the
+    // message would make the fold's own PUT fail. Either way, dropping it is
+    // the only direction that lands on what the network can hold.
     //
     // No published generation ever enforced a size limit -- `MAX_MESSAGE_BYTES`
     // and the send-side refusal both arrive on this branch, after the commit
@@ -944,8 +965,23 @@ pub(crate) fn merge_mailbox_reporting_drops(
     // message would discard the WHOLE predecessor generation, which is much
     // harder to justify for a mailbox, where the predecessor may hold the only
     // copy of a conversation.
+    // Everything that fit the size bound, by digest, so a message on both
+    // sides counts once; whatever of it the result lacks was pruned by a cap.
+    let offered: std::collections::HashSet<[u8; 32]> = base
+        .messages
+        .iter()
+        .chain(carried.iter())
+        .map(harvest_common::mailbox::entry_digest)
+        .collect();
     let outcome = fold_or_keep_primary("mailbox", base, |base| base.apply_delta(&Some(carried)));
+    let kept: std::collections::HashSet<[u8; 32]> = outcome
+        .state
+        .messages
+        .iter()
+        .map(harvest_common::mailbox::entry_digest)
+        .collect();
     MailboxFold {
+        pruned_by_cap: offered.difference(&kept).count(),
         state: outcome.state,
         dropped_oversized,
         discarded: outcome.discarded,

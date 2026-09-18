@@ -25,6 +25,14 @@ impl ContractInterface for Contract {
         let mailbox_state = from_reader::<MailboxStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        if !harvest_common::is_canonical_cbor(&mailbox_state, bytes) {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: "State verification failed: state is not in canonical CBOR encoding \
+                         (trailing bytes, an unknown key, or a non-minimal encoding)"
+                    .into(),
+            });
+        }
+
         mailbox_state
             .verify()
             .map(|_| ValidateResult::Valid)
@@ -575,12 +583,14 @@ mod tests {
     ///
     /// # Waivers
     ///
-    /// There are none today. The reputation contract used to carry five, for
-    /// deciding feedback identity by `token.nonce` while its signature covered
-    /// the token alone (issue #22). Its re-key closed that: the token's entry
-    /// key now signs every field, so the nonce names a slot only the buyer can
-    /// fill, and two entries for it are resolved by their bytes. The markers
-    /// went with the defect. The count is still asserted, so a new site cannot
+    /// There is one. The reputation contract used to carry five, for deciding
+    /// feedback identity by `token.nonce` while its signature covered the
+    /// token alone (issue #22). Its re-key closed that: the token's entry key
+    /// now signs every field, and the nonce must be DERIVED from that key, so
+    /// the nonce names a slot only the key's holder can fill. The one waiver
+    /// left is `FeedbackEntry::verify` checking that derivation, which
+    /// compares a nonce with a hash rather than deciding that two entries
+    /// are the same one. The count is still asserted, so a new site cannot
     /// join quietly -- which is the whole difference between a documented gap
     /// and a spreading one.
     ///
@@ -644,7 +654,7 @@ mod tests {
         );
         assert_eq!(
             waived.len(),
-            0,
+            1,
             "the number of waived nonce-identity sites changed. A waiver parks the same \
              defect the mailbox re-key fixed; a new one must be a deliberate decision, not \
              a quiet addition:\n{}",
@@ -923,5 +933,54 @@ mod empty_state_tests {
         let mut default = vec![];
         into_writer(&MailboxStateV1::default(), &mut default).expect("encode");
         assert_eq!(out, default);
+    }
+
+    /// **`validate_state` refuses a state that is not byte-canonical (PR
+    /// #82 review, Should Fix 2).** Each of these decoded to a valid state
+    /// and was accepted, then rewritten by the next merge, while its summary
+    /// matched a canonical peer's so no delta ever repaired it.
+    #[test]
+    fn validate_state_refuses_non_canonical_bytes() {
+        let validate = |bytes: Vec<u8>| {
+            <Contract as ContractInterface>::validate_state(
+                parameters(),
+                State::from(bytes),
+                RelatedContracts::new(),
+            )
+        };
+        let mut canonical = vec![];
+        into_writer(
+            &harvest_common::mailbox::MailboxStateV1::default(),
+            &mut canonical,
+        )
+        .expect("encode");
+        assert!(
+            matches!(validate(canonical.clone()), Ok(ValidateResult::Valid)),
+            "the canonical encoding validates"
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0x00);
+        assert!(
+            validate(trailing).is_err(),
+            "a trailing byte must be refused"
+        );
+
+        #[derive(serde::Serialize)]
+        struct WithExtraKey<T> {
+            #[serde(flatten)]
+            state: T,
+            unknown: u8,
+        }
+        let mut extra = vec![];
+        into_writer(
+            &WithExtraKey {
+                state: harvest_common::mailbox::MailboxStateV1::default(),
+                unknown: 1,
+            },
+            &mut extra,
+        )
+        .expect("encode");
+        assert!(validate(extra).is_err(), "an unknown key must be refused");
     }
 }

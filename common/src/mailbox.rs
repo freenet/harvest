@@ -849,10 +849,13 @@ fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
 ///
 /// # What a flood can still do
 ///
-/// Fill a class. A flood of small messages evicts small honest messages
-/// (`known_gap_a_funded_flood_still_evicts_every_honest_message`), but no
-/// longer touches a larger class, and a flood of large messages can no longer
-/// evict small ones at all.
+/// Fill a class, and through the smallest class, the mailbox. A flood of
+/// large messages fills only its own class and cannot evict small ones. A
+/// flood of SMALL messages is different: the smallest class's cap equals
+/// [`MAX_MESSAGES`], so 512 small messages reach the overall cap and evict
+/// honest messages of every class
+/// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). The class
+/// caps narrow the byte route; they do not close the count route.
 fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
     // Descending by rank. The digest closes the order, since two entries can
     // share a timestamp and a nonce.
@@ -1936,6 +1939,12 @@ mod byte_budget_tests {
     /// bound. So nothing honest can be stranded, and a state the cap would
     /// prune is one that is not equal to itself merged with itself, which is
     /// the merge-law violation `fdev verify-merge` reported.
+    ///
+    /// **The justification is specific to this re-key.** It holds only
+    /// because the harvest#85 generation starts every mailbox empty. A later
+    /// change that tightens the caps or `verify` WITHOUT re-keying would
+    /// strand every mailbox already over the new bound, for good, and the
+    /// argument this test replaced would apply again.
     #[test]
     fn verify_refuses_an_over_budget_state_now_the_rekey_starts_empty() {
         let mut messages = over_budget_but_under_count();
@@ -2595,6 +2604,97 @@ mod merge_law_tests {
             state_of(vec![charged(7_002, base + 5_000, 4_000)]),
         ];
         assert_merge_laws(&states);
+    }
+
+    /// **One size class's cap, isolated** (PR #82 review, Should Fix 8).
+    /// Only the 4 KiB class goes over its cap here: the overall count stays
+    /// well under `MAX_MESSAGES` and the other classes are nowhere near
+    /// theirs. The laws must hold, the class must be cut to exactly its cap
+    /// keeping the highest-ranked, and nothing in another class may be
+    /// touched.
+    #[test]
+    fn one_class_cap_alone_is_associative_and_exact() {
+        let base = 1_700_000_000;
+        let class1 = size_class_limit(1);
+        let cap = SIZE_CLASS_CAPS[1];
+        let mid: Vec<EncryptedMessage> = (0..cap as u32)
+            .map(|i| charged(i, base + 1_000 + i as i64, class1))
+            .collect();
+        let small = |i: u32, secs: i64| charged(i, secs, 400);
+        let mut p = mid.clone();
+        p.push(small(50_000, base + 5));
+        let q = vec![charged(60_000, base, class1), small(50_001, base + 6)];
+        let r = vec![
+            charged(60_001, base + 9_000, class1),
+            charged(60_002, base + 10, size_class_limit(2)),
+        ];
+        let states = [state_of(p), state_of(q), state_of(r)];
+        assert_merge_laws(&states);
+
+        let all = merge(&merge(&states[0], &states[1]), &states[2]);
+        let in_class = |c: usize| {
+            all.messages
+                .iter()
+                .filter(|m| size_class(m) == Some(c))
+                .count()
+        };
+        assert_eq!(in_class(1), cap, "the class is cut to exactly its cap");
+        assert_eq!(in_class(0), 2, "the smaller class is untouched");
+        assert_eq!(in_class(2), 1, "the larger class is untouched");
+        let oldest = charged(60_000, base, class1);
+        assert!(
+            !all.messages.contains(&oldest),
+            "the lowest-ranked in the class goes"
+        );
+    }
+
+    /// **Seeded random merge laws, byte for byte** (PR #82 review, Should
+    /// Fix 3). A few hundred small states from a pool that covers every size
+    /// class, shared nonces, shared timestamps, and a block of top-class
+    /// messages big enough that some states sit at that class's cap.
+    #[test]
+    fn seeded_random_mailboxes_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let base = 1_700_000_000;
+        let mut pool = Vec::new();
+        for i in 0..40u32 {
+            let class = (i % 4) as usize;
+            let bytes = size_class_limit(class) - (i as usize % 7) * 3;
+            // Few distinct timestamps and nonces, so ties are common.
+            let mut m = charged(i % 13, base + (i % 5) as i64, bytes);
+            m.ciphertext[0] = i as u8;
+            pool.push(m);
+        }
+        // More top-class messages than fit in `MAX_MAILBOX_BYTES` together,
+        // so a rule that met the byte bound by walking bytes would bind here.
+        let top: Vec<EncryptedMessage> = (0..(MAX_MAILBOX_BYTES / MAX_MESSAGE_BYTES) as u32 + 8)
+            .map(|i| charged(1_000 + i, base + 100 + (i % 9) as i64, MAX_MESSAGE_BYTES))
+            .collect();
+
+        let mut rng = Rng::new(0x5eed_0085);
+        let mut states: Vec<MailboxStateV1> =
+            (0..200).map(|_| state_of(rng.subset(&pool, 8))).collect();
+        for _ in 0..6 {
+            let mut messages = rng.subset(&top, top.len());
+            messages.extend(rng.subset(&pool, 3));
+            states.push(state_of(messages));
+        }
+        states.push(state_of(top.clone()));
+        assert!(
+            states
+                .iter()
+                .any(|s| s.messages.len() >= SIZE_CLASS_CAPS[3]),
+            "some state must be at the top class's cap"
+        );
+        // Through the summary and delta, which is how two peers actually
+        // exchange state, as well as the whole-state merge above.
+        let exchange = |a: &MailboxStateV1, b: &MailboxStateV1| {
+            let mut out = a.clone();
+            out.apply_delta(&b.delta(&a.summarize())).expect("apply");
+            out
+        };
+        assert_laws(&states, 150, &mut rng, merge, enc);
+        assert_laws(&states, 60, &mut rng, exchange, enc);
     }
 
     fn sorted_messages() -> Vec<EncryptedMessage> {

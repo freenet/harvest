@@ -368,15 +368,18 @@ pub const MAX_ORDERS: usize = 4096;
 /// a merge -- that comparison is over the full CBOR bytes, in
 /// `merge_order` -- it only has to be cheap enough to carry in every
 /// summary entry and to change whenever the record's bytes do.
-fn order_content_digest(record: &AuthorizedOrder) -> [u8; 8] {
+///
+/// The full 32 bytes (PR #82 review, Should Fix 4). It was truncated to 8,
+/// and two same-rank variants of one order whose truncated digests collide
+/// -- about 2^32 work for a birthday search -- read as the same record in
+/// each other's summaries, so the two peers holding them never exchanged
+/// them. Widening it was free during this re-key.
+fn order_content_digest(record: &AuthorizedOrder) -> [u8; 32] {
     // Infallible: `AuthorizedOrder` and everything it contains derives
     // `Serialize` over plain data (no custom fallible encoding), so CBOR
     // serialization of an in-memory value here cannot fail.
     let bytes = crate::to_cbor(record).expect("AuthorizedOrder always serializes to CBOR");
-    let hash = blake3::hash(&bytes);
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&hash.as_bytes()[..8]);
-    out
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// Merge one already-verified incoming order record into `orders`.
@@ -564,12 +567,12 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     /// not as a resend of every order that happens to hash into the same
     /// bucket. Instead this is bounded the way `MAX_CLAIMS` bounds
     /// `ClaimSetV1`: capped at a fixed number of entries rather than a fixed
-    /// number of bytes. At 25 bytes an entry (16-byte id, 1-byte rank,
-    /// 8-byte digest) this is still tiny next to a single order's own
+    /// number of bytes. At 65 bytes an entry (32-byte id, 1-byte rank,
+    /// 32-byte digest) this is still tiny next to a single order's own
     /// encoded size once it carries an `OrderPaymentProof` -- an order can
     /// run into the hundreds of bytes to multiple KB; a summary entry never
     /// does.
-    type Summary = Vec<(OrderId, u8, [u8; 8])>;
+    type Summary = Vec<(OrderId, u8, [u8; 32])>;
     /// Full replacement records for whichever orders are new, ahead in rank,
     /// or -- at an exact rank tie -- differ in content (see `delta`).
     type Delta = Vec<AuthorizedOrder>;
@@ -620,7 +623,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let old: BTreeMap<&OrderId, (u8, [u8; 8])> = old_state_summary
+        let old: BTreeMap<&OrderId, (u8, [u8; 32])> = old_state_summary
             .iter()
             .map(|(id, rank, digest)| (id, (*rank, *digest)))
             .collect();
@@ -2490,6 +2493,155 @@ mod order_tests {
                 }
             }
         }
+    }
+
+    /// The summary names an order's content by the full 32-byte BLAKE3 of
+    /// its encoding (PR #82 review, Should Fix 4), not a truncation a
+    /// birthday search could collide.
+    #[test]
+    fn the_order_summary_digest_is_the_full_hash() {
+        let (_, record) = synthetic_order(3, 1_000, OrderStatus::AwaitingPayment);
+        let expected = *blake3::hash(&crate::to_cbor(&record).expect("encode")).as_bytes();
+        assert_eq!(order_content_digest(&record), expected);
+    }
+
+    /// **Seeded random merge laws on the whole store, byte for byte** (PR #82
+    /// review, Should Fix 3). States combine genuinely signed store details
+    /// at three versions, signed listings, and signed orders at every status
+    /// with two different valid Paid proofs for one order (the equal-rank
+    /// tie-break). Merge is what `update_state` runs: the composable merge
+    /// and then `ListingsV1::normalize`.
+    #[test]
+    fn seeded_random_stores_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let info = |version: u32| {
+            let info = StoreInfoV1 {
+                version,
+                certificate_pem: "CERT".into(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [7u8; 32],
+                store_name: format!("Shop v{version}"),
+                description: String::new(),
+                encryption_public_key: None,
+            };
+            let (scoped_payload, signature) = sign_scoped(&seller, &info);
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let infos: Vec<_> = (1..=3).map(info).collect();
+        let listings: Vec<_> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|t| make_listing(&seller, t))
+            .collect();
+        let x = make_order("buyer-x", 1_700_000_000, &[0x00, 0x14, 0x01, 0x01]);
+        let y = make_order("buyer-y", 1_700_000_100, &[0x00, 0x14, 0x02, 0x02]);
+        let orders = vec![
+            make_authorized_order(&seller, x.clone(), OrderStatus::AwaitingPayment, None),
+            make_authorized_order(&seller, x.clone(), OrderStatus::Cancelled, None),
+            make_authorized_order(
+                &seller,
+                x.clone(),
+                OrderStatus::Paid,
+                Some(make_payment_proof(&x, &bridge, 3)),
+            ),
+            make_authorized_order(
+                &seller,
+                x.clone(),
+                OrderStatus::Paid,
+                Some(make_payment_proof(&x, &bridge, 5)),
+            ),
+            make_authorized_order(&seller, y.clone(), OrderStatus::AwaitingPayment, None),
+        ];
+        for o in &orders {
+            o.verify(&p.seller_verifying_key)
+                .expect("fixture order verifies");
+        }
+
+        let merge = |a: &StoreStateV1, b: &StoreStateV1| {
+            let mut out = a.clone();
+            out.merge(&a.clone(), &p, b).expect("merge");
+            out.listings.normalize();
+            out
+        };
+        let mut rng = Rng::new(0x5eed_0026);
+        let states: Vec<StoreStateV1> = (0..200)
+            .map(|_| {
+                let mut s = StoreStateV1::default();
+                if rng.below(2) == 0 {
+                    s.info = infos[rng.below(infos.len())].clone();
+                }
+                let mut ls = ListingsV1 {
+                    listings: rng.subset(&listings, 3),
+                };
+                ls.normalize();
+                s.listings = ls;
+                for o in rng.subset(&orders, 3) {
+                    merge_order(&mut s.orders.orders, o);
+                }
+                s.verify(&s, &p).expect("fixture state verifies");
+                s
+            })
+            .collect();
+        assert_laws(&states, 300, &mut rng, merge, |s| {
+            crate::to_cbor(s).expect("encode")
+        });
+    }
+
+    /// The same at the order cap: random states of synthetic orders around
+    /// `MAX_ORDERS`, with shared keys at different statuses and tied
+    /// `created_at`, merged at the `merge_order` + cap layer.
+    #[test]
+    fn seeded_random_order_sets_at_the_cap_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let statuses = [
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+        ];
+        let base = full_of_old_orders();
+        let mut rng = Rng::new(0x5eed_4096);
+        let mut pool = Vec::new();
+        for k in 0..24u8 {
+            // Half older than the whole base, half newer, some tied.
+            let secs = if k % 2 == 0 {
+                900 + (k / 4) as i64
+            } else {
+                9_000_000 + (k / 4) as i64
+            };
+            for status in statuses {
+                pool.push(synthetic_order(100 + k, secs, status).1);
+            }
+        }
+        let states: Vec<BTreeMap<OrderId, AuthorizedOrder>> = (0..40)
+            .map(|_| {
+                let mut m = if rng.below(2) == 0 {
+                    base.clone()
+                } else {
+                    BTreeMap::new()
+                };
+                for rec in rng.subset(&pool, 6) {
+                    merge_order(&mut m, rec);
+                }
+                enforce_order_cap(&mut m);
+                m
+            })
+            .collect();
+        assert!(
+            states.iter().any(|m| m.len() == MAX_ORDERS),
+            "some state is at the cap"
+        );
+        assert_laws(&states, 60, &mut rng, merge_maps, |m| {
+            crate::to_cbor(m).expect("encode")
+        });
     }
 
     /// The cap keeps the newest orders by their signed `created_at`, whatever

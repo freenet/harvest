@@ -1573,11 +1573,12 @@ fn folding_is_commutative_across_the_message_size_bound() {
 /// **What the fold cannot carry, it drops from BOTH sides.**
 ///
 /// The direction matters and is the reason commutativity is restored by
-/// dropping rather than by keeping. `verify` tolerates an over-budget state,
-/// so a folded state carrying an oversized message would be accepted by
-/// `validate_state` and PUT successfully -- and then every peer that merged it
-/// would run `apply_delta` and drop the message, leaving this node holding an
-/// entry no other peer has, permanently. Dropping it here moves the node
+/// dropping rather than by keeping. Until harvest#85 `verify` tolerated an
+/// oversized message, so a folded state carrying one would have been accepted
+/// by `validate_state` and PUT successfully -- and then every peer that merged
+/// it would run `apply_delta` and drop the message, leaving this node holding
+/// an entry no other peer has, permanently. Since harvest#85 `verify` refuses
+/// it, so keeping it would fail the fold's own PUT instead. Dropping it here moves the node
 /// toward what the network holds; keeping it would be a silent permanent
 /// divergence dressed up as data preservation.
 #[test]
@@ -1827,6 +1828,52 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         DiscardedSide::Predecessor,
     );
     assert!(!ok.discarded, "a successful store fold claims no discard");
+}
+
+/// **A fold that prunes to the caps says how many it pruned** (PR #82 review,
+/// Should Fix 7). Two generations of top-size messages meet for the first time
+/// in the fold and together exceed the top size class's cap; the lowest-ranked
+/// go, and the report counts them once each, even where a message is on both
+/// sides.
+#[test]
+fn a_fold_that_prunes_to_the_caps_reports_it() {
+    let cap = harvest_common::mailbox::SIZE_CLASS_CAPS[3];
+    let top = harvest_common::mailbox::MAX_MESSAGE_BYTES;
+    let base = 1_700_000_000;
+    let newer: Vec<_> = (0..cap as u8)
+        .map(|i| sized_message(i, base + 100 + i as i64, top))
+        .collect();
+    // Older than every message above, so these are the ones pruned; one of
+    // them is on both sides.
+    let older: Vec<_> = (0..3u8)
+        .map(|i| sized_message(200 + i, base + i as i64, top))
+        .collect();
+    let successor = {
+        let mut s = MailboxStateV1::default();
+        s.apply_delta(&Some(newer)).expect("apply");
+        s.messages.push(older[0].clone());
+        s
+    };
+    let report = merge_mailbox_reporting_drops(successor, &mailbox_with(older.clone()));
+    assert_eq!(report.state.messages.len(), cap);
+    assert_eq!(
+        report.pruned_by_cap, 3,
+        "three distinct older messages were pruned"
+    );
+    let warning = report
+        .unfoldable_warning()
+        .expect("a prune must be reported");
+    assert!(
+        warning.contains("3 message(s) were pruned"),
+        "got: {warning}"
+    );
+
+    let clean = merge_mailbox_reporting_drops(mailbox_with(vec![]), &mailbox_with(older));
+    assert_eq!(clean.pruned_by_cap, 0);
+    assert!(
+        clean.unfoldable_warning().is_none(),
+        "nothing pruned, nothing said"
+    );
 }
 
 /// An oversized message present on BOTH sides is one message that could not be

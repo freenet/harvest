@@ -25,6 +25,14 @@ impl ContractInterface for Contract {
         let reputation_state = from_reader::<ReputationStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
+        if !harvest_common::is_canonical_cbor(&reputation_state, bytes) {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: "State verification failed: state is not in canonical CBOR encoding \
+                         (trailing bytes, an unknown key, or a non-minimal encoding)"
+                    .into(),
+            });
+        }
+
         let parameters = from_reader::<ReputationParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
@@ -399,5 +407,75 @@ mod tests {
         let mut default = vec![];
         into_writer(&ReputationStateV1::default(), &mut default).expect("encode");
         assert_eq!(out, default);
+    }
+
+    /// Parameters with a real RSA key, for the paths that parse it.
+    fn real_parameters() -> Parameters<'static> {
+        use rsa::pkcs1::EncodeRsaPublicKey;
+        let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("key");
+        let der = rsa::RsaPublicKey::from(&private)
+            .to_pkcs1_der()
+            .expect("der")
+            .as_bytes()
+            .to_vec();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        let mut bytes = vec![];
+        into_writer(&ReputationParameters::new(der, owner), &mut bytes).expect("encode");
+        Parameters::from(bytes)
+    }
+
+    /// **`validate_state` refuses a state that is not byte-canonical (PR
+    /// #82 review, Should Fix 2).** Each of these decoded to a valid state
+    /// and was accepted, then rewritten by the next merge, while its summary
+    /// matched a canonical peer's so no delta ever repaired it.
+    #[test]
+    fn validate_state_refuses_non_canonical_bytes() {
+        let validate = |bytes: Vec<u8>| {
+            <Contract as ContractInterface>::validate_state(
+                real_parameters(),
+                State::from(bytes),
+                RelatedContracts::new(),
+            )
+        };
+        let mut canonical = vec![];
+        into_writer(
+            &ReputationStateV1 {
+                owner_certificate_pem: "CERT".into(),
+                ..Default::default()
+            },
+            &mut canonical,
+        )
+        .expect("encode");
+        assert!(
+            matches!(validate(canonical.clone()), Ok(ValidateResult::Valid)),
+            "the canonical encoding validates"
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0x00);
+        assert!(
+            validate(trailing).is_err(),
+            "a trailing byte must be refused"
+        );
+
+        #[derive(serde::Serialize)]
+        struct WithExtraKey<T> {
+            #[serde(flatten)]
+            state: T,
+            unknown: u8,
+        }
+        let mut extra = vec![];
+        into_writer(
+            &WithExtraKey {
+                state: ReputationStateV1 {
+                    owner_certificate_pem: "CERT".into(),
+                    ..Default::default()
+                },
+                unknown: 1,
+            },
+            &mut extra,
+        )
+        .expect("encode");
+        assert!(validate(extra).is_err(), "an unknown key must be refused");
     }
 }

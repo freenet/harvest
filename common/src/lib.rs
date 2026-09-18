@@ -141,6 +141,83 @@ pub fn from_cbor<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T,
     ciborium::from_reader(bytes).map_err(|e| format!("CBOR deserialize: {e}"))
 }
 
+/// Whether `bytes` is exactly what [`to_cbor`] produces for the value they
+/// decode to.
+///
+/// A contract's `validate_state` decodes leniently: `ciborium` stops after one
+/// item and ignores trailing bytes, serde skips unknown map keys, and CBOR
+/// admits more than one encoding of an integer or a length. A state encoded
+/// any of those ways passed `verify` and was then rewritten by the next merge,
+/// while its summary matched a canonical peer's, so no delta ever repaired
+/// it -- the #26 defect one layer down (PR #82 review, Should Fix 2). Every
+/// contract now refuses a state that does not re-encode to its own bytes.
+pub fn is_canonical_cbor<T: serde::Serialize>(value: &T, bytes: &[u8]) -> bool {
+    to_cbor(value).is_ok_and(|re| re == bytes)
+}
+
+/// A seeded, deterministic merge-law checker for the per-state property tests
+/// (PR #82 review, Should Fix 3). No new dependency: a xorshift generator is
+/// enough to pick subsets and orders, and a fixed seed keeps every run, and
+/// every failure, reproducible.
+#[cfg(test)]
+pub(crate) mod merge_laws {
+    pub(crate) struct Rng(u64);
+
+    impl Rng {
+        pub(crate) fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        pub(crate) fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        /// A random subset of `pool`, of at most `max` items, in random order.
+        pub(crate) fn subset<T: Clone>(&mut self, pool: &[T], max: usize) -> Vec<T> {
+            let n = self.below(max + 1);
+            (0..n)
+                .map(|_| pool[self.below(pool.len())].clone())
+                .collect()
+        }
+    }
+
+    /// Byte-level idempotence on every state, and commutativity and
+    /// associativity on `cases` random pairs and triples drawn from `states`.
+    pub(crate) fn assert_laws<S>(
+        states: &[S],
+        cases: usize,
+        rng: &mut Rng,
+        merge: impl Fn(&S, &S) -> S,
+        enc: impl Fn(&S) -> Vec<u8>,
+    ) {
+        for (i, a) in states.iter().enumerate() {
+            assert_eq!(enc(&merge(a, a)), enc(a), "idempotence on state {i}");
+        }
+        for case in 0..cases {
+            let (i, j, k) = (
+                rng.below(states.len()),
+                rng.below(states.len()),
+                rng.below(states.len()),
+            );
+            let (a, b, c) = (&states[i], &states[j], &states[k]);
+            assert_eq!(
+                enc(&merge(a, b)),
+                enc(&merge(b, a)),
+                "commutativity, case {case}: states {i}, {j}"
+            );
+            assert_eq!(
+                enc(&merge(&merge(a, b), c)),
+                enc(&merge(a, &merge(b, c))),
+                "associativity, case {case}: states {i}, {j}, {k}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
