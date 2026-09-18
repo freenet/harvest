@@ -2957,6 +2957,47 @@ impl AppState {
         settled
     }
 
+    /// A settlement update that did not reach the node.
+    ///
+    /// Withdraws the record of having submitted it, so the settlement is
+    /// derived and sent again on the next address state to arrive -- which,
+    /// since the re-reads landed, is a few minutes away rather than never.
+    /// The submitted-set exists to stop one arrival publishing twice, not to
+    /// make a failed publish permanent: the payment is on chain and the
+    /// evidence is not going anywhere. Leaving it recorded is how a confirmed
+    /// payment could stay `AwaitingPayment` for a whole session, which is
+    /// #67's own shape one step further down the path, where the re-read
+    /// loop cannot reach it.
+    ///
+    /// A method rather than three lines inside the spawned task so it can be
+    /// tested: everything in that task is wasm-only, and a native test cannot
+    /// reach it. Only the seller reaches this at all
+    /// ([`Self::publish_settled_orders`] refuses to try otherwise), so the
+    /// failures it retries are genuine send failures rather than a tab that
+    /// was never going to be able to publish.
+    pub fn settlement_publish_failed(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+        why: &str,
+    ) {
+        self.settlements_submitted.remove(order_id);
+        self.notifications.push(format!(
+            "Your payment was seen on chain, but the order could not be updated to say so: {why}"
+        ));
+    }
+
+    /// Whether one of this node's identities owns `store_contract_id`.
+    ///
+    /// The same question `crate::gateway::store_ops::owned_store_key` asks
+    /// before it will sign anything for a store, kept here so a decision that
+    /// depends on it can be made without a browser.
+    pub fn owns_store(&self, store_contract_id: &[u8]) -> bool {
+        self.my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .any(|s| s.store_contract_id == store_contract_id)
+    }
+
     /// [`Self::settled_orders`], published.
     ///
     /// Each order once per tab. Between dispatching the update and the
@@ -2980,6 +3021,22 @@ impl AppState {
         &mut self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
+        // Only the seller can publish. The store contract takes an update
+        // signed with the store's own key, which `owned_store_key` resolves
+        // from `my_stores`, so on a buyer's tab this send cannot succeed --
+        // not now and not later, because nothing about a buyer will change
+        // into ownership.
+        //
+        // Stopping here rather than dispatching and failing matters more
+        // since the re-reads landed: `publish_settled_orders` runs on every
+        // address state arrival, an unsettled order now produces one every
+        // few minutes, and the failure path apologises to the user each time.
+        // A buyer whose payment worked perfectly would watch that apology
+        // pile up for as long as the seller took to publish.
+        if !self.owns_store(store_contract_id) {
+            return Vec::new();
+        }
+
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
             if !self.settlements_submitted.insert(settled.order.id.clone()) {
@@ -2999,22 +3056,9 @@ impl AppState {
                         crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
                     {
                         dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
-                        let mut app = crate::gateway::APP_STATE.write();
-                        // Withdrawn so the settlement can be derived again.
-                        // The guard exists to stop one arrival publishing
-                        // twice, not to make a failed publish permanent: the
-                        // payment is on chain and the evidence is not going
-                        // anywhere, so the next address state to arrive
-                        // should try again. Leaving it recorded is how a
-                        // confirmed payment stayed AwaitingPayment for a
-                        // whole session -- the same shape as #67, one step
-                        // further down the path, and the re-read loop cannot
-                        // rescue it from outside.
-                        app.settlements_submitted.remove(&order_id);
-                        app.notifications.push(format!(
-                            "Your payment was seen on chain, but the order could not be \
-                             updated to say so: {e}"
-                        ));
+                        crate::gateway::APP_STATE
+                            .write()
+                            .settlement_publish_failed(&order_id, &e);
                     }
                 });
             }
@@ -3081,6 +3125,15 @@ impl AppState {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
+        // `keep` is cheap (a status and some heights) and the ownership
+        // tests below are not, so nothing is decided about ownership until
+        // some order could survive it. This runs on a timer now, once a
+        // minute for the life of the tab, and `buyer_purchases` decrypts
+        // every message of every conversation on its way to answering.
+        if !store.orders.iter().any(&keep) {
+            return Vec::new();
+        }
+
         let mine: std::collections::HashSet<&str> = self
             .my_stores
             .iter()
@@ -3091,11 +3144,20 @@ impl AppState {
             })
             .map(|(fingerprint, _)| fingerprint.as_str())
             .collect();
-        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = self
-            .buyer_purchases(store_contract_id)
-            .into_iter()
-            .map(|purchase| purchase.order_id)
-            .collect();
+        // Likewise deferred: a seller's own orders are decided by
+        // fingerprint alone, so a seller's tab never pays for this.
+        let bought: std::collections::HashSet<harvest_common::payment::OrderId> = if store
+            .orders
+            .iter()
+            .any(|o| keep(o) && !mine.contains(o.order.seller_fingerprint.as_str()))
+        {
+            self.buyer_purchases(store_contract_id)
+                .into_iter()
+                .map(|purchase| purchase.order_id)
+                .collect()
+        } else {
+            Default::default()
+        };
 
         let mut ids = Vec::new();
         for order in &store.orders {
@@ -3225,12 +3287,13 @@ impl AppState {
                     // Nothing is in flight, so the ask recorded above would
                     // otherwise widen the wait for a request that never left
                     // the tab -- leaving a disconnected tab at its slowest
-                    // exactly when it reconnects.
+                    // exactly when it reconnects. Withdrawn by the moment it
+                    // was recorded, so a later tick's ask is left alone.
                     crate::gateway::APP_STATE
                         .write()
                         .bitcoin
                         .address_rereads
-                        .forget(&id);
+                        .forget(&id, now_ms);
                 }
             });
         }
@@ -3251,14 +3314,6 @@ impl AppState {
                 .find(|order| order.order.bitcoin_address_instance_id().as_ref() == Some(id))
                 .map(|order| order.order.network)
         })
-    }
-
-    /// [`Self::due_address_rereads`] and [`Self::send_address_rereads`], for
-    /// a caller holding the state for writing already.
-    pub fn send_due_address_rereads(&mut self) {
-        let now = now_ms();
-        let (wanted, due) = self.due_address_rereads(now);
-        self.send_address_rereads(&wanted, &due, now);
     }
 
     /// Whether one of the SELLER's own orders has stopped being payable and
@@ -5147,10 +5202,25 @@ impl AppState {
         // Reading the same contract repeatedly is exactly what this app now
         // does (`crate::address_reread`), and a node may answer a read from
         // a copy older than one it served before, so this stopped being
-        // hypothetical when the re-reads were added. `scanned_to` is the
-        // bridge's own watermark and only moves forward, which makes it the
-        // ordering this can be judged by. Equal watermarks still apply: that
-        // is how a claim added within one scan window lands.
+        // hypothetical when the re-reads were added.
+        //
+        // `scanned_to` is the watermark the bridge stamps, and it only moves
+        // forward, which makes it the ordering this can be judged by. Two
+        // limits, both in the direction of admitting too much rather than
+        // refusing a payment:
+        //
+        // * Equal watermarks still apply, because that is how a claim added
+        //   within one scan window lands. A same-height reorg is exactly
+        //   that shape -- the watermark does not move, a `Retracted` claim
+        //   is added -- so a copy missing that retraction is still admitted.
+        //   This narrows the window rather than closing it.
+        // * The watermark is a maximum over PER-BRIDGE watermarks. With one
+        //   trusted bridge, which is what this build ships
+        //   (`bitcoin_config::default_trusted_bridges`), that is a total
+        //   order. With two scanning at different rates it is not, and a
+        //   copy carrying the slower bridge's payment claim could have the
+        //   lower maximum and be refused. Whoever adds a second bridge has
+        //   to revisit this.
         let held_scanned_to = self
             .bitcoin
             .addresses
@@ -12514,7 +12584,12 @@ mod buy_flow_tests {
     #[test]
     fn a_settlement_is_published_once_per_tab() {
         let (order, claims, tip) = a_paid_order();
-        let (mut state, _) = buyer_after_acceptance(&order);
+        // The SELLER's tab. Only they can publish -- the store contract takes
+        // an update signed with the store's own key -- so this is the tab
+        // where the guard has anything to guard. This test used a buyer's
+        // tab until the re-reads landed, which pinned an attempt that could
+        // only ever fail; see `a_buyers_tab_does_not_try_to_publish`.
+        let mut state = seller_holding(&order);
         give_the_node_the_chain(&mut state, &order, claims, tip);
 
         assert_eq!(
@@ -12579,6 +12654,31 @@ mod buy_flow_tests {
         address_state_scanned_to(order, TIP_HEIGHT, claims)
     }
 
+    /// A seller's own tab, holding `order` in their store.
+    fn seller_holding(order: &AuthorizedOrder) -> AppState {
+        let mut state = AppState::default();
+        state.begin_browsing(STORE.to_vec());
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![order.clone()];
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state
+    }
+
     /// A seller's own tab: their store, their identity, and one invoice they
     /// issued that is still awaiting payment.
     fn seller_with_an_issued_invoice() -> (AppState, AuthorizedOrder) {
@@ -12610,14 +12710,19 @@ mod buy_flow_tests {
         (state, issued)
     }
 
-    /// What the periodic tick does: decide under a read, then send.
+    /// What the periodic tick does: decide under a read, and send only if
+    /// something is due.
     ///
-    /// Mirrors `bitcoin_generation_ops`'s interval exactly, so these tests
-    /// exercise the path production takes rather than a convenience wrapper
-    /// that skips the peek.
+    /// The `is_empty` check is not a detail -- it is why a tick with nothing
+    /// to send never takes the state for writing, and it means `retain` does
+    /// not run on such a tick either. A version of this helper without it
+    /// made `a_settled_order_stops_being_asked_about` assert a pruning that
+    /// production does not perform.
     fn tick_rereads(state: &mut AppState, now_ms: u64) -> Vec<[u8; 32]> {
         let (wanted, due) = state.due_address_rereads(now_ms);
-        state.send_address_rereads(&wanted, &due, now_ms);
+        if !due.is_empty() {
+            state.send_address_rereads(&wanted, &due, now_ms);
+        }
         due
     }
 
@@ -12695,10 +12800,15 @@ mod buy_flow_tests {
             due.is_empty() && wanted.is_empty(),
             "and the tick finds nothing to send, so it never takes the state for writing"
         );
+        // Its tracker entry outlives it, which is the honest state of
+        // affairs rather than an oversight: pruning happens on a tick that
+        // has something to send, and a tab whose last order just settled has
+        // nothing. Asserted so that a future change claiming to prune here
+        // has to change this line and say so.
         assert_eq!(
             state.bitcoin.address_rereads.tracked(),
-            0,
-            "and it is forgotten rather than tracked for the session"
+            1,
+            "the entry is pruned by a later acting tick, not by settling"
         );
     }
 
@@ -12756,9 +12866,13 @@ mod buy_flow_tests {
         // address carries a per-address offset (see
         // `address_reread::stagger`), so the exact moment depends on its id.
         assert_eq!(
-            tick_rereads(&mut state, crate::address_reread::FIRST_RETRY_MS * 2).len(),
+            tick_rereads(
+                &mut state,
+                crate::address_reread::FIRST_RETRY_MS + crate::address_reread::MAX_RETRY_MS
+            )
+            .len(),
             1,
-            "and again once the wait has passed"
+            "and again once the wait and the address's own offset have passed"
         );
     }
 
@@ -12773,7 +12887,9 @@ mod buy_flow_tests {
     #[test]
     fn a_re_read_answer_is_routed_and_settles_the_order() {
         let (order, claims, tip) = a_paid_order();
-        let (mut state, _) = buyer_after_acceptance(&order);
+        // The seller's tab: the party that was stuck in the live incident,
+        // and the only one that can publish the settlement.
+        let mut state = seller_holding(&order);
         // The chain, but NOT the address view: this is a tab that has asked
         // and not yet been answered.
         let mut tip_view = tip_at(TIP_HEIGHT);
@@ -12955,6 +13071,132 @@ mod buy_flow_tests {
         assert_eq!(
             after.confirmed_sats, confirmed,
             "and the balance does not go backwards"
+        );
+    }
+
+    /// **A settlement whose update never landed is published again.**
+    ///
+    /// The step after the re-read, and the one the re-read cannot rescue
+    /// from outside: the submitted-set is checked before the send and was
+    /// never withdrawn when the send failed, so a settlement that did not
+    /// reach the node was never retried for the life of the tab. That is
+    /// #67's own symptom -- a confirmed payment reading as awaiting payment
+    /// -- one step further down the path.
+    ///
+    /// Asserted through `settlement_publish_failed` because the send itself
+    /// is wasm-only; that method exists at all so this can be tested rather
+    /// than only described.
+    #[test]
+    fn a_settlement_that_failed_to_send_is_published_again() {
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "published once"
+        );
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "and not again while that send is in flight"
+        );
+
+        // The send failed.
+        state.settlement_publish_failed(&order.order.id, "put timed out");
+
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "so the next arrival publishes it again rather than giving up for the session"
+        );
+        assert_eq!(
+            state.notifications.len(),
+            1,
+            "and the seller was told once, not once per arrival"
+        );
+    }
+
+    /// **A buyer's tab does not try to publish a settlement.**
+    ///
+    /// It cannot succeed: the store contract takes an update signed with the
+    /// store's own key, which only the seller has. Before the re-reads that
+    /// cost one failed send and one apology per session. After them
+    /// `publish_settled_orders` runs on every address state arrival, so an
+    /// unsettled order produces one every few minutes, and the apology --
+    /// "your payment was seen on chain, but the order could not be updated
+    /// to say so" -- would pile up on the screen of the buyer whose payment
+    /// worked perfectly, for as long as the seller took to publish.
+    #[test]
+    fn a_buyers_tab_does_not_try_to_publish() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "the buyer can see the payment settles the order"
+        );
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "but does not attempt a publish only the seller can make"
+        );
+        assert!(
+            state.settlements_submitted.is_empty(),
+            "and nothing is recorded as submitted"
+        );
+    }
+
+    /// **A claim added within one scan window still lands.**
+    ///
+    /// The other side of `an_answer_that_scanned_less_far_is_ignored`, and
+    /// the branch whose failure direction is losing a payment rather than
+    /// delaying one. The watermark only advances on a strictly greater
+    /// height, so a bridge that sees a payment while scanning at the height
+    /// it has already reported publishes a state with the SAME watermark and
+    /// one more claim. A guard written as `>` rather than `>=` would refuse
+    /// that forever -- recreating #67 inside the guard meant to make #67
+    /// safe. Mutation-checked: `>` leaves the rest of the suite green.
+    #[test]
+    fn an_answer_at_the_same_height_still_lands() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // Scanned to the tip, nothing seen yet.
+        let nothing_yet = address_state_scanned_to(&order, TIP_HEIGHT, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&nothing_yet).expect("cbor"),
+        );
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "nothing to settle yet"
+        );
+
+        // The payment, seen at the same height.
+        let now_paid = address_state_scanned_to(&order, TIP_HEIGHT, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&now_paid).expect("cbor"),
+        );
+
+        let view = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("the view");
+        assert!(
+            view.confirmed_sats >= order.order.amount_sats,
+            "the payment at the same watermark was applied, not refused"
         );
     }
 

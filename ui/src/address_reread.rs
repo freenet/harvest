@@ -82,12 +82,14 @@ use std::collections::BTreeMap;
 /// at, and the shortest wait that is clearly not a retry storm.
 pub const FIRST_RETRY_MS: u64 = 60_000;
 
-/// The longest the wait grows to.
+/// The longest the spacing grows to, before the per-address offset.
 ///
 /// Five minutes against a repair measured in tens of minutes: fast enough
 /// that a healed node is noticed well inside the window a person would call
 /// "it updated", slow enough that an order left open all day costs a few
-/// hundred GETs rather than a few thousand.
+/// hundred GETs rather than a few thousand. [`AddressRereads::stagger`] is
+/// added on top, so the longest an individual address waits is just under
+/// twice this.
 pub const MAX_RETRY_MS: u64 = 5 * 60_000;
 
 /// When each address contract was last asked for, and how many times in a
@@ -128,16 +130,24 @@ impl AddressRereads {
     /// Every address of a batch of invoices is first asked for on the same
     /// tick, so without this they take every doubling step together and stay
     /// in lockstep for the life of the tab: a seller with tens of unsettled
-    /// orders would send all of them in one burst, forever. Spreading them
-    /// over the first wait breaks the convoy.
+    /// orders would send all of them in one burst, forever. An offset per
+    /// address breaks the convoy.
     ///
     /// Derived from the id rather than from a random number because it has to
     /// be the same on every tick (a fresh number each time would re-roll the
     /// deadline and could starve one address), and because a deterministic
     /// offset is testable. The id is a contract address, so its bytes are
     /// already uniformly distributed.
+    ///
+    /// Spread across [`MAX_RETRY_MS`] rather than across the first wait,
+    /// because the caller only looks once a tick: an offset smaller than one
+    /// tick rounds to the same tick for every address and separates nothing.
+    /// A first version spread it over [`FIRST_RETRY_MS`], which is exactly
+    /// one tick, so 255 ids in 256 stayed in lockstep and the convoy this
+    /// exists to break survived intact. Over the ceiling the offsets land in
+    /// five different ticks.
     fn stagger(id: &[u8; 32]) -> u64 {
-        (id[0] as u64) * (FIRST_RETRY_MS / 256)
+        (id[0] as u64) * (MAX_RETRY_MS / 256)
     }
 
     /// Which of `wanted` to ask for now, in the caller's order.
@@ -187,8 +197,15 @@ impl AddressRereads {
     ///
     /// The same shape as `AppState::spawn_inbox_entry_signature`, which
     /// withdraws its pending signature when the send fails.
-    pub fn forget(&mut self, id: &[u8; 32]) {
-        self.asked.remove(id);
+    ///
+    /// `asked_at_ms` is the moment the failed ask was recorded, and a record
+    /// made since is left alone: the failure is learned in a spawned task, so
+    /// a later tick may already have asked again, and withdrawing that
+    /// newer ask would reset a wait that is doing its job.
+    pub fn forget(&mut self, id: &[u8; 32], asked_at_ms: u64) {
+        if self.asked.get(id).is_some_and(|a| a.at_ms == asked_at_ms) {
+            self.asked.remove(id);
+        }
     }
 
     /// Forget every address not in `wanted`.
@@ -341,28 +358,47 @@ mod tests {
     /// without a per-address offset they take every doubling step together
     /// and a seller with tens of unsettled orders sends all of them in one
     /// burst, forever.
+    /// Sampled at the tick the caller actually uses, not at arbitrary
+    /// milliseconds. An offset smaller than one tick rounds to the same tick
+    /// for every address, so a test free to pick any instant will happily
+    /// report a separation that production never sees. The first version of
+    /// this test did exactly that, and passed while 255 ids in 256 convoyed.
     #[test]
     fn addresses_asked_together_do_not_come_due_together() {
-        let mut tracker = AddressRereads::default();
-        let early = unstaggered(9);
-        let late = {
-            let mut id = [9u8; 32];
-            id[0] = 255;
-            id
-        };
-        tracker.note_asked(early, 0);
-        tracker.note_asked(late, 0);
+        const TICK_MS: u64 = 60_000;
+        let ids: Vec<[u8; 32]> = [0u8, 40, 90, 150, 200, 255]
+            .into_iter()
+            .map(|first| {
+                let mut id = [9u8; 32];
+                id[0] = first;
+                id
+            })
+            .collect();
 
-        let due = tracker.due(&[early, late], FIRST_RETRY_MS);
-        assert_eq!(
-            due,
-            vec![early],
-            "the offset address waits longer than the one with no offset"
-        );
-        assert_eq!(
-            tracker.due(&[early, late], FIRST_RETRY_MS * 2).len(),
-            2,
-            "and both are asked for eventually"
+        let mut tracker = AddressRereads::default();
+        for id in &ids {
+            tracker.note_asked(*id, 0);
+        }
+
+        // Which tick each address first comes due on, asking only when the
+        // timer would.
+        let mut ticks: Vec<u64> = Vec::new();
+        for id in &ids {
+            let mut tick = 0;
+            loop {
+                tick += 1;
+                assert!(tick < 100, "an address that never comes due");
+                if !tracker.due(&[*id], tick * TICK_MS).is_empty() {
+                    break;
+                }
+            }
+            ticks.push(tick);
+        }
+
+        let distinct: std::collections::BTreeSet<u64> = ticks.iter().copied().collect();
+        assert!(
+            distinct.len() >= 4,
+            "addresses asked together must not all come due on one tick: {ticks:?}"
         );
     }
 
@@ -395,7 +431,7 @@ mod tests {
     fn a_withdrawn_ask_does_not_widen_the_wait() {
         let mut tracker = AddressRereads::default();
         tracker.note_asked(A, 0);
-        tracker.forget(&A);
+        tracker.forget(&A, 0);
 
         assert_eq!(
             tracker.due(&[A], 0),
