@@ -1932,6 +1932,82 @@ fn a_fold_drops_unsigned_version_zero_details() {
         .expect("the folded state is one the new contract accepts");
 }
 
+/// Store details at `version`, signed by the test seller the way the ghostkey
+/// delegate would.
+fn signed_store_info(version: u32) -> harvest_common::store::AuthorizedStoreInfoV1 {
+    let info = harvest_common::store::StoreInfoV1 {
+        version,
+        certificate_pem: String::new(),
+        seller_fingerprint: "fp".into(),
+        reputation_contract_id: [7u8; 32],
+        store_name: format!("Shop v{version}"),
+        description: String::new(),
+        encryption_public_key: None,
+    };
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&info).expect("serialize info"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped payload");
+    let signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+    harvest_common::store::AuthorizedStoreInfoV1 {
+        info,
+        scoped_payload,
+        signature,
+    }
+}
+
+/// **The four fold orders the round-3 review reproduced, through the real
+/// fold.** Each is a sequence of generations, newest first, folded the way
+/// `merge_generations` folds them and then merged with an empty local state.
+/// Every forward state must be one the new contract accepts, with the listing
+/// carried; where a signed predecessor exists its details win.
+#[test]
+fn every_fold_order_with_injected_version_zero_details_moves_the_listings() {
+    use freenet_scaffold::ComposableState;
+    let params = store_params(&seller_vk());
+    let mut junk = store_with(&[signed_listing("Alpha")]);
+    junk.info.info.store_name = "Totally Legit Farm".into();
+    junk.info.info.encryption_public_key = Some([0xAA; 32]);
+    let mut signed = StoreStateV1::default();
+    signed.info = signed_store_info(1);
+    let plain = store_with(&[signed_listing("Alpha")]);
+
+    let fold = |base: StoreStateV1, other: &StoreStateV1| {
+        merge_store_reporting_discard(base, other, &params, DiscardedSide::Predecessor).state
+    };
+    let cases: [(&str, Vec<&StoreStateV1>, u32); 4] = [
+        ("junk only", vec![&junk], 0),
+        ("junk newest, signed older", vec![&junk, &signed], 1),
+        ("signed newest, junk older", vec![&signed, &junk], 1),
+        ("plain newest, junk older", vec![&plain, &junk], 0),
+    ];
+    for (name, generations, version) in cases {
+        let mut acc = generations[0].clone();
+        for older in &generations[1..] {
+            acc = fold(acc, older);
+        }
+        let forward = fold(acc, &StoreStateV1::default());
+        forward
+            .verify(&forward, &params)
+            .unwrap_or_else(|e| panic!("{name}: the new contract refuses the forward state: {e}"));
+        assert_eq!(
+            forward.listings.listings.len(),
+            1,
+            "{name}: the listing moved"
+        );
+        assert_eq!(forward.info.info.version, version, "{name}: details");
+        assert!(
+            forward.info.info.encryption_public_key.is_none(),
+            "{name}: the injected key did not move"
+        );
+    }
+}
+
 /// **A fold whose base is not canonical writes canonical state (harvest#26).**
 ///
 /// The current contract refuses unsorted listings or a listing held twice,
