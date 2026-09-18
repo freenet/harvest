@@ -3663,7 +3663,11 @@ mod order_tests {
                 let code =
                     bs58::encode(key.verifying_key().as_bytes()).into_string()[..2].to_string();
                 if let Some(other) = seen.remove(&code) {
-                    return if outranks(&other.verifying_key(), &key.verifying_key()) {
+                    // Ordered by the raw bytes, NOT by `outranks`: a fixture
+                    // that asked the rule under test which key is "low"
+                    // would agree with that rule whichever way it pointed,
+                    // and every test below would pass with it flipped.
+                    return if other.verifying_key().as_bytes() < key.verifying_key().as_bytes() {
                         (other, key, code)
                     } else {
                         (key, other, code)
@@ -3784,17 +3788,17 @@ mod order_tests {
                 .expect("an owned store with its owner's listing verifies");
 
             let bare = owned(&seller, vec![]);
-            assert!(
-                bare.verify(&bare, &p).is_err(),
-                "an owner with nothing it signed proves nothing"
-            );
+            let refused = bare
+                .verify(&bare, &p)
+                .expect_err("an owner with nothing it signed proves nothing");
+            assert!(refused.contains("a key alone proves nothing"), "{refused}");
 
             let mut ownerless = good.clone();
             ownerless.owner = None;
-            assert!(
-                ownerless.verify(&ownerless, &p).is_err(),
-                "records need an owner"
-            );
+            let refused = ownerless
+                .verify(&ownerless, &p)
+                .expect_err("records need an owner");
+            assert!(refused.contains("no owner cannot hold"), "{refused}");
 
             let squatter = owned(&other, vec![make_listing(&other, "Theirs")]);
             let refused = squatter.verify(&squatter, &p).expect_err("wrong code");

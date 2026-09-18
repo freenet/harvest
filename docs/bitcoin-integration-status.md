@@ -24,9 +24,10 @@ Bitcoin.
 - A Payments UI that subscribes to contracts and updates live.
 - The bridge is deployed and observing real signet payments.
 - A buyer can open a seller's store from a share link: `begin_browsing()` is
-  called from `store_link::open_store_from_url`, which parses a store id out of
-  the page's hash or query string, GETs the contract, and reports a failure
-  rather than sitting on "Loading store…" forever.
+  called from `store_link::open_store_from_url`, which parses a store code
+  (harvest#52) out of the page's hash or query string, derives the store's
+  address from it, GETs the contract, and reports a failure rather than
+  sitting on "Loading store…" forever.
 - `mailbox_to_store` is populated, by `AppState::register_store_mailbox`. Only
   for the user's own stores: the mapping comes from the delegate's
   `StoreRegistration`, and `StoreInfoV1` names a store's reputation contract
@@ -49,8 +50,10 @@ fatal. A bridge that went away could not be replaced either.
 The list (and the paired `bitcoin_address_code_hash`) now live on
 `payment::Order`, inside what the seller signs. So each invoice names the
 bridges that settle it, a later invoice may name different ones, and
-`StoreParameters` is back to holding only the seller's key — which genuinely
-is the store's identity, and is correctly immutable. Moving the list to
+`StoreParameters` is back to holding only the seller's identity (since
+harvest#52, a twelve-character code derived from the seller's key, with the
+full key bound in the store's state), which genuinely is the store's
+identity, and is correctly immutable. Moving the list to
 mutable *state* instead would have been worse: `OrdersV1::verify` re-checks
 every order on every state validation, so rotating a shared mutable list would
 retroactively invalidate the whole historical order book.
