@@ -110,6 +110,9 @@ pub fn is_old_format_link(raw: &str) -> bool {
     let Some(value) = param(raw, STORE_PARAM) else {
         return false;
     };
+    // Checked before decoding: `bs58::decode` is quadratic in its input, and
+    // a whole contract id is 43 or 44 characters, so nothing longer is worth
+    // the work -- the bound the pre-#52 parser had for the same reason.
     (43..=44).contains(&value.len())
         && bs58::decode(value)
             .into_vec()
@@ -370,6 +373,14 @@ mod tests {
         ));
         assert!(!is_old_format_link(""));
         assert!(!is_old_format_link(&format!("#tab={old}")));
+        // A long value is refused. That it is refused BEFORE decoding is a
+        // cost bound, not an answer: without it the decode still says "not
+        // 32 bytes", only later, so no assertion here can tell the two apart
+        // except by timing, which is not worth a flaky test.
+        assert!(!is_old_format_link(&format!(
+            "#store={}",
+            "z".repeat(50_000)
+        )));
     }
 
     #[test]

@@ -1730,13 +1730,19 @@ impl AppState {
     /// typed code or the list -- and only once per session: the state
     /// re-arrives on every update notification, and the delegate's answer is
     /// the same each time.
-    pub fn remember_loaded_store(&mut self, store_contract_id: &[u8]) {
+    ///
+    /// Answers whether it asked, so the once-per-session guard can be seen by
+    /// a test: the queue it feeds before the delegate exists dedupes on its
+    /// own and would hide the guard's absence.
+    pub fn remember_loaded_store(&mut self, store_contract_id: &[u8]) -> bool {
         let Some(code) = self.store_codes.get(store_contract_id).cloned() else {
-            return;
+            return false;
         };
-        if self.stores_remembered.insert(code.clone()) {
-            self.remember_store(&code);
+        if !self.stores_remembered.insert(code.clone()) {
+            return false;
         }
+        self.remember_store(&code);
+        true
     }
 
     /// Remember a store the user opened, so it is still listed after the tab
@@ -17957,6 +17963,17 @@ mod store_code_tests {
         // not added to the visitor's list by its state arriving.
         arrive(&mut state, &[6u8; 32], None);
         assert_eq!(state.stores_to_remember.len(), 1);
+
+        // With the delegate up, the guard itself is what stops a request per
+        // arrival: nothing downstream dedupes a send.
+        state.harvest_delegate_key = Some(freenet_stdlib::prelude::DelegateKey::new(
+            [1u8; 32],
+            freenet_stdlib::prelude::CodeHash::new([2u8; 32]),
+        ));
+        let fresh = [7u8; 32];
+        state.note_store_code(fresh.to_vec(), "2222222222222222".to_string());
+        assert!(state.remember_loaded_store(&fresh), "asked once");
+        assert!(!state.remember_loaded_store(&fresh), "and not again");
     }
 
     #[test]
