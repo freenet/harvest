@@ -41,9 +41,11 @@
 //!
 //! The first re-ask comes [`FIRST_RETRY_MS`] after the last one, and each
 //! consecutive ask doubles the wait to a ceiling of [`MAX_RETRY_MS`]. Where
-//! several addresses are being asked about at once, each also carries an
-//! offset of its own (see [`AddressRereads::stagger`]) so they do not all
-//! fire on one tick; a tab with a single unsettled order carries none. The
+//! several addresses are being asked about at once, each also carries a
+//! one-time offset of its own on its FIRST re-ask (see
+//! [`AddressRereads::stagger`]) so they do not all fire on one tick; that
+//! shifts their phase rather than their rate, and a tab with a single
+//! unsettled order carries none at all. The
 //! widening is the point: while the node is stale every answer is identical,
 //! so asking at a fixed minute would spend an unbounded number of GETs
 //! learning nothing, and the repair it is waiting for takes tens of minutes.
@@ -90,11 +92,25 @@ pub const FIRST_RETRY_MS: u64 = 60_000;
 /// Five minutes against a repair measured in tens of minutes: fast enough
 /// that a healed node is noticed well inside the window a person would call
 /// "it updated", slow enough that an order left open all day costs a few
-/// hundred GETs rather than a few thousand. Where more than one address is
-/// in play [`AddressRereads::stagger`] is added on top, so with a large
-/// enough batch the longest an individual address waits approaches twice
-/// this; with one address it is exactly this.
+/// hundred GETs rather than a few thousand. This is the steady-state wait
+/// for every address: [`AddressRereads::stagger`] offsets only the first
+/// re-ask, so it moves when an address asks and not how often.
 pub const MAX_RETRY_MS: u64 = 5 * 60_000;
+
+/// How often the caller looks for an address that has come due.
+///
+/// Lives here rather than beside the timer that uses it because it is only
+/// meaningful against the waits above: a tick slower than [`FIRST_RETRY_MS`]
+/// would quietly become the thing that decides how fast a heal is noticed,
+/// and the spacing in this module would stop being the answer. The assertion
+/// below is what keeps that from happening silently, and keeping both in one
+/// file is what lets a host test measure ticks without copying the number.
+pub const CHECK_EVERY_MS: u64 = 60_000;
+
+const _: () = assert!(
+    CHECK_EVERY_MS <= FIRST_RETRY_MS,
+    "the re-read tick must be at least as frequent as the shortest wait"
+);
 
 /// When each address contract was last asked for, and how many times in a
 /// row.
@@ -185,9 +201,21 @@ impl AddressRereads {
             .filter(|id| match self.asked.get(*id) {
                 None => true,
                 Some(asked) => {
+                    // The offset applies to the FIRST re-ask only, so it
+                    // shifts an address's phase rather than lengthening its
+                    // every wait. Added to every wait it would also change
+                    // the RATE, leaving addresses polling at anything from
+                    // five to ten minutes depending on a byte of their id,
+                    // for no benefit: once two addresses are out of step the
+                    // doubling keeps them out of step.
+                    let offset = if asked.consecutive <= 1 {
+                        Self::stagger(id, wanted.len())
+                    } else {
+                        0
+                    };
                     now_ms < asked.at_ms
                         || now_ms.saturating_sub(asked.at_ms)
-                            >= Self::spacing(asked.consecutive) + Self::stagger(id, wanted.len())
+                            >= Self::spacing(asked.consecutive) + offset
                 }
             })
             .copied()
@@ -382,7 +410,9 @@ mod tests {
     /// this test did exactly that, and passed while 255 ids in 256 convoyed.
     #[test]
     fn addresses_asked_together_do_not_come_due_together() {
-        const TICK_MS: u64 = 60_000;
+        // The real tick, not a copy of its value: a test that duplicates
+        // the constant keeps asserting against the old one after it moves.
+        const TICK_MS: u64 = CHECK_EVERY_MS;
         let ids: Vec<[u8; 32]> = [0u8, 40, 90, 150, 200, 255]
             .into_iter()
             .map(|first| {
@@ -418,6 +448,29 @@ mod tests {
         assert!(
             distinct.len() >= 4,
             "addresses asked together must not all come due on one tick: {ticks:?}"
+        );
+
+        // And they stay apart. The offset applies to the first re-ask only,
+        // so this is what has to hold for the convoy to stay broken: once
+        // two addresses are out of step, the doubling keeps them there.
+        let mut second: Vec<u64> = Vec::new();
+        for (id, first) in ids.iter().zip(&ticks) {
+            let mut tracker = tracker.clone();
+            tracker.note_asked(*id, first * TICK_MS);
+            let mut tick = *first;
+            loop {
+                tick += 1;
+                assert!(tick < 200, "an address that never comes due again");
+                if tracker.due(&ids, tick * TICK_MS).contains(id) {
+                    break;
+                }
+            }
+            second.push(tick);
+        }
+        let distinct_second: std::collections::BTreeSet<u64> = second.iter().copied().collect();
+        assert!(
+            distinct_second.len() >= 4,
+            "and they must not converge onto one tick afterwards: {second:?}"
         );
     }
 
@@ -458,6 +511,31 @@ mod tests {
             "due again at once, as though it had never been asked"
         );
         assert_eq!(tracker.tracked(), 0, "and nothing is remembered about it");
+    }
+
+    /// **Withdrawing a failed ask leaves a later one alone.**
+    ///
+    /// The failure is learned inside a spawned task, so by the time it
+    /// arrives the next tick may already have asked again. Withdrawing that
+    /// newer ask would reset a wait that is doing its job, and the address
+    /// would be asked about twice in quick succession for as long as sends
+    /// kept failing slowly. The timestamp is the whole reason the parameter
+    /// exists, and without this test an unconditional `remove` passes every
+    /// other test in the suite.
+    #[test]
+    fn withdrawing_a_failed_ask_leaves_a_later_ask_alone() {
+        let mut tracker = AddressRereads::default();
+        tracker.note_asked(A, 0);
+        tracker.note_asked(A, FIRST_RETRY_MS);
+
+        // The first ask's failure arrives late.
+        tracker.forget(&A, 0);
+
+        assert_eq!(tracker.tracked(), 1, "the later ask is still recorded");
+        assert!(
+            tracker.due(&[A], FIRST_RETRY_MS + 1).is_empty(),
+            "and it is still waiting its turn rather than due at once"
+        );
     }
 
     /// **The widening cannot overflow the shift.**

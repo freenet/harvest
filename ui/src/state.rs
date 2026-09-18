@@ -3036,18 +3036,27 @@ impl AppState {
         &mut self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
-        // Only the seller can publish. The store contract takes an update
-        // signed with the store's own key, which `owned_store_key` resolves
-        // from `my_stores`, so on a buyer's tab this send cannot succeed --
-        // not now and not later, because nothing about a buyer will change
-        // into ownership.
+        // Only a tab that owns the store can publish TODAY, which is not the
+        // same as saying only the seller may.
         //
-        // Stopping here rather than dispatching and failing matters more
-        // since the re-reads landed: `publish_settled_orders` runs on every
-        // address state arrival, an unsettled order now produces one every
-        // few minutes, and the failure path apologises to the user each time.
-        // A buyer whose payment worked perfectly would watch that apology
-        // pile up for as long as the seller took to publish.
+        // `Paid` is authorized by evidence rather than by a signature, and
+        // the store contract accepts it from anyone holding the claims --
+        // [`Self::settled_orders`] says so, and says the buyer is simply the
+        // party who cares soonest. What stops a buyer is not the contract but
+        // `store_ops::owned_store_key`, which resolves the contract key from
+        // `my_stores`, so a buyer's send has never once succeeded.
+        //
+        // Given that, dispatching from a buyer's tab only produces a failure
+        // and an apology for a payment that was fine. That mattered little
+        // when it happened once per session; `publish_settled_orders` now
+        // runs on every address state arrival, and an unsettled order
+        // produces one every few minutes, so it would have become a growing
+        // wall of apologies on the screen of the buyer whose payment worked.
+        //
+        // The cost of stopping here is real and is not hidden: until a buyer
+        // can publish (freenet/harvest#75), an order reaches `Paid` on the
+        // network only when the seller opens the app. Recorded in
+        // `docs/untested-invariants.md` rather than left to be discovered.
         if !self.owns_store(store_contract_id) {
             return Vec::new();
         }
@@ -3312,6 +3321,30 @@ impl AppState {
                 }
             });
         }
+    }
+
+    /// The Bitcoin parameters of an order naming this address contract.
+    ///
+    /// The parameters are what an address contract's claims are signed over,
+    /// so folding two copies of one contract together needs them. Found from
+    /// the order rather than carried alongside the view, because the order is
+    /// what decides the address in the first place.
+    fn address_params_for(
+        &self,
+        contract_id: &[u8],
+    ) -> Option<freenet_bitcoin_common::BitcoinAddressParameters> {
+        self.browsing_stores.values().find_map(|store| {
+            store
+                .orders
+                .iter()
+                .find(|order| {
+                    order
+                        .order
+                        .bitcoin_address_instance_id()
+                        .is_some_and(|id| id.as_slice() == contract_id)
+                })
+                .map(|order| order.order.bitcoin_params())
+        })
     }
 
     /// The network of an order naming this address contract.
@@ -5206,55 +5239,68 @@ impl AppState {
             .get(&network)
             .and_then(|t| t.tip_height)
             .unwrap_or(0);
-        // Refuse a copy that has scanned less far than the one already held.
+        // Fold the arriving claims into the ones already held, rather than
+        // replacing them.
         //
-        // This view is replaced wholesale below, and a reorg RETRACTION is
-        // expressed as an additional signed claim rather than by removing
-        // one. So applying an older copy would silently un-retract a payment
-        // that has been reversed, and `publish_settled_orders` runs on the
-        // very next line -- turning a late settlement into a wrong one.
+        // Claims are signed and additive: a payment is a claim, and a reorg
+        // RETRACTION is another claim rather than the removal of one. So a
+        // copy of this contract that is behind -- missing a payment, or
+        // missing a retraction -- differs from a current one only by absence.
+        // Replacing the view with it therefore un-does whichever of the two
+        // it has not caught up with, and `publish_settled_orders` runs
+        // immediately afterwards: one direction publishes `Paid` for a
+        // payment that was reversed, the other drops a confirmed payment and
+        // un-settles an order that was about to be published.
         //
-        // Reading the same contract repeatedly is exactly what this app now
-        // does (`crate::address_reread`), and a node may answer a read from
-        // a copy older than one it served before, so this stopped being
-        // hypothetical when the re-reads were added.
+        // Both were reachable, and reading the same contract every few
+        // minutes (`crate::address_reread`) is what made them ordinary
+        // rather than theoretical, so the guard belongs to that change. A
+        // union needs no ordering between copies, which is what an earlier
+        // watermark comparison here got wrong: the watermark advances only
+        // on a strictly greater height, so two copies of one scan window --
+        // exactly the same-height reorg case -- compare equal while one of
+        // them is missing a claim.
         //
-        // `scanned_to` is the watermark the bridge stamps, and it only moves
-        // forward, which makes it the ordering this can be judged by. Two
-        // limits, both in the direction of admitting too much rather than
-        // refusing a payment:
-        //
-        // * Equal watermarks still apply, because that is how a claim added
-        //   within one scan window lands. A same-height reorg is exactly
-        //   that shape -- the watermark does not move, a `Retracted` claim
-        //   is added -- so a copy missing that retraction is still admitted.
-        //   This narrows the window rather than closing it.
-        // * The watermark is a maximum over PER-BRIDGE watermarks. With one
-        //   trusted bridge, which is what this build ships
-        //   (`bitcoin_config::default_trusted_bridges`), that is a total
-        //   order. With two scanning at different rates it is not, and a
-        //   copy carrying the slower bridge's payment claim could have the
-        //   lower maximum and be refused. Whoever adds a second bridge has
-        //   to revisit this.
-        let held_scanned_to = self
-            .bitcoin
-            .addresses
-            .get(&contract_id)
-            .and_then(|view| view.scanned_to);
-        if let Some(held) = held_scanned_to {
-            match state.scanned_to() {
-                Some(incoming) if incoming >= held => {}
-                _ => {
-                    debug!(
-                        "ignoring an address state for {:?} scanned to {:?}, behind the {held} \
-                         already held",
-                        &contract_id[..8.min(contract_id.len())],
-                        state.scanned_to()
-                    );
-                    return;
+        // `from_claims` re-verifies every claim against the contract's own
+        // parameters, so nothing enters the view that the bridge did not
+        // sign for this script, and a claim this node made up cannot survive
+        // the fold. Where the parameters cannot be resolved -- no order in
+        // view names this address -- the arriving state is used as it came,
+        // which is what this did before.
+        let merged;
+        let state = match self.address_params_for(&contract_id) {
+            Some(params) => {
+                let held = self
+                    .bitcoin
+                    .addresses
+                    .get(&contract_id)
+                    .map(|view| view.claims.clone())
+                    .unwrap_or_default();
+                let union: Vec<freenet_bitcoin_common::SignedClaim> = state
+                    .claims
+                    .scanned
+                    .values()
+                    .chain(state.claims.claims.values())
+                    .cloned()
+                    .chain(held)
+                    .collect();
+                match freenet_bitcoin_common::BitcoinAddressStateV1::from_claims(&params, union) {
+                    Ok(folded) => {
+                        merged = folded;
+                        &merged
+                    }
+                    Err(e) => {
+                        warn!(
+                            "could not fold an address state for {:?} into the one held, using it \
+                             as it arrived: {e}",
+                            &contract_id[..8.min(contract_id.len())]
+                        );
+                        state
+                    }
                 }
             }
-        }
+            None => state,
+        };
 
         let confirmed_sats = state.claims.confirmed_value_sats(tip_height, 1);
         let pending_sats = state.claims.pending_value_sats(tip_height, 1);
@@ -13037,15 +13083,17 @@ mod buy_flow_tests {
     ///
     /// The one way re-reading could make a settlement WRONG rather than
     /// merely late. A reorg retraction is an extra signed claim, not a
-    /// removal, so a copy that predates the retraction simply lacks it --
-    /// and the view is replaced wholesale, with `publish_settled_orders`
-    /// running immediately afterwards. Applying that copy would un-retract a
-    /// reversed payment and publish `Paid` on it.
+    /// removal, so a copy that predates the retraction simply lacks it. If
+    /// the view were replaced by that copy the retraction would be undone,
+    /// with `publish_settled_orders` running immediately afterwards -- so a
+    /// reversed payment would be published as `Paid`.
     ///
     /// Reading the same contract over and over is what this change
-    /// introduces, so this is its risk to carry.
+    /// introduces, so this is its risk to carry. See
+    /// `a_copy_missing_a_payment_does_not_erase_it` for the other
+    /// direction.
     #[test]
-    fn an_answer_that_scanned_less_far_is_ignored() {
+    fn a_stale_answer_cannot_erase_what_is_known() {
         let (order, claims, tip) = a_paid_order();
         let (mut state, _) = buyer_after_acceptance(&order);
         let mut tip_view = tip_at(TIP_HEIGHT);
@@ -13141,6 +13189,61 @@ mod buy_flow_tests {
             state.notifications.len(),
             1,
             "the seller was told once, not once per retry at the re-read cadence"
+        );
+    }
+
+    /// **A copy missing a payment cannot erase one that arrived.**
+    ///
+    /// The direction that loses money rather than misreporting it, and the
+    /// one a watermark comparison could not catch: the bridge stamps its
+    /// watermark only when it advances, so two copies of a single scan
+    /// window carry the SAME watermark while one of them is missing a
+    /// claim. Ordering them is impossible; folding them is not.
+    ///
+    /// Found by review of the watermark guard this replaced, and it failed
+    /// against that guard.
+    #[test]
+    fn a_copy_missing_a_payment_does_not_erase_it() {
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order.order.bitcoin_address_instance_id().expect("id");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id]);
+
+        let paid = address_state_scanned_to(&order, TIP_HEIGHT, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&paid).expect("cbor"),
+        );
+        let before = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("view")
+            .confirmed_sats;
+        assert!(before > 0, "the fixture pays");
+
+        let empty = address_state_scanned_to(&order, TIP_HEIGHT, Vec::new());
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&empty).expect("cbor"),
+        );
+        let after = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("view")
+            .confirmed_sats;
+        assert_eq!(
+            after, before,
+            "a copy at the same watermark carrying no payment must not erase one"
+        );
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "and the order stays settleable"
         );
     }
 

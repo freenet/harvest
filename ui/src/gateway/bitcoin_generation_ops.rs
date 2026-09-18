@@ -45,18 +45,9 @@ const WATCH_CHECK_EVERY_MS: u32 = 60_000;
 /// be asked for again (#67).
 ///
 /// The tick rate, not the ask rate: which addresses are actually due is
-/// `crate::address_reread`'s decision, and it widens the wait per address.
-/// This only has to fire often enough not to be the thing that delays it,
-/// which the assertion below is what keeps true.
-const ADDRESS_REREAD_CHECK_EVERY_MS: u32 = 60_000;
-
-/// Slowing the tick past the shortest wait would silently move the decision
-/// out of `crate::address_reread` and into this constant, where it is not
-/// tested and reads like a detail.
-const _: () = assert!(
-    ADDRESS_REREAD_CHECK_EVERY_MS as u64 <= crate::address_reread::FIRST_RETRY_MS,
-    "the re-read tick must be at least as frequent as the shortest wait"
-);
+/// `crate::address_reread`'s decision, and that is where this constant lives
+/// and is checked against the waits it has to keep up with.
+const ADDRESS_REREAD_CHECK_EVERY_MS: u32 = crate::address_reread::CHECK_EVERY_MS as u32;
 
 thread_local! {
     static GENERATIONS: RefCell<Option<BridgeGenerations>> = const { RefCell::new(None) };
