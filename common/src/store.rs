@@ -1654,7 +1654,8 @@ mod order_tests {
         // Paid at 100 for an earlier invoice; the new order is signed at 150.
         let order = order_anchored_at(150);
         let (old_payment, _) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
-        let proof = OrderPaymentProof::on_chain(vec![old_payment], signed_tip(&order, &bridge, 160));
+        let proof =
+            OrderPaymentProof::on_chain(vec![old_payment], signed_tip(&order, &bridge, 160));
 
         assert_eq!(
             crate::payment::verify_payment_proof(&order, &proof),
