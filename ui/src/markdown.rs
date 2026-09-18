@@ -249,7 +249,9 @@ fn host_is_plain(host: &str) -> bool {
     !host.is_empty()
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            // Underscore included: a browser resolves `my_service.example.com`
+            // and no normalisation turns it into anything else.
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 /// An IPv4 address in any spelling a browser accepts: dotted quad, but also
@@ -320,14 +322,36 @@ fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
     let shown = shown.replace(['\u{ff0e}', '\u{3002}', '\u{2024}'], ".");
     // A sentence can carry an address: "Pay at https://freenet.org" said
     // nothing while the whole claim had to be the address.
+    // Trimmed BEFORE the test, not after: a trailing `.` or `"` lands in the
+    // last label, the label test fails, and the token is never considered --
+    // so `freenet.org.` and `"freenet.org"`, the two most natural ways to
+    // write it, said nothing at all.
     let claim = shown
         .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '(' | ')'
+                        | '<'
+                        | '>'
+                        | '['
+                        | ']'
+                        | ','
+                        | '"'
+                        | '\''
+                        | '.'
+                        | '!'
+                        | '?'
+                        | ';'
+                        | ':'
+                        | '*'
+                        | '_'
+                )
+            })
+        })
         .find(|token| looks_like_an_address(token))?
-        .trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\''))
         .to_string();
-    if !looks_like_an_address(&claim) {
-        return None;
-    }
     let destination = destination_label(href)?;
     // Userinfo in the CLAIM is the spoof itself: what a reader sees first in
     // `https://freenet.org@evil.example` is freenet.org. Never suppress the
@@ -339,6 +363,12 @@ fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
     };
     let claimed_authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     if claimed_authority.contains('@') {
+        // Except for a mail link whose text is itself an address: every one
+        // of those contains an `@`, so the note fired on the honest case and
+        // read identically to the spoofed one, which makes it unactionable.
+        if destination == "a mail address" && !claim.contains("://") {
+            return None;
+        }
         return Some(format!(" (goes to {destination})"));
     }
     let claimed = claimed_authority.split(':').next().unwrap_or("");
@@ -356,10 +386,16 @@ fn disagreeing_host_note(href: &str, children: &[Inline]) -> Option<String> {
 /// Whether a run of text reads as an address rather than as prose.
 ///
 /// A scheme or `www.` is unambiguous. A bare domain is how most people write
-/// link text, but requiring only a dot fired on `v1.2.3`, `readme.md`,
-/// `$4.99` and `Fig.1` -- and an indicator that cries wolf on a version
-/// number teaches a buyer to ignore it. So the last label has to look like a
-/// suffix: letters, at least two of them.
+/// link text, but requiring only a dot fired on `v1.2.3`, `$4.99` and
+/// `Fig.1`, and an indicator that cries wolf on a version number teaches a
+/// buyer to ignore it. So the last label has to look like a suffix: letters,
+/// at least two of them.
+///
+/// That still leaves a filename, because `readme.md` is a domain as far as
+/// this can tell -- `.md` is Moldova. A short list of the extensions people
+/// actually link by name is cheaper than being wrong about them, and being
+/// wrong here is the cry-wolf case rather than a missed spoof: the text is
+/// not claiming an address in the first place.
 fn looks_like_an_address(token: &str) -> bool {
     if token.contains("://") || token.starts_with("www.") {
         return true;
@@ -367,10 +403,14 @@ fn looks_like_an_address(token: &str) -> bool {
     let host = token.split(['/', '?', '#']).next().unwrap_or(token);
     let mut labels = host.split('.');
     let last = labels.next_back().unwrap_or("");
+    const FILE_EXTENSIONS: &[&str] = &[
+        "md", "txt", "html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "svg", "zip", "tar", "gz",
+        "rs", "py", "js", "ts", "toml", "json", "yaml", "yml", "csv", "doc", "docx",
+    ];
     host.matches('.').count() >= 1
         && last.len() >= 2
         && last.chars().all(|c| c.is_ascii_alphabetic())
-        && labels.clone().count() >= 1
+        && !FILE_EXTENSIONS.contains(&last)
         && labels.all(|label| !label.is_empty())
 }
 
@@ -1231,6 +1271,77 @@ mod tests {
         ] {
             assert!(safe_href(url).is_some(), "{url} is somewhere else");
         }
+    }
+
+    /// **The punctuation people actually write around a link.**
+    ///
+    /// The token was tested before its punctuation was trimmed, so a trailing
+    /// full stop or quote landed in the last label, the label test failed,
+    /// and the claim was never considered: the two most natural spellings of
+    /// the spoof said nothing.
+    #[test]
+    fn punctuation_around_the_claim_does_not_silence_the_note() {
+        for text in [
+            "freenet.org.",
+            "\"freenet.org\"",
+            "(freenet.org)",
+            "[freenet.org]",
+            "freenet.org!",
+            "(www.freenet.org)",
+            "Pay at freenet.org, today",
+        ] {
+            let source = format!("[{text}](https://evil.example/pay)");
+            let rendered = format!("{:?}", parse(&source));
+            assert!(
+                rendered.contains("goes to evil.example"),
+                "{text:?} said nothing: {rendered}"
+            );
+        }
+    }
+
+    /// A filename is not a claim about where a link goes.
+    #[test]
+    fn a_filename_as_link_text_says_nothing() {
+        for text in [
+            "readme.md",
+            "notes.txt",
+            "index.html",
+            "main.rs",
+            "setup.py",
+            "cargo.toml",
+            "photo.jpg",
+        ] {
+            let source = format!("[{text}](https://github.com/x/y/blob/main/{text})");
+            let rendered = format!("{:?}", parse(&source));
+            assert!(
+                !rendered.contains("goes to"),
+                "{text:?} is a filename, not an address: {rendered}"
+            );
+        }
+    }
+
+    /// A mail link whose text is that same address is the honest case, and
+    /// the note read identically on the spoofed one, so it could not be
+    /// acted on either way.
+    #[test]
+    fn a_mail_link_only_says_something_when_the_text_claims_the_web() {
+        let honest = format!(
+            "{:?}",
+            parse("[sales@example.com](mailto:sales@example.com)")
+        );
+        assert!(!honest.contains("goes to"), "{honest}");
+        let spoof = format!(
+            "{:?}",
+            parse("[https://freenet.org](mailto:evil@example.com)")
+        );
+        assert!(spoof.contains("a mail address"), "{spoof}");
+    }
+
+    /// An underscore is a host character a browser resolves.
+    #[test]
+    fn an_underscore_host_is_a_real_host() {
+        assert!(safe_href("https://my_service.example.com/").is_some());
+        assert!(safe_href("https://exa_mple.com/").is_some());
     }
 
     /// **A host that cannot be judged as written is not linked.**
