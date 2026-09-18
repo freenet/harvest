@@ -3893,20 +3893,38 @@ impl AppState {
             .retain(|pending| !pending.signed_bytes().is_ok_and(|queued| queued == bytes));
     }
 
-    /// Whether a publish for this store is already on its way to the
-    /// delegate or the network -- waiting on its certificate, or queued for
-    /// the ghostkey delegate's `SignResult`.
+    /// Whether a publish for this store is waiting on its certificate or on
+    /// the ghostkey delegate's `SignResult` -- the certificate/sign phase
+    /// only, NOT the whole publish.
     ///
-    /// Computed from state that already exists rather than a dedicated flag,
-    /// so it can never get stuck reporting `true`: `pending_store_edit` is
-    /// always cleared by `take()` (once `start_store_edit_if_ready` queues
-    /// the signature) or by every ghostkey failure arm (`Error`,
-    /// `AccessDenied`, `NoIdentityAvailable`, `PermissionDenied`), and the
-    /// matching `pending_signatures` entry is always removed either by
-    /// `SignResult` matching it, by `withdraw_pending_signature` when the
-    /// send itself fails, or by those same failure arms clearing the whole
-    /// queue. There is no separate "clear the flag" step for a caller to
-    /// forget.
+    /// # What this does and does not cover
+    ///
+    /// `pending_store_edit` is cleared by `take()` once
+    /// `start_store_edit_if_ready` queues the signature, or by every ghostkey
+    /// failure arm (`Error`, `AccessDenied`, `NoIdentityAvailable`,
+    /// `PermissionDenied`); the matching `pending_signatures` entry is
+    /// removed the moment a `SignResult` matches it (`state.rs`'s response
+    /// handler, `pending_signatures.remove(at)`), by
+    /// `withdraw_pending_signature` if the send itself fails, or by those
+    /// same failure arms clearing the whole queue. So this reports `false`
+    /// again as soon as either of those happens -- there is no separate
+    /// "clear the flag" step for a caller to forget.
+    ///
+    /// But the `SignResult` match removes the `pending_signatures` entry --
+    /// so this function starts reporting `false` again -- *before* the
+    /// network write it authorizes has even started: `submit_store_info_by_id`
+    /// is only spawned after the match. So a second click landing during
+    /// that in-flight network write reads as "not in flight" and can queue a
+    /// second, real publish. That duplicate carries identical content at the
+    /// next sequenced version, so it is wasted work, not data corruption --
+    /// the store contract just discards or applies-as-a-no-op the extra
+    /// write.
+    ///
+    /// This also stays `true` for the rest of the session if the delegate
+    /// never answers the `SignResult` request at all -- there is no
+    /// timeout on either `pending_store_edit` or a queued `StoreInfo`
+    /// signature, so a delegate that goes silent leaves the button
+    /// disabled with no message until the page is reloaded.
     ///
     /// Used to gate a one-click publish button (My Store's "Publish details"
     /// for `StoreDetailsGap::NoEncryptionKey`, PR #80) against a double-click
