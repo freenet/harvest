@@ -120,6 +120,13 @@ fn handle_contract_response(response: ContractResponse) {
             // a probe's, so at most one of the two takes it.
             #[cfg(target_arch = "wasm32")]
             let _pointer = super::bitcoin_generation_ops::deliver_absent(&instance_id);
+            // And to an invoice waiting to learn whether its payment address
+            // was used before: absence is the answer that says it was not.
+            // See `AppState::check_address_before_signing`.
+            #[cfg(target_arch = "wasm32")]
+            APP_STATE
+                .write()
+                .on_address_reuse_absent(instance_id.as_bytes());
 
             // Nothing else acts on it. `AppState` already has a
             // `store_state_unavailable` set that this could feed, and feeding

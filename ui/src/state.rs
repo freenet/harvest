@@ -272,6 +272,15 @@ pub struct AppState {
     /// say it is not testing the correlation at all.
     pub pending_invoices: std::collections::BTreeMap<u64, PendingInvoice>,
 
+    /// Invoices whose address has been derived and whose order is built,
+    /// waiting to learn whether that address has been used before. Keyed by
+    /// the address contract's instance id. See
+    /// [`AppState::check_address_before_signing`].
+    pub address_reuse_checks: HashMap<Vec<u8>, PendingReuseCheck>,
+    /// How many used addresses an invoice has already skipped, keyed by the
+    /// request id of the derivation that replaces the last one.
+    pub address_skips: HashMap<u64, u32>,
+
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
     ///
     /// A store's details carry the seller's certificate so a buyer can check
@@ -564,6 +573,25 @@ fn spawn_order_address_request(request_id: u64) {
                 .notifications
                 .push(format!("Could not issue the invoice: {e}"));
         }
+    });
+}
+
+/// Read a derived address's contract once, without subscribing, and end the
+/// wait after [`ADDRESS_REUSE_CHECK_TIMEOUT_MS`] whatever happens. The answer
+/// arrives through the ordinary response path (`on_contract_state`, or the
+/// `NotFound` arm in `gateway::response_handler`).
+#[cfg(target_arch = "wasm32")]
+fn spawn_address_reuse_check(contract_id: [u8; 32]) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(contract_id);
+        if let Err(e) = crate::gateway::get_contract(&id, false).await {
+            dioxus::logger::tracing::error!("Failed to ask about a payment address: {e}");
+        }
+        gloo_timers::future::TimeoutFuture::new(ADDRESS_REUSE_CHECK_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .on_address_reuse_timeout(&contract_id);
     });
 }
 
@@ -971,6 +999,33 @@ pub fn order_for_invoice(
     }
     .with_derived_id())
 }
+
+/// An invoice held back from signing until its payment address is known to
+/// be unused. See [`AppState::check_address_before_signing`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingReuseCheck {
+    pub invoice: PendingInvoice,
+    pub order: harvest_common::payment::Order,
+    /// Used addresses this invoice has already skipped.
+    pub skipped: u32,
+}
+
+/// How many used addresses in a row one invoice may skip before giving up.
+///
+/// Each skip burns an index that a wallet will not see paid, and a run this
+/// long means something other than a stale counter is wrong (another device
+/// issuing from the same key right now, say), which the seller should hear
+/// about rather than have papered over.
+pub const MAX_REUSED_ADDRESS_SKIPS: u32 = 20;
+
+/// How long to wait for a derived address's contract before signing anyway.
+///
+/// The expected answer for a fresh address is that its contract does not
+/// exist, and Freenet reports absence slowly or not at all (a GET that
+/// dead-ends produces no response). See
+/// [`AppState::on_address_reuse_timeout`] for why the wait ends in signing
+/// rather than refusing.
+pub const ADDRESS_REUSE_CHECK_TIMEOUT_MS: u32 = 15_000;
 
 /// The message a `SignResult`'s scoped payload was built around, i.e. the
 /// bytes the caller originally asked to have signed.
@@ -1766,6 +1821,18 @@ impl AppState {
 
     /// Handle full contract state received from a GET response.
     pub fn on_contract_state(&mut self, contract_id: Vec<u8>, state_bytes: Vec<u8>) {
+        // Before anything else, and before the empty check: an empty state is
+        // itself an answer to a reuse check (nothing registered there). An id
+        // that is ALSO a watched address goes on to the ordinary path below,
+        // so a check never swallows an update a watch was waiting for.
+        if self.on_address_reuse_state(&contract_id, &state_bytes)
+            && !self
+                .bitcoin
+                .address_contract_network
+                .contains_key(&contract_id)
+        {
+            return;
+        }
         if state_bytes.is_empty() {
             return;
         }
@@ -4283,8 +4350,9 @@ impl AppState {
     ///
     /// Only stores whose state has arrived contribute. `issue_invoice` refuses
     /// until the store being invoiced has; a sibling store that has not loaded
-    /// contributes nothing, and the store contract's pre-order rule is what
-    /// stops a reused address settling an order in that case.
+    /// contributes nothing. What catches that case is the address-contract
+    /// check before signing (`check_address_before_signing`), with the store
+    /// contract's payment window behind it.
     pub fn published_payment_scripts(&self) -> Vec<Vec<u8>> {
         let mut scripts = std::collections::BTreeSet::new();
         for registration in self.my_stores.values().flatten() {
@@ -4354,6 +4422,151 @@ impl AppState {
                 return;
             }
         };
+        let skipped = self.address_skips.remove(&request_id).unwrap_or(0);
+        self.check_address_before_signing(PendingReuseCheck {
+            invoice,
+            order,
+            skipped,
+        });
+    }
+
+    /// Hold a built invoice back until its address is known to be unused.
+    ///
+    /// # Why the address contract, on top of the recovered counter
+    ///
+    /// The delegate's counter is recovered from the store's published orders
+    /// (harvest#77), and that is not the whole record: a re-created store's
+    /// first state is its own fresh PUT, an order pruned at `MAX_ORDERS` is
+    /// gone, a sibling store may not have loaded, and a published order
+    /// beyond the recovery scan's gap is not found (PR #83 review, Must Fix
+    /// 3). The bridge's address contract for the derived script is the
+    /// ground truth for reuse: it exists and holds claims only if the address
+    /// was registered with the bridge before, i.e. put on an invoice that
+    /// was published. So an address whose contract holds ANY claim -- a
+    /// payment, a retraction, or only a `ScannedTo` from a watch nobody paid
+    /// -- is skipped, and a fresh one is derived. The recovered counter stays
+    /// as the first line; this catches what it cannot see.
+    ///
+    /// # What it does not see
+    ///
+    /// The contract id is derived from the script AND the order's bridge set
+    /// and address-contract build, so an address used under a different
+    /// bridge set or an earlier address-contract generation is a different
+    /// contract and reads as unused. And a timed-out check signs anyway (see
+    /// [`Self::on_address_reuse_timeout`]). The payment window in
+    /// `verify_on_chain_proof` is what bounds those.
+    fn check_address_before_signing(&mut self, check: PendingReuseCheck) {
+        let Some(contract_id) = check.order.bitcoin_address_instance_id() else {
+            // Every order `order_for_invoice` builds names a build, so this
+            // is unreachable from the UI. An order that names none can never
+            // be settled at all, so there is nothing a reuse check protects.
+            self.sign_checked_order(check);
+            return;
+        };
+        // Already watched on this node: no need to ask the network.
+        if let Some(view) = self.bitcoin.addresses.get(contract_id.as_slice()) {
+            if !view.claims.is_empty() {
+                self.skip_used_address(check);
+                return;
+            }
+        }
+        self.address_reuse_checks
+            .insert(contract_id.to_vec(), check);
+        #[cfg(target_arch = "wasm32")]
+        spawn_address_reuse_check(contract_id);
+    }
+
+    /// A state arrived for a contract id. If it answers a pending reuse check,
+    /// settle that check; returns whether the id was one.
+    ///
+    /// Any claim at all means the address was used. A state that does not
+    /// decode as an address contract's is also treated as used: that costs
+    /// one skipped index, while treating it as unused could put an old
+    /// address on a new invoice.
+    pub fn on_address_reuse_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
+        let Some(check) = self.address_reuse_checks.remove(contract_id) else {
+            return false;
+        };
+        let used = if state_bytes.is_empty() {
+            false
+        } else {
+            freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(
+                state_bytes,
+            )
+            .map(|state| !state.claims.claims.is_empty() || !state.claims.scanned.is_empty())
+            .unwrap_or(true)
+        };
+        if used {
+            self.skip_used_address(check);
+        } else {
+            self.sign_checked_order(check);
+        }
+        true
+    }
+
+    /// The node answered that nothing is stored for this contract: the
+    /// address has never been registered, so it is fresh.
+    pub fn on_address_reuse_absent(&mut self, contract_id: &[u8]) {
+        if let Some(check) = self.address_reuse_checks.remove(contract_id) {
+            self.sign_checked_order(check);
+        }
+    }
+
+    /// No answer within [`ADDRESS_REUSE_CHECK_TIMEOUT_MS`]: sign anyway.
+    ///
+    /// # Why this fails OPEN
+    ///
+    /// Silence is the expected answer for a fresh address, which is almost
+    /// every address: its contract does not exist, and Freenet's "not found"
+    /// arrives slowly or never. Failing closed would refuse nearly every
+    /// invoice, which would be the check disabling the product. A used
+    /// address, by contrast, has a contract the bridge PUT and at least one
+    /// party subscribed to, so it is findable and usually answers in time.
+    /// When it does not, what is left is exactly what this check adds to:
+    /// the recovered counter (which usually already moved past it) and the
+    /// payment window in `verify_on_chain_proof`, which stops a payment made
+    /// before the order from settling it.
+    pub fn on_address_reuse_timeout(&mut self, contract_id: &[u8]) {
+        if let Some(check) = self.address_reuse_checks.remove(contract_id) {
+            warn!(
+                "No answer about address {} in {} ms; issuing the invoice without knowing \
+                 whether it was used before",
+                check.order.payment_address, ADDRESS_REUSE_CHECK_TIMEOUT_MS
+            );
+            self.sign_checked_order(check);
+        }
+    }
+
+    /// The address was used before: derive another one for the same invoice.
+    fn skip_used_address(&mut self, check: PendingReuseCheck) {
+        let skipped = check.skipped + 1;
+        warn!(
+            "Payment address {} has been used before; deriving another for this invoice",
+            check.order.payment_address
+        );
+        if skipped > MAX_REUSED_ADDRESS_SKIPS {
+            self.notifications.push(format!(
+                "Could not issue the invoice: the last {MAX_REUSED_ADDRESS_SKIPS} payment \
+                 addresses from your key had all been used before. Is another device issuing \
+                 invoices from the same key?"
+            ));
+            return;
+        }
+        let request_id = self.bitcoin.next_request_id();
+        self.bitcoin.in_flight.insert(request_id);
+        self.pending_invoices.insert(request_id, check.invoice);
+        self.address_skips.insert(request_id, skipped);
+        #[cfg(target_arch = "wasm32")]
+        spawn_order_address_request(request_id);
+    }
+
+    /// Queue a checked invoice for the seller's signature.
+    fn sign_checked_order(&mut self, check: PendingReuseCheck) {
+        let PendingReuseCheck {
+            invoice,
+            order,
+            skipped: _,
+        } = check;
         info!(
             "Issuing invoice {} for '{}' ({} sats) to {}",
             order.id.short(),
@@ -5279,7 +5492,8 @@ impl AppState {
                     Ok(status) => {
                         // Replaced, not extended: the counter now belongs to
                         // this key and was floored against exactly these.
-                        self.bitcoin.accounted_scripts = sent.unwrap_or_default().into_iter().collect();
+                        self.bitcoin.accounted_scripts =
+                            sent.unwrap_or_default().into_iter().collect();
                         info!(
                             "Payment key recorded for {}, next index {}",
                             status.network.as_str(),
@@ -8340,6 +8554,21 @@ mod invoice_tests {
         }
     }
 
+    /// Answer every pending address-reuse check with "nothing is stored
+    /// there", which is what the node says about a fresh address. Tests of the
+    /// invoice path that are not about reuse call this after the address
+    /// arrives; `address_reuse_tests` is what exercises the check itself.
+    pub(super) fn settle_reuse_checks_as_fresh(state: &mut AppState) {
+        for id in state
+            .address_reuse_checks
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            state.on_address_reuse_absent(&id);
+        }
+    }
+
     fn address_answer(request_id: u64, index: u32) -> BitcoinDelegateResponse {
         BitcoinDelegateResponse::OrderAddress {
             request_id,
@@ -8421,6 +8650,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let queued = state
             .pending_signatures
@@ -8623,6 +8853,7 @@ mod invoice_tests {
 
         // Answered: not sent again; a newly published order is.
         state.on_bitcoin_delegate_response(address_answer(2, 0));
+        settle_reuse_checks_as_fresh(&mut state);
         assert!(scripts(state.order_address_request(3)).is_empty());
         state
             .browsing_stores
@@ -8648,6 +8879,189 @@ mod invoice_tests {
         assert!(scripts(state.order_address_request(6)).is_empty());
     }
 
+    // -----------------------------------------------------------------
+    // The address-contract reuse check (PR #83 review, Must Fix 3)
+    // -----------------------------------------------------------------
+
+    /// Issue one invoice and answer its derivation with `derived(index)`,
+    /// leaving the reuse check pending. Returns the check's contract id.
+    fn invoice_awaiting_reuse_check(state: &mut AppState, index: u32) -> Vec<u8> {
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.on_bitcoin_delegate_response(address_answer(request_id, index));
+        assert!(
+            state.pending_signatures.is_empty(),
+            "nothing is signed before the address has been checked"
+        );
+        assert_eq!(state.address_reuse_checks.len(), 1);
+        state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("one check")
+    }
+
+    /// An address contract state holding one claim: a bridge's scan
+    /// watermark, which is what a registered-but-never-paid address holds.
+    /// Unsigned, because the reuse check reads presence, not validity.
+    fn a_used_address_state() -> Vec<u8> {
+        let bridge = freenet_bitcoin_common::BridgeId([7u8; 32]);
+        let mut state = freenet_bitcoin_common::BitcoinAddressStateV1::default();
+        state.claims.scanned.insert(
+            bridge,
+            freenet_bitcoin_common::SignedClaim {
+                body_cbor: vec![1, 2, 3],
+                bridge,
+                signature: vec![4, 5, 6],
+            },
+        );
+        freenet_bitcoin_common::to_cbor(&state).expect("encode")
+    }
+
+    /// **The reuse check.** The derived address's contract already holds a
+    /// claim, so the address was on an invoice before: nothing is signed, and
+    /// a fresh address is asked for in its place. When that one reads as
+    /// fresh, the invoice is signed with it.
+    #[test]
+    fn an_address_used_before_is_skipped_and_another_derived() {
+        let mut state = seller_with_a_store();
+        let first = invoice_awaiting_reuse_check(&mut state, 0);
+
+        state.on_contract_state(first, a_used_address_state());
+        assert!(
+            state.pending_signatures.is_empty(),
+            "a used address was signed"
+        );
+        let (&retry_id, _) = state
+            .pending_invoices
+            .iter()
+            .next()
+            .expect("a fresh derivation for the same invoice");
+        assert_eq!(state.address_skips.get(&retry_id), Some(&1));
+
+        state.on_bitcoin_delegate_response(address_answer(retry_id, 1));
+        settle_reuse_checks_as_fresh(&mut state);
+        assert_eq!(
+            queued_order(&state).payment_script_pubkey,
+            derived(1).script_pubkey
+        );
+    }
+
+    /// A contract the node answers with no state, is absent, or does not
+    /// answer in time, is signed. Absence is the ordinary answer for a fresh
+    /// address; the timeout fails open, for the reason on
+    /// `on_address_reuse_timeout`.
+    #[test]
+    fn a_fresh_or_unanswered_address_is_signed() {
+        for settle in [
+            |s: &mut AppState, id: Vec<u8>| s.on_contract_state(id, Vec::new()),
+            |s: &mut AppState, id: Vec<u8>| s.on_address_reuse_absent(&id),
+            |s: &mut AppState, id: Vec<u8>| s.on_address_reuse_timeout(&id),
+        ] {
+            let mut state = seller_with_a_store();
+            let id = invoice_awaiting_reuse_check(&mut state, 0);
+            settle(&mut state, id);
+            assert_eq!(
+                queued_order(&state).payment_script_pubkey,
+                derived(0).script_pubkey
+            );
+            assert!(state.address_reuse_checks.is_empty());
+        }
+    }
+
+    /// A state that does not decode as an address contract's counts as used:
+    /// one skipped index is cheap, a reused address is not.
+    #[test]
+    fn an_undecodable_address_state_counts_as_used() {
+        let mut state = seller_with_a_store();
+        let id = invoice_awaiting_reuse_check(&mut state, 0);
+        state.on_contract_state(id, vec![0xff, 0x00, 0x13]);
+        assert!(state.pending_signatures.is_empty());
+        assert_eq!(
+            state.pending_invoices.len(),
+            1,
+            "a fresh derivation was asked for"
+        );
+    }
+
+    /// An address this node already watches, with claims, is skipped without
+    /// asking the network.
+    #[test]
+    fn an_address_already_watched_with_claims_is_skipped_at_once() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        // Work out the contract id the order will name, and give the node a
+        // view of it holding a claim.
+        let probe = order_for_invoice(
+            &invoice(),
+            &derived(0),
+            Some(anchor(TIP_HEIGHT)),
+            chrono::Utc::now(),
+            &resolved_address_generation(),
+            None,
+        )
+        .expect("order");
+        let id = probe.bitcoin_address_instance_id().expect("names a build");
+        let used: freenet_bitcoin_common::BitcoinAddressStateV1 =
+            freenet_bitcoin_common::from_cbor(&a_used_address_state()).expect("decode");
+        state.bitcoin.addresses.insert(
+            id.to_vec(),
+            AddressView {
+                network: BitcoinNetwork::Signet,
+                claims: used.claims.scanned.values().cloned().collect(),
+                scanned_to: None,
+                confirmed_sats: 0,
+                pending_sats: 0,
+                txs: Vec::new(),
+            },
+        );
+
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        assert!(
+            state.address_reuse_checks.is_empty(),
+            "the network was asked needlessly"
+        );
+        assert!(state.pending_signatures.is_empty());
+        assert_eq!(
+            state.pending_invoices.len(),
+            1,
+            "a fresh derivation was asked for"
+        );
+    }
+
+    /// A long run of used addresses stops rather than burning indices
+    /// forever, and says so.
+    #[test]
+    fn a_long_run_of_used_addresses_gives_up_and_says_so() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state
+            .address_skips
+            .insert(request_id, MAX_REUSED_ADDRESS_SKIPS);
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        let id = state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("check");
+
+        state.on_contract_state(id, a_used_address_state());
+        assert!(state.pending_invoices.is_empty(), "it kept deriving");
+        assert!(state.pending_signatures.is_empty());
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.contains("had all been used before")),
+            "the seller was not told: {:?}",
+            state.notifications
+        );
+    }
+
     /// **A seller who cannot see the chain issues nothing at all.**
     ///
     /// The alternative is worse than it looks: an unanchored invoice is one
@@ -8670,6 +9084,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert!(
             state.pending_signatures.is_empty(),
@@ -8715,6 +9130,7 @@ mod invoice_tests {
             state.issue_invoice(invoice()).expect("accepted");
             let request_id = *state.pending_invoices.keys().next().expect("one entry");
             state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+            settle_reuse_checks_as_fresh(&mut state);
 
             assert!(
                 state.pending_signatures.is_empty(),
@@ -8848,6 +9264,7 @@ mod invoice_tests {
         state.issue_invoice(answering).expect("accepted");
         let request_id = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(request_id, 3));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert_eq!(
             queued_order(&state).listing_tag,
@@ -8883,6 +9300,7 @@ mod invoice_tests {
         // to work -- and answering the LATER one first is what distinguishes
         // a real lookup from "take whichever invoice is at hand".
         state.on_bitcoin_delegate_response(address_answer(second_id, 5));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let order = queued_order(&state);
         assert_eq!(order.amount_sats, 20_000);
@@ -8895,6 +9313,7 @@ mod invoice_tests {
 
         // And the one left behind gets its OWN address, not the leftover.
         state.on_bitcoin_delegate_response(address_answer(first_id, 9));
+        settle_reuse_checks_as_fresh(&mut state);
         let both: Vec<(String, String)> = state
             .pending_signatures
             .iter()
@@ -8926,6 +9345,7 @@ mod invoice_tests {
         let waiting = *state.pending_invoices.keys().next().expect("one entry");
 
         state.on_bitcoin_delegate_response(address_answer(waiting + 1000, 0));
+        settle_reuse_checks_as_fresh(&mut state);
 
         assert!(state.pending_invoices.contains_key(&waiting));
         assert!(
@@ -8975,6 +9395,7 @@ mod invoice_tests {
         state.issue_invoice(invoice()).expect("accepted");
         let waiting = *state.pending_invoices.keys().next().expect("one entry");
         state.on_bitcoin_delegate_response(address_answer(waiting, 0));
+        settle_reuse_checks_as_fresh(&mut state);
         assert_eq!(state.pending_signatures.len(), 2);
 
         let order_request = state
@@ -9107,7 +9528,9 @@ mod invoice_tests {
             .expect("two entries");
 
         state.on_bitcoin_delegate_response(address_answer(first_id, 0));
+        settle_reuse_checks_as_fresh(&mut state);
         state.on_bitcoin_delegate_response(address_answer(second_id, 1));
+        settle_reuse_checks_as_fresh(&mut state);
 
         let ids: Vec<_> = state
             .pending_signatures
@@ -12168,6 +12591,7 @@ mod buy_flow_tests {
                 address: "tb1qexample".to_string(),
             }),
         });
+        super::invoice_tests::settle_reuse_checks_as_fresh(&mut state);
         let queued = match state.pending_signatures.front() {
             Some(PendingSignature::Order(order)) => order.clone(),
             other => panic!("expected an order awaiting signature, got {other:?}"),

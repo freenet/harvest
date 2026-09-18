@@ -93,11 +93,17 @@ pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 /// ever HANDED OUT: an index whose invoice was abandoned before it was
 /// published, on a device that is gone, is invisible to it, and so is an
 /// order pruned from the store at `MAX_ORDERS`. Both can be issued again.
-/// What stops either from settling a new order with an old payment is the
-/// store contract's own rule that a payment confirmed at or before an
-/// order's anchor block is not that order's (`harvest_common::payment`,
-/// `verify_on_chain_proof`), so the residual is a reused address, not a
-/// wrongly-settled order.
+/// Two more layers sit behind this one. The UI reads the derived address's
+/// own contract before signing and skips an address that holds any claim
+/// (`AppState::check_address_before_signing`), which catches any address
+/// that was registered with the bridge. And the store contract settles an
+/// order only with a payment that confirmed inside its window
+/// (`harvest_common::payment::Order::payment_window`), so a payment made
+/// before a reissued order cannot settle it, and a new order's payment
+/// cannot settle an older one anchored more than `PAYMENT_WINDOW_BLOCKS`
+/// earlier. What is left when all three miss is two orders on one address
+/// whose windows overlap, which one payment in the overlap settles BOTH:
+/// a wrongly-settled order, not merely a reused address.
 pub(crate) const BITCOIN_PAYMENT_XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
 
 fn load_watches<S: SecretStore>(store: &S) -> Vec<WatchedPayment> {
@@ -956,7 +962,7 @@ mod tests {
     /// KNOWN LIMIT, pinned so it is a decision rather than a surprise: a
     /// published order more than [`PUBLISHED_INDEX_GAP`] indices past the
     /// last one found is not found. Reaching it takes that many abandoned
-    /// invoices in a row; the store contract's pre-order rule still stops
+    /// invoices in a row; the store contract's payment window still stops
     /// that order's payment settling a new one.
     #[test]
     fn a_published_order_beyond_the_gap_is_not_found() {
@@ -1318,7 +1324,9 @@ mod origin_gating_tests {
         held.next_index = 1;
         save_payment_xpub(&mut store, &held).expect("store");
 
-        let published: Vec<Vec<u8>> = (0..5).map(|i| chain.script_at(i).expect("derive")).collect();
+        let published: Vec<Vec<u8>> = (0..5)
+            .map(|i| chain.script_at(i).expect("derive"))
+            .collect();
         match handle(
             &mut store,
             Some(&harvest()),

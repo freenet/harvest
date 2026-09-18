@@ -1754,7 +1754,10 @@ mod order_tests {
         let (stale, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 148);
         let retracted = retraction_claim(&order, &bridge, outpoint, 149);
         let (current, current_outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 152);
-        assert_eq!(outpoint, current_outpoint, "one transaction, two placements");
+        assert_eq!(
+            outpoint, current_outpoint,
+            "one transaction, two placements"
+        );
 
         assert_eq!(
             crate::payment::verify_payment_proof(

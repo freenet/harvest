@@ -228,8 +228,7 @@ pub async fn derive_order_address(request_id: u64) -> Result<(), String> {
             .ok_or("harvest delegate not yet registered")?;
         (key, state.order_address_request(request_id))
     };
-    let payload =
-        to_cbor(&request).map_err(|e| format!("serialize DeriveOrderAddress: {e}"))?;
+    let payload = to_cbor(&request).map_err(|e| format!("serialize DeriveOrderAddress: {e}"))?;
     super::send_delegate_message(&delegate_key, payload).await
 }
 

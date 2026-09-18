@@ -608,7 +608,10 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
 ///
 /// Split out of the component so the reading it depends on is testable; see
 /// [`AddressReading`] for why it is not the raw address balance.
-pub(crate) fn status_pill(status: OrderStatus, reading: &AddressReading) -> (&'static str, &'static str) {
+pub(crate) fn status_pill(
+    status: OrderStatus,
+    reading: &AddressReading,
+) -> (&'static str, &'static str) {
     match status {
         OrderStatus::AwaitingPayment => {
             if reading.in_window_sats > 0 {
@@ -681,8 +684,11 @@ impl AddressReading {
                     reading.in_window_sats = reading.in_window_sats.saturating_add(tx.value_sats);
                 }
                 Some(w) if anchor_height > *w.end() => {
-                    reading.after_window =
-                        Some(reading.after_window.map_or(anchor_height, |h| h.min(anchor_height)));
+                    reading.after_window = Some(
+                        reading
+                            .after_window
+                            .map_or(anchor_height, |h| h.min(anchor_height)),
+                    );
                 }
                 _ => {
                     reading.before_order = Some(
@@ -1316,9 +1322,15 @@ mod address_reading_tests {
     fn a_payment_older_than_the_invoice_does_not_light_the_paid_pill() {
         let order = order_anchored_at(150);
         let reading = AddressReading::of(&order, Some(&address_with(&[(100, 10_000)])));
-        assert_eq!(reading.in_window_sats, 0, "the old payment counted as this invoice's");
         assert_eq!(
-            super::status_pill(harvest_common::payment::OrderStatus::AwaitingPayment, &reading),
+            reading.in_window_sats, 0,
+            "the old payment counted as this invoice's"
+        );
+        assert_eq!(
+            super::status_pill(
+                harvest_common::payment::OrderStatus::AwaitingPayment,
+                &reading
+            ),
             ("btc-pill waiting", "Awaiting payment"),
             "the card read a payment older than the invoice as this invoice's"
         );
