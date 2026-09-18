@@ -523,20 +523,8 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 .join(", "),
         )
     };
-    let (status_class, status_text) = match order.status {
-        OrderStatus::AwaitingPayment => match &live {
-            Some(l) if l.confirmed_sats > 0 => {
-                ("btc-pill paid", "Payment seen on chain".to_string())
-            }
-            Some(l) if l.pending_sats > 0 => {
-                ("btc-pill pending", "Payment seen, unconfirmed".to_string())
-            }
-            _ => ("btc-pill waiting", "Awaiting payment".to_string()),
-        },
-        OrderStatus::Paid => ("btc-pill paid", "Paid".to_string()),
-        OrderStatus::PaymentReversed => ("btc-pill reversed", "Payment reversed".to_string()),
-        OrderStatus::Cancelled => ("btc-pill cancelled", "Cancelled".to_string()),
-    };
+    let reading = AddressReading::of(o, live.as_ref());
+    let (status_class, status_text) = status_pill(order.status, &reading);
 
     rsx! {
         div { class: "listing-card",
@@ -545,6 +533,11 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 span { class: "{status_class}", "{status_text}" }
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
+            if order.status == OrderStatus::AwaitingPayment {
+                if let Some(note) = reading.outside_note() {
+                    p { class: "text-warning", "{note}" }
+                }
+            }
             // The address is only offered when it is the script that settles
             // this order. Showing one that is not would be handing somebody a
             // destination whose payment the order can never recognise -- see
@@ -608,6 +601,118 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 },
             }
         }
+    }
+}
+
+/// The pill an order card shows: class and text.
+///
+/// Split out of the component so the reading it depends on is testable; see
+/// [`AddressReading`] for why it is not the raw address balance.
+pub(crate) fn status_pill(status: OrderStatus, reading: &AddressReading) -> (&'static str, &'static str) {
+    match status {
+        OrderStatus::AwaitingPayment => {
+            if reading.in_window_sats > 0 {
+                ("btc-pill paid", "Payment seen on chain")
+            } else if reading.pending_sats > 0 {
+                ("btc-pill pending", "Payment seen, unconfirmed")
+            } else {
+                ("btc-pill waiting", "Awaiting payment")
+            }
+        }
+        OrderStatus::Paid => ("btc-pill paid", "Paid"),
+        OrderStatus::PaymentReversed => ("btc-pill reversed", "Payment reversed"),
+        OrderStatus::Cancelled => ("btc-pill cancelled", "Cancelled"),
+    }
+}
+
+/// What an order's address shows, read against THAT ORDER's payment window.
+///
+/// # Why the card cannot just read the address balance
+///
+/// A balance is per script, and a script can carry more than one order's
+/// money when an address has been issued twice (harvest#77). The card used to
+/// light up "Payment seen on chain" for any confirmed balance at all, so a
+/// seller looking at a reissued address saw a new invoice as paid by the old
+/// invoice's payment, and the harm #77 is about (goods shipped for money that
+/// paid for something else) survived through the pill even though the store
+/// contract refused to settle the order (PR #83 review, Must Fix 2).
+///
+/// So confirmed value is split by [`Order::payment_window`], the same window
+/// the verifier applies, using each transaction's current (winning)
+/// confirmation height -- the same one the verifier judges. What falls
+/// outside the window is reported separately, which is also how the seller
+/// learns WHY a funded address does not settle the order (Should Fix 6):
+/// `settled_orders` cannot say, because it only ever publishes successes.
+///
+/// [`Order::payment_window`]: harvest_common::payment::Order::payment_window
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AddressReading {
+    /// Confirmed value inside the order's window: what can settle it.
+    pub in_window_sats: u64,
+    /// Unconfirmed value. Not window-checked, because an unconfirmed
+    /// transaction has no height yet; the pill says only "unconfirmed".
+    pub pending_sats: u64,
+    /// Highest confirmation height of value that confirmed at or before the
+    /// anchor, if any.
+    pub before_order: Option<u32>,
+    /// Lowest confirmation height of value that confirmed after the window
+    /// closed, if any.
+    pub after_window: Option<u32>,
+}
+
+impl AddressReading {
+    pub(crate) fn of(order: &harvest_common::payment::Order, live: Option<&AddressView>) -> Self {
+        let Some(live) = live else {
+            return Self::default();
+        };
+        let mut reading = Self {
+            pending_sats: live.pending_sats,
+            ..Self::default()
+        };
+        // No anchor: nothing can settle this order (the verifier refuses it),
+        // so no confirmed value is counted as its payment.
+        let window = order.payment_window();
+        for tx in &live.txs {
+            let TxRowStatus::Confirmed { anchor_height } = tx.status else {
+                continue;
+            };
+            match &window {
+                Some(w) if w.contains(&anchor_height) => {
+                    reading.in_window_sats = reading.in_window_sats.saturating_add(tx.value_sats);
+                }
+                Some(w) if anchor_height > *w.end() => {
+                    reading.after_window =
+                        Some(reading.after_window.map_or(anchor_height, |h| h.min(anchor_height)));
+                }
+                _ => {
+                    reading.before_order = Some(
+                        reading
+                            .before_order
+                            .map_or(anchor_height, |h| h.max(anchor_height)),
+                    );
+                }
+            }
+        }
+        reading
+    }
+
+    /// What to tell the seller when the address holds confirmed value that is
+    /// not this order's payment.
+    pub(crate) fn outside_note(&self) -> Option<String> {
+        if let Some(height) = self.before_order {
+            return Some(format!(
+                "This address already holds a payment that confirmed in block {height}, \
+                 before this invoice was made. It paid for something else and does not \
+                 settle this invoice, so do not ship against it. Issue a new invoice, which \
+                 gets a new address."
+            ));
+        }
+        self.after_window.map(|height| {
+            format!(
+                "A payment to this address confirmed in block {height}, after this invoice's \
+                 payment window closed, so it does not settle this invoice."
+            )
+        })
     }
 }
 
@@ -1151,5 +1256,103 @@ mod live_address_tests {
             live_address_for_order(&bitcoin, &order).map(|v| v.confirmed_sats),
             Some(777)
         );
+    }
+}
+
+#[cfg(test)]
+mod address_reading_tests {
+    use super::AddressReading;
+    use crate::state::{AddressView, TxRow, TxRowStatus};
+    use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
+    use harvest_common::payment::{Order, OrderId, PAYMENT_WINDOW_BLOCKS};
+
+    fn order_anchored_at(height: u32) -> Order {
+        Order {
+            id: OrderId([0u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller".into(),
+            amount_sats: 10_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa],
+            payment_address: "tb1qexample".into(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: Some(BlockAnchor {
+                height,
+                hash: BlockHash([1u8; 32]),
+            }),
+            order_binding: None,
+            listing_tag: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
+        }
+        .with_derived_id()
+    }
+
+    fn address_with(confirmed_at: &[(u32, u64)]) -> AddressView {
+        AddressView {
+            network: BitcoinNetwork::Signet,
+            claims: Vec::new(),
+            scanned_to: Some(10_000),
+            confirmed_sats: confirmed_at.iter().map(|(_, v)| v).sum(),
+            pending_sats: 0,
+            txs: confirmed_at
+                .iter()
+                .map(|&(anchor_height, value_sats)| TxRow {
+                    txid_display: format!("tx{anchor_height}"),
+                    value_sats,
+                    status: TxRowStatus::Confirmed { anchor_height },
+                })
+                .collect(),
+        }
+    }
+
+    /// **PR #83 review, Must Fix 2.** The #77 address: an old invoice's
+    /// payment confirmed at 100 and a new invoice was issued at 150 on the
+    /// same address. The card must not read that balance as this invoice's
+    /// payment, and must say why.
+    #[test]
+    fn a_payment_older_than_the_invoice_does_not_light_the_paid_pill() {
+        let order = order_anchored_at(150);
+        let reading = AddressReading::of(&order, Some(&address_with(&[(100, 10_000)])));
+        assert_eq!(reading.in_window_sats, 0, "the old payment counted as this invoice's");
+        assert_eq!(
+            super::status_pill(harvest_common::payment::OrderStatus::AwaitingPayment, &reading),
+            ("btc-pill waiting", "Awaiting payment"),
+            "the card read a payment older than the invoice as this invoice's"
+        );
+        let note = reading.outside_note().expect("the seller must be told");
+        assert!(note.contains("block 100"), "{note}");
+        assert!(note.contains("do not ship"), "{note}");
+    }
+
+    /// The window edges match the verifier's: the anchor block is outside,
+    /// the next block and the last block of the window are inside, the block
+    /// after it is outside.
+    #[test]
+    fn the_card_applies_the_verifiers_window() {
+        let order = order_anchored_at(150);
+        let last = 150 + PAYMENT_WINDOW_BLOCKS;
+        for (height, counts) in [(150, false), (151, true), (last, true), (last + 1, false)] {
+            let reading = AddressReading::of(&order, Some(&address_with(&[(height, 7)])));
+            assert_eq!(
+                reading.in_window_sats > 0,
+                counts,
+                "a payment at block {height} for an order anchored at 150"
+            );
+        }
+        let late = AddressReading::of(&order, Some(&address_with(&[(last + 1, 7)])));
+        assert!(late.outside_note().expect("said").contains("window closed"));
+    }
+
+    /// And the ordinary case is untouched: a payment after the anchor lights
+    /// the pill and says nothing extra.
+    #[test]
+    fn a_payment_inside_the_window_reads_as_seen() {
+        let order = order_anchored_at(150);
+        let reading = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
+        assert_eq!(reading.in_window_sats, 10_000);
+        assert_eq!(reading.outside_note(), None);
     }
 }
