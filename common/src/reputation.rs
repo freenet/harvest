@@ -714,10 +714,14 @@ mod tests {
         identity[0] = 1;
         let mut identity_signbit = identity;
         identity_signbit[31] = 0x80;
+        // The identity again, non-canonically encoded as y = 1 + p.
+        let mut identity_y_plus_p = [0xFFu8; 32];
+        identity_y_plus_p[0] = 0xEE;
+        identity_y_plus_p[31] = 0x7F;
         let mut forged = [0u8; 64];
         forged[0] = 1; // R = identity, s = 0
 
-        for key in [identity, identity_signbit] {
+        for key in [identity, identity_signbit, identity_y_plus_p] {
             let token = FeedbackToken::new([5u8; 32], key);
             let rsa_signature = seller_rsa
                 .sign_with_rng(
