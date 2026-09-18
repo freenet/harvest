@@ -1739,35 +1739,138 @@ mod order_tests {
         );
     }
 
-    /// Judged per OUTPOINT over every confirmation of it. A transaction that
-    /// confirmed before the order, was reorged out, and was mined again after
-    /// the anchor is still a transaction that existed before the order --
-    /// even though the fold's current verdict on it is the later block.
+    /// Judged by the fold's WINNING confirmation. A bridge that briefly
+    /// followed a stale fork can leave a claim placing the payment at or
+    /// below the anchor; if the fold's current answer is a block inside the
+    /// window, the payment settles. The earlier every-confirmation rule let
+    /// such a claim veto an honest payment forever, while a dishonest
+    /// submitter could simply omit it (PR #83 review, Should Fix 5).
     #[test]
-    fn a_pre_order_payment_re_mined_after_the_anchor_still_predates_it() {
+    fn a_payment_is_judged_by_its_winning_confirmation() {
         let bridge = bridge_key();
         let order = order_anchored_at(150);
 
-        let (first, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
-        let retracted = retraction_claim(&order, &bridge, outpoint, 101);
-        let (again, again_outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 152);
-        assert_eq!(outpoint, again_outpoint, "one transaction, mined twice");
+        // Stale-fork sighting at 148, current chain has it at 152.
+        let (stale, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 148);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 149);
+        let (current, current_outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 152);
+        assert_eq!(outpoint, current_outpoint, "one transaction, two placements");
 
         assert_eq!(
             crate::payment::verify_payment_proof(
                 &order,
                 &OrderPaymentProof::on_chain(
-                    vec![first, retracted, again],
+                    vec![stale, retracted, current],
                     signed_tip(&order, &bridge, 160),
                 ),
             ),
+            Ok(order.amount_sats),
+            "the stale placement must not veto the payment the chain now holds"
+        );
+    }
+
+    /// And the other way round: if the fold's current answer is at or below
+    /// the anchor, an earlier in-window placement does not rescue it.
+    #[test]
+    fn a_winning_confirmation_before_the_anchor_does_not_settle() {
+        let bridge = bridge_key();
+        let order = order_anchored_at(150);
+
+        // Seen at 152 first; a later bridge view (as_of 160) places it at 149.
+        let (early_view, outpoint) =
+            confirmed_claim_seen_from(&order, &bridge, order.amount_sats, 152, 152);
+        let (later_view, later_outpoint) =
+            confirmed_claim_seen_from(&order, &bridge, order.amount_sats, 149, 160);
+        assert_eq!(outpoint, later_outpoint);
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(
+                    vec![early_view, later_view],
+                    signed_tip(&order, &bridge, 170),
+                ),
+            ),
             Err(crate::payment::ProofError::PaymentPredatesOrder {
-                confirmed_at: 100,
+                confirmed_at: 149,
                 order_anchor: 150,
             })
         );
     }
 
+    /// **The upper edge.** A payment at the last block of the window settles;
+    /// one block later does not.
+    #[test]
+    fn a_payment_after_the_window_does_not_settle() {
+        use crate::payment::PAYMENT_WINDOW_BLOCKS;
+        let bridge = bridge_key();
+        let order = order_anchored_at(150);
+        let last = 150 + PAYMENT_WINDOW_BLOCKS;
+
+        let (on_time, _) = confirmed_claim(&order, &bridge, order.amount_sats, last);
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![on_time], signed_tip(&order, &bridge, last)),
+            ),
+            Ok(order.amount_sats)
+        );
+
+        let (late, _) = confirmed_claim(&order, &bridge, order.amount_sats, last + 1);
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![late], signed_tip(&order, &bridge, last + 1)),
+            ),
+            Err(crate::payment::ProofError::PaymentAfterWindow {
+                confirmed_at: last + 1,
+                window_end: last,
+            })
+        );
+    }
+
+    /// **PR #83 review, Must Fix 1: one payment must not settle two orders.**
+    /// An old unpaid order A and a new order B share an address (reissued a
+    /// window or more later). B's buyer pays; B settles and A does not.
+    #[test]
+    fn a_new_orders_payment_does_not_settle_an_old_order_on_the_same_address() {
+        use crate::payment::PAYMENT_WINDOW_BLOCKS;
+        let bridge = bridge_key();
+        let old = order_anchored_at(100);
+        let new = order_anchored_at(100 + PAYMENT_WINDOW_BLOCKS);
+        assert_eq!(old.payment_script_pubkey, new.payment_script_pubkey);
+
+        let paid_at = 100 + PAYMENT_WINDOW_BLOCKS + 1;
+        let (payment, _) = confirmed_claim(&new, &bridge, new.amount_sats, paid_at);
+        let tip = signed_tip(&new, &bridge, paid_at);
+        let proof = OrderPaymentProof::on_chain(vec![payment], tip);
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(&new, &proof),
+            Ok(new.amount_sats)
+        );
+        assert!(
+            crate::payment::verify_payment_proof(&old, &proof).is_err(),
+            "the new order's payment settled the old order too"
+        );
+    }
+
+    /// KNOWN LIMIT, pinned so it is a decision rather than a surprise: two
+    /// orders on one address whose windows OVERLAP are both settled by one
+    /// payment in the overlap. Reaching it needs an address reissued within
+    /// `PAYMENT_WINDOW_BLOCKS` of an unpaid order on it, past both the
+    /// derivation recovery and the UI's address-contract check.
+    #[test]
+    fn known_limit_overlapping_windows_on_a_reused_address_both_settle() {
+        let bridge = bridge_key();
+        let old = order_anchored_at(100);
+        let new = order_anchored_at(150);
+        let (payment, _) = confirmed_claim(&new, &bridge, new.amount_sats, 151);
+        let proof = OrderPaymentProof::on_chain(vec![payment], signed_tip(&new, &bridge, 160));
+
+        assert!(crate::payment::verify_payment_proof(&new, &proof).is_ok());
+        assert!(crate::payment::verify_payment_proof(&old, &proof).is_ok());
+    }
     /// The reversal direction. A reorg that retracts an OLD payment on a
     /// reused address must not read as a reversal of the NEW order, which
     /// nobody has paid: `PaymentReversed` is permanent under merge and
