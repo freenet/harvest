@@ -205,6 +205,12 @@ pub struct AppState {
     /// In-flight only. See [`AppState::publish_settled_orders`] for why it is
     /// deliberately not durable.
     pub settlements_submitted: HashSet<harvest_common::payment::OrderId>,
+    /// Orders whose failed settlement publish the seller has been told about.
+    ///
+    /// Separate from `settlements_submitted`, which is withdrawn on failure
+    /// so the publish is retried: the retry is silent, and this is what keeps
+    /// it silent. See [`AppState::settlement_publish_failed`].
+    pub settlement_failures_reported: HashSet<harvest_common::payment::OrderId>,
 
     /// `ForgetBuyerConversation` requests in flight, as request id -> the
     /// store and routing tag asked about.
@@ -2971,19 +2977,28 @@ impl AppState {
     ///
     /// A method rather than three lines inside the spawned task so it can be
     /// tested: everything in that task is wasm-only, and a native test cannot
-    /// reach it. Only the seller reaches this at all
-    /// ([`Self::publish_settled_orders`] refuses to try otherwise), so the
-    /// failures it retries are genuine send failures rather than a tab that
-    /// was never going to be able to publish.
+    /// reach it.
+    ///
+    /// The seller is told once per order, and the retry after that is
+    /// silent. Retrying is the right response to a send that failed, and
+    /// most failures here are transient -- but not all of them are: a store
+    /// published under an older contract resolves to a key naming a contract
+    /// that does not exist (`store_ops::store_contract_key`), which fails
+    /// the same way every time. Without the guard that order would post an
+    /// apology at the re-read cadence onto a list nothing clears, which is
+    /// exactly the pile-up just removed from the buyer's side.
     pub fn settlement_publish_failed(
         &mut self,
         order_id: &harvest_common::payment::OrderId,
         why: &str,
     ) {
         self.settlements_submitted.remove(order_id);
-        self.notifications.push(format!(
-            "Your payment was seen on chain, but the order could not be updated to say so: {why}"
-        ));
+        if self.settlement_failures_reported.insert(order_id.clone()) {
+            self.notifications.push(format!(
+                "Your payment was seen on chain, but the order could not be updated to say so: \
+                 {why}"
+            ));
+        }
     }
 
     /// Whether one of this node's identities owns `store_contract_id`.
@@ -13110,10 +13125,22 @@ mod buy_flow_tests {
             1,
             "so the next arrival publishes it again rather than giving up for the session"
         );
+
+        // A failure that repeats -- a store whose recorded key names a
+        // contract that does not exist fails identically every time -- keeps
+        // retrying, and stops talking about it.
+        for _ in 0..5 {
+            state.settlement_publish_failed(&order.order.id, "put timed out");
+            assert_eq!(
+                state.publish_settled_orders(STORE).len(),
+                1,
+                "still retried"
+            );
+        }
         assert_eq!(
             state.notifications.len(),
             1,
-            "and the seller was told once, not once per arrival"
+            "the seller was told once, not once per retry at the re-read cadence"
         );
     }
 

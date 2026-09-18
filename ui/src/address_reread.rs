@@ -40,7 +40,10 @@
 //! # The spacing, and why it widens
 //!
 //! The first re-ask comes [`FIRST_RETRY_MS`] after the last one, and each
-//! consecutive ask doubles the wait to a ceiling of [`MAX_RETRY_MS`]. The
+//! consecutive ask doubles the wait to a ceiling of [`MAX_RETRY_MS`]. Where
+//! several addresses are being asked about at once, each also carries an
+//! offset of its own (see [`AddressRereads::stagger`]) so they do not all
+//! fire on one tick; a tab with a single unsettled order carries none. The
 //! widening is the point: while the node is stale every answer is identical,
 //! so asking at a fixed minute would spend an unbounded number of GETs
 //! learning nothing, and the repair it is waiting for takes tens of minutes.
@@ -87,9 +90,10 @@ pub const FIRST_RETRY_MS: u64 = 60_000;
 /// Five minutes against a repair measured in tens of minutes: fast enough
 /// that a healed node is noticed well inside the window a person would call
 /// "it updated", slow enough that an order left open all day costs a few
-/// hundred GETs rather than a few thousand. [`AddressRereads::stagger`] is
-/// added on top, so the longest an individual address waits is just under
-/// twice this.
+/// hundred GETs rather than a few thousand. Where more than one address is
+/// in play [`AddressRereads::stagger`] is added on top, so with a large
+/// enough batch the longest an individual address waits approaches twice
+/// this; with one address it is exactly this.
 pub const MAX_RETRY_MS: u64 = 5 * 60_000;
 
 /// When each address contract was last asked for, and how many times in a
@@ -139,15 +143,28 @@ impl AddressRereads {
     /// offset is testable. The id is a contract address, so its bytes are
     /// already uniformly distributed.
     ///
-    /// Spread across [`MAX_RETRY_MS`] rather than across the first wait,
-    /// because the caller only looks once a tick: an offset smaller than one
-    /// tick rounds to the same tick for every address and separates nothing.
-    /// A first version spread it over [`FIRST_RETRY_MS`], which is exactly
-    /// one tick, so 255 ids in 256 stayed in lockstep and the convoy this
-    /// exists to break survived intact. Over the ceiling the offsets land in
-    /// five different ticks.
-    fn stagger(id: &[u8; 32]) -> u64 {
-        (id[0] as u64) * (MAX_RETRY_MS / 256)
+    /// Spread over a span wide enough to reach different ticks, because the
+    /// caller only looks once a tick: an offset smaller than one tick rounds
+    /// to the same tick for every address and separates nothing. A first
+    /// version spread it over [`FIRST_RETRY_MS`], which is exactly one tick,
+    /// so 255 ids in 256 stayed in lockstep and the convoy this exists to
+    /// break survived intact.
+    ///
+    /// The span grows with the number of addresses being asked about, and is
+    /// zero for one. Nothing convoys with itself, and an offset charged to a
+    /// tab with a single unsettled order is pure delay on the one number
+    /// this module exists to lower: spreading over the whole ceiling took
+    /// the ordinary case from a 5-6 minute steady state to 5-10 minutes,
+    /// which is a real fraction of the improvement handed back to buy
+    /// nothing.
+    fn stagger(id: &[u8; 32], wanted: usize) -> u64 {
+        if wanted <= 1 {
+            return 0;
+        }
+        let span = (wanted as u64)
+            .saturating_mul(FIRST_RETRY_MS)
+            .min(MAX_RETRY_MS);
+        (id[0] as u64) * (span / 256)
     }
 
     /// Which of `wanted` to ask for now, in the caller's order.
@@ -170,7 +187,7 @@ impl AddressRereads {
                 Some(asked) => {
                     now_ms < asked.at_ms
                         || now_ms.saturating_sub(asked.at_ms)
-                            >= Self::spacing(asked.consecutive) + Self::stagger(id)
+                            >= Self::spacing(asked.consecutive) + Self::stagger(id, wanted.len())
                 }
             })
             .copied()
@@ -380,15 +397,17 @@ mod tests {
             tracker.note_asked(*id, 0);
         }
 
-        // Which tick each address first comes due on, asking only when the
-        // timer would.
+        // Which tick each address first comes due on, asked the way the
+        // timer asks: the whole set at once, once a tick. Asking about one
+        // address at a time would report no offset at all, because a lone
+        // address has no convoy to break and is deliberately not delayed.
         let mut ticks: Vec<u64> = Vec::new();
         for id in &ids {
             let mut tick = 0;
             loop {
                 tick += 1;
                 assert!(tick < 100, "an address that never comes due");
-                if !tracker.due(&[*id], tick * TICK_MS).is_empty() {
+                if tracker.due(&ids, tick * TICK_MS).contains(id) {
                     break;
                 }
             }
