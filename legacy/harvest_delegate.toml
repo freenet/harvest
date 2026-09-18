@@ -40,8 +40,12 @@
 # From V7 the cost of that gap includes the Bitcoin derivation counter, and
 # that one is worse than the others: the RSA keypair and the watch list are
 # things a seller can recreate, while a reset counter re-issues addresses that
-# already have live invoices against them. Until the driver exists, a seller
-# crossing a delegate re-key should point Harvest at a fresh wallet account.
+# already have live invoices against them. From the generation after V13 the
+# delegate recovers the counter from the store's published orders when the
+# same key is entered again (harvest#77), so this no longer needs a fresh
+# wallet account. It recovers the highest PUBLISHED index, not the highest
+# handed out; see `BITCOIN_PAYMENT_XPUB_KEY` in
+# `delegates/harvest-delegate/src/bitcoin.rs` for what that leaves.
 
 [[entry]]
 version = "V1"
@@ -126,3 +130,10 @@ description = "Superseded by replacing `listing_id` on `Order` with a conversati
 date = "2026-09-17"
 code_hash = "4739e01954ab57d866840f9542fe87bb35910057bcee793c0a6a27a8c9536397"
 delegate_key = "4537b03aecf10d7a00202d8c20de1da7023233fe8e06952c62e74954dbbab71f"
+
+[[entry]]
+version = "V13"
+date = "2026-09-18"
+description = "Superseded by recovering the payment-address counter from the store's published orders (harvest#77). `SetPaymentXpub` and `DeriveOrderAddress` gained `published_scripts` (`#[serde(default)]`), and the delegate moves its counter past the highest index of the stored key whose script appears there before deriving. The counter was device-local, so a fresh install restarted it at 0 and re-issued an address that already held a confirmed payment. Like every generation before it, this re-key strands the predecessor's secrets, including the counter, because nothing drives the export handshake yet; unlike them, re-entering the same payment key now recovers the count from the store rather than restarting it, which is the case this header warned about from V7 on. The parameters are unchanged (empty)."
+code_hash = "08eac64a49dd1ca2f97421db0f022843b631b8c3b45fcd7f296f231bf9d0bd7e"
+delegate_key = "6e3532a2ba3dbab9a36fb25abc6190b3a8cc3cecd6497e8d2419e075c6cbb980"

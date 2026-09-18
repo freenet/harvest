@@ -286,6 +286,12 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // `StoreInfoV1`, which changes what the store's signed details
                 // re-encode to, so a predecessor's info no longer verifies.
                 "ddac8dd508819052c3771d23aaff9078e52c84ca17e62ae7e68ce356770b3a67",
+                // V14, from `git show 7fb733e:ui/public/contracts/store_contract.wasm`.
+                // Superseded by refusing to settle an order with a payment
+                // that confirmed at or before its anchor (harvest#77), which
+                // makes verification stricter, so a predecessor holding such
+                // an order no longer verifies.
+                "3f47ab79e985659f7c03728d907f05e9321037aa23c1ff7c7e569512a445489a",
             ],
         ),
         (
@@ -414,6 +420,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Codegen only: this delegate's source and wire types did not
             // change.
             "4739e01954ab57d866840f9542fe87bb35910057bcee793c0a6a27a8c9536397".to_string(),
+            // V13, from `git show 5320beb:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by recovering the payment-address counter from the
+            // store's published orders (harvest#77): `SetPaymentXpub` and
+            // `DeriveOrderAddress` gained `published_scripts`.
+            "08eac64a49dd1ca2f97421db0f022843b631b8c3b45fcd7f296f231bf9d0bd7e".to_string(),
         ],
     );
 }
@@ -780,6 +791,11 @@ const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
     // `StoreParameters` did not move: still 56 bytes per
     // `cargo make code-hashes` after the removal, checked rather than assumed.
     (13, false),
+    // V14: the pre-order payment rule (harvest#77), a change to verification
+    // only. `StoreParameters` did not move: still 56 bytes per
+    // `scripts/check-code-hashes.sh` after the rebuild, checked rather than
+    // assumed.
+    (14, false),
 ];
 
 /// V1 is derived under TODAY's parameter encoding, not the legacy one.
