@@ -5261,12 +5261,23 @@ impl AppState {
         // exactly the same-height reorg case -- compare equal while one of
         // them is missing a claim.
         //
-        // `from_claims` re-verifies every claim against the contract's own
-        // parameters, so nothing enters the view that the bridge did not
-        // sign for this script, and a claim this node made up cannot survive
-        // the fold. Where the parameters cannot be resolved -- no order in
-        // view names this address -- the arriving state is used as it came,
-        // which is what this did before.
+        // Every claim is checked against the contract's own parameters and
+        // the ones that do not verify are DROPPED, rather than the fold
+        // being abandoned because of them. That distinction is the whole
+        // guard: `from_claims` fails on the first bad claim, so falling back
+        // to the arriving state on its error would mean one unverifiable
+        // claim -- the cheapest thing in the world to produce -- restores
+        // exactly the replace-the-view behaviour this exists to remove, and
+        // with it the erasure. Filtering first makes the fold unable to
+        // fail for that reason.
+        //
+        // This holds only where the parameters can be resolved, which means
+        // an order in view names this address. A manually watched address
+        // names no order, nothing can be verified against, and the arriving
+        // state is used as it came -- which is what every address did before
+        // this change, and is why the watch list's balances are not evidence
+        // of anything. `assemble_on_chain_proof` re-verifies before any of
+        // this reaches the network.
         let merged;
         let state = match self.address_params_for(&contract_id) {
             Some(params) => {
@@ -5283,6 +5294,7 @@ impl AppState {
                     .chain(state.claims.claims.values())
                     .cloned()
                     .chain(held)
+                    .filter(|claim| claim.verify(&params).is_ok())
                     .collect();
                 match freenet_bitcoin_common::BitcoinAddressStateV1::from_claims(&params, union) {
                     Ok(folded) => {
@@ -5290,12 +5302,18 @@ impl AppState {
                         &merged
                     }
                     Err(e) => {
+                        // Unreachable by way of an unverifiable claim, which
+                        // the filter above has already removed. Whatever is
+                        // left, the view is kept as it stands: refusing an
+                        // update costs a late settlement, and replacing the
+                        // view with something that could not be folded costs
+                        // a payment.
                         warn!(
-                            "could not fold an address state for {:?} into the one held, using it \
-                             as it arrived: {e}",
+                            "could not fold an address state for {:?} into the one held, keeping \
+                             what is held: {e}",
                             &contract_id[..8.min(contract_id.len())]
                         );
-                        state
+                        return;
                     }
                 }
             }
@@ -13244,6 +13262,161 @@ mod buy_flow_tests {
             state.settled_orders(STORE).len(),
             1,
             "and the order stays settleable"
+        );
+    }
+
+    /// **One unverifiable claim cannot erase a payment.**
+    ///
+    /// The fold is what stops a copy that is behind from taking anything
+    /// away, and it is built on `from_claims`, which fails on the FIRST
+    /// claim that does not verify. So an arriving copy carrying one piece of
+    /// junk -- signed by nobody, costing nothing to produce -- would abandon
+    /// the fold, and any fallback that used the arriving copy would restore
+    /// the erasure in full. Found in review, by probe, against exactly this
+    /// shape.
+    #[test]
+    fn a_claim_that_does_not_verify_cannot_erase_a_payment() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, OutPoint};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        let paid = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&paid).expect("cbor"),
+        );
+        let before = state
+            .bitcoin
+            .addresses
+            .get(id.as_slice())
+            .expect("a view")
+            .confirmed_sats;
+        assert!(before > 0, "the fixture pays the order");
+
+        // A copy carrying no payment, plus one claim signed by a key no
+        // bridge holds. Assembled by hand rather than through
+        // `from_claims`, which would refuse it -- which is the point.
+        let mut poisoned = address_state_carrying(&order, Vec::new());
+        let stranger = SigningKey::from_bytes(&[77u8; 32]);
+        let junk = freenet_bitcoin_common::SignedClaim::sign(
+            &stranger,
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::MempoolOutput {
+                    outpoint: OutPoint {
+                        txid: freenet_bitcoin_common::Txid([9u8; 32]),
+                        vout: 0,
+                    },
+                    value_sats: 999_999,
+                },
+            },
+        )
+        .expect("sign");
+        poisoned.claims.claims.insert(
+            freenet_bitcoin_common::address_state::ClaimKey(junk.digest()),
+            junk,
+        );
+
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&poisoned).expect("cbor"),
+        );
+
+        let after = state.bitcoin.addresses.get(id.as_slice()).expect("a view");
+        assert_eq!(
+            after.confirmed_sats, before,
+            "the payment survives a copy carrying an unverifiable claim"
+        );
+        assert!(
+            after.pending_sats < 999_999,
+            "and the unverifiable claim is not counted"
+        );
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "and the order is still settleable"
+        );
+    }
+
+    /// **A copy from before a retraction cannot un-retract it.**
+    ///
+    /// The direction the fold was written for, asserted rather than only
+    /// described: a reorg retraction is an extra signed claim, so a copy
+    /// that predates it differs only by absence, and replacing the view with
+    /// that copy would publish `Paid` for a payment that has been reversed.
+    #[test]
+    fn a_copy_from_before_a_retraction_cannot_undo_it() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, SignedClaim};
+
+        let (order, claims, tip) = a_paid_order();
+        let mut state = seller_holding(&order);
+        let mut tip_view = tip_at(TIP_HEIGHT);
+        tip_view.signed_tip = Some(tip);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip_view);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+        assert_eq!(tick_rereads(&mut state, 0), vec![id], "asked");
+
+        // The payment, and then the bridge retracting it after a reorg.
+        let outpoint = claims
+            .iter()
+            .find_map(|c| match c.body().expect("body").claim {
+                Claim::ConfirmedOutput { outpoint, .. } => Some(outpoint),
+                _ => None,
+            })
+            .expect("the fixture confirms an output");
+        let retraction = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([6u8; 32]),
+                },
+                claim: Claim::Retracted { outpoint },
+            },
+        )
+        .expect("sign the retraction");
+
+        let mut with_retraction = claims.clone();
+        with_retraction.push(retraction);
+        let reversed = address_state_carrying(&order, with_retraction);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&reversed).expect("cbor"),
+        );
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "a retracted payment does not settle the order"
+        );
+
+        // A copy from before the reorg, at the same watermark.
+        let pre_reorg = address_state_carrying(&order, claims);
+        state.on_contract_state(
+            id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&pre_reorg).expect("cbor"),
+        );
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "and a copy that predates the retraction must not bring it back"
         );
     }
 
