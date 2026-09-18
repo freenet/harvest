@@ -9,14 +9,22 @@
 //! always keep up: a peer that misses one live fan-out serves its own copy
 //! until anti-entropy repairs it, which took ~18 minutes in the live test on
 //! 2026-09-17 and is measured in the field at 300s to 40-75 minutes
-//! (freenet-core#5527). While that lasts, every GET is answered from the
-//! stale copy, because a peer serves its best local copy immediately rather
-//! than blocking a read to confirm freshness (`hosting-invariants.md`
-//! invariant 1, which also says there is no freshness flag to ask for).
+//! (freenet-core#5527). While that lasts, every GET is answered from that
+//! copy, and no GET can do better: a read is served locally without
+//! consulting the network, and `hosting-invariants.md` invariant 1 settles
+//! that there is no freshness flag to ask for and that none should be added.
 //!
-//! So the node heals on its own, and nothing told Harvest. A seller watched
-//! an order that had been paid, confirmed and attested sit on "awaiting
-//! payment", and a reload did not help, because a reload asks once too.
+//! So the node heals on its own, and Harvest was not told. The "was not told"
+//! half is an inference rather than an established fact: the observed
+//! behaviour is consistent with no update notification reaching an already
+//! subscribed client when a repair lands locally, and nobody has confirmed
+//! that is what the node does. If it turns out notifications do fire, this
+//! module is cheap insurance rather than the fix, and the real defect is
+//! whatever swallowed the notification.
+//!
+//! What was observed is not in doubt: a seller watched an order that had been
+//! paid, confirmed and attested sit on "awaiting payment", and a reload did
+//! not help, because a reload asks once too.
 //!
 //! The fix is to keep asking while an order is unsettled. Re-asking cannot
 //! make a stale answer fresh, and it is not trying to: it is what converts a
@@ -43,14 +51,28 @@
 //! answers every ask, so resetting on arrival would hold the fastest cadence
 //! for exactly the case the widening exists to bound.
 //!
-//! # What bounds it
+//! # What bounds it, and where the bound has a hole
 //!
 //! Nothing here. The caller passes only addresses still worth asking about,
 //! which is how an invoice nobody ever pays stops being asked about: see
 //! `AppState::address_contracts_to_reread`, which drops an order that has
-//! settled and one whose anchor has aged out of the payable window. Entries
-//! for addresses the caller stops naming are forgotten by [`Self::retain`],
-//! so a long session does not accumulate them.
+//! settled and one whose anchor has aged out of the payable window.
+//!
+//! **That window needs a chain tip.** With no tip this node cannot say the
+//! window has closed, and an order is kept rather than abandoned, so a tab
+//! that never resolves a tip keeps asking about its unsettled orders at the
+//! ceiling for as long as it is open. That is deliberate (the alternative
+//! stops watching an order that is still being paid) but it means the bound
+//! is "the payable window, once a tip is known", not "the payable window".
+//!
+//! Entries for addresses the caller stops naming are forgotten by
+//! [`Self::retain`], which runs on any tick that has something to send. Two
+//! consequences worth knowing: when the LAST unsettled order settles there is
+//! nothing to send, so its entry is pruned on some later tick rather than at
+//! once; and an order that vanishes from a store's state and comes back --
+//! which a stale store state can do -- is asked about at the base wait again
+//! rather than the widened one. Both cost a few dozen bytes or one extra GET,
+//! which is why neither is defended against here.
 
 use std::collections::BTreeMap;
 
@@ -101,18 +123,44 @@ impl AddressRereads {
             .min(MAX_RETRY_MS)
     }
 
+    /// How far into its wait an address is offset, from its own id.
+    ///
+    /// Every address of a batch of invoices is first asked for on the same
+    /// tick, so without this they take every doubling step together and stay
+    /// in lockstep for the life of the tab: a seller with tens of unsettled
+    /// orders would send all of them in one burst, forever. Spreading them
+    /// over the first wait breaks the convoy.
+    ///
+    /// Derived from the id rather than from a random number because it has to
+    /// be the same on every tick (a fresh number each time would re-roll the
+    /// deadline and could starve one address), and because a deterministic
+    /// offset is testable. The id is a contract address, so its bytes are
+    /// already uniformly distributed.
+    fn stagger(id: &[u8; 32]) -> u64 {
+        (id[0] as u64) * (FIRST_RETRY_MS / 256)
+    }
+
     /// Which of `wanted` to ask for now, in the caller's order.
     ///
     /// An address never asked for is due at once. That is the first re-ask
     /// after the original subscription, and it is wanted: the subscription's
     /// own answer is exactly the one that may be stale.
+    ///
+    /// A clock that has gone backwards since the last ask also makes an
+    /// address due. The alternative is worse than asking early: the wait is
+    /// measured against a wall clock (`chrono::Utc::now`), so an NTP
+    /// correction or a user fixing a wrong clock would otherwise park every
+    /// unsettled order until real time caught up, silently, for exactly the
+    /// orders this exists to watch.
     pub fn due(&self, wanted: &[[u8; 32]], now_ms: u64) -> Vec<[u8; 32]> {
         wanted
             .iter()
             .filter(|id| match self.asked.get(*id) {
                 None => true,
                 Some(asked) => {
-                    now_ms.saturating_sub(asked.at_ms) >= Self::spacing(asked.consecutive)
+                    now_ms < asked.at_ms
+                        || now_ms.saturating_sub(asked.at_ms)
+                            >= Self::spacing(asked.consecutive) + Self::stagger(id)
                 }
             })
             .copied()
@@ -127,6 +175,20 @@ impl AddressRereads {
         });
         entry.at_ms = now_ms;
         entry.consecutive = entry.consecutive.saturating_add(1);
+    }
+
+    /// Take back an ask that turned out not to have been sent.
+    ///
+    /// The ask is recorded before the request is dispatched, so that one tick
+    /// cannot ask twice; when the dispatch then fails there is nothing in
+    /// flight and the record is a lie that costs a doubling step. A tab whose
+    /// websocket is down would otherwise widen to the ceiling having sent
+    /// nothing at all, and be at its slowest at the moment it reconnects.
+    ///
+    /// The same shape as `AppState::spawn_inbox_entry_signature`, which
+    /// withdraws its pending signature when the send fails.
+    pub fn forget(&mut self, id: &[u8; 32]) {
+        self.asked.remove(id);
     }
 
     /// Forget every address not in `wanted`.
@@ -152,8 +214,17 @@ impl AddressRereads {
 mod tests {
     use super::*;
 
-    const A: [u8; 32] = [1; 32];
-    const B: [u8; 32] = [2; 32];
+    /// An id whose first byte is 0, so [`AddressRereads::stagger`] is 0 and a
+    /// test of the spacing measures the spacing alone. The stagger has its
+    /// own test below.
+    const fn unstaggered(tag: u8) -> [u8; 32] {
+        let mut id = [tag; 32];
+        id[0] = 0;
+        id
+    }
+
+    const A: [u8; 32] = unstaggered(1);
+    const B: [u8; 32] = unstaggered(2);
 
     /// **An address never asked about is asked about at once.**
     ///
@@ -262,6 +333,76 @@ mod tests {
             vec![A],
             "and asking about A again starts from scratch"
         );
+    }
+
+    /// **Addresses asked for together do not stay in lockstep.**
+    ///
+    /// Every invoice in a batch is first asked about on the same tick, so
+    /// without a per-address offset they take every doubling step together
+    /// and a seller with tens of unsettled orders sends all of them in one
+    /// burst, forever.
+    #[test]
+    fn addresses_asked_together_do_not_come_due_together() {
+        let mut tracker = AddressRereads::default();
+        let early = unstaggered(9);
+        let late = {
+            let mut id = [9u8; 32];
+            id[0] = 255;
+            id
+        };
+        tracker.note_asked(early, 0);
+        tracker.note_asked(late, 0);
+
+        let due = tracker.due(&[early, late], FIRST_RETRY_MS);
+        assert_eq!(
+            due,
+            vec![early],
+            "the offset address waits longer than the one with no offset"
+        );
+        assert_eq!(
+            tracker.due(&[early, late], FIRST_RETRY_MS * 2).len(),
+            2,
+            "and both are asked for eventually"
+        );
+    }
+
+    /// **A clock that jumps backwards does not park every order.**
+    ///
+    /// The wait is measured against a wall clock, so an NTP correction or a
+    /// user fixing a wrong clock would otherwise stop the re-reads until real
+    /// time caught up -- silently, for exactly the orders being watched. The
+    /// failure mode this avoids is not a wrong answer but no answer at all.
+    #[test]
+    fn a_clock_that_goes_backwards_does_not_stop_the_asking() {
+        let mut tracker = AddressRereads::default();
+        tracker.note_asked(A, 10 * FIRST_RETRY_MS);
+
+        assert_eq!(
+            tracker.due(&[A], 1_000),
+            vec![A],
+            "a backwards clock step makes the address due rather than parking it"
+        );
+    }
+
+    /// **An ask that was never sent does not cost a doubling step.**
+    ///
+    /// The ask is recorded before the request is dispatched so one tick
+    /// cannot ask twice. When the dispatch fails there is nothing in flight,
+    /// and a tab whose websocket is down would otherwise widen to the ceiling
+    /// having sent nothing -- arriving at its slowest exactly when it
+    /// reconnects.
+    #[test]
+    fn a_withdrawn_ask_does_not_widen_the_wait() {
+        let mut tracker = AddressRereads::default();
+        tracker.note_asked(A, 0);
+        tracker.forget(&A);
+
+        assert_eq!(
+            tracker.due(&[A], 0),
+            vec![A],
+            "due again at once, as though it had never been asked"
+        );
+        assert_eq!(tracker.tracked(), 0, "and nothing is remembered about it");
     }
 
     /// **The widening cannot overflow the shift.**
