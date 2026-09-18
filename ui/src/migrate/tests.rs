@@ -1973,8 +1973,10 @@ fn every_fold_order_with_injected_version_zero_details_moves_the_listings() {
     let mut junk = store_with(&[signed_listing("Alpha")]);
     junk.info.info.store_name = "Totally Legit Farm".into();
     junk.info.info.encryption_public_key = Some([0xAA; 32]);
-    let mut signed = StoreStateV1::default();
-    signed.info = signed_store_info(1);
+    let signed = StoreStateV1 {
+        info: signed_store_info(1),
+        ..Default::default()
+    };
     let plain = store_with(&[signed_listing("Alpha")]);
 
     let fold = |base: StoreStateV1, other: &StoreStateV1| {
