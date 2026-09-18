@@ -707,6 +707,14 @@ mod order_tests {
         DateTime::from_timestamp(secs, 0).unwrap()
     }
 
+    /// The block every test order is anchored to: one below the lowest
+    /// height any fixture here confirms a payment at (100), so each fixture
+    /// payment reads as made AFTER its order, which is what an honest buyer's
+    /// payment always is. `verify_on_chain_proof` refuses a payment at or
+    /// below the anchor (harvest#77); the tests that exercise that boundary
+    /// set their own anchor rather than moving this one.
+    const ORDER_ANCHOR_HEIGHT: u32 = 99;
+
     fn make_order(buyer_fp: &str, created_at_secs: i64, script: &[u8]) -> Order {
         let seller_fp = "seller-fingerprint";
         let ts = timestamp(created_at_secs);
@@ -724,7 +732,10 @@ mod order_tests {
             // seller's signature, rather than in the store's address.
             trusted_bridges: bridges(&bridge_key()),
             bitcoin_address_code_hash: None,
-            anchor: None,
+            anchor: Some(BlockAnchor {
+                height: ORDER_ANCHOR_HEIGHT,
+                hash: BlockHash([0x99; 32]),
+            }),
             order_binding: None,
             listing_tag: None,
             created_at: ts,
@@ -1609,6 +1620,203 @@ mod order_tests {
         assert!(
             state.verify(&StoreStateV1::default(), &p).is_ok(),
             "KNOWN GAP: the contract accepts the curated proof as a paid order",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // A payment made before the order is not the order's payment
+    //
+    // harvest#77: a seller reinstalled Harvest, re-entered the same wallet
+    // key, and was issued index 0 again. The new invoice named an address
+    // that already held a confirmed payment for an old one, and settled
+    // itself without anybody paying. These pin the rule that makes that
+    // impossible, whatever the derivation index does.
+    // -----------------------------------------------------------------
+
+    /// `make_order`, anchored at `height` instead of [`ORDER_ANCHOR_HEIGHT`].
+    fn order_anchored_at(height: u32) -> Order {
+        let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        order.anchor = Some(BlockAnchor {
+            height,
+            hash: BlockHash([0x42; 32]),
+        });
+        order.with_derived_id()
+    }
+
+    /// **The reported case.** The address already held a confirmed payment of
+    /// the full amount, made hours before the order was signed. It must not
+    /// settle the order, at the contract layer as well as in the proof.
+    #[test]
+    fn a_payment_that_confirmed_before_the_order_does_not_settle_it() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        // Paid at 100 for an earlier invoice; the new order is signed at 150.
+        let order = order_anchored_at(150);
+        let (old_payment, _) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let proof = OrderPaymentProof::on_chain(vec![old_payment], signed_tip(&order, &bridge, 160));
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &proof),
+            Err(crate::payment::ProofError::PaymentPredatesOrder {
+                confirmed_at: 100,
+                order_anchor: 150,
+            })
+        );
+
+        let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
+        let state = orders_of([(order.id.clone(), record)]);
+        assert!(
+            state.verify(&StoreStateV1::default(), &p).is_err(),
+            "the store must refuse an order settled by a payment older than the order"
+        );
+    }
+
+    /// **The boundary.** A payment in the anchor block itself predates the
+    /// order: the seller signed after seeing that block, and the buyer only
+    /// learned the address from the signed order. The next block is the
+    /// earliest an honest payment can land, and it must still settle.
+    #[test]
+    fn a_payment_in_the_anchor_block_does_not_settle_but_the_next_block_does() {
+        let bridge = bridge_key();
+        let order = order_anchored_at(150);
+
+        let (same_block, _) = confirmed_claim(&order, &bridge, order.amount_sats, 150);
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![same_block], signed_tip(&order, &bridge, 150)),
+            ),
+            Err(crate::payment::ProofError::PaymentPredatesOrder {
+                confirmed_at: 150,
+                order_anchor: 150,
+            }),
+            "a payment confirmed in the block the order was anchored to came before it"
+        );
+
+        let (next_block, _) = confirmed_claim(&order, &bridge, order.amount_sats, 151);
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![next_block], signed_tip(&order, &bridge, 151)),
+            ),
+            Ok(order.amount_sats),
+            "a payment in the block after the anchor is exactly what an honest buyer produces"
+        );
+    }
+
+    /// An old payment must not TOP UP a new one either. Here the address
+    /// holds 50,000 from before the order and 30,000 after: the order is
+    /// short, not paid. And when the new payment does cover the order, the
+    /// value reported is the new payment's alone.
+    #[test]
+    fn an_old_payment_does_not_count_toward_a_new_order() {
+        let bridge = bridge_key();
+        let order = order_anchored_at(150);
+        assert_eq!(order.amount_sats, 50_000);
+        let tip = signed_tip(&order, &bridge, 160);
+
+        let (old, _) = confirmed_claim(&order, &bridge, 50_000, 100);
+        let (partial, _) = confirmed_claim(&order, &bridge, 30_000, 155);
+        assert!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![old.clone(), partial], tip.clone()),
+            )
+            .is_err(),
+            "30,000 paid after the order is not 50,000, whatever arrived before it"
+        );
+
+        let (full, _) = confirmed_claim(&order, &bridge, 50_001, 155);
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(vec![old, full], tip),
+            ),
+            Ok(50_001),
+            "only the payment made after the order is this order's"
+        );
+    }
+
+    /// Judged per OUTPOINT over every confirmation of it. A transaction that
+    /// confirmed before the order, was reorged out, and was mined again after
+    /// the anchor is still a transaction that existed before the order --
+    /// even though the fold's current verdict on it is the later block.
+    #[test]
+    fn a_pre_order_payment_re_mined_after_the_anchor_still_predates_it() {
+        let bridge = bridge_key();
+        let order = order_anchored_at(150);
+
+        let (first, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 101);
+        let (again, again_outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 152);
+        assert_eq!(outpoint, again_outpoint, "one transaction, mined twice");
+
+        assert_eq!(
+            crate::payment::verify_payment_proof(
+                &order,
+                &OrderPaymentProof::on_chain(
+                    vec![first, retracted, again],
+                    signed_tip(&order, &bridge, 160),
+                ),
+            ),
+            Err(crate::payment::ProofError::PaymentPredatesOrder {
+                confirmed_at: 100,
+                order_anchor: 150,
+            })
+        );
+    }
+
+    /// The reversal direction. A reorg that retracts an OLD payment on a
+    /// reused address must not read as a reversal of the NEW order, which
+    /// nobody has paid: `PaymentReversed` is permanent under merge and
+    /// unsigned, so this would let anyone holding the old retraction poison
+    /// the new order for good.
+    #[test]
+    fn a_retracted_pre_order_payment_cannot_reverse_a_new_order() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = order_anchored_at(150);
+
+        let (old, outpoint) = confirmed_claim(&order, &bridge, order.amount_sats, 100);
+        let retracted = retraction_claim(&order, &bridge, outpoint, 155);
+        let proof =
+            OrderPaymentProof::on_chain(vec![old, retracted], signed_tip(&order, &bridge, 160));
+
+        assert_ne!(
+            crate::payment::verify_payment_proof(&order, &proof),
+            Err(crate::payment::ProofError::Reversed),
+            "an old payment being reorged out is not this order's payment being reversed"
+        );
+        let record = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::PaymentReversed,
+            Some(proof),
+        );
+        assert!(
+            orders_of([(order.id.clone(), record)])
+                .verify(&StoreStateV1::default(), &p)
+                .is_err(),
+            "the store must refuse a reversal built out of a payment older than the order"
+        );
+    }
+
+    /// An on-chain order that names no anchor cannot be paid: without a block
+    /// to measure against, no payment can be shown to have come after it.
+    /// Every order the UI issues carries one, and a buyer refuses to pay one
+    /// that does not, so this refuses nothing anybody would have paid.
+    #[test]
+    fn an_on_chain_order_without_an_anchor_cannot_be_paid() {
+        let bridge = bridge_key();
+        let mut order = make_order("buyer-1", 1_700_000_000, &[0x00, 0x14, 0xaa, 0xbb]);
+        order.anchor = None;
+        let order = order.with_derived_id();
+        let proof = make_payment_proof(&order, &bridge, 1);
+        assert_eq!(
+            crate::payment::verify_payment_proof(&order, &proof),
+            Err(crate::payment::ProofError::NoAnchor)
         );
     }
 

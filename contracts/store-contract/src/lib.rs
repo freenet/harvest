@@ -350,6 +350,16 @@ mod tests {
     }
 
     fn make_order(script: &[u8], code_hash: Option<[u8; 32]>) -> Order {
+        // One block before `make_paid_order` confirms its payment (100), so
+        // the payment reads as made after the order, as an honest one is.
+        make_order_anchored_at(script, code_hash, 99)
+    }
+
+    fn make_order_anchored_at(
+        script: &[u8],
+        code_hash: Option<[u8; 32]>,
+        anchor_height: u32,
+    ) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
             id: OrderId([0u8; 32]),
@@ -365,7 +375,10 @@ mod tests {
                 bridge_key().verifying_key().to_bytes(),
             )],
             bitcoin_address_code_hash: code_hash,
-            anchor: None,
+            anchor: Some(BlockAnchor {
+                height: anchor_height,
+                hash: BlockHash([0x42; 32]),
+            }),
             order_binding: None,
             listing_tag: None,
             created_at: ts,
@@ -529,5 +542,31 @@ mod tests {
             "an order whose related contract came back empty must still validate, on the \
              strength of its own embedded proof"
         );
+    }
+
+    /// harvest#77, at the layer that decides. A store state holding an order
+    /// marked `Paid` by a payment that confirmed (block 100) before the order
+    /// was signed (anchored at block 150) is refused by the contract itself,
+    /// so no peer running it accepts the settlement whatever the UI does.
+    #[test]
+    fn refuses_an_order_settled_by_a_payment_older_than_the_order() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let order = make_order_anchored_at(&[0x00, 0x14, 0xaa, 0xbb], None, 150);
+        let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
+        let params = params_bytes(&seller);
+
+        let result = Contract::validate_state(
+            Parameters::from(params),
+            State::from(state_bytes),
+            RelatedContracts::new(),
+        );
+        match result {
+            Err(ContractError::InvalidUpdateWithInfo { reason }) => assert!(
+                reason.contains("at or before block 150"),
+                "the refusal should say the payment predates the order: {reason}"
+            ),
+            other => panic!("a pre-order payment must not settle the order, got {other:?}"),
+        }
     }
 }

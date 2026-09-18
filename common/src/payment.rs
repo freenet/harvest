@@ -423,6 +423,15 @@ pub struct Order {
     /// See `harvest_ui::state::AppState::payment_blockers`. This field
     /// carries the fact; the verdict is not a contract's to form.
     ///
+    /// # The one thing the contract DOES use it for
+    ///
+    /// A comparison between two heights, which needs no clock: a payment that
+    /// confirmed at or below this block was made before the order, so it does
+    /// not settle it (harvest#77, and `verify_on_chain_proof`). Backdating the
+    /// anchor only widens what the SELLER's own order accepts, so the seller
+    /// has no reason to; the rule protects the seller from their own address
+    /// being issued twice, not the buyer from the seller.
+    ///
     /// # Why `Option`, and why it skips when absent
     ///
     /// `None` for every order signed before this field existed.
@@ -435,7 +444,8 @@ pub struct Order {
     /// which was observed red against the naive `#[serde(default)]`-only
     /// form.
     ///
-    /// A buyer refuses to pay an order with no anchor, so absence is the safe
+    /// A buyer refuses to pay an order with no anchor, and an on-chain proof
+    /// for one is refused (`ProofError::NoAnchor`), so absence is the safe
     /// direction rather than a silent downgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<BlockAnchor>,
@@ -749,6 +759,18 @@ pub enum ProofError {
         have_bytes: usize,
         budget: usize,
     },
+    /// An on-chain order with no [`Order::anchor`]: nothing says when it was
+    /// made, so no payment can be shown to have come after it.
+    NoAnchor,
+    /// The value that reached the script confirmed in a block at or below
+    /// the order's anchor, i.e. before the order existed. See
+    /// [`verify_on_chain_proof`] for why that payment cannot be this order's.
+    PaymentPredatesOrder {
+        /// The highest block height, among the refused outpoints, at which
+        /// one of them confirmed.
+        confirmed_at: u32,
+        order_anchor: u32,
+    },
 }
 
 impl std::fmt::Display for ProofError {
@@ -798,6 +820,19 @@ impl std::fmt::Display for ProofError {
                     "payment evidence is {have_bytes} bytes, budget is {budget}"
                 )
             }
+            ProofError::NoAnchor => write!(
+                f,
+                "the order names no Bitcoin block it was made at, so no payment can be shown \
+                 to have come after it"
+            ),
+            ProofError::PaymentPredatesOrder {
+                confirmed_at,
+                order_anchor,
+            } => write!(
+                f,
+                "the payment at this address confirmed in block {confirmed_at}, at or before \
+                 block {order_anchor} when this order was made, so it paid for something else"
+            ),
         }
     }
 }
@@ -991,6 +1026,13 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     if order.trusted_bridges.is_empty() {
         return Err(ProofError::NoTrustedBridges);
     }
+    // The block the seller signed this order at. Required, because the
+    // pre-order rule in the fold below has nothing to measure against without
+    // it. Fails closed: a buyer already refuses to pay an order with no
+    // anchor (`harvest_ui::state::AppState::payment_blockers`), and every
+    // order the UI issues carries one (`order_for_invoice` refuses to build
+    // one without), so the only orders this refuses are ones nobody would pay.
+    let order_anchor_height = order.anchor.ok_or(ProofError::NoAnchor)?.height;
 
     // Bound the work BEFORE doing any crypto at all -- see
     // `MAX_PROOF_CLAIM_BYTES` and `MAX_PROOF_CLAIMS` for what each bounds and
@@ -1077,8 +1119,80 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
     // CONFIRMED by it. A retraction of something never confirmed -- a dust
     // sighting, an evicted mempool transaction -- reverses nothing.
     let mut retracted_a_confirmed_outpoint = false;
+    // The highest confirmation height among outpoints refused below for
+    // predating the order, kept only so the error can say what happened.
+    let mut predating: Option<u32> = None;
 
     for claims in by_outpoint.values() {
+        // # A payment that confirmed before the order existed is not its payment
+        //
+        // A payment's evidence is scoped to a SCRIPT, not to an order, so
+        // whatever has ever been paid to this order's address is presented
+        // here as if it were for this order. Normally each order has a fresh
+        // address and that is the same thing. It stops being the same thing
+        // the moment an address is issued twice -- which a seller reinstalling
+        // Harvest and re-entering the same wallet key used to do from index 0
+        // (harvest#77): the new invoice named an address that already held a
+        // confirmed payment for an old one, and settled itself with nobody
+        // paying anything.
+        //
+        // The order's anchor is the block the seller's software saw as the tip
+        // when it signed. That block was mined before the order was signed, so
+        // a transaction confirmed IN it or below it was broadcast before the
+        // order existed and cannot have been sent in answer to it. Such an
+        // outpoint is dropped from this order's fold entirely: it adds nothing
+        // to what was paid, and -- because it is dropped before the reversal
+        // bookkeeping -- a later retraction of it cannot read as this order's
+        // payment being reversed either.
+        //
+        // ## The boundary is `<=`, so a payment in the anchor block itself is
+        // refused
+        //
+        // The seller could only have signed after seeing the anchor block, and
+        // the buyer only learns the address from the signed order, so an
+        // honest payment lands at `anchor + 1` at the earliest. The one honest
+        // case `<=` gets wrong needs a reorg AT the anchor height that
+        // replaces the anchor block with one carrying the buyer's payment; the
+        // order then names a block that is no longer on the chain, which a
+        // buyer's own software treats as unpayable anyway. Failing closed
+        // there costs a reissued invoice. Failing open costs goods shipped for
+        // nothing.
+        //
+        // ## What the anchor does NOT bound
+        //
+        // It is a lower bound on when the order was made, set by the seller's
+        // own view of the tip. A tip that lags reality makes the anchor older
+        // than the order, so a payment that confirmed inside that lag still
+        // reads as after the order; a buyer refuses anchors more than
+        // [`MAX_ANCHOR_AGE_BLOCKS`] behind, which caps the window but does not
+        // close it. And a payment broadcast before the order but still
+        // UNCONFIRMED when it was made confirms after the anchor and is
+        // counted. Both residuals are why the UI also recovers its derivation
+        // index from the store (so an address is not issued twice in the first
+        // place); this rule is the backstop that makes the reported case
+        // impossible, not a substitute for not reusing addresses.
+        //
+        // Judged per OUTPOINT, over every confirmation of it, because a
+        // transaction that confirmed before the order and was reorged into a
+        // later block is still a transaction that existed before the order.
+        let predates_order = claims
+            .iter()
+            .filter_map(|b| match &b.claim {
+                Claim::ConfirmedOutput {
+                    outpoint: _,
+                    value_sats: _,
+                    anchor,
+                    spv: _,
+                } => Some(anchor.height),
+                _ => None,
+            })
+            .filter(|&confirmed_at| confirmed_at <= order_anchor_height)
+            .max();
+        if let Some(confirmed_at) = predates_order {
+            predating = Some(predating.map_or(confirmed_at, |p: u32| p.max(confirmed_at)));
+            continue;
+        }
+
         // The value the proof attests this outpoint once held, if it holds a
         // confirmation for it at all. Taking the minimum across duplicates is
         // the conservative direction for a value that will be used to ADMIT a
@@ -1188,6 +1302,15 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
         return Err(ProofError::Reversed);
     }
     if confirmed_total < order.amount_sats {
+        // Said as its own error when refusing a pre-order payment is what
+        // left the order short, because "short of the amount" is not what a
+        // seller looking at a funded address needs to be told.
+        if let Some(confirmed_at) = predating {
+            return Err(ProofError::PaymentPredatesOrder {
+                confirmed_at,
+                order_anchor: order_anchor_height,
+            });
+        }
         return Err(ProofError::InsufficientValue {
             have_sats: confirmed_total,
             need_sats: order.amount_sats,
@@ -2219,7 +2342,12 @@ mod proof_assembly_tests {
             payment_hash: None,
             trusted_bridges: vec![BridgeId(bridge().verifying_key().to_bytes())],
             bitcoin_address_code_hash: Some([4u8; 32]),
-            anchor: None,
+            // One below the lowest height a fixture here confirms at, so each
+            // payment reads as made after its order (see `verify_on_chain_proof`).
+            anchor: Some(BlockAnchor {
+                height: 99,
+                hash: BlockHash([0x99; 32]),
+            }),
             order_binding: None,
             listing_tag: None,
             created_at,

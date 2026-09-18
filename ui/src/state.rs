@@ -12529,9 +12529,14 @@ mod buy_flow_tests {
             BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
         };
 
+        // Anchored two blocks below the tip and paid in the block after
+        // that: the order has to exist BEFORE its payment, or
+        // `verify_on_chain_proof` refuses the payment as one made for
+        // something else (harvest#77). Still well inside
+        // `MAX_ANCHOR_AGE_BLOCKS`, so the buyer's own freshness check holds.
         let mut order = commitment(
             &seller_signing_key(),
-            Some(anchor(TIP_HEIGHT)),
+            Some(anchor(TIP_HEIGHT - 2)),
             OrderStatus::AwaitingPayment,
         );
         order.order.trusted_bridges = vec![freenet_bitcoin_common::BridgeId(
@@ -12691,6 +12696,29 @@ mod buy_flow_tests {
     /// Publishing `Paid` on evidence that does not carry it is a state every
     /// peer refuses, which on the buyer's screen looks like the payment
     /// never registering.
+    /// **harvest#77, through the state that publishes.** The same payment
+    /// that settles [`a_paid_order`] does not settle an order signed AFTER it
+    /// confirmed, which is what an address issued twice looks like from here:
+    /// the node holds genuine, verifying claims of the full amount at the
+    /// order's own script, and they are for something else.
+    #[test]
+    fn a_payment_older_than_the_order_does_not_settle_it() {
+        let (paid, claims, tip) = a_paid_order();
+        // The payment confirmed at TIP_HEIGHT - 1; this order was signed at
+        // the tip, one block later, on the same address.
+        let mut later = paid.clone();
+        later.order.anchor = Some(anchor(TIP_HEIGHT));
+        let later = resigned(later, &seller_signing_key());
+
+        let (mut state, _) = buyer_after_acceptance(&later);
+        give_the_node_the_chain(&mut state, &later, claims, tip);
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "a payment that confirmed before the order was signed settled it"
+        );
+    }
+
     #[test]
     fn an_unpaid_order_is_not_settled() {
         let (order, claims, tip) = a_paid_order();
