@@ -18,8 +18,24 @@ pub enum FeedbackCategory {
 pub struct FeedbackToken {
     /// Which reputation contract this token targets (ContractInstanceId bytes).
     pub target_reputation_contract: [u8; 32],
-    /// Unique nonce to prevent replay.
+    /// Unique nonce to prevent replay. One token carries at most one piece of
+    /// feedback, and this is how the reputation contract names that slot.
     pub nonce: [u8; 32],
+    /// Ed25519 verifying key of a keypair the buyer generates fresh for this
+    /// token and keeps the secret half of.
+    ///
+    /// The seller's blind signature covers the token, so it covers this key,
+    /// and the key in turn signs the whole feedback entry (see
+    /// [`crate::reputation::FeedbackEntry::entry_signature`]). That is what
+    /// makes the category, the comment and the timestamp part of what was
+    /// signed. Before this field existed the RSA signature covered the token
+    /// alone, so anyone reading a published entry could re-submit the token
+    /// with different words (harvest#22).
+    ///
+    /// Fresh per token so it links nothing: the seller never sees the token
+    /// unblinded until the feedback is published, and a key reused across
+    /// tokens would tie a buyer's feedback together.
+    pub entry_key: [u8; 32],
 }
 
 /// Protocol messages for the feedback token exchange, sent via encrypted mailbox.

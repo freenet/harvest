@@ -56,27 +56,11 @@ impl ContractInterface for Contract {
                 UpdateData::State(new_state) => {
                     let new_state = from_reader::<ReputationStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    // Merge: add any feedback entries we don't have
-                    let delta: ReputationDelta = new_state
-                        .feedback
-                        .into_iter()
-                        // nonce-identity-waiver: reputation keys identity on `token.nonce` and has the
-                        // same defect the mailbox re-key fixed -- see
-                        // `known_gap_two_feedback_variants_sharing_a_token_do_not_converge`. Parked
-                        // until the reputation contract's own re-key; NOT a site to copy.
-                        .filter(|e| !reputation_state.used_nonces.contains(&e.token.nonce))
-                        .collect();
-                    if !delta.is_empty() {
-                        reputation_state
-                            .apply_delta(&parameters, &Some(delta))
-                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                                reason: e.to_string(),
-                            })?;
-                    }
-                    // Update certificate if empty
-                    if reputation_state.owner_certificate_pem.is_empty() {
-                        reputation_state.owner_certificate_pem = new_state.owner_certificate_pem;
-                    }
+                    reputation_state
+                        .merge(&parameters, &new_state)
+                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        })?;
                 }
                 UpdateData::Delta(d) => {
                     if d.as_ref().is_empty() {
@@ -129,10 +113,26 @@ impl ContractInterface for Contract {
     ) -> Result<StateDelta<'static>, ContractError> {
         let _parameters = from_reader::<ReputationParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // Zero bytes on either side means "there is no state here yet", not a
+        // malformed encoding (harvest#55). `summarize_state` answers an empty
+        // state with a zero-byte summary, and an empty `BTreeSet` encodes as
+        // `0x80`, never as zero bytes, so decoding either one fails. The
+        // mailbox contract already guards both; this is the same pattern.
+        //
+        // A holder with nothing has nothing to send.
+        if state.as_ref().is_empty() {
+            return Ok(StateDelta::from(vec![]));
+        }
         let reputation_state = from_reader::<ReputationStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let old_summary = from_reader::<ReputationSummary, &[u8]>(summary.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // A requester with nothing knows nothing: the empty summary is the
+        // summary of the empty state, so the delta is everything held.
+        let old_summary = if summary.as_ref().is_empty() {
+            ReputationStateV1::default().summarize()
+        } else {
+            from_reader::<ReputationSummary, &[u8]>(summary.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
+        };
 
         match reputation_state.delta(&old_summary) {
             Some(delta) => {
@@ -237,5 +237,83 @@ mod tests {
             b.as_ref(),
             "two peers holding the same nonces must send the same summary bytes"
         );
+    }
+
+    /// A feedback entry in the shape the state holds. Its signatures do not
+    /// verify, and nothing here needs them to: `get_state_delta` only reads.
+    fn unsigned_entry(nonce: u8) -> harvest_common::reputation::FeedbackEntry {
+        harvest_common::reputation::FeedbackEntry {
+            token: harvest_common::feedback::FeedbackToken {
+                target_reputation_contract: [5u8; 32],
+                nonce: [nonce; 32],
+                entry_key: [nonce; 32],
+            },
+            signature: vec![1, 2, 3],
+            category: harvest_common::feedback::FeedbackCategory::NonDelivery,
+            comment: String::new(),
+            submitted_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            entry_signature: vec![4, 5, 6],
+        }
+    }
+
+    fn state_with_feedback() -> State<'static> {
+        let mut state = ReputationStateV1::default();
+        for n in [1u8, 2] {
+            state.used_nonces.insert([n; 32]);
+            state.feedback.push(unsigned_entry(n));
+        }
+        let mut bytes = vec![];
+        into_writer(&state, &mut bytes).expect("encode state");
+        State::from(bytes)
+    }
+
+    /// **A new subscriber's first exchange gets the state, not a decode
+    /// error (harvest#55).**
+    ///
+    /// The subscriber has no state, so `summarize_state` gives it a zero-byte
+    /// summary, and a holder asked for the delta against that summary used to
+    /// fail decoding it: an empty `BTreeSet` encodes as `0x80`, never as zero
+    /// bytes. The empty summary means "knows nothing", so the answer is
+    /// everything held.
+    #[test]
+    fn an_empty_summary_is_answered_with_everything_held() {
+        let empty_summary =
+            <Contract as ContractInterface>::summarize_state(parameters(), State::from(vec![]))
+                .expect("summarize the absent state");
+        assert!(
+            empty_summary.as_ref().is_empty(),
+            "precondition: the absent state's summary is zero bytes"
+        );
+
+        let delta = <Contract as ContractInterface>::get_state_delta(
+            parameters(),
+            state_with_feedback(),
+            empty_summary,
+        )
+        .expect("an empty summary must not be a decode error");
+        let delta: ReputationDelta = from_reader(delta.as_ref()).expect("decode delta");
+        assert_eq!(
+            delta.len(),
+            2,
+            "a requester that holds nothing is sent everything"
+        );
+    }
+
+    /// The mirror image: a holder with no state of its own answers with an
+    /// empty delta rather than failing to decode its own zero bytes.
+    #[test]
+    fn an_empty_state_answers_with_an_empty_delta() {
+        let some_summary =
+            <Contract as ContractInterface>::summarize_state(parameters(), state_with_feedback())
+                .expect("summarize");
+        for summary in [some_summary, StateSummary::from(vec![])] {
+            let delta = <Contract as ContractInterface>::get_state_delta(
+                parameters(),
+                State::from(vec![]),
+                summary,
+            )
+            .expect("an empty state must not be a decode error");
+            assert!(delta.as_ref().is_empty(), "nothing held, nothing to send");
+        }
     }
 }

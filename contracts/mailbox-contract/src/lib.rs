@@ -562,14 +562,14 @@ mod tests {
     ///
     /// # Waivers
     ///
-    /// The reputation contract decides identity by `token.nonce` and has the
-    /// same defect (`known_gap_two_feedback_variants_sharing_a_token_do_not_converge`,
-    /// issue #22). Its re-key is deliberately not on this branch, so those
-    /// sites carry an explicit `nonce-identity-waiver:` marker naming the gap,
-    /// as does the one line in `merge_reputation_reporting_exclusions` that
-    /// DETECTS such a collision in order to report it. The count is asserted,
-    /// so another site cannot join them quietly -- which is the whole
-    /// difference between a documented gap and a spreading one.
+    /// There are none today. The reputation contract used to carry five, for
+    /// deciding feedback identity by `token.nonce` while its signature covered
+    /// the token alone (issue #22). Its re-key closed that: the token's entry
+    /// key now signs every field, so the nonce names a slot only the buyer can
+    /// fill, and two entries for it are resolved by their bytes. The markers
+    /// went with the defect. The count is still asserted, so a new site cannot
+    /// join quietly -- which is the whole difference between a documented gap
+    /// and a spreading one.
     ///
     /// A waiver marks a LINE, not a function: it applies to the next line that
     /// is not blank or a comment. That is deliberate, so a waiver written for
@@ -624,17 +624,17 @@ mod tests {
         assert!(scanned > 40, "the scrape found almost no files: {scanned}");
         assert!(
             offenders.is_empty(),
-            "these decide identity by nonce rather than by `entry_digest`. If this is the \
-             reputation contract's known gap, add a `nonce-identity-waiver:` comment on the \
-             line above naming it, and update the expected waiver count in this test:\n{}",
+            "these decide identity by nonce rather than by `entry_digest`. If one is a \
+             deliberate, documented gap, add a `nonce-identity-waiver:` comment on the line \
+             above naming it, and update the expected waiver count in this test:\n{}",
             offenders.join("\n")
         );
         assert_eq!(
             waived.len(),
-            5,
-            "the number of waived nonce-identity sites changed. Every one of these is the \
-             same defect the mailbox re-key fixed, parked until the reputation contract's \
-             own re-key. A new one must be a deliberate decision, not a quiet addition:\n{}",
+            0,
+            "the number of waived nonce-identity sites changed. A waiver parks the same \
+             defect the mailbox re-key fixed; a new one must be a deliberate decision, not \
+             a quiet addition:\n{}",
             waived.join("\n")
         );
     }

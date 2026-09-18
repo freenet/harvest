@@ -94,3 +94,9 @@ version = "V10"
 description = "Superseded by the canonical set-encoding fix: `MailboxSummaryV2` moved from `HashSet` to `BTreeSet`. The summary is not part of the state, so nothing stored at V9 changes shape and the fold is unaffected. See the reputation V10 row for why the mechanism is a per-construction counter rather than randomness, which is what it is on wasm32."
 date = "2026-09-09"
 code_hash = "29e874557b99730efb7a863d7d393ea8f5444d066144cf354582c23c60b11404"
+
+[[entry]]
+version = "V11"
+description = "Superseded by harvest#22, #26 and #55, in which this contract took NO behavioural change of its own; its only source edit is test code (the nonce-identity scrape's expected waiver count goes from 5 to 0, because the reputation sites it waived were fixed), which is not compiled into the artifact. The bytes moved through `harvest-common`, which is compiled in: comparing the two builds' strings, `HashSet` instantiations that the reputation code used are gone and several `BTreeMap` node and `Vec` instances were re-emitted under new symbol hashes. What mailbox state looks like, its summary, and every record's identity are unchanged, so V10 state folds as before. The parameter structs are unchanged, so no derivation split is needed."
+date = "2026-09-18"
+code_hash = "5c0145d2421ebcae41ae8ee5591907c7f015502400b939e46dcbd8f128051854"

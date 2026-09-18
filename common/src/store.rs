@@ -231,6 +231,24 @@ pub struct ListingsV1 {
     pub listings: Vec<AuthorizedListing>,
 }
 
+impl ListingsV1 {
+    /// Put the listings in the canonical form `verify` requires: sorted by id,
+    /// no id twice.
+    ///
+    /// `apply_delta` calls this, but the scaffold does not call `apply_delta`
+    /// at all when a merge brings nothing new, so the two places that can hold
+    /// a state nothing verified call it directly as well: the contract's
+    /// `update_state`, before it encodes its result, and the migration fold,
+    /// whose base may be a predecessor's state written under the old,
+    /// permissive `verify` (harvest#26). A stable sort keeps the first of two
+    /// equal ids, which is the one already held.
+    pub fn normalize(&mut self) {
+        self.listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        self.listings.dedup_by(|a, b| a.listing.id == b.listing.id);
+    }
+}
+
 impl freenet_scaffold::ComposableState for ListingsV1 {
     type ParentState = StoreStateV1;
     type Summary = Vec<ListingId>;
@@ -244,6 +262,26 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
     ) -> Result<(), String> {
         for authorized in &self.listings {
             authorized.verify(&parameters.seller_verifying_key)?;
+        }
+        // Canonical form: strictly ascending by id, which also means no id
+        // twice. `apply_delta` only ever produces this, but a state can reach
+        // a peer whole (a PUT, or `UpdateData::State`), and one that arrived
+        // unsorted or with a duplicate used to verify -- so two peers holding
+        // the same set of listings could hold different bytes and never agree
+        // (harvest#26).
+        //
+        // Rejecting in `verify` is safe here only because of the re-key: the
+        // new contract starts empty, and the migration fold builds its state
+        // through `apply_delta`, which normalises (see below), so no state
+        // this generation holds was written by the old, permissive code.
+        for pair in self.listings.windows(2) {
+            if pair[0].listing.id >= pair[1].listing.id {
+                return Err(format!(
+                    "listings are not strictly ascending by id (unsorted, or listing {} \
+                     twice)",
+                    pair[1].listing.id
+                ));
+            }
         }
         Ok(())
     }
@@ -305,11 +343,9 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
                 to_add.push(listing.clone());
             }
             self.listings.extend(to_add);
-
-            // Sort deterministically for CRDT convergence
-            self.listings
-                .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         }
+
+        self.normalize();
         Ok(())
     }
 }
@@ -2705,6 +2741,129 @@ mod order_tests {
             1,
             "the same listing twice in one delta must be stored once"
         );
+    }
+
+    /// Three listings in id order.
+    fn three_sorted_listings(seller: &SigningKey) -> Vec<AuthorizedListing> {
+        let mut listings = vec![
+            make_listing(seller, "Alpha"),
+            make_listing(seller, "Beta"),
+            make_listing(seller, "Gamma"),
+        ];
+        listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        listings
+    }
+
+    /// **`verify` refuses listings that are not in canonical form
+    /// (harvest#26).**
+    ///
+    /// Both of these used to verify. A peer that took such a state whole (a
+    /// PUT, or `UpdateData::State`) then held different bytes from a peer
+    /// that reached the same set through deltas, and the two never agreed.
+    #[test]
+    fn verify_refuses_unsorted_or_repeated_listings() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+
+        ListingsV1 {
+            listings: sorted.clone(),
+        }
+        .verify(&parent, &p)
+        .expect("the canonical form verifies");
+
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        let err = ListingsV1 { listings: reversed }
+            .verify(&parent, &p)
+            .expect_err("unsorted listings must not verify");
+        assert!(err.contains("strictly ascending"), "got: {err}");
+
+        let repeated = vec![sorted[0].clone(), sorted[0].clone(), sorted[1].clone()];
+        ListingsV1 { listings: repeated }
+            .verify(&parent, &p)
+            .expect_err("a listing held twice must not verify");
+    }
+
+    /// **Merging lands on canonical form whatever it started from.**
+    ///
+    /// `verify` now refuses a non-canonical state, so anything this code
+    /// writes has to be canonical, including when the state it started from
+    /// was written by the old, permissive code: the migration fold merges a
+    /// predecessor's state that nothing verified. Covers both the path where
+    /// the merge brings something new and the one where it brings nothing,
+    /// which the scaffold skips `apply_delta` for entirely.
+    #[test]
+    fn merging_normalises_a_non_canonical_state() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+        let canonical = ListingsV1 {
+            listings: sorted.clone(),
+        };
+
+        // Unsorted, with a duplicate, missing one listing.
+        let messy = || ListingsV1 {
+            listings: vec![sorted[2].clone(), sorted[0].clone(), sorted[2].clone()],
+        };
+
+        // Brings something new.
+        let mut state = messy();
+        state
+            .apply_delta(&parent, &p, &Some(vec![sorted[1].clone()]))
+            .expect("apply");
+        assert_eq!(state, canonical);
+
+        // Brings nothing new: only `normalize` reaches this.
+        let mut state = messy();
+        let other = ListingsV1 {
+            listings: vec![sorted[0].clone()],
+        };
+        state.merge(&parent, &p, &other).expect("merge");
+        state.normalize();
+        assert_eq!(
+            state,
+            ListingsV1 {
+                listings: vec![sorted[0].clone(), sorted[2].clone()],
+            }
+        );
+        state.verify(&parent, &p).expect("the result verifies");
+    }
+
+    /// **Two peers reach the same bytes whichever order they merge in.**
+    ///
+    /// The property #26 is about, pinned in-process. `fdev verify-merge`
+    /// checks the same laws against the built WASM; this keeps a regression
+    /// visible in `cargo test`.
+    #[test]
+    fn listing_merge_is_commutative_including_non_canonical_inputs() {
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let parent = StoreStateV1::default();
+        let sorted = three_sorted_listings(&seller);
+        let a = ListingsV1 {
+            listings: vec![sorted[2].clone(), sorted[0].clone()],
+        };
+        let b = ListingsV1 {
+            listings: vec![sorted[1].clone()],
+        };
+
+        let merge = |x: &ListingsV1, y: &ListingsV1| {
+            let mut out = x.clone();
+            out.merge(&parent, &p, y).expect("merge");
+            out.normalize();
+            crate::to_cbor(&out).expect("encode")
+        };
+        assert_eq!(merge(&a, &b), merge(&b, &a));
+        assert_eq!(merge(&a, &a), merge(&a, &ListingsV1::default()));
     }
 }
 

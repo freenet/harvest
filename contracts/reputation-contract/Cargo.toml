@@ -26,6 +26,8 @@ getrandom = { workspace = true }
 # A dev-dependency is not linked into the `cdylib`, so this does not move the
 # code hash. Verified with `cargo make code-hashes` rather than assumed.
 ed25519-dalek = { workspace = true }
+# Only to build a `FeedbackEntry` fixture's timestamp in the harvest#55 tests.
+chrono = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

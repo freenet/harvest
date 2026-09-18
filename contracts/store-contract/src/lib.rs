@@ -248,6 +248,11 @@ impl ContractInterface for Contract {
             }
         }
 
+        // The scaffold skips a child's `apply_delta` when a merge brings it
+        // nothing, so a stored state that is not canonical would otherwise be
+        // written back as it came (harvest#26).
+        store_state.listings.normalize();
+
         let mut updated_state = vec![];
         into_writer(&store_state, &mut updated_state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
@@ -281,10 +286,28 @@ impl ContractInterface for Contract {
     ) -> Result<StateDelta<'static>, ContractError> {
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // Zero bytes on either side means "there is no state here yet", not a
+        // malformed encoding (harvest#55). `summarize_state` answers an empty
+        // state with a zero-byte summary, which no `StoreStateV1Summary`
+        // encodes to, so decoding either one used to fail and a new
+        // subscriber's first exchange was answered with an error. The mailbox
+        // contract already guards both; this is the same pattern.
+        //
+        // A holder with nothing has nothing to send.
+        if state.as_ref().is_empty() {
+            return Ok(StateDelta::from(vec![]));
+        }
         let store_state = from_reader::<StoreStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let old_summary = from_reader::<StoreStateV1Summary, &[u8]>(summary.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // A requester with nothing knows nothing: the empty summary is the
+        // summary of the empty state, so the delta is everything held.
+        let old_summary = if summary.as_ref().is_empty() {
+            let empty = StoreStateV1::default();
+            empty.summarize(&empty, &parameters)
+        } else {
+            from_reader::<StoreStateV1Summary, &[u8]>(summary.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
+        };
 
         match store_state.delta(&store_state, &parameters, &old_summary) {
             Some(delta) => {
@@ -568,5 +591,124 @@ mod tests {
             ),
             other => panic!("a pre-order payment must not settle the order, got {other:?}"),
         }
+    }
+
+    /// A store state with details in it. Unsigned: `get_state_delta` only
+    /// reads, so nothing here needs the signature to verify.
+    fn state_with_details() -> State<'static> {
+        let mut state = StoreStateV1::default();
+        state.info.info.version = 3;
+        state.info.info.store_name = "Shop".to_string();
+        let mut bytes = vec![];
+        into_writer(&state, &mut bytes).expect("encode state");
+        State::from(bytes)
+    }
+
+    /// **A new subscriber's first exchange gets the state, not a decode
+    /// error (harvest#55).**
+    ///
+    /// The subscriber has no state, so `summarize_state` gives it a zero-byte
+    /// summary, which no `StoreStateV1Summary` encodes to. The empty summary
+    /// means "knows nothing", so the answer is everything held.
+    #[test]
+    fn an_empty_summary_is_answered_with_everything_held() {
+        let params = params_bytes(&seller_key());
+        let empty_summary =
+            Contract::summarize_state(Parameters::from(params.clone()), State::from(vec![]))
+                .expect("summarize the absent state");
+        assert!(
+            empty_summary.as_ref().is_empty(),
+            "precondition: the absent state's summary is zero bytes"
+        );
+
+        let delta = Contract::get_state_delta(
+            Parameters::from(params),
+            state_with_details(),
+            empty_summary,
+        )
+        .expect("an empty summary must not be a decode error");
+        let delta: StoreStateV1Delta = from_reader(delta.as_ref()).expect("decode delta");
+        assert_eq!(
+            delta.info.map(|i| i.info.store_name),
+            Some("Shop".to_string()),
+            "a requester that holds nothing is sent the store's details"
+        );
+    }
+
+    /// The mirror image: a holder with no state of its own answers with an
+    /// empty delta rather than failing to decode its own zero bytes.
+    #[test]
+    fn an_empty_state_answers_with_an_empty_delta() {
+        let params = params_bytes(&seller_key());
+        let some_summary =
+            Contract::summarize_state(Parameters::from(params.clone()), state_with_details())
+                .expect("summarize");
+        for summary in [some_summary, StateSummary::from(vec![])] {
+            let delta = Contract::get_state_delta(
+                Parameters::from(params.clone()),
+                State::from(vec![]),
+                summary,
+            )
+            .expect("an empty state must not be a decode error");
+            assert!(delta.as_ref().is_empty(), "nothing held, nothing to send");
+        }
+    }
+
+    /// **`update_state` writes canonical listings even when the merge brings
+    /// nothing (harvest#26).** The scaffold skips `ListingsV1::apply_delta`
+    /// then, so without the explicit normalise a stored unsorted state would be
+    /// written back unsorted, and the contract's own `verify` now refuses that.
+    #[test]
+    fn update_state_writes_canonical_listings_when_the_merge_brings_nothing() {
+        use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+
+        let seller = seller_key();
+        let make = |title: &str| {
+            let listing = Listing {
+                id: ListingId([0u8; 32]),
+                title: title.to_string(),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id();
+            AuthorizedListing {
+                listing,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            }
+        };
+        let mut listings = vec![make("Alpha"), make("Beta")];
+        listings.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        listings.reverse();
+
+        let mut unsorted = StoreStateV1::default();
+        unsorted.listings.listings = listings;
+        let mut bytes = vec![];
+        into_writer(&unsorted, &mut bytes).expect("encode");
+
+        // Merging the empty state brings nothing, so nothing is verified and
+        // the unsigned fixture is enough.
+        let mut empty = vec![];
+        into_writer(&StoreStateV1::default(), &mut empty).expect("encode");
+        let out = Contract::update_state(
+            Parameters::from(params_bytes(&seller)),
+            State::from(bytes),
+            vec![UpdateData::State(State::from(empty))],
+        )
+        .expect("update");
+        let out: StoreStateV1 =
+            from_reader(out.unwrap_valid().as_ref()).expect("decode the result");
+        let ids: Vec<_> = out
+            .listings
+            .listings
+            .iter()
+            .map(|l| l.listing.id.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "the written state must be sorted by id");
     }
 }

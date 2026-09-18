@@ -115,13 +115,13 @@ Reputation is therefore an append-only list of negative feedback entries. A clea
 
 The feedback token exchange uses the same RSA blind signature mechanism as ghostkey creation:
 
-1. Bob creates a feedback token (containing a target reputation contract and a unique nonce)
+1. Bob creates a feedback token (containing a target reputation contract, a unique nonce, and the public half of an Ed25519 key he generates for this token alone)
 2. Bob **blinds** the token and sends the blinded version to Alice
 3. Alice signs the blinded token -- she can't see what she's signing
 4. Bob **unblinds** the signature -- now he has Alice's valid RSA signature on a token Alice has never seen in cleartext
-5. When Bob later submits this token with feedback, Alice sees the feedback appear but **cannot link it to Bob**
+5. When Bob later submits this token with feedback, he signs the whole entry (token, Alice's signature, category, comment, timestamp) with the token's key. Alice sees the feedback appear but **cannot link it to Bob**, and nobody but Bob can change what it says (harvest#22: before this, the signature covered the token alone and anyone could re-submit it with different words)
 
-The reputation contract validates: (a) the RSA signature is from the contract owner, (b) the token targets this contract, (c) the nonce hasn't been used before.
+The reputation contract validates: (a) the RSA signature is from the contract owner, (b) the token targets this contract, (c) the nonce hasn't been used before, (d) the token's key signed the entry. If Bob signs two entries for one token, the contract keeps the one with the smaller encoding, so every peer keeps the same one.
 
 #### Mutual Accountability
 
@@ -221,6 +221,7 @@ These message types are embedded in whatever encrypted communication channel the
 struct FeedbackToken {
     target_contract: ContractKey,  // which reputation contract this targets
     nonce: [u8; 32],               // unique, prevents replay
+    entry_key: [u8; 32],           // Ed25519 key, fresh per token, signs the entry
 }
 
 enum FeedbackTokenMsg {
@@ -241,7 +242,7 @@ struct ReputationState {
     owner: GhostkeyCertificateV1,
     token_verifying_key: RSAVerifyingKey,   // for blind-signed feedback tokens
     feedback: Vec<FeedbackEntry>,            // append-only
-    used_nonces: HashSet<[u8; 32]>,          // replay prevention
+    used_nonces: BTreeSet<[u8; 32]>,         // replay prevention
 }
 
 struct FeedbackEntry {
@@ -249,6 +250,7 @@ struct FeedbackEntry {
     signature: RSASignature,
     content: Vec<u8>,        // format defined by app, not reputation system
     timestamp: u64,
+    entry_signature: Ed25519Signature,  // by token.entry_key, over everything above
 }
 ```
 
