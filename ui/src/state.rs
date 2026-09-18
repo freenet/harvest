@@ -289,6 +289,9 @@ pub struct AppState {
     /// missing from `my_stores`, so settlements are withheld
     /// ([`AppState::unloaded_stores`]).
     pub store_lists_answered: HashSet<String>,
+    /// Ghost Key fingerprints whose `ListStores` request failed to send.
+    /// Not retried: a reload does it.
+    pub store_list_failed: HashSet<String>,
     /// Settlements a proof exists for but that were not auto-published
     /// (see [`AppState::settlement_hold`]), by order, with their store, so
     /// the seller can confirm them from the card.
@@ -1030,6 +1033,9 @@ pub struct SameAddressOrder {
     pub window: std::ops::RangeInclusive<u32>,
     pub amount_sats: u64,
     pub status: harvest_common::payment::OrderStatus,
+    /// Its Paid record was confirmed and sent from this tab but has not come
+    /// back yet. Set by [`AppState::settlement_hold`], never cached.
+    pub confirmed_by_you: bool,
 }
 
 impl SettlementHold {
@@ -1050,6 +1056,9 @@ impl SettlementHold {
                         twin.id.short(),
                         twin.amount_sats,
                         match twin.status {
+                            // Sent, not back yet: as good as Paid for the
+                            // question "may I confirm this one too?".
+                            _ if twin.confirmed_by_you => "confirmed by you, publishing",
                             harvest_common::payment::OrderStatus::Paid => "ALREADY PAID",
                             harvest_common::payment::OrderStatus::PaymentReversed => "reversed",
                             _ => "awaiting payment",
@@ -3160,6 +3169,7 @@ impl AppState {
                             window,
                             amount_sats: order.amount_sats,
                             status: record.status,
+                            confirmed_by_you: false,
                         });
                 }
             }
@@ -3211,7 +3221,17 @@ impl AppState {
             .ghostkeys
             .iter()
             .filter(|key| !self.store_lists_answered.contains(&key.fingerprint))
-            .map(|key| format!("the store list for Ghost Key {}", key.fingerprint))
+            .map(|key| {
+                if self.store_list_failed.contains(&key.fingerprint) {
+                    format!(
+                        "the store list for Ghost Key {}, whose request failed; reloading \
+                         the page retries it",
+                        key.fingerprint
+                    )
+                } else {
+                    format!("the store list for Ghost Key {}", key.fingerprint)
+                }
+            })
             .collect();
         for registration in self.my_stores.values().flatten() {
             let id = &registration.store_contract_id;
@@ -3254,7 +3274,10 @@ impl AppState {
             .filter(|other| {
                 window.start().max(other.window.start()) <= window.end().min(other.window.end())
             })
-            .cloned()
+            .map(|other| SameAddressOrder {
+                confirmed_by_you: self.settlements_submitted.contains(&other.id),
+                ..other.clone()
+            })
             .collect();
         if !twins.is_empty() {
             return Some(SettlementHold::Twins(twins));
@@ -5394,6 +5417,14 @@ impl AppState {
                             dioxus::logger::tracing::error!(
                                 "Failed to list stores for {fingerprint}: {e}"
                             );
+                            // Named in any settlement hold it causes, so the
+                            // seller is not told to wait for an answer that
+                            // is not coming.
+                            use dioxus::prelude::WritableExt;
+                            crate::gateway::APP_STATE
+                                .write()
+                                .store_list_failed
+                                .insert(fingerprint.clone());
                         }
                         if let Some(vk) = vk.as_ref() {
                             crate::gateway::migrate_ops::start_identity_migration(&fingerprint, vk);
@@ -14269,6 +14300,45 @@ mod buy_flow_tests {
             "the hold cleared and nothing published it"
         );
         assert!(state.withheld_settlements.is_empty());
+    }
+
+    /// **Final re-check, Low 1.** A twin this tab has confirmed but whose
+    /// Paid record has not come back is shown as confirmed, not as awaiting
+    /// payment, so the seller is not invited to confirm this one on the same
+    /// payment.
+    #[test]
+    fn a_twin_confirmed_here_is_labelled_as_such() {
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        let twin_id = state.browsing_stores[STORE].orders[1].order.id.clone();
+        state.settlements_submitted.insert(twin_id);
+        let text = state
+            .settlement_hold(&order.order)
+            .expect("held")
+            .explain(order.order.amount_sats, 0);
+        assert!(text.contains("confirmed by you, publishing"), "{text}");
+        assert!(!text.contains("awaiting payment"), "{text}");
+    }
+
+    /// **Final re-check, Low 2.** A store-list request that failed to send
+    /// is named as failed, with how to retry, not left as a wait.
+    #[test]
+    fn a_failed_store_list_request_says_so() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "seller-fp".to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        state.store_list_failed.insert("seller-fp".to_string());
+        match state.settlement_hold(&order.order) {
+            Some(SettlementHold::StoresNotLoaded(what)) => {
+                assert!(what[0].contains("request failed"), "{what:?}");
+                assert!(what[0].contains("reloading"), "{what:?}");
+            }
+            other => panic!("expected StoresNotLoaded, got {other:?}"),
+        }
     }
 
     /// **Round 5, Should Fix 3.** A store the node gave up on still holds
