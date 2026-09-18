@@ -100,9 +100,10 @@ panic = "abort"
 # `cargo test` inherits from `[profile.dev]` by default, which builds the
 # RSA-2048 / Ed25519 / BLAKE3 crypto used by the seeded-random merge-law tests
 # (`common/src/store.rs`, `common/src/reputation.rs`, `common/src/mailbox.rs`,
-# added in #82) completely unoptimised. Measured locally: those tests take
-# ~181s at the debug default and ~13s at opt-level 2 -- the crypto primitives,
-# not the merge logic, dominate the wall clock. debug-assertions and
+# added in #82) completely unoptimised. Measured locally, warm cache, on two
+# separate runs: four of those tests run single-threaded took 181s at the
+# debug default and 13s at opt-level 2; all five run in parallel took 55s and
+# 6s. The crypto primitives, not the merge logic, dominate. debug-assertions and
 # overflow-checks are unaffected here (they are `[profile.dev]` keys this
 # profile still inherits), so no runtime checks are lost, only the codegen
 # quality of the compiled test binaries.
