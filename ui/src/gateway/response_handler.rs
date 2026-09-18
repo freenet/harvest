@@ -121,8 +121,9 @@ fn handle_contract_response(response: ContractResponse) {
             #[cfg(target_arch = "wasm32")]
             let _pointer = super::bitcoin_generation_ops::deliver_absent(&instance_id);
             // And to an invoice waiting to learn whether its payment address
-            // was used before: absence is the answer that says it was not.
-            // See `AppState::check_address_before_signing`.
+            // was used before. Absence lets it sign, but it is not proof the
+            // address is unused: a dead-ended GET reports NotFound for a
+            // contract that exists. See `AppState::on_address_reuse_absent`.
             #[cfg(target_arch = "wasm32")]
             APP_STATE
                 .write()

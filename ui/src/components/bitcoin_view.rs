@@ -525,9 +525,18 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     };
     let reading = AddressReading::of(o, live.as_ref());
     // Only ever set for the seller's own orders; see
-    // `AppState::orders_sharing_an_address` and `address_warning`.
-    let address_warning = APP_STATE.read().address_warning(&o.id);
-    let (status_class, status_text) = status_pill(order.status, &reading);
+    // `AppState::refresh_shared_address_warnings`.
+    let (address_warning, late_is_another_orders) = {
+        let state = APP_STATE.read();
+        (
+            state.address_warning(&o.id),
+            reading
+                .after_window
+                .is_some_and(|height| state.another_own_order_window_holds(o, height)),
+        )
+    };
+    let (status_class, status_text) =
+        status_pill(order.status, &reading, address_warning.is_some());
 
     rsx! {
         div { class: "listing-card",
@@ -537,7 +546,7 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
             if order.status == OrderStatus::AwaitingPayment {
-                if let Some(note) = reading.outside_note() {
+                if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
                 }
             }
@@ -614,11 +623,18 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
 ///
 /// Split out of the component so the reading it depends on is testable; see
 /// [`AddressReading`] for why it is not the raw address balance.
+///
+/// Never the paid style while another invoice sharing the address is flagged:
+/// the payment it shows may be the other invoice's.
 pub(crate) fn status_pill(
     status: OrderStatus,
     reading: &AddressReading,
+    shares_address: bool,
 ) -> (&'static str, &'static str) {
     match status {
+        OrderStatus::AwaitingPayment | OrderStatus::Paid if shares_address => {
+            ("btc-pill pending", "Check shared address")
+        }
         OrderStatus::AwaitingPayment => {
             // The paid style only for the full amount: anyone can send dust
             // to a published address (PR #83 round 2, Should Fix 5).
@@ -724,7 +740,10 @@ impl AddressReading {
 
     /// What to tell the seller when the address holds confirmed value that is
     /// not this order's payment.
-    pub(crate) fn outside_note(&self) -> Option<String> {
+    /// `late_is_another_orders`: a payment after this invoice's window falls
+    /// inside another of the seller's invoices' windows on this address, so
+    /// it is not presumed to be this buyer's late payment.
+    pub(crate) fn outside_note(&self, late_is_another_orders: bool) -> Option<String> {
         if self.no_anchor {
             return Some(
                 "This invoice names no Bitcoin block it was made at, so no payment can ever \
@@ -751,10 +770,16 @@ impl AddressReading {
             });
         }
         self.after_window.map(|height| {
+            let whose = if late_is_another_orders {
+                "It falls inside another of your invoices' windows on this address, so it may \
+                 be that invoice's payment."
+            } else {
+                "It is probably this buyer's late payment: check your wallet and settle it \
+                 with them directly."
+            };
             format!(
                 "A payment to this address confirmed in block {height}, after this invoice's \
-                 payment window closed, so Harvest will not mark it paid. It is probably this \
-                 buyer's late payment: check your wallet and settle it with them directly."
+                 payment window closed, so Harvest will not mark it paid. {whose}"
             )
         })
     }
@@ -1367,12 +1392,15 @@ mod address_reading_tests {
         assert_eq!(
             super::status_pill(
                 harvest_common::payment::OrderStatus::AwaitingPayment,
-                &reading
+                &reading,
+                false
             ),
             ("btc-pill waiting", "Awaiting payment"),
             "the card read a payment older than the invoice as this invoice's"
         );
-        let note = reading.outside_note().expect("the seller must be told");
+        let note = reading
+            .outside_note(false)
+            .expect("the seller must be told");
         assert!(note.contains("block 100"), "{note}");
         assert!(note.contains("do not ship"), "{note}");
     }
@@ -1393,7 +1421,10 @@ mod address_reading_tests {
             );
         }
         let late = AddressReading::of(&order, Some(&address_with(&[(last + 1, 7)])));
-        assert!(late.outside_note().expect("said").contains("window closed"));
+        assert!(late
+            .outside_note(false)
+            .expect("said")
+            .contains("window closed"));
     }
 
     /// And the ordinary case is untouched: a payment after the anchor lights
@@ -1403,7 +1434,7 @@ mod address_reading_tests {
         let order = order_anchored_at(150);
         let reading = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
         assert_eq!(reading.in_window_sats, 10_000);
-        assert_eq!(reading.outside_note(), None);
+        assert_eq!(reading.outside_note(false), None);
     }
 
     /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a
@@ -1414,14 +1445,19 @@ mod address_reading_tests {
         let order = order_anchored_at(150);
         let dust = AddressReading::of(&order, Some(&address_with(&[(151, 546)])));
         assert_eq!(
-            super::status_pill(OrderStatus::AwaitingPayment, &dust),
+            super::status_pill(OrderStatus::AwaitingPayment, &dust, false),
             ("btc-pill pending", "Partial payment seen")
         );
         let full = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
         assert_eq!(
-            super::status_pill(OrderStatus::AwaitingPayment, &full),
+            super::status_pill(OrderStatus::AwaitingPayment, &full, false),
             ("btc-pill paid", "Payment seen on chain")
         );
+        // Round 3, Should Fix 1: never the paid style while a shared-address
+        // warning shows, for an order awaiting payment or already paid.
+        for status in [OrderStatus::AwaitingPayment, OrderStatus::Paid] {
+            assert_ne!(super::status_pill(status, &full, true).0, "btc-pill paid");
+        }
     }
 
     /// Round 2, Consider: the notes say the right thing in each case. An
@@ -1432,19 +1468,29 @@ mod address_reading_tests {
     fn each_note_names_its_own_reason() {
         let order = order_anchored_at(150);
         let both = AddressReading::of(&order, Some(&address_with(&[(100, 10_000), (151, 10_000)])));
-        let note = both.outside_note().expect("the older payment is mentioned");
+        let note = both
+            .outside_note(false)
+            .expect("the older payment is mentioned");
         assert!(!note.contains("Issue a new invoice"), "{note}");
 
         let late = AddressReading::of(
             &order,
             Some(&address_with(&[(150 + PAYMENT_WINDOW_BLOCKS + 1, 10_000)])),
         );
-        assert!(late.outside_note().expect("said").contains("late payment"));
+        assert!(late
+            .outside_note(false)
+            .expect("said")
+            .contains("late payment"));
+        // Round 3, Should Fix 4: not presumed late when it falls in another
+        // own invoice's window on this address.
+        let theirs = late.outside_note(true).expect("said");
+        assert!(!theirs.contains("late payment"), "{theirs}");
+        assert!(theirs.contains("another of your invoices"), "{theirs}");
 
         let mut anchorless = order_anchored_at(150);
         anchorless.anchor = None;
         let reading = AddressReading::of(&anchorless, Some(&address_with(&[(100, 10_000)])));
-        let note = reading.outside_note().expect("said");
+        let note = reading.outside_note(false).expect("said");
         assert!(note.contains("names no Bitcoin block"), "{note}");
         assert_eq!(reading.before_order, None);
     }
