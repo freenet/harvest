@@ -251,7 +251,7 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 "This is a "
                 strong { "public" }
                 " key: it can produce addresses and nothing else. Harvest never holds "
-                "anything that could spend your coins \u{2014} the key that can stays in "
+                "anything that could spend your coins: the key that can spend stays in "
                 "your wallet, which is also what lets you spend what buyers send."
             }
             if replacing {
