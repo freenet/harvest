@@ -82,7 +82,7 @@ fn StoreList() -> Element {
             crate::store_link::open_store(params);
         }
         None => typed_error.set(Some(
-            "That is not a store code. A store code is 12 letters and digits, the part of a \
+            "That is not a store code. A store code is 16 letters and digits, the part of a \
              store link after \"store=\"."
                 .to_string(),
         )),

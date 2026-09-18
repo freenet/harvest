@@ -26,7 +26,16 @@
 //!
 //! There is deliberately no request that removes one of these. See
 //! `HarvestDelegateRequest::SetStoreArchived` for why the operation a buyer
-//! is offered is "archive".
+//! is offered is "archive". Held structurally: every function here is
+//! generic over `SecretStore` alone, which has no removal, so deleting a
+//! record would need a new bound -- and `tests::nothing_here_can_delete_a_record`
+//! stops compiling with one.
+//!
+//! # One list per node, not per Ghost Key
+//!
+//! The list is keyed by nothing but the code, so it is shared by everyone
+//! using this node's Harvest delegate, whichever Ghost Key they hold (and a
+//! buyer needs none). It is a record of stores this DEVICE opened.
 
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{HarvestDelegateResponse, RememberedStore};
@@ -39,7 +48,7 @@ pub(crate) const KNOWN_STORE_PREFIX: &str = "harvest:known_store:";
 
 /// How many stores one node remembers.
 ///
-/// Each record is a fixed-size key (a validated twelve-character code) and a
+/// Each record is a fixed-size key (a validated sixteen-character code) and a
 /// one-field value, so this is a bound on bytes as well: about 50 bytes a
 /// store. Past it, a new store is refused out loud rather than an old one
 /// dropped, because which of a buyer's stores matters least is not something
@@ -84,12 +93,24 @@ fn upsert<S: SecretStore>(
         return refusal;
     }
     let key = known_store_key(store_code);
-    let existing = store
+    let record = match store
         .get_secret(&key)
-        .map(|bytes| from_cbor::<Record>(&bytes).unwrap_or_default());
-    let record = match existing {
-        Some(record) if keep_archived => record,
-        Some(_) => Record { archived },
+        .map(|bytes| from_cbor::<Record>(&bytes))
+    {
+        Some(Ok(record)) if keep_archived => record,
+        Some(Ok(_)) => Record { archived },
+        // A record that is there and does not decode is damage, which `list`
+        // hides rather than guesses about. A visit must not guess either:
+        // reading it as "not archived" would quietly un-archive a store the
+        // buyer archived. An explicit archive or unarchive is a real answer,
+        // so that one replaces it.
+        Some(Err(_)) if keep_archived => {
+            return refuse(
+                "this store's saved record could not be read, so it was left as it is; \
+                 archiving or unarchiving the store replaces it",
+            )
+        }
+        Some(Err(_)) => Record { archived },
         None => {
             if store.list_secrets(KNOWN_STORE_PREFIX.as_bytes()).len() >= MAX_KNOWN_STORES {
                 return refuse(format!(
@@ -156,8 +177,8 @@ mod tests {
     use super::*;
     use crate::secrets::MemSecrets;
 
-    const CODE_A: &str = "3Bn8xWqLd6Tz";
-    const CODE_B: &str = "Qp5vMe7RkT2c";
+    const CODE_A: &str = "3Bn8xWqLd6Tz9Kf2";
+    const CODE_B: &str = "Qp5vMe7RkT2cHw4n";
 
     fn stores(response: HarvestDelegateResponse) -> Vec<RememberedStore> {
         match response {
@@ -239,9 +260,10 @@ mod tests {
         let mut secrets = MemSecrets::default();
         for bad in [
             "",
-            "3Bn8xWqLd6T",
-            "3Bn8xWqLd6Tzz",
-            "3Bn8xWqLd6T0",
+            "3Bn8xWqLd6Tz9Kf",
+            "3Bn8xWqLd6Tz9Kf2z",
+            "3Bn8xWqLd6Tz9Kf0",
+            "3Bn8xWqLd6Tz",
             "harvest:rsa_sk",
         ] {
             assert!(
@@ -266,7 +288,7 @@ mod tests {
             .chars()
             .collect();
         let code = |n: usize| -> String {
-            let mut s = String::from("zzzzzzzzz");
+            let mut s = String::from("zzzzzzzzzzzzz");
             let mut n = n;
             for _ in 0..3 {
                 s.push(alphabet[n % alphabet.len()]);
@@ -291,6 +313,73 @@ mod tests {
             set_archived(&mut secrets, &code(0), true),
             HarvestDelegateResponse::RememberedStores { .. }
         ));
+    }
+
+    /// A secret store with no way to remove anything: `SecretStore` and
+    /// nothing else. That this module's functions accept it is the structural
+    /// half of "archive, never delete"; the key count never falling across a
+    /// run of every operation is the behavioural half.
+    struct NoRemoval(MemSecrets);
+
+    impl SecretStore for NoRemoval {
+        fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.0.list_secrets(prefix)
+        }
+        fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get_secret(key)
+        }
+        fn has_secret(&self, key: &[u8]) -> bool {
+            self.0.has_secret(key)
+        }
+        fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+            self.0.set_secret(key, value)
+        }
+    }
+
+    #[test]
+    fn nothing_here_can_delete_a_record() {
+        let mut secrets = NoRemoval(MemSecrets::default());
+        let codes = [CODE_A, CODE_B];
+        let mut seen = 0;
+        for step in 0u32..60 {
+            let code = codes[(step % 2) as usize];
+            match step % 3 {
+                0 => remember(&mut secrets, code),
+                1 => set_archived(&mut secrets, code, step % 4 == 1),
+                _ => list(&secrets),
+            };
+            let held = secrets.list_secrets(KNOWN_STORE_PREFIX.as_bytes()).len();
+            assert!(held >= seen, "a record went away at step {step}");
+            seen = held;
+        }
+        assert_eq!(seen, 2);
+    }
+
+    /// An unreadable record is not read as "not archived" by a visit, which
+    /// would un-archive it; an explicit choice replaces it.
+    #[test]
+    fn a_visit_does_not_guess_about_an_unreadable_record() {
+        let mut secrets = MemSecrets::default();
+        let key = known_store_key(CODE_A);
+        secrets.set_secret(&key, b"not cbor at all");
+        assert!(matches!(
+            remember(&mut secrets, CODE_A),
+            HarvestDelegateResponse::Error { .. }
+        ));
+        assert_eq!(
+            secrets.get_secret(&key).as_deref(),
+            Some(&b"not cbor at all"[..]),
+            "left as it was"
+        );
+        assert!(
+            stores(list(&secrets)).is_empty(),
+            "and still hidden, as list hides damage"
+        );
+        assert_eq!(
+            stores(set_archived(&mut secrets, CODE_A, true)),
+            vec![entry(CODE_A, true)],
+            "an explicit choice replaces it"
+        );
     }
 
     #[test]

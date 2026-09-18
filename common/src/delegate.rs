@@ -329,6 +329,9 @@ pub enum HarvestDelegateRequest {
     SetStoreArchived { store_code: String, archived: bool },
 
     /// Every store this node remembers, archived ones included.
+    ///
+    /// One list per node, shared by every Ghost Key on it (and by a buyer
+    /// with none): the records are keyed by store code alone.
     ListRememberedStores,
 }
 

@@ -9,12 +9,24 @@ use crate::payment::{AuthorizedOrder, OrderId};
 
 /// How many base58 characters of the seller's verifying key make a store code.
 ///
-/// 12, not Delta's 10 (harvest#52, decided by @sanity). A code pins
-/// 58^12 ~= 2^70.3 keys; taking a store's address from its seller needs a
-/// keypair whose public key shares the seller's code, which is that many
-/// scalar multiplications. 10 characters would be ~2^58.6, within reach of
-/// rented vanity-grinding compute. Two characters buys the difference.
-pub const STORE_CODE_LEN: usize = 12;
+/// 16 (harvest#52, decided by @sanity in two steps). A code pins
+/// 58^16 ~= 2^93.7 keys; taking one chosen seller's address needs a keypair
+/// whose public key shares that seller's code, which is about that many
+/// scalar multiplications.
+///
+/// # Why not 12, and why the single-target figure is not the one that matters
+///
+/// 12 characters was the first choice, at ~2^70 against one seller. The
+/// #91 review pointed out that a grinder does not have to pick its victim in
+/// advance: every candidate key can be checked against EVERY live store code
+/// at once, so the cost of hitting some store falls by the number of stores.
+/// With 12 characters that is about 2^60 at 1,000 stores and 2^57 at 10,000
+/// -- within reach -- and under the smaller-key-wins rule (see
+/// [`StoreStateV1`]) a hit takes the store's address and every replica drops
+/// the seller's listings and Paid orders. At 16 characters it is about 2^94
+/// for one chosen seller and about 2^80 against 10,000 stores at once (2^84
+/// at 1,000). A link is still well under half the 44-character contract id.
+pub const STORE_CODE_LEN: usize = 16;
 
 /// The base58 alphabet a store code is written in (Bitcoin's, which is what
 /// `bs58` encodes with by default).
@@ -61,7 +73,8 @@ pub fn store_code(seller_verifying_key: &VerifyingKey) -> String {
 ///
 /// A salt would give a seller whose code was taken a second address, at the
 /// cost of the code no longer being derivable from the key alone. Declined:
-/// taking a code needs ~2^70 work (above), so the escape hatch would be for a
+/// taking a code needs ~2^80 work even against every store at once (above,
+/// on [`STORE_CODE_LEN`]), so the escape hatch would be for a
 /// case that does not realistically occur, and a seller who does meet it is
 /// told plainly rather than silently failing (the UI's "already claimed by a
 /// different key").
@@ -77,7 +90,7 @@ pub struct StoreParameters {
     /// [`StoreParameters::from_code`] are the only constructors, and both
     /// produce exactly [`STORE_CODE_LEN`]. Accepting any length is what lets
     /// the production contract's merge be checked with two keys that really
-    /// do share a code (ground to a two-character code; twelve cannot be
+    /// do share a code (ground to a two-character code; sixteen cannot be
     /// ground), rather than with a test-only build.
     pub(crate) store_code: String,
 }
@@ -859,7 +872,7 @@ fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
 /// owner therefore arrives only alongside something it signed; a state that
 /// names an owner and holds nothing it signed is refused, because a key alone
 /// proves nothing (anyone can write down a curve point that begins with a
-/// given code -- the ~2^70 cost of a code is the cost of a KEYPAIR, which
+/// given code -- the cost of a code (see [`STORE_CODE_LEN`]) is the cost of a KEYPAIR, which
 /// only a signature demonstrates).
 ///
 /// # Two keys, one code: why the smaller key wins, and not the first
@@ -880,14 +893,28 @@ fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
 /// owner's own join-semilattice, which is itself a join-semilattice: the
 /// result of merging any set of states is "the smallest owner among them,
 /// with the join of that owner's records", whatever the order or grouping.
-/// Pinned by `claim_tests`, and checked on the built contract with
-/// `fdev verify-merge` over states that include two owners sharing a code.
+/// That holds for honestly signed content: the per-owner merge itself still
+/// has the known unsigned-field tie cases recorded as harvest#81, and this
+/// rule neither fixes nor worsens them. Pinned by `claim_tests`, and checked
+/// on the built contract with `fdev verify-merge` over states that include
+/// two and three owners sharing a code.
+///
+/// A delta between owners is everything the winner holds, measured against
+/// the empty store. But a delta that was computed against a summary of the
+/// SAME owner can arrive at a replica that has meanwhile switched to a
+/// different, outranked owner; the replica then switches to the incoming
+/// owner holding only the records in that delta, a subset of the winner's
+/// store, until the next summary exchange sends it the rest. Transient, and
+/// it needs two keys sharing a code to happen at all.
 ///
 /// What it costs, stated plainly: a key with a smaller encoding that shares a
 /// seller's code takes the address even after the seller has published, and
 /// the seller's records stop being served. That is the same attack as
 /// pre-empting a seller who has not published yet, at the same price -- a
-/// keypair in a 2^70 space, half of which rank below any given key -- so the
+/// keypair sharing a 16-character code, half of which rank below any given
+/// key: about 2^95 for one chosen seller, about 2^81 to hit one of 10,000
+/// (see [`STORE_CODE_LEN`] for why the second figure is the one that
+/// matters) -- so the
 /// rule adds no attack that a first-writer rule would have prevented, and it
 /// is the only one of the two that converges. A seller whose address is held
 /// by another key is told so, loudly (the UI's "already claimed by a
@@ -1054,9 +1081,10 @@ impl ComposableState for StoreStateV1 {
 
     /// What the holder of `old_state_summary` is missing.
     ///
+    /// * We hold no owner: nothing, since an unowned store holds no records.
     /// * Same owner: the ordinary per-part difference.
-    /// * The requester holds an owner that outranks ours, or ours outranks
-    ///   nothing it holds: nothing. Our records are the ones that lose.
+    /// * The requester holds an owner that outranks ours: nothing. Our
+    ///   records are the ones that lose.
     /// * The requester holds no owner, or one ours outranks: EVERYTHING,
     ///   measured against the empty store, because the requester is about to
     ///   drop what it holds and start again from ours. A difference against
@@ -3649,7 +3677,7 @@ mod order_tests {
         /// Two signing keys whose verifying keys begin with the same two
         /// base58 characters, the lower-ranked first, and that code.
         ///
-        /// Twelve characters cannot be ground (that is the point of twelve),
+        /// Sixteen characters cannot be ground (that is the point of sixteen),
         /// but nothing in the merge depends on the code's length, so two is
         /// the same rule at a size a test can reach: a birthday search over
         /// 58^2 codes finds a pair within a few hundred keys.
@@ -3717,12 +3745,12 @@ mod order_tests {
         }
 
         #[test]
-        fn a_code_is_the_first_twelve_base58_characters_of_the_key() {
+        fn a_code_is_the_first_sixteen_base58_characters_of_the_key() {
             let key = seller_key().verifying_key();
             let p = StoreParameters::new(key);
             let encoded = bs58::encode(key.as_bytes()).into_string();
             assert_eq!(p.code(), &encoded[..STORE_CODE_LEN]);
-            assert_eq!(p.code().len(), 12);
+            assert_eq!(p.code().len(), 16);
             assert!(p.admits(&key));
             assert_eq!(
                 StoreParameters::from_code(p.code()),
@@ -3738,7 +3766,7 @@ mod order_tests {
                 .code()
                 .to_string();
             assert!(
-                StoreParameters::from_code(&code[..11]).is_none(),
+                StoreParameters::from_code(&code[..15]).is_none(),
                 "too short"
             );
             assert!(
@@ -3752,7 +3780,7 @@ mod order_tests {
                 "a whole key is not a code"
             );
             for bad in ['0', 'O', 'I', 'l', '-', ' ', 'é'] {
-                let mut s: String = code.chars().take(11).collect();
+                let mut s: String = code.chars().take(15).collect();
                 s.push(bad);
                 assert!(
                     StoreParameters::from_code(&s).is_none(),

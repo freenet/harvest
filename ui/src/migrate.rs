@@ -40,7 +40,7 @@
 //! store's is not. `StoreParameters` GAINED two fields when the Bitcoin bridge
 //! list arrived and then shed them again when it moved onto `Order`, so
 //! generations V2-V5 live at addresses under a three-field encoding. Then
-//! harvest#52 replaced the whole seller key with a twelve-character code, so
+//! harvest#52 replaced the whole seller key with a sixteen-character code, so
 //! every generation up to and including V16 lives under a whole-key encoding
 //! this build no longer produces for anything current. [`store_candidates`]
 //! derives each generation under the encoding it was actually published with;

@@ -337,6 +337,10 @@ pub struct AppState {
     /// up, which is before the delegate exists.
     pub stores_to_remember: Vec<String>,
 
+    /// Codes already sent to be remembered this session. See
+    /// [`AppState::remember_loaded_store`].
+    pub stores_remembered: HashSet<String>,
+
     /// Our stores whose address another key holds, already announced, so
     /// the notification is made once rather than on every state arrival.
     pub foreign_owner_announced: HashSet<Vec<u8>>,
@@ -1477,8 +1481,8 @@ pub fn foreign_owner_message(code: &str, held: &[u8; 32]) -> String {
         "Your store's address is already claimed by a different key. Harvest cannot \
          publish your store there: anyone who opens store code {code} sees the store of \
          the key beginning {theirs}, not yours, and nothing you publish will change that. \
-         A key sharing the first 12 characters of yours should take around 2^70 attempts \
-         to find, so this is not an accident."
+         A key sharing the first 16 characters of yours takes around 2^80 attempts to \
+         find even aimed at every store at once, so this is not an accident."
     )
 }
 
@@ -1690,6 +1694,13 @@ impl AppState {
         self.store_link_error = None;
     }
 
+    /// A link named a store the old way (a whole contract id): say so on the
+    /// Browse tab instead of showing nothing. See
+    /// `store_link::is_old_format_link`.
+    pub fn note_old_format_link(&mut self) {
+        self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
+    }
+
     /// Record the code a store was opened under. See [`Self::store_codes`].
     pub fn note_store_code(&mut self, store_contract_id: Vec<u8>, code: String) {
         self.store_codes.insert(store_contract_id, code);
@@ -1711,6 +1722,21 @@ impl AppState {
         Some(harvest_common::HarvestDelegateRequest::RememberStore {
             store_code: code.to_string(),
         })
+    }
+
+    /// Remember a store opened by its code, once its state has arrived.
+    ///
+    /// Only a store in [`Self::store_codes`] -- one opened from a link, a
+    /// typed code or the list -- and only once per session: the state
+    /// re-arrives on every update notification, and the delegate's answer is
+    /// the same each time.
+    pub fn remember_loaded_store(&mut self, store_contract_id: &[u8]) {
+        let Some(code) = self.store_codes.get(store_contract_id).cloned() else {
+            return;
+        };
+        if self.stores_remembered.insert(code.clone()) {
+            self.remember_store(&code);
+        }
     }
 
     /// Remember a store the user opened, so it is still listed after the tab
@@ -2235,6 +2261,11 @@ impl AppState {
 
                     // Whatever we concluded from a timeout, the state is here now.
                     self.store_state_unavailable.remove(&contract_id);
+
+                    // A store opened by its code is remembered now that it has
+                    // loaded, and not before: a mistyped or unreachable code
+                    // never gets here, so it never joins the list.
+                    self.remember_loaded_store(&contract_id);
 
                     // Form the certificate verdicts here, before anything can be
                     // displayed. `verify_store_certificate` needs the contract id,
@@ -17863,9 +17894,12 @@ mod store_code_tests {
     #[test]
     fn a_store_opened_before_the_delegate_is_remembered_once_it_is_up() {
         let mut state = AppState::default();
-        assert!(state.remember_store_request("3Bn8xWqLd6Tz").is_none());
-        assert!(state.remember_store_request("3Bn8xWqLd6Tz").is_none());
-        assert_eq!(state.stores_to_remember, vec!["3Bn8xWqLd6Tz".to_string()]);
+        assert!(state.remember_store_request("3Bn8xWqLd6Tz9Kf2").is_none());
+        assert!(state.remember_store_request("3Bn8xWqLd6Tz9Kf2").is_none());
+        assert_eq!(
+            state.stores_to_remember,
+            vec!["3Bn8xWqLd6Tz9Kf2".to_string()]
+        );
 
         state.harvest_delegate_key = Some(freenet_stdlib::prelude::DelegateKey::new(
             [1u8; 32],
@@ -17874,7 +17908,7 @@ mod store_code_tests {
         assert_eq!(
             state.remembered_store_requests(),
             vec![harvest_common::HarvestDelegateRequest::RememberStore {
-                store_code: "3Bn8xWqLd6Tz".to_string()
+                store_code: "3Bn8xWqLd6Tz9Kf2".to_string()
             }]
         );
         assert!(
@@ -17886,12 +17920,43 @@ mod store_code_tests {
             vec![harvest_common::HarvestDelegateRequest::ListRememberedStores]
         );
         assert_eq!(
-            state.remember_store_request("Qp5vMe7RkT2c"),
+            state.remember_store_request("Qp5vMe7RkT2cHw4n"),
             Some(harvest_common::HarvestDelegateRequest::RememberStore {
-                store_code: "Qp5vMe7RkT2c".to_string()
+                store_code: "Qp5vMe7RkT2cHw4n".to_string()
             }),
             "with the delegate up a store is remembered straight away"
         );
+    }
+
+    /// A code is remembered once the store's state has arrived, not when it
+    /// is opened: a mistyped or unreachable code never loads, so it never
+    /// joins the list (PR #91 review).
+    #[test]
+    fn a_store_is_remembered_only_once_it_has_loaded() {
+        let mut state = AppState::default();
+        let code = harvest_common::store::store_code(&other().verifying_key());
+        let loads = [3u8; 32];
+        let never = [4u8; 32];
+        state.note_store_code(loads.to_vec(), code.clone());
+        state.note_store_code(never.to_vec(), "1111111111111111".to_string());
+        assert!(
+            state.stores_to_remember.is_empty(),
+            "opening remembers nothing"
+        );
+
+        arrive(&mut state, &loads, None);
+        assert_eq!(state.stores_to_remember, vec![code.clone()]);
+        arrive(&mut state, &loads, None);
+        assert_eq!(
+            state.stores_to_remember,
+            vec![code],
+            "the state re-arrives on every update; it is remembered once"
+        );
+
+        // A store that was not opened by a code (the seller's own, say) is
+        // not added to the visitor's list by its state arriving.
+        arrive(&mut state, &[6u8; 32], None);
+        assert_eq!(state.stores_to_remember.len(), 1);
     }
 
     #[test]

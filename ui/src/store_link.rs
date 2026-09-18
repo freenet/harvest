@@ -5,7 +5,7 @@
 //!
 //! # What the link carries: a store CODE (harvest#52)
 //!
-//! `#store=<code>`, where the code is the first twelve base58 characters of
+//! `#store=<code>`, where the code is the first sixteen base58 characters of
 //! the seller's verifying key. The code is the store contract's only
 //! parameter, so any client turns it into the store's address with nothing
 //! but the store contract it bundles -- no registry, no lookup, no round trip
@@ -94,6 +94,28 @@ pub fn parse_store_code(raw: &str) -> Option<StoreParameters> {
     StoreParameters::from_code(param(raw, STORE_PARAM)?)
 }
 
+/// What a buyer is told when their link names a store the old way.
+pub const OLD_FORMAT_LINK_MESSAGE: &str = "This is an old-format store link, from before \
+    Harvest used store codes, and it cannot be opened any more. Ask the seller for \
+    their store code, or a new link.";
+
+/// Whether `raw` names a store the way links did before harvest#52: a whole
+/// 32-byte contract id (43 or 44 base58 characters) rather than a code.
+///
+/// Such a link opens nothing -- the address it names is not one this build
+/// derives from a link, and a store has moved generation since it was made
+/// -- so it is recognised only to say so, rather than leaving the buyer on a
+/// page that silently shows nothing.
+pub fn is_old_format_link(raw: &str) -> bool {
+    let Some(value) = param(raw, STORE_PARAM) else {
+        return false;
+    };
+    (43..=44).contains(&value.len())
+        && bs58::decode(value)
+            .into_vec()
+            .is_ok_and(|bytes| bytes.len() == 32)
+}
+
 /// Parse a code the user typed or pasted: the bare code, or a whole link.
 ///
 /// Surrounding whitespace is forgiven, since a code read out of a message
@@ -146,8 +168,9 @@ pub fn store_label(code: &str, store_name: Option<&str>) -> String {
 /// Called once the websocket is up. It deliberately does not wait for the
 /// delegates: fetching and subscribing to a store contract needs nothing from
 /// them, and a buyer following a link has no reason to hold a ghostkey.
-/// Remembering the store does need the harvest delegate, so that is queued
-/// and sent once the delegate is registered (`AppState::remember_store`).
+/// Remembering the store happens once its state has arrived, and needs the
+/// harvest delegate, so it is queued until that is registered
+/// (`AppState::remember_loaded_store`).
 #[cfg(target_arch = "wasm32")]
 pub fn open_store_from_url() {
     let Some(location) = web_sys::window().map(|window| window.location()) else {
@@ -156,6 +179,10 @@ pub fn open_store_from_url() {
     let hash = location.hash().unwrap_or_default();
     let search = location.search().unwrap_or_default();
     let Some(params) = parse_store_code(&hash).or_else(|| parse_store_code(&search)) else {
+        if is_old_format_link(&hash) || is_old_format_link(&search) {
+            use dioxus::prelude::WritableExt;
+            crate::gateway::APP_STATE.write().note_old_format_link();
+        }
         return;
     };
     open_store(params);
@@ -185,8 +212,10 @@ pub fn open_store(params: StoreParameters) {
     {
         let mut state = crate::gateway::APP_STATE.write();
         state.begin_browsing(store_id.as_bytes().to_vec());
+        // Remembered only once its state arrives (`AppState::
+        // remember_loaded_store`), so a mistyped or unreachable code does not
+        // stay in the list for good.
         state.note_store_code(store_id.as_bytes().to_vec(), code.clone());
-        state.remember_store(&code);
     }
 
     wasm_bindgen_futures::spawn_local(async move {
@@ -266,7 +295,7 @@ mod tests {
     #[test]
     fn rejects_a_code_of_the_wrong_length() {
         let code = code();
-        assert!(parse_store_code(&format!("#store={}", &code[..11])).is_none());
+        assert!(parse_store_code(&format!("#store={}", &code[..15])).is_none());
         assert!(parse_store_code(&format!("#store={code}x")).is_none());
         let old_style = bs58::encode([5u8; 32]).into_string();
         assert!(parse_store_code(&format!("#store={old_style}")).is_none());
@@ -318,9 +347,29 @@ mod tests {
                 "{typed:?}"
             );
         }
-        for typed in ["", &code[..11], "http://127.0.0.1:7509/", "#store=short"] {
+        for typed in ["", &code[..15], "http://127.0.0.1:7509/", "#store=short"] {
             assert!(parse_typed_store_code(typed).is_none(), "{typed:?}");
         }
+    }
+
+    /// A link from before store codes is recognised, so the buyer is told
+    /// to ask for a code instead of looking at a page that shows nothing;
+    /// nothing else is mistaken for one.
+    #[test]
+    fn an_old_format_link_is_recognised_and_nothing_else_is() {
+        let old = bs58::encode([5u8; 32]).into_string();
+        assert!(is_old_format_link(&format!("#store={old}")));
+        assert!(is_old_format_link(&format!("?x=1&store={old}")));
+        assert!(!is_old_format_link(&format!("#store={}", code())));
+        assert!(!is_old_format_link(&format!(
+            "#store={}",
+            &old[..old.len() - 2]
+        )));
+        assert!(!is_old_format_link(
+            "#store=0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OI"
+        ));
+        assert!(!is_old_format_link(""));
+        assert!(!is_old_format_link(&format!("#tab={old}")));
     }
 
     #[test]

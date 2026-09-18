@@ -791,7 +791,7 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
 /// | V1         | `ded0e3a` | whole key              | 56 B  |
 /// | V2..=V5    | `78d1020`..`9e3e1fb` | + 2 Bitcoin fields | 109 B |
 /// | V6..=V16   | `ea94a33`..`5110283` | whole key   | 56 B  |
-/// | current    | this build | code (harvest#52)     | 25 B  |
+/// | current    | this build | code (harvest#52)     | 29 B  |
 ///
 /// The two Bitcoin fields were added by `7c192d2` (first shipped in the V2
 /// artifact) and removed again by `fc760ed` (first shipped in the V6
@@ -865,7 +865,7 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     assert_eq!(size(StoreParamShape::WholeKey), 56);
     assert_eq!(
         size(StoreParamShape::Code),
-        25,
+        29,
         "current StoreParameters cbor"
     );
 
@@ -1134,6 +1134,89 @@ fn a_populated_predecessor_is_recovered_and_seals() {
 /// Both halves are needed, and each fails silently without the other: probed
 /// under today's code parameters the V16 address is one it never had, and
 /// carried without an owner every record is refused by the new contract.
+/// **The owner fill-in never reassigns a store.** A local snapshot owned by
+/// a DIFFERENT key (the case where another key holds the seller's address)
+/// is merged with the seller's whole-key predecessor. The fill-in names the
+/// seller only where a state names nobody, so the snapshot stays the other
+/// key's: its records are not re-attributed to the seller, and the merge
+/// decides between the two owners by the contract's own rule.
+///
+/// Mutated red by dropping the `is_none()` guard in `name_whole_key_owner`,
+/// which the review found survived every other test.
+#[test]
+fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
+    let other = SigningKey::from_bytes(&[0x3cu8; 32]);
+    let mut foreign = StoreStateV1 {
+        owner: Some(other.verifying_key()),
+        ..Default::default()
+    };
+    foreign.listings.listings = vec![{
+        let listing = Listing {
+            id: ListingId([0u8; 32]),
+            title: "Not the seller's".to_string(),
+            description: String::new(),
+            kind: ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("ts"),
+        }
+        .with_derived_id();
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: harvest_common::expected_harvest_requestor(),
+            payload: harvest_common::to_cbor(&listing).expect("encode"),
+        };
+        let scoped_payload = harvest_common::to_cbor(&scoped).expect("encode");
+        AuthorizedListing {
+            signature: other.sign(&scoped_payload).to_bytes().to_vec(),
+            listing,
+            scoped_payload,
+            certificate_pem: String::new(),
+        }
+    }];
+
+    assert_eq!(
+        crate::migrate::name_whole_key_owner(foreign.clone(), &seller_vk()).owner,
+        Some(other.verifying_key()),
+        "a state that names an owner keeps it"
+    );
+
+    // Precondition for the refusal asserted below: the other key outranks
+    // the seller, so its snapshot is SENT and refused. The other way round
+    // it would simply lose the merge and send nothing, which is also right
+    // (its records are not the seller's) but reports nothing.
+    assert!(other.verifying_key().as_bytes() < seller_vk().as_bytes());
+
+    take_uncarried();
+    let recovered = store_with(&[signed_listing("Coffee")]);
+    let merged = store_ops().merge_with_local(recovered, &foreign);
+    assert_eq!(
+        merged.owner,
+        Some(seller_vk()),
+        "the seller's recovered store"
+    );
+    assert!(
+        merged
+            .listings
+            .listings
+            .iter()
+            .all(|l| l.listing.title != "Not the seller's"),
+        "no record of the other key's is carried as the seller's"
+    );
+    assert!(
+        merged
+            .listings
+            .listings
+            .iter()
+            .all(|l| l.verify(&seller_vk()).is_ok()),
+        "every carried record verifies against the owner it is carried under"
+    );
+    // The other key does not share the seller's code, so the contract's own
+    // rule refuses its snapshot, and the fold says so rather than dropping it
+    // quietly.
+    let lost = take_uncarried();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert!(lost[0].contains("could not be merged"), "{}", lost[0]);
+}
+
 #[test]
 fn a_whole_key_store_is_found_and_carried_into_the_code_addressed_contract() {
     use freenet_scaffold::ComposableState;

@@ -51,7 +51,7 @@ The list (and the paired `bitcoin_address_code_hash`) now live on
 `payment::Order`, inside what the seller signs. So each invoice names the
 bridges that settle it, a later invoice may name different ones, and
 `StoreParameters` is back to holding only the seller's identity (since
-harvest#52, a twelve-character code derived from the seller's key, with the
+harvest#52, a sixteen-character code derived from the seller's key, with the
 full key bound in the store's state), which genuinely is the store's
 identity, and is correctly immutable. Moving the list to
 mutable *state* instead would have been worse: `OrdersV1::verify` re-checks

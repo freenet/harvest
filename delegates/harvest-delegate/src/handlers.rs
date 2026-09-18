@@ -51,7 +51,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
         crate::markers::marker_secret_key("v1.store.aa.bb"),
         crate::messaging::buyer_conversation_key(&[3u8; 32], &[4u8; 32]),
-        crate::known_stores::known_store_key("3Bn8xWqLd6Tz"),
+        crate::known_stores::known_store_key("3Bn8xWqLd6Tz9Kf2"),
     ]
 }
 
@@ -733,7 +733,7 @@ mod origin_gating_tests {
             &mut store,
             Some(&harvest()),
             HarvestDelegateRequest::RememberStore {
-                store_code: "3Bn8xWqLd6Tz".to_string(),
+                store_code: "3Bn8xWqLd6Tz9Kf2".to_string(),
             },
         );
         assert!(
@@ -745,10 +745,10 @@ mod origin_gating_tests {
         for request in [
             HarvestDelegateRequest::ListRememberedStores,
             HarvestDelegateRequest::RememberStore {
-                store_code: "Qp5vMe7RkT2c".to_string(),
+                store_code: "Qp5vMe7RkT2cHw4n".to_string(),
             },
             HarvestDelegateRequest::SetStoreArchived {
-                store_code: "3Bn8xWqLd6Tz".to_string(),
+                store_code: "3Bn8xWqLd6Tz9Kf2".to_string(),
                 archived: true,
             },
         ] {

@@ -39,7 +39,7 @@
 //!
 //! # How (2) is answered since the store code (harvest#52)
 //!
-//! A store's parameter is now a twelve-character CODE, a prefix of its
+//! A store's parameter is now a sixteen-character CODE, a prefix of its
 //! owner's key, and a prefix names many keys. So the address alone no longer
 //! says whose store it is; the state does, in `StoreStateV1::owner`, and the
 //! contract verifies every record against that owner. For a store at the
@@ -641,7 +641,7 @@ mod tests {
     /// verified every record against the key in the state, and that key is
     /// not this certificate's.
     ///
-    /// Grinding a real twelve-character collision is out of reach, so the
+    /// Grinding a real sixteen-character collision is out of reach, so the
     /// shared code is modelled the other way round: the certificate's own
     /// store, whose state names a different owner.
     #[test]
