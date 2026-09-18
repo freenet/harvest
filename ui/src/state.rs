@@ -280,8 +280,20 @@ pub struct AppState {
     /// How many used addresses an invoice has already skipped, keyed by the
     /// request id of the derivation that replaces the last one.
     pub address_skips: HashMap<u64, u32>,
-    /// Output of [`AppState::refresh_shared_address_warnings`], by order.
-    pub shared_address_warnings: HashMap<harvest_common::payment::OrderId, AddressWarning>,
+    /// For each of this seller's own orders, the OTHER own orders on the same
+    /// payment address and network that are not cancelled, with their payment
+    /// windows. Output of [`AppState::refresh_same_address_orders`].
+    pub same_address_orders: HashMap<
+        harvest_common::payment::OrderId,
+        Vec<(
+            harvest_common::payment::OrderId,
+            std::ops::RangeInclusive<u32>,
+        )>,
+    >,
+    /// Settlements a proof exists for but that were not auto-published
+    /// (see [`AppState::settlement_hold`]), by order, with their store, so
+    /// the seller can confirm them from the card.
+    pub withheld_settlements: HashMap<harvest_common::payment::OrderId, (Vec<u8>, AuthorizedOrder)>,
 
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
     ///
@@ -1001,32 +1013,37 @@ pub fn order_for_invoice(
     .with_derived_id())
 }
 
-/// Why the seller's card warns that another of their invoices shares this
-/// order's payment address with an overlapping window. See
-/// [`AppState::refresh_shared_address_warnings`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AddressWarning {
-    /// Awaiting payment, and the address does not yet hold, inside this
-    /// order's window, enough for it and every twin still awaiting payment.
-    /// Not auto-published as Paid until it does.
-    Held { needed_sats: u64 },
-    /// Already paid (or reversed) while a twin exists: it may have been
-    /// marked paid on the twin's payment.
-    MayBeTwinsPayment,
+/// Why a payment that proves an order was not published as Paid on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettlementHold {
+    /// Other own orders on the same address have overlapping windows, so one
+    /// payment would prove them all and nothing on the chain says whose it is.
+    Twins(Vec<harvest_common::payment::OrderId>),
+    /// Not every store this seller owns has loaded, so a twin could be
+    /// sitting in one that has not.
+    StoresNotLoaded,
 }
 
-impl AddressWarning {
-    pub fn explain(self) -> String {
+impl SettlementHold {
+    pub fn explain(&self) -> String {
         match self {
-            AddressWarning::Held { needed_sats } => format!(
-                "Another of your invoices uses this same payment address, so one payment \
-                 could look like it pays for both. Harvest will not mark this one paid until \
-                 the address holds enough for all of them ({needed_sats} sats). Do not ship \
-                 against a single payment."
+            SettlementHold::Twins(twins) => format!(
+                "A payment at this address proves this invoice, but your invoice{} {} use{} \
+                 the same address, and one payment cannot pay for both invoices. Harvest \
+                 will not mark this one paid on its own. Check your wallet for a separate \
+                 payment per invoice, then confirm.",
+                if twins.len() == 1 { "" } else { "s" },
+                twins
+                    .iter()
+                    .map(|id| id.short())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if twins.len() == 1 { "s" } else { "" },
             ),
-            AddressWarning::MayBeTwinsPayment => "Another of your invoices uses this same \
-                 payment address, so this one may have been marked paid on the other \
-                 invoice's payment. Check your wallet for separate payments before shipping."
+            SettlementHold::StoresNotLoaded => "A payment at this address proves this \
+                 invoice, but not all of your stores have loaded, so Harvest cannot rule \
+                 out another invoice on the same address, and one payment cannot pay for \
+                 both invoices. Check your wallet, then confirm."
                 .to_string(),
         }
     }
@@ -1945,7 +1962,7 @@ impl AppState {
             ) {
                 Ok(addr_state) => {
                     self.apply_address_state(contract_id, network, &addr_state);
-                    self.refresh_shared_address_warnings();
+                    self.refresh_same_address_orders();
                     // A payment confirming is exactly the moment an order
                     // becomes provable, and this is the only notification
                     // that says so -- the store's own state does not change
@@ -2058,7 +2075,7 @@ impl AppState {
                     // prove. Here as well as on the address path below,
                     // because the two arrive independently: the claims may be
                     // in hand before the order is, or the other way round.
-                    self.refresh_shared_address_warnings();
+                    self.refresh_same_address_orders();
                     self.publish_settled_orders(&contract_id);
 
                     // And ask the bridge to watch the payment address of any
@@ -3051,16 +3068,6 @@ impl AppState {
             if order.status != OrderStatus::AwaitingPayment {
                 continue;
             }
-            // One payment could prove two of this seller's orders on one
-            // address (the contract's pinned known limit), so an order is
-            // held until its address covers every twin still awaiting
-            // payment. See `refresh_shared_address_warnings`.
-            if matches!(
-                self.shared_address_warnings.get(&order.order.id),
-                Some(AddressWarning::Held { .. })
-            ) {
-                continue;
-            }
             let Some(view) = order
                 .order
                 .bitcoin_address_instance_id()
@@ -3090,129 +3097,118 @@ impl AppState {
         settled
     }
 
-    /// Recompute which of this seller's orders share a payment address with
-    /// another whose window overlaps theirs, and what the card should say.
+    /// Recompute [`Self::same_address_orders`].
     ///
-    /// # Why this exists on top of every lookup
+    /// One payment can prove two orders on one address whose windows overlap
+    /// (the contract's pinned known limit), and nothing on the chain says
+    /// which order a payment was for. So this does not try to attribute
+    /// payments: it records which orders COULD be confused, and
+    /// [`Self::settlement_hold`] leaves those to the seller.
     ///
-    /// The store contract's window cannot stop ONE payment settling two
-    /// orders on one address whose windows overlap: a cross-order rule is not
-    /// merge-safe, since a `Paid` record cannot be demoted. No lookup before
-    /// signing rules it out either (two devices invoicing at once both find
-    /// no contract; "not found" and timeouts sign anyway). Noticing it
-    /// afterwards, locally, from the orders themselves always works, and
-    /// writes nothing.
-    ///
-    /// An order still awaiting payment is HELD (not auto-published as Paid)
-    /// only while the confirmed value inside its own window cannot cover it
-    /// plus every overlapping twin still awaiting payment, so a genuine
-    /// payment for all of them releases it rather than stranding it. An
-    /// order already paid gets a warning only.
-    ///
-    /// Own stores only: scripts are public, so a stranger's store copying one
-    /// must not be able to stall this seller's settlements. Twins on another
-    /// network are ignored (signet and testnet4 share script bytes but not
-    /// payments). An order with no anchor has no window and is ignored.
-    ///
-    /// UI-only, and only for loaded stores: see `docs/untested-invariants.md`.
-    /// Stored rather than computed per render, because it is quadratic in a
-    /// script's orders and the card reads it on every render.
-    pub fn refresh_shared_address_warnings(&mut self) {
-        use harvest_common::payment::{Order, OrderStatus};
-        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<&AuthorizedOrder>> = HashMap::new();
+    /// Own stores only (a stranger copying a script must not stall this
+    /// seller), same network only (signet and testnet4 share script bytes but
+    /// not payments), cancelled orders ignored, and orders with no anchor
+    /// ignored (no window). Stored because the card reads it on every render.
+    pub fn refresh_same_address_orders(&mut self) {
+        use harvest_common::payment::{OrderId, OrderStatus};
+        type Entry = (OrderId, std::ops::RangeInclusive<u32>);
+        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<Entry>> = HashMap::new();
         let mut seen = HashSet::new();
         for registration in self.my_stores.values().flatten() {
             let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
                 continue;
             };
             for record in &store.orders {
-                if !record.order.payment_script_pubkey.is_empty() && seen.insert(&record.order.id) {
-                    by_script
-                        .entry((
-                            record.order.network,
-                            record.order.payment_script_pubkey.as_slice(),
-                        ))
-                        .or_default()
-                        .push(record);
-                }
-            }
-        }
-        let overlap = |a: &Order, b: &Order| match (a.payment_window(), b.payment_window()) {
-            (Some(wa), Some(wb)) => wa.start().max(wb.start()) <= wa.end().min(wb.end()),
-            _ => false,
-        };
-        let mut warnings = HashMap::new();
-        for orders in by_script.values() {
-            for record in orders {
                 let order = &record.order;
-                let twins: Vec<_> = orders
-                    .iter()
-                    .filter(|twin| twin.order.id != order.id && overlap(order, &twin.order))
-                    .collect();
-                if twins.is_empty() {
+                let Some(window) = order.payment_window() else {
                     continue;
-                }
-                let warning = match record.status {
-                    OrderStatus::Paid | OrderStatus::PaymentReversed => {
-                        AddressWarning::MayBeTwinsPayment
-                    }
-                    OrderStatus::Cancelled => continue,
-                    OrderStatus::AwaitingPayment => {
-                        let needed_sats = twins
-                            .iter()
-                            .filter(|twin| twin.status == OrderStatus::AwaitingPayment)
-                            .fold(order.amount_sats, |sum, twin| {
-                                sum.saturating_add(twin.order.amount_sats)
-                            });
-                        let view = order
-                            .bitcoin_address_instance_id()
-                            .and_then(|id| self.bitcoin.addresses.get(id.as_slice()));
-                        let in_window =
-                            crate::components::bitcoin_view::AddressReading::of(order, view)
-                                .in_window_sats;
-                        if in_window >= needed_sats {
-                            continue;
-                        }
-                        AddressWarning::Held { needed_sats }
-                    }
                 };
-                warnings.insert(order.id.clone(), warning);
+                if record.status != OrderStatus::Cancelled
+                    && !order.payment_script_pubkey.is_empty()
+                    && seen.insert(&order.id)
+                {
+                    by_script
+                        .entry((order.network, order.payment_script_pubkey.as_slice()))
+                        .or_default()
+                        .push((order.id.clone(), window));
+                }
             }
         }
-        self.shared_address_warnings = warnings;
+        let mut map = HashMap::new();
+        for orders in by_script.values().filter(|orders| orders.len() > 1) {
+            for (id, _) in orders {
+                let others = orders
+                    .iter()
+                    .filter(|(other, _)| other != id)
+                    .cloned()
+                    .collect();
+                map.insert(id.clone(), others);
+            }
+        }
+        self.same_address_orders = map;
     }
 
-    /// Whether another of this seller's own orders on the same address and
-    /// network has a payment window containing `height`, i.e. a payment
-    /// confirmed there may be that order's rather than a late one for this.
+    /// Whether another own, uncancelled order on the same address and
+    /// network has a payment window containing `height`.
     pub fn another_own_order_window_holds(
         &self,
-        order: &harvest_common::payment::Order,
+        order_id: &harvest_common::payment::OrderId,
         height: u32,
     ) -> bool {
-        self.my_stores
-            .values()
-            .flatten()
-            .filter_map(|registration| self.browsing_stores.get(&registration.store_contract_id))
-            .flat_map(|store| &store.orders)
-            .any(|other| {
-                other.order.id != order.id
-                    && other.order.network == order.network
-                    && other.order.payment_script_pubkey == order.payment_script_pubkey
-                    && other
-                        .order
-                        .payment_window()
-                        .is_some_and(|window| window.contains(&height))
-            })
+        self.same_address_orders
+            .get(order_id)
+            .is_some_and(|others| others.iter().any(|(_, window)| window.contains(&height)))
     }
 
-    /// What the seller's card should say about another invoice sharing this
-    /// order's address, if anything.
-    pub fn address_warning(
+    /// Whether a payment confirmed at any of `heights` (an order's in-window
+    /// confirmations) also falls in another own order's window, i.e. whether
+    /// a Paid order may have been settled on another invoice's payment.
+    pub fn payment_may_be_anothers(
         &self,
         order_id: &harvest_common::payment::OrderId,
-    ) -> Option<AddressWarning> {
-        self.shared_address_warnings.get(order_id).copied()
+        heights: &[u32],
+    ) -> bool {
+        heights
+            .iter()
+            .any(|&height| self.another_own_order_window_holds(order_id, height))
+    }
+
+    /// Whether every store this seller owns has been read from the network.
+    pub fn owned_stores_loaded(&self) -> bool {
+        self.my_stores.values().flatten().all(|registration| {
+            self.browsing_stores
+                .get(&registration.store_contract_id)
+                .is_some_and(|store| store.info.is_some())
+        })
+    }
+
+    /// Why a provable payment for `order` should not be published as Paid
+    /// without the seller confirming it, if it should not.
+    ///
+    /// Only when nothing is ambiguous: no other own, uncancelled order on the
+    /// same address and network with an overlapping window (a Paid one
+    /// counts: its payment may be the very one proving this order), and
+    /// every owned store loaded (a twin could be in one that has not).
+    /// Everything else goes to the seller with the reason in front of them;
+    /// the contract accepts `Paid` on the evidence alone, so a confirmation
+    /// needs no new trust.
+    pub fn settlement_hold(
+        &self,
+        order: &harvest_common::payment::Order,
+    ) -> Option<SettlementHold> {
+        let window = order.payment_window()?;
+        let twins: Vec<_> = self
+            .same_address_orders
+            .get(&order.id)
+            .into_iter()
+            .flatten()
+            .filter(|(_, other)| window.start().max(other.start()) <= window.end().min(other.end()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !twins.is_empty() {
+            return Some(SettlementHold::Twins(twins));
+        }
+        (!self.owned_stores_loaded()).then_some(SettlementHold::StoresNotLoaded)
     }
 
     /// A settlement update that did not reach the node.
@@ -3313,33 +3309,70 @@ impl AppState {
             return Vec::new();
         }
 
+        // Anything ambiguous goes to the seller rather than out on its own;
+        // see `settlement_hold`. Rebuilt for this store on every call so an
+        // entry never outlives the proof or the reason behind it.
+        self.withheld_settlements
+            .retain(|_, (store, _)| store.as_slice() != store_contract_id);
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
-            if !self.settlements_submitted.insert(settled.order.id.clone()) {
+            if self.settlement_hold(&settled.order).is_some() {
+                self.withheld_settlements.insert(
+                    settled.order.id.clone(),
+                    (store_contract_id.to_vec(), settled),
+                );
                 continue;
             }
-            published.push(settled.clone());
-            info!(
-                "Publishing the settled order {} -- the payment verifies",
-                settled.order.id.short()
-            );
-            #[cfg(target_arch = "wasm32")]
-            {
-                let store_id = store_contract_id.to_vec();
-                let order_id = settled.order.id.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) =
-                        crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
-                    {
-                        dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
-                        crate::gateway::APP_STATE
-                            .write()
-                            .settlement_publish_failed(&order_id, &e);
-                    }
-                });
+            if self.dispatch_settlement(store_contract_id, settled.clone()) {
+                published.push(settled);
             }
         }
         published
+    }
+
+    /// The seller confirming a withheld settlement from its card: publishes
+    /// exactly the proof that was assembled and verified. Returns it, since
+    /// the send itself is wasm-only.
+    pub fn confirm_paid(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<harvest_common::payment::AuthorizedOrder> {
+        let (store_contract_id, settled) = self.withheld_settlements.remove(order_id)?;
+        self.dispatch_settlement(&store_contract_id, settled.clone())
+            .then_some(settled)
+    }
+
+    /// Send one settlement, once per tab. Returns whether it was sent.
+    fn dispatch_settlement(
+        &mut self,
+        store_contract_id: &[u8],
+        settled: harvest_common::payment::AuthorizedOrder,
+    ) -> bool {
+        if !self.settlements_submitted.insert(settled.order.id.clone()) {
+            return false;
+        }
+        info!(
+            "Publishing the settled order {} -- the payment verifies",
+            settled.order.id.short()
+        );
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store_id = store_contract_id.to_vec();
+            let order_id = settled.order.id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) =
+                    crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
+                {
+                    dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
+                    crate::gateway::APP_STATE
+                        .write()
+                        .settlement_publish_failed(&order_id, &e);
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (store_contract_id, settled);
+        true
     }
 
     /// The Bitcoin address contracts this node should be watching for one
@@ -5077,7 +5110,7 @@ impl AppState {
                     ghostkey_fingerprint
                 );
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
-                self.refresh_shared_address_warnings();
+                self.refresh_same_address_orders();
 
                 // Nothing else re-fetches these after a reload: the seller's
                 // own store is subscribed at creation time and never again,
@@ -9413,154 +9446,89 @@ mod invoice_tests {
         );
     }
 
-    /// **Which orders are warned about, and which are held.** Two of the
-    /// seller's orders on one address overlap exactly when the later anchor
-    /// is less than a window after the earlier; an overlapping order awaiting
-    /// payment is held until its window holds enough for every twin still
-    /// awaiting payment, and then released; a paid one is only warned about.
-    /// A stranger's store, or a twin on another network, flags nothing.
+    /// **Which orders are ambiguous.** Any other own, uncancelled order on the
+    /// same address and network whose window overlaps, whatever its status.
+    /// Windows overlap exactly when the later anchor is less than a window
+    /// after the earlier; a partial overlap counts. A stranger's store flags
+    /// nothing. `another_own_order_window_holds` reads the same map.
     #[test]
-    fn shared_address_warnings_hold_until_the_address_covers_the_twins() {
+    fn an_order_is_ambiguous_with_any_overlapping_uncancelled_own_twin() {
         use harvest_common::payment::{OrderStatus, PAYMENT_WINDOW_BLOCKS};
         fn anchored(height: u32, amount: u64) -> harvest_common::payment::AuthorizedOrder {
             let mut record = with_script(&[0x00, 0x14, 1]);
             record.order.anchor = Some(anchor(height));
             record.order.amount_sats = amount;
-            record.order.bitcoin_address_code_hash = Some([4u8; 32]);
             record.order = record.order.with_derived_id();
             record
         }
-        fn warnings_for(
-            orders: Vec<harvest_common::payment::AuthorizedOrder>,
-            paid_in_window: u64,
-        ) -> Vec<Option<AddressWarning>> {
+        fn twins_of(
+            a: &harvest_common::payment::AuthorizedOrder,
+            b: harvest_common::payment::AuthorizedOrder,
+            elsewhere: bool,
+        ) -> Option<SettlementHold> {
             let mut state = seller_with_a_store();
-            if paid_in_window > 0 {
-                let id = orders[0].order.bitcoin_address_instance_id().expect("id");
-                state.bitcoin.addresses.insert(
-                    id.to_vec(),
-                    AddressView {
-                        network: BitcoinNetwork::Signet,
-                        claims: Vec::new(),
-                        scanned_to: None,
-                        confirmed_sats: paid_in_window,
-                        pending_sats: 0,
-                        txs: vec![TxRow {
-                            txid_display: "tx".into(),
-                            value_sats: paid_in_window,
-                            // Inside both overlapping windows.
-                            status: TxRowStatus::Confirmed {
-                                anchor_height: 100 + PAYMENT_WINDOW_BLOCKS,
-                            },
-                        }],
-                    },
-                );
-            }
+            let store = if elsewhere {
+                vec![0x77; 32]
+            } else {
+                STORE_ID.to_vec()
+            };
             state
                 .browsing_stores
                 .get_mut(STORE_ID.as_slice())
                 .expect("store")
-                .orders = orders.clone();
-            state.refresh_shared_address_warnings();
-            orders
-                .iter()
-                .map(|o| state.address_warning(&o.order.id))
-                .collect()
+                .orders = vec![a.clone()];
+            state
+                .browsing_stores
+                .entry(store)
+                .or_default()
+                .orders
+                .push(b);
+            state.refresh_same_address_orders();
+            state.settlement_hold(&a.order)
         }
-        let held = Some(AddressWarning::Held { needed_sats: 3 });
-
-        // Both window boundaries.
-        let (a, late_overlap) = (
-            anchored(100, 1),
-            anchored(100 + PAYMENT_WINDOW_BLOCKS - 1, 2),
+        let a = anchored(100, 1);
+        let late = anchored(100 + PAYMENT_WINDOW_BLOCKS - 1, 2);
+        let twins = Some(SettlementHold::Twins(vec![late.order.id.clone()]));
+        assert_eq!(
+            twins_of(&a, late.clone(), false),
+            twins,
+            "a partial overlap"
         );
         assert_eq!(
-            warnings_for(vec![a.clone(), late_overlap.clone()], 0),
-            vec![held, held]
-        );
-        let apart = anchored(100 + PAYMENT_WINDOW_BLOCKS, 2);
-        assert_eq!(warnings_for(vec![a.clone(), apart], 0), vec![None, None]);
-
-        // Released once the address holds enough for both, not before.
-        assert_eq!(
-            warnings_for(vec![a.clone(), late_overlap.clone()], 2),
-            vec![held, held]
-        );
-        assert_eq!(
-            warnings_for(vec![a.clone(), late_overlap.clone()], 3),
-            vec![None, None]
+            twins_of(&a, anchored(100 + PAYMENT_WINDOW_BLOCKS, 2), false),
+            None
         );
 
-        // A paid twin: it is only warned about, and it no longer counts
-        // toward what the awaiting one needs.
-        let mut paid = late_overlap.clone();
+        let mut paid = late.clone();
         paid.status = OrderStatus::Paid;
-        assert_eq!(
-            warnings_for(vec![a.clone(), paid], 0),
-            vec![
-                Some(AddressWarning::Held { needed_sats: 1 }),
-                Some(AddressWarning::MayBeTwinsPayment)
-            ]
-        );
+        assert_eq!(twins_of(&a, paid, false), twins, "a paid twin counts");
+        let mut cancelled = late.clone();
+        cancelled.status = OrderStatus::Cancelled;
+        assert_eq!(twins_of(&a, cancelled, false), None, "a cancelled twin");
+        let mut other_net = late.clone();
+        other_net.order.network = BitcoinNetwork::Testnet4;
+        other_net.order = other_net.order.with_derived_id();
+        assert_eq!(twins_of(&a, other_net, false), None, "another network");
+        assert_eq!(twins_of(&a, late.clone(), true), None, "a stranger's store");
 
-        // A twin on another network shares script bytes but not payments.
-        let mut elsewhere = late_overlap.clone();
-        elsewhere.order.network = BitcoinNetwork::Testnet4;
-        elsewhere.order = elsewhere.order.with_derived_id();
-        assert_eq!(
-            warnings_for(vec![a.clone(), elsewhere], 0),
-            vec![None, None]
-        );
-
-        // A stranger's store holding the same script.
+        // `another_own_order_window_holds`, by height, from the same map.
         let mut state = seller_with_a_store();
-        state
-            .browsing_stores
-            .get_mut(STORE_ID.as_slice())
-            .expect("store")
-            .orders = vec![a.clone()];
-        state
-            .browsing_stores
-            .entry(vec![0x77; 32])
-            .or_default()
-            .orders = vec![late_overlap];
-        state.refresh_shared_address_warnings();
-        assert_eq!(state.address_warning(&a.order.id), None);
-    }
-
-    /// **Round 3, Should Fix 4.** Whether a payment after this order's window
-    /// lands inside another own order's window on the same address.
-    #[test]
-    fn another_own_orders_window_is_found_by_height() {
-        use harvest_common::payment::PAYMENT_WINDOW_BLOCKS;
-        let mut state = seller_with_a_store();
-        let mut first = with_script(&[0x00, 0x14, 1]);
-        first.order.anchor = Some(anchor(100));
-        first.order = first.order.with_derived_id();
-        let mut second = first.clone();
-        second.order.anchor = Some(anchor(100 + PAYMENT_WINDOW_BLOCKS));
-        second.order = second.order.with_derived_id();
-        state
-            .browsing_stores
-            .get_mut(STORE_ID.as_slice())
-            .expect("store")
-            .orders = vec![first.clone(), second];
-        let after_first = 100 + PAYMENT_WINDOW_BLOCKS + 1;
-        assert!(state.another_own_order_window_holds(&first.order, after_first));
-        // An order on another address whose window holds the height is not
-        // the same address's order.
+        let apart = anchored(100 + PAYMENT_WINDOW_BLOCKS, 2);
         let mut unrelated = with_script(&[0x00, 0x14, 9]);
-        unrelated.order.anchor = Some(anchor(100 + 3 * PAYMENT_WINDOW_BLOCKS - 5));
+        unrelated.order.anchor = Some(anchor(100 + PAYMENT_WINDOW_BLOCKS));
         unrelated.order = unrelated.order.with_derived_id();
         state
             .browsing_stores
             .get_mut(STORE_ID.as_slice())
             .expect("store")
-            .orders
-            .push(unrelated);
-        assert!(
-            !state.another_own_order_window_holds(&first.order, 100 + 3 * PAYMENT_WINDOW_BLOCKS)
-        );
+            .orders = vec![a.clone(), apart, unrelated];
+        state.refresh_same_address_orders();
+        assert!(state.another_own_order_window_holds(&a.order.id, 100 + PAYMENT_WINDOW_BLOCKS + 1));
+        // A Paid order's note: only when one of its own payment heights is in
+        // the other order's window.
+        assert!(state.payment_may_be_anothers(&a.order.id, &[150, 100 + PAYMENT_WINDOW_BLOCKS + 1]));
+        assert!(!state.payment_may_be_anothers(&a.order.id, &[150]));
+        assert!(!state.another_own_order_window_holds(&a.order.id, 100 + 3 * PAYMENT_WINDOW_BLOCKS));
     }
 
     /// **Round 2, Should Fix 6.** Two invoices handed the same address: the
@@ -14049,30 +14017,14 @@ mod buy_flow_tests {
             .expect("a settled order must verify as Paid");
     }
 
-    /// **PR #83 round 2, Should Fix 1.** When this seller owns the store and
-    /// holds a second order on the same address whose window overlaps, the
-    /// confirmed payment is NOT auto-published as Paid: one payment could
-    /// prove both. The same state without the twin still settles, so the
-    /// refusal is the twin's doing and not the registration's.
-    #[test]
-    fn a_payment_on_an_address_two_own_orders_share_is_not_auto_published() {
+    /// This seller's store, loaded, holding a provable payment for `order`,
+    /// plus `twin` (if any) on the same address with the given status.
+    fn seller_holding_a_paid_order(
+        twin_status: Option<OrderStatus>,
+    ) -> (AppState, AuthorizedOrder) {
         let (order, claims, tip) = a_paid_order();
         let (mut state, _) = buyer_after_acceptance(&order);
         give_the_node_the_chain(&mut state, &order, claims, tip);
-        // The folded view the card and the hold read, as the claims fold.
-        let id = order.order.bitcoin_address_instance_id().expect("id");
-        state
-            .bitcoin
-            .addresses
-            .get_mut(id.as_slice())
-            .expect("view")
-            .txs = vec![TxRow {
-            txid_display: "tx".into(),
-            value_sats: order.order.amount_sats,
-            status: TxRowStatus::Confirmed {
-                anchor_height: TIP_HEIGHT - 1,
-            },
-        }];
         state.my_stores.insert(
             "seller-fp".to_string(),
             vec![StoreRegistration {
@@ -14082,45 +14034,98 @@ mod buy_flow_tests {
                 store_contract_key: None,
             }],
         );
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
+        if let Some(status) = twin_status {
+            let mut twin = order.clone();
+            twin.order.amount_sats += 1;
+            let mut twin = resigned(twin, &seller_signing_key());
+            twin.status = status;
+            state
+                .browsing_stores
+                .get_mut(STORE)
+                .expect("store")
+                .orders
+                .push(twin);
+        }
+        state.refresh_same_address_orders();
+        (state, order)
+    }
+
+    /// **PR #83 round 4.** With no twin and every owned store loaded, a
+    /// provable payment is published on its own.
+    #[test]
+    fn an_unambiguous_payment_is_auto_published() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].order.id, order.order.id);
+        assert!(state.withheld_settlements.is_empty());
+    }
+
+    /// **Round 4, blocking.** A twin on the same address with an overlapping
+    /// window -- a PAID one included, since its payment may be the very one
+    /// proving this order, and an abandoned one awaiting payment forever --
+    /// means nothing is auto-published. The seller's "Confirm paid" then
+    /// publishes exactly the proof that was assembled, and it verifies, so no
+    /// case is left stuck. A cancelled twin does not count.
+    #[test]
+    fn a_twin_withholds_the_settlement_and_the_seller_can_confirm_it() {
+        for twin in [OrderStatus::Paid, OrderStatus::AwaitingPayment] {
+            let (mut state, order) = seller_holding_a_paid_order(Some(twin));
+            let assembled = state
+                .settled_orders(STORE)
+                .into_iter()
+                .find(|r| r.order.id == order.order.id)
+                .expect("the proof assembles");
+            assert!(
+                state
+                    .publish_settled_orders(STORE)
+                    .iter()
+                    .all(|r| r.order.id != order.order.id),
+                "one payment was auto-published for an order with a {twin:?} twin"
+            );
+            assert!(matches!(
+                state.settlement_hold(&order.order),
+                Some(SettlementHold::Twins(_))
+            ));
+
+            let confirmed = state
+                .confirm_paid(&order.order.id)
+                .expect("confirm publishes");
+            assert_eq!(confirmed, assembled);
+            confirmed
+                .verify(&seller_signing_key().verifying_key())
+                .expect("the confirmed record verifies as Paid");
+        }
+
+        let (mut state, _) = seller_holding_a_paid_order(Some(OrderStatus::Cancelled));
         assert_eq!(
-            state.settled_orders(STORE).len(),
+            state.publish_settled_orders(STORE).len(),
             1,
-            "owning the store alone must not stop a settlement"
+            "a cancelled twin counted"
         );
+    }
 
-        let mut twin = order.clone();
-        twin.order.amount_sats += 1;
-        let twin = resigned(twin, &seller_signing_key());
-        assert_ne!(twin.order.id, order.order.id);
-        state
-            .browsing_stores
-            .get_mut(STORE)
-            .expect("store")
-            .orders
-            .push(twin.clone());
-
-        state.refresh_shared_address_warnings();
-        assert!(
-            state.settled_orders(STORE).is_empty(),
-            "a payment was auto-published for an order sharing its address"
+    /// **Round 4.** An owned store that has not loaded could hold a twin, so
+    /// nothing is auto-published until it has; the seller can still confirm.
+    #[test]
+    fn an_owned_store_not_loaded_withholds_the_settlement() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        state.my_stores.insert(
+            "another-ghost-key".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![0x5e; 32],
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            }],
         );
-
-        // And the hold lifts: once the twin is paid, what is at the address
-        // covers this order alone, and it settles.
-        state
-            .browsing_stores
-            .get_mut(STORE)
-            .expect("store")
-            .orders
-            .last_mut()
-            .expect("twin")
-            .status = OrderStatus::Paid;
-        state.refresh_shared_address_warnings();
+        assert!(state.publish_settled_orders(STORE).is_empty());
         assert_eq!(
-            state.settled_orders(STORE).len(),
-            1,
-            "the hold never lifted"
+            state.settlement_hold(&order.order),
+            Some(SettlementHold::StoresNotLoaded)
         );
+        assert!(state.confirm_paid(&order.order.id).is_some());
     }
 
     /// **An order whose payment has not confirmed is not settled.**
@@ -14345,6 +14350,9 @@ mod buy_flow_tests {
             .get_mut(STORE)
             .expect("the store")
             .orders = vec![order.clone()];
+        // Read from the network, so its settlements are not withheld for a
+        // store that has not loaded (`settlement_hold`).
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
         state
             .bitcoin
             .tips

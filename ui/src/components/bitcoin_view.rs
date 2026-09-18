@@ -524,19 +524,26 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
         )
     };
     let reading = AddressReading::of(o, live.as_ref());
-    // Only ever set for the seller's own orders; see
-    // `AppState::refresh_shared_address_warnings`.
-    let (address_warning, late_is_another_orders) = {
+    // All of this is about the seller's own orders; see
+    // `AppState::settlement_hold` and `refresh_same_address_orders`.
+    let (hold, late_is_another_orders, paid_maybe_twins) = {
         let state = APP_STATE.read();
-        (
-            state.address_warning(&o.id),
-            reading
-                .after_window
-                .is_some_and(|height| state.another_own_order_window_holds(o, height)),
-        )
+        let hold = state
+            .withheld_settlements
+            .contains_key(&o.id)
+            .then(|| state.settlement_hold(o))
+            .flatten();
+        let late = reading
+            .after_window
+            .is_some_and(|height| state.another_own_order_window_holds(&o.id, height));
+        // Only when it is actually possible: the payment this order was
+        // settled on confirmed inside another own order's window too.
+        let paid_maybe_twins = order.status == OrderStatus::Paid
+            && state.payment_may_be_anothers(&o.id, &reading.in_window_heights);
+        (hold, late, paid_maybe_twins)
     };
-    let (status_class, status_text) =
-        status_pill(order.status, &reading, address_warning.is_some());
+    let (status_class, status_text) = status_pill(order.status, &reading, hold.is_some());
+    let order_id = o.id.clone();
 
     rsx! {
         div { class: "listing-card",
@@ -550,8 +557,23 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                     p { class: "text-warning", "{note}" }
                 }
             }
-            if let Some(warning) = address_warning {
-                p { class: "text-warning", "{warning.explain()}" }
+            if let Some(hold) = hold {
+                p { class: "text-warning", "{hold.explain()}" }
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: move |_| {
+                        APP_STATE.write().confirm_paid(&order_id);
+                    },
+                    "Confirm paid"
+                }
+            }
+            if paid_maybe_twins {
+                p { class: "text-muted",
+                    "Another of your invoices uses this same address, and the payment that \
+                     settled this one also falls inside that invoice's window. One payment \
+                     cannot pay for both invoices: check your wallet for a separate payment \
+                     per invoice before shipping both."
+                }
             }
             // The address is only offered when it is the script that settles
             // this order. Showing one that is not would be handing somebody a
@@ -624,16 +646,16 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
 /// Split out of the component so the reading it depends on is testable; see
 /// [`AddressReading`] for why it is not the raw address balance.
 ///
-/// Never the paid style while another invoice sharing the address is flagged:
-/// the payment it shows may be the other invoice's.
+/// Not the paid style while a provable payment is waiting on the seller's
+/// confirmation (`AppState::settlement_hold`): it may be another invoice's.
 pub(crate) fn status_pill(
     status: OrderStatus,
     reading: &AddressReading,
-    shares_address: bool,
+    awaiting_confirmation: bool,
 ) -> (&'static str, &'static str) {
     match status {
-        OrderStatus::AwaitingPayment | OrderStatus::Paid if shares_address => {
-            ("btc-pill pending", "Check shared address")
+        OrderStatus::AwaitingPayment if awaiting_confirmation => {
+            ("btc-pill pending", "Payment seen, confirm to mark paid")
         }
         OrderStatus::AwaitingPayment => {
             // The paid style only for the full amount: anyone can send dust
@@ -682,6 +704,8 @@ pub(crate) struct AddressReading {
     pub no_anchor: bool,
     /// Confirmed value inside the order's window: what can settle it.
     pub in_window_sats: u64,
+    /// The confirmation heights of that value.
+    pub in_window_heights: Vec<u32>,
     /// Unconfirmed value. Not window-checked, because an unconfirmed
     /// transaction has no height yet; the pill says only "unconfirmed".
     pub pending_sats: u64,
@@ -716,6 +740,7 @@ impl AddressReading {
             };
             match &window {
                 Some(w) if w.contains(&anchor_height) => {
+                    reading.in_window_heights.push(anchor_height);
                     reading.in_window_sats = reading.in_window_sats.saturating_add(tx.value_sats);
                 }
                 Some(w) if anchor_height > *w.end() => {
@@ -1434,6 +1459,7 @@ mod address_reading_tests {
         let order = order_anchored_at(150);
         let reading = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
         assert_eq!(reading.in_window_sats, 10_000);
+        assert_eq!(reading.in_window_heights, vec![151]);
         assert_eq!(reading.outside_note(false), None);
     }
 
@@ -1453,11 +1479,11 @@ mod address_reading_tests {
             super::status_pill(OrderStatus::AwaitingPayment, &full, false),
             ("btc-pill paid", "Payment seen on chain")
         );
-        // Round 3, Should Fix 1: never the paid style while a shared-address
-        // warning shows, for an order awaiting payment or already paid.
-        for status in [OrderStatus::AwaitingPayment, OrderStatus::Paid] {
-            assert_ne!(super::status_pill(status, &full, true).0, "btc-pill paid");
-        }
+        // Not the paid style while the seller's confirmation is awaited.
+        assert_ne!(
+            super::status_pill(OrderStatus::AwaitingPayment, &full, true).0,
+            "btc-pill paid"
+        );
     }
 
     /// Round 2, Consider: the notes say the right thing in each case. An
