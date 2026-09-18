@@ -75,24 +75,29 @@ pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 /// Versioned for the same reason as [`BITCOIN_WATCHES_KEY`]: this crate has no
 /// secret-migration registry, so the version in the key IS the mechanism.
 ///
-/// # Why the counter is a secret rather than derived from anything
+/// # The counter is a floor the network can raise, not the whole answer
 ///
-/// "Next unused index" cannot be recovered by looking at the network. The
-/// orders a store has issued are public, but they name SCRIPTS, not indices,
-/// and recovering an index from a script means re-deriving forward until one
-/// matches -- which finds the highest index ever USED, not the highest ever
-/// HANDED OUT. Those differ every time an invoice is abandoned after its
-/// address was shown to a buyer, and the difference is exactly an address
-/// reuse.
+/// This record lives on one device. A reinstall, a second machine, or a
+/// delegate re-key (which strands every secret here -- see
+/// `legacy/harvest_delegate.toml`) starts it again at 0, while the same
+/// wallet key's low addresses already sit on published, possibly paid,
+/// orders. That is harvest#77: a fresh install issued index 0 again and the
+/// new invoice settled itself against the old invoice's payment.
 ///
-/// So the counter is authoritative state. It does NOT survive a delegate
-/// re-key today: this generation can answer an export request, but nothing in
-/// the UI drives the handshake yet, and a successor imports through these same
-/// request handlers -- none of which can restore a counter, since
-/// [`apply_set_payment_xpub`] only preserves one it already holds. A seller
-/// crossing a re-key should therefore point Harvest at a FRESH account in
-/// their wallet rather than re-entering the same key, whose low indices may
-/// already carry live invoices.
+/// So every derivation is also handed the scripts of the seller's own
+/// published orders, and [`apply_published_floor`] moves the counter past
+/// the highest index whose script it finds there. The counter is then the
+/// maximum of what this device handed out and what the network shows.
+///
+/// That recovers the highest index ever PUBLISHED, which is not the highest
+/// ever HANDED OUT: an index whose invoice was abandoned before it was
+/// published, on a device that is gone, is invisible to it, and so is an
+/// order pruned from the store at `MAX_ORDERS`. Both can be issued again.
+/// What stops either from settling a new order with an old payment is the
+/// store contract's own rule that a payment confirmed at or before an
+/// order's anchor block is not that order's (`harvest_common::payment`,
+/// `verify_on_chain_proof`), so the residual is a reused address, not a
+/// wrongly-settled order.
 pub(crate) const BITCOIN_PAYMENT_XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
 
 fn load_watches<S: SecretStore>(store: &S) -> Vec<WatchedPayment> {
@@ -271,6 +276,58 @@ fn apply_set_payment_xpub(
         network,
         next_index,
     })
+}
+
+/// How many consecutive indices past the last match [`apply_published_floor`]
+/// derives before concluding there are no more published orders above it.
+///
+/// Published orders are not contiguous: an invoice abandoned after its address
+/// was derived burns an index that no order names. A seller would have to
+/// abandon this many invoices IN A ROW, then publish one, for the scan to stop
+/// short of it -- and even then the store contract refuses to let that old
+/// order's payment settle a new one. Each step is one public-key derivation,
+/// so this is also the cost the scan adds to every invoice on a device whose
+/// count is already current.
+pub(crate) const PUBLISHED_INDEX_GAP: u32 = 100;
+
+/// Raise `status.next_index` past every index of this key whose script
+/// appears in `published`, and return the new value.
+///
+/// `published` is the payment scripts of the seller's own published orders
+/// (see [`BitcoinDelegateRequest::DeriveOrderAddress`]). Scripts derived from
+/// some other key never match and are ignored, which is what keeps a seller
+/// who moved to a new wallet starting that wallet at 0.
+///
+/// Scans forward FROM the counter, not from 0: an index below the counter is
+/// already covered, so matching it could not raise anything. It stops after
+/// [`PUBLISHED_INDEX_GAP`] consecutive indices with no match, or when every
+/// published script has been matched, or at [`MAX_ORDER_INDEX`]. Never lowers
+/// the counter: a device ahead of the network (invoices derived but not yet
+/// published) keeps its count.
+fn apply_published_floor(
+    status: &mut PaymentXpubStatus,
+    published: &[Vec<u8>],
+) -> Result<u32, String> {
+    let mut remaining: std::collections::HashSet<&[u8]> =
+        published.iter().map(Vec::as_slice).collect();
+    if remaining.is_empty() {
+        return Ok(status.next_index);
+    }
+    let chain = AccountXpub::parse(&status.xpub)?.external_chain()?;
+
+    let mut index = status.next_index;
+    // The first index the scan may give up at: `PUBLISHED_INDEX_GAP` past the
+    // start, and pushed on by each match.
+    let mut give_up_at = index.saturating_add(PUBLISHED_INDEX_GAP);
+    while index <= MAX_ORDER_INDEX && index < give_up_at && !remaining.is_empty() {
+        let script = chain.script_at(index)?;
+        if remaining.remove(script.as_slice()) {
+            status.next_index = index + 1;
+            give_up_at = status.next_index.saturating_add(PUBLISHED_INDEX_GAP);
+        }
+        index += 1;
+    }
+    Ok(status.next_index)
 }
 
 /// Hand out the next address and advance the counter.
@@ -459,10 +516,12 @@ pub fn handle<S: SecretStore>(
             request_id,
             xpub,
             network,
+            published_scripts,
         } => {
             let existing = load_payment_xpub(store);
             let result =
-                apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|status| {
+                apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|mut status| {
+                    apply_published_floor(&mut status, &published_scripts)?;
                     save_payment_xpub(store, &status)?;
                     Ok(status)
                 });
@@ -473,22 +532,29 @@ pub fn handle<S: SecretStore>(
             status: load_payment_xpub(store),
         },
 
-        BitcoinDelegateRequest::DeriveOrderAddress { request_id } => {
+        BitcoinDelegateRequest::DeriveOrderAddress {
+            request_id,
+            published_scripts,
+        } => {
             let result = match load_payment_xpub(store) {
                 None => Err(
                     "no payment key is set for this store yet. Add your wallet's native \
                      SegWit account key before issuing an invoice."
                         .to_string(),
                 ),
-                Some(mut status) => apply_derive_order_address(&mut status).and_then(|derived| {
-                    // Save the advanced counter BEFORE the address leaves
-                    // here. If persisting fails the address is discarded
-                    // rather than returned, because a caller that received it
-                    // may show it to a buyer while the delegate still believes
-                    // the index is unused.
-                    save_payment_xpub(store, &status)?;
-                    Ok(derived)
-                }),
+                // Raised to the network's count FIRST, so the index handed out
+                // is past every published order of this key (harvest#77).
+                Some(mut status) => apply_published_floor(&mut status, &published_scripts)
+                    .and_then(|_| apply_derive_order_address(&mut status))
+                    .and_then(|derived| {
+                        // Save the advanced counter BEFORE the address leaves
+                        // here. If persisting fails the address is discarded
+                        // rather than returned, because a caller that received it
+                        // may show it to a buyer while the delegate still believes
+                        // the index is unused.
+                        save_payment_xpub(store, &status)?;
+                        Ok(derived)
+                    }),
             };
             BitcoinDelegateResponse::OrderAddress { request_id, result }
         }
@@ -800,6 +866,111 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Recovering the counter from the store's published orders (harvest#77)
+    // -----------------------------------------------------------------
+
+    /// The scripts `key` derives at `indices`, standing in for the store's
+    /// published orders.
+    fn published_at(key: &str, indices: &[u32]) -> Vec<Vec<u8>> {
+        let chain = AccountXpub::parse(key)
+            .expect("parse")
+            .external_chain()
+            .expect("chain");
+        indices
+            .iter()
+            .map(|&i| chain.script_at(i).expect("derive"))
+            .collect()
+    }
+
+    /// **The reported case.** A fresh install holds no count, the same key is
+    /// entered, and the store already publishes orders at indices 0-2. The
+    /// next invoice must be index 3, not 0.
+    #[test]
+    fn a_fresh_install_resumes_past_the_stores_published_orders() {
+        let published = published_at(&signet_vpub(), &[0, 1, 2]);
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        assert_eq!(status.next_index, 0, "the device genuinely knows nothing");
+
+        assert_eq!(apply_published_floor(&mut status, &published), Ok(3));
+        let derived = apply_derive_order_address(&mut status).expect("derive");
+        assert_eq!(derived.index, 3);
+        assert!(
+            !published.contains(&derived.script_pubkey),
+            "the new invoice was given an address a published order already names"
+        );
+    }
+
+    /// A stale device -- one that handed out a few addresses and then fell
+    /// behind another device on the same key -- takes the network's count.
+    /// Burned indices between published orders do not stop the scan.
+    #[test]
+    fn a_stale_device_takes_the_higher_published_count() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        status.next_index = 1;
+        // Index 4 and 40 published elsewhere; 5-39 burned by abandoned invoices.
+        let published = published_at(&signet_vpub(), &[0, 4, 40]);
+        assert_eq!(apply_published_floor(&mut status, &published), Ok(41));
+    }
+
+    /// Each match pushes the give-up point on, so published orders spaced
+    /// less than the gap apart are all found however far the run goes -- the
+    /// second one here is past `PUBLISHED_INDEX_GAP` from the START.
+    #[test]
+    fn each_match_extends_the_scan() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        let first = PUBLISHED_INDEX_GAP - 10;
+        let second = first + PUBLISHED_INDEX_GAP - 10;
+        let published = published_at(&signet_vpub(), &[first, second]);
+        assert_eq!(
+            apply_published_floor(&mut status, &published),
+            Ok(second + 1)
+        );
+    }
+
+    /// And never the other way: a device AHEAD of the network (addresses
+    /// derived, invoices not yet published) keeps its count, or it would hand
+    /// out an address already shown to a buyer.
+    #[test]
+    fn a_device_ahead_of_the_network_keeps_its_count() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        status.next_index = 10;
+        let published = published_at(&signet_vpub(), &[0, 1, 2]);
+        assert_eq!(apply_published_floor(&mut status, &published), Ok(10));
+    }
+
+    /// Orders paid into some OTHER wallet raise nothing, so a seller who
+    /// moved to a new wallet starts it at 0 as before.
+    #[test]
+    fn orders_from_another_key_do_not_move_the_count() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        let elsewhere = published_at(&another_signet_vpub(), &[0, 1, 2, 3]);
+        assert_eq!(apply_published_floor(&mut status, &elsewhere), Ok(0));
+    }
+
+    /// KNOWN LIMIT, pinned so it is a decision rather than a surprise: a
+    /// published order more than [`PUBLISHED_INDEX_GAP`] indices past the
+    /// last one found is not found. Reaching it takes that many abandoned
+    /// invoices in a row; the store contract's pre-order rule still stops
+    /// that order's payment settling a new one.
+    #[test]
+    fn a_published_order_beyond_the_gap_is_not_found() {
+        let mut status =
+            apply_set_payment_xpub(&signet_vpub(), BitcoinNetwork::Signet, None).expect("accepted");
+        let within = published_at(&signet_vpub(), &[PUBLISHED_INDEX_GAP - 1]);
+        assert_eq!(
+            apply_published_floor(&mut status.clone(), &within),
+            Ok(PUBLISHED_INDEX_GAP)
+        );
+        let beyond = published_at(&signet_vpub(), &[PUBLISHED_INDEX_GAP]);
+        assert_eq!(apply_published_floor(&mut status, &beyond), Ok(0));
+    }
+
     /// A private label must never end up in anything shaped for the wire to
     /// a bridge. This mirrors
     /// `harvest_common::bitcoin_delegate::tests::the_bridge_watch_request_has_nowhere_to_put_a_private_label`,
@@ -874,6 +1045,7 @@ mod origin_gating_tests {
             request_id: 1,
             xpub: key.to_string(),
             network: BitcoinNetwork::Bitcoin,
+            published_scripts: Vec::new(),
         }
     }
 
@@ -1046,7 +1218,10 @@ mod origin_gating_tests {
                     auth: BridgeAuthMode::Open,
                 },
             },
-            BitcoinDelegateRequest::DeriveOrderAddress { request_id: 7 },
+            BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 7,
+                published_scripts: Vec::new(),
+            },
         ];
 
         let before = load_watches(&store);
@@ -1065,5 +1240,65 @@ mod origin_gating_tests {
             before_index,
             "an address index was consumed by a caller that had no business asking"
         );
+    }
+
+    /// harvest#77 through `handle`, the way the UI drives it: a brand new
+    /// secret store (fresh install), the same key re-entered, and the store's
+    /// published orders sent along with both requests. The count shown after
+    /// the key is set, and the address the next invoice gets, both follow the
+    /// published record.
+    #[test]
+    fn a_fresh_install_does_not_reissue_a_published_address() {
+        let chain = crate::bip32::AccountXpub::parse(SELLERS_KEY)
+            .expect("parse")
+            .external_chain()
+            .expect("chain");
+        let published: Vec<Vec<u8>> = (0..3)
+            .map(|i| chain.script_at(i).expect("derive"))
+            .collect();
+
+        let mut store = MemSecrets::default();
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: 1,
+                xpub: SELLERS_KEY.to_string(),
+                network: BitcoinNetwork::Bitcoin,
+                published_scripts: published.clone(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::PaymentXpubSet { result, .. } => {
+                assert_eq!(result.expect("accepted").next_index, 3);
+            }
+            other => panic!("expected PaymentXpubSet, got {other:?}"),
+        }
+
+        // The counter as stored, then wound back as if this device had lost
+        // it again, so the derive request has to recover it on its own.
+        let mut wound_back = load_payment_xpub(&store).expect("stored");
+        wound_back.next_index = 0;
+        save_payment_xpub(&mut store, &wound_back).expect("store");
+
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 2,
+                published_scripts: published.clone(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::OrderAddress { result, .. } => {
+                let derived = result.expect("derived");
+                assert_eq!(derived.index, 3);
+                assert!(!published.contains(&derived.script_pubkey));
+            }
+            other => panic!("expected OrderAddress, got {other:?}"),
+        }
+        assert_eq!(load_payment_xpub(&store).map(|s| s.next_index), Some(4));
     }
 }

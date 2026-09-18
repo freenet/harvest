@@ -303,6 +303,7 @@ mod boundary_tests {
             request_id: 1,
             xpub: A_VALID_ZPUB.to_string(),
             network: BitcoinNetwork::Bitcoin,
+            published_scripts: Vec::new(),
         })
         .expect("cbor");
 

@@ -551,11 +551,13 @@ fn authorize_new_order(
 /// will answer, and an entry left behind would sit in `pending_invoices`
 /// forever waiting for an id that was never asked about.
 #[cfg(target_arch = "wasm32")]
-fn spawn_order_address_request(request_id: u64) {
+fn spawn_order_address_request(request_id: u64, published_scripts: Vec<Vec<u8>>) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
 
-        if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(request_id).await {
+        if let Err(e) =
+            crate::gateway::bitcoin_ops::derive_order_address(request_id, published_scripts).await
+        {
             dioxus::logger::tracing::error!("Failed to request a payment address: {e}");
             let mut state = crate::gateway::APP_STATE.write();
             state.pending_invoices.remove(&request_id);
@@ -4181,6 +4183,24 @@ impl AppState {
                     .to_string(),
             );
         }
+        // The delegate's address counter lives on this device and restarts at
+        // 0 on a new one, so each derivation also carries the scripts this
+        // seller's stores have already published and the delegate moves past
+        // them (harvest#77). That only works once the store has actually been
+        // read from the network: before then there is nothing to move past,
+        // and the address handed out could be one an old, possibly paid,
+        // order already names.
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_none_or(|store| store.info.is_none())
+        {
+            return Err(
+                "your store has not loaded from the network yet, so Harvest cannot see which \
+                 payment addresses its orders already use. Try again once it has."
+                    .to_string(),
+            );
+        }
         // An invoice answering a request must carry that conversation's listing
         // tag, which needs its key. Refused here, before a derivation index is
         // spent on an address, rather than when the order is built.
@@ -4203,8 +4223,37 @@ impl AppState {
         self.pending_invoices.insert(request_id, invoice);
 
         #[cfg(target_arch = "wasm32")]
-        spawn_order_address_request(request_id);
+        spawn_order_address_request(request_id, self.published_payment_scripts());
         Ok(())
+    }
+
+    /// The payment scripts of every order this seller's own stores have
+    /// published, as last read from the network.
+    ///
+    /// Sent with every derivation (and with the payment key itself) so the
+    /// delegate can move its address counter past them: the counter is
+    /// device-local and a new device starts it at 0, while the same wallet
+    /// key's low addresses already carry these orders (harvest#77). Every
+    /// store the seller owns, under every Ghost Key, because one payment key
+    /// serves all of them.
+    ///
+    /// Only stores whose state has arrived contribute. `issue_invoice` refuses
+    /// until the store being invoiced has; a sibling store that has not loaded
+    /// contributes nothing, and the store contract's pre-order rule is what
+    /// stops a reused address settling an order in that case.
+    pub fn published_payment_scripts(&self) -> Vec<Vec<u8>> {
+        let mut scripts = std::collections::BTreeSet::new();
+        for registration in self.my_stores.values().flatten() {
+            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
+                continue;
+            };
+            for record in &store.orders {
+                if !record.order.payment_script_pubkey.is_empty() {
+                    scripts.insert(record.order.payment_script_pubkey.clone());
+                }
+            }
+        }
+        scripts.into_iter().collect()
     }
 
     /// Turn a freshly-derived address into a signed, published invoice.
@@ -8170,7 +8219,30 @@ mod invoice_tests {
         // refuses to issue without, pinned by
         // `a_seller_whose_bridge_generation_has_not_resolved_cannot_issue_an_invoice`.
         state.bitcoin.address_generation = resolved_address_generation();
+        // And the store's own state has arrived from the network, which
+        // `issue_invoice` waits for so the delegate can be told which
+        // addresses its published orders already use (harvest#77). Pinned by
+        // `an_invoice_waits_for_the_store_to_load`.
+        store_state_arrived(&mut state, &STORE_ID);
         state
+    }
+
+    /// Mark `store` as read from the network, the way `on_contract_state`
+    /// does: its details are known.
+    pub(super) fn store_state_arrived(state: &mut AppState, store: &[u8]) {
+        state
+            .browsing_stores
+            .entry(store.to_vec())
+            .or_default()
+            .info = Some(harvest_common::store::StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: SELLER.to_string(),
+            reputation_contract_id: [10u8; 32],
+            store_name: "Store".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+        });
     }
 
     /// The height every test in this module treats as the current tip.
@@ -8298,6 +8370,116 @@ mod invoice_tests {
             queued.anchor,
             Some(anchor(TIP_HEIGHT)),
             "the invoice must be anchored to the newest block the seller can see"
+        );
+    }
+
+    /// **harvest#77: no address is derived before the store has loaded.**
+    ///
+    /// The delegate's counter is device-local and restarts at 0 on a new
+    /// device; what moves it past addresses already on published orders is
+    /// the list of those orders' scripts sent with the request. Before the
+    /// store's state has arrived that list is empty, and deriving then is
+    /// exactly how a fresh install re-issued an address that already held a
+    /// payment. So the invoice is refused, and no index is spent.
+    #[test]
+    fn an_invoice_waits_for_the_store_to_load() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("the fixture's store")
+            .info = None;
+
+        let err = state
+            .issue_invoice(invoice())
+            .expect_err("an invoice before the store has loaded must be refused");
+        assert!(err.contains("not loaded"), "unhelpful refusal: {err}");
+        assert!(
+            state.pending_invoices.is_empty(),
+            "a refused invoice must not ask the delegate for an address"
+        );
+    }
+
+    /// **What the delegate is told has been used.** Every order in every store
+    /// this seller owns, under every Ghost Key, because one payment key serves
+    /// all of them; not a store they are merely browsing, whose orders pay
+    /// some other wallet; each script once; and nothing for an order with no
+    /// on-chain script.
+    #[test]
+    fn the_published_scripts_are_every_owned_stores_orders() {
+        fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
+            let order = harvest_common::payment::Order {
+                id: harvest_common::payment::OrderId([0u8; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: SELLER.to_string(),
+                amount_sats: 50_000,
+                network: BitcoinNetwork::Signet,
+                payment_script_pubkey: script.to_vec(),
+                payment_address: "tb1qexample".to_string(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: Some(anchor(TIP_HEIGHT)),
+                order_binding: None,
+                listing_tag: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
+            }
+            .with_derived_id();
+            harvest_common::payment::AuthorizedOrder {
+                order,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                status: harvest_common::payment::OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            }
+        }
+
+        let mut state = seller_with_a_store();
+        const SECOND_STORE: [u8; 32] = [0x5e; 32];
+        const SOMEONE_ELSES: [u8; 32] = [0x77; 32];
+        state.my_stores.insert(
+            "another-ghost-key".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: SECOND_STORE.to_vec(),
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&[0x00, 0x14, 1]), with_script(&[0x00, 0x14, 2])];
+        state
+            .browsing_stores
+            .entry(SECOND_STORE.to_vec())
+            .or_default()
+            .orders = vec![with_script(&[0x00, 0x14, 2]), with_script(&[0x00, 0x14, 3])];
+        state
+            .browsing_stores
+            .entry(SOMEONE_ELSES.to_vec())
+            .or_default()
+            .orders = vec![with_script(&[0x00, 0x14, 9])];
+        let mut no_script = with_script(&[]);
+        no_script.order.payment_hash = Some([1u8; 32]);
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders
+            .push(no_script);
+
+        assert_eq!(
+            state.published_payment_scripts(),
+            vec![
+                vec![0x00, 0x14, 1],
+                vec![0x00, 0x14, 2],
+                vec![0x00, 0x14, 3],
+            ]
         );
     }
 
@@ -11717,6 +11899,7 @@ mod buy_flow_tests {
             .expect("seal the request");
 
         state.begin_browsing(STORE.to_vec());
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
         let store = state.browsing_stores.get_mut(STORE).expect("the store");
         store.mailbox_contract_id = Some(vec![11u8; 32]);
         store.mailbox_messages = vec![request.clone()];

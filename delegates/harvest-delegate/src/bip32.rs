@@ -202,17 +202,50 @@ impl AccountXpub {
                 network.as_str()
             ));
         }
-        // Non-hardened only, which public derivation is limited to anyway --
-        // and `EXTERNAL_CHAIN`/`index` are both well under 2^31 here, since
-        // `index` is a u32 the delegate increments from 0 and refuses to run
-        // past `MAX_ORDER_INDEX`.
-        let (chain_key, chain_code) =
-            derive_child(&self.public_key, &self.chain_code, EXTERNAL_CHAIN)?;
-        let (leaf_key, _) = derive_child(&chain_key, &chain_code, index)?;
-
+        let leaf_key = self.external_chain()?.leaf_key(index)?;
         let script = p2wpkh_script_pubkey(&leaf_key);
         let address = p2wpkh_address(&leaf_key, network)?;
         Ok((script, address))
+    }
+
+    /// The external chain `m/0`, derived once.
+    ///
+    /// [`Self::order_address`] goes through this too, so a scan over many
+    /// indices and the address handed to a buyer cannot come from two
+    /// derivations that disagree.
+    pub fn external_chain(&self) -> Result<ExternalChain, String> {
+        // Non-hardened only, which public derivation is limited to anyway.
+        let (key, chain_code) = derive_child(&self.public_key, &self.chain_code, EXTERNAL_CHAIN)?;
+        Ok(ExternalChain { key, chain_code })
+    }
+}
+
+/// The receiving chain below an account key, from which each order's key is
+/// one more derivation.
+///
+/// Exists so that recovering the derivation counter from a store's published
+/// orders (see `crate::bitcoin::apply_published_floor`) pays one child
+/// derivation per index scanned instead of two.
+pub struct ExternalChain {
+    key: [u8; 33],
+    chain_code: [u8; 32],
+}
+
+impl ExternalChain {
+    /// The `scriptPubKey` for order index `index`, i.e. `m/0/index`.
+    ///
+    /// Network-free on purpose: a P2WPKH script is the same bytes on every
+    /// network, which is also why the recovery scan can compare it against
+    /// published orders without knowing which network they were for.
+    pub fn script_at(&self, index: u32) -> Result<Vec<u8>, String> {
+        Ok(p2wpkh_script_pubkey(&self.leaf_key(index)?))
+    }
+
+    fn leaf_key(&self, index: u32) -> Result<[u8; 33], String> {
+        // `index` stays under 2^31: the delegate refuses to run past
+        // `MAX_ORDER_INDEX`, and `derive_child` refuses a hardened index.
+        let (leaf_key, _) = derive_child(&self.key, &self.chain_code, index)?;
+        Ok(leaf_key)
     }
 }
 
@@ -356,6 +389,26 @@ mod tests {
     /// address would let one payment satisfy two invoices, because payment
     /// evidence is scoped to a script rather than to an order -- see this
     /// module's header.
+    /// The scan and the address handed out are one derivation, not two
+    /// that could drift: a scan that disagreed with `order_address` would
+    /// look for scripts no invoice ever named, find none, and hand out an
+    /// address already on a published order.
+    #[test]
+    fn the_chain_scan_derives_the_same_scripts_as_order_address() {
+        let account = AccountXpub::parse(BIP84_ZPUB).expect("parse");
+        let chain = account.external_chain().expect("chain");
+        for index in [0u32, 1, 2, 17, 1000] {
+            let (script, _) = account
+                .order_address(index, BitcoinNetwork::Bitcoin)
+                .expect("derive");
+            assert_eq!(
+                chain.script_at(index).expect("scan"),
+                script,
+                "index {index}"
+            );
+        }
+    }
+
     #[test]
     fn consecutive_indices_give_distinct_scripts() {
         let account = AccountXpub::parse(BIP84_ZPUB).expect("parse");

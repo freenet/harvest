@@ -209,7 +209,9 @@ fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded:
                     "Paying into your "
                     strong { "{status.network.as_str()}" }
                     " wallet. "
-                    "{status.next_index} invoice(s) have taken an address so far. "
+                    "{status.next_index} address(es) from this key are already taken, \
+                     counting the orders your stores have published, so the next invoice \
+                     gets a new one. "
                     "This key is shared by every store and every Ghost Key in this app."
                 }
                 button {
@@ -256,12 +258,12 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
             }
             if replacing {
                 p { class: "text-warning",
-                    "Entering a DIFFERENT key restarts the address count from zero, which is "
-                    "correct \u{2014} addresses only mean anything relative to the key they "
-                    "come from. Re-entering the key you already use keeps the count, so "
-                    "correcting the network below will not re-issue addresses that already "
-                    "have invoices against them. Either way, invoices you have already issued "
-                    "are unaffected: they name an address, not a key."
+                    "Entering a DIFFERENT key starts its addresses from the beginning, which "
+                    "is correct: addresses only mean anything relative to the key they come "
+                    "from. Entering a key you have used before, here or on another device, "
+                    "does not reuse its addresses: Harvest skips past every address your "
+                    "stores' published orders already name. Either way, invoices you have "
+                    "already issued are unaffected: they name an address, not a key."
                 }
             }
 
@@ -452,7 +454,8 @@ fn InvoiceForm(
 fn save_payment_key(xpub: String, network: BitcoinNetwork) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network).await {
+        let published = APP_STATE.read().published_payment_scripts();
+        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network, published).await {
             dioxus::logger::tracing::error!("Failed to send the payment key: {e}");
             APP_STATE
                 .write()
