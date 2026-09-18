@@ -740,8 +740,9 @@ pub fn store_details_gap(
 ) -> Option<StoreDetailsGap> {
     let info = info?;
     if info.version == 0 {
-        // Version 0 is the default state, which `AuthorizedStoreInfoV1::verify`
-        // skips entirely -- nothing in it was ever signed or published.
+        // Version 0 is the default state -- nothing in it was ever signed or
+        // published, and `AuthorizedStoreInfoV1::verify` accepts it only as
+        // the empty default.
         return Some(StoreDetailsGap::NeverPublished);
     }
     if info.store_name.trim().is_empty() {
@@ -1145,8 +1146,8 @@ fn signed_message_bytes(scoped_payload: &[u8]) -> Option<Vec<u8>> {
 
 /// A store's own details, awaiting signature so they can be published.
 ///
-/// `AuthorizedStoreInfoV1::verify` skips verification only at version 0, so
-/// anything a buyer can actually read has to carry a real signature over the
+/// `AuthorizedStoreInfoV1::verify` accepts version 0 only as the empty
+/// default, so anything a buyer can actually read has to carry a real signature over the
 /// ghostkey delegate's `ScopedPayload` -- the same round-trip a listing makes.
 #[derive(Clone, Debug)]
 pub struct PendingStoreInfo {
@@ -2090,9 +2091,12 @@ impl AppState {
                     store.certificate_status = certificate_status;
                     store.seller_verifying_key = seller_verifying_key;
                     store.unverified_listings = unverified_listings;
-                    // Only signed details are details.
-                    store.info =
-                        (store_state.info.info.version > 0).then_some(store_state.info.info);
+                    // `Some` even at version 0: `None` means "not loaded yet"
+                    // to the seller's own paths, and a store stranded at
+                    // version 0 must reach the NeverPublished repair prompt.
+                    // At version 0 this is the default (reset above), so a
+                    // buyer finds no name, no key and no reputation link in it.
+                    store.info = Some(store_state.info.info);
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.reputation_contract_id = Some(reputation_id.clone());
@@ -7977,6 +7981,29 @@ mod tests {
         );
     }
 
+    /// **A store stranded at version 0 reaches the NeverPublished repair**
+    /// (PR #82 round-3 review). The first cut of the version-0 guard set the
+    /// store's info to `None`, which the seller's own paths read as "not
+    /// loaded yet": the page showed "Loading this store's published
+    /// details..." forever and the repair prompt was unreachable.
+    #[test]
+    fn a_version_zero_store_is_resolved_and_prompts_to_publish() {
+        let mut state = AppState::default();
+        ingest(&mut state, &harvest_common::store::StoreStateV1::default());
+        assert!(
+            state.store_details_are_resolved(&STORE_ID),
+            "an arrived version-0 state is resolved, not loading"
+        );
+        let info = state
+            .browsing_stores
+            .get(STORE_ID.as_slice())
+            .and_then(|s| s.info.as_ref());
+        assert_eq!(
+            store_details_gap(info, false),
+            Some(StoreDetailsGap::NeverPublished)
+        );
+    }
+
     /// **Unsigned version-0 store details are never believed** (PR #82
     /// re-review). The contract used to accept any content at version 0, so
     /// a third party could give a store that had not published yet a name
@@ -7996,10 +8023,13 @@ mod tests {
             .browsing_stores
             .get(STORE_ID.as_slice())
             .expect("the store is still shown");
-        assert!(
-            store.info.is_none(),
+        let info = store.info.as_ref().expect("loaded, as the default");
+        assert_eq!(
+            *info,
+            harvest_common::store::AuthorizedStoreInfoV1::default().info,
             "version 0 is no details, not these details"
         );
+        assert!(info.encryption_public_key.is_none(), "no key to buy with");
         assert!(
             !state
                 .reputation_to_store

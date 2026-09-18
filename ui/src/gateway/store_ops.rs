@@ -295,8 +295,8 @@ pub async fn create_store_contracts(
     // seller's share link arrives at a blank storefront.
     //
     // This cannot be done in the PUT above: `AuthorizedStoreInfoV1::verify`
-    // skips verification only at version 0, so anything a buyer can read has
-    // to carry a real Ed25519 signature over the ghostkey delegate's
+    // accepts version 0 only as the empty default, so anything a buyer can
+    // read has to carry a real Ed25519 signature over the ghostkey delegate's
     // `ScopedPayload`. That is a round-trip -- `SignMessage` now, the update
     // when `SignResult` comes back (see `AppState::on_ghostkey_response`) --
     // the same one a listing makes.
@@ -780,9 +780,8 @@ mod tests {
         assert!(delta.info.is_some());
     }
 
-    /// Version 0 is the uninitialized state, which `verify` skips entirely --
-    /// so publishing details at version 0 would publish something no buyer
-    /// can trust. The details we build must be past it.
+    /// Version 0 is the unsigned state, which `verify` accepts only as the
+    /// empty default -- so details published at version 0 would be refused. The details we build must be past it.
     #[test]
     fn published_store_details_are_past_the_unverified_version() {
         let unpublished = harvest_common::store::AuthorizedStoreInfoV1::default();

@@ -148,8 +148,11 @@ impl FeedbackEntry {
     pub fn verify(&self, rsa_key: &rsa::pss::VerifyingKey<sha2::Sha256>) -> Result<(), String> {
         use rsa::signature::Verifier;
 
-        // First, because it is one hash and the RSA check is not (PR #82
-        // re-review). The slot must be bound to the key, or the seller (who can sign any
+        // Before the RSA check (PR #82 re-review), but not as a defence: an
+        // attacker picks `entry_key`, so it can always pass this. It saves the
+        // RSA verification only on junk and honest mistakes. What bounds RSA
+        // work per update is `apply_delta`'s digest skip: an entry already
+        // held is never verified again. The slot must be bound to the key, or the seller (who can sign any
         // token) could mint one for a buyer's published slot with a key of its
         // own. See `FeedbackToken::nonce`.
         let bound = FeedbackToken::nonce_for(&self.token.entry_key);

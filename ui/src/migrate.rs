@@ -483,7 +483,8 @@ impl ProbeStateOps for StoreOps {
     /// "Real" means the seller actually did something with this store.
     ///
     /// A store PUT at creation time holds `StoreStateV1::default()`: info at
-    /// version 0 (the uninitialized version `verify` skips), no listings, no
+    /// version 0 (the unsigned version, which `verify` requires to be the
+    /// default), no listings, no
     /// orders. Adopting one of those would report a hit while recovering
     /// nothing, and -- worse -- could satisfy a caller that stops at the first
     /// hit, so a genuinely populated older generation would never be reached.
@@ -618,6 +619,14 @@ pub(crate) fn merge_store_reporting_discard(
     // would be carried forward unsorted, and the current contract refuses that
     // (harvest#26).
     outcome.state.listings.normalize();
+    // Nor does it touch a version-0 info, and a predecessor written before the
+    // PR #82 re-review can hold unsigned content there: anything was accepted
+    // at version 0. Carried forward, it would make the new contract refuse
+    // the PUT, forever, and the listings beside it would never move. Version 0
+    // means "no details published", so the default is the only faithful copy.
+    if outcome.state.info.info.version == 0 {
+        outcome.state.info = Default::default();
+    }
     if outcome.discarded {
         // Named specifically, and here rather than in `fold_or_keep_primary`,
         // because this is the only place that still holds the refused side

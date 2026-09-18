@@ -613,7 +613,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     /// not as a resend of every order that happens to hash into the same
     /// bucket. Instead this is bounded the way `MAX_CLAIMS` bounds
     /// `ClaimSetV1`: capped at a fixed number of entries rather than a fixed
-    /// number of bytes. At about 71 encoded bytes an entry (a 32-byte id and a
+    /// number of bytes. At 70 encoded bytes an entry (a 32-byte id and a
     /// 32-byte digest as CBOR byte strings, see [`Bytes32`], plus a 1-byte
     /// rank) this is still tiny next to a single order's own
     /// encoded size once it carries an `OrderPaymentProof` -- an order can
@@ -2692,8 +2692,8 @@ mod order_tests {
     }
 
     /// **The order summary at the cap stays small** (PR #82 re-review). Its
-    /// id and digest encode as CBOR byte strings: 71 bytes an entry, so
-    /// `MAX_ORDERS` entries come to about 284 KiB, where the default integer
+    /// id and digest encode as CBOR byte strings: 70 bytes an entry, so
+    /// `MAX_ORDERS` entries come to about 280 KiB, where the default integer
     /// arrays made it about 512 KiB. And it survives the round trip a peer
     /// puts it through.
     #[test]
@@ -2705,7 +2705,7 @@ mod order_tests {
         let summary = orders.summarize(&StoreStateV1::default(), &params(&seller_key()));
         let bytes = crate::to_cbor(&summary).expect("encode");
         assert!(
-            bytes.len() <= MAX_ORDERS * 72,
+            bytes.len() <= MAX_ORDERS * 70 + 3,
             "summary of {} bytes for {MAX_ORDERS} orders",
             bytes.len()
         );

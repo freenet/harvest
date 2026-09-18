@@ -178,12 +178,40 @@ fn handle_contract_response(response: ContractResponse) {
 fn check_for_reputation_link(state_bytes: &[u8]) -> Option<Vec<u8>> {
     let store_state =
         harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(state_bytes).ok()?;
+    // Version 0 is "no details published", and nothing signs it. A store
+    // written before the PR #82 re-review can carry any reputation id there,
+    // so following it would subscribe to whatever contract a third party
+    // named. Only signed details are followed.
+    if store_state.info.info.version == 0 {
+        return None;
+    }
     let reputation_id = store_state.info.info.reputation_contract_id;
     // Don't follow if it's all zeros (uninitialized)
     if reputation_id == [0u8; 32] {
         return None;
     }
     Some(reputation_id.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unsigned version-0 reputation id is not followed; a signed one is
+    /// (PR #82 round-3 review).
+    #[test]
+    fn only_a_signed_reputation_link_is_followed() {
+        let mut state = harvest_common::store::StoreStateV1::default();
+        state.info.info.reputation_contract_id = [0xBB; 32];
+        let bytes =
+            |s: &harvest_common::store::StoreStateV1| harvest_common::to_cbor(s).expect("encode");
+        assert_eq!(check_for_reputation_link(&bytes(&state)), None);
+        state.info.info.version = 1;
+        assert_eq!(
+            check_for_reputation_link(&bytes(&state)),
+            Some(vec![0xBB; 32])
+        );
+    }
 }
 
 /// Re-GET a contract's full state (re-subscribing is a harmless no-op if we

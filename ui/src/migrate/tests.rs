@@ -1896,6 +1896,42 @@ fn an_oversized_message_on_both_sides_is_counted_once() {
     );
 }
 
+/// **A fold does not carry unsigned version-0 details forward** (PR #82
+/// round-3 review). Before the re-review the contract accepted any content at
+/// version 0, so a predecessor can hold an injected name and key at version 0
+/// beside real listings. The scaffold's merge never touches a version-0 base,
+/// so the fold carried the junk forward, the new contract refused the PUT,
+/// and the listings never moved. The fold resets it to the default instead.
+#[test]
+fn a_fold_drops_unsigned_version_zero_details() {
+    use freenet_scaffold::ComposableState;
+    let mut junk = store_with(&[signed_listing("Alpha")]);
+    junk.info.info.store_name = "Totally Legit Farm".into();
+    junk.info.info.encryption_public_key = Some([0xAA; 32]);
+    let params = store_params(&seller_vk());
+
+    let folded = merge_store_reporting_discard(
+        junk,
+        &StoreStateV1::default(),
+        &params,
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded);
+    assert_eq!(
+        folded.state.info,
+        harvest_common::store::AuthorizedStoreInfoV1::default()
+    );
+    assert_eq!(
+        folded.state.listings.listings.len(),
+        1,
+        "the listing is carried"
+    );
+    folded
+        .state
+        .verify(&folded.state, &params)
+        .expect("the folded state is one the new contract accepts");
+}
+
 /// **A fold whose base is not canonical writes canonical state (harvest#26).**
 ///
 /// The current contract refuses unsorted listings or a listing held twice,
