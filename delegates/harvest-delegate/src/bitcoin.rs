@@ -1301,4 +1301,55 @@ mod origin_gating_tests {
         }
         assert_eq!(load_payment_xpub(&store).map(|s| s.next_index), Some(4));
     }
+
+    /// **PR #83 review, Should Fix 8.** A stale device, not a fresh one: it
+    /// holds this key with a count of 1, another device has since published
+    /// orders up to index 4, and the seller re-enters the same key. Through
+    /// `handle`, the count comes back as 5, and the next address is index 5.
+    #[test]
+    fn a_stale_device_re_entering_the_same_key_takes_the_published_count() {
+        let chain = crate::bip32::AccountXpub::parse(SELLERS_KEY)
+            .expect("parse")
+            .external_chain()
+            .expect("chain");
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        let mut held = load_payment_xpub(&store).expect("stored");
+        held.next_index = 1;
+        save_payment_xpub(&mut store, &held).expect("store");
+
+        let published: Vec<Vec<u8>> = (0..5).map(|i| chain.script_at(i).expect("derive")).collect();
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: 3,
+                xpub: SELLERS_KEY.to_string(),
+                network: BitcoinNetwork::Bitcoin,
+                published_scripts: published.clone(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::PaymentXpubSet { result, .. } => {
+                assert_eq!(result.expect("accepted").next_index, 5);
+            }
+            other => panic!("expected PaymentXpubSet, got {other:?}"),
+        }
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 4,
+                published_scripts: Vec::new(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::OrderAddress { result, .. } => {
+                assert_eq!(result.expect("derived").index, 5);
+            }
+            other => panic!("expected OrderAddress, got {other:?}"),
+        }
+    }
 }

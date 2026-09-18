@@ -551,13 +551,11 @@ fn authorize_new_order(
 /// will answer, and an entry left behind would sit in `pending_invoices`
 /// forever waiting for an id that was never asked about.
 #[cfg(target_arch = "wasm32")]
-fn spawn_order_address_request(request_id: u64, published_scripts: Vec<Vec<u8>>) {
+fn spawn_order_address_request(request_id: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
 
-        if let Err(e) =
-            crate::gateway::bitcoin_ops::derive_order_address(request_id, published_scripts).await
-        {
+        if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(request_id).await {
             dioxus::logger::tracing::error!("Failed to request a payment address: {e}");
             let mut state = crate::gateway::APP_STATE.write();
             state.pending_invoices.remove(&request_id);
@@ -4223,8 +4221,54 @@ impl AppState {
         self.pending_invoices.insert(request_id, invoice);
 
         #[cfg(target_arch = "wasm32")]
-        spawn_order_address_request(request_id, self.published_payment_scripts());
+        spawn_order_address_request(request_id);
         Ok(())
+    }
+
+    /// The request that asks the delegate for invoice `request_id`'s address.
+    ///
+    /// Built here rather than at the wasm call site so the one thing that
+    /// makes it safe -- carrying the published scripts -- is executed by
+    /// tests (PR #83 review, Must Fix 4): a `Vec::new()` at a wasm-only send
+    /// compiled, passed every test, and restored harvest#77. Sends only the
+    /// scripts the delegate has not already accounted for in this tab.
+    pub fn order_address_request(
+        &mut self,
+        request_id: u64,
+    ) -> harvest_common::BitcoinDelegateRequest {
+        let published_scripts: Vec<Vec<u8>> = self
+            .published_payment_scripts()
+            .into_iter()
+            .filter(|script| !self.bitcoin.accounted_scripts.contains(script))
+            .collect();
+        self.bitcoin
+            .scripts_in_flight
+            .insert(request_id, published_scripts.clone());
+        harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+            request_id,
+            published_scripts,
+        }
+    }
+
+    /// The request that records the seller's payment key. Always carries
+    /// EVERY published script: a new key resets the delegate's counter, and
+    /// what was accounted for under the old key says nothing about this one.
+    pub fn set_payment_xpub_request(
+        &mut self,
+        request_id: u64,
+        xpub: String,
+        network: BitcoinNetwork,
+    ) -> harvest_common::BitcoinDelegateRequest {
+        let published_scripts = self.published_payment_scripts();
+        self.bitcoin
+            .scripts_in_flight
+            .insert(request_id, published_scripts.clone());
+        harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+            request_id,
+            xpub,
+            network,
+            published_scripts,
+        }
     }
 
     /// The payment scripts of every order this seller's own stores have
@@ -5230,8 +5274,12 @@ impl AppState {
 
             BitcoinDelegateResponse::PaymentXpubSet { request_id, result } => {
                 self.bitcoin.in_flight.remove(&request_id);
+                let sent = self.bitcoin.scripts_in_flight.remove(&request_id);
                 match result {
                     Ok(status) => {
+                        // Replaced, not extended: the counter now belongs to
+                        // this key and was floored against exactly these.
+                        self.bitcoin.accounted_scripts = sent.unwrap_or_default().into_iter().collect();
                         info!(
                             "Payment key recorded for {}, next index {}",
                             status.network.as_str(),
@@ -5257,8 +5305,14 @@ impl AppState {
 
             BitcoinDelegateResponse::OrderAddress { request_id, result } => {
                 self.bitcoin.in_flight.remove(&request_id);
+                let sent = self.bitcoin.scripts_in_flight.remove(&request_id);
                 match result {
-                    Ok(derived) => self.complete_invoice(request_id, derived),
+                    Ok(derived) => {
+                        self.bitcoin
+                            .accounted_scripts
+                            .extend(sent.unwrap_or_default());
+                        self.complete_invoice(request_id, derived)
+                    }
                     Err(e) => {
                         // Drop the invoice: without an address there is
                         // nothing to sign, and leaving it queued would leave
@@ -6286,6 +6340,17 @@ pub struct BitcoinState {
     pub watches_loaded: bool,
     /// The account public key invoices derive their payment addresses from.
     pub payment_xpub: Option<harvest_common::PaymentXpubStatus>,
+    /// Published payment scripts the delegate has already been told about and
+    /// has answered, in this tab. Only scripts NOT in here are sent with the
+    /// next derivation, so the delegate's recovery scan and the request size
+    /// are paid once per tab rather than on every invoice (PR #83 review,
+    /// Should Fix 7). Replaced wholesale when a payment key is set, because
+    /// "accounted for" only means anything relative to one key.
+    pub accounted_scripts: std::collections::BTreeSet<Vec<u8>>,
+    /// The scripts sent with each outstanding `DeriveOrderAddress` /
+    /// `SetPaymentXpub`, keyed by request id, moved into
+    /// [`Self::accounted_scripts`] when the delegate answers `Ok`.
+    pub scripts_in_flight: HashMap<u64, Vec<Vec<u8>>>,
     /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
     /// key configured" from "we have not asked yet", so the seller is not
     /// prompted to add one before we know whether they already have.
@@ -8400,6 +8465,37 @@ mod invoice_tests {
         );
     }
 
+    /// A published order paying `script`, as a store holds it.
+    fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
+        let order = harvest_common::payment::Order {
+            id: harvest_common::payment::OrderId([0u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: SELLER.to_string(),
+            amount_sats: 50_000,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: script.to_vec(),
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: Some(anchor(TIP_HEIGHT)),
+            order_binding: None,
+            listing_tag: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
+        }
+        .with_derived_id();
+        harvest_common::payment::AuthorizedOrder {
+            order,
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
     /// **What the delegate is told has been used.** Every order in every store
     /// this seller owns, under every Ghost Key, because one payment key serves
     /// all of them; not a store they are merely browsing, whose orders pay
@@ -8407,36 +8503,6 @@ mod invoice_tests {
     /// on-chain script.
     #[test]
     fn the_published_scripts_are_every_owned_stores_orders() {
-        fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
-            let order = harvest_common::payment::Order {
-                id: harvest_common::payment::OrderId([0u8; 32]),
-                buyer_fingerprint: String::new(),
-                seller_fingerprint: SELLER.to_string(),
-                amount_sats: 50_000,
-                network: BitcoinNetwork::Signet,
-                payment_script_pubkey: script.to_vec(),
-                payment_address: "tb1qexample".to_string(),
-                required_confirmations: 1,
-                payment_hash: None,
-                trusted_bridges: Vec::new(),
-                bitcoin_address_code_hash: None,
-                anchor: Some(anchor(TIP_HEIGHT)),
-                order_binding: None,
-                listing_tag: None,
-                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
-            }
-            .with_derived_id();
-            harvest_common::payment::AuthorizedOrder {
-                order,
-                scoped_payload: Vec::new(),
-                signature: Vec::new(),
-                status: harvest_common::payment::OrderStatus::AwaitingPayment,
-                payment_proof: None,
-                status_scoped_payload: None,
-                status_signature: None,
-            }
-        }
-
         let mut state = seller_with_a_store();
         const SECOND_STORE: [u8; 32] = [0x5e; 32];
         const SOMEONE_ELSES: [u8; 32] = [0x77; 32];
@@ -8481,6 +8547,105 @@ mod invoice_tests {
                 vec![0x00, 0x14, 3],
             ]
         );
+    }
+
+    /// **PR #83 review, Must Fix 4.** The derivation request is built by
+    /// `order_address_request`, not at the wasm send, and it carries the
+    /// published scripts. A request built without them is how harvest#77
+    /// came back.
+    #[test]
+    fn the_address_request_carries_the_published_scripts() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&[0x00, 0x14, 1]), with_script(&[0x00, 0x14, 2])];
+
+        match state.order_address_request(7) {
+            harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id,
+                published_scripts,
+            } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(
+                    published_scripts,
+                    vec![vec![0x00, 0x14, 1], vec![0x00, 0x14, 2]]
+                );
+            }
+            other => panic!("expected DeriveOrderAddress, got {other:?}"),
+        }
+        match state.set_payment_xpub_request(8, "vpub".into(), BitcoinNetwork::Signet) {
+            harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                published_scripts, ..
+            } => assert_eq!(published_scripts.len(), 2),
+            other => panic!("expected SetPaymentXpub, got {other:?}"),
+        }
+    }
+
+    /// **PR #83 review, Should Fix 7.** Once the delegate has answered for a
+    /// script it is not sent again in this tab, so neither the scan nor the
+    /// request grows with the store on every invoice. A refused derivation
+    /// accounts for nothing, and setting a key sends everything again and
+    /// replaces what is accounted for, because a new key's counter starts
+    /// from scratch.
+    #[test]
+    fn a_script_the_delegate_has_answered_for_is_not_sent_again() {
+        fn scripts(request: harvest_common::BitcoinDelegateRequest) -> Vec<Vec<u8>> {
+            match request {
+                harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                    published_scripts,
+                    ..
+                }
+                | harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                    published_scripts,
+                    ..
+                } => published_scripts,
+                other => panic!("unexpected request {other:?}"),
+            }
+        }
+        let mut state = seller_with_a_store();
+        let one = vec![0x00, 0x14, 1];
+        let two = vec![0x00, 0x14, 2];
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![with_script(&one)];
+
+        // Refused: nothing is accounted for.
+        assert_eq!(scripts(state.order_address_request(1)), vec![one.clone()]);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: 1,
+            result: Err("refused".into()),
+        });
+        assert_eq!(scripts(state.order_address_request(2)), vec![one.clone()]);
+
+        // Answered: not sent again; a newly published order is.
+        state.on_bitcoin_delegate_response(address_answer(2, 0));
+        assert!(scripts(state.order_address_request(3)).is_empty());
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders
+            .push(with_script(&two));
+        assert_eq!(scripts(state.order_address_request(4)), vec![two.clone()]);
+
+        // Setting a key sends everything and replaces the accounted set.
+        assert_eq!(
+            scripts(state.set_payment_xpub_request(5, "vpub".into(), BitcoinNetwork::Signet)),
+            vec![one.clone(), two.clone()]
+        );
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: 5,
+            result: Ok(PaymentXpubStatus {
+                xpub: "vpub".into(),
+                network: BitcoinNetwork::Signet,
+                next_index: 2,
+            }),
+        });
+        assert!(scripts(state.order_address_request(6)).is_empty());
     }
 
     /// **A seller who cannot see the chain issues nothing at all.**

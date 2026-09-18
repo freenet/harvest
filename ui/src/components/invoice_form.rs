@@ -454,8 +454,7 @@ fn InvoiceForm(
 fn save_payment_key(xpub: String, network: BitcoinNetwork) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        let published = APP_STATE.read().published_payment_scripts();
-        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network, published).await {
+        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network).await {
             dioxus::logger::tracing::error!("Failed to send the payment key: {e}");
             APP_STATE
                 .write()

@@ -18,6 +18,15 @@ use super::APP_STATE;
 /// fresh request id from `APP_STATE.bitcoin` and marking it in-flight.
 #[cfg(target_arch = "wasm32")]
 async fn send_request(build: impl FnOnce(u64) -> BitcoinDelegateRequest) -> Result<(), String> {
+    send_request_from_state(|_, request_id| build(request_id)).await
+}
+
+/// [`send_request`], for a request whose contents come from `AppState` --
+/// built while the state is already held, rather than by re-borrowing it.
+#[cfg(target_arch = "wasm32")]
+async fn send_request_from_state(
+    build: impl FnOnce(&mut crate::state::AppState, u64) -> BitcoinDelegateRequest,
+) -> Result<(), String> {
     let (delegate_key, request) = {
         let mut state = APP_STATE.write();
         let key = state
@@ -26,7 +35,8 @@ async fn send_request(build: impl FnOnce(u64) -> BitcoinDelegateRequest) -> Resu
             .ok_or("harvest delegate not yet registered")?;
         let request_id = state.bitcoin.next_request_id();
         state.bitcoin.in_flight.insert(request_id);
-        (key, build(request_id))
+        let request = build(&mut state, request_id);
+        (key, request)
     };
     let payload = to_cbor(&request).map_err(|e| format!("serialize bitcoin request: {e}"))?;
     super::send_delegate_message(&delegate_key, payload).await
@@ -150,19 +160,16 @@ pub async fn configure_bridge(_endpoint: BridgeEndpoint) -> Result<(), String> {
 /// Record the seller's account xpub, so invoices can each be given a fresh
 /// payment address.
 ///
-/// `published_scripts` is `AppState::published_payment_scripts`, so the count
-/// the delegate reports back already accounts for the store's own orders.
+/// The request is `AppState::set_payment_xpub_request`, which carries the
+/// store's published payment scripts so the count the delegate reports back
+/// already accounts for them. Built there so tests execute it.
 #[cfg(target_arch = "wasm32")]
 pub async fn set_payment_xpub(
     xpub: String,
     network: freenet_bitcoin_common::BitcoinNetwork,
-    published_scripts: Vec<Vec<u8>>,
 ) -> Result<(), String> {
-    send_request(|request_id| BitcoinDelegateRequest::SetPaymentXpub {
-        request_id,
-        xpub,
-        network,
-        published_scripts,
+    send_request_from_state(|state, request_id| {
+        state.set_payment_xpub_request(request_id, xpub, network)
     })
     .await
 }
@@ -171,7 +178,6 @@ pub async fn set_payment_xpub(
 pub async fn set_payment_xpub(
     _xpub: String,
     _network: freenet_bitcoin_common::BitcoinNetwork,
-    _published_scripts: Vec<Vec<u8>>,
 ) -> Result<(), String> {
     Err("bitcoin operations require WASM".into())
 }
@@ -209,32 +215,26 @@ pub async fn get_payment_xpub() -> Result<(), String> {
 /// registers first (`AppState::pending_invoices`, keyed on this id) and sends
 /// second -- which it cannot do if the id only exists inside this function.
 ///
-/// `published_scripts` is `AppState::published_payment_scripts`: the delegate
-/// moves its device-local counter past every one of them before it derives
-/// (harvest#77).
+/// The request is `AppState::order_address_request`, which carries the
+/// published scripts the delegate moves its device-local counter past
+/// (harvest#77). Built there so tests execute it.
 #[cfg(target_arch = "wasm32")]
-pub async fn derive_order_address(
-    request_id: u64,
-    published_scripts: Vec<Vec<u8>>,
-) -> Result<(), String> {
-    let delegate_key = APP_STATE
-        .read()
-        .harvest_delegate_key
-        .clone()
-        .ok_or("harvest delegate not yet registered")?;
-    let payload = to_cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
-        request_id,
-        published_scripts,
-    })
-    .map_err(|e| format!("serialize DeriveOrderAddress: {e}"))?;
+pub async fn derive_order_address(request_id: u64) -> Result<(), String> {
+    let (delegate_key, request) = {
+        let mut state = APP_STATE.write();
+        let key = state
+            .harvest_delegate_key
+            .clone()
+            .ok_or("harvest delegate not yet registered")?;
+        (key, state.order_address_request(request_id))
+    };
+    let payload =
+        to_cbor(&request).map_err(|e| format!("serialize DeriveOrderAddress: {e}"))?;
     super::send_delegate_message(&delegate_key, payload).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn derive_order_address(
-    _request_id: u64,
-    _published_scripts: Vec<Vec<u8>>,
-) -> Result<(), String> {
+pub async fn derive_order_address(_request_id: u64) -> Result<(), String> {
     Err("bitcoin operations require WASM".into())
 }
 
