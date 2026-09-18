@@ -50,7 +50,38 @@ set -e
 # is where sync-wasm stages contracts/), and the two fixed-name assets are
 # re-copied below.
 rm -rf target/dx/harvest-ui/${BUILD_PROFILE}/web/public
-cd ui && dx build --${BUILD_PROFILE}
+cd ui
+# --debug-symbols false: a release UI has no use for wasm debuginfo, and
+# keeping it is what breaks the optimizer (harvest#34). With debug symbols on
+# (dx's own default, regardless of --release), wasm-bindgen preserves the
+# DWARF sections rustc emitted and dx asks wasm-opt to REWRITE them
+# (`--debuginfo`) rather than drop them. This rustc's DWARF output aborts
+# binaryen's rewrite pass with SIGABRT ("compile unit size was incorrect,
+# this may be an unsupported version of DWARF"), and `dx build` treats that
+# as non-fatal: it logs an ERROR line, silently falls back to the
+# unoptimized wasm-bindgen output, and still exits 0 / prints "completed
+# successfully". With debug symbols off, wasm-bindgen never keeps the DWARF
+# and wasm-opt is asked to `--strip-debug` instead, which has nothing to
+# choke on -- optimization actually runs. Verified: with this flag, no
+# wasm-opt error, the emitted wasm has no .debug_* sections, and it is
+# smaller than the unoptimized build.
+#
+# Because dx exits 0 either way, `cargo make` cannot see the difference
+# between a real optimization pass and the silent fallback on its own exit
+# code -- so we capture dx's own output and fail loudly if the failure
+# signature is there. A build that would ship unoptimized wasm must be a
+# build FAILURE, not a quiet success (harvest#34's whole point).
+DX_LOG="../target/dx-build-ui.log"
+if dx build --${BUILD_PROFILE} --debug-symbols false > "$DX_LOG" 2>&1; then
+  dx_status=0
+else
+  dx_status=1
+fi
+cat "$DX_LOG"
+if [ "$dx_status" -ne 0 ] || grep -q "wasm-opt failed" "$DX_LOG"; then
+  echo "ERROR: dx build failed, or wasm-opt aborted and dx silently fell back to unoptimized wasm (harvest#34). See the log above. Aborting." >&2
+  exit 1
+fi
 # dx doesn't copy CSS from assets/ to the build output root, so copy
 # manually. Path is relative to `ui/` because we cd'd above and the
 # script runs as one shell so the cwd persists.
@@ -58,7 +89,17 @@ cp assets/harvest.css ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harves
 # The logo is referenced by harvest.css but dx does not copy it either, so the
 # published app 404s on it. Same class of gap as the CSS.
 cp assets/harvest-logo.svg ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest-logo.svg
-echo "CSS copied to build output"
+# Bundled fonts (harvest#28): harvest.css references these by a path relative
+# to itself (fonts/...), so they need to land beside it. Same copy gap as
+# the CSS and the logo -- dx only manages files under ui/public. Only the
+# woff2 files ship; the OFL licence texts in assets/fonts/ are attribution
+# for this repo, not a runtime asset, and the publish bundle gate
+# (check-webapp-bundle.sh) requires every shipped file to be either
+# content-hashed or explicitly listed as required.
+rm -rf ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts
+mkdir -p ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts
+cp assets/fonts/*.woff2 ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/fonts/
+echo "CSS and fonts copied to build output"
 '''
 
 # --- Development tasks ---

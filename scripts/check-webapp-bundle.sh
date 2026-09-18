@@ -68,13 +68,22 @@ cd "$WORK"
 fail() { echo "FAILED: $*"; exit 1; }
 
 # Fixed-name files the app needs. index.html is first because everything else
-# is judged relative to it. harvest-logo.svg is REQUIRED rather than a
-# reachability candidate because it is not content-hashed: it is copied in by
-# build-ui and referenced from harvest.css by a fixed name.
+# is judged relative to it. harvest-logo.svg and the fonts/*.woff2 files are
+# REQUIRED rather than reachability candidates because none of them are
+# content-hashed: they are copied in by build-ui and referenced from
+# harvest.css by a fixed name (harvest#28 bundles the fonts locally so the
+# CSP no longer blocks the Google Fonts import).
 REQUIRED=(
     index.html
     harvest.css
     harvest-logo.svg
+    fonts/libre-baskerville-400.woff2
+    fonts/libre-baskerville-700.woff2
+    fonts/libre-baskerville-400-italic.woff2
+    fonts/source-sans-3-300.woff2
+    fonts/source-sans-3-400.woff2
+    fonts/source-sans-3-500.woff2
+    fonts/source-sans-3-600.woff2
     contracts/store_contract.wasm
     contracts/reputation_contract.wasm
     contracts/mailbox_contract.wasm

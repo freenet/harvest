@@ -1,7 +1,73 @@
 /* Harvest - Farmer's Market Aesthetic
    Warm, earthy, minimal, honest */
 
-@import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Source+Sans+3:wght@300;400;500;600&display=swap');
+/* Fonts are bundled locally rather than imported from Google Fonts
+   (harvest#28). The published app's CSP is `default-src
+   http://127.0.0.1:7509 ...`, which blocks a `fonts.googleapis.com`
+   stylesheet outright -- so the import silently never loaded and the app
+   always rendered in fallback fonts. Widening the CSP to allow it would fix
+   that, but it would also make every visitor's browser fetch from Google on
+   every load, announcing who is using Harvest and when. Serving the fonts
+   from the app's own origin avoids both problems, and the CSP already
+   permits that origin, so no CSP change is needed here.
+   Latin subset only (Google's default "latin" range, which already covers
+   Western European accented characters). Files and OFL licences are in
+   fonts/. */
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/libre-baskerville-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('fonts/libre-baskerville-700.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/libre-baskerville-400-italic.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Sans 3';
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url('fonts/source-sans-3-300.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Sans 3';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/source-sans-3-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Sans 3';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('fonts/source-sans-3-500.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Sans 3';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('fonts/source-sans-3-600.woff2') format('woff2');
+}
 
 :root {
   /* Earth palette */
