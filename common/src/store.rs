@@ -1,39 +1,89 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::VerifyingKey;
-use freenet_scaffold_macro::composable;
+use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 
 use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
 use crate::payment::{AuthorizedOrder, OrderId};
 
+/// How many base58 characters of the seller's verifying key make a store code.
+///
+/// 12, not Delta's 10 (harvest#52, decided by @sanity). A code pins
+/// 58^12 ~= 2^70.3 keys; taking a store's address from its seller needs a
+/// keypair whose public key shares the seller's code, which is that many
+/// scalar multiplications. 10 characters would be ~2^58.6, within reach of
+/// rented vanity-grinding compute. Two characters buys the difference.
+pub const STORE_CODE_LEN: usize = 12;
+
+/// The base58 alphabet a store code is written in (Bitcoin's, which is what
+/// `bs58` encodes with by default).
+const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// The store code a verifying key opens a store under: the first
+/// [`STORE_CODE_LEN`] characters of its base58 encoding.
+///
+/// Every 32-byte value encodes to at least 32 base58 characters (each leading
+/// zero byte is a `1`), so the slice always exists.
+pub fn store_code(seller_verifying_key: &VerifyingKey) -> String {
+    let encoded = bs58::encode(seller_verifying_key.as_bytes()).into_string();
+    encoded[..STORE_CODE_LEN.min(encoded.len())].to_string()
+}
+
 /// Immutable parameters for a store contract, set at creation time.
+///
+/// # A prefix of the seller's key, not the key (harvest#52)
+///
+/// Parameters are hashed into the contract's address, so they are what a link
+/// has to carry. The whole key made that a 44-character contract id; a
+/// [`STORE_CODE_LEN`]-character prefix of it is short enough to read out, and
+/// any client re-derives the full address from it and the store contract it
+/// bundles, with no registry and no lookup. This is Delta's `SiteParameters`
+/// mechanism.
+///
+/// A prefix names many keys, so the contract cannot take the owner from here.
+/// It takes it from the state, [`StoreStateV1::owner`], checks that it
+/// matches this code ([`StoreParameters::admits`]), and verifies everything
+/// the store holds against it. See `StoreStateV1`'s docs for how two owners
+/// at one address are resolved, and why that resolution converges.
 ///
 /// # Why there is only one field
 ///
-/// Parameters are hashed into the contract's address, so anything here is
-/// frozen for the store's entire life. The seller's key genuinely is the
-/// store's identity, so freezing it is correct.
+/// Anything here is frozen for the store's entire life. The seller's key
+/// genuinely is the store's identity, so freezing it is correct. The Bitcoin
+/// trust configuration used to live here too -- `trusted_bitcoin_bridges` and
+/// `bitcoin_address_code_hash` -- and being frozen was fatal to it: every
+/// store the UI created was published with an empty bridge list, which made
+/// it permanently incapable of accepting an on-chain payment. Both fields now
+/// live on [`crate::payment::Order`]; see that struct's `trusted_bridges`.
 ///
-/// The Bitcoin trust configuration used to live here too --
-/// `trusted_bitcoin_bridges` and `bitcoin_address_code_hash` -- and being
-/// frozen was fatal to it: every store the UI creates was published with an
-/// empty bridge list, which made it permanently incapable of accepting an
-/// on-chain payment, and a bridge that went away could never be replaced.
-/// Both fields now live on [`crate::payment::Order`], where the seller's
-/// signature on the invoice authenticates them and each new order may name a
-/// new set. See that struct's `trusted_bridges` for the full argument,
-/// including why moving them to mutable *state* would have been worse.
+/// # No salt (decided on harvest#52)
+///
+/// A salt would give a seller whose code was taken a second address, at the
+/// cost of the code no longer being derivable from the key alone. Declined:
+/// taking a code needs ~2^70 work (above), so the escape hatch would be for a
+/// case that does not realistically occur, and a seller who does meet it is
+/// told plainly rather than silently failing (the UI's "already claimed by a
+/// different key").
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreParameters {
-    /// The seller's Ed25519 verifying key (from their ghostkey certificate).
+    /// The store code: a prefix of the seller's base58 verifying key.
     ///
     /// `pub(crate)` on purpose -- see [`StoreParameters::new`].
-    pub(crate) seller_verifying_key: VerifyingKey,
+    ///
+    /// The contract does not insist on [`STORE_CODE_LEN`] characters, only on
+    /// a non-empty code the owner's key begins with. A shorter code is a
+    /// different address that no link names: [`StoreParameters::new`] and
+    /// [`StoreParameters::from_code`] are the only constructors, and both
+    /// produce exactly [`STORE_CODE_LEN`]. Accepting any length is what lets
+    /// the production contract's merge be checked with two keys that really
+    /// do share a code (ground to a two-character code; twelve cannot be
+    /// ground), rather than with a test-only build.
+    pub(crate) store_code: String,
 }
 
 impl StoreParameters {
-    /// The only way to build these parameters from outside `harvest-common`.
+    /// The only way to build these parameters from a seller's key.
     ///
     /// # Why the fields are not public
     ///
@@ -46,19 +96,58 @@ impl StoreParameters {
     ///
     /// That is not hypothetical. `StoreParameters` gained two Bitcoin fields
     /// and lost them again; the probe went on deriving V1, the only generation
-    /// ever published, at an address it never had. Removing the duplicate
-    /// constructions fixed the instance. A source-scrape test was written to
-    /// stop them coming back and was beaten by a type alias, which is an
-    /// ordinary refactor rather than an exotic evasion.
+    /// ever published, at an address it never had. And it changed shape again
+    /// for harvest#52, from the whole key to a code, which is why
+    /// `ui/src/migrate.rs` now derives every generation up to V16 under a
+    /// frozen copy of the whole-key encoding.
     ///
     /// Private fields are what actually holds it: a second derivation outside
-    /// this crate does not compile. Adding a field changes this signature, so
-    /// the decision is made once, here, rather than in every place that
-    /// happens to construct one.
+    /// this crate does not compile.
     pub fn new(seller_verifying_key: VerifyingKey) -> Self {
         Self {
-            seller_verifying_key,
+            store_code: store_code(&seller_verifying_key),
         }
+    }
+
+    /// Parameters for a store code read from a link.
+    ///
+    /// `None` unless `code` is exactly [`STORE_CODE_LEN`] base58 characters.
+    /// A code of any other length is refused rather than trimmed or padded:
+    /// it names a different address, and a typo in a shared link should open
+    /// nothing, not something else.
+    pub fn from_code(code: &str) -> Option<Self> {
+        if code.len() != STORE_CODE_LEN || !code.chars().all(|c| BASE58_ALPHABET.contains(c)) {
+            return None;
+        }
+        Some(Self {
+            store_code: code.to_string(),
+        })
+    }
+
+    /// A test-only constructor for a code of any length, so merge laws can be
+    /// exercised with two keys that genuinely share one. See the field docs.
+    #[cfg(test)]
+    pub(crate) fn with_code_for_test(code: &str) -> Self {
+        Self {
+            store_code: code.to_string(),
+        }
+    }
+
+    /// The store code these parameters carry.
+    pub fn code(&self) -> &str {
+        &self.store_code
+    }
+
+    /// Whether `owner` may own the store at this address: its base58
+    /// encoding begins with this code.
+    ///
+    /// An empty code admits nobody. It would admit everybody, which is not a
+    /// store any link can name, and refusing it costs nothing.
+    pub fn admits(&self, owner: &VerifyingKey) -> bool {
+        !self.store_code.is_empty()
+            && bs58::encode(owner.as_bytes())
+                .into_string()
+                .starts_with(&self.store_code)
     }
 }
 
@@ -153,8 +242,8 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
 
     fn verify(
         &self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
     ) -> Result<(), String> {
         // Version 0 is "no details published", and it must be exactly the
         // default. Nothing signs a version-0 info, so skipping verification
@@ -173,7 +262,7 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         verify_scoped_signature(
             &self.scoped_payload,
             &self.signature,
-            &parameters.seller_verifying_key,
+            owner_key(parent_state)?,
             &self.info,
         )
         .map_err(|e| format!("store info signature invalid: {e}"))
@@ -202,8 +291,8 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
 
     fn apply_delta(
         &mut self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(new_info) = delta {
@@ -213,7 +302,7 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
             verify_scoped_signature(
                 &new_info.scoped_payload,
                 &new_info.signature,
-                &parameters.seller_verifying_key,
+                owner_key(parent_state)?,
                 &new_info.info,
             )
             .map_err(|e| format!("store info delta signature invalid: {e}"))?;
@@ -267,11 +356,11 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
 
     fn verify(
         &self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
     ) -> Result<(), String> {
         for authorized in &self.listings {
-            authorized.verify(&parameters.seller_verifying_key)?;
+            authorized.verify(owner_key(parent_state)?)?;
         }
         // Canonical form: strictly ascending by id, which also means no id
         // twice. `apply_delta` only ever produces this, but a state can reach
@@ -325,8 +414,8 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
 
     fn apply_delta(
         &mut self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(new_listings) = delta {
@@ -349,7 +438,7 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
                 if !known_ids.insert(listing.listing.id.clone()) {
                     continue; // already have this listing
                 }
-                listing.verify(&parameters.seller_verifying_key)?;
+                listing.verify(owner_key(parent_state)?)?;
                 to_add.push(listing.clone());
             }
             self.listings.extend(to_add);
@@ -627,8 +716,8 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 
     fn verify(
         &self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
     ) -> Result<(), String> {
         if self.orders.len() > MAX_ORDERS {
             return Err(format!(
@@ -641,7 +730,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
                 return Err("order filed under a key that is not its own id".to_string());
             }
             record
-                .verify(&parameters.seller_verifying_key)
+                .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
         }
         Ok(())
@@ -710,8 +799,8 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 
     fn apply_delta(
         &mut self,
-        _parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let Some(incoming) = delta else {
@@ -726,7 +815,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         // that is a property of that call site, not of this function.
         for record in incoming {
             record
-                .verify(&parameters.seller_verifying_key)
+                .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
         }
         for record in incoming {
@@ -737,10 +826,90 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
     }
 }
 
-/// Top-level composable store state.
-#[composable]
+/// The key a store's records are verified against: its owner.
+///
+/// Every child of [`StoreStateV1`] verifies through this, so a store with no
+/// owner can hold nothing that needs a signature -- which is everything but
+/// the empty default.
+fn owner_key(parent: &StoreStateV1) -> Result<&VerifyingKey, String> {
+    parent.owner.as_ref().ok_or_else(|| {
+        "this store has no owner yet, so nothing in it can be verified: a store's first \
+         signed record has to name the key that signed it"
+            .to_string()
+    })
+}
+
+/// Whether `a` wins a store address over `b`: the smaller key, by its bytes.
+///
+/// See [`StoreStateV1`] for why the rule is a total order on keys rather than
+/// "whoever claimed first".
+fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
+    a.as_bytes() < b.as_bytes()
+}
+
+/// A store's whole state.
+///
+/// # The owner, and binding a store to one key (harvest#52)
+///
+/// [`StoreParameters`] carry only a [`STORE_CODE_LEN`]-character prefix of
+/// the seller's key, so the address alone does not say whose store it is.
+/// The state does: [`StoreStateV1::owner`] is the full key, it must begin
+/// with the code ([`StoreParameters::admits`]), and every record the store
+/// holds -- its details, listings and orders -- is verified against it. An
+/// owner therefore arrives only alongside something it signed; a state that
+/// names an owner and holds nothing it signed is refused, because a key alone
+/// proves nothing (anyone can write down a curve point that begins with a
+/// given code -- the ~2^70 cost of a code is the cost of a KEYPAIR, which
+/// only a signature demonstrates).
+///
+/// # Two keys, one code: why the smaller key wins, and not the first
+///
+/// Delta binds a site to its first claimant and refuses any other key
+/// (`SiteState::merge`). That is not convergent. "First" is not a property of
+/// a state; it is an arrival order, and arrival orders differ between peers.
+/// Let two keys that share a code each publish before either has seen the
+/// other: every peer keeps whichever reached it first and refuses the other
+/// forever, so the network splits into two stores at one address and never
+/// agrees again.
+///
+/// So the merge here picks by a total order that every peer computes the
+/// same way from the states alone: **the owner whose key bytes are smaller
+/// wins the address, and the other owner's records are dropped.** With one
+/// owner, the merge is the ordinary per-record one below. That is the
+/// lexicographic product of a chain (owners, smallest first) with each
+/// owner's own join-semilattice, which is itself a join-semilattice: the
+/// result of merging any set of states is "the smallest owner among them,
+/// with the join of that owner's records", whatever the order or grouping.
+/// Pinned by `claim_tests`, and checked on the built contract with
+/// `fdev verify-merge` over states that include two owners sharing a code.
+///
+/// What it costs, stated plainly: a key with a smaller encoding that shares a
+/// seller's code takes the address even after the seller has published, and
+/// the seller's records stop being served. That is the same attack as
+/// pre-empting a seller who has not published yet, at the same price -- a
+/// keypair in a 2^70 space, half of which rank below any given key -- so the
+/// rule adds no attack that a first-writer rule would have prevented, and it
+/// is the only one of the two that converges. A seller whose address is held
+/// by another key is told so, loudly (the UI's "already claimed by a
+/// different key"); see the decision on harvest#52 for why there is no second
+/// address to move to.
+///
+/// # What is NOT bound here
+///
+/// Whether the owner is the person whose ghostkey certificate the store
+/// publishes. That is `ui/src/ghostkey_cert.rs`'s question, and it now
+/// compares the certified key with this field rather than re-deriving the
+/// address, since a prefix can no longer tell two keys apart on its own.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct StoreStateV1 {
+    /// The store's owner, or `None` for a store nobody has published to.
+    ///
+    /// `#[serde(default)]` so the migration fold can decode a predecessor
+    /// generation's state, which had no owner field: those were addressed by
+    /// the whole key, and the fold names that key as their owner. A state
+    /// with content and no owner never verifies here.
+    #[serde(default)]
+    pub owner: Option<VerifyingKey>,
     pub info: AuthorizedStoreInfoV1,
     pub listings: ListingsV1,
     /// `#[serde(default)]` so store states written before orders existed
@@ -749,12 +918,228 @@ pub struct StoreStateV1 {
     /// Not optional: V1 (`legacy/store_contract.toml`, code hash
     /// `4d7ad3c3...`) is the only generation ever deployed, and its state has
     /// no `orders` key at all. `OrdersV1` derives `Default`, but serde does
-    /// not consult `Default` for a missing field without this attribute and
-    /// `#[composable]` does not add one -- so without it every real V1 state
-    /// fails to decode with "missing field `orders`", and the migration probe
-    /// cannot tell that from an address that was never written.
+    /// not consult `Default` for a missing field without this attribute --
+    /// so without it every real V1 state fails to decode with "missing field
+    /// `orders`", and the migration probe cannot tell that from an address
+    /// that was never written.
     #[serde(default)]
     pub orders: OrdersV1,
+}
+
+/// What a peer tells another it already holds. See [`StoreStateV1::delta`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreStateV1Summary {
+    /// Whose records the rest of the summary describes. A holder of a
+    /// different owner's records needs all of ours or none of them, never a
+    /// difference against records of another key.
+    pub owner: Option<VerifyingKey>,
+    pub info: <AuthorizedStoreInfoV1 as ComposableState>::Summary,
+    pub listings: <ListingsV1 as ComposableState>::Summary,
+    pub orders: <OrdersV1 as ComposableState>::Summary,
+}
+
+/// An update to a store: one `Option` per part, plus the owner whose records
+/// they are.
+///
+/// Field-for-field the shape `#[composable]` used to generate, with `owner`
+/// added, so a delta carrying only listings is still
+/// `{owner, info: None, listings: Some(..), orders: None}` and never the bare
+/// inner `Vec` (see `ui/src/gateway/store_ops.rs` for what that mistake cost).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct StoreStateV1Delta {
+    /// The key every record in this delta is signed by.
+    ///
+    /// `None` is accepted and means "the owner already held", so a delta can
+    /// never CLAIM a store without naming who is claiming it.
+    pub owner: Option<VerifyingKey>,
+    pub info: Option<<AuthorizedStoreInfoV1 as ComposableState>::Delta>,
+    pub listings: Option<<ListingsV1 as ComposableState>::Delta>,
+    pub orders: Option<<OrdersV1 as ComposableState>::Delta>,
+}
+
+impl StoreStateV1 {
+    /// Whether the store holds anything its owner signed.
+    ///
+    /// Details at version 0 are the unsigned default (`verify` requires it),
+    /// so only a published version counts.
+    pub fn holds_signed_content(&self) -> bool {
+        self.info.info.version > 0
+            || !self.listings.listings.is_empty()
+            || !self.orders.orders.is_empty()
+    }
+
+    /// The parent the children are verified under. They read the owner and
+    /// nothing else, so this is all of `self` they need -- and cloning a
+    /// whole store, up to [`MAX_ORDERS`] orders with their payment proofs,
+    /// three times per update to hand each child its parent, bought nothing.
+    fn owner_only(&self) -> Self {
+        Self {
+            owner: self.owner,
+            ..Default::default()
+        }
+    }
+
+    /// Apply a delta's parts under the owner already in `self`, all or
+    /// nothing.
+    fn apply_parts(
+        &mut self,
+        parameters: &StoreParameters,
+        delta: &StoreStateV1Delta,
+    ) -> Result<(), String> {
+        let parent = self.owner_only();
+        let mut next = self.clone();
+        next.info.apply_delta(&parent, parameters, &delta.info)?;
+        next.listings
+            .apply_delta(&parent, parameters, &delta.listings)?;
+        next.orders
+            .apply_delta(&parent, parameters, &delta.orders)?;
+        *self = next;
+        Ok(())
+    }
+}
+
+impl ComposableState for StoreStateV1 {
+    type ParentState = StoreStateV1;
+    type Summary = StoreStateV1Summary;
+    type Delta = StoreStateV1Delta;
+    type Parameters = StoreParameters;
+
+    fn verify(
+        &self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        match &self.owner {
+            Some(owner) => {
+                if !parameters.admits(owner) {
+                    return Err(format!(
+                        "the store's owner key {} does not begin with this store's code {}",
+                        bs58::encode(owner.as_bytes()).into_string(),
+                        parameters.code()
+                    ));
+                }
+                if !self.holds_signed_content() {
+                    return Err(
+                        "a store that names an owner must hold something that owner \
+                                signed: a key alone proves nothing"
+                            .into(),
+                    );
+                }
+            }
+            None => {
+                if self.holds_signed_content() {
+                    return Err("a store with no owner cannot hold signed records".into());
+                }
+            }
+        }
+        let parent = self.owner_only();
+        self.info.verify(&parent, parameters)?;
+        self.listings.verify(&parent, parameters)?;
+        self.orders.verify(&parent, parameters)
+    }
+
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        let parent = self.owner_only();
+        StoreStateV1Summary {
+            owner: self.owner,
+            info: self.info.summarize(&parent, parameters),
+            listings: self.listings.summarize(&parent, parameters),
+            orders: self.orders.summarize(&parent, parameters),
+        }
+    }
+
+    /// What the holder of `old_state_summary` is missing.
+    ///
+    /// * Same owner: the ordinary per-part difference.
+    /// * The requester holds an owner that outranks ours, or ours outranks
+    ///   nothing it holds: nothing. Our records are the ones that lose.
+    /// * The requester holds no owner, or one ours outranks: EVERYTHING,
+    ///   measured against the empty store, because the requester is about to
+    ///   drop what it holds and start again from ours. A difference against
+    ///   another key's records would leave it holding a subset.
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        let owner = self.owner?;
+        let empty;
+        let base = match &old_state_summary.owner {
+            Some(theirs) if *theirs == owner => old_state_summary,
+            Some(theirs) if outranks(theirs, &owner) => return None,
+            _ => {
+                empty = Self::default().summarize(&Self::default(), parameters);
+                &empty
+            }
+        };
+        let parent = self.owner_only();
+        let delta = StoreStateV1Delta {
+            owner: Some(owner),
+            info: self.info.delta(&parent, parameters, &base.info),
+            listings: self.listings.delta(&parent, parameters, &base.listings),
+            orders: self.orders.delta(&parent, parameters, &base.orders),
+        };
+        if delta.info.is_none() && delta.listings.is_none() && delta.orders.is_none() {
+            None
+        } else {
+            Some(delta)
+        }
+    }
+
+    /// Apply a delta, deciding first whose records the store holds.
+    ///
+    /// All or nothing: on an error `self` is unchanged.
+    fn apply_delta(
+        &mut self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        let Some(delta) = delta else {
+            return Ok(());
+        };
+        let Some(incoming) = delta.owner else {
+            // No owner named: the records are verified against the owner
+            // already held, and against nobody if there is none, which fails.
+            return self.apply_parts(parameters, delta);
+        };
+        if !parameters.admits(&incoming) {
+            return Err(format!(
+                "an update names owner {}, which does not begin with this store's code {}",
+                bs58::encode(incoming.as_bytes()).into_string(),
+                parameters.code()
+            ));
+        }
+        match self.owner {
+            Some(held) if held == incoming => self.apply_parts(parameters, delta),
+            // The owner held outranks the one this delta speaks for, so its
+            // records are another key's and are not ours to take. Not an
+            // error: an error is not a merge, and the result has to be the
+            // same whichever way round two peers exchange their states.
+            Some(held) if outranks(&held, &incoming) => Ok(()),
+            // Nobody holds the address, or the incoming owner outranks the
+            // one who does: start again from nothing under the incoming owner.
+            _ => {
+                let mut claimed = Self {
+                    owner: Some(incoming),
+                    ..Default::default()
+                };
+                claimed.apply_parts(parameters, delta)?;
+                if !claimed.holds_signed_content() {
+                    return Err("an update that claims a store must carry something its \
+                                owner signed"
+                        .into());
+                }
+                *self = claimed;
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -784,8 +1169,15 @@ mod order_tests {
     }
 
     fn params(seller: &SigningKey) -> StoreParameters {
-        StoreParameters {
-            seller_verifying_key: seller.verifying_key(),
+        StoreParameters::new(seller.verifying_key())
+    }
+
+    /// The parent a child part is verified under: a store owned by the test
+    /// seller. The parts read their owner from it.
+    fn parent() -> StoreStateV1 {
+        StoreStateV1 {
+            owner: Some(seller_key().verifying_key()),
+            ..Default::default()
         }
     }
 
@@ -1007,7 +1399,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            state.verify(&parent(), &p).is_ok(),
             "a genuinely paid order, with a real bridge-signed proof, must verify"
         );
     }
@@ -1051,7 +1443,7 @@ mod order_tests {
             ),
         ]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            state.verify(&parent(), &p).is_ok(),
             "each order must be judged against the bridge set IT names, not a store-wide one"
         );
     }
@@ -1070,7 +1462,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("an untrusted bridge's signature must not settle this order");
         assert!(err.contains("payment proof rejected"), "got: {err}");
     }
@@ -1092,7 +1484,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("an order that names no bridge must not be provable as paid");
         assert!(err.contains("trusts no Bitcoin bridge"), "got: {err}");
     }
@@ -1118,7 +1510,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("the bridge set must be inside what the seller signed");
         assert!(
             err.contains("does not match expected data"),
@@ -1142,7 +1534,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("a forged bridge signature must not verify");
         assert!(err.contains("invalid"), "got: {err}");
     }
@@ -1156,7 +1548,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("Paid with no payment_proof must be rejected");
         assert!(err.contains("without payment evidence"), "got: {err}");
     }
@@ -1174,7 +1566,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("a proof for a different script must not establish this order as paid");
         assert!(err.contains("payment proof rejected"), "got: {err}");
     }
@@ -1325,7 +1717,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("an empty claim set must not establish a reversal");
         assert!(err.contains("reversal evidence invalid"), "got: {err}");
     }
@@ -1362,7 +1754,7 @@ mod order_tests {
         );
         let state = orders_of([(order.id.clone(), record)]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            state.verify(&parent(), &p).is_ok(),
             "a bridge-signed retraction at a higher as_of is a real reversal"
         );
     }
@@ -1501,7 +1893,7 @@ mod order_tests {
             );
             let state = orders_of([(order.id.clone(), record)]);
             let err = state
-                .verify(&StoreStateV1::default(), &p)
+                .verify(&parent(), &p)
                 .expect_err("a reversal of a payment that never happened must be rejected");
             assert!(
                 err.contains("reversal evidence invalid"),
@@ -1558,7 +1950,7 @@ mod order_tests {
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(stale));
         let state = orders_of([(order.id.clone(), record)]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_err(),
+            state.verify(&parent(), &p).is_err(),
             "and the contract must refuse the record, not just the proof"
         );
 
@@ -1656,7 +2048,7 @@ mod order_tests {
 
         let state = orders_of([(order.id.clone(), record)]);
         let err = state
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("evidence of payment is not evidence of reversal");
         assert!(err.contains("still proves payment"), "got: {err}");
     }
@@ -1710,7 +2102,7 @@ mod order_tests {
             make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(curated));
         let state = orders_of([(order.id.clone(), record)]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_ok(),
+            state.verify(&parent(), &p).is_ok(),
             "KNOWN GAP: the contract accepts the curated proof as a paid order",
         );
     }
@@ -1760,7 +2152,7 @@ mod order_tests {
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
         let state = orders_of([(order.id.clone(), record)]);
         assert!(
-            state.verify(&StoreStateV1::default(), &p).is_err(),
+            state.verify(&parent(), &p).is_err(),
             "the store must refuse an order settled by a payment older than the order"
         );
     }
@@ -1996,7 +2388,7 @@ mod order_tests {
         );
         assert!(
             orders_of([(order.id.clone(), record)])
-                .verify(&StoreStateV1::default(), &p)
+                .verify(&parent(), &p)
                 .is_err(),
             "the store must refuse a reversal built out of a payment older than the order"
         );
@@ -2162,7 +2554,7 @@ mod order_tests {
 
         let mut a = orders_of([(order.id.clone(), awaiting.clone())]);
         let b = orders_of([(order.id.clone(), paid.clone())]);
-        a.merge(&StoreStateV1::default(), &p, &b).unwrap();
+        a.merge(&parent(), &p, &b).unwrap();
         assert_eq!(
             a.orders[&order.id].status,
             OrderStatus::Paid,
@@ -2172,7 +2564,7 @@ mod order_tests {
         // Merging the stale AwaitingPayment version back in must NOT
         // regress the status: rank only ever moves forward.
         let stale = orders_of([(order.id.clone(), awaiting)]);
-        a.merge(&StoreStateV1::default(), &p, &stale).unwrap();
+        a.merge(&parent(), &p, &stale).unwrap();
         assert_eq!(
             a.orders[&order.id].status,
             OrderStatus::Paid,
@@ -2249,7 +2641,7 @@ mod order_tests {
 
         let merge = |x: &OrdersV1, y: &OrdersV1| -> OrdersV1 {
             let mut m = x.clone();
-            m.merge(&StoreStateV1::default(), &p, y).unwrap();
+            m.merge(&parent(), &p, y).unwrap();
             m
         };
 
@@ -2302,9 +2694,9 @@ mod order_tests {
         let b = orders_of([(order.id.clone(), record_2.clone())]);
 
         let mut a_then_b = a.clone();
-        a_then_b.merge(&StoreStateV1::default(), &p, &b).unwrap();
+        a_then_b.merge(&parent(), &p, &b).unwrap();
         let mut b_then_a = b.clone();
-        b_then_a.merge(&StoreStateV1::default(), &p, &a).unwrap();
+        b_then_a.merge(&parent(), &p, &a).unwrap();
 
         assert_eq!(
             crate::to_cbor(&a_then_b).unwrap(),
@@ -2328,9 +2720,7 @@ mod order_tests {
 
         // Idempotent: merging the winner into itself changes nothing.
         let mut winner_twice = a_then_b.clone();
-        winner_twice
-            .merge(&StoreStateV1::default(), &p, &a_then_b)
-            .unwrap();
+        winner_twice.merge(&parent(), &p, &a_then_b).unwrap();
         assert_eq!(
             crate::to_cbor(&a_then_b).unwrap(),
             crate::to_cbor(&winner_twice).unwrap()
@@ -2347,11 +2737,9 @@ mod order_tests {
         let record = make_authorized_order(&seller, order.clone(), OrderStatus::Paid, Some(proof));
         let state = orders_of([(order.id.clone(), record)]);
 
-        let own_summary = state.summarize(&StoreStateV1::default(), &p);
+        let own_summary = state.summarize(&parent(), &p);
         assert!(
-            state
-                .delta(&StoreStateV1::default(), &p, &own_summary)
-                .is_none(),
+            state.delta(&parent(), &p, &own_summary).is_none(),
             "a requester whose summary already matches ours must get no delta"
         );
     }
@@ -2608,7 +2996,7 @@ mod order_tests {
             make_authorized_order(&seller, y.clone(), OrderStatus::AwaitingPayment, None),
         ];
         for o in &orders {
-            o.verify(&p.seller_verifying_key)
+            o.verify(&seller.verifying_key())
                 .expect("fixture order verifies");
         }
 
@@ -2632,6 +3020,9 @@ mod order_tests {
                 s.listings = ls;
                 for o in rng.subset(&orders, 3) {
                     merge_order(&mut s.orders.orders, o);
+                }
+                if s.holds_signed_content() {
+                    s.owner = Some(seller.verifying_key());
                 }
                 s.verify(&s, &p).expect("fixture state verifies");
                 s
@@ -2702,7 +3093,7 @@ mod order_tests {
         let orders = OrdersV1 {
             orders: full_of_old_orders(),
         };
-        let summary = orders.summarize(&StoreStateV1::default(), &params(&seller_key()));
+        let summary = orders.summarize(&parent(), &params(&seller_key()));
         let bytes = crate::to_cbor(&summary).expect("encode");
         assert!(
             bytes.len() <= MAX_ORDERS * 70 + 3,
@@ -2835,9 +3226,9 @@ mod order_tests {
         // Both are individually valid -- the attacker has broken no rule.
         let honest_state = orders_of([(order.id.clone(), honest.clone())]);
         let padded_state = orders_of([(order.id.clone(), padded.clone())]);
-        assert!(honest_state.verify(&StoreStateV1::default(), &p).is_ok());
+        assert!(honest_state.verify(&parent(), &p).is_ok());
         assert!(
-            padded_state.verify(&StoreStateV1::default(), &p).is_ok(),
+            padded_state.verify(&parent(), &p).is_ok(),
             "the padded record must still verify -- that is what makes this an \
              attack rather than a rejected update"
         );
@@ -2845,11 +3236,11 @@ mod order_tests {
         // Whichever way round they meet, the compact record is what survives.
         let mut honest_then_padded = honest_state.clone();
         honest_then_padded
-            .merge(&StoreStateV1::default(), &p, &padded_state)
+            .merge(&parent(), &p, &padded_state)
             .unwrap();
         let mut padded_then_honest = padded_state.clone();
         padded_then_honest
-            .merge(&StoreStateV1::default(), &p, &honest_state)
+            .merge(&parent(), &p, &honest_state)
             .unwrap();
 
         assert_eq!(
@@ -2904,7 +3295,7 @@ mod order_tests {
         );
         assert!(
             orders_of([(order.id.clone(), honest.clone())])
-                .verify(&StoreStateV1::default(), &p)
+                .verify(&parent(), &p)
                 .is_ok(),
             "the honest record is unaffected"
         );
@@ -2920,7 +3311,7 @@ mod order_tests {
              rejecting it at verify is what has to stop this"
         );
         let err = orders_of([(order.id.clone(), stuffed)])
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("a Paid record carrying a status signature must be rejected");
         assert!(err.contains("status signature"), "got: {err}");
 
@@ -2930,7 +3321,7 @@ mod order_tests {
             make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None);
         early.payment_proof = Some(make_payment_proof(&order, &bridge, 5));
         let err = orders_of([(order.id.clone(), early)])
-            .verify(&StoreStateV1::default(), &p)
+            .verify(&parent(), &p)
             .expect_err("an AwaitingPayment record carrying payment evidence must be rejected");
         assert!(err.contains("payment evidence"), "got: {err}");
 
@@ -2939,7 +3330,7 @@ mod order_tests {
         let cancelled = make_authorized_order(&seller, order.clone(), OrderStatus::Cancelled, None);
         assert!(
             orders_of([(order.id.clone(), cancelled)])
-                .verify(&StoreStateV1::default(), &p)
+                .verify(&parent(), &p)
                 .is_ok(),
             "Cancelled genuinely uses its status signature"
         );
@@ -2984,11 +3375,7 @@ mod order_tests {
 
         let mut state = OrdersV1::default();
         let err = state
-            .apply_delta(
-                &StoreStateV1::default(),
-                &p,
-                &Some(vec![good.clone(), bad.clone()]),
-            )
+            .apply_delta(&parent(), &p, &Some(vec![good.clone(), bad.clone()]))
             .expect_err("a delta carrying an invalid record must be rejected");
         assert!(
             err.contains(&bad_order.id.to_string()) || err.contains("invalid"),
@@ -3005,7 +3392,7 @@ mod order_tests {
         // unmergeable for some other reason.
         let mut state = OrdersV1::default();
         state
-            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![good.clone()]))
+            .apply_delta(&parent(), &p, &Some(vec![good.clone()]))
             .expect("the valid record alone must apply");
         assert_eq!(
             state.orders.keys().collect::<Vec<_>>(),
@@ -3015,7 +3402,7 @@ mod order_tests {
         // Order within the delta must not matter either.
         let mut state = OrdersV1::default();
         state
-            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![bad, good]))
+            .apply_delta(&parent(), &p, &Some(vec![bad, good]))
             .expect_err("a delta carrying an invalid record must be rejected");
         assert!(state.orders.is_empty());
     }
@@ -3059,11 +3446,7 @@ mod order_tests {
 
         let mut state = ListingsV1::default();
         state
-            .apply_delta(
-                &StoreStateV1::default(),
-                &p,
-                &Some(vec![good.clone(), bad.clone()]),
-            )
+            .apply_delta(&parent(), &p, &Some(vec![good.clone(), bad.clone()]))
             .expect_err("a listing delta carrying an unsigned entry must be rejected");
         assert!(
             state.listings.is_empty(),
@@ -3072,7 +3455,7 @@ mod order_tests {
 
         let mut state = ListingsV1::default();
         state
-            .apply_delta(&StoreStateV1::default(), &p, &Some(vec![good.clone()]))
+            .apply_delta(&parent(), &p, &Some(vec![good.clone()]))
             .expect("the valid listing alone must apply");
         assert_eq!(state.listings.len(), 1);
     }
@@ -3093,11 +3476,7 @@ mod order_tests {
 
         let mut state = ListingsV1::default();
         state
-            .apply_delta(
-                &StoreStateV1::default(),
-                &p,
-                &Some(vec![listing.clone(), listing.clone()]),
-            )
+            .apply_delta(&parent(), &p, &Some(vec![listing.clone(), listing.clone()]))
             .expect("a repeated-but-valid listing is not an error, just a duplicate");
         assert_eq!(
             state.listings.len(),
@@ -3117,7 +3496,7 @@ mod order_tests {
     fn version_zero_info_must_be_the_default() {
         use freenet_scaffold::ComposableState;
         let p = params(&seller_key());
-        let parent = StoreStateV1::default();
+        let parent = parent();
         AuthorizedStoreInfoV1::default()
             .verify(&parent, &p)
             .expect("the default verifies");
@@ -3161,7 +3540,7 @@ mod order_tests {
 
         let seller = seller_key();
         let p = params(&seller);
-        let parent = StoreStateV1::default();
+        let parent = parent();
         let sorted = three_sorted_listings(&seller);
 
         ListingsV1 {
@@ -3197,7 +3576,7 @@ mod order_tests {
 
         let seller = seller_key();
         let p = params(&seller);
-        let parent = StoreStateV1::default();
+        let parent = parent();
         let sorted = three_sorted_listings(&seller);
         let canonical = ListingsV1 {
             listings: sorted.clone(),
@@ -3242,7 +3621,7 @@ mod order_tests {
 
         let seller = seller_key();
         let p = params(&seller);
-        let parent = StoreStateV1::default();
+        let parent = parent();
         let sorted = three_sorted_listings(&seller);
         let a = ListingsV1 {
             listings: vec![sorted[2].clone(), sorted[0].clone()],
@@ -3259,6 +3638,403 @@ mod order_tests {
         };
         assert_eq!(merge(&a, &b), merge(&b, &a));
         assert_eq!(merge(&a, &a), merge(&a, &ListingsV1::default()));
+    }
+
+    /// harvest#52: a store is bound to one owner key, and two keys that share
+    /// a code resolve the same way on every peer. See [`StoreStateV1`].
+    mod claim_tests {
+        use super::*;
+        use crate::merge_laws::{assert_laws, Rng};
+
+        /// Two signing keys whose verifying keys begin with the same two
+        /// base58 characters, the lower-ranked first, and that code.
+        ///
+        /// Twelve characters cannot be ground (that is the point of twelve),
+        /// but nothing in the merge depends on the code's length, so two is
+        /// the same rule at a size a test can reach: a birthday search over
+        /// 58^2 codes finds a pair within a few hundred keys.
+        pub(crate) fn two_keys_sharing_a_code() -> (SigningKey, SigningKey, String) {
+            let mut seen: std::collections::HashMap<String, SigningKey> =
+                std::collections::HashMap::new();
+            for i in 0u32..100_000 {
+                let mut seed = [0x52u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                let key = SigningKey::from_bytes(&seed);
+                let code =
+                    bs58::encode(key.verifying_key().as_bytes()).into_string()[..2].to_string();
+                if let Some(other) = seen.remove(&code) {
+                    return if outranks(&other.verifying_key(), &key.verifying_key()) {
+                        (other, key, code)
+                    } else {
+                        (key, other, code)
+                    };
+                }
+                seen.insert(code, key);
+            }
+            panic!("no two keys shared a two-character code in 100,000 tries");
+        }
+
+        fn owned(owner: &SigningKey, listings: Vec<AuthorizedListing>) -> StoreStateV1 {
+            let mut state = StoreStateV1 {
+                owner: Some(owner.verifying_key()),
+                ..Default::default()
+            };
+            state.listings.listings = listings;
+            state.listings.normalize();
+            state
+        }
+
+        fn signed_info(owner: &SigningKey, version: u32) -> AuthorizedStoreInfoV1 {
+            let info = StoreInfoV1 {
+                version,
+                certificate_pem: String::new(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [0u8; 32],
+                store_name: format!("version {version}"),
+                description: String::new(),
+                encryption_public_key: None,
+            };
+            let (scoped_payload, signature) = sign_scoped(owner, &info);
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        }
+
+        fn merged(p: &StoreParameters, a: &StoreStateV1, b: &StoreStateV1) -> StoreStateV1 {
+            let mut out = a.clone();
+            out.merge(&a.clone(), p, b).expect("merge");
+            out
+        }
+
+        fn bytes(state: &StoreStateV1) -> Vec<u8> {
+            crate::to_cbor(state).expect("encode")
+        }
+
+        #[test]
+        fn a_code_is_the_first_twelve_base58_characters_of_the_key() {
+            let key = seller_key().verifying_key();
+            let p = StoreParameters::new(key);
+            let encoded = bs58::encode(key.as_bytes()).into_string();
+            assert_eq!(p.code(), &encoded[..STORE_CODE_LEN]);
+            assert_eq!(p.code().len(), 12);
+            assert!(p.admits(&key));
+            assert_eq!(
+                StoreParameters::from_code(p.code()),
+                Some(p.clone()),
+                "a code read back from a link is the same parameters, so the same address"
+            );
+        }
+
+        /// A wrong-length code must open nothing rather than something else.
+        #[test]
+        fn a_code_of_any_other_length_or_alphabet_is_refused() {
+            let code = StoreParameters::new(seller_key().verifying_key())
+                .code()
+                .to_string();
+            assert!(
+                StoreParameters::from_code(&code[..11]).is_none(),
+                "too short"
+            );
+            assert!(
+                StoreParameters::from_code(&format!("{code}1")).is_none(),
+                "too long"
+            );
+            assert!(StoreParameters::from_code("").is_none());
+            let whole = bs58::encode(seller_key().verifying_key().as_bytes()).into_string();
+            assert!(
+                StoreParameters::from_code(&whole).is_none(),
+                "a whole key is not a code"
+            );
+            for bad in ['0', 'O', 'I', 'l', '-', ' ', 'é'] {
+                let mut s: String = code.chars().take(11).collect();
+                s.push(bad);
+                assert!(
+                    StoreParameters::from_code(&s).is_none(),
+                    "{bad:?} is not base58"
+                );
+            }
+        }
+
+        #[test]
+        fn a_code_admits_only_keys_that_begin_with_it() {
+            let p = params(&seller_key());
+            let other = bridge_key().verifying_key();
+            assert!(!p.admits(&other), "another key does not share this code");
+            let everything = StoreParameters::with_code_for_test("");
+            assert!(
+                !everything.admits(&seller_key().verifying_key()),
+                "an empty code admits nobody"
+            );
+        }
+
+        #[test]
+        fn verify_binds_every_record_to_an_owner_the_code_admits() {
+            let seller = seller_key();
+            let other = bridge_key();
+            let p = params(&seller);
+            let own = make_listing(&seller, "Mine");
+
+            StoreStateV1::default()
+                .verify(&StoreStateV1::default(), &p)
+                .expect("the empty store verifies");
+            let good = owned(&seller, vec![own.clone()]);
+            good.verify(&good, &p)
+                .expect("an owned store with its owner's listing verifies");
+
+            let bare = owned(&seller, vec![]);
+            assert!(
+                bare.verify(&bare, &p).is_err(),
+                "an owner with nothing it signed proves nothing"
+            );
+
+            let mut ownerless = good.clone();
+            ownerless.owner = None;
+            assert!(
+                ownerless.verify(&ownerless, &p).is_err(),
+                "records need an owner"
+            );
+
+            let squatter = owned(&other, vec![make_listing(&other, "Theirs")]);
+            let refused = squatter.verify(&squatter, &p).expect_err("wrong code");
+            assert!(refused.contains("does not begin with"), "{refused}");
+
+            let forged = owned(&seller, vec![make_listing(&other, "Forged")]);
+            assert!(
+                forged.verify(&forged, &p).is_err(),
+                "a record signed by any key but the owner is refused"
+            );
+        }
+
+        #[test]
+        fn the_first_owner_to_publish_claims_an_unowned_store() {
+            let seller = seller_key();
+            let p = params(&seller);
+            let store = owned(&seller, vec![make_listing(&seller, "Mine")]);
+            let empty = StoreStateV1::default();
+            assert_eq!(bytes(&merged(&p, &empty, &store)), bytes(&store));
+            assert_eq!(bytes(&merged(&p, &store, &empty)), bytes(&store));
+        }
+
+        #[test]
+        fn the_smaller_key_wins_a_shared_code_whichever_way_round() {
+            let (low, high, code) = two_keys_sharing_a_code();
+            let p = StoreParameters::with_code_for_test(&code);
+            let a = owned(&low, vec![make_listing(&low, "Low")]);
+            let b = owned(
+                &high,
+                vec![make_listing(&high, "High"), make_listing(&high, "Two")],
+            );
+            // Each is a valid store on its own, so what follows is the rule
+            // at work and not one side failing to verify.
+            a.verify(&a, &p).expect("the lower key's store verifies");
+            b.verify(&b, &p).expect("the higher key's store verifies");
+
+            assert_eq!(
+                bytes(&merged(&p, &a, &b)),
+                bytes(&a),
+                "held low, high arrives"
+            );
+            assert_eq!(
+                bytes(&merged(&p, &b, &a)),
+                bytes(&a),
+                "held high, low arrives"
+            );
+        }
+
+        #[test]
+        fn an_update_from_an_outranked_owner_changes_nothing() {
+            let (low, high, code) = two_keys_sharing_a_code();
+            let p = StoreParameters::with_code_for_test(&code);
+            let mut held = owned(&low, vec![make_listing(&low, "Low")]);
+            let before = bytes(&held);
+            held.apply_delta(
+                &StoreStateV1::default(),
+                &p,
+                &Some(StoreStateV1Delta {
+                    owner: Some(high.verifying_key()),
+                    listings: Some(vec![make_listing(&high, "High")]),
+                    ..Default::default()
+                }),
+            )
+            .expect("an outranked update is not an error, or merge order would matter");
+            assert_eq!(bytes(&held), before);
+        }
+
+        #[test]
+        fn an_update_from_an_outranking_owner_replaces_the_store() {
+            let (low, high, code) = two_keys_sharing_a_code();
+            let p = StoreParameters::with_code_for_test(&code);
+            let mut held = owned(
+                &high,
+                vec![make_listing(&high, "High"), make_listing(&high, "Two")],
+            );
+            let theirs = make_listing(&low, "Low");
+            held.apply_delta(
+                &StoreStateV1::default(),
+                &p,
+                &Some(StoreStateV1Delta {
+                    owner: Some(low.verifying_key()),
+                    listings: Some(vec![theirs.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .expect("apply");
+            assert_eq!(bytes(&held), bytes(&owned(&low, vec![theirs])));
+        }
+
+        #[test]
+        fn an_update_naming_an_owner_but_carrying_nothing_signed_cannot_claim() {
+            let seller = seller_key();
+            let p = params(&seller);
+            for delta in [
+                StoreStateV1Delta {
+                    owner: Some(seller.verifying_key()),
+                    ..Default::default()
+                },
+                // The unsigned version-0 info is not something the owner signed.
+                StoreStateV1Delta {
+                    owner: Some(seller.verifying_key()),
+                    info: Some(AuthorizedStoreInfoV1::default()),
+                    ..Default::default()
+                },
+            ] {
+                let mut state = StoreStateV1::default();
+                assert!(state
+                    .apply_delta(&StoreStateV1::default(), &p, &Some(delta))
+                    .is_err());
+                assert_eq!(state, StoreStateV1::default(), "and nothing changed");
+            }
+        }
+
+        #[test]
+        fn an_update_naming_a_key_the_code_does_not_admit_is_refused() {
+            let seller = seller_key();
+            let other = bridge_key();
+            let mut state = StoreStateV1::default();
+            let refused = state
+                .apply_delta(
+                    &StoreStateV1::default(),
+                    &params(&seller),
+                    &Some(StoreStateV1Delta {
+                        owner: Some(other.verifying_key()),
+                        listings: Some(vec![make_listing(&other, "Theirs")]),
+                        ..Default::default()
+                    }),
+                )
+                .expect_err("wrong code");
+            assert!(refused.contains("does not begin with"), "{refused}");
+            assert_eq!(state, StoreStateV1::default());
+        }
+
+        #[test]
+        fn an_ownerless_update_cannot_put_records_in_an_unowned_store() {
+            let seller = seller_key();
+            let mut state = StoreStateV1::default();
+            assert!(state
+                .apply_delta(
+                    &StoreStateV1::default(),
+                    &params(&seller),
+                    &Some(StoreStateV1Delta {
+                        listings: Some(vec![make_listing(&seller, "Mine")]),
+                        ..Default::default()
+                    }),
+                )
+                .is_err());
+            assert_eq!(state, StoreStateV1::default());
+        }
+
+        /// A delta between different owners is everything or nothing: the
+        /// receiver either keeps its own records or starts again from ours,
+        /// and a difference against another key's records would leave it
+        /// with a subset.
+        #[test]
+        fn a_delta_across_owners_is_everything_or_nothing() {
+            let (low, high, code) = two_keys_sharing_a_code();
+            let p = StoreParameters::with_code_for_test(&code);
+            let a = owned(
+                &low,
+                vec![make_listing(&low, "Low"), make_listing(&low, "Two")],
+            );
+            let b = owned(&high, vec![make_listing(&high, "Low")]);
+            let summary = |s: &StoreStateV1| s.summarize(s, &p);
+
+            assert!(
+                b.delta(&b, &p, &summary(&a)).is_none(),
+                "the loser sends nothing"
+            );
+            let full = a.delta(&a, &p, &summary(&b)).expect("the winner sends");
+            assert_eq!(full.listings.as_ref().map(Vec::len), Some(2), "all of it");
+            let mut receiver = b.clone();
+            receiver
+                .apply_delta(&receiver.clone(), &p, &Some(full))
+                .expect("apply");
+            assert_eq!(bytes(&receiver), bytes(&a));
+
+            assert!(
+                a.delta(&a, &p, &summary(&a)).is_none(),
+                "nothing new, nothing sent"
+            );
+            let unowned = StoreStateV1::default();
+            assert!(unowned.delta(&unowned, &p, &summary(&a)).is_none());
+        }
+
+        /// The laws the network needs, over random states of two owners that
+        /// share a code, with details and listings from each.
+        #[test]
+        fn two_owners_sharing_a_code_obey_the_merge_laws() {
+            let (low, high, code) = two_keys_sharing_a_code();
+            let p = StoreParameters::with_code_for_test(&code);
+            let pools: Vec<(
+                SigningKey,
+                Vec<AuthorizedListing>,
+                Vec<AuthorizedStoreInfoV1>,
+            )> = [low, high]
+                .into_iter()
+                .map(|key| {
+                    let listings = ["A", "B", "C"]
+                        .iter()
+                        .map(|t| make_listing(&key, t))
+                        .collect();
+                    let infos = vec![signed_info(&key, 1), signed_info(&key, 2)];
+                    (key, listings, infos)
+                })
+                .collect();
+            let mut rng = Rng::new(0x5eed_0052);
+            let states: Vec<StoreStateV1> = (0..150)
+                .map(|_| {
+                    let pick = rng.below(pools.len() + 1);
+                    let Some((key, listings, infos)) = pools.get(pick) else {
+                        return StoreStateV1::default();
+                    };
+                    let mut s = owned(key, rng.subset(listings, 3));
+                    if rng.below(2) == 0 || s.listings.listings.is_empty() {
+                        s.info = infos[rng.below(infos.len())].clone();
+                    }
+                    s.verify(&s, &p).expect("fixture state verifies");
+                    s
+                })
+                .collect();
+            assert!(
+                states
+                    .iter()
+                    .any(|s| s.owner == Some(pools[0].0.verifying_key()))
+                    && states
+                        .iter()
+                        .any(|s| s.owner == Some(pools[1].0.verifying_key())),
+                "the corpus must actually hold both owners"
+            );
+            assert_laws(&states, 400, &mut rng, |a, b| merged(&p, a, b), bytes);
+
+            // And the closed form: merging everything gives the lower key's
+            // records and nothing of the other's.
+            let all = states
+                .iter()
+                .fold(StoreStateV1::default(), |acc, s| merged(&p, &acc, s));
+            assert_eq!(all.owner, Some(pools[0].0.verifying_key()));
+            all.verify(&all, &p).expect("the converged store verifies");
+        }
     }
 }
 

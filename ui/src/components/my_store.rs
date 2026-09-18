@@ -10,8 +10,15 @@ use crate::state::{StoreDetails, StoreDetailsGap};
 struct StoreCard {
     contract_id: Vec<u8>,
     label: String,
-    /// `None` when the page URL is unavailable, as on a native build.
+    /// The store's code (harvest#52), `None` while the identity's key is not
+    /// known.
+    code: Option<String>,
+    /// The link to share, built from the code: see `store_link::share_link`
+    /// for why it names the default node rather than this page's.
     link: Option<String>,
+    /// Set when another key holds this store's address: what to tell the
+    /// seller. See `AppState::foreign_store_owner`.
+    foreign_owner: Option<String>,
     /// Set when the store's published details need repairing.
     gap: Option<StoreDetailsGap>,
     /// Current values, to fill the form with when editing.
@@ -206,6 +213,15 @@ fn IdentityCard(
     //
     // Each store is labelled: a seller with two stores otherwise gets two
     // 44-character links with nothing to tell them apart.
+    // The identity's store code. One identity, one code: the code is a
+    // prefix of the key, so it names the same address for every store
+    // registration this identity holds at the current generation.
+    let code: Option<String> = identity
+        .verifying_key_bytes
+        .as_deref()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+        .map(|key| harvest_common::store::store_code(&key));
     let store_cards: Vec<StoreCard> = {
         let app_state = APP_STATE.read();
         stores
@@ -226,11 +242,20 @@ fn IdentityCard(
                 let info = browsing.and_then(|browsing| browsing.info.as_ref());
                 let name = info.map(|info| info.store_name.clone());
                 Some(StoreCard {
-                    label: crate::store_link::store_label(
-                        &store.store_contract_id,
-                        name.as_deref(),
+                    label: match code.as_deref() {
+                        Some(code) => crate::store_link::store_label(code, name.as_deref()),
+                        None => name.clone().unwrap_or_else(|| "Your store".to_string()),
+                    },
+                    code: code.clone(),
+                    link: code.as_deref().map(crate::store_link::share_link),
+                    foreign_owner: app_state.foreign_store_owner(&store.store_contract_id).map(
+                        |held| {
+                            crate::state::foreign_owner_message(
+                                code.as_deref().unwrap_or_default(),
+                                &held,
+                            )
+                        },
                     ),
-                    link: crate::store_link::share_link(&store.store_contract_id),
                     // The seller can only be prompted to publish a key the
                     // delegate has actually produced -- see
                     // `state::store_details_gap`.
@@ -312,6 +337,18 @@ fn IdentityCard(
                                 aria_label: "{card.label} store link, select to copy",
                                 value: "{link}",
                             }
+                        }
+                        if let Some(ref code) = card.code {
+                            p { class: "text-muted",
+                                "Store code: "
+                                code { "{code}" }
+                                ". The link opens Harvest on a buyer's own Freenet node at its \
+                                 usual address. A buyer whose node runs elsewhere can open \
+                                 Harvest and enter this code instead."
+                            }
+                        }
+                        if let Some(ref refusal) = card.foreign_owner {
+                            p { class: "text-warning", "{refusal}" }
                         }
 
                         // Nothing is offered until we know what the store

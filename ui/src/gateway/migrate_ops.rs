@@ -182,12 +182,12 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
 
     let store_params = migrate::store_params(&vk);
     // The store's predecessors are NOT addressed by these parameter bytes.
-    // `StoreParameters` shed two fields when the Bitcoin bridge list moved
-    // onto `Order`, so every already-published generation lives at an address
-    // derived from the older, longer encoding, and `store_candidates` is what
-    // derives each generation under the encoding it was published with. These
-    // parameters still address the CURRENT instance, which is what `start`
-    // needs them for.
+    // `StoreParameters` has had three encodings -- the whole key, the whole key
+    // with two Bitcoin fields, and since harvest#52 a code -- so every
+    // already-published generation lives at an address derived from an older
+    // one, and `store_candidates` is what derives each generation under the
+    // encoding it was published with. These parameters address the CURRENT
+    // instance, which is what `start` needs them for.
     match (
         migrate::encode_params(&store_params),
         migrate::store_candidates(&vk),
@@ -202,6 +202,7 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
                     Session::Store(Box::new(ProbeSession::start_with_candidates(
                         StoreOps {
                             params: store_params.clone(),
+                            seller: vk,
                         },
                         local_snapshot(),
                         candidates.clone(),

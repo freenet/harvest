@@ -21,6 +21,7 @@ pub fn StoreView() -> Element {
         store_entry.is_none() && app_state.active_store_id.is_some() && link_error.is_none();
 
     rsx! {
+        StoreList {}
         div {
             h2 { "Store" }
 
@@ -42,10 +43,126 @@ pub fn StoreView() -> Element {
                 None => {
                     rsx! {
                         p { class: "text-muted text-italic",
-                            "No store loaded. Share a store link to browse listings."
+                            "No store open. Follow a seller's link, or enter their store code above."
                         }
                         {example_listings_section()}
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The stores this node has visited, a way to open one by its code, and
+/// archiving (harvest#52).
+///
+/// # Archive, and why it says what it does not do
+///
+/// Archiving hides a row and deletes nothing: a buyer's history with a store
+/// IS its conversations, so a "remove" that removed would take them with it.
+/// Deleting a conversation is `ForgetBuyerConversation`, inside the thread.
+/// And archiving a store you own is a view preference, not closing the shop,
+/// so the text beside the control says both.
+#[component]
+fn StoreList() -> Element {
+    let mut show_archived = use_signal(|| false);
+    let mut typed = use_signal(String::new);
+    let mut typed_error = use_signal(|| Option::<String>::None);
+
+    let app_state = APP_STATE.read();
+    let remembered = app_state.remembered_stores.is_some();
+    let (rows, hidden) = app_state.store_list_rows(show_archived());
+    let any_archived = hidden > 0 || rows.iter().any(|row| row.archived);
+    drop(app_state);
+
+    let mut open_typed = move || match crate::store_link::parse_typed_store_code(&typed()) {
+        Some(params) => {
+            typed_error.set(None);
+            typed.set(String::new());
+            crate::store_link::open_store(params);
+        }
+        None => typed_error.set(Some(
+            "That is not a store code. A store code is 12 letters and digits, the part of a \
+             store link after \"store=\"."
+                .to_string(),
+        )),
+    };
+
+    rsx! {
+        div { class: "store-list",
+            h2 { "Stores" }
+            div { class: "store-share-row",
+                input {
+                    class: "form-input",
+                    r#type: "text",
+                    spellcheck: false,
+                    aria_label: "Store code or link",
+                    placeholder: "Store code or link",
+                    value: "{typed}",
+                    oninput: move |e| typed.set(e.value()),
+                    onkeydown: move |e| {
+                        if e.key() == Key::Enter {
+                            open_typed();
+                        }
+                    },
+                }
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: move |_| open_typed(),
+                    "Open"
+                }
+            }
+            if let Some(ref why) = typed_error() {
+                p { class: "text-warning", "{why}" }
+            }
+
+            if remembered && rows.is_empty() && hidden == 0 {
+                p { class: "text-muted text-italic", "Stores you open are listed here." }
+            }
+            for row in rows {
+                div { class: "store-share-row", key: "{row.code}",
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: {
+                            let code = row.code.clone();
+                            move |_| {
+                                if let Some(params) = harvest_common::StoreParameters::from_code(&code) {
+                                    crate::store_link::open_store(params);
+                                }
+                            }
+                        },
+                        "{row.label}"
+                    }
+                    span { class: "text-muted", " {row.code} " }
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: {
+                            let code = row.code.clone();
+                            let archive = !row.archived;
+                            move |_| APP_STATE.write().set_store_archived(&code, archive)
+                        },
+                        if row.archived { "Unarchive" } else { "Archive" }
+                    }
+                }
+            }
+            if hidden > 0 {
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| show_archived.set(true),
+                    "Show {hidden} archived store(s)"
+                }
+            } else if show_archived() && any_archived {
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| show_archived.set(false),
+                    "Hide archived stores"
+                }
+            }
+            if any_archived || show_archived() {
+                p { class: "text-muted",
+                    "Archiving only hides a store from this list. Its conversations are kept, and "
+                    "archiving a store of your own does not close it: buyers can still open it "
+                    "and order."
                 }
             }
         }

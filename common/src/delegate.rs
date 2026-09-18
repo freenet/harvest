@@ -295,6 +295,50 @@ pub enum HarvestDelegateRequest {
     /// value so a later reader can see what sealed it. Only the presence of
     /// the key is load-bearing.
     SetMigrationMarker { marker: String, note: String },
+
+    // === Stores this node has visited (harvest#52) ===
+    /// Remember a store whose link was followed, so it is still listed after
+    /// the tab is gone.
+    ///
+    /// Keyed by the store's CODE (see `crate::store::StoreParameters`),
+    /// which is what the link carried and all a client needs to re-derive
+    /// the store's address. A code of the wrong length or alphabet is
+    /// refused: it is written into the secret's key, and the cap on how many
+    /// stores are remembered bounds bytes only while every key is one size.
+    ///
+    /// Idempotent, and it never un-archives: re-opening an archived store's
+    /// link shows the store without moving it back into the list, because
+    /// archiving is a choice the buyer made and a link is not a reversal of
+    /// it. Answered with [`HarvestDelegateResponse::RememberedStores`].
+    RememberStore { store_code: String },
+
+    /// Archive or unarchive a store: hide it from the list, or bring it back.
+    ///
+    /// # Archive, not remove
+    ///
+    /// Nothing is deleted, and that is the design rather than a
+    /// half-measure (harvest#52). A buyer's history with a store IS its
+    /// conversations, filed under `harvest:buyer_conv:{store}:`, so a
+    /// "remove" that removed would take the conversation with it. Deleting a
+    /// conversation stays `ForgetBuyerConversation`, inside the thread.
+    ///
+    /// Archiving a store the seller owns does NOT close it: this is this
+    /// node's view preference, and the store contract is untouched.
+    ///
+    /// Remembers the store too, if it was not already remembered.
+    SetStoreArchived { store_code: String, archived: bool },
+
+    /// Every store this node remembers, archived ones included.
+    ListRememberedStores,
+}
+
+/// A store this node remembers visiting.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RememberedStore {
+    /// The store's code, from which its address is derived.
+    pub store_code: String,
+    /// Hidden from the list unless the user asks to see archived stores.
+    pub archived: bool,
 }
 
 /// Responses from the Harvest delegate to the UI.
@@ -457,6 +501,16 @@ pub enum HarvestDelegateResponse {
     StoreList {
         ghostkey_fingerprint: String,
         stores: Vec<StoreRegistration>,
+    },
+
+    /// Every store this node remembers, sorted by code, after whichever
+    /// `RememberStore`, `SetStoreArchived` or `ListRememberedStores` asked.
+    ///
+    /// The whole list rather than an acknowledgement, so the UI's copy is
+    /// replaced by what the delegate holds rather than patched to match what
+    /// it believes it asked for.
+    RememberedStores {
+        stores: Vec<RememberedStore>,
     },
 
     /// Whether the migration named by `marker` is already recorded as done.

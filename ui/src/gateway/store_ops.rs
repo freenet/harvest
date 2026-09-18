@@ -25,6 +25,37 @@ pub(crate) const REPUTATION_CONTRACT_WASM: &[u8] =
 pub const MAILBOX_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/mailbox_contract.wasm");
 
+/// The code hash of the store contract this build bundles.
+///
+/// Cached: it is a BLAKE3 over the whole contract WASM, and it is asked for
+/// once per certificate a store page verifies and once per store code a page
+/// resolves.
+pub(crate) fn store_code_hash() -> [u8; 32] {
+    static HASH: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        let hash = *ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash();
+        let bytes: &[u8] = hash.as_ref();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[..32]);
+        out
+    });
+    *HASH
+}
+
+/// The address a store code opens under this build (harvest#52).
+///
+/// Everything a client needs is local: the code is the store contract's only
+/// parameter and the contract's WASM is bundled, so the address is
+/// `BLAKE3(code_hash || cbor(parameters))` with no lookup and no round trip.
+/// Through `crate::migrate`'s derivation, the one every other store address
+/// in this app goes through, so a link and the seller's own PUT cannot
+/// disagree about where a store lives.
+pub fn store_instance_id(
+    params: &harvest_common::store::StoreParameters,
+) -> Result<ContractInstanceId, String> {
+    let bytes = crate::migrate::encode_params(params)?;
+    Ok(crate::migrate::current_id(&store_code_hash(), &bytes))
+}
+
 /// Whether a store's `ContractKey` was recovered from local state or rebuilt
 /// from the bundled contract -- see `store_contract_key`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,8 +74,19 @@ pub enum KeyOrigin {
 /// field's own delta. Sending the bare `Vec<AuthorizedListing>` produces CBOR
 /// the contract rejects outright with "invalid type: sequence, expected map",
 /// so the listing never lands and the failure says nothing about why.
-fn listings_delta_bytes(listings: Vec<AuthorizedListing>) -> Result<Vec<u8>, String> {
+///
+/// Every delta names its `owner`, the key its records are signed by
+/// (harvest#52). The first one to reach a store is what claims it, and an
+/// update from an owner the store does not hold is ignored rather than
+/// refused, so a seller whose address another key holds finds out from the
+/// state that comes back, not from this send: see
+/// `AppState::foreign_store_owner`.
+fn listings_delta_bytes(
+    owner: ed25519_dalek::VerifyingKey,
+    listings: Vec<AuthorizedListing>,
+) -> Result<Vec<u8>, String> {
     harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
         info: None,
         listings: Some(listings),
         orders: None,
@@ -61,9 +103,11 @@ fn listings_delta_bytes(listings: Vec<AuthorizedListing>) -> Result<Vec<u8>, Str
 /// "invalid type: sequence, expected map", so the invoice never lands and the
 /// error says nothing about why.
 fn orders_delta_bytes(
+    owner: ed25519_dalek::VerifyingKey,
     orders: Vec<harvest_common::payment::AuthorizedOrder>,
 ) -> Result<Vec<u8>, String> {
     harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
         info: None,
         listings: None,
         orders: Some(orders),
@@ -73,9 +117,11 @@ fn orders_delta_bytes(
 
 /// Bytes of a store-contract delta carrying only the store's own details.
 fn store_info_delta_bytes(
+    owner: ed25519_dalek::VerifyingKey,
     info: harvest_common::store::AuthorizedStoreInfoV1,
 ) -> Result<Vec<u8>, String> {
     harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
         info: Some(info),
         listings: None,
         orders: None,
@@ -382,11 +428,14 @@ async fn request_store_info_signature(
 ///
 /// `whats_missing` completes "this store is not one of yours -- ...", so each
 /// caller can still say what the seller was trying to do.
+///
+/// Also answers the key the store's records are signed by, which every delta
+/// names as the store's owner (harvest#52).
 #[cfg(target_arch = "wasm32")]
 fn owned_store_key(
     store_contract_id: &[u8],
     whats_missing: &str,
-) -> Result<(ContractKey, KeyOrigin), String> {
+) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
     use dioxus::prelude::ReadableExt;
 
     let state = super::APP_STATE.read();
@@ -396,7 +445,11 @@ fn owned_store_key(
         .flat_map(|stores| stores.iter())
         .find(|s| s.store_contract_id == store_contract_id)
         .ok_or_else(|| format!("this store is not one of yours -- {whats_missing}"))?;
-    store_contract_key(registration)
+    let owner = state.store_owner_key(store_contract_id).ok_or_else(|| {
+        format!("the key of the identity that owns this store is not known yet -- {whats_missing}")
+    })?;
+    let (key, origin) = store_contract_key(registration)?;
+    Ok((key, origin, owner))
 }
 
 /// Submit a signed listing to a store contract.
@@ -411,13 +464,14 @@ pub async fn submit_listing_by_id(
     use dioxus::logger::tracing::{info, warn};
     use freenet_stdlib::prelude::*;
 
-    let (contract_key, origin) = owned_store_key(store_contract_id, "nothing to add a listing to")?;
+    let (contract_key, origin, owner) =
+        owned_store_key(store_contract_id, "nothing to add a listing to")?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
 
     let title = listing.listing.title.clone();
-    let delta_bytes = listings_delta_bytes(vec![listing])?;
+    let delta_bytes = listings_delta_bytes(owner, vec![listing])?;
 
     super::update_contract(
         &contract_key,
@@ -455,10 +509,11 @@ pub async fn submit_store_info_by_id(
     use dioxus::logger::tracing::info;
     use freenet_stdlib::prelude::*;
 
-    let (contract_key, _origin) = owned_store_key(store_contract_id, "cannot publish its details")?;
+    let (contract_key, _origin, owner) =
+        owned_store_key(store_contract_id, "cannot publish its details")?;
 
     let name = info.info.store_name.clone();
-    let delta_bytes = store_info_delta_bytes(info)?;
+    let delta_bytes = store_info_delta_bytes(owner, info)?;
     super::update_contract(
         &contract_key,
         UpdateData::Delta(StateDelta::from(delta_bytes)),
@@ -483,14 +538,14 @@ pub async fn submit_order_by_id(
     use dioxus::logger::tracing::{info, warn};
     use freenet_stdlib::prelude::*;
 
-    let (contract_key, origin) =
+    let (contract_key, origin, owner) =
         owned_store_key(store_contract_id, "cannot issue an invoice on it")?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
 
     let id = order.order.id.short();
-    let delta_bytes = orders_delta_bytes(vec![order])?;
+    let delta_bytes = orders_delta_bytes(owner, vec![order])?;
 
     super::update_contract(
         &contract_key,
@@ -548,6 +603,10 @@ pub async fn list_stores(_ghostkey_fingerprint: String) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn test_owner() -> ed25519_dalek::VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key()
+    }
+
     fn registration(store_contract_key: Option<Vec<u8>>) -> StoreRegistration {
         StoreRegistration {
             store_contract_id: vec![3u8; 32],
@@ -600,11 +659,12 @@ mod tests {
     /// `Vec` was CBOR the contract could not read, so no listing ever landed.
     #[test]
     fn a_listing_delta_is_shaped_like_the_contracts_delta() {
-        let bytes = listings_delta_bytes(Vec::new()).expect("serialize");
+        let bytes = listings_delta_bytes(test_owner(), Vec::new()).expect("serialize");
         let delta = harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bytes)
             .expect("the contract must be able to read its own delta");
         assert!(delta.listings.is_some());
         assert!(delta.info.is_none() && delta.orders.is_none());
+        assert_eq!(delta.owner, Some(test_owner()), "a delta names its owner");
 
         // The shape that was being sent, pinned so it cannot come back.
         let bare = harvest_common::to_cbor(&Vec::<AuthorizedListing>::new()).expect("serialize");
@@ -621,11 +681,12 @@ mod tests {
     /// failure said so.
     #[test]
     fn an_order_delta_is_shaped_like_the_contracts_delta() {
-        let bytes = orders_delta_bytes(Vec::new()).expect("serialize");
+        let bytes = orders_delta_bytes(test_owner(), Vec::new()).expect("serialize");
         let delta = harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bytes)
             .expect("the contract must be able to read its own delta");
         assert!(delta.orders.is_some());
         assert!(delta.info.is_none() && delta.listings.is_none());
+        assert_eq!(delta.owner, Some(test_owner()), "a delta names its owner");
 
         // The shape that would be sent by reaching for `OrdersV1::Delta`
         // directly, pinned so it cannot come back.
@@ -699,7 +760,8 @@ mod tests {
 
         // Decode the wire bytes back, so what is applied is what would travel,
         // not the in-memory value that produced them.
-        let bytes = orders_delta_bytes(vec![authorized]).expect("serialize delta");
+        let bytes = orders_delta_bytes(signing_key.verifying_key(), vec![authorized])
+            .expect("serialize delta");
         let delta: harvest_common::store::StoreStateV1Delta =
             harvest_common::from_cbor(&bytes).expect("the contract must read its own delta");
 
@@ -718,6 +780,11 @@ mod tests {
             .expect("the invoice must be in the contract's state");
         assert_eq!(stored.order.payment_address, "tb1qexample");
         assert_eq!(stored.status, OrderStatus::AwaitingPayment);
+        assert_eq!(
+            state.owner,
+            Some(signing_key.verifying_key()),
+            "the first signed update to a store claims it for the key it names (harvest#52)"
+        );
     }
 
     /// The whole point of the round-trip: the bytes we hand `SignMessage`
@@ -774,7 +841,8 @@ mod tests {
         .expect("the store contract must accept its own signed info");
 
         // And it must go on the wire in the shape the contract reads.
-        let bytes = store_info_delta_bytes(authorized).expect("serialize delta");
+        let bytes = store_info_delta_bytes(signing_key.verifying_key(), authorized)
+            .expect("serialize delta");
         let delta = harvest_common::from_cbor::<harvest_common::store::StoreStateV1Delta>(&bytes)
             .expect("the contract must be able to read its own delta");
         assert!(delta.info.is_some());

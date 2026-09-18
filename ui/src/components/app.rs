@@ -58,6 +58,11 @@ pub fn App() -> Element {
                             .write()
                             .recall_conversations_for_known_stores();
 
+                        // And the stores this node remembers, remembering
+                        // first whatever a link opened before the delegate
+                        // existed (harvest#52).
+                        crate::gateway::APP_STATE.write().sync_remembered_stores();
+
                         // Kick off the Bitcoin surface: bridge config (needed
                         // for the first-run status panel, no credential
                         // required) and the private watch list. Each of

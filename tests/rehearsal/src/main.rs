@@ -130,6 +130,21 @@ fn legacy_params(vk: &VerifyingKey) -> Parameters<'static> {
     Parameters::from(bytes)
 }
 
+/// The whole-key shape V1 and V6..=V16 were published under, before
+/// harvest#52 made the parameter a code. Written out independently too.
+#[derive(serde::Serialize)]
+struct WholeKeyStoreParameters {
+    seller_verifying_key: VerifyingKey,
+}
+
+fn whole_key_params(vk: &VerifyingKey) -> Parameters<'static> {
+    let bytes = harvest_common::to_cbor(&WholeKeyStoreParameters {
+        seller_verifying_key: *vk,
+    })
+    .expect("encode whole-key store parameters");
+    Parameters::from(bytes)
+}
+
 fn current_params(vk: &VerifyingKey) -> Parameters<'static> {
     migrate::encode_params(&StoreParameters::new(*vk)).expect("encode current store parameters")
 }
@@ -384,6 +399,7 @@ async fn run_probe(
     let mut session = ProbeSession::start_with_candidates(
         StoreOps {
             params: migrate::store_params(vk),
+            seller: *vk,
         },
         StoreStateV1::default(),
         candidates,
@@ -474,8 +490,22 @@ const ENCODING_BY_GENERATION: &[(u32, bool)] = &[
     (8, false),
     (9, false),
     (10, false),
+    // V11..=V16 were missed the same way and added with harvest#52. All are
+    // the 56-byte whole-key shape; V16 is the last of them, because harvest#52
+    // made the parameter a code. `false` here means "whole key", which since
+    // harvest#52 is no longer the CURRENT encoding -- see
+    // `assert_candidate_addresses`.
+    (11, false),
+    (12, false),
+    (13, false),
+    (14, false),
+    (15, false),
+    (16, false),
 ];
 
+/// Every recorded generation is published under the three-field (`legacy`)
+/// or the whole-key shape; none is under today's code shape, which only the
+/// current build uses. So `current` here is the whole-key encoding.
 fn assert_candidate_addresses(
     repo: &Path,
     vk: &VerifyingKey,
@@ -601,7 +631,7 @@ async fn main() {
     // The arithmetic that matters: the ids migrate.rs will walk must equal the
     // ids the node addresses those generations by -- every generation, each
     // under the parameter encoding IT shipped with.
-    assert_candidate_addresses(&repo, &vk, &legacy, &curr_p);
+    assert_candidate_addresses(&repo, &vk, &legacy, &whole_key_params(&vk));
 
     for (generation, want) in PLANT_AT {
         let row = migrate::store_lineage()
@@ -629,7 +659,10 @@ async fn main() {
 
     // Plant DIFFERENT data at two generations, so a fold that stops early is
     // visible as a missing listing rather than as a pass.
+    // Whole-key generations: their state names no owner, which is what the
+    // fold has to supply (harvest#52).
     let v5_state = StoreStateV1 {
+        owner: None,
         info: make_info(&seller, &fp, "Fifth Generation Store", 3),
         listings: harvest_common::store::ListingsV1 {
             listings: vec![make_listing(&seller, &fp, "gen5-listing", 1_756_000_000)],
@@ -637,6 +670,7 @@ async fn main() {
         orders: Default::default(),
     };
     let v4_state = StoreStateV1 {
+        owner: None,
         info: make_info(&seller, &fp, "Fourth Generation Store", 2),
         listings: harvest_common::store::ListingsV1 {
             listings: vec![make_listing(&seller, &fp, "gen4-listing", 1_755_000_000)],

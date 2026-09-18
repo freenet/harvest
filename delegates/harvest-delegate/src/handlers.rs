@@ -51,6 +51,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
         crate::markers::marker_secret_key("v1.store.aa.bb"),
         crate::messaging::buyer_conversation_key(&[3u8; 32], &[4u8; 32]),
+        crate::known_stores::known_store_key("3Bn8xWqLd6Tz"),
     ]
 }
 
@@ -292,6 +293,20 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::SetMigrationMarker { marker, note } => {
             crate::markers::set_marker(store, &marker, &note)
         }
+
+        // The stores this node has visited. Gated like everything else: the
+        // list is a record of which sellers this user has dealt with, which
+        // is exactly the linkage a pseudonymous marketplace keeps private.
+        HarvestDelegateRequest::RememberStore { store_code } => {
+            crate::known_stores::remember(store, &store_code)
+        }
+
+        HarvestDelegateRequest::SetStoreArchived {
+            store_code,
+            archived,
+        } => crate::known_stores::set_archived(store, &store_code, archived),
+
+        HarvestDelegateRequest::ListRememberedStores => crate::known_stores::list(store),
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),
@@ -706,6 +721,44 @@ mod origin_gating_tests {
                 "a foreign web app read Harvest's private state"
             );
         }
+    }
+
+    /// The stores a buyer has visited are a list of who they have dealt
+    /// with, and archiving is theirs to decide: another web app can neither
+    /// read the list nor change it (harvest#52).
+    #[test]
+    fn another_web_app_cannot_read_or_change_the_remembered_stores() {
+        let mut store = MemSecrets::default();
+        let listed = handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::RememberStore {
+                store_code: "3Bn8xWqLd6Tz".to_string(),
+            },
+        );
+        assert!(
+            matches!(listed, HarvestDelegateResponse::RememberedStores { ref stores } if stores.len() == 1),
+            "the Harvest web app remembers a store through the handler: {listed:?}"
+        );
+        let before = store.list_secrets(b"");
+
+        for request in [
+            HarvestDelegateRequest::ListRememberedStores,
+            HarvestDelegateRequest::RememberStore {
+                store_code: "Qp5vMe7RkT2c".to_string(),
+            },
+            HarvestDelegateRequest::SetStoreArchived {
+                store_code: "3Bn8xWqLd6Tz".to_string(),
+                archived: true,
+            },
+        ] {
+            let response = handle(&mut store, Some(&a_different_web_app()), request);
+            assert!(
+                refusal_message(&response).contains("Harvest web app"),
+                "a foreign web app reached the remembered stores: {response:?}"
+            );
+        }
+        assert_eq!(store.list_secrets(b""), before, "and nothing changed");
     }
 
     /// The seller's messaging key, both halves of the exposure.

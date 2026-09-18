@@ -636,10 +636,11 @@ mod tests {
             scoped_payload: scoped_bytes,
             signature: signature.to_bytes().to_vec(),
         };
-        let parent = StoreStateV1::default();
-        let params = StoreParameters {
-            seller_verifying_key: verifying_key,
+        let parent = StoreStateV1 {
+            owner: Some(verifying_key),
+            ..Default::default()
         };
+        let params = StoreParameters::new(verifying_key);
 
         use freenet_scaffold::ComposableState;
         let result = authorized.verify(&parent, &params);
@@ -691,10 +692,11 @@ mod tests {
             scoped_payload: scoped_bytes,
             signature: signature.to_bytes().to_vec(),
         };
-        let parent = StoreStateV1::default();
-        let params = StoreParameters {
-            seller_verifying_key: verifying_key,
+        let parent = StoreStateV1 {
+            owner: Some(verifying_key),
+            ..Default::default()
         };
+        let params = StoreParameters::new(verifying_key);
 
         use freenet_scaffold::ComposableState;
         assert!(authorized.verify(&parent, &params).is_ok());
@@ -896,7 +898,10 @@ mod listing_identity_tests {
 
         let merged = |first: &AuthorizedListing, second: &AuthorizedListing| {
             let mut state = ListingsV1::default();
-            let parent = crate::store::StoreStateV1::default();
+            let parent = crate::store::StoreStateV1 {
+                owner: Some(seller.verifying_key()),
+                ..Default::default()
+            };
             state
                 .apply_delta(&parent, &params, &Some(vec![first.clone()]))
                 .expect("first");

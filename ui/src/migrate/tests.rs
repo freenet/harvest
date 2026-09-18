@@ -112,6 +112,7 @@ fn mailbox_with(messages: Vec<EncryptedMessage>) -> MailboxStateV1 {
 fn store_ops() -> StoreOps {
     StoreOps {
         params: store_params(&seller_vk()),
+        seller: seller_vk(),
     }
 }
 
@@ -296,6 +297,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#26 (canonical listings in `verify`)
                 // and #55 (an empty summary or state is not a decode error).
                 "c4e212924bc4547525a63c3ab13f6170b552224b32e9ae990b4a438abe890a98",
+                // V16, from `git show 5110283:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#52: the parameter became a store code
+                // and the state gained its owner. The last generation
+                // addressed by the whole key.
+                "95f464c47796ec638185bb023a37e60dff3a63ecbe115824a3be1bb28c82067d",
             ],
         ),
         (
@@ -333,6 +339,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // token's entry key now signs every field of an entry, which
                 // changes what a record's signature covers.
                 "eef8685c7a829a36fd95733b94a00a1581f377e734bd64765f0a8ed239709054",
+                // V12, from `git show 5110283:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#52; this
+                // artifact moves only because `harvest-common` is compiled
+                // into it.
+                "58c9632d415d46d333c25e6299878c736460854ca4cdd01e0162fda88ce1f22b",
             ],
         ),
         (
@@ -368,6 +379,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#85: size-class caps instead of a
                 // byte budget, and a `verify` that requires canonical state.
                 "5c0145d2421ebcae41ae8ee5591907c7f015502400b939e46dcbd8f128051854",
+                // V12, from `git show 5110283:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#52; this artifact moves only because
+                // `harvest-common` is compiled into it.
+                "f78ff5a230a63904705059cc1cb8e67dd54ee9f7a02662fa882b1557455a3913",
             ],
         ),
     ];
@@ -442,6 +457,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#22: `FeedbackToken` gained `entry_key`, a
             // wire type this delegate stores.
             "a1118c09466362b8b7b9edba06087126b71b08ddbd048287d04064af0e56e413".to_string(),
+            // V15, from `git show 5110283:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#52: the remembered-store requests and the
+            // `harvest:known_store:` secret family.
+            "da3c9ca1819663314512aa08378374a88be9701a83f0034c37af9cbc81e1c7a0".to_string(),
         ],
     );
 }
@@ -633,9 +652,9 @@ fn the_rsa_key_changes_the_reputation_instance_id() {
     );
 }
 
-// --- the store's parameter-encoding split -------------------------------
+// --- the store's parameter-encoding splits ------------------------------
 
-/// The bytes generations V1..=5 were published under, reconstructed here
+/// The bytes generations V2..=V5 were published under, reconstructed here
 /// independently of `migrate.rs` so the two have to agree.
 fn legacy_store_param_bytes(vk: &VerifyingKey) -> Vec<u8> {
     #[derive(serde::Serialize)]
@@ -652,20 +671,57 @@ fn legacy_store_param_bytes(vk: &VerifyingKey) -> Vec<u8> {
     .expect("encode legacy store parameters")
 }
 
-/// The premise: the two encodings really are different, so probing an old
+/// The bytes V1 and V6..=V16 were published under: the whole key, before
+/// harvest#52. Reconstructed independently of `migrate.rs`, likewise.
+fn whole_key_store_param_bytes(vk: &VerifyingKey) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct WholeKey {
+        seller_verifying_key: VerifyingKey,
+    }
+    harvest_common::to_cbor(&WholeKey {
+        seller_verifying_key: *vk,
+    })
+    .expect("encode whole-key store parameters")
+}
+
+/// The parameters each shape addresses `vk`'s store under.
+fn store_params_for_shape(vk: &VerifyingKey, shape: StoreParamShape) -> Parameters<'static> {
+    match shape {
+        StoreParamShape::WholeKeyWithBitcoinFields => {
+            Parameters::from(legacy_store_param_bytes(vk))
+        }
+        StoreParamShape::WholeKey => Parameters::from(whole_key_store_param_bytes(vk)),
+        StoreParamShape::Code => encode_params(&store_params(vk)).expect("encode"),
+    }
+}
+
+const SHAPES: [StoreParamShape; 3] = [
+    StoreParamShape::WholeKey,
+    StoreParamShape::WholeKeyWithBitcoinFields,
+    StoreParamShape::Code,
+];
+
+/// The premise: the three encodings really are different, so probing an old
 /// generation with today's parameters is a search of the wrong address rather
 /// than a harmless re-encoding.
 ///
-/// Without this the test below could pass vacuously.
+/// Without this the tests below could pass vacuously.
 #[test]
-fn the_store_parameter_encoding_actually_changed() {
-    let current = encode_params(&store_params(&seller_vk())).expect("encode");
-    assert_ne!(
-        current.as_ref(),
-        legacy_store_param_bytes(&seller_vk()).as_slice(),
-        "if these matched there would be nothing to split on and \
-         `store_candidates` would be dead weight"
-    );
+fn the_store_parameter_encodings_actually_differ() {
+    let vk = seller_vk();
+    let encodings: Vec<Vec<u8>> = SHAPES
+        .iter()
+        .map(|shape| store_params_for_shape(&vk, *shape).as_ref().to_vec())
+        .collect();
+    for i in 0..encodings.len() {
+        for j in 0..i {
+            assert_ne!(
+                encodings[i], encodings[j],
+                "{:?} and {:?} must be different bytes, or there is nothing to split on",
+                SHAPES[i], SHAPES[j]
+            );
+        }
+    }
 }
 
 /// Every already-published store generation must be probed at the address it
@@ -684,9 +740,6 @@ fn the_store_parameter_encoding_actually_changed() {
 #[test]
 fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() {
     let vk = seller_vk();
-    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
-    let current = encode_params(&store_params(&vk)).expect("encode");
-
     let candidates = store_candidate_ids(&vk).expect("candidates");
     assert_eq!(
         candidates.len(),
@@ -695,7 +748,7 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
     );
 
     // Newest-first, each generation derived under the encoding IT was
-    // published with. Which side each generation falls on is asserted against
+    // published with. Which shape each generation has is asserted against
     // the artifacts in
     // `each_store_generation_is_derived_under_the_encoding_it_shipped_with`;
     // this test is about the ordering and completeness of the walk, so it is
@@ -703,58 +756,42 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
     let mut newest_first: Vec<_> = store_lineage().iter().collect();
     newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
 
-    let mut seen_legacy = false;
-    let mut seen_current = false;
+    let mut seen = HashSet::new();
     for (entry, got) in newest_first.iter().zip(&candidates) {
-        let legacy_side = published_under_legacy_store_params(entry.generation);
-        let (expected, wrong) = if legacy_side {
-            seen_legacy = true;
-            (
-                current_id(&entry.code_hash, &legacy),
-                current_id(&entry.code_hash, &current),
-            )
-        } else {
-            seen_current = true;
-            (
-                current_id(&entry.code_hash, &current),
-                current_id(&entry.code_hash, &legacy),
-            )
-        };
-        assert_ne!(expected, wrong);
+        let shape = store_param_shape(entry.generation);
+        seen.insert(format!("{shape:?}"));
+        let expected = current_id(&entry.code_hash, &store_params_for_shape(&vk, shape));
+        for other in SHAPES.iter().filter(|s| **s != shape) {
+            assert_ne!(
+                expected,
+                current_id(&entry.code_hash, &store_params_for_shape(&vk, *other))
+            );
+        }
         assert_eq!(
-            *got,
-            expected,
-            "generation {} must be probed at its real address, not at one derived \
-             from the {} parameter encoding -- which it was never published under",
+            *got, expected,
+            "generation {} must be probed at its real address, under the {shape:?} encoding",
             entry.generation,
-            if legacy_side { "current" } else { "legacy" }
         );
     }
 
-    // Both branches have to be exercised, or this test stops being about the
-    // split at all: with generations on only one side of it, deriving every
-    // id under one encoding would pass.
+    // Both recorded shapes have to be exercised, or this test stops being
+    // about the split at all. (No recorded generation is on the code shape
+    // yet: the current build is the first, and it is never recorded.)
     assert!(
-        seen_legacy && seen_current,
-        "the lineage must span the parameter split for this test to mean anything \
-         (legacy seen: {seen_legacy}, current seen: {seen_current})"
+        seen.contains("WholeKey") && seen.contains("WholeKeyWithBitcoinFields"),
+        "the lineage must span the parameter splits for this test to mean anything: {seen:?}"
     );
 }
 
 /// Which encoding each store generation was ACTUALLY published under, taken
 /// from the artifacts rather than from the code under test.
 ///
-/// The store's parameter encoding did not change once, it changed twice and
-/// came back:
-///
-/// | generation | built at  | `StoreParameters` | cbor |
-/// |------------|-----------|-------------------|------|
-/// | V1         | `ded0e3a` | 1 field           | 56 B |
-/// | V2         | `78d1020` | 3 fields          | 109 B|
-/// | V3         | `ca57d8f` | 3 fields          | 109 B|
-/// | V4         | `47b67aa` | 3 fields          | 109 B|
-/// | V5         | `9e3e1fb` | 3 fields          | 109 B|
-/// | V6         | `ea94a33` | 1 field           | 56 B |
+/// | generation | built at  | `StoreParameters`      | cbor  |
+/// |------------|-----------|------------------------|-------|
+/// | V1         | `ded0e3a` | whole key              | 56 B  |
+/// | V2..=V5    | `78d1020`..`9e3e1fb` | + 2 Bitcoin fields | 109 B |
+/// | V6..=V16   | `ea94a33`..`5110283` | whole key   | 56 B  |
+/// | current    | this build | code (harvest#52)     | 25 B  |
 ///
 /// The two Bitcoin fields were added by `7c192d2` (first shipped in the V2
 /// artifact) and removed again by `fc760ed` (first shipped in the V6
@@ -764,86 +801,76 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
 /// with `git show <commit>:ui/public/contracts/store_contract.wasm | b3sum`.
 ///
 /// Written out per generation on purpose. Deriving the expectation from
-/// `published_under_legacy_store_params` -- as the test below this one does,
-/// for the ordering property it is actually about -- cannot catch the
-/// boundary being wrong, because it asks the code under test what the answer
-/// is. V1 sat on the wrong side of that boundary for exactly that reason.
-const PUBLISHED_UNDER_LEGACY_PARAMS: &[(u32, bool)] = &[
-    (1, false),
-    (2, true),
-    (3, true),
-    (4, true),
-    (5, true),
-    (6, false),
-    // V7: the 2026-09-05 review. `StoreParameters` changed VISIBILITY only --
-    // `pub` to `pub(crate)` plus a constructor -- which moves the code hash
-    // like any `common` edit but leaves the encoding at 56 bytes. Current
-    // shape, as every generation from V6 on will be unless a FIELD moves.
-    (7, false),
-    // V8: the buyer-to-seller messaging work. `StoreInfoV1` gained a field,
-    // which is STATE and not parameters; `StoreParameters` is field-for-field
-    // what it was, verified against V7 rather than assumed, so the encoding is
-    // still 56 bytes and this generation derives under the current one.
-    (8, false),
-    // V9: the buy flow. `OrderId` and `ListingId` became content-derived and
-    // 32 bytes, and `Order` gained two fields -- all STATE, none of it
-    // parameters. `StoreParameters` is field-for-field what it was, diffed
-    // against V8 rather than assumed, so the encoding is still 56 bytes.
-    (9, false),
-    // V10: the canonical set-encoding fix. The only Rust it changes under
-    // `common/` is `reputation.rs` and `mailbox.rs`, so `StoreParameters` is
-    // field-for-field what it was -- confirmed by `cargo make code-hashes`
-    // still reporting 56B of store params after the change, rather than
-    // assumed from the diff.
-    (10, false),
-    // V11: `freenet-bitcoin-common` moved 0e5b9d9 -> a037181 with no source
-    // change, and the store re-keyed only through an embedded checkout path.
-    // `StoreParameters` did not move: `cargo make code-hashes` reported 56B of
-    // store params after the bump, checked rather than assumed.
-    (11, false),
-    // V12: `listing_id` removed from `Order` (harvest#57). `StoreParameters`
-    // did not move: still 56 bytes per `cargo make code-hashes`.
-    (12, false),
-    // V13: `payment_instructions` removed from `StoreInfoV1`, which is STATE.
-    // `StoreParameters` did not move: still 56 bytes per
-    // `cargo make code-hashes` after the removal, checked rather than assumed.
-    (13, false),
-    // V14: the payment-window rule (harvest#77), a change to verification
-    // only. `StoreParameters` did not move: still 56 bytes per
-    // `scripts/check-code-hashes.sh` after the rebuild, checked rather than
-    // assumed.
-    (14, false),
-    // V15: harvest#26 and #55. `StoreParameters` did not move: still 56 bytes
-    // per `cargo make code-hashes`, checked rather than assumed.
-    (15, false),
-];
+/// `store_param_shape` -- as the test above does, for the ordering property
+/// it is actually about -- cannot catch the boundary being wrong, because it
+/// asks the code under test what the answer is. V1 once sat on the wrong
+/// side of a boundary for exactly that reason.
+const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
+    use StoreParamShape::{WholeKey, WholeKeyWithBitcoinFields};
+    &[
+        (1, WholeKey),
+        (2, WholeKeyWithBitcoinFields),
+        (3, WholeKeyWithBitcoinFields),
+        (4, WholeKeyWithBitcoinFields),
+        (5, WholeKeyWithBitcoinFields),
+        (6, WholeKey),
+        // V7: the 2026-09-05 review. `StoreParameters` changed VISIBILITY
+        // only -- `pub` to `pub(crate)` plus a constructor -- which moves the
+        // code hash like any `common` edit but leaves the encoding at 56
+        // bytes.
+        (7, WholeKey),
+        // V8: `StoreInfoV1` gained a field, which is STATE and not
+        // parameters; verified against V7 rather than assumed.
+        (8, WholeKey),
+        // V9: the buy flow. Record identities changed, all STATE.
+        (9, WholeKey),
+        // V10: the canonical set-encoding fix, `reputation.rs` and
+        // `mailbox.rs` only; `cargo make code-hashes` still reported 56B.
+        (10, WholeKey),
+        // V11: a `freenet-bitcoin-common` bump with no source change; 56B.
+        (11, WholeKey),
+        // V12: `listing_id` removed from `Order` (harvest#57); 56B.
+        (12, WholeKey),
+        // V13: `payment_instructions` removed from `StoreInfoV1`; 56B.
+        (13, WholeKey),
+        // V14: the payment-window rule (harvest#77); 56B.
+        (14, WholeKey),
+        // V15: harvest#26 and #55; 56B.
+        (15, WholeKey),
+        // V16: the build at `5110283`, the last before harvest#52 made the
+        // parameter a code. Still the whole key, 56B per
+        // `scripts/check-code-hashes.sh` on that commit.
+        (16, WholeKey),
+    ]
+};
 
-/// V1 is derived under TODAY's parameter encoding, not the legacy one.
+/// V1 is derived under the whole-key encoding, not the three-field one, and
+/// V16 is the last generation that is.
 ///
-/// V1 predates the Bitcoin payments work entirely: its `StoreParameters` had
-/// one field, exactly as today's does. It is also the only generation ever
-/// published to the network (`git show origin/main:ui/public/contracts/\
-/// store_contract.wasm | b3sum` is `4d7ad3c3...`, the registry's first row),
-/// so getting it wrong means the migration probe cannot find the one store
-/// that exists -- and reports a clean "nothing to migrate" while doing it.
-///
-/// Mutated red by restoring the single threshold this replaced
-/// (`generation <= LAST_LEGACY_STORE_PARAM_GENERATION`), which buckets V1 as
-/// legacy because generations are 1-based.
+/// V1 is the first generation ever published to the network (`4d7ad3c3...`,
+/// the registry's first row), so getting it wrong means the migration probe
+/// cannot find the store that exists -- and reports a clean "nothing to
+/// migrate" while doing it. Mutated red by restoring the single threshold the
+/// band replaced (`generation <= LAST_LEGACY_STORE_PARAM_GENERATION`), which
+/// buckets V1 as three-field because generations are 1-based.
 #[test]
 fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     let vk = seller_vk();
-    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
-    let current = encode_params(&store_params(&vk)).expect("encode");
 
     // The sizes named in `legacy/store_contract.toml` and in
-    // `harvest_common::address`. If either moves, the table above is about
+    // `harvest_common::address`. If any moves, the table above is about
     // something else.
-    assert_eq!(legacy.as_ref().len(), 109, "legacy StoreParameters cbor");
-    assert_eq!(current.as_ref().len(), 56, "current StoreParameters cbor");
+    let size = |shape| store_params_for_shape(&vk, shape).as_ref().len();
+    assert_eq!(size(StoreParamShape::WholeKeyWithBitcoinFields), 109);
+    assert_eq!(size(StoreParamShape::WholeKey), 56);
+    assert_eq!(
+        size(StoreParamShape::Code),
+        25,
+        "current StoreParameters cbor"
+    );
 
     assert_eq!(
-        PUBLISHED_UNDER_LEGACY_PARAMS.len(),
+        PUBLISHED_UNDER.len(),
         store_lineage().len(),
         "the table must cover every recorded generation, and only those"
     );
@@ -853,34 +880,34 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     newest_first.sort_by_key(|e| std::cmp::Reverse(e.generation));
 
     for (entry, got) in newest_first.iter().zip(&candidates) {
-        let (_, legacy_side) = PUBLISHED_UNDER_LEGACY_PARAMS
+        let (_, shape) = PUBLISHED_UNDER
             .iter()
             .find(|(g, _)| *g == entry.generation)
             .unwrap_or_else(|| panic!("generation {} is not in the table", entry.generation));
 
-        let expected = if *legacy_side {
-            current_id(&entry.code_hash, &legacy)
-        } else {
-            current_id(&entry.code_hash, &current)
-        };
         assert_eq!(
             *got,
-            expected,
-            "generation {} was published under the {} parameter encoding",
+            current_id(&entry.code_hash, &store_params_for_shape(&vk, *shape)),
+            "generation {} was published under the {shape:?} encoding",
             entry.generation,
-            if *legacy_side { "legacy" } else { "current" }
         );
 
         // And the predicate the derivation actually consults has to agree
         // with the table, so a future edit to one of them cannot drift from
         // the other unnoticed.
         assert_eq!(
-            published_under_legacy_store_params(entry.generation),
-            *legacy_side,
-            "the generation band disagrees with the artifacts for V{}",
+            store_param_shape(entry.generation),
+            *shape,
+            "the generation bands disagree with the artifacts for V{}",
             entry.generation
         );
     }
+
+    // A generation recorded after V16 was published under the code.
+    assert_eq!(
+        store_param_shape(LAST_WHOLE_KEY_STORE_PARAM_GENERATION + 1),
+        StoreParamShape::Code
+    );
 }
 
 /// `migrate`'s address arithmetic agrees with the one the NODE uses.
@@ -892,14 +919,10 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
 /// silent direction, since a walk to an address that was never written just
 /// reports "nothing to migrate".
 ///
-/// The rehearsal harness asserted this, for the current generation only, and
-/// that harness needs a live node and until today had been failing since V6
-/// was recorded. It costs nothing to assert here instead: it needs no node,
-/// and no git history either, so it runs in CI on every PR.
-///
-/// Both parameter encodings are checked, because the whole point of
-/// `store_candidate_ids` is that it addresses some generations under one and
-/// some under the other.
+/// Every parameter encoding is checked, because the whole point of
+/// `store_candidate_ids` is that it addresses generations under different
+/// ones; and so is the address a store code resolves to from a link
+/// (`store_ops::store_instance_id`), which is the one a buyer reaches.
 #[test]
 fn migrate_addresses_agree_with_the_stdlib_key_derivation() {
     use freenet_stdlib::prelude::WrappedContract;
@@ -915,33 +938,34 @@ fn migrate_addresses_agree_with_the_stdlib_key_derivation() {
     };
 
     let vk = seller_vk();
-    let current = encode_params(&store_params(&vk)).expect("encode");
-    let legacy = Parameters::from(legacy_store_param_bytes(&vk));
-
     let mut ids = Vec::new();
-    for (name, params) in [("current", &current), ("legacy", &legacy)] {
-        let ours = current_id(&code_hash, params);
-        let theirs = *WrappedContract::new(
-            Arc::new(ContractCode::from(wasm.to_vec())),
-            (*params).clone(),
-        )
-        .key()
-        .id();
+    for shape in SHAPES {
+        let params = store_params_for_shape(&vk, shape);
+        let ours = current_id(&code_hash, &params);
+        let theirs = *WrappedContract::new(Arc::new(ContractCode::from(wasm.to_vec())), params)
+            .key()
+            .id();
         assert_eq!(
             ours, theirs,
-            "under the {name} parameter encoding, migrate's derivation and the node's \
+            "under the {shape:?} parameter encoding, migrate's derivation and the node's \
              must name the same instance"
         );
         ids.push(ours);
     }
+    assert_eq!(
+        crate::gateway::store_ops::store_instance_id(&store_params(&vk)).expect("derive"),
+        ids[2],
+        "a store code read from a link resolves to the address the seller's PUT uses"
+    );
 
-    // Non-vacuous: the two encodings must actually produce different
-    // addresses, or the assertions above would hold for a derivation that
-    // ignored its parameters entirely.
-    assert_ne!(
-        ids[0], ids[1],
-        "the two parameter encodings must address different instances, or this test \
-         would pass for a derivation that ignored parameters"
+    // Non-vacuous: the encodings must actually produce different addresses,
+    // or the assertions above would hold for a derivation that ignored its
+    // parameters entirely.
+    let distinct: HashSet<_> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "each encoding must address a different instance"
     );
 }
 
@@ -1100,6 +1124,59 @@ fn a_populated_predecessor_is_recovered_and_seals() {
         other => panic!("expected a recovery, got {}", describe(&other)),
     }
     assert_eq!(seal, Seal::Seal);
+}
+
+/// **harvest#52, end to end.** A seller's store at V16 -- addressed by the
+/// whole key, its state naming no owner -- is found at the address the
+/// whole-key encoding derives, and carried into a state the CODE-addressed
+/// contract accepts, owned by that seller.
+///
+/// Both halves are needed, and each fails silently without the other: probed
+/// under today's code parameters the V16 address is one it never had, and
+/// carried without an owner every record is refused by the new contract.
+#[test]
+fn a_whole_key_store_is_found_and_carried_into_the_code_addressed_contract() {
+    use freenet_scaffold::ComposableState;
+    let vk = seller_vk();
+    let v16 = store_lineage()
+        .iter()
+        .find(|e| e.generation == LAST_WHOLE_KEY_STORE_PARAM_GENERATION)
+        .expect("V16 is recorded");
+    let v16_address = current_id(
+        &v16.code_hash,
+        &Parameters::from(whole_key_store_param_bytes(&vk)),
+    );
+    let mut predecessor = store_with(&[signed_listing("Coffee")]);
+    predecessor.info = signed_store_info(1);
+    assert_eq!(predecessor.owner, None, "a whole-key state names no owner");
+    let bytes = store_bytes(&predecessor);
+
+    let session = ProbeSession::start_with_candidates(
+        store_ops(),
+        StoreStateV1::default(),
+        store_candidates(&vk).expect("candidates"),
+        fold_all_policy(),
+    );
+    let (outcome, _) = run(session, |id| {
+        if id == v16_address {
+            Answer::State(bytes.clone())
+        } else {
+            Answer::Absent
+        }
+    });
+    let Outcome::Recovered { merged, source, .. } = outcome else {
+        panic!("expected a recovery, got {}", describe(&outcome));
+    };
+    assert_eq!(source, v16_address);
+    assert_eq!(
+        merged.owner,
+        Some(vk),
+        "the fold names the seller as the owner"
+    );
+    assert_eq!(merged.listings.listings.len(), 1);
+    merged
+        .verify(&merged, &store_params(&vk))
+        .expect("the carried store is one the code-addressed contract accepts");
 }
 
 /// Fold-all reaches past the newest populated generation.
@@ -1346,11 +1423,16 @@ fn undecodable_state_is_a_miss_not_a_crash() {
 #[test]
 fn fold_all_preconditions_hold_for_the_store_state() {
     let ops = store_ops();
-    let samples = vec![
+    // As the fold holds them: `StoreOps::decode` has already named the
+    // seller as the owner of a whole-key generation's state (harvest#52).
+    let samples: Vec<StoreStateV1> = [
         store_with(&[signed_listing("Alpha")]),
         store_with(&[signed_listing("Beta")]),
         store_with(&[signed_listing("Alpha"), signed_listing("Gamma")]),
-    ];
+    ]
+    .into_iter()
+    .map(|s| crate::migrate::name_whole_key_owner(s, &seller_vk()))
+    .collect();
     let merge = |x: StoreStateV1, y: StoreStateV1| ops.merge_generations(x, y);
     freenet_migrate::driver::policy_check::assert_merge_commutative(&samples, merge);
     freenet_migrate::driver::policy_check::assert_merge_idempotent(&samples, merge);
@@ -1813,6 +1895,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         StoreStateV1::default(),
         &store_with(&[signed_listing("Alpha")]),
         &store_params(&other_seller),
+        &other_seller,
         DiscardedSide::Predecessor,
     );
     assert!(
@@ -1825,6 +1908,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         StoreStateV1::default(),
         &store_with(&[signed_listing("Beta")]),
         &store_params(&seller_vk()),
+        &seller_vk(),
         DiscardedSide::Predecessor,
     );
     assert!(!ok.discarded, "a successful store fold claims no discard");
@@ -1914,6 +1998,7 @@ fn a_fold_drops_unsigned_version_zero_details() {
         junk,
         &StoreStateV1::default(),
         &params,
+        &seller_vk(),
         DiscardedSide::Predecessor,
     );
     assert!(!folded.discarded);
@@ -1980,7 +2065,14 @@ fn every_fold_order_with_injected_version_zero_details_moves_the_listings() {
     let plain = store_with(&[signed_listing("Alpha")]);
 
     let fold = |base: StoreStateV1, other: &StoreStateV1| {
-        merge_store_reporting_discard(base, other, &params, DiscardedSide::Predecessor).state
+        merge_store_reporting_discard(
+            base,
+            other,
+            &params,
+            &seller_vk(),
+            DiscardedSide::Predecessor,
+        )
+        .state
     };
     let cases: [(&str, Vec<&StoreStateV1>, u32); 4] = [
         ("junk only", vec![&junk], 0),
@@ -2032,6 +2124,7 @@ fn a_fold_normalises_a_non_canonical_base() {
         messy,
         &StoreStateV1::default(),
         &store_params(&seller_vk()),
+        &seller_vk(),
         DiscardedSide::Predecessor,
     );
     assert!(!folded.discarded);

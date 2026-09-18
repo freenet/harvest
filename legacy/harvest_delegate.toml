@@ -144,3 +144,10 @@ description = "Superseded by harvest#22, which changed a wire type this delegate
 date = "2026-09-18"
 code_hash = "a1118c09466362b8b7b9edba06087126b71b08ddbd048287d04064af0e56e413"
 delegate_key = "4ad013d53cf918e7776c36a1a12ece630fc92a2c5688b1381da0d3e58439f292"
+
+[[entry]]
+version = "V15"
+description = "Superseded by harvest#52. This delegate gained the remembered-store requests (`RememberStore`, `SetStoreArchived`, `ListRememberedStores`, answered with `RememberedStores`) and a new secret family, `harvest:known_store:{code}`, one per store a buyer opened, holding whether it is archived. Archive, never delete: there is deliberately no request that removes one, because a buyer's history with a store is its conversations and deleting a conversation stays `ForgetBuyerConversation`. The key starts with `harvest:` so the export prefix covers it, pinned by `handlers::all_secret_key_shapes`; the code is validated so every key is one size and `MAX_KNOWN_STORES` (1024) bounds bytes as well as entries; and every request is behind `origin::authorize`. As before, nothing drives the export handshake yet, so the secrets this generation holds do not survive the re-key."
+date = "2026-09-18"
+code_hash = "da3c9ca1819663314512aa08378374a88be9701a83f0034c37af9cbc81e1c7a0"
+delegate_key = "87c497a6869b2ac1cfd9ac7e17f48d63b051e0b0331cbc43a076cd016636f73e"

@@ -8,8 +8,8 @@
 //! # What a certificate is for, and what it is not for
 //!
 //! Harvest already proves *this key signed this record*: the store contract
-//! verifies every listing, order and store-info signature against
-//! [`StoreParameters::seller_verifying_key`], which is frozen into the
+//! verifies every listing, order and store-info signature against the
+//! store's owner, whose key must begin with the store code frozen into the
 //! store's address. That is authentication, and it works without any
 //! certificate at all.
 //!
@@ -37,10 +37,23 @@
 //! 1. Does the certificate chain to Freenet's master key?
 //! 2. Is the key it certifies the key this store is addressed by?
 //!
-//! # How (2) is answered without the contract's parameters
+//! # How (2) is answered since the store code (harvest#52)
+//!
+//! A store's parameter is now a twelve-character CODE, a prefix of its
+//! owner's key, and a prefix names many keys. So the address alone no longer
+//! says whose store it is; the state does, in `StoreStateV1::owner`, and the
+//! contract verifies every record against that owner. For a store at the
+//! current generation the question is therefore two checks: the certified
+//! key's code derives this address (so the code at that address is the
+//! genuine Harvest store contract), AND the certified key IS the store's
+//! owner. The second is what a key sharing the seller's code, or a copied
+//! certificate, fails. A superseded generation was addressed by the whole
+//! key, so for those the address check below still settles it alone.
+//!
+//! # How the address is checked without the contract's parameters
 //!
 //! A Freenet contract lives at `BLAKE3(BLAKE3(wasm) || parameters)`, and a
-//! store's only parameter is the seller's verifying key. The node's GET
+//! store's only parameter is derived from the seller's verifying key. The node's GET
 //! response does carry the contract container, but Harvest discards it (see
 //! `gateway::response_handler`), so the reader holds the instance id and
 //! nothing else.
@@ -94,14 +107,11 @@
 //! complaint multipliers. None of that is designed yet, and a half-read tier
 //! displayed next to a store would be acted on as if it were.
 //!
-//! [`StoreParameters::seller_verifying_key`]: harvest_common::store::StoreParameters::seller_verifying_key
 
 use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
+use freenet_stdlib::prelude::ContractInstanceId;
 use ghostkey_lib::armorable::Armorable;
 use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
-
-use crate::gateway::store_ops::STORE_CONTRACT_WASM;
 
 /// What a reader concluded about one published certificate.
 ///
@@ -144,18 +154,8 @@ impl CertificateStatus {
 }
 
 /// The code hash of the store contract this build bundles.
-///
-/// Cached: it is a BLAKE3 over the whole contract WASM, and a store page
-/// verifies one certificate per listing plus one for the store itself.
 fn store_code_hash() -> [u8; 32] {
-    static HASH: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
-        let hash = *ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash();
-        let bytes: &[u8] = hash.as_ref();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes[..32]);
-        out
-    });
-    *HASH
+    crate::gateway::store_ops::store_code_hash()
 }
 
 /// Every store instance id the holder of `key` could have published at: this
@@ -175,10 +175,17 @@ fn store_code_hash() -> [u8; 32] {
 /// published -- at an address it never had. Delegating rather than
 /// re-deriving is what kept that bug out of this file.
 fn store_instance_ids(key: &VerifyingKey) -> Result<Vec<ContractInstanceId>, String> {
-    let params = crate::migrate::encode_params(&crate::migrate::store_params(key))?;
-    let mut ids = vec![crate::migrate::current_id(&store_code_hash(), &params)];
+    let mut ids = vec![current_store_id(key)?];
     ids.extend(crate::migrate::store_candidate_ids(key)?);
     Ok(ids)
+}
+
+/// The id of the store `key`'s code opens under this build: the one address
+/// that a prefix, not the whole key, derives -- so the one where the owner
+/// has to be checked as well. See the module docs.
+fn current_store_id(key: &VerifyingKey) -> Result<ContractInstanceId, String> {
+    let params = crate::migrate::encode_params(&crate::migrate::store_params(key))?;
+    Ok(crate::migrate::current_id(&store_code_hash(), &params))
 }
 
 /// Parse a certificate and check its chain, returning the key it certifies.
@@ -201,9 +208,13 @@ fn certified_key(pem: &str, master: &Option<VerifyingKey>) -> Result<VerifyingKe
 }
 
 /// Verify a certificate published by, or inside, the store at
-/// `store_contract_id`.
-pub fn verify_store_certificate(pem: &str, store_contract_id: &[u8]) -> CertificateStatus {
-    verify_store_certificate_against(pem, store_contract_id, &None).0
+/// `store_contract_id`, whose state names `owner` (`StoreStateV1::owner`).
+pub fn verify_store_certificate(
+    pem: &str,
+    store_contract_id: &[u8],
+    owner: Option<&VerifyingKey>,
+) -> CertificateStatus {
+    verify_store_certificate_against(pem, store_contract_id, owner, &None).0
 }
 
 /// The seller's Ed25519 verifying key, but ONLY when the store's certificate
@@ -232,8 +243,12 @@ pub fn verify_store_certificate(pem: &str, store_contract_id: &[u8]) -> Certific
 /// a newer build of Harvest than this one. The caller cannot distinguish
 /// them here and should say the truthful thing that covers all three: this
 /// store cannot be messaged from this build.
-pub fn store_verifying_key(pem: &str, store_contract_id: &[u8]) -> Option<VerifyingKey> {
-    store_verifying_key_against(pem, store_contract_id, &None)
+pub fn store_verifying_key(
+    pem: &str,
+    store_contract_id: &[u8],
+    owner: Option<&VerifyingKey>,
+) -> Option<VerifyingKey> {
+    store_verifying_key_against(pem, store_contract_id, owner, &None)
 }
 
 /// [`store_verifying_key`] with the authority named, so the tests can mint a
@@ -243,9 +258,10 @@ pub fn store_verifying_key(pem: &str, store_contract_id: &[u8]) -> Option<Verify
 fn store_verifying_key_against(
     pem: &str,
     store_contract_id: &[u8],
+    owner: Option<&VerifyingKey>,
     master: &Option<VerifyingKey>,
 ) -> Option<VerifyingKey> {
-    match verify_store_certificate_against(pem, store_contract_id, master) {
+    match verify_store_certificate_against(pem, store_contract_id, owner, master) {
         (CertificateStatus::Verified, key) => key,
         _ => None,
     }
@@ -260,6 +276,7 @@ fn store_verifying_key_against(
 fn verify_store_certificate_against(
     pem: &str,
     store_contract_id: &[u8],
+    owner: Option<&VerifyingKey>,
     master: &Option<VerifyingKey>,
 ) -> (CertificateStatus, Option<VerifyingKey>) {
     if pem.trim().is_empty() {
@@ -282,6 +299,28 @@ fn verify_store_certificate_against(
     };
     let id = ContractInstanceId::new(bytes);
 
+    // At the current generation the address pins only the key's CODE, so a
+    // certificate for any key sharing it would pass the membership check
+    // below. The store's owner is the key the contract verified everything
+    // against, and it has to be this one. Superseded generations were
+    // addressed by the whole key and carry no owner, so the address is the
+    // whole check there.
+    match current_store_id(&key) {
+        Ok(current) if current == id => {
+            return if owner == Some(&key) {
+                (CertificateStatus::Verified, Some(key))
+            } else {
+                (
+                    CertificateStatus::Invalid(
+                        "genuine, but not the key this store belongs to".to_string(),
+                    ),
+                    None,
+                )
+            };
+        }
+        Ok(_) => {}
+        Err(e) => return (CertificateStatus::Invalid(e), None),
+    }
     match store_instance_ids(&key) {
         Ok(ids) if ids.contains(&id) => (CertificateStatus::Verified, Some(key)),
         // The attack this whole module is for: a genuine certificate, issued
@@ -346,12 +385,17 @@ mod tests {
 
     /// The verdict alone, since most tests here are about the verdict.
     /// `store_verifying_key`'s own tests use the pair.
+    ///
+    /// The store is taken to be owned by `owner`, which for a real store is
+    /// the key in its state. Most tests pass the certificate's own key, as an
+    /// honest seller's store would.
     fn verdict(
         pem: &str,
         store_contract_id: &[u8],
+        owner: Option<&VerifyingKey>,
         master: &Option<VerifyingKey>,
     ) -> CertificateStatus {
-        verify_store_certificate_against(pem, store_contract_id, master).0
+        verify_store_certificate_against(pem, store_contract_id, owner, master).0
     }
 
     fn test_master() -> Option<VerifyingKey> {
@@ -369,7 +413,7 @@ mod tests {
     fn a_genuine_certificate_verifies_for_its_own_store() {
         let (key, pem) = issue_ghostkey();
         assert_eq!(
-            verdict(&pem, &store_id_for(&key), &test_master()),
+            verdict(&pem, &store_id_for(&key), Some(&key), &test_master()),
             CertificateStatus::Verified
         );
     }
@@ -387,7 +431,12 @@ mod tests {
         let (scammer_key, _scammer_pem) = issue_ghostkey();
 
         // The scammer's own store, carrying the victim's real certificate.
-        let status = verdict(&victim_pem, &store_id_for(&scammer_key), &test_master());
+        let status = verdict(
+            &victim_pem,
+            &store_id_for(&scammer_key),
+            Some(&scammer_key),
+            &test_master(),
+        );
 
         assert!(
             matches!(status, CertificateStatus::Invalid(_)),
@@ -396,7 +445,12 @@ mod tests {
         // And the certificate itself is genuine -- the rejection is about
         // identity, not about the chain.
         assert_eq!(
-            verdict(&victim_pem, &store_id_for(&victim_key), &test_master()),
+            verdict(
+                &victim_pem,
+                &store_id_for(&victim_key),
+                Some(&victim_key),
+                &test_master()
+            ),
             CertificateStatus::Verified,
             "the same certificate must still verify for the store it belongs to"
         );
@@ -415,7 +469,8 @@ mod tests {
         );
         for id in ids.iter().skip(1) {
             assert_eq!(
-                verdict(&pem, id.as_bytes(), &test_master()),
+                // A superseded generation's state has no owner field.
+                verdict(&pem, id.as_bytes(), None, &test_master()),
                 CertificateStatus::Verified,
                 "a store at a superseded generation must still verify"
             );
@@ -437,7 +492,7 @@ mod tests {
 
         assert!(
             matches!(
-                verdict(&pem, future.as_bytes(), &test_master()),
+                verdict(&pem, future.as_bytes(), Some(&key), &test_master()),
                 CertificateStatus::Invalid(_)
             ),
             "a generation this build cannot derive cannot be verified either"
@@ -449,7 +504,7 @@ mod tests {
     fn a_verified_store_yields_the_sellers_key() {
         let (key, pem) = issue_ghostkey();
         assert_eq!(
-            store_verifying_key_against(&pem, &store_id_for(&key), &test_master()),
+            store_verifying_key_against(&pem, &store_id_for(&key), Some(&key), &test_master()),
             Some(key),
             "a verified store must yield the key it is addressed by"
         );
@@ -473,14 +528,24 @@ mod tests {
         let (scammer_key, _) = issue_ghostkey();
 
         assert_eq!(
-            store_verifying_key_against(&victim_pem, &store_id_for(&scammer_key), &test_master()),
+            store_verifying_key_against(
+                &victim_pem,
+                &store_id_for(&scammer_key),
+                Some(&scammer_key),
+                &test_master()
+            ),
             None,
             "a certificate issued to somebody else must not name this store's mailbox"
         );
         // The same certificate on its OWN store still works, so the assertion
         // above is about identity rather than about a broken fixture.
         assert_eq!(
-            store_verifying_key_against(&victim_pem, &store_id_for(&victim_key), &test_master()),
+            store_verifying_key_against(
+                &victim_pem,
+                &store_id_for(&victim_key),
+                Some(&victim_key),
+                &test_master()
+            ),
             Some(victim_key)
         );
     }
@@ -491,7 +556,7 @@ mod tests {
     #[test]
     fn a_store_without_a_certificate_yields_no_key() {
         assert_eq!(
-            store_verifying_key_against("", &[7u8; 32], &test_master()),
+            store_verifying_key_against("", &[7u8; 32], None, &test_master()),
             None
         );
     }
@@ -501,7 +566,7 @@ mod tests {
         let (key, pem) = issue_ghostkey();
         let stranger = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
 
-        let status = verdict(&pem, &store_id_for(&key), &Some(stranger));
+        let status = verdict(&pem, &store_id_for(&key), Some(&key), &Some(stranger));
         assert!(
             matches!(status, CertificateStatus::Invalid(_)),
             "a chain to the wrong master key must not verify, got {status:?}"
@@ -517,13 +582,13 @@ mod tests {
         let id = store_id_for(&key);
 
         assert_eq!(
-            verdict(&pem, &id, &test_master()),
+            verdict(&pem, &id, Some(&key), &test_master()),
             CertificateStatus::Verified,
             "the fixture must be a valid chain under its own authority"
         );
         assert!(
             matches!(
-                verify_store_certificate(&pem, &id),
+                verify_store_certificate(&pem, &id, Some(&key)),
                 CertificateStatus::Invalid(_)
             ),
             "a certificate minted outside Freenet's PKI must not verify in production"
@@ -540,7 +605,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    verdict(pem, &[7u8; 32], &test_master()),
+                    verdict(pem, &[7u8; 32], None, &test_master()),
                     CertificateStatus::Invalid(_)
                 ),
                 "{pem:?} is not a certificate and must not verify"
@@ -555,7 +620,7 @@ mod tests {
     fn an_absent_certificate_is_absent_rather_than_invalid() {
         for pem in ["", "   \n "] {
             assert_eq!(
-                verdict(pem, &[7u8; 32], &test_master()),
+                verdict(pem, &[7u8; 32], None, &test_master()),
                 CertificateStatus::Absent
             );
         }
@@ -565,8 +630,43 @@ mod tests {
     fn a_contract_id_of_the_wrong_length_does_not_verify() {
         let (_key, pem) = issue_ghostkey();
         assert!(matches!(
-            verdict(&pem, &[1u8; 31], &test_master()),
+            verdict(&pem, &[1u8; 31], None, &test_master()),
             CertificateStatus::Invalid(_)
         ));
+    }
+
+    /// **harvest#52.** A store's address now pins only its owner's CODE, so
+    /// a genuine certificate for a key sharing that code derives this very
+    /// address. What it cannot do is be the store's owner: the contract
+    /// verified every record against the key in the state, and that key is
+    /// not this certificate's.
+    ///
+    /// Grinding a real twelve-character collision is out of reach, so the
+    /// shared code is modelled the other way round: the certificate's own
+    /// store, whose state names a different owner.
+    #[test]
+    fn a_certificate_whose_key_is_not_the_stores_owner_does_not_verify() {
+        let (key, pem) = issue_ghostkey();
+        let (other, _) = issue_ghostkey();
+        let id = store_id_for(&key);
+        for owner in [Some(&other), None] {
+            assert!(
+                matches!(
+                    verdict(&pem, &id, owner, &test_master()),
+                    CertificateStatus::Invalid(_)
+                ),
+                "owner {owner:?} is not the certified key"
+            );
+            assert_eq!(
+                store_verifying_key_against(&pem, &id, owner, &test_master()),
+                None,
+                "and no mailbox is derived from it"
+            );
+        }
+        assert_eq!(
+            verdict(&pem, &id, Some(&key), &test_master()),
+            CertificateStatus::Verified,
+            "the same certificate on the store it owns still verifies"
+        );
     }
 }

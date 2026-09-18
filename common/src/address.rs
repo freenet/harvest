@@ -80,9 +80,7 @@ pub fn placeholder_params_cbor<T: AddressGuardParams>() -> Result<Vec<u8>, Strin
 
 impl AddressGuardParams for crate::store::StoreParameters {
     fn address_guard_placeholder() -> Self {
-        Self {
-            seller_verifying_key: placeholder_verifying_key(),
-        }
+        Self::new(placeholder_verifying_key())
     }
 }
 

@@ -8,7 +8,7 @@ use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
 use harvest_common::reputation::FeedbackEntry;
-use harvest_common::store::StoreInfoV1;
+use harvest_common::store::{StoreInfoV1, StoreParameters};
 use harvest_common::{
     BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration,
     WatchedPayment,
@@ -316,6 +316,30 @@ pub struct AppState {
 
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
+
+    /// The code each browsed store was opened under, by contract id
+    /// (harvest#52).
+    ///
+    /// A code derives an id and not the other way round, so this is the only
+    /// way back from a store on screen to the code that names it -- which is
+    /// what the store list, archiving and a seller's share link all speak.
+    pub store_codes: HashMap<Vec<u8>, String>,
+
+    /// The stores the harvest delegate remembers this node visiting, or
+    /// `None` until it has answered.
+    ///
+    /// `None` and "none" are different things to show: the first is "still
+    /// asking", the second is an empty list.
+    pub remembered_stores: Option<Vec<harvest_common::RememberedStore>>,
+
+    /// Stores opened before the harvest delegate was registered, waiting to
+    /// be remembered. A followed link is opened as soon as the websocket is
+    /// up, which is before the delegate exists.
+    pub stores_to_remember: Vec<String>,
+
+    /// Our stores whose address another key holds, already announced, so
+    /// the notification is made once rather than on every state arrival.
+    pub foreign_owner_announced: HashSet<Vec<u8>>,
 
     /// Bitcoin/Payments state: bridge config, private watch list, and live
     /// on-chain data mirrored from subscribed Bitcoin contracts.
@@ -769,6 +793,7 @@ pub fn store_details_gap(
 fn unverified_listings(
     listings: &[AuthorizedListing],
     contract_id: &[u8],
+    owner: Option<&ed25519_dalek::VerifyingKey>,
     store_certificate_pem: &str,
     store_status: &crate::ghostkey_cert::CertificateStatus,
 ) -> HashSet<harvest_common::listing::ListingId> {
@@ -781,6 +806,7 @@ fn unverified_listings(
                 crate::ghostkey_cert::verify_store_certificate(
                     &authorized.certificate_pem,
                     contract_id,
+                    owner,
                 )
                 .is_verified()
             };
@@ -1435,6 +1461,27 @@ pub struct BuyerPurchase {
     pub blockers: Vec<PaymentBlocker>,
 }
 
+/// One row of the store list. See [`AppState::store_list_rows`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoreListRow {
+    pub code: String,
+    pub label: String,
+    pub archived: bool,
+}
+
+/// What a seller is told when their store's address is held by another key
+/// (harvest#52). See [`AppState::foreign_store_owner`].
+pub fn foreign_owner_message(code: &str, held: &[u8; 32]) -> String {
+    let theirs: String = bs58::encode(held).into_string().chars().take(16).collect();
+    format!(
+        "Your store's address is already claimed by a different key. Harvest cannot \
+         publish your store there: anyone who opens store code {code} sees the store of \
+         the key beginning {theirs}, not yours, and nothing you publish will change that. \
+         A key sharing the first 12 characters of yours should take around 2^70 attempts \
+         to find, so this is not an accident."
+    )
+}
+
 /// State for a store we're browsing.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BrowsingStore {
@@ -1464,6 +1511,15 @@ pub struct BrowsingStore {
     /// Stored as bytes rather than a `VerifyingKey` because `BrowsingStore`
     /// derives `Default`, and there is no meaningful default curve point.
     pub seller_verifying_key: Option<[u8; 32]>,
+    /// The key the store contract says owns this store
+    /// (`StoreStateV1::owner`), or `None` before anyone has published to it.
+    ///
+    /// Not the same thing as [`Self::seller_verifying_key`], which is set only
+    /// when a certificate vouches for the owner. This one is what the
+    /// contract verified every record against, so it is what tells a seller
+    /// that their store's address is held by another key (harvest#52): see
+    /// [`AppState::foreign_store_owner`].
+    pub owner: Option<[u8; 32]>,
     /// Listings whose own certificate did not verify against this store.
     ///
     /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
@@ -1632,6 +1688,124 @@ impl AppState {
             .or_default();
         self.active_store_id = Some(store_contract_id);
         self.store_link_error = None;
+    }
+
+    /// Record the code a store was opened under. See [`Self::store_codes`].
+    pub fn note_store_code(&mut self, store_contract_id: Vec<u8>, code: String) {
+        self.store_codes.insert(store_contract_id, code);
+    }
+
+    /// Ask the harvest delegate to remember a store, or queue the request
+    /// until the delegate is registered. Answers the request if it is to be
+    /// sent now; `remember_store` sends it.
+    pub fn remember_store_request(
+        &mut self,
+        code: &str,
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        if self.harvest_delegate_key.is_none() {
+            if !self.stores_to_remember.iter().any(|queued| queued == code) {
+                self.stores_to_remember.push(code.to_string());
+            }
+            return None;
+        }
+        Some(harvest_common::HarvestDelegateRequest::RememberStore {
+            store_code: code.to_string(),
+        })
+    }
+
+    /// Remember a store the user opened, so it is still listed after the tab
+    /// is gone (harvest#52). See `known_stores` in the harvest delegate.
+    pub fn remember_store(&mut self, code: &str) {
+        if let Some(request) = self.remember_store_request(code) {
+            self.send_to_harvest_delegate("remember this store", &request);
+        }
+    }
+
+    /// What to ask the harvest delegate once it is registered: remember
+    /// whatever was opened before it existed, or, if nothing was, just list
+    /// what it holds. Either answer is the whole list.
+    pub fn remembered_store_requests(&mut self) -> Vec<harvest_common::HarvestDelegateRequest> {
+        let queued = std::mem::take(&mut self.stores_to_remember);
+        if queued.is_empty() {
+            return vec![harvest_common::HarvestDelegateRequest::ListRememberedStores];
+        }
+        queued
+            .into_iter()
+            .map(|store_code| harvest_common::HarvestDelegateRequest::RememberStore { store_code })
+            .collect()
+    }
+
+    /// Send [`Self::remembered_store_requests`].
+    pub fn sync_remembered_stores(&mut self) {
+        for request in self.remembered_store_requests() {
+            self.send_to_harvest_delegate("list the remembered stores", &request);
+        }
+    }
+
+    /// Archive a store (hide it from the list) or bring it back. A view
+    /// preference kept in the delegate; the store itself is untouched.
+    pub fn set_store_archived(&mut self, code: &str, archived: bool) {
+        let request = harvest_common::HarvestDelegateRequest::SetStoreArchived {
+            store_code: code.to_string(),
+            archived,
+        };
+        self.send_to_harvest_delegate("archive this store", &request);
+    }
+
+    /// The rows of the store list, and how many archived ones it is not
+    /// showing.
+    ///
+    /// Labelled by name wherever the store's state has arrived this session,
+    /// by code otherwise. Archived stores are included only when asked for,
+    /// and come after the others.
+    pub fn store_list_rows(&self, show_archived: bool) -> (Vec<StoreListRow>, usize) {
+        let Some(remembered) = self.remembered_stores.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let hidden = if show_archived {
+            0
+        } else {
+            remembered.iter().filter(|s| s.archived).count()
+        };
+        let mut rows: Vec<StoreListRow> = remembered
+            .iter()
+            .filter(|s| show_archived || !s.archived)
+            .map(|s| {
+                let name = StoreParameters::from_code(&s.store_code)
+                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                    .and_then(|id| self.browsing_stores.get(id.as_bytes()))
+                    .and_then(|store| store.info.as_ref())
+                    .map(|info| info.store_name.clone());
+                StoreListRow {
+                    label: crate::store_link::store_label(&s.store_code, name.as_deref()),
+                    code: s.store_code.clone(),
+                    archived: s.archived,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.archived.cmp(&b.archived).then(a.label.cmp(&b.label)));
+        (rows, hidden)
+    }
+
+    /// The key holding one of OUR stores' addresses, when it is not ours.
+    ///
+    /// # Why this has to be looked for
+    ///
+    /// The store contract resolves two owners of one address by keeping the
+    /// smaller key and ignoring the other's updates, without an error --
+    /// an error would make the merge depend on which peer sent what first
+    /// (see `harvest_common::store::StoreStateV1`). So a seller whose
+    /// address another key holds gets no failure from anything they publish;
+    /// their details and listings just never appear. The state that comes
+    /// back names the owner, and this is where that is compared with the
+    /// seller's own key, so the refusal is said out loud (harvest#52).
+    ///
+    /// `None` for a store that is not ours, one not yet published to, and
+    /// one whose owner is us.
+    pub fn foreign_store_owner(&self, store_contract_id: &[u8]) -> Option<[u8; 32]> {
+        let mine = self.store_owner_key(store_contract_id)?;
+        let held = self.browsing_stores.get(store_contract_id)?.owner?;
+        (held != mine.to_bytes()).then_some(held)
     }
 
     /// Record that a store opened from a link could not be loaded, so the
@@ -2067,9 +2241,11 @@ impl AppState {
                     // which is what binds a certificate to THIS store: a genuine
                     // certificate issued to somebody else passes every other check
                     // there is. See `crate::ghostkey_cert`.
+                    let owner = store_state.owner;
                     let certificate_status = crate::ghostkey_cert::verify_store_certificate(
                         &store_state.info.info.certificate_pem,
                         &contract_id,
+                        owner.as_ref(),
                     );
                     // The same check, kept for the mailbox address rather
                     // than for display -- see `BrowsingStore::
@@ -2078,11 +2254,13 @@ impl AppState {
                     let seller_verifying_key = crate::ghostkey_cert::store_verifying_key(
                         &store_state.info.info.certificate_pem,
                         &contract_id,
+                        owner.as_ref(),
                     )
                     .map(|key| key.to_bytes());
                     let unverified_listings = unverified_listings(
                         &store_state.listings.listings,
                         &contract_id,
+                        owner.as_ref(),
                         &store_state.info.info.certificate_pem,
                         &certificate_status,
                     );
@@ -2090,6 +2268,7 @@ impl AppState {
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
                     store.certificate_status = certificate_status;
                     store.seller_verifying_key = seller_verifying_key;
+                    store.owner = owner.map(|key| key.to_bytes());
                     store.unverified_listings = unverified_listings;
                     // `Some` even at version 0: `None` means "not loaded yet"
                     // to the seller's own paths, and a store stranded at
@@ -2100,6 +2279,17 @@ impl AppState {
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.reputation_contract_id = Some(reputation_id.clone());
+
+                    // One of our stores, held by another key: say so, once.
+                    if let Some(held) = self.foreign_store_owner(&contract_id) {
+                        if self.foreign_owner_announced.insert(contract_id.clone()) {
+                            let code = self
+                                .store_owner_key(&contract_id)
+                                .map(|key| harvest_common::store::store_code(&key))
+                                .unwrap_or_default();
+                            self.notifications.push(foreign_owner_message(&code, &held));
+                        }
+                    }
 
                     // Register the reverse mapping so incoming reputation state
                     // can be matched to this store
@@ -4267,6 +4457,20 @@ impl AppState {
 
     /// Whether this store is one of the connected identities', and if so
     /// which identity owns it.
+    /// The verifying key of the identity that owns `store_contract_id`, which
+    /// is the key every record the store holds must be signed by and the
+    /// owner every update to it names (harvest#52).
+    pub fn store_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
+        let fingerprint = self.store_owner_fingerprint(store_contract_id)?;
+        let bytes = self
+            .ghostkeys
+            .iter()
+            .find(|k| k.fingerprint == fingerprint)?
+            .verifying_key_bytes
+            .as_deref()?;
+        ed25519_dalek::VerifyingKey::from_bytes(bytes.try_into().ok()?).ok()
+    }
+
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
         self.my_stores.iter().find_map(|(fingerprint, stores)| {
             stores
@@ -5246,6 +5450,10 @@ impl AppState {
                     }
                     self.register_store_mailbox(&store_contract_id, &mailbox_contract_id);
                 }
+            }
+
+            HarvestDelegateResponse::RememberedStores { stores } => {
+                self.remembered_stores = Some(stores);
             }
 
             HarvestDelegateResponse::Error { message } => {
@@ -8147,6 +8355,7 @@ mod tests {
         let marked = unverified_listings(
             &listings,
             &STORE_ID,
+            None,
             sellers,
             &crate::ghostkey_cert::CertificateStatus::Verified,
         );
@@ -8171,6 +8380,7 @@ mod tests {
         let marked = unverified_listings(
             &listings,
             &STORE_ID,
+            None,
             sellers,
             &crate::ghostkey_cert::CertificateStatus::Invalid("nope".to_string()),
         );

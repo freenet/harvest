@@ -499,6 +499,7 @@ mod tests {
         let id = order.id.clone();
         let record = make_paid_order(seller, bridge, order);
         let state = StoreStateV1 {
+            owner: Some(seller.verifying_key()),
             orders: OrdersV1 {
                 orders: std::collections::BTreeMap::from([(id.clone(), record)]),
             },
@@ -624,7 +625,10 @@ mod tests {
     /// A store state with details in it. Unsigned: `get_state_delta` only
     /// reads, so nothing here needs the signature to verify.
     fn state_with_details() -> State<'static> {
-        let mut state = StoreStateV1::default();
+        let mut state = StoreStateV1 {
+            owner: Some(seller_key().verifying_key()),
+            ..Default::default()
+        };
         state.info.info.version = 3;
         state.info.info.store_name = "Shop".to_string();
         let mut bytes = vec![];
@@ -791,6 +795,7 @@ mod tests {
         let mut delta = vec![];
         into_writer(
             &StoreStateV1Delta {
+                owner: None,
                 info: None,
                 listings: None,
                 orders: None,
@@ -855,5 +860,168 @@ mod tests {
         )
         .expect("encode");
         assert!(validate(extra).is_err(), "an unknown key must be refused");
+    }
+
+    // --- harvest#52: the owner, through the contract's own entry points ---
+
+    /// Two signing keys whose verifying keys share a two-character code, the
+    /// lower-ranked first. `harvest-common`'s `claim_tests` explain why two
+    /// characters stand in for twelve; the contract accepts a code of any
+    /// length, which is what makes this reachable at all.
+    fn two_keys_sharing_a_code() -> (SigningKey, SigningKey, String) {
+        let mut seen: HashMap<String, SigningKey> = HashMap::new();
+        for i in 0u32..100_000 {
+            let mut seed = [0x5au8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            let key = SigningKey::from_bytes(&seed);
+            let code = bs58::encode(key.verifying_key().as_bytes()).into_string()[..2].to_string();
+            if let Some(other) = seen.remove(&code) {
+                return if other.verifying_key().as_bytes() < key.verifying_key().as_bytes() {
+                    (other, key, code)
+                } else {
+                    (key, other, code)
+                };
+            }
+            seen.insert(code, key);
+        }
+        panic!("no two keys shared a two-character code");
+    }
+
+    /// Parameters for an arbitrary code, encoded the way the struct encodes.
+    fn code_params_bytes(code: &str) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Params<'a> {
+            store_code: &'a str,
+        }
+        let mut bytes = vec![];
+        into_writer(&Params { store_code: code }, &mut bytes).unwrap();
+        bytes
+    }
+
+    fn owned_store_bytes(owner: &SigningKey, titles: &[&str]) -> Vec<u8> {
+        use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
+        let mut state = StoreStateV1 {
+            owner: Some(owner.verifying_key()),
+            ..Default::default()
+        };
+        for title in titles {
+            let listing = Listing {
+                id: ListingId([0u8; 32]),
+                title: title.to_string(),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id();
+            let (scoped_payload, signature) = sign_scoped(owner, &listing);
+            state.listings.listings.push(AuthorizedListing {
+                listing,
+                scoped_payload,
+                signature,
+                certificate_pem: String::new(),
+            });
+        }
+        state.listings.normalize();
+        let mut bytes = vec![];
+        into_writer(&state, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_parameters_are_the_code_and_it_matches_the_struct_encoding() {
+        let seller = seller_key();
+        let code = harvest_common::store::store_code(&seller.verifying_key());
+        assert_eq!(code.len(), harvest_common::store::STORE_CODE_LEN);
+        assert_eq!(params_bytes(&seller), code_params_bytes(&code));
+    }
+
+    #[test]
+    fn validate_state_refuses_an_owner_the_code_does_not_admit() {
+        let seller = seller_key();
+        let other = bridge_key();
+        let validate = |params: Vec<u8>, state: Vec<u8>| {
+            Contract::validate_state(
+                Parameters::from(params),
+                State::from(state),
+                RelatedContracts::new(),
+            )
+        };
+        assert!(matches!(
+            validate(params_bytes(&seller), owned_store_bytes(&seller, &["Mine"])),
+            Ok(ValidateResult::Valid)
+        ));
+        assert!(
+            validate(
+                params_bytes(&seller),
+                owned_store_bytes(&other, &["Theirs"])
+            )
+            .is_err(),
+            "a store at the seller's code owned by another key"
+        );
+        assert!(
+            validate(params_bytes(&seller), owned_store_bytes(&seller, &[])).is_err(),
+            "an owner with nothing it signed"
+        );
+    }
+
+    /// The contract's `update_state` resolves two owners of one code the same
+    /// way whichever state it holds, for whole states and for deltas.
+    #[test]
+    fn update_state_keeps_the_smaller_key_whichever_state_it_holds() {
+        let (low, high, code) = two_keys_sharing_a_code();
+        let params = code_params_bytes(&code);
+        let a = owned_store_bytes(&low, &["Low"]);
+        let b = owned_store_bytes(&high, &["High", "Two"]);
+        let merge = |held: &[u8], incoming: &[u8]| -> Vec<u8> {
+            Contract::update_state(
+                Parameters::from(params.clone()),
+                State::from(held.to_vec()),
+                vec![UpdateData::State(State::from(incoming.to_vec()))],
+            )
+            .expect("merge")
+            .unwrap_valid()
+            .as_ref()
+            .to_vec()
+        };
+        assert_eq!(merge(&a, &b), a);
+        assert_eq!(merge(&b, &a), a);
+
+        // And through a delta, which is how a client publishes: the held
+        // lower owner ignores the higher one's update, without an error.
+        let summary =
+            Contract::summarize_state(Parameters::from(params.clone()), State::from(a.clone()))
+                .unwrap();
+        let delta = Contract::get_state_delta(
+            Parameters::from(params.clone()),
+            State::from(b.clone()),
+            summary,
+        )
+        .unwrap();
+        assert!(
+            delta.as_ref().is_empty(),
+            "the outranked store has nothing to send"
+        );
+        let mut higher_update = vec![];
+        let decoded: StoreStateV1 = from_reader(b.as_slice()).unwrap();
+        into_writer(
+            &StoreStateV1Delta {
+                owner: decoded.owner,
+                listings: Some(decoded.listings.listings),
+                ..Default::default()
+            },
+            &mut higher_update,
+        )
+        .unwrap();
+        let out = Contract::update_state(
+            Parameters::from(params),
+            State::from(a.clone()),
+            vec![UpdateData::Delta(StateDelta::from(higher_update))],
+        )
+        .expect("an outranked update is not an error")
+        .unwrap_valid()
+        .as_ref()
+        .to_vec();
+        assert_eq!(out, a);
     }
 }

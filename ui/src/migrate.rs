@@ -37,14 +37,21 @@
 //!
 //! `freenet_migrate` derives every predecessor id from one set of parameter
 //! bytes, which is right only while the parameter encoding is stable. The
-//! store's is not: `StoreParameters` GAINED two fields when the Bitcoin bridge
+//! store's is not. `StoreParameters` GAINED two fields when the Bitcoin bridge
 //! list arrived and then shed them again when it moved onto `Order`, so
-//! generations V2-V5 -- and only those -- live at addresses no encoding this
-//! build produces can reproduce. [`store_candidates`] derives each generation
-//! under the encoding it was actually published with, and
-//! [`published_under_legacy_store_params`] is the band. Any future change to a
-//! contract's parameters needs the same treatment, and its absence is silent:
-//! the probe finds nothing at every address and reports success.
+//! generations V2-V5 live at addresses under a three-field encoding. Then
+//! harvest#52 replaced the whole seller key with a twelve-character code, so
+//! every generation up to and including V16 lives under a whole-key encoding
+//! this build no longer produces for anything current. [`store_candidates`]
+//! derives each generation under the encoding it was actually published with;
+//! [`store_param_shape`] says which. Any future change to a contract's
+//! parameters needs the same treatment, and its absence is silent: the probe
+//! finds nothing at every address and reports success.
+//!
+//! The whole-key generations have a second consequence, for the STATE: they
+//! carry no `StoreStateV1::owner`, because their address was the owner. The
+//! fold names the seller's key as their owner (see [`StoreOps`]), which is
+//! exactly the key their contract verified every record against.
 //!
 //! # The ordering constraint
 //!
@@ -191,6 +198,37 @@ pub fn store_params(seller_verifying_key: &ed25519_dalek::VerifyingKey) -> Store
     StoreParameters::new(*seller_verifying_key)
 }
 
+/// The last store generation addressed by the seller's WHOLE verifying key.
+///
+/// Every generation after it is addressed by the key's code (harvest#52). A
+/// fixed historical fact like the band below: V16 is the build at `5110283`,
+/// the last before the code, and a generation recorded from here on falls on
+/// the code side by itself.
+pub const LAST_WHOLE_KEY_STORE_PARAM_GENERATION: u32 = 16;
+
+/// The parameter encoding a store generation was published under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreParamShape {
+    /// `{seller_verifying_key}`, 56 bytes: V1, and V6 to V16.
+    WholeKey,
+    /// `{seller_verifying_key, trusted_bitcoin_bridges, bitcoin_address_code_hash}`,
+    /// 109 bytes: V2 to V5. See [`published_under_legacy_store_params`].
+    WholeKeyWithBitcoinFields,
+    /// `{store_code}`: V17 on, and the current build.
+    Code,
+}
+
+/// Which encoding generation `generation` was published under.
+pub fn store_param_shape(generation: u32) -> StoreParamShape {
+    if published_under_legacy_store_params(generation) {
+        StoreParamShape::WholeKeyWithBitcoinFields
+    } else if generation <= LAST_WHOLE_KEY_STORE_PARAM_GENERATION {
+        StoreParamShape::WholeKey
+    } else {
+        StoreParamShape::Code
+    }
+}
+
 /// The FIRST store generation published under the old `StoreParameters` shape.
 ///
 /// See [`published_under_legacy_store_params`] for why the band has a lower
@@ -268,6 +306,25 @@ fn legacy_store_params_cbor(
     })
 }
 
+/// The parameter bytes generations V1 and V6..=[`LAST_WHOLE_KEY_STORE_PARAM_GENERATION`]
+/// were published under: the whole seller key, before harvest#52 made it a
+/// code.
+///
+/// A frozen record of bytes already on the network, written out rather than
+/// derived from the live struct, for the reason [`legacy_store_params_cbor`]
+/// gives.
+fn whole_key_store_params_cbor(
+    seller_verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<Parameters<'static>, String> {
+    #[derive(serde::Serialize)]
+    struct WholeKeyStoreParameters {
+        seller_verifying_key: ed25519_dalek::VerifyingKey,
+    }
+    encode_params(&WholeKeyStoreParameters {
+        seller_verifying_key: *seller_verifying_key,
+    })
+}
+
 /// Every superseded store instance to probe, newest generation first, each id
 /// derived under the parameter encoding ITS generation was published with.
 ///
@@ -278,15 +335,16 @@ pub fn store_candidate_ids(
     seller_verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<ContractInstanceId>, String> {
     let current = encode_params(&store_params(seller_verifying_key))?;
+    let whole_key = whole_key_store_params_cbor(seller_verifying_key)?;
     let legacy = legacy_store_params_cbor(seller_verifying_key)?;
 
     let mut by_generation: Vec<(u32, ContractInstanceId)> = store_lineage()
         .iter()
         .map(|e| {
-            let params = if published_under_legacy_store_params(e.generation) {
-                &legacy
-            } else {
-                &current
+            let params = match store_param_shape(e.generation) {
+                StoreParamShape::WholeKeyWithBitcoinFields => &legacy,
+                StoreParamShape::WholeKey => &whole_key,
+                StoreParamShape::Code => &current,
             };
             (
                 e.generation,
@@ -469,15 +527,44 @@ where
 /// than reimplemented: folding a generation is then the same operation the
 /// network performs between two peers, so its correctness does not have to be
 /// argued separately from the contract's.
+///
+/// # Naming the owner of a whole-key generation (harvest#52)
+///
+/// A generation up to V16 was addressed by the seller's whole key, so its
+/// state names no owner: the address did. The current contract verifies
+/// every record against `StoreStateV1::owner` and refuses records with no
+/// owner, so carried as-is, every predecessor would be refused in full.
+/// The fold names `seller` as the owner of any state that holds
+/// records and names nobody. That is not a guess: these predecessors were
+/// probed at addresses derived from `seller`, and their contract verified
+/// every record in them against exactly that key. A record anyone else
+/// signed was never in such a state, and if one were, the fold's merge would
+/// refuse it against `seller` as the contract would. [`name_whole_key_owner`]
+/// does it, on every state the fold decodes or merges.
 pub struct StoreOps {
     pub params: StoreParameters,
+    /// The seller whose store this is: the key every probed address was
+    /// derived from.
+    pub seller: ed25519_dalek::VerifyingKey,
+}
+
+/// `state`, with `seller` named as its owner if it holds records and names
+/// nobody. See [`StoreOps`] for why that is the owner such a state had.
+pub(crate) fn name_whole_key_owner(
+    mut state: StoreStateV1,
+    seller: &ed25519_dalek::VerifyingKey,
+) -> StoreStateV1 {
+    if state.owner.is_none() && state.holds_signed_content() {
+        state.owner = Some(*seller);
+    }
+    state
 }
 
 impl ProbeStateOps for StoreOps {
     type State = StoreStateV1;
 
     fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
-        decode_probed_state("store", bytes)
+        decode_probed_state("store", bytes).map(|state| name_whole_key_owner(state, &self.seller))
     }
 
     /// "Real" means the seller actually did something with this store.
@@ -495,11 +582,23 @@ impl ProbeStateOps for StoreOps {
     }
 
     fn merge_with_local(&self, recovered: Self::State, local: &Self::State) -> Self::State {
-        merge_store(recovered, local, &self.params, DiscardedSide::LocalSnapshot)
+        merge_store(
+            recovered,
+            local,
+            &self.params,
+            &self.seller,
+            DiscardedSide::LocalSnapshot,
+        )
     }
 
     fn merge_generations(&self, newer: Self::State, older: Self::State) -> Self::State {
-        merge_store(newer, &older, &self.params, DiscardedSide::Predecessor)
+        merge_store(
+            newer,
+            &older,
+            &self.params,
+            &self.seller,
+            DiscardedSide::Predecessor,
+        )
     }
 }
 
@@ -593,9 +692,10 @@ fn merge_store(
     base: StoreStateV1,
     other: &StoreStateV1,
     params: &StoreParameters,
+    seller: &ed25519_dalek::VerifyingKey,
     side: DiscardedSide,
 ) -> StoreStateV1 {
-    merge_store_reporting_discard(base, other, params, side).state
+    merge_store_reporting_discard(base, other, params, seller, side).state
 }
 
 /// [`merge_store`], saying whether it discarded the predecessor wholesale.
@@ -604,13 +704,24 @@ fn merge_store(
 /// does not verify against these parameters. Discarding that side is the right
 /// answer -- but it takes every VERIFIED listing with it, measured at 0 of 2
 /// carried with 1 verifiable, so it is reported rather than assumed harmless.
+///
+/// Both sides are first given `seller` as their owner if they hold records
+/// and name nobody -- see [`StoreOps`] for why that is exactly right for a
+/// whole-key generation. Without it, the new merge would not refuse such a
+/// side: a state that names no owner has nothing to send, so its records
+/// would be dropped in silence, which is the one outcome this function exists
+/// to prevent.
 pub(crate) fn merge_store_reporting_discard(
     base: StoreStateV1,
     other: &StoreStateV1,
     params: &StoreParameters,
+    seller: &ed25519_dalek::VerifyingKey,
     side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
+    let base = name_whole_key_owner(base, seller);
+    let owned_other = name_whole_key_owner(other.clone(), seller);
+    let other = &owned_other;
     let snapshot = base.clone();
     let mut outcome =
         fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
@@ -1543,6 +1654,7 @@ mod predecessor_generation_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            &key.verifying_key(),
             DiscardedSide::Predecessor,
         );
 
@@ -1590,6 +1702,7 @@ mod predecessor_generation_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            &key.verifying_key(),
             DiscardedSide::Predecessor,
         );
 
@@ -1709,6 +1822,7 @@ mod uncarried_tests {
                 StoreStateV1::default(),
                 &predecessor,
                 &params,
+                &key.verifying_key(),
                 DiscardedSide::Predecessor,
             );
 
@@ -1803,6 +1917,7 @@ mod uncarried_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            &key.verifying_key(),
             DiscardedSide::Predecessor,
         );
         assert!(outcome.discarded, "the premise");
@@ -1856,6 +1971,7 @@ mod uncarried_tests {
             StoreStateV1::default(),
             &local,
             &StoreParameters::new(key.verifying_key()),
+            &key.verifying_key(),
             DiscardedSide::LocalSnapshot,
         );
         assert!(outcome.discarded, "the premise");
@@ -1918,6 +2034,7 @@ mod uncarried_tests {
             StoreStateV1::default(),
             &predecessor,
             &StoreParameters::new(key.verifying_key()),
+            &key.verifying_key(),
             DiscardedSide::Predecessor,
         );
 
