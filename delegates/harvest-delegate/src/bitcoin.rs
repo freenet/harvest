@@ -311,6 +311,7 @@ pub(crate) use harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
 /// published script has been matched, or at [`MAX_ORDER_INDEX`]. Never lowers
 /// the counter: a device ahead of the network (invoices derived but not yet
 /// published) keeps its count.
+#[cfg(test)]
 fn apply_published_floor(
     status: &mut PaymentXpubStatus,
     published: &[Vec<u8>],

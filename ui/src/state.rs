@@ -280,6 +280,13 @@ pub struct AppState {
     /// How many used addresses an invoice has already skipped, keyed by the
     /// request id of the derivation that replaces the last one.
     pub address_skips: HashMap<u64, u32>,
+    /// Invoices signed without a definite answer from the reuse check (the
+    /// node said "not found", or the wait timed out), keyed by the address
+    /// contract, so a late answer showing the address WAS used can still
+    /// reach the seller. Bounded by [`MAX_UNCHECKED_ADDRESSES_KEPT`].
+    pub signed_unchecked: std::collections::VecDeque<(Vec<u8>, harvest_common::payment::OrderId)>,
+    /// Orders whose address a late answer showed had been used before.
+    pub orders_on_used_addresses: HashSet<harvest_common::payment::OrderId>,
 
     /// Ghostkey certificates by fingerprint, as the delegate reports them.
     ///
@@ -999,6 +1006,36 @@ pub fn order_for_invoice(
     .with_derived_id())
 }
 
+/// Why the seller's card warns about an order's payment address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressWarning {
+    /// Another of this seller's orders uses the same address and their
+    /// payment windows overlap, so one payment could prove both.
+    SharedWithAnotherOrder,
+    /// The address turned out to have been used before, after the invoice
+    /// had already been signed without knowing (a late answer to the reuse
+    /// check).
+    UsedBefore,
+}
+
+impl AddressWarning {
+    pub fn explain(self) -> &'static str {
+        match self {
+            AddressWarning::SharedWithAnotherOrder => {
+                "Another of your invoices uses this same payment address, and a single \
+                 payment could look like it pays for both. Harvest will not mark either as \
+                 paid by itself. Do not ship either against a single payment: check your \
+                 wallet for two separate payments, or reissue one of them."
+            }
+            AddressWarning::UsedBefore => {
+                "This invoice's payment address turned out to have been used before. A \
+                 payment already at it is not this invoice's. Check your wallet before \
+                 shipping, or reissue the invoice, which gets a new address."
+            }
+        }
+    }
+}
+
 /// An invoice held back from signing until its payment address is known to
 /// be unused. See [`AppState::check_address_before_signing`].
 #[derive(Clone, Debug, PartialEq)]
@@ -1016,6 +1053,23 @@ pub struct PendingReuseCheck {
 /// issuing from the same key right now, say), which the seller should hear
 /// about rather than have papered over.
 pub const MAX_REUSED_ADDRESS_SKIPS: u32 = 20;
+
+/// How many invoices signed without a definite reuse answer are remembered,
+/// so a late answer can still flag them. Oldest forgotten first.
+pub const MAX_UNCHECKED_ADDRESSES_KEPT: usize = 64;
+
+/// Whether an address contract's state shows the address was used: any claim
+/// at all. An empty state shows nothing; one that does not decode counts as
+/// used, since skipping costs one index and a wrong "unused" could put an old
+/// address on a new invoice.
+fn address_state_shows_use(state_bytes: &[u8]) -> bool {
+    if state_bytes.is_empty() {
+        return false;
+    }
+    freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(state_bytes)
+        .map(|state| !state.claims.claims.is_empty() || !state.claims.scanned.is_empty())
+        .unwrap_or(true)
+}
 
 /// How long to wait for a derived address's contract before signing anyway.
 ///
@@ -2995,9 +3049,19 @@ impl AppState {
         // `address_contracts_to_watch` subscribed to, which ARE this node's
         // own. The scoping is the subscription's, and saying so here is
         // cheaper than a second copy of the rule that could disagree with it.
+        let shared = self.orders_sharing_an_address();
         let mut settled = Vec::new();
         for order in &store.orders {
             if order.status != OrderStatus::AwaitingPayment {
+                continue;
+            }
+            // Two of this seller's orders on one address with overlapping
+            // windows can both be proven by ONE payment (the contract's
+            // pinned known limit). Publishing Paid for either would let one
+            // buyer's money read as paying for both, so neither is
+            // auto-published; the card says why (PR #83 round 2, Should
+            // Fix 1).
+            if shared.contains(&order.order.id) {
                 continue;
             }
             let Some(view) = order
@@ -3027,6 +3091,80 @@ impl AppState {
             settled.push(paid);
         }
         settled
+    }
+
+    /// Orders in this seller's own loaded stores that share a payment script
+    /// with another such order whose payment window overlaps theirs.
+    ///
+    /// # Why this exists on top of every lookup
+    ///
+    /// The store contract's window stops a payment settling an order made
+    /// after it, or one anchored more than a window before it. It cannot stop
+    /// ONE payment settling two orders on one address whose windows overlap:
+    /// a cross-order rule is not merge-safe, since a `Paid` record cannot be
+    /// demoted. And no lookup before signing can rule the case out: two
+    /// devices invoicing at the same moment both find no contract for the
+    /// address, and a lookup that times out or is wrongly told "not found"
+    /// signs anyway. What is always possible is noticing afterwards, locally,
+    /// from the orders themselves. That is merge-safe because nothing is
+    /// written: the seller's card is flagged, and `settled_orders` declines
+    /// to publish `Paid` for either order (PR #83 round 2, Should Fix 1).
+    ///
+    /// Own stores only. Scripts are public, so a stranger's store could copy
+    /// one of this seller's; letting that suppress this seller's own
+    /// settlements would hand anyone a way to stall them.
+    ///
+    /// An order with no anchor has no window and cannot be settled, so it is
+    /// not counted as overlapping anything.
+    pub fn orders_sharing_an_address(&self) -> HashSet<harvest_common::payment::OrderId> {
+        let mut by_script: HashMap<&[u8], Vec<&harvest_common::payment::Order>> = HashMap::new();
+        for registration in self.my_stores.values().flatten() {
+            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
+                continue;
+            };
+            for record in &store.orders {
+                if !record.order.payment_script_pubkey.is_empty() {
+                    by_script
+                        .entry(record.order.payment_script_pubkey.as_slice())
+                        .or_default()
+                        .push(&record.order);
+                }
+            }
+        }
+        let mut shared = HashSet::new();
+        for orders in by_script.values() {
+            for (i, a) in orders.iter().enumerate() {
+                for b in &orders[i + 1..] {
+                    if a.id == b.id {
+                        // The same order listed twice (two registrations
+                        // naming one store) is not two orders.
+                        continue;
+                    }
+                    let (Some(wa), Some(wb)) = (a.payment_window(), b.payment_window()) else {
+                        continue;
+                    };
+                    if wa.start().max(wb.start()) <= wa.end().min(wb.end()) {
+                        shared.insert(a.id.clone());
+                        shared.insert(b.id.clone());
+                    }
+                }
+            }
+        }
+        shared
+    }
+
+    /// What the seller's card should say about this order's address, if
+    /// anything beyond what the chain shows.
+    pub fn address_warning(
+        &self,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<AddressWarning> {
+        if self.orders_sharing_an_address().contains(order_id) {
+            return Some(AddressWarning::SharedWithAnotherOrder);
+        }
+        self.orders_on_used_addresses
+            .contains(order_id)
+            .then_some(AddressWarning::UsedBefore)
     }
 
     /// A settlement update that did not reach the node.
@@ -4545,6 +4683,17 @@ impl AppState {
                 return;
             }
         }
+        // Two invoices waiting on the SAME address means the delegate handed
+        // it out twice, which is reuse by definition. Skip this one rather
+        // than silently replacing the other's check (PR #83 round 2, Should
+        // Fix 6).
+        if self
+            .address_reuse_checks
+            .contains_key(contract_id.as_slice())
+        {
+            self.skip_used_address(check);
+            return;
+        }
         self.address_reuse_checks
             .insert(contract_id.to_vec(), check);
         #[cfg(target_arch = "wasm32")]
@@ -4560,17 +4709,9 @@ impl AppState {
     /// address on a new invoice.
     pub fn on_address_reuse_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
         let Some(check) = self.address_reuse_checks.remove(contract_id) else {
-            return false;
+            return self.on_late_address_reuse_state(contract_id, state_bytes);
         };
-        let used = if state_bytes.is_empty() {
-            false
-        } else {
-            freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(
-                state_bytes,
-            )
-            .map(|state| !state.claims.claims.is_empty() || !state.claims.scanned.is_empty())
-            .unwrap_or(true)
-        };
+        let used = address_state_shows_use(state_bytes);
         if used {
             self.skip_used_address(check);
         } else {
@@ -4579,10 +4720,79 @@ impl AppState {
         true
     }
 
-    /// The node answered that nothing is stored for this contract: the
-    /// address has never been registered, so it is fresh.
+    /// An answer about an address whose invoice was already signed without
+    /// one. If it shows the address was used, the seller is told and the
+    /// order flagged; the invoice cannot be unsigned, and may already be in
+    /// front of a buyer (PR #83 round 2, Should Fix 4).
+    fn on_late_address_reuse_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
+        let Some(position) = self
+            .signed_unchecked
+            .iter()
+            .position(|(id, _)| id.as_slice() == contract_id)
+        else {
+            return false;
+        };
+        let Some((_, order_id)) = self.signed_unchecked.remove(position) else {
+            return false;
+        };
+        // Once this node watches the address as an order's, its states come
+        // from that subscription -- and soon include the bridge's claims for
+        // THIS invoice's own registration, which would read as "used before".
+        // The late answer only means something before then, so listening
+        // stops at the moment the watch begins. A late answer that arrives
+        // after it is lost, which is the fail-open direction already chosen.
+        if self
+            .bitcoin
+            .address_contract_network
+            .contains_key(contract_id)
+        {
+            return false;
+        }
+        if address_state_shows_use(state_bytes) {
+            warn!(
+                "A late answer shows the address of order {} was used before",
+                order_id.short()
+            );
+            self.orders_on_used_addresses.insert(order_id.clone());
+            self.notifications.push(format!(
+                "Invoice {} was issued on a payment address that turned out to have been used \
+                 before. A payment already at it is not this invoice's: check your wallet \
+                 before shipping, or reissue the invoice.",
+                order_id.short()
+            ));
+        }
+        true
+    }
+
+    /// Remember an invoice signed without a definite answer, so a late one
+    /// can still reach the seller.
+    fn note_signed_unchecked(
+        &mut self,
+        contract_id: &[u8],
+        order_id: harvest_common::payment::OrderId,
+    ) {
+        if self.signed_unchecked.len() >= MAX_UNCHECKED_ADDRESSES_KEPT {
+            self.signed_unchecked.pop_front();
+        }
+        self.signed_unchecked
+            .push_back((contract_id.to_vec(), order_id));
+    }
+
+    /// The node answered that nothing is stored for this contract.
+    ///
+    /// Treated like the timeout, not as proof: on Freenet a GET that
+    /// dead-ends can report `NotFound` for a contract that exists (PR #83
+    /// round 2, Should Fix 4). So it signs, fails open for the reasons on
+    /// [`Self::on_address_reuse_timeout`], logs, and keeps listening in case
+    /// a real answer arrives later.
     pub fn on_address_reuse_absent(&mut self, contract_id: &[u8]) {
         if let Some(check) = self.address_reuse_checks.remove(contract_id) {
+            warn!(
+                "The node found nothing for address {}; issuing the invoice, and will still \
+                 flag it if a later answer shows it was used",
+                check.order.payment_address
+            );
+            self.note_signed_unchecked(contract_id, check.order.id.clone());
             self.sign_checked_order(check);
         }
     }
@@ -4608,6 +4818,7 @@ impl AppState {
                  whether it was used before",
                 check.order.payment_address, ADDRESS_REUSE_CHECK_TIMEOUT_MS
             );
+            self.note_signed_unchecked(contract_id, check.order.id.clone());
             self.sign_checked_order(check);
         }
     }
@@ -4621,9 +4832,9 @@ impl AppState {
         );
         if skipped > MAX_REUSED_ADDRESS_SKIPS {
             self.notifications.push(format!(
-                "Could not issue the invoice: the last {MAX_REUSED_ADDRESS_SKIPS} payment \
-                 addresses from your key had all been used before. Is another device issuing \
-                 invoices from the same key?"
+                "Could not issue the invoice: the last {skipped} payment addresses from your \
+                 key had all been used before. Is another device issuing invoices from the \
+                 same key?"
             ));
             return;
         }
@@ -9195,6 +9406,169 @@ mod invoice_tests {
         );
     }
 
+    /// **Round 2, Should Fix 1: which pairs overlap.** Windows are
+    /// `(anchor, anchor + PAYMENT_WINDOW_BLOCKS]`; two orders on one address
+    /// overlap exactly when the later anchor is less than a window after the
+    /// earlier. A stranger's store holding the same script flags nothing.
+    #[test]
+    fn orders_share_an_address_only_when_their_windows_overlap() {
+        use harvest_common::payment::PAYMENT_WINDOW_BLOCKS;
+        fn anchored(
+            script: &[u8],
+            height: u32,
+            amount: u64,
+        ) -> harvest_common::payment::AuthorizedOrder {
+            let mut record = with_script(script);
+            record.order.anchor = Some(anchor(height));
+            record.order.amount_sats = amount;
+            record.order = record.order.with_derived_id();
+            record
+        }
+        let script = [0x00, 0x14, 1];
+        for (later, overlaps) in [
+            (100 + PAYMENT_WINDOW_BLOCKS - 1, true),
+            (100 + PAYMENT_WINDOW_BLOCKS, false),
+        ] {
+            let mut state = seller_with_a_store();
+            let a = anchored(&script, 100, 1);
+            let b = anchored(&script, later, 2);
+            state
+                .browsing_stores
+                .get_mut(STORE_ID.as_slice())
+                .expect("store")
+                .orders = vec![a.clone(), b.clone()];
+            let shared = state.orders_sharing_an_address();
+            assert_eq!(
+                shared.contains(&a.order.id),
+                overlaps,
+                "later anchor {later}"
+            );
+            assert_eq!(
+                shared.contains(&b.order.id),
+                overlaps,
+                "later anchor {later}"
+            );
+        }
+
+        // A stranger's store with the same script.
+        let mut state = seller_with_a_store();
+        let mine = anchored(&script, 100, 1);
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = vec![mine.clone()];
+        state
+            .browsing_stores
+            .entry(vec![0x77; 32])
+            .or_default()
+            .orders = vec![anchored(&script, 120, 9)];
+        assert!(state.orders_sharing_an_address().is_empty());
+    }
+
+    /// **Round 2, Should Fix 4.** An invoice signed on "not found" or on a
+    /// timeout is still flagged, and the seller told, when an answer showing
+    /// the address WAS used arrives later. Once the node watches the address
+    /// as an order's, it stops listening, because the bridge's claims for
+    /// this invoice's own registration would read as "used before".
+    #[test]
+    fn a_late_answer_showing_use_flags_an_invoice_already_signed() {
+        for settle in [
+            |s: &mut AppState, id: &[u8]| s.on_address_reuse_absent(id),
+            |s: &mut AppState, id: &[u8]| s.on_address_reuse_timeout(id),
+        ] {
+            let mut state = seller_with_a_store();
+            let id = invoice_awaiting_reuse_check(&mut state, 0);
+            settle(&mut state, &id);
+            let order_id = queued_order(&state).id;
+            assert_eq!(state.address_warning(&order_id), None);
+
+            state.on_contract_state(id, a_used_address_state());
+            assert_eq!(
+                state.address_warning(&order_id),
+                Some(AddressWarning::UsedBefore)
+            );
+            assert!(state
+                .notifications
+                .iter()
+                .any(|n| n.contains("turned out to have been used before")));
+        }
+
+        let mut state = seller_with_a_store();
+        let id = invoice_awaiting_reuse_check(&mut state, 0);
+        state.on_address_reuse_timeout(&id);
+        let order_id = queued_order(&state).id;
+        state
+            .bitcoin
+            .address_contract_network
+            .insert(id.clone(), BitcoinNetwork::Signet);
+        state.on_contract_state(id, a_used_address_state());
+        assert_eq!(
+            state.address_warning(&order_id),
+            None,
+            "the invoice's own registration read as reuse"
+        );
+    }
+
+    /// **Round 2, Should Fix 6.** Two invoices handed the same address: the
+    /// second does not replace the first's check, it is skipped.
+    #[test]
+    fn a_second_invoice_on_an_address_already_being_checked_is_skipped() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        state.issue_invoice(invoice()).expect("accepted");
+        let ids: Vec<u64> = state.pending_invoices.keys().copied().collect();
+        state.on_bitcoin_delegate_response(address_answer(ids[0], 0));
+        state.on_bitcoin_delegate_response(address_answer(ids[1], 0));
+        assert_eq!(state.address_reuse_checks.len(), 1);
+        let (&retry_id, _) = state.pending_invoices.iter().next().expect("a retry");
+        assert_eq!(state.address_skips.get(&retry_id), Some(&1));
+    }
+
+    /// **Round 2, Should Fix 6: the skip-limit boundary.** One short of the
+    /// limit still derives again; the limit itself gives up.
+    #[test]
+    fn one_short_of_the_skip_limit_still_derives_again() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state
+            .address_skips
+            .insert(request_id, MAX_REUSED_ADDRESS_SKIPS - 1);
+        state.on_bitcoin_delegate_response(address_answer(request_id, 0));
+        let id = state
+            .address_reuse_checks
+            .keys()
+            .next()
+            .cloned()
+            .expect("check");
+        state.on_contract_state(id, a_used_address_state());
+        let (&retry_id, _) = state.pending_invoices.iter().next().expect("derived again");
+        assert_eq!(
+            state.address_skips.get(&retry_id),
+            Some(&MAX_REUSED_ADDRESS_SKIPS)
+        );
+    }
+
+    /// **Round 2, Should Fix 6.** A refused derivation drops the skip count
+    /// and in-flight scripts held for it, not only the invoice.
+    #[test]
+    fn a_refused_derivation_forgets_everything_held_for_it() {
+        let mut state = seller_with_a_store();
+        state.issue_invoice(invoice()).expect("accepted");
+        let request_id = *state.pending_invoices.keys().next().expect("one entry");
+        state.address_skips.insert(request_id, 3);
+        let _ = state.order_address_request(request_id);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id,
+            result: Err("refused".into()),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.pending_invoices.is_empty());
+        assert!(state.address_skips.is_empty());
+        assert!(state.bitcoin.scripts_in_flight.is_empty());
+    }
+
     /// A long run of used addresses stops rather than burning indices
     /// forever, and says so.
     #[test]
@@ -13620,6 +13994,56 @@ mod buy_flow_tests {
         settled
             .verify(&seller_signing_key().verifying_key())
             .expect("a settled order must verify as Paid");
+    }
+
+    /// **PR #83 round 2, Should Fix 1.** When this seller owns the store and
+    /// holds a second order on the same address whose window overlaps, the
+    /// confirmed payment is NOT auto-published as Paid: one payment could
+    /// prove both. The same state without the twin still settles, so the
+    /// refusal is the twin's doing and not the registration's.
+    #[test]
+    fn a_payment_on_an_address_two_own_orders_share_is_not_auto_published() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        assert_eq!(
+            state.settled_orders(STORE).len(),
+            1,
+            "owning the store alone must not stop a settlement"
+        );
+
+        let mut twin = order.clone();
+        twin.order.amount_sats += 1;
+        let twin = resigned(twin, &seller_signing_key());
+        assert_ne!(twin.order.id, order.order.id);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .orders
+            .push(twin.clone());
+
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "a payment was auto-published for an order sharing its address"
+        );
+        assert_eq!(
+            state.address_warning(&order.order.id),
+            Some(AddressWarning::SharedWithAnotherOrder)
+        );
+        assert_eq!(
+            state.address_warning(&twin.order.id),
+            Some(AddressWarning::SharedWithAnotherOrder)
+        );
     }
 
     /// **An order whose payment has not confirmed is not settled.**

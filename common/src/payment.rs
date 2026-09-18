@@ -305,10 +305,12 @@ const _: () = assert!(
 /// How long after an order's anchor a buyer's payment may take to confirm and
 /// still be this order's payment, beyond the time the buyer has to send it.
 ///
-/// Two weeks of blocks, because that is Bitcoin Core's default mempool expiry
+/// Two weeks of blocks, Bitcoin Core's default mempool expiry
 /// (`-mempoolexpiry=336` hours): a transaction still unconfirmed after that is
-/// dropped from default mempools, so an honest payment either confirms within
-/// it or has, for practical purposes, stopped trying. A low-fee payment during
+/// dropped from default mempools. That is not the end of it -- wallets
+/// rebroadcast, and a fee bump can revive it -- so this is a chosen bound, not
+/// a natural one: past it, a payment that finally confirms is left for the
+/// two parties to settle between themselves rather than proven here. A low-fee payment during
 /// congestion can genuinely take days, and a payment refused for landing
 /// late is the buyer's money arriving with nothing on the public record to
 /// say so, which is why this is generous rather than tight.

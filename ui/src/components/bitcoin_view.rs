@@ -524,6 +524,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
         )
     };
     let reading = AddressReading::of(o, live.as_ref());
+    // Only ever set for the seller's own orders; see
+    // `AppState::orders_sharing_an_address` and `address_warning`.
+    let address_warning = APP_STATE.read().address_warning(&o.id);
     let (status_class, status_text) = status_pill(order.status, &reading);
 
     rsx! {
@@ -537,6 +540,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 if let Some(note) = reading.outside_note() {
                     p { class: "text-warning", "{note}" }
                 }
+            }
+            if let Some(warning) = address_warning {
+                p { class: "text-warning", "{warning.explain()}" }
             }
             // The address is only offered when it is the script that settles
             // this order. Showing one that is not would be handing somebody a
@@ -614,8 +620,12 @@ pub(crate) fn status_pill(
 ) -> (&'static str, &'static str) {
     match status {
         OrderStatus::AwaitingPayment => {
-            if reading.in_window_sats > 0 {
+            // The paid style only for the full amount: anyone can send dust
+            // to a published address (PR #83 round 2, Should Fix 5).
+            if reading.in_window_sats > 0 && reading.in_window_sats >= reading.amount_sats {
                 ("btc-pill paid", "Payment seen on chain")
+            } else if reading.in_window_sats > 0 {
+                ("btc-pill pending", "Partial payment seen")
             } else if reading.pending_sats > 0 {
                 ("btc-pill pending", "Payment seen, unconfirmed")
             } else {
@@ -650,6 +660,10 @@ pub(crate) fn status_pill(
 /// [`Order::payment_window`]: harvest_common::payment::Order::payment_window
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AddressReading {
+    /// What the order asks for, so the pill can tell a payment from dust.
+    pub amount_sats: u64,
+    /// The order names no anchor block, so nothing can settle it.
+    pub no_anchor: bool,
     /// Confirmed value inside the order's window: what can settle it.
     pub in_window_sats: u64,
     /// Unconfirmed value. Not window-checked, because an unconfirmed
@@ -665,16 +679,21 @@ pub(crate) struct AddressReading {
 
 impl AddressReading {
     pub(crate) fn of(order: &harvest_common::payment::Order, live: Option<&AddressView>) -> Self {
+        let window = order.payment_window();
+        let base = Self {
+            amount_sats: order.amount_sats,
+            no_anchor: window.is_none(),
+            ..Self::default()
+        };
         let Some(live) = live else {
-            return Self::default();
+            return base;
         };
         let mut reading = Self {
             pending_sats: live.pending_sats,
-            ..Self::default()
+            ..base
         };
         // No anchor: nothing can settle this order (the verifier refuses it),
         // so no confirmed value is counted as its payment.
-        let window = order.payment_window();
         for tx in &live.txs {
             let TxRowStatus::Confirmed { anchor_height } = tx.status else {
                 continue;
@@ -690,7 +709,8 @@ impl AddressReading {
                             .map_or(anchor_height, |h| h.min(anchor_height)),
                     );
                 }
-                _ => {
+                None => {}
+                Some(_) => {
                     reading.before_order = Some(
                         reading
                             .before_order
@@ -705,18 +725,36 @@ impl AddressReading {
     /// What to tell the seller when the address holds confirmed value that is
     /// not this order's payment.
     pub(crate) fn outside_note(&self) -> Option<String> {
+        if self.no_anchor {
+            return Some(
+                "This invoice names no Bitcoin block it was made at, so no payment can ever \
+                 settle it. Issue a new invoice."
+                    .to_string(),
+            );
+        }
+        let paid_in_window = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
         if let Some(height) = self.before_order {
-            return Some(format!(
-                "This address already holds a payment that confirmed in block {height}, \
-                 before this invoice was made. It paid for something else and does not \
-                 settle this invoice, so do not ship against it. Issue a new invoice, which \
-                 gets a new address."
-            ));
+            return Some(if paid_in_window {
+                // A valid payment is also here: no reason to reissue.
+                format!(
+                    "This address also holds an older payment, confirmed in block {height} \
+                     before this invoice was made. That one paid for something else; only the \
+                     payment made after this invoice counts for it."
+                )
+            } else {
+                format!(
+                    "This address already holds a payment that confirmed in block {height}, \
+                     before this invoice was made. It paid for something else and does not \
+                     settle this invoice, so do not ship against it. Issue a new invoice, \
+                     which gets a new address."
+                )
+            });
         }
         self.after_window.map(|height| {
             format!(
                 "A payment to this address confirmed in block {height}, after this invoice's \
-                 payment window closed, so it does not settle this invoice."
+                 payment window closed, so Harvest will not mark it paid. It is probably this \
+                 buyer's late payment: check your wallet and settle it with them directly."
             )
         })
     }
@@ -1366,5 +1404,48 @@ mod address_reading_tests {
         let reading = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
         assert_eq!(reading.in_window_sats, 10_000);
         assert_eq!(reading.outside_note(), None);
+    }
+
+    /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a
+    /// payment: the paid style needs the full amount.
+    #[test]
+    fn dust_inside_the_window_reads_as_partial_not_paid() {
+        use harvest_common::payment::OrderStatus;
+        let order = order_anchored_at(150);
+        let dust = AddressReading::of(&order, Some(&address_with(&[(151, 546)])));
+        assert_eq!(
+            super::status_pill(OrderStatus::AwaitingPayment, &dust),
+            ("btc-pill pending", "Partial payment seen")
+        );
+        let full = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
+        assert_eq!(
+            super::status_pill(OrderStatus::AwaitingPayment, &full),
+            ("btc-pill paid", "Payment seen on chain")
+        );
+    }
+
+    /// Round 2, Consider: the notes say the right thing in each case. An
+    /// older payment beside a valid one does not tell the seller to reissue;
+    /// a late one is called the buyer's probable late payment; an order with
+    /// no anchor says so rather than blaming an older payment.
+    #[test]
+    fn each_note_names_its_own_reason() {
+        let order = order_anchored_at(150);
+        let both = AddressReading::of(&order, Some(&address_with(&[(100, 10_000), (151, 10_000)])));
+        let note = both.outside_note().expect("the older payment is mentioned");
+        assert!(!note.contains("Issue a new invoice"), "{note}");
+
+        let late = AddressReading::of(
+            &order,
+            Some(&address_with(&[(150 + PAYMENT_WINDOW_BLOCKS + 1, 10_000)])),
+        );
+        assert!(late.outside_note().expect("said").contains("late payment"));
+
+        let mut anchorless = order_anchored_at(150);
+        anchorless.anchor = None;
+        let reading = AddressReading::of(&anchorless, Some(&address_with(&[(100, 10_000)])));
+        let note = reading.outside_note().expect("said");
+        assert!(note.contains("names no Bitcoin block"), "{note}");
+        assert_eq!(reading.before_order, None);
     }
 }
