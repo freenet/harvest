@@ -18,14 +18,14 @@ use super::APP_STATE;
 /// fresh request id from `APP_STATE.bitcoin` and marking it in-flight.
 #[cfg(target_arch = "wasm32")]
 async fn send_request(build: impl FnOnce(u64) -> BitcoinDelegateRequest) -> Result<(), String> {
-    send_request_from_state(|_, request_id| build(request_id)).await
+    send_request_from_state(|_, request_id| Ok(build(request_id))).await
 }
 
 /// [`send_request`], for a request whose contents come from `AppState` --
 /// built while the state is already held, rather than by re-borrowing it.
 #[cfg(target_arch = "wasm32")]
 async fn send_request_from_state(
-    build: impl FnOnce(&mut crate::state::AppState, u64) -> BitcoinDelegateRequest,
+    build: impl FnOnce(&mut crate::state::AppState, u64) -> Result<BitcoinDelegateRequest, String>,
 ) -> Result<(), String> {
     let (delegate_key, request) = {
         let mut state = APP_STATE.write();
@@ -34,8 +34,8 @@ async fn send_request_from_state(
             .clone()
             .ok_or("harvest delegate not yet registered")?;
         let request_id = state.bitcoin.next_request_id();
+        let request = build(&mut state, request_id)?;
         state.bitcoin.in_flight.insert(request_id);
-        let request = build(&mut state, request_id);
         (key, request)
     };
     let payload = to_cbor(&request).map_err(|e| format!("serialize bitcoin request: {e}"))?;

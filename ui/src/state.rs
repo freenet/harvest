@@ -567,8 +567,7 @@ fn spawn_order_address_request(request_id: u64) {
         if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(request_id).await {
             dioxus::logger::tracing::error!("Failed to request a payment address: {e}");
             let mut state = crate::gateway::APP_STATE.write();
-            state.pending_invoices.remove(&request_id);
-            state.bitcoin.in_flight.remove(&request_id);
+            state.abandon_address_request(request_id);
             state
                 .notifications
                 .push(format!("Could not issue the invoice: {e}"));
@@ -4303,14 +4302,24 @@ impl AppState {
         &mut self,
         request_id: u64,
     ) -> harvest_common::BitcoinDelegateRequest {
+        let counter = self.current_address_counter();
         let published_scripts: Vec<Vec<u8>> = self
             .published_payment_scripts()
             .into_iter()
             .filter(|script| !self.bitcoin.accounted_scripts.contains(script))
+            .filter(|script| match self.bitcoin.unmatched_scripts.get(script) {
+                None => true,
+                Some(&offered_at) => {
+                    counter
+                        >= offered_at.saturating_add(
+                            harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP / 2,
+                        )
+                }
+            })
             .collect();
         self.bitcoin
             .scripts_in_flight
-            .insert(request_id, published_scripts.clone());
+            .insert(request_id, (published_scripts.clone(), counter));
         harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
             request_id,
             published_scripts,
@@ -4320,21 +4329,87 @@ impl AppState {
     /// The request that records the seller's payment key. Always carries
     /// EVERY published script: a new key resets the delegate's counter, and
     /// what was accounted for under the old key says nothing about this one.
+    ///
+    /// Refused until every store this seller owns has been read from the
+    /// network (PR #83 round 2, Should Fix 3): a key set against an empty
+    /// record starts its count at 0, and the scripts that would lift it may
+    /// be marked accounted for in another tab.
     pub fn set_payment_xpub_request(
         &mut self,
         request_id: u64,
         xpub: String,
         network: BitcoinNetwork,
-    ) -> harvest_common::BitcoinDelegateRequest {
+    ) -> Result<harvest_common::BitcoinDelegateRequest, String> {
+        if self.my_stores.values().flatten().any(|registration| {
+            self.browsing_stores
+                .get(&registration.store_contract_id)
+                .is_none_or(|store| store.info.is_none())
+        }) {
+            return Err(
+                "your stores have not all loaded from the network yet, so Harvest cannot see \
+                 which payment addresses their orders already use. Try again once they have."
+                    .to_string(),
+            );
+        }
         let published_scripts = self.published_payment_scripts();
         self.bitcoin
             .scripts_in_flight
-            .insert(request_id, published_scripts.clone());
-        harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+            .insert(request_id, (published_scripts.clone(), 0));
+        Ok(harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
             request_id,
             xpub,
             network,
             published_scripts,
+        })
+    }
+
+    /// Forget everything held for an address request that will never be
+    /// answered usefully (PR #83 round 2, Should Fix 6).
+    pub fn abandon_address_request(&mut self, request_id: u64) {
+        self.pending_invoices.remove(&request_id);
+        self.bitcoin.in_flight.remove(&request_id);
+        self.bitcoin.scripts_in_flight.remove(&request_id);
+        self.address_skips.remove(&request_id);
+    }
+
+    /// The delegate's address counter as last reported, 0 when unknown.
+    fn current_address_counter(&self) -> u32 {
+        self.bitcoin
+            .payment_xpub
+            .as_ref()
+            .map_or(0, |status| status.next_index)
+    }
+
+    /// Record what the delegate did with the scripts it was offered.
+    fn note_scripts_answered(&mut self, request_id: u64, matched: Vec<Vec<u8>>, counter: u32) {
+        let Some((sent, _)) = self.bitcoin.scripts_in_flight.remove(&request_id) else {
+            return;
+        };
+        let matched: std::collections::BTreeSet<Vec<u8>> = matched.into_iter().collect();
+        for script in sent {
+            if matched.contains(&script) {
+                self.bitcoin.unmatched_scripts.remove(&script);
+                self.bitcoin.accounted_scripts.insert(script);
+            } else {
+                self.bitcoin.unmatched_scripts.insert(script, counter);
+            }
+        }
+    }
+
+    /// A reported count lower than the last one, or a different key, means
+    /// what was accounted for no longer describes the counter.
+    fn forget_accounted_scripts_if_counter_fell(
+        &mut self,
+        new: Option<&harvest_common::PaymentXpubStatus>,
+    ) {
+        let fell = match (self.bitcoin.payment_xpub.as_ref(), new) {
+            (Some(old), Some(new)) => new.xpub != old.xpub || new.next_index < old.next_index,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if fell {
+            self.bitcoin.accounted_scripts.clear();
+            self.bitcoin.unmatched_scripts.clear();
         }
     }
 
@@ -5485,15 +5560,19 @@ impl AppState {
                 // listener.
             }
 
-            BitcoinDelegateResponse::PaymentXpubSet { request_id, result } => {
+            BitcoinDelegateResponse::PaymentXpubSet {
+                request_id,
+                result,
+                matched_scripts,
+            } => {
                 self.bitcoin.in_flight.remove(&request_id);
-                let sent = self.bitcoin.scripts_in_flight.remove(&request_id);
                 match result {
                     Ok(status) => {
                         // Replaced, not extended: the counter now belongs to
                         // this key and was floored against exactly these.
-                        self.bitcoin.accounted_scripts =
-                            sent.unwrap_or_default().into_iter().collect();
+                        self.bitcoin.accounted_scripts.clear();
+                        self.bitcoin.unmatched_scripts.clear();
+                        self.note_scripts_answered(request_id, matched_scripts, status.next_index);
                         info!(
                             "Payment key recorded for {}, next index {}",
                             status.network.as_str(),
@@ -5506,25 +5585,35 @@ impl AppState {
                     // on -- the wrong export, the wrong network, the wrong
                     // depth -- so it is shown verbatim rather than reduced to
                     // "invalid key".
-                    Err(e) => self
-                        .notifications
-                        .push(format!("Couldn't use that payment key: {e}")),
+                    Err(e) => {
+                        self.bitcoin.scripts_in_flight.remove(&request_id);
+                        self.notifications
+                            .push(format!("Couldn't use that payment key: {e}"))
+                    }
                 }
             }
 
             BitcoinDelegateResponse::PaymentXpub { status } => {
+                self.forget_accounted_scripts_if_counter_fell(status.as_ref());
                 self.bitcoin.payment_xpub = status;
                 self.bitcoin.payment_xpub_loaded = true;
             }
 
-            BitcoinDelegateResponse::OrderAddress { request_id, result } => {
+            BitcoinDelegateResponse::OrderAddress {
+                request_id,
+                result,
+                matched_scripts,
+            } => {
                 self.bitcoin.in_flight.remove(&request_id);
-                let sent = self.bitcoin.scripts_in_flight.remove(&request_id);
                 match result {
                     Ok(derived) => {
-                        self.bitcoin
-                            .accounted_scripts
-                            .extend(sent.unwrap_or_default());
+                        // The counter the delegate had once it had scanned:
+                        // this address's index plus one.
+                        self.note_scripts_answered(
+                            request_id,
+                            matched_scripts,
+                            derived.index.saturating_add(1),
+                        );
                         self.complete_invoice(request_id, derived)
                     }
                     Err(e) => {
@@ -5532,7 +5621,7 @@ impl AppState {
                         // nothing to sign, and leaving it queued would leave
                         // the form looking as though something were still in
                         // progress.
-                        self.pending_invoices.remove(&request_id);
+                        self.abandon_address_request(request_id);
                         self.notifications
                             .push(format!("Couldn't get a payment address: {e}"));
                     }
@@ -6554,17 +6643,23 @@ pub struct BitcoinState {
     pub watches_loaded: bool,
     /// The account public key invoices derive their payment addresses from.
     pub payment_xpub: Option<harvest_common::PaymentXpubStatus>,
-    /// Published payment scripts the delegate has already been told about and
-    /// has answered, in this tab. Only scripts NOT in here are sent with the
-    /// next derivation, so the delegate's recovery scan and the request size
-    /// are paid once per tab rather than on every invoice (PR #83 review,
-    /// Should Fix 7). Replaced wholesale when a payment key is set, because
-    /// "accounted for" only means anything relative to one key.
+    /// Published payment scripts the delegate has MATCHED to an index of the
+    /// current key, in this tab. They are not sent again, so the recovery
+    /// scan and the request size are not paid on every invoice (PR #83
+    /// review, Should Fix 7). Replaced wholesale when a payment key is set,
+    /// and cleared when the delegate reports a lower count than before,
+    /// because "accounted for" only means anything relative to one counter.
     pub accounted_scripts: std::collections::BTreeSet<Vec<u8>>,
+    /// Published scripts the delegate was offered and did NOT match, with the
+    /// counter it had when they were offered. Foreign, below-counter and
+    /// beyond-gap scripts all land here; only the last kind can ever raise
+    /// the counter, and it can do so only once the counter has come within
+    /// the delegate's scan gap of it, so each is offered again after the
+    /// counter has advanced by half the gap (PR #83 round 2, Should Fix 2).
+    pub unmatched_scripts: std::collections::BTreeMap<Vec<u8>, u32>,
     /// The scripts sent with each outstanding `DeriveOrderAddress` /
-    /// `SetPaymentXpub`, keyed by request id, moved into
-    /// [`Self::accounted_scripts`] when the delegate answers `Ok`.
-    pub scripts_in_flight: HashMap<u64, Vec<Vec<u8>>>,
+    /// `SetPaymentXpub` and the counter at the time, keyed by request id.
+    pub scripts_in_flight: HashMap<u64, (Vec<Vec<u8>>, u32)>,
     /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
     /// key configured" from "we have not asked yet", so the seller is not
     /// prompted to add one before we know whether they already have.
@@ -8573,6 +8668,7 @@ mod invoice_tests {
         BitcoinDelegateResponse::OrderAddress {
             request_id,
             result: Ok(derived(index)),
+            matched_scripts: Vec::new(),
         }
     }
 
@@ -8805,7 +8901,10 @@ mod invoice_tests {
             }
             other => panic!("expected DeriveOrderAddress, got {other:?}"),
         }
-        match state.set_payment_xpub_request(8, "vpub".into(), BitcoinNetwork::Signet) {
+        match state
+            .set_payment_xpub_request(8, "vpub".into(), BitcoinNetwork::Signet)
+            .expect("stores loaded")
+        {
             harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
                 published_scripts, ..
             } => assert_eq!(published_scripts.len(), 2),
@@ -8813,14 +8912,17 @@ mod invoice_tests {
         }
     }
 
-    /// **PR #83 review, Should Fix 7.** Once the delegate has answered for a
-    /// script it is not sent again in this tab, so neither the scan nor the
-    /// request grows with the store on every invoice. A refused derivation
-    /// accounts for nothing, and setting a key sends everything again and
-    /// replaces what is accounted for, because a new key's counter starts
-    /// from scratch.
+    /// **PR #83 review, Should Fix 7, and round 2, Should Fix 2.** A script
+    /// the delegate MATCHED is not sent again in this tab. One it was sent but
+    /// did not match (foreign, below its counter, or beyond its scan gap) is
+    /// held back until the counter has advanced by half the gap, which is
+    /// when a beyond-gap order can have come within reach. A refused
+    /// derivation records nothing. Setting a key sends everything and
+    /// starts the record again, and so does the delegate reporting a lower
+    /// count than before.
     #[test]
-    fn a_script_the_delegate_has_answered_for_is_not_sent_again() {
+    fn only_scripts_the_delegate_matched_are_not_sent_again() {
+        use harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
         fn scripts(request: harvest_common::BitcoinDelegateRequest) -> Vec<Vec<u8>> {
             match request {
                 harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
@@ -8834,49 +8936,111 @@ mod invoice_tests {
                 other => panic!("unexpected request {other:?}"),
             }
         }
+        fn answered(state: &mut AppState, request_id: u64, index: u32, matched: Vec<Vec<u8>>) {
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+                request_id,
+                result: Ok(derived(index)),
+                matched_scripts: matched,
+            });
+            settle_reuse_checks_as_fresh(state);
+        }
+        fn counter_is(state: &mut AppState, next_index: u32) {
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpub {
+                status: Some(PaymentXpubStatus {
+                    xpub: "vpub-placeholder".to_string(),
+                    network: BitcoinNetwork::Signet,
+                    next_index,
+                }),
+            });
+        }
         let mut state = seller_with_a_store();
-        let one = vec![0x00, 0x14, 1];
-        let two = vec![0x00, 0x14, 2];
+        let mine = vec![0x00, 0x14, 1];
+        let unmatched = vec![0x00, 0x14, 2];
         state
             .browsing_stores
             .get_mut(STORE_ID.as_slice())
             .expect("store")
-            .orders = vec![with_script(&one)];
+            .orders = vec![with_script(&mine), with_script(&unmatched)];
 
-        // Refused: nothing is accounted for.
-        assert_eq!(scripts(state.order_address_request(1)), vec![one.clone()]);
+        // Refused: nothing is recorded, both go again.
+        assert_eq!(
+            scripts(state.order_address_request(1)),
+            vec![mine.clone(), unmatched.clone()]
+        );
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
             request_id: 1,
             result: Err("refused".into()),
+            matched_scripts: Vec::new(),
         });
-        assert_eq!(scripts(state.order_address_request(2)), vec![one.clone()]);
-
-        // Answered: not sent again; a newly published order is.
-        state.on_bitcoin_delegate_response(address_answer(2, 0));
-        settle_reuse_checks_as_fresh(&mut state);
-        assert!(scripts(state.order_address_request(3)).is_empty());
-        state
-            .browsing_stores
-            .get_mut(STORE_ID.as_slice())
-            .expect("store")
-            .orders
-            .push(with_script(&two));
-        assert_eq!(scripts(state.order_address_request(4)), vec![two.clone()]);
-
-        // Setting a key sends everything and replaces the accounted set.
         assert_eq!(
-            scripts(state.set_payment_xpub_request(5, "vpub".into(), BitcoinNetwork::Signet)),
-            vec![one.clone(), two.clone()]
+            scripts(state.order_address_request(2)),
+            vec![mine.clone(), unmatched.clone()]
+        );
+
+        // Answered, matching only `mine`: neither is sent straight away...
+        answered(&mut state, 2, 0, vec![mine.clone()]);
+        counter_is(&mut state, 1);
+        assert!(scripts(state.order_address_request(3)).is_empty());
+        // ...and the unmatched one comes back once the counter has moved on.
+        counter_is(&mut state, 1 + PUBLISHED_INDEX_GAP / 2);
+        assert_eq!(
+            scripts(state.order_address_request(4)),
+            vec![unmatched.clone()]
+        );
+
+        // Setting a key sends everything and starts the record again.
+        assert_eq!(
+            scripts(
+                state
+                    .set_payment_xpub_request(5, "vpub".into(), BitcoinNetwork::Signet)
+                    .expect("stores loaded")
+            ),
+            vec![mine.clone(), unmatched.clone()]
         );
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
             request_id: 5,
             result: Ok(PaymentXpubStatus {
-                xpub: "vpub".into(),
+                xpub: "vpub-placeholder".into(),
                 network: BitcoinNetwork::Signet,
                 next_index: 2,
             }),
+            matched_scripts: vec![mine.clone(), unmatched.clone()],
         });
         assert!(scripts(state.order_address_request(6)).is_empty());
+
+        // A lower count than before (another tab reset it): send everything.
+        counter_is(&mut state, 0);
+        assert_eq!(
+            scripts(state.order_address_request(7)),
+            vec![mine, unmatched]
+        );
+    }
+
+    /// **PR #83 round 2, Should Fix 3.** The payment key is not set before
+    /// every store this seller owns has loaded: set against an empty record,
+    /// the delegate's count starts again at 0.
+    #[test]
+    fn a_payment_key_waits_for_every_owned_store_to_load() {
+        let mut state = seller_with_a_store();
+        state.my_stores.insert(
+            "another-ghost-key".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![0x5e; 32],
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+            }],
+        );
+        let err = state
+            .set_payment_xpub_request(1, "vpub".into(), BitcoinNetwork::Signet)
+            .expect_err("a store has not loaded");
+        assert!(err.contains("not all loaded"), "{err}");
+        assert!(state.bitcoin.scripts_in_flight.is_empty());
+
+        store_state_arrived(&mut state, &[0x5e; 32]);
+        assert!(state
+            .set_payment_xpub_request(2, "vpub".into(), BitcoinNetwork::Signet)
+            .is_ok());
     }
 
     // -----------------------------------------------------------------
@@ -9365,6 +9529,7 @@ mod invoice_tests {
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
             request_id: waiting,
             result: Err("no payment key is set".to_string()),
+            matched_scripts: Vec::new(),
         });
 
         assert!(state.pending_invoices.is_empty());
@@ -9494,6 +9659,7 @@ mod invoice_tests {
                 network: BitcoinNetwork::Signet,
                 next_index: 4,
             }),
+            matched_scripts: Vec::new(),
         });
         assert_eq!(
             state.bitcoin.payment_xpub.as_ref().map(|s| s.next_index),
@@ -9628,6 +9794,7 @@ mod invoice_tests {
         state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
             request_id: 1,
             result: Err("that is a legacy account key (xpub/tpub)".to_string()),
+            matched_scripts: Vec::new(),
         });
 
         assert!(state.bitcoin.payment_xpub.is_none());
@@ -12590,6 +12757,7 @@ mod buy_flow_tests {
                 script_pubkey: vec![0x00, 0x14, 0x01],
                 address: "tb1qexample".to_string(),
             }),
+            matched_scripts: Vec::new(),
         });
         super::invoice_tests::settle_reuse_checks_as_fresh(&mut state);
         let queued = match state.pending_signatures.front() {

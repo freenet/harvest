@@ -293,8 +293,9 @@ fn apply_set_payment_xpub(
 /// short of it -- and even then the store contract refuses to let that old
 /// order's payment settle a new one. Each step is one public-key derivation,
 /// so this is also the cost the scan adds to every invoice on a device whose
-/// count is already current.
-pub(crate) const PUBLISHED_INDEX_GAP: u32 = 100;
+/// count is already current. Defined in `harvest-common` because the UI uses
+/// it too, to decide when to offer the delegate an unmatched script again.
+pub(crate) use harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
 
 /// Raise `status.next_index` past every index of this key whose script
 /// appears in `published`, and return the new value.
@@ -314,10 +315,26 @@ fn apply_published_floor(
     status: &mut PaymentXpubStatus,
     published: &[Vec<u8>],
 ) -> Result<u32, String> {
+    published_floor_matches(status, published).map(|_| status.next_index)
+}
+
+/// [`apply_published_floor`], returning the published scripts the scan
+/// MATCHED rather than the new count.
+///
+/// The UI marks only these as accounted for (PR #83 review, round 2, Should
+/// Fix 2). A script sent but not matched is foreign, below the counter, or
+/// beyond the gap, and only the last kind can ever matter again; the UI
+/// offers unmatched scripts again once the counter has moved on, which is
+/// when a beyond-gap one can come into reach.
+fn published_floor_matches(
+    status: &mut PaymentXpubStatus,
+    published: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, String> {
     let mut remaining: std::collections::HashSet<&[u8]> =
         published.iter().map(Vec::as_slice).collect();
+    let mut matched = Vec::new();
     if remaining.is_empty() {
-        return Ok(status.next_index);
+        return Ok(matched);
     }
     let chain = AccountXpub::parse(&status.xpub)?.external_chain()?;
 
@@ -328,12 +345,13 @@ fn apply_published_floor(
     while index <= MAX_ORDER_INDEX && index < give_up_at && !remaining.is_empty() {
         let script = chain.script_at(index)?;
         if remaining.remove(script.as_slice()) {
+            matched.push(script);
             status.next_index = index + 1;
             give_up_at = status.next_index.saturating_add(PUBLISHED_INDEX_GAP);
         }
         index += 1;
     }
-    Ok(status.next_index)
+    Ok(matched)
 }
 
 /// Hand out the next address and advance the counter.
@@ -525,13 +543,21 @@ pub fn handle<S: SecretStore>(
             published_scripts,
         } => {
             let existing = load_payment_xpub(store);
+            let mut matched_scripts = Vec::new();
             let result =
                 apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|mut status| {
-                    apply_published_floor(&mut status, &published_scripts)?;
+                    matched_scripts = published_floor_matches(&mut status, &published_scripts)?;
                     save_payment_xpub(store, &status)?;
                     Ok(status)
                 });
-            BitcoinDelegateResponse::PaymentXpubSet { request_id, result }
+            if result.is_err() {
+                matched_scripts.clear();
+            }
+            BitcoinDelegateResponse::PaymentXpubSet {
+                request_id,
+                result,
+                matched_scripts,
+            }
         }
 
         BitcoinDelegateRequest::GetPaymentXpub => BitcoinDelegateResponse::PaymentXpub {
@@ -542,6 +568,7 @@ pub fn handle<S: SecretStore>(
             request_id,
             published_scripts,
         } => {
+            let mut matched_scripts = Vec::new();
             let result = match load_payment_xpub(store) {
                 None => Err(
                     "no payment key is set for this store yet. Add your wallet's native \
@@ -550,7 +577,8 @@ pub fn handle<S: SecretStore>(
                 ),
                 // Raised to the network's count FIRST, so the index handed out
                 // is past every published order of this key (harvest#77).
-                Some(mut status) => apply_published_floor(&mut status, &published_scripts)
+                Some(mut status) => published_floor_matches(&mut status, &published_scripts)
+                    .map(|matched| matched_scripts = matched)
                     .and_then(|_| apply_derive_order_address(&mut status))
                     .and_then(|derived| {
                         // Save the advanced counter BEFORE the address leaves
@@ -562,7 +590,15 @@ pub fn handle<S: SecretStore>(
                         Ok(derived)
                     }),
             };
-            BitcoinDelegateResponse::OrderAddress { request_id, result }
+            if result.is_err() {
+                // Nothing was saved, so nothing the scan matched is on record.
+                matched_scripts.clear();
+            }
+            BitcoinDelegateResponse::OrderAddress {
+                request_id,
+                result,
+                matched_scripts,
+            }
         }
 
         // `BitcoinDelegateRequest` is `#[non_exhaustive]` in harvest-common,
@@ -1356,6 +1392,51 @@ mod origin_gating_tests {
         {
             BitcoinDelegateResponse::OrderAddress { result, .. } => {
                 assert_eq!(result.expect("derived").index, 5);
+            }
+            other => panic!("expected OrderAddress, got {other:?}"),
+        }
+    }
+
+    /// **PR #83 round 2, Should Fix 2.** The delegate reports which of the
+    /// scripts it was sent it actually matched, so the UI marks only those as
+    /// accounted for. A foreign script and one beyond the scan's gap are sent
+    /// but not matched, and must not be reported.
+    #[test]
+    fn the_delegate_reports_only_the_scripts_it_matched() {
+        let chain = crate::bip32::AccountXpub::parse(SELLERS_KEY)
+            .expect("parse")
+            .external_chain()
+            .expect("chain");
+        let mine: Vec<Vec<u8>> = (0..2)
+            .map(|i| chain.script_at(i).expect("derive"))
+            .collect();
+        let beyond_gap = chain
+            .script_at(2 + PUBLISHED_INDEX_GAP + 5)
+            .expect("derive");
+        let foreign = vec![0x00, 0x14, 0xee];
+        let mut sent = mine.clone();
+        sent.push(beyond_gap);
+        sent.push(foreign);
+
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 9,
+                published_scripts: sent,
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::OrderAddress {
+                result,
+                matched_scripts,
+                ..
+            } => {
+                assert_eq!(result.expect("derived").index, 2);
+                assert_eq!(matched_scripts, mine);
             }
             other => panic!("expected OrderAddress, got {other:?}"),
         }

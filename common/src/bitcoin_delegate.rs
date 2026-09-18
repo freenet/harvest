@@ -150,6 +150,12 @@ pub struct DerivedAddress {
     pub address: String,
 }
 
+/// How many consecutive derivation indices past the last published order the
+/// delegate scans before concluding there are none further up. Shared so the
+/// UI knows when an unmatched script may have come within reach again; see
+/// the delegate's `apply_published_floor`.
+pub const PUBLISHED_INDEX_GAP: u32 = 100;
+
 /// Requests the UI sends the delegate about Bitcoin payments.
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -264,6 +270,10 @@ pub enum BitcoinDelegateResponse {
     PaymentXpubSet {
         request_id: u64,
         result: Result<PaymentXpubStatus, String>,
+        /// The request's `published_scripts` that the delegate matched to an
+        /// index of this key. See `DeriveOrderAddress`.
+        #[serde(default)]
+        matched_scripts: Vec<Vec<u8>>,
     },
     /// `None` means no xpub is configured, which is the honest first-run
     /// answer -- distinct from "we have not asked yet", which the UI tracks
@@ -274,6 +284,12 @@ pub enum BitcoinDelegateResponse {
     OrderAddress {
         request_id: u64,
         result: Result<DerivedAddress, String>,
+        /// The request's `published_scripts` that the delegate matched to an
+        /// index of the stored key, i.e. that its counter now accounts for.
+        /// A script sent but not listed here was foreign, already below the
+        /// counter, or past the scan's gap, and the UI may offer it again.
+        #[serde(default)]
+        matched_scripts: Vec<Vec<u8>>,
     },
 }
 
