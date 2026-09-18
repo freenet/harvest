@@ -3037,6 +3037,37 @@ impl AppState {
     /// decidable without a browser. [`Self::watch_purchase_addresses`] is the
     /// half that needs one.
     pub fn address_contracts_to_watch(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        self.our_order_addresses(store_contract_id, |_| true)
+    }
+
+    /// The address contracts of orders that are ours and still unsettled, so
+    /// a node whose copy was stale can be asked again (#67).
+    ///
+    /// The strict subset of [`Self::address_contracts_to_watch`] still worth
+    /// a question. An order that has moved past `AwaitingPayment` has its
+    /// answer, and one whose anchor has aged out of the payable window will
+    /// never get one, so both stop being asked about: that is what bounds a
+    /// tab left open on an invoice nobody paid, and it is the same rule
+    /// [`Self::worth_watching_for_payment`] applies to watch requests rather
+    /// than a second copy of it that could disagree.
+    pub fn address_contracts_to_reread(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
+        use harvest_common::payment::OrderStatus;
+        self.our_order_addresses(store_contract_id, |order| {
+            order.status == OrderStatus::AwaitingPayment && self.worth_watching_for_payment(order)
+        })
+    }
+
+    /// [`Self::address_contracts_to_watch`], for the orders `keep` accepts.
+    ///
+    /// One copy of the rule for which orders are this node's own, because two
+    /// copies could disagree about whose payment addresses this node
+    /// advertises an interest in, and that is the question the scoping exists
+    /// to answer.
+    fn our_order_addresses(
+        &self,
+        store_contract_id: &[u8],
+        keep: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+    ) -> Vec<[u8; 32]> {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
@@ -3060,7 +3091,7 @@ impl AppState {
         for order in &store.orders {
             let ours = bought.contains(&order.order.id)
                 || mine.contains(order.order.seller_fingerprint.as_str());
-            if !ours {
+            if !ours || !keep(order) {
                 continue;
             }
             // `None` for an order naming no contract build: there is nothing
@@ -3105,6 +3136,84 @@ impl AppState {
                 }
             });
         }
+    }
+
+    /// The address contracts to ask the node for again now, across every
+    /// store this tab is showing, recorded as asked for (#67).
+    ///
+    /// Returns the ids rather than sending the GETs, so what would be asked
+    /// for is decidable without a browser.
+    ///
+    /// Each id is registered in `address_contract_network` on the way out,
+    /// for the same reason [`Self::watch_purchase_addresses`] registers it:
+    /// an arriving state is routed to an address view by that map, so an
+    /// answer to an unregistered id would be tried as store state and
+    /// discarded. The subscription normally registers it first; this does not
+    /// depend on that having happened.
+    pub fn queue_due_address_rereads(&mut self, now_ms: u64) -> Vec<[u8; 32]> {
+        let mut wanted: Vec<[u8; 32]> = Vec::new();
+        for store_contract_id in self.browsing_stores.keys().cloned().collect::<Vec<_>>() {
+            for id in self.address_contracts_to_reread(&store_contract_id) {
+                if !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+        }
+
+        // An order that settled, or aged out, stops being asked about and
+        // stops being remembered.
+        self.bitcoin.address_rereads.retain(&wanted);
+
+        let due = self.bitcoin.address_rereads.due(&wanted, now_ms);
+        for id in &due {
+            self.bitcoin
+                .address_contract_network
+                .entry(id.to_vec())
+                .or_insert_with(crate::gateway::bitcoin_config::default_network);
+            self.bitcoin.address_rereads.note_asked(*id, now_ms);
+        }
+        due
+    }
+
+    /// Whether any unsettled order is being watched at all.
+    ///
+    /// Read before taking the state for writing, because taking it for
+    /// writing re-renders the app: a tab with nothing awaiting payment must
+    /// not repaint itself once a minute forever. The same reason
+    /// [`Self::watch_check_could_act`] exists.
+    pub fn address_reread_could_act(&self) -> bool {
+        self.browsing_stores.keys().any(|store_contract_id| {
+            !self
+                .address_contracts_to_reread(store_contract_id)
+                .is_empty()
+        })
+    }
+
+    /// [`Self::queue_due_address_rereads`], sent.
+    pub fn send_due_address_rereads(&mut self) {
+        let due = self.queue_due_address_rereads(now_ms());
+        #[cfg(target_arch = "wasm32")]
+        {
+            for id in due {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
+                    // Subscribing again as well as reading: a subscription
+                    // can lapse without the app being told, and re-asking is
+                    // the only moment this tab has a reason to repair it.
+                    //
+                    // A failure needs no handling. Nothing arrives, the order
+                    // stays unsettled, and it is due again shortly -- which is
+                    // the whole mechanism, not a fallback.
+                    if let Err(e) = crate::gateway::get_contract(&id, true).await {
+                        dioxus::logger::tracing::warn!(
+                            "could not ask again for an order's payment address: {e}"
+                        );
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = due;
     }
 
     /// Whether one of the SELLER's own orders has stopped being payable and
@@ -5242,6 +5351,36 @@ impl AppState {
     /// this app, and only orders issued under that fingerprint, so no node asks
     /// on behalf of anyone else's invoices. The Ghost Key is the store's
     /// verified seller key, which the request is bound to.
+    /// Whether a payment to this order could still arrive and matter.
+    ///
+    /// A buyer pays only while the anchor is within
+    /// [`harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS`], and a payment made
+    /// at that moment must still be found while it is buried, which is what
+    /// [`WATCH_PAST_ANCHOR_BLOCKS`] allows for. Past that nothing more is
+    /// coming, so both the watch requests and the address re-reads stop.
+    ///
+    /// Without a tip this answers `true`: a node that cannot see the chain
+    /// has not established that the window has closed, and treating that
+    /// silence as a verdict would stop watching an order that is still being
+    /// paid. The unknown is resolved in the direction that costs a request,
+    /// not the one that loses a payment.
+    fn worth_watching_for_payment(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.tip_height);
+        match (tip, order.order.anchor) {
+            (Some(tip), Some(anchor)) => {
+                tip.saturating_sub(anchor.height) <= WATCH_PAST_ANCHOR_BLOCKS
+            }
+            (None, Some(_)) => true,
+            // No buyer pays an order with no anchor, so there is nothing to
+            // watch for, now or later.
+            (_, None) => false,
+        }
+    }
+
     pub fn watches_wanted(
         &self,
         bridge: freenet_bitcoin_common::BridgeId,
@@ -5287,22 +5426,7 @@ impl AppState {
                             && !o.order.payment_script_pubkey.is_empty()
                             && o.order.trusted_bridges.contains(&bridge)
                     })
-                    .filter(|o| {
-                        let tip = self
-                            .bitcoin
-                            .tips
-                            .get(&o.order.network)
-                            .and_then(|tip| tip.tip_height);
-                        match (tip, o.order.anchor) {
-                            (Some(tip), Some(anchor)) => {
-                                tip.saturating_sub(anchor.height) <= WATCH_PAST_ANCHOR_BLOCKS
-                            }
-                            (None, Some(_)) => true,
-                            // No buyer pays an order with no anchor, so there
-                            // is nothing to watch for, now or later.
-                            (_, None) => false,
-                        }
-                    })
+                    .filter(|o| self.worth_watching_for_payment(o))
                     .collect();
                 orders.sort_by_key(|o| std::cmp::Reverse(o.order.anchor.map(|a| a.height)));
                 let wanted: Vec<crate::bitcoin_inbox::WatchWanted> = orders
@@ -5858,6 +5982,12 @@ pub struct BitcoinState {
     /// back, or one it could not use. See
     /// `AppState::stop_watch_requests_for`.
     pub watch_requests_stopped: HashSet<String>,
+    /// When each unsettled order's address contract was last asked for again.
+    ///
+    /// A subscription's one answer can be stale for tens of minutes, and
+    /// nothing tells the app when the node catches up, so an unsettled order
+    /// asks again on a widening interval. See `crate::address_reread`.
+    pub address_rereads: crate::address_reread::AddressRereads,
 }
 
 impl BitcoinState {
@@ -12318,6 +12448,173 @@ mod buy_flow_tests {
         assert!(
             state.publish_settled_orders(STORE).is_empty(),
             "a second notification must not send a second update"
+        );
+    }
+
+    /// **An order still awaiting payment asks for its address again.**
+    ///
+    /// The bug (#67): Harvest asked for an order's payment address once and
+    /// believed the answer for the life of the tab. A node that misses one
+    /// update serves its stale copy for tens of minutes and says nothing when
+    /// it heals, so a payment that had confirmed and been attested sat on
+    /// screen as "awaiting payment", and a reload did not help because a
+    /// reload also asks once.
+    ///
+    /// Asked with the address view already present and empty, which is the
+    /// exact shape of the live failure: a served answer, carrying no claims,
+    /// that nothing would ever question again.
+    #[test]
+    fn an_unsettled_order_asks_for_its_payment_address_again() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        let id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build");
+
+        assert!(
+            state.address_reread_could_act(),
+            "an unsettled order is a reason to look"
+        );
+        assert_eq!(
+            state.queue_due_address_rereads(0),
+            vec![id],
+            "the unsettled order's address is asked for again"
+        );
+        // And the answer can be routed when it arrives: an id the address
+        // map does not know is tried as store state and thrown away.
+        assert!(state
+            .bitcoin
+            .address_contract_network
+            .contains_key(id.as_slice()));
+    }
+
+    /// **An order that has been paid stops being asked about.**
+    ///
+    /// The re-read exists to settle an order. Once one is settled there is
+    /// nothing left to learn, and asking anyway would be a GET a minute for
+    /// every order a busy store ever completed.
+    #[test]
+    fn a_settled_order_stops_being_asked_about() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        assert!(
+            !state.queue_due_address_rereads(0).is_empty(),
+            "asked while awaiting"
+        );
+
+        // Publish the settlement back into the store's state, as the network
+        // would once the update lands.
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        for existing in store.orders.iter_mut() {
+            if existing.order.id == settled.order.id {
+                *existing = settled.clone();
+            }
+        }
+
+        assert!(
+            state.queue_due_address_rereads(60_000).is_empty(),
+            "a paid order is not asked about again"
+        );
+        assert!(
+            !state.address_reread_could_act(),
+            "and the tick stops taking the state for writing"
+        );
+        assert_eq!(
+            state.bitcoin.address_rereads.tracked(),
+            0,
+            "and it is forgotten rather than tracked for the session"
+        );
+    }
+
+    /// **An order nobody can pay any more stops being asked about.**
+    ///
+    /// What bounds a tab left open. The window is the one the watch requests
+    /// already use, so the two cannot disagree about when an invoice is
+    /// finished.
+    #[test]
+    fn an_order_past_the_payable_window_stops_being_asked_about() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        assert!(
+            !state.queue_due_address_rereads(0).is_empty(),
+            "asked while payable"
+        );
+
+        // The chain moves past the anchor's payable window, with room to
+        // bury a payment made at the last possible moment.
+        let far_past = TIP_HEIGHT + WATCH_PAST_ANCHOR_BLOCKS + 1;
+        state
+            .bitcoin
+            .tips
+            .entry(BitcoinNetwork::Signet)
+            .and_modify(|view| view.tip_height = Some(far_past));
+
+        assert!(
+            state.queue_due_address_rereads(10 * 60_000).is_empty(),
+            "an invoice nobody paid stops being asked about"
+        );
+    }
+
+    /// **The same address is not asked for twice in a minute.**
+    ///
+    /// The tick fires every minute for as long as anything is unsettled, so
+    /// without the spacing this is one GET per tick per order, and the
+    /// spacing is what makes a widening wait possible at all.
+    #[test]
+    fn the_same_address_is_not_asked_for_twice_in_a_minute() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+
+        assert_eq!(state.queue_due_address_rereads(0).len(), 1, "asked once");
+        assert!(
+            state.queue_due_address_rereads(1_000).is_empty(),
+            "and not again a second later"
+        );
+        assert_eq!(
+            state
+                .queue_due_address_rereads(crate::address_reread::FIRST_RETRY_MS)
+                .len(),
+            1,
+            "and again once the wait has passed"
+        );
+    }
+
+    /// **A stranger's order is never asked about.**
+    ///
+    /// The scoping rule of `address_contracts_to_watch`: subscribing to
+    /// every order a busy seller ever issued would advertise this node's
+    /// interest in payment addresses it has nothing to do with. The re-read
+    /// runs through the same walk, so this is the test that would fail if
+    /// the shared filter ever stopped applying it to one of the two callers.
+    #[test]
+    fn a_strangers_order_is_never_asked_about() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+
+        // Stop being the buyer of it, and own no store that issued it.
+        state.my_stores.clear();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .conversations
+            .clear();
+
+        assert!(
+            state.address_contracts_to_watch(STORE).is_empty(),
+            "the fixture no longer makes this order ours"
+        );
+        assert!(
+            state.queue_due_address_rereads(0).is_empty(),
+            "and a stranger's payment address is not asked about"
         );
     }
 

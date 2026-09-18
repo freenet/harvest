@@ -41,9 +41,18 @@ const REFRESH_EVERY_MS: u32 = 10 * 60_000;
 /// local work happens unless something is due.
 const WATCH_CHECK_EVERY_MS: u32 = 60_000;
 
+/// How often to look for an unsettled order's payment address that is due to
+/// be asked for again (#67).
+///
+/// The tick rate, not the ask rate: which addresses are actually due is
+/// `crate::address_reread`'s decision, and it widens the wait per address.
+/// This only has to fire often enough not to be the thing that delays it.
+const ADDRESS_REREAD_CHECK_EVERY_MS: u32 = 60_000;
+
 thread_local! {
     static GENERATIONS: RefCell<Option<BridgeGenerations>> = const { RefCell::new(None) };
     static WATCH_CHECK: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
+    static ADDRESS_REREAD: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
     static REFRESH: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
     static FAILURES: RefCell<std::collections::HashMap<Resolve, u32>> = RefCell::new(Default::default());
 }
@@ -86,6 +95,26 @@ pub fn start() {
                 };
                 if could_act {
                     APP_STATE.write().send_due_watch_requests();
+                }
+            })
+        });
+    });
+    // Asking again for the payment address of an order still awaiting
+    // payment. A subscription's one answer can be stale for tens of minutes
+    // and nothing announces the repair, so the only way a healed node reaches
+    // the screen is to ask it again. See `crate::address_reread`.
+    ADDRESS_REREAD.with(|timer| {
+        timer.borrow_mut().get_or_insert_with(|| {
+            gloo_timers::callback::Interval::new(ADDRESS_REREAD_CHECK_EVERY_MS, || {
+                // Peeked first: taking the state for writing re-renders the
+                // app, and a tab with nothing awaiting payment must not
+                // repaint once a minute for the life of the session.
+                let could_act = {
+                    use dioxus::prelude::ReadableExt;
+                    APP_STATE.peek().address_reread_could_act()
+                };
+                if could_act {
+                    APP_STATE.write().send_due_address_rereads();
                 }
             })
         });
