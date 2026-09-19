@@ -307,6 +307,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // fetch from `validate_state`. The first generation addressed
                 // by the store code; state and validity unchanged.
                 "7c56e044b2f69825f209500c54c433038e1be5b3e5cc59b78a92bf4173175f68",
+                // V18, from `git show f6afc74:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#93 phase 1a: a store key owns the
+                // store, and the state gained backings, retirements and the
+                // closed flag. The last generation owned by a Ghost Key.
+                "1e4eba431c84532ecc684d1d3d664f8d8cbde9156f7a4fcab2af0ca20fcbc79c",
             ],
         ),
         (
@@ -349,6 +354,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // artifact moves only because `harvest-common` is compiled
                 // into it.
                 "58c9632d415d46d333c25e6299878c736460854ca4cdd01e0162fda88ce1f22b",
+                // V13, from `git show bc57dac:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#93 phase
+                // 1a; this artifact moves only because `harvest-common` is
+                // compiled into it.
+                "bf1f3c47e6888c686ca9e6b74d9eee6692c94c9de6b3a7eed68a2a27e027a947",
             ],
         ),
         (
@@ -388,6 +398,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#52; this artifact moves only because
                 // `harvest-common` is compiled into it.
                 "f78ff5a230a63904705059cc1cb8e67dd54ee9f7a02662fa882b1557455a3913",
+                // V13, from `git show bc57dac:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#93 phase 1a; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "21b1bbedf8ce32df123a5b7af4b675654e47aceb017fee08c12d4e5c0fbedcc6",
             ],
         ),
     ];
@@ -471,6 +485,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // backup strings, the xpub and the private half of a feedback
             // token redact themselves under `Debug`. Wire unchanged.
             "4fae20e120a968fe6651529ed8eb36fa04bd98a8fcc6c52f69206cdb6fae1444".to_string(),
+            // V17, from `git show 0173527:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#93 phase 1a: the store-key requests and
+            // the `harvest:store_sk:` secret family.
+            "4d36b2a41c7f77d99ea39d0b5bbf565d8b62b22552aeda6249d6626b70392dea".to_string(),
         ],
     );
 }
@@ -854,6 +872,11 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // V17: the build at `bc57dac` (harvest#52), the first addressed by
         // the store code, 29B.
         (17, Code),
+        // V18: the build at `f6afc74` (#95). Still the code, 29B, and still
+        // the code of the seller's GHOST KEY: harvest#93 changed whose key
+        // the code is a prefix of, not the parameter encoding, so a Ghost
+        // Key's own probe derives it exactly as it derives V17.
+        (18, Code),
     ]
 };
 
@@ -1355,6 +1378,71 @@ fn a_code_addressed_store_is_carried_into_the_next_generation() {
     merged
         .verify(&merged, &store_params(&vk))
         .expect("the carried store is one the current contract accepts");
+}
+
+/// **The last Ghost-Key-owned generation carries forward as it is, and
+/// arrives unbacked** (harvest#93). Every store up to V18 was owned by the
+/// seller's Ghost Key. The current contract still accepts such a state -- its
+/// owner is a key, and every record verifies against it -- so the probe
+/// carries it forward by data transfer alone. But it has no backing, so every
+/// reader finds no current backing, and that is what sends its seller to the
+/// move in `backing_flow` rather than leaving them a store buyers cannot pay.
+///
+/// Mutated red by deriving V18 under the whole-key encoding
+/// (`LAST_WHOLE_KEY_STORE_PARAM_GENERATION` = 18): the probe then asks for an
+/// address V18 never had.
+#[test]
+fn a_ghost_key_owned_store_is_carried_forward_and_arrives_unbacked() {
+    use freenet_scaffold::ComposableState;
+    let vk = seller_vk();
+    let v18 = store_lineage()
+        .iter()
+        .find(|e| e.generation == 18)
+        .expect("V18 is recorded");
+    let v18_address = current_id(&v18.code_hash, &store_params_encoded());
+    let mut predecessor = store_with(&[signed_listing("Coffee")]);
+    predecessor.info = signed_store_info(1);
+    predecessor.owner = Some(vk);
+    let bytes = store_bytes(&predecessor);
+
+    let session = ProbeSession::start_with_candidates(
+        store_ops(),
+        StoreStateV1::default(),
+        store_candidates(&vk).expect("candidates"),
+        fold_all_policy(),
+    );
+    let (outcome, _) = run(session, |id| {
+        if id == v18_address {
+            Answer::State(bytes.clone())
+        } else {
+            Answer::Absent
+        }
+    });
+    let Outcome::Recovered { merged, source, .. } = outcome else {
+        panic!("expected a recovery, got {}", describe(&outcome));
+    };
+    assert_eq!(source, v18_address);
+    assert_eq!(merged.owner, Some(vk), "still owned by the Ghost Key");
+    merged
+        .verify(&merged, &store_params(&vk))
+        .expect("the current contract accepts a Ghost-Key-owned state as it is");
+    assert!(
+        harvest_common::backing::current_backing(&merged, |_| None).is_none(),
+        "and it arrives with no backing, so readers treat it as unbacked"
+    );
+}
+
+/// A store owned by a store key is probed at the addresses that key derives,
+/// which a Ghost Key's own probe cannot reach (harvest#93). So the next
+/// re-key finds it; see `migrate_ops::start_store_key_migration`.
+#[test]
+fn a_store_keys_candidates_are_its_own_and_not_its_ghost_keys() {
+    let ghost = seller_vk();
+    let store = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]).verifying_key();
+    let by_store_key = store_candidate_ids(&store).expect("candidates");
+    let by_ghost_key = store_candidate_ids(&ghost).expect("candidates");
+    assert_eq!(by_store_key.len(), store_lineage().len());
+    assert!(by_store_key.iter().all(|id| !by_ghost_key.contains(id)));
 }
 
 /// Fold-all reaches past the newest populated generation.
