@@ -6149,8 +6149,12 @@ impl AppState {
                 self.on_backing_accepted(*pending, scoped_payload, signature);
             }
             None => {
+                let from = match signer {
+                    Signer::GhostKey => "Ghost Key",
+                    Signer::StoreKey => "store key",
+                };
                 warn!(
-                    "a {signer:?} signature matches none of the {} outstanding signature request(s) \
+                    "a {from} signature matches none of the {} outstanding signature request(s) \
                      -- dropping it",
                     self.pending_signatures.len()
                 );

@@ -1042,9 +1042,13 @@ mod tests {
             R::MigrationMarker { .. } => (20, false),
             R::MigrationMarkerRecorded { .. } => (21, false),
             R::Error { .. } => (22, false),
+            // The store key's public half only; the seed never leaves.
+            R::StoreKeyCreated { .. } => (23, false),
+            // A signature over a store record, published as it is.
+            R::StoreUpdateSigned { .. } => (24, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 23;
+    const RESPONSE_VARIANTS: usize = 25;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1075,9 +1079,12 @@ mod tests {
             Q::RememberStore { .. } => (19, false),
             Q::SetStoreArchived { .. } => (20, false),
             Q::ListRememberedStores => (21, false),
+            Q::CreateStoreKey { .. } => (22, false),
+            // A store record to be signed and published.
+            Q::SignStoreUpdate { .. } => (23, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 22;
+    const REQUEST_VARIANTS: usize = 24;
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1210,6 +1217,7 @@ mod tests {
                     reputation_contract_id: vec![15u8; 32],
                     mailbox_contract_id: vec![16u8; 32],
                     store_contract_key: None,
+                    store_verifying_key: Some([17u8; 32]),
                 }],
             },
             R::RememberedStores {
@@ -1228,6 +1236,18 @@ mod tests {
             },
             R::Error {
                 message: "refused".into(),
+            },
+            R::StoreKeyCreated {
+                request_id: 43,
+                result: Ok([17u8; 32]),
+            },
+            R::StoreUpdateSigned {
+                request_id: 44,
+                store_verifying_key: [17u8; 32],
+                result: Ok(StoreKeySignature {
+                    scoped_payload: vec![18u8; 8],
+                    signature: vec![19u8; 64],
+                }),
             },
         ]
     }
@@ -1320,6 +1340,7 @@ mod tests {
                 store_contract_id: store(),
                 reputation_contract_id: vec![15u8; 32],
                 mailbox_contract_id: vec![16u8; 32],
+                store_verifying_key: Some([17u8; 32]),
             },
             Q::ListStores {
                 ghostkey_fingerprint: fp(),
@@ -1339,6 +1360,12 @@ mod tests {
                 archived: true,
             },
             Q::ListRememberedStores,
+            Q::CreateStoreKey { request_id: 43 },
+            Q::SignStoreUpdate {
+                request_id: 44,
+                store_verifying_key: [17u8; 32],
+                payload: vec![18u8; 8],
+            },
         ]
     }
 
