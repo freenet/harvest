@@ -290,6 +290,10 @@ pub struct AppState {
     /// not the store's.
     pub record_key_mismatch: HashSet<[u8; 32]>,
 
+    /// When each `pending_custody` request started, for its timeout
+    /// (`custody_flow::CUSTODY_TIMEOUT_MS`).
+    pub custody_started_ms: std::collections::BTreeMap<[u8; 32], u64>,
+
     /// (store key, backing key) pairs custody has been started for this
     /// session, so a store's state arriving again does not ask the vault
     /// again.
@@ -2644,6 +2648,10 @@ impl AppState {
                     // Key, or recover it here if this device has lost it
                     // (harvest#93 phase 1b). See `custody_flow`.
                     self.start_custody_for(&contract_id);
+                    // Details that arrive after this device derived the
+                    // store's keys are checked too, and a block lifts when a
+                    // later check agrees (#99 re-check).
+                    self.recheck_record_key(&contract_id);
 
                     // One of our stores, held by another key: say so, once.
                     if let Some(held) = self.foreign_store_owner(&contract_id) {
@@ -8692,6 +8700,39 @@ mod tests {
     const STORE_ID: [u8; 32] = [1u8; 32];
     const STORE_INBOX_KEY: [u8; 32] = [0x1b; 32];
     const STORE_RECORD_KEY: [u8; 4] = [0x2e; 4];
+
+    /// A pending edit of a store whose derived record key disagrees with
+    /// the published one is refused, not published (#99 re-check). Mutated
+    /// red by removing the check in `start_store_edit_if_ready`.
+    #[test]
+    fn an_edit_is_refused_while_the_record_key_disagrees() {
+        let mut state = seller_with_store(Some(published_info(1, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state.record_key_mismatch.insert(test_store_key());
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        assert!(queued_store_info(&state).is_none(), "nothing published");
+        assert!(
+            state.pending_store_edit.is_none(),
+            "and nothing left waiting"
+        );
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("different record key")));
+
+        state.record_key_mismatch.clear();
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        assert!(
+            queued_store_info(&state).is_some(),
+            "published once it agrees"
+        );
+    }
 
     /// A store with its own key publishes the keys its store key derives
     /// (harvest#93 phase 1b), not the per-device key of its Ghost Key, and

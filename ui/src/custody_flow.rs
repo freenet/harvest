@@ -74,6 +74,14 @@ pub enum CustodyPurpose {
     Recover(custody::WrappedStoreKey),
 }
 
+/// How long a custody request may wait on the vault and then the Harvest
+/// delegate before it is given up (#99 re-check): the same bound watch
+/// requests use. Without it, a send that failed, a bare delegate `Error`
+/// (which names no request) or no answer at all left the request pending
+/// for the session, and a pending custody request holds back watch
+/// requests and every other custody request.
+pub(crate) const CUSTODY_TIMEOUT_MS: u64 = crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS;
+
 /// A custody request waiting on the vault, then on the Harvest delegate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CustodyRequest {
@@ -136,10 +144,50 @@ impl AppState {
         self.custody_attempted.insert((store, request.backer));
         let fingerprint = request.fingerprint.clone();
         self.pending_custody.insert(store, request);
+        self.custody_started_ms
+            .insert(store, crate::state::now_ms());
         #[cfg(target_arch = "wasm32")]
-        spawn_wrap_signature_request(fingerprint, store);
+        {
+            spawn_wrap_signature_request(fingerprint, store);
+            wasm_bindgen_futures::spawn_local(async {
+                gloo_timers::future::TimeoutFuture::new(CUSTODY_TIMEOUT_MS as u32).await;
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .expire_custody(crate::state::now_ms());
+            });
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = fingerprint;
+    }
+
+    /// Give up every custody request older than [`CUSTODY_TIMEOUT_MS`], say
+    /// so, and let the vault take the next one. The attempt stays recorded,
+    /// so it is not retried until a reload.
+    pub(crate) fn expire_custody(&mut self, now_ms: u64) {
+        let started = &self.custody_started_ms;
+        let expired: Vec<[u8; 32]> = self
+            .pending_custody
+            .keys()
+            .filter(|store| {
+                started
+                    .get(*store)
+                    .is_none_or(|t| now_ms.saturating_sub(*t) >= CUSTODY_TIMEOUT_MS)
+            })
+            .copied()
+            .collect();
+        for store in &expired {
+            self.pending_custody.remove(store);
+            self.custody_started_ms.remove(store);
+        }
+        if !expired.is_empty() {
+            self.notifications.push(
+                "Backing up or recovering your store's key did not finish: the Ghost Key vault \
+                 or the Harvest delegate did not answer. Reload to try again."
+                    .into(),
+            );
+            self.start_custody_where_needed();
+        }
     }
 
     /// Re-decide custody for every loaded store: when the Ghost Keys
@@ -281,7 +329,7 @@ impl AppState {
             }
         };
         #[cfg(target_arch = "wasm32")]
-        crate::state::spawn_harvest_request(request, "a custody request");
+        spawn_custody_request(store, request);
         #[cfg(not(target_arch = "wasm32"))]
         self.custody_sent.push(request);
     }
@@ -352,6 +400,14 @@ impl AppState {
     /// The registration a recovered store gets: its record from its published
     /// details, its mailbox derived from the backing Ghost Key (where the
     /// mailbox is still addressed; see `docs/design/entity-model.md`).
+    ///
+    /// KNOWN LIMIT (#99 re-check), left for the phase that re-addresses the
+    /// mailbox by the store key (1d): the mailbox is derived from the
+    /// RECOVERING backer, and the store's mailbox was made by the Ghost Key
+    /// that created it. They are the same Ghost Key until a store has had a
+    /// second backer, which nothing in the UI does yet (no rotation
+    /// control); once it can, a device recovering through the second backer
+    /// would register a mailbox the store never used.
     fn recovered_registration(
         &self,
         pending: &CustodyRequest,
@@ -417,16 +473,42 @@ impl AppState {
                 return;
             }
         };
+        self.check_published_record_key(&store, &info);
+        self.store_subkeys.insert(store, info);
+        self.fill_creation_from_subkeys(store);
+        self.start_store_creation_if_ready();
+        self.start_store_edit_if_ready();
+    }
+
+    /// Check the record key again for the store `store_contract_id`, if this
+    /// device has derived its store's subkeys.
+    pub(crate) fn recheck_record_key(&mut self, store_contract_id: &[u8]) {
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.backing_state.owner)
+            .map(|k| k.to_bytes())
+        else {
+            return;
+        };
+        if let Some(info) = self.store_subkeys.get(&owner).cloned() {
+            self.check_published_record_key(&owner, &info);
+        }
+    }
+
+    /// Fill the pending creation for the store key `store` from the subkeys
+    /// this session holds for it. Whether they were there.
+    pub(crate) fn fill_creation_from_subkeys(&mut self, store: [u8; 32]) -> bool {
+        let Some(info) = self.store_subkeys.get(&store) else {
+            return false;
+        };
         if let Some(pending) = self.pending_store_creation.as_mut() {
             if pending.store_verifying_key == Some(store) {
                 pending.rsa_public_key_der = Some(info.record_public_key.clone());
                 pending.encryption_public_key = Some(info.inbox_public_key);
             }
         }
-        self.check_published_record_key(&store, &info);
-        self.store_subkeys.insert(store, info);
-        self.start_store_creation_if_ready();
-        self.start_store_edit_if_ready();
+        true
     }
 
     /// The record key a store publishes must be the one this device derives
@@ -445,8 +527,11 @@ impl AppState {
         });
         if published.is_some_and(|published| published != info.record_public_key) {
             // Blocked, not only reported (#99 review): an edit from here
-            // would publish a record key that is not the store's.
-            self.record_key_mismatch.insert(*store);
+            // would publish a record key that is not the store's. Said once,
+            // not on every state arrival.
+            if !self.record_key_mismatch.insert(*store) {
+                return;
+            }
             self.notifications.push(
                 "This device derives a different record key for your store than the one it \
                  publishes, so it will not publish the store's details: its build of Harvest \
@@ -457,6 +542,41 @@ impl AppState {
             self.record_key_mismatch.remove(store);
         }
     }
+}
+
+/// Send a custody request to the Harvest delegate; if it cannot be sent,
+/// give the request up and say so, rather than leave it pending (#99
+/// re-check).
+#[cfg(target_arch = "wasm32")]
+fn spawn_custody_request(store: [u8; 32], request: harvest_common::HarvestDelegateRequest) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::{ReadableExt, WritableExt};
+        let fail = |why: String| {
+            dioxus::logger::tracing::warn!("custody: {why}");
+            let mut state = crate::gateway::APP_STATE.write();
+            state.pending_custody.remove(&store);
+            state.notifications.push(format!(
+                "Your store's key could not be backed up or recovered: {why}. Reload to try again."
+            ));
+        };
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .harvest_delegate_key
+            .clone()
+        else {
+            fail("the Harvest delegate is not registered".into());
+            return;
+        };
+        match harvest_common::to_cbor(&request) {
+            Ok(payload) => {
+                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await
+                {
+                    fail(format!("could not reach the Harvest delegate: {e}"));
+                }
+            }
+            Err(e) => fail(format!("could not encode the request: {e}")),
+        }
+    });
 }
 
 /// Ask the vault for the Ghost Key's signature over a store's wrap message.
@@ -790,6 +910,60 @@ mod tests {
                 .map(|r| r.purpose.clone()),
             Some(CustodyPurpose::Wrap)
         );
+    }
+
+    /// A custody request that nothing answers is given up after
+    /// `CUSTODY_TIMEOUT_MS`, and the seller told, so it does not hold the
+    /// vault for the session (#99 re-check). Mutated red by keeping it.
+    #[test]
+    fn an_unanswered_custody_request_times_out() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        let started = state.custody_started_ms[&store_vk().to_bytes()];
+        state.expire_custody(started + CUSTODY_TIMEOUT_MS - 1);
+        assert!(!state.pending_custody.is_empty(), "not yet");
+        state.expire_custody(started + CUSTODY_TIMEOUT_MS);
+        assert!(state.pending_custody.is_empty());
+        assert!(!state.user_signature_under_way(), "the vault is free again");
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("did not finish")));
+    }
+
+    /// Store details that arrive after the subkeys are checked too, and the
+    /// block lifts when a later check agrees (#99 re-check). Mutated red by
+    /// not re-checking, and by never clearing the block.
+    #[test]
+    fn a_record_key_block_follows_the_published_details() {
+        let mut state = backed_store();
+        state.on_delegate_response(subkeys(vec![9, 9, 9]));
+        assert!(
+            state.record_key_mismatch.is_empty(),
+            "nothing published yet"
+        );
+
+        let set_published = |state: &mut AppState, key: Vec<u8>| {
+            state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
+                Some(harvest_common::store::StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: FINGERPRINT.to_string(),
+                    reputation_contract_id: [0x0e; 32],
+                    store_name: "Bean Shop".to_string(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    record_public_key: Some(key),
+                });
+        };
+        set_published(&mut state, vec![1, 2, 3]);
+        state.recheck_record_key(&[ID; 32]);
+        assert!(state.record_key_mismatch.contains(&store_vk().to_bytes()));
+
+        set_published(&mut state, vec![9, 9, 9]);
+        state.recheck_record_key(&[ID; 32]);
+        assert!(state.record_key_mismatch.is_empty(), "lifted");
     }
 
     /// With no Harvest delegate registered, a wrap signature is not left

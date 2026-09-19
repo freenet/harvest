@@ -1022,8 +1022,10 @@ pub struct StoreStateV1 {
     pub closed: ClosedV1,
     /// The store key, wrapped to each backing Ghost Key, one copy per
     /// (backer, webapp scope), each signed by the store key (harvest#93
-    /// phase 1b). A copy is kept exactly while its backer holds a backing
-    /// that is not retired: the retirement is the tombstone. See
+    /// phase 1b). A copy is kept unless its backer is retired (the
+    /// retirement is the tombstone) or its slot is cut by the store-wide
+    /// bound; it need not name a backing the store holds, since it may
+    /// arrive first. See
     /// [`crate::custody`] and [`StoreStateV1::normalize_backings`].
     #[serde(
         default,

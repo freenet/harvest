@@ -272,8 +272,14 @@ impl AppState {
                     pending.store_verifying_key = Some(key);
                 }
                 // The record and inbox keys derive from the store key
-                // (harvest#93 phase 1b); creation waits on them.
-                self.request_store_subkeys(key);
+                // (harvest#93 phase 1b); creation waits on them. A retry
+                // gets the same key back, whose subkeys this session may
+                // already hold: use them, or the delegate, asked once per
+                // session, is never asked again and creation waits forever
+                // (#99 re-check).
+                if !self.fill_creation_from_subkeys(key) {
+                    self.request_store_subkeys(key);
+                }
                 self.start_store_creation_if_ready();
             }
             Err(why) => {
@@ -835,8 +841,21 @@ pub(crate) mod tests {
             .expect("started");
         let pending = state.pending_store_creation.as_mut().unwrap();
         pending.certificate_pem = "CERT".to_string();
-        pending.rsa_public_key_der = Some(vec![1]);
         request
+    }
+
+    /// The Harvest delegate's answer to `GetStoreSubkeys` for `store_key()`,
+    /// as the real path receives it (#99 re-check: a retry must not depend
+    /// on a hand-filled record key).
+    fn answer_subkeys(state: &mut AppState) {
+        state.on_delegate_response(HarvestDelegateResponse::StoreSubkeys {
+            request_id: 0,
+            store_verifying_key: store_key().verifying_key().to_bytes(),
+            result: Ok(harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [0x1b; 32],
+                record_public_key: vec![0x2e; 4],
+            }),
+        });
     }
 
     /// A publish that failed after both keys signed the backing is retried
@@ -852,6 +871,7 @@ pub(crate) mod tests {
             request_id: request,
             result: Ok(store_key().verifying_key().to_bytes()),
         });
+        answer_subkeys(&mut state);
         let dated = queued_statement(&state).expect("asked to back");
         state.on_ghostkey_response(vault_answer(&ghost(), &dated));
         state.on_delegate_response(store_key_answer(&store_key(), &dated));
@@ -860,6 +880,9 @@ pub(crate) mod tests {
         state.store_creation_failed("the node refused the PUT");
         assert!(state.store_creation_in_flight.is_none());
 
+        // The retry: the delegate answers the same key, and its subkeys are
+        // already known from the first attempt, so nothing is asked of the
+        // delegate again (#99 re-check: this hung before).
         let request = started(&mut state);
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
             request_id: request,
@@ -927,6 +950,7 @@ pub(crate) mod tests {
             request_id: request,
             result: Ok(store_key().verifying_key().to_bytes()),
         });
+        answer_subkeys(&mut state);
         assert!(!state.pending_signatures.is_empty(), "waiting on the vault");
         state.cancel_store_creation();
         assert!(state.store_creation_in_flight.is_none());
@@ -940,6 +964,7 @@ pub(crate) mod tests {
             request_id: request,
             result: Ok(store_key().verifying_key().to_bytes()),
         });
+        answer_subkeys(&mut state);
         let dated = queued_statement(&state).expect("asked to back");
         state.on_ghostkey_response(vault_answer(&ghost(), &dated));
         state.on_delegate_response(store_key_answer(&store_key(), &dated));

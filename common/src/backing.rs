@@ -1718,6 +1718,57 @@ mod tests {
         assert_eq!(scopes, (10..10 + max as u8).collect::<Vec<_>>());
     }
 
+    /// More copy-only backers than the store-wide bound: every merge keeps
+    /// at most `MAX_BACKINGS` of them, the smallest keys, and obeys the
+    /// merge laws (#99 re-check: a copy's backer takes a slot). Mutated red
+    /// by leaving copies out of the slot ranking.
+    #[test]
+    fn copy_only_backers_past_the_bound_keep_the_smallest_slots() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let keys: Vec<SigningKey> = (0..MAX_BACKINGS as u32 + 8)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&(i + 5000).to_le_bytes());
+                SigningKey::from_bytes(&seed)
+            })
+            .collect();
+        let copies: Vec<_> = keys.iter().map(|k| copy(k, 7, 1)).collect();
+        let mut sorted: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        sorted.sort();
+        let smallest: std::collections::BTreeSet<[u8; 32]> =
+            sorted[..MAX_BACKINGS].iter().copied().collect();
+        let mut rng = Rng::new(0x5107_b0d5);
+        let mut states = Vec::new();
+        for _ in 0..16 {
+            let c: Vec<_> = copies
+                .iter()
+                .filter(|_| rng.below(3) != 0)
+                .cloned()
+                .collect();
+            states.push(with_copies(vec![], vec![], c).expect("generated state"));
+        }
+        let all = with_copies(vec![], vec![], copies.clone()).expect("the union");
+        assert_eq!(all.copies.records.len(), MAX_BACKINGS);
+        assert!(all
+            .copies
+            .records
+            .values()
+            .all(|c| smallest.contains(&c.copy.backer.to_bytes())));
+        assert_laws(
+            &states,
+            150,
+            &mut rng,
+            |a, b| {
+                let mut merged = a.clone();
+                merged.merge(&a.clone(), &params(), b).expect("never fails");
+                merged.verify(&merged, &params()).expect("valid");
+                assert!(merged.copies.records.len() <= MAX_BACKINGS);
+                merged
+            },
+            |s| crate::to_cbor(s).unwrap(),
+        );
+    }
+
     /// Copies obey the merge laws with backings, retirements and the bound
     /// in play. Seeded; byte-level.
     #[test]
