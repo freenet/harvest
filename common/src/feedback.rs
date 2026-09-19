@@ -87,11 +87,15 @@ impl FeedbackToken {
 impl core::fmt::Debug for FeedbackToken {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use crate::delegate::Redacted;
+        // Destructured, so a new field does not compile until somebody
+        // decides whether it may print.
+        let Self {
+            target_reputation_contract,
+            nonce: _,
+            entry_key: _,
+        } = self;
         f.debug_struct("FeedbackToken")
-            .field(
-                "target_reputation_contract",
-                &self.target_reputation_contract,
-            )
+            .field("target_reputation_contract", target_reputation_contract)
             .field("nonce", &Redacted)
             .field("entry_key", &Redacted)
             .finish()

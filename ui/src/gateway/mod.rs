@@ -15,6 +15,9 @@ pub mod mailbox_ops;
 // Secret-free one-line descriptions of delegate traffic: the only way a
 // response reaches a log (harvest#94).
 pub mod log_summary;
+// The call-site guard for `log_summary` (test-only; see its module docs).
+#[cfg(test)]
+mod log_scan;
 // The migration probe's I/O half. wasm-only: it exists to drive the gateway's
 // shared response handler, which has no native counterpart. Every decision it
 // makes lives in `crate::migrate`, which is target-independent and tested on

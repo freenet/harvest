@@ -781,15 +781,24 @@ impl core::fmt::Debug for ConversationKey {
 
 impl core::fmt::Debug for TransactionRecord {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Destructured, so a new field does not compile until somebody
+        // decides whether it may print.
+        let Self {
+            transaction_id,
+            our_token,
+            our_blinded_token: _,
+            blind_signature,
+            created_at,
+        } = self;
         f.debug_struct("TransactionRecord")
-            .field("transaction_id", &self.transaction_id)
-            .field("our_token", &self.our_token)
+            .field("transaction_id", transaction_id)
+            .field("our_token", our_token)
             .field("our_blinded_token", &Redacted)
             .field(
                 "blind_signature",
-                &self.blind_signature.as_ref().map(|_| Redacted),
+                &blind_signature.as_ref().map(|_| Redacted),
             )
-            .field("created_at", &self.created_at)
+            .field("created_at", created_at)
             .finish()
     }
 }

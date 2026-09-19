@@ -185,14 +185,17 @@ fn handle_request(
                 ApplicationMessage::new(response_bytes),
             )])
         }
-        Err(harvest_decode_err) => {
-            let request: BitcoinDelegateRequest =
-                from_cbor(payload).map_err(|bitcoin_decode_err| {
-                    DelegateError::Other(format!(
-                        "payload is neither a HarvestDelegateRequest ({harvest_decode_err}) nor a \
-                     BitcoinDelegateRequest ({bitcoin_decode_err})"
-                    ))
-                })?;
+        Err(_) => {
+            // Not serde's messages: where it meets a string it did not expect
+            // it quotes it, and a request's strings include a backup and an
+            // xpub. This error reaches the UI's log (harvest#96 review).
+            let request: BitcoinDelegateRequest = from_cbor(payload).map_err(|_| {
+                DelegateError::Other(format!(
+                    "payload is neither a HarvestDelegateRequest nor a BitcoinDelegateRequest \
+                     ({})",
+                    payload_shape(payload)
+                ))
+            })?;
 
             let response = bitcoin::handle(&mut CtxSecrets(ctx), origin, request)?;
 
@@ -203,6 +206,33 @@ fn handle_request(
                 ApplicationMessage::new(response_bytes),
             )])
         }
+    }
+}
+
+/// What a payload that did not decode looked like, without its contents:
+/// the CBOR enum variant, if it is one and the name is a plain identifier,
+/// and the length. The UI's `gateway::log_summary::payload_shape` is the same
+/// rule on the other side of the wire.
+fn payload_shape(payload: &[u8]) -> String {
+    let variant = from_cbor::<ciborium::Value>(payload)
+        .ok()
+        .and_then(|value| match value {
+            ciborium::Value::Text(name) => Some(name),
+            ciborium::Value::Map(mut entries) if entries.len() == 1 => {
+                match entries.pop().map(|(key, _)| key) {
+                    Some(ciborium::Value::Text(name)) => Some(name),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .filter(|name| {
+            (1..=64).contains(&name.len())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    match variant {
+        Some(name) => format!("variant `{name}`, {} bytes", payload.len()),
+        None => format!("{} bytes", payload.len()),
     }
 }
 
@@ -291,6 +321,45 @@ mod boundary_tests {
             DelegateError::Other(message) => message,
             other => panic!("expected a refusal message, got {other:?}"),
         }
+    }
+
+    /// **A request that does not decode is refused without quoting it**
+    /// (harvest#96 review). serde quotes a string it did not expect -- here
+    /// an xpub-shaped value where an enum belongs, the shape a version skew
+    /// takes -- and this error reaches the UI's `Gateway error` log line.
+    #[test]
+    fn an_undecodable_request_is_refused_without_quoting_it() {
+        #[derive(serde::Serialize)]
+        enum Skewed {
+            SetPaymentXpub {
+                request_id: u64,
+                xpub: String,
+                network: String,
+            },
+        }
+        const SECRET: &str = "zpubSECRETXPUB";
+        let payload = to_cbor(&Skewed::SetPaymentXpub {
+            request_id: 1,
+            xpub: "x".into(),
+            network: SECRET.into(),
+        })
+        .expect("cbor");
+        // Precondition: serde does quote it.
+        let serde_says = from_cbor::<BtcReq>(&payload).expect_err("must not decode");
+        assert!(serde_says.contains(SECRET), "{serde_says}");
+
+        let message = match handle_request(&mut ctx(), Some(&harvest()), &payload) {
+            Err(DelegateError::Other(message)) => message,
+            other => panic!("expected a refusal message, got {other:?}"),
+        };
+        assert!(!message.contains(SECRET), "{message}");
+        assert!(
+            message.contains(&format!(
+                "variant `SetPaymentXpub`, {} bytes",
+                payload.len()
+            )),
+            "{message}"
+        );
     }
 
     /// The reported defect, at the dispatcher: a `SetPaymentXpub` from a web
