@@ -1888,14 +1888,17 @@ from the phase 1 API sketch and what it leaves for later.
   keeps. The contract checks the signature and the copy's shape. It cannot
   check that a ciphertext opens, and does not need to: the delegate checks
   that the recovered seed is this store's key before keeping it.
-- **The retirement is the tombstone.** A copy is kept exactly while its
-  backer holds a backing that is not retired
-  (`StoreStateV1::normalize_copies`, called from `normalize_backings`), so
-  one signed retirement stops a key being current and stops it recovering
-  the store key from state. A copy that arrives after the retirement, from
-  a stale peer or written under a new scope, is dropped. `verify` refuses a
-  state holding a copy for a key that does not back the store, or whose
-  backing is retired.
+- **The retirement is the tombstone.** A copy is kept unless its backer is
+  retired (`StoreStateV1::normalize_copies`, called from
+  `normalize_backings`), so one signed retirement stops a key being current
+  and stops it recovering the store key from state, whichever arrives
+  first. A copy that arrives after the retirement, from a stale peer or
+  written under a new scope, is dropped. A copy need NOT name a backing the
+  replica holds: the first build required one, which lost a copy for good
+  when it arrived before its backing, the same arrival-order fault the #98
+  merge-law re-check found in retirements. A copy's backer takes a slot in
+  the store-wide bound, like a backing or a retirement. `verify` refuses a
+  state holding a copy for a retired key.
 - **At most four scopes per backer** (`MAX_SCOPES_PER_BACKER`). Past it the
   smallest scope bytes are kept. That is top-N over the slot, the same
   argument as the backings bound, so the merge stays total and associative.
@@ -1957,8 +1960,24 @@ from the phase 1 API sketch and what it leaves for later.
 - A store key and its copies exist only for stores created (or moved) by
   this build. Nothing published since phase 1a, because 1a, 1b and 1c are
   merged and published together, so no 1a-only store needs a copy.
-- Recovery needs the backing Ghost Key connected in the tab's vault. A
-  device with no backing Ghost Key cannot recover, by design.
+- Recovery needs a backing Ghost Key connected in the tab's vault, any
+  whose backing is not retired and which has a copy, not only the current
+  one. A device with no backing Ghost Key cannot recover, by design.
+- **One vault prompt at a time.** A vault refusal names no request, so
+  custody starts only while nothing else waits on the vault, and counts as
+  the seller's own vault work while it waits. It is decided again when the
+  Ghost Key list, the store list or a vault answer arrives.
+- **A record-key mismatch blocks publishing** the store's details from that
+  device, and a recovered key is checked before anything is published.
+- **Blind signing still uses the per-device key.** A new store's record is
+  addressed by the store-derived record key, so a feedback token signed
+  with the Ghost Key's per-device RSA key would not verify against it.
+  Feedback submission is not wired yet (#53), so nothing reaches it; the
+  store-key path belongs with that work.
+- The Harvest web app's origin is trusted with the seed in principle: it
+  supplies the wrap signature, so a UI built to could open a copy. Keeping
+  the seed out of the UI is how this UI is built, not something the
+  delegate enforces.
 - Recovery runs when the store's state is loaded on the device. A device
   that does not know about the store (a new device, or one whose
   registrations are gone) finds it by opening the store's link; nothing yet
