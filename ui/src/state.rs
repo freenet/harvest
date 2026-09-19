@@ -287,6 +287,16 @@ pub struct AppState {
     /// late failure of the first would then wipe it.
     pub store_publishing: bool,
 
+    /// A creation refused because its Ghost Key already backs a store, kept
+    /// so the seller can be asked whether they meant to open a second one
+    /// (harvest#93 section 6.2). Cleared when they answer either way.
+    pub second_store_offer: Option<SecondStoreOffer>,
+
+    /// Off-target only: retirements that would have been published, so the
+    /// retire flow can be followed in a test.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub retirements_published: Vec<(Vec<u8>, harvest_common::backing::AuthorizedRetirement)>,
+
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -396,6 +406,11 @@ pub struct AppState {
 /// that supply the rest of its inputs. See `start_store_creation_if_ready`.
 #[derive(Clone, Debug)]
 pub struct PendingStoreCreation {
+    /// The seller said, on purpose, that this Ghost Key may back a second
+    /// store (harvest#93 section 6.2). Carried into `CreateStoreKey` so the
+    /// delegate's own one-store rule lets it through, and it turns off this
+    /// tab's check too.
+    pub another_store: bool,
     pub ghostkey_fingerprint: String,
     pub seller_verifying_key_bytes: [u8; 32],
     /// Filled by the ghostkey delegate's `Certificate` (or `GhostKeyDetail`)
@@ -903,6 +918,8 @@ pub enum PendingSignature {
     /// The store key's acceptance of that statement, from the Harvest
     /// delegate.
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
+    /// The store key's retirement of a Ghost Key's backing (harvest#93).
+    Retirement(crate::backing_flow::PendingRetirement),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -932,6 +949,7 @@ impl PendingSignature {
                     backing: pending.statement.clone(),
                 })
             }
+            PendingSignature::Retirement(pending) => harvest_common::to_cbor(&pending.retirement()),
         }
     }
 
@@ -948,12 +966,32 @@ impl PendingSignature {
             PendingSignature::Listing(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
-            | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
+            | PendingSignature::BackingAcceptance(_)
+            | PendingSignature::Retirement(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_) | PendingSignature::BackingStatement(_) => {
                 Signer::GhostKey
             }
         }
     }
+}
+
+/// A refused creation, waiting on the seller's answer to "open a second
+/// store under this Ghost Key anyway?".
+///
+/// The refusal alone is a dead end: a Ghost Key that already backs a store
+/// cannot back another, and until the seller retires the first backing
+/// (My Store offers that) nothing else can be created under that key. Some
+/// sellers do want two stores under one key, knowing both then read as
+/// unbacked until one backing is retired, so the refusal is escapable rather
+/// than final.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SecondStoreOffer {
+    pub fingerprint: String,
+    pub seller_verifying_key_bytes: [u8; 32],
+    /// The store this Ghost Key already backs, as the refusal named it.
+    pub other_store: String,
+    pub details: StoreDetails,
+    pub carried_listings: Vec<harvest_common::listing::Listing>,
 }
 
 /// What a seller has typed to issue one invoice, before it has an address.
@@ -5893,6 +5931,21 @@ impl AppState {
                 Err(why) => self.store_key_signature_failed(request_id, &why),
             },
 
+            HarvestDelegateResponse::StoreRetired {
+                ghostkey_fingerprint,
+                store_verifying_key,
+                removed,
+            } => {
+                info!(
+                    "Delegate {} the registration of a retired store for {ghostkey_fingerprint}",
+                    if removed { "removed" } else { "did not hold" }
+                );
+                // Whatever the delegate held, this device no longer lists it.
+                if let Some(stores) = self.my_stores.get_mut(&ghostkey_fingerprint) {
+                    stores.retain(|s| s.store_verifying_key != Some(store_verifying_key));
+                }
+            }
+
             HarvestDelegateResponse::Error { message } => {
                 // A creation waiting on `CreateStoreKey` never gets its
                 // answer once the delegate has refused (#98 review, L1): an
@@ -6179,6 +6232,9 @@ impl AppState {
             }
             Some(PendingSignature::BackingAcceptance(pending)) => {
                 self.on_backing_accepted(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Retirement(pending)) => {
+                self.on_retirement_signed(pending, scoped_payload, signature);
             }
             None => {
                 let from = match signer {
@@ -8388,6 +8444,7 @@ mod tests {
 
     fn pending_creation() -> PendingStoreCreation {
         PendingStoreCreation {
+            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [7u8; 32],
             certificate_pem: String::new(),
@@ -8548,7 +8605,8 @@ mod tests {
                 | PendingSignature::Order(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_) => None,
+                | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_) => None,
             })
     }
 
@@ -9086,7 +9144,8 @@ mod tests {
                 | PendingSignature::Order(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_) => None,
+                | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_) => None,
             })
             .collect();
         assert_eq!(
@@ -9495,6 +9554,7 @@ mod tests {
     fn a_ghostkey_error_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
+            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -9531,6 +9591,7 @@ mod tests {
     fn key_not_found_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
+            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -11792,6 +11853,7 @@ mod mailbox_read_tests {
         // reaching for the wrong fingerprint would most naturally pick up.
         let mut state = AppState {
             pending_store_creation: Some(PendingStoreCreation {
+                another_store: false,
                 ghostkey_fingerprint: "someone-else".to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 certificate_pem: String::new(),
@@ -12141,6 +12203,7 @@ mod delegate_correlation_tests {
     fn with_another_creation_in_flight() -> AppState {
         AppState {
             pending_store_creation: Some(PendingStoreCreation {
+                another_store: false,
                 ghostkey_fingerprint: THEIRS.to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 // Empty on purpose: `start_store_creation_if_ready` gates on

@@ -224,6 +224,13 @@ fn IdentityCard(
         APP_STATE.read().store_creation_in_flight.as_deref() == Some(identity.fingerprint.as_str());
     // No Cancel once the PUTs have started (#98 re-check).
     let publishing = APP_STATE.read().store_publishing;
+    // A creation this Ghost Key's existing backing refused, waiting on the
+    // seller's answer (harvest#93 section 6.2).
+    let second_store = APP_STATE
+        .read()
+        .second_store_offer
+        .clone()
+        .filter(|offer| offer.fingerprint == identity.fingerprint);
     // A store made before revision 2 that has not loaded yet: offering
     // "Create Store" now would make a second store instead of moving this
     // one (#98 review, L3).
@@ -374,6 +381,48 @@ fn IdentityCard(
             }
         }
 
+        if let Some(offer) = second_store {
+            div { class: "store-share",
+                p { class: "text-warning",
+                    "This Ghost Key already backs {offer.other_store}. A Ghost Key backs one \
+                     store at a time, so opening a second one under it makes buyers treat \
+                     BOTH as unbacked until one backing is retired."
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| {
+                        let started = APP_STATE.write().confirm_second_store();
+                        match started {
+                            Ok(request) => {
+                                #[cfg(target_arch = "wasm32")]
+                                send_store_creation_requests(
+                                    APP_STATE
+                                        .read()
+                                        .pending_store_creation
+                                        .as_ref()
+                                        .map(|p| p.ghostkey_fingerprint.clone())
+                                        .unwrap_or_default(),
+                                    request,
+                                );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let _ = request;
+                            }
+                            Err(e) => APP_STATE
+                                .write()
+                                .notifications
+                                .push(format!("Could not create the store: {e}")),
+                        }
+                    },
+                    "Open a second store under it anyway"
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| APP_STATE.write().second_store_offer = None,
+                    "Not now"
+                }
+            }
+        }
+
         if !store_cards.is_empty() {
             div { class: "store-share",
                 p { class: "text-muted",
@@ -419,6 +468,30 @@ fn IdentityCard(
                         // lost, so the seller retypes them, and the edit is
                         // then published at a version the store contract
                         // discards as stale.
+                        if !card.legacy {
+                            // The way out of section 6.2: a Ghost Key that
+                            // backs two stores counts for neither, so a
+                            // seller must always be able to retire one.
+                            button {
+                                class: "btn btn-sm btn-outline",
+                                onclick: {
+                                    let id = card.contract_id.clone();
+                                    let fp = identity.fingerprint.clone();
+                                    move |_| {
+                                        let done = APP_STATE
+                                            .write()
+                                            .begin_retire_backing(id.clone(), fp.clone());
+                                        if let Err(e) = done {
+                                            APP_STATE
+                                                .write()
+                                                .notifications
+                                                .push(format!("Could not retire the backing: {e}"));
+                                        }
+                                    }
+                                },
+                                "Retire this Ghost Key's backing"
+                            }
+                        }
                         if card.legacy {
                             p { class: "text-warning",
                                 "This store was made before stores had keys of their own, so this \
@@ -771,6 +844,7 @@ fn initiate_store_creation(
             vk_bytes,
             details,
             carried_listings,
+            false,
         );
         match started {
             Ok(store_key_request) => send_store_creation_requests(fingerprint, store_key_request),
@@ -826,6 +900,14 @@ fn move_legacy_store(_fingerprint: String) {
 /// `AppState::start_store_creation_if_ready` decides when to go on.
 #[cfg(target_arch = "wasm32")]
 fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
+    // Deliberate second store under this Ghost Key? The delegate applies the
+    // same one-store rule across tabs, so it has to be told (harvest#93
+    // section 6.2).
+    let another_store = APP_STATE
+        .read()
+        .pending_store_creation
+        .as_ref()
+        .is_some_and(|p| p.another_store);
     wasm_bindgen_futures::spawn_local(async move {
         let fail = |why: String| {
             dioxus::logger::tracing::error!("{why}");
@@ -869,7 +951,7 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             harvest_common::HarvestDelegateRequest::CreateStoreKey {
                 request_id: store_key_request,
                 ghostkey_fingerprint: Some(fingerprint.clone()),
-                another_store: false,
+                another_store,
             },
         ] {
             let payload = match harvest_common::to_cbor(&request) {
