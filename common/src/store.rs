@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
@@ -1069,14 +1069,16 @@ impl StoreStateV1 {
             || !self.closed.is_empty()
     }
 
-    /// Apply the store-wide bound on backings, and keep a retirement exactly
-    /// as long as its backing (harvest#93 review, Must Fix 1).
+    /// Apply the store-wide bound on backings and retirements (harvest#93
+    /// review, Must Fix 1, and the #98 merge-law re-check).
     ///
-    /// Keeps the [`crate::backing::MAX_BACKINGS`] backings whose Ghost Keys
-    /// are smallest by bytes, then drops every retirement whose backing is
-    /// not among them. Never fails, so no merge of valid states fails, and it
-    /// touches nothing but these two sets: the closed flag, the details,
-    /// listings and orders in the same update always land.
+    /// Ranks ONE set of slots, every Ghost Key that has a backing or a
+    /// retirement here, keeps the [`crate::backing::MAX_BACKINGS`] smallest
+    /// by bytes, and keeps a backing or a retirement exactly when its slot
+    /// is kept. A retirement need not name a backing this replica holds.
+    /// Never fails, so no merge of valid states fails, and it touches
+    /// nothing but these two sets: the closed flag, the details, listings
+    /// and orders in the same update always land.
     ///
     /// # Why this is a merge rather than a refusal
     ///
@@ -1087,33 +1089,51 @@ impl StoreStateV1 {
     /// contract error as "inconclusive", not as a violation, which is how it
     /// passed.
     ///
-    /// # Why it obeys the merge laws
+    /// # Why one slot set, and not "a retirement needs its backing"
     ///
-    /// Kept backing slots are top-N over a ranking that depends on the slot
-    /// alone ([`crate::backing::MAX_BACKINGS`]), which is associative. Kept
-    /// retirements are `(union of retirements) ∩ (kept backing slots)`: a
-    /// valid input holds a retirement only for a backing it holds, and a slot
-    /// in the top N of a union is in the top N of every sub-union containing
-    /// it, so every grouping keeps the same retirements.
+    /// The previous version kept backings by rank and then dropped every
+    /// retirement whose backing was not held. That depends on arrival
+    /// order: a retirement of X arriving before X's backing was dropped,
+    /// and the backing, arriving next, stood unretired, while the other
+    /// order kept X retired. Deltas computed against a stale summary deliver
+    /// exactly that order, and the sender never resends, so a key was
+    /// un-retired for good (`fdev`'s `delta_permutation_invariance`, 18
+    /// violations over `store-r98race` and `store-r98retire`).
+    ///
+    /// # Why it obeys the merge laws, in any arrival order
+    ///
+    /// The ranking depends on the slot alone, never on which record a slot
+    /// holds, and the kept set is the top N of the union of every slot seen,
+    /// which is associative, commutative and idempotent: a slot cut from one
+    /// side ranks below that side's N-th slot, so it ranks below the N-th
+    /// slot of any union containing that side and is cut again. A backing
+    /// and a retirement for one key share a slot, so they are kept or cut
+    /// together, whichever arrived first.
     ///
     /// # Why nothing is ever un-retired
     ///
-    /// A retirement is dropped only with its backing. A dropped slot ranks
-    /// below N slots this replica keeps, and any later merge only adds slots,
-    /// so it can never rank back in: a backing, once cut, cannot return to
-    /// this replica without its retirement.
+    /// A retirement is dropped only when its slot is cut, and a cut slot
+    /// never ranks back in, so its backing cannot return either.
     pub(crate) fn normalize_backings(&mut self) {
         let max = crate::backing::MAX_BACKINGS;
-        if self.backings.records.len() > max {
-            let cut: Vec<Bytes32> = self.backings.records.keys().skip(max).copied().collect();
-            for slot in cut {
+        let slots = self.backing_slots();
+        if slots.len() > max {
+            for slot in slots.into_iter().skip(max) {
                 self.backings.records.remove(&slot);
+                self.retirements.records.remove(&slot);
             }
         }
-        let backings = &self.backings.records;
-        self.retirements
+    }
+
+    /// Every Ghost Key with a backing or a retirement here, smallest first:
+    /// the slots [`Self::normalize_backings`] ranks.
+    fn backing_slots(&self) -> BTreeSet<Bytes32> {
+        self.backings
             .records
-            .retain(|slot, _| backings.contains_key(slot));
+            .keys()
+            .chain(self.retirements.records.keys())
+            .copied()
+            .collect()
     }
 
     /// The parent the children are verified under. They read the owner and
@@ -1191,25 +1211,16 @@ impl ComposableState for StoreStateV1 {
         self.info.verify(&parent, parameters)?;
         self.listings.verify(&parent, parameters)?;
         self.orders.verify(&parent, parameters)?;
-        // The two store-wide rules `normalize_backings` keeps: at most
-        // `MAX_BACKINGS` backings, and every retirement names one of them.
-        // A state that breaks either is one no merge produces.
-        if self.backings.records.len() > crate::backing::MAX_BACKINGS {
+        // The store-wide rule `normalize_backings` keeps: at most
+        // `MAX_BACKINGS` Ghost Keys with a backing or a retirement. A state
+        // that breaks it is one no merge produces. A retirement need not
+        // name a held backing (see `normalize_backings`).
+        let slots = self.backing_slots().len();
+        if slots > crate::backing::MAX_BACKINGS {
             return Err(format!(
-                "store holds {} backings, the most it keeps is {}",
-                self.backings.records.len(),
+                "store holds backings or retirements for {slots} Ghost Keys, the most it keeps \
+                 is {}",
                 crate::backing::MAX_BACKINGS
-            ));
-        }
-        if let Some(orphan) = self
-            .retirements
-            .records
-            .keys()
-            .find(|slot| !self.backings.records.contains_key(*slot))
-        {
-            return Err(format!(
-                "a retirement names Ghost Key {}, which does not back this store",
-                bs58::encode(orphan.0).into_string()
             ));
         }
         self.backings.verify(&parent, parameters)?;

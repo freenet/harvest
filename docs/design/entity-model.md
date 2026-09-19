@@ -1723,24 +1723,31 @@ left open, and what phase 1a deliberately does not do yet.
 - Backings and retirements are grow-only sets keyed by the Ghost Key; the
   closed flag is the same kind of set with one possible slot. Two different
   records for one slot resolve to the smaller CBOR encoding (not the newer
-  one), as orders do. A retirement is per Ghost Key and permanent, and must
-  name a Ghost Key the store holds a backing for, which is the shape phase
-  1b's custody tombstone needs (section 6.3, check 4).
+  one), as orders do. A retirement is per Ghost Key and permanent. It may
+  arrive before the backing it retires, and is kept either way, so the key
+  ends retired in any arrival order; that is also the shape phase 1b's
+  custody tombstone needs (section 6.3, check 4).
 - The contract checks both signatures on a backing, the store key's on a
-  retirement and a closure, that each names this store, that each
-  retirement names a held backing, and bounds (64 backings, a 4 KiB
-  certificate). It checks nothing about another contract, a certificate
+  retirement and a closure, that each names this store, and bounds (64
+  Ghost Keys with a backing or a retirement, a 4 KiB certificate). It checks nothing about another contract, a certificate
   chain or a block reference.
-- **Bounds and the merge (after the PR #98 review, Must Fix 1).** Every
-  merge of valid states succeeds. Past 64 backings the store keeps the 64
-  whose Ghost Keys are smallest by bytes and drops the rest, each with its
-  retirement (`StoreStateV1::normalize_backings`). The ranking depends on
-  the slot alone, so the per-slot merge cannot change it, and top-N over
-  such a ranking is associative (the argument the order cap already rests
-  on); retirements are the union intersected with the kept backings, which
-  every grouping agrees on because a valid state holds a retirement only for
-  a backing it holds. A cut backing never returns to a replica that cut it,
-  so nothing is ever un-retired. The closed flag, details, listings and
+- **Bounds and the merge (after the PR #98 review, Must Fix 1, and its
+  merge-law re-check).** Every merge of valid states succeeds, in any
+  arrival order. The store ranks every Ghost Key with a backing or a
+  retirement, keeps the 64 smallest by bytes, and keeps a backing or a
+  retirement exactly when its key is kept
+  (`StoreStateV1::normalize_backings`). The ranking depends on the slot
+  alone, so the per-slot merge cannot change it, and top-N over such a
+  ranking is associative (the argument the order cap already rests on). A
+  key's backing and retirement share one slot, so they are kept or cut
+  together. The second version kept backings by rank and dropped any
+  retirement whose backing was not held, which un-retired a key whenever
+  the retirement arrived first (a delta computed against a stale summary
+  does exactly that); `fdev`'s delta-permutation check found it. A cut slot
+  never returns to a replica that cut it, so nothing is ever un-retired.
+  Retired keys keep their slots, so after more than 60 rotations the cut
+  can fall on the current backing, leaving the store unbacked until a key
+  that ranks inside the bound backs it. The closed flag, details, listings and
   orders are never touched by the bound, so a closure always propagates.
   The first version refused a union past the bound instead, which took
   everything else in the same update down with it and split replicas for

@@ -70,12 +70,14 @@ use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 ///
 /// # What happens past it: a total merge (harvest#93 review, Must Fix 1)
 ///
-/// Two replicas can each hold [`MAX_BACKINGS`] backings whose union holds
-/// more. The merge must still succeed, deterministically, and it must not
-/// carry anything else in the same update down with it. So the store keeps
-/// the [`MAX_BACKINGS`] backings whose Ghost Keys are SMALLEST by bytes and
-/// drops the rest ([`StoreStateV1::normalize_backings`]), and a retirement
-/// is kept exactly when its backing is.
+/// Two replicas can each hold [`MAX_BACKINGS`] Ghost Keys whose union holds
+/// more. The merge must still succeed, deterministically, in any arrival
+/// order, and it must not carry anything else in the same update down with
+/// it. So the store ranks every Ghost Key that has a backing OR a
+/// retirement, keeps the [`MAX_BACKINGS`] SMALLEST by bytes, and keeps a
+/// backing or a retirement exactly when its key is kept
+/// ([`StoreStateV1::normalize_backings`]). A retirement need not name a
+/// backing the replica holds: it may arrive first.
 ///
 /// Why this ranking: it depends on the slot (the Ghost Key) alone, never on
 /// which of two records for that slot a replica holds, so a merge cannot
@@ -85,12 +87,17 @@ use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 /// of any union containing that side and is cut again, whichever version of
 /// it returns. This is the argument `store::enforce_order_cap` rests on.
 ///
-/// What it costs: past the bound, history is dropped (a backing, and with it
-/// its retirement). A dropped slot never returns to a replica that dropped
-/// it, so nothing is ever UN-retired; see
-/// [`StoreStateV1::normalize_backings`]. Only the store key's holder can get
-/// here, and a store whose key is in the wrong hands is closed, which this
-/// bound never touches: the closed flag is its own part of the state.
+/// What it costs: past the bound, history is dropped (a key's backing and
+/// its retirement together). A dropped slot never returns to a replica that
+/// dropped it, so nothing is ever UN-retired; see
+/// [`StoreStateV1::normalize_backings`]. Retired keys keep their slots, so
+/// a store rotated through many Ghost Keys can reach the bound, and then the
+/// cut falls on the largest keys, which may include the CURRENT backing: the
+/// store is then unbacked and has to be backed again by a key that ranks
+/// inside the bound. That takes more than 60 rotations. Only the store key's
+/// holder can get here, and a store whose key is in the wrong hands is
+/// closed, which this bound never touches: the closed flag is its own part
+/// of the state.
 pub const MAX_BACKINGS: usize = 64;
 
 /// The largest certificate a backing may carry, in bytes of PEM text.
@@ -1066,25 +1073,90 @@ mod tests {
         assert!(state.verify(&state, &params()).is_err());
     }
 
-    /// A retirement must name a backing the store holds, so a store never
-    /// holds more retirements than backings. Mutated red by removing the
-    /// check from `StoreStateV1::verify`.
+    /// A retirement may arrive before the backing it retires, and the key
+    /// ends retired whichever order the two arrive in, by merge or by delta
+    /// (the #98 merge-law re-check: the previous rule dropped a retirement
+    /// with no held backing, so the backing arriving next stood unretired).
+    /// Mutated red by restoring that rule in `normalize_backings`.
     #[test]
-    fn a_retirement_of_a_key_that_does_not_back_the_store_is_refused() {
-        let mut state = with(vec![backing(&ghost(1), 100)], vec![]);
-        let orphan = retirement(&ghost(2));
-        state.retirements.records.insert(orphan.slot(), orphan);
-        let err = state
-            .verify(&state, &params())
-            .expect_err("an orphan retirement");
-        assert!(err.contains("does not back this store"), "{err}");
+    fn a_retirement_arriving_before_its_backing_still_retires_it() {
+        let backed = with(vec![backing(&ghost(1), 100)], vec![]);
+        let retired_only = with(vec![], vec![retirement(&ghost(1))]);
+        retired_only
+            .verify(&retired_only, &params())
+            .expect("a retirement with no backing held is a valid state");
+
+        let mut retire_first = retired_only.clone();
+        retire_first
+            .merge(&retired_only.clone(), &params(), &backed)
+            .unwrap();
+        let mut back_first = backed.clone();
+        back_first
+            .merge(&backed.clone(), &params(), &retired_only)
+            .unwrap();
+        assert_eq!(retire_first, back_first);
+        assert!(
+            current_backing(&retire_first, |_| None).is_none(),
+            "retired"
+        );
+
+        // The same through deltas, the way a stale summary delivers them.
+        let mut by_delta = StoreStateV1::default();
+        by_delta
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(delta_with(vec![], vec![retirement(&ghost(1))], vec![])),
+            )
+            .unwrap();
+        by_delta
+            .apply_delta(
+                &by_delta.clone(),
+                &params(),
+                &Some(delta_with(vec![backing(&ghost(1), 100)], vec![], vec![])),
+            )
+            .unwrap();
+        assert_eq!(by_delta, back_first);
     }
 
-    /// A retirement is dropped exactly when its backing is cut, and a
-    /// backing once cut never comes back UN-retired: whatever a later merge
-    /// brings, the slot still ranks below the kept ones.
+    /// A retirement's key counts toward the bound like a backing's: 64
+    /// backings and one more retired key are 65 slots, and the largest is
+    /// cut. Mutated red by ranking backings alone.
+    #[test]
+    fn retired_keys_count_toward_the_bound() {
+        let many = many_backings(MAX_BACKINGS);
+        let mut state = with(many.clone(), vec![]);
+        let mut extra = SigningKey::from_bytes(&[0u8; 32]);
+        for i in 0u8..=255 {
+            let k = SigningKey::from_bytes(&[i; 32]);
+            if many
+                .iter()
+                .all(|b| b.slot().0 < k.verifying_key().to_bytes())
+            {
+                extra = k;
+                break;
+            }
+        }
+        let extra_slot = Bytes32(extra.verifying_key().to_bytes());
+        assert!(many.iter().all(|b| b.slot() < extra_slot), "precondition");
+        let retired = with(vec![], vec![retirement(&extra)]);
+        state.merge(&state.clone(), &params(), &retired).unwrap();
+        assert_eq!(state.backings.records.len(), MAX_BACKINGS);
+        assert!(state.retirements.records.is_empty(), "the 65th slot is cut");
+        state.verify(&state, &params()).unwrap();
+
+        // And a state over the bound is refused.
+        let mut over = with(many, vec![]);
+        let r = retirement(&extra);
+        over.retirements.records.insert(r.slot(), r);
+        assert!(over.verify(&over, &params()).is_err());
+    }
+
+    /// A retirement is dropped exactly when its slot is cut, and a backing
+    /// once cut never comes back UN-retired: whatever a later merge brings,
+    /// the slot still ranks below the kept ones.
     ///
-    /// Mutated red by keeping retirements whose backing was cut.
+    /// Mutated red by keeping retirements whose slot was cut.
     #[test]
     fn a_cut_backing_takes_its_retirement_and_never_returns_unretired() {
         let many = many_backings(MAX_BACKINGS + 1);
@@ -1375,6 +1447,40 @@ mod tests {
         assert_laws(&states, 150, &mut rng, merge, |s| {
             crate::to_cbor(s).unwrap()
         });
+
+        // Delta permutation (the #98 merge-law re-check): deltas computed
+        // against a stale summary (here, the empty store's) applied to any
+        // state in either order give the same result as the merge. Each
+        // delta carries only one side's records, so a retirement can land
+        // before the backing it retires.
+        let empty = StoreStateV1::default();
+        let stale = empty.summarize(&empty, &params());
+        let deltas: Vec<_> = states
+            .iter()
+            .map(|s| s.delta(s, &params(), &stale).expect("non-empty"))
+            .chain(states.iter().map(|s| {
+                // Split: backings alone, then everything else.
+                let mut d = s.delta(s, &params(), &stale).unwrap();
+                d.backings = None;
+                d
+            }))
+            .collect();
+        for _ in 0..150 {
+            let base = &states[rng.below(states.len())];
+            let x = &deltas[rng.below(deltas.len())];
+            let y = &deltas[rng.below(deltas.len())];
+            let apply2 = |first: &crate::store::StoreStateV1Delta,
+                          second: &crate::store::StoreStateV1Delta| {
+                let mut r = base.clone();
+                r.apply_delta(&base.clone(), &params(), &Some(first.clone()))
+                    .expect("a delta of a valid state applies");
+                r.apply_delta(&r.clone(), &params(), &Some(second.clone()))
+                    .expect("a delta of a valid state applies");
+                r.verify(&r, &params()).expect("valid");
+                crate::to_cbor(&r).unwrap()
+            };
+            assert_eq!(apply2(x, y), apply2(y, x), "delta order changed the result");
+        }
     }
 
     #[test]
