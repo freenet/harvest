@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Delegate, DelegateCode, Parameters};
 use harvest_common::address::placeholder_params_cbor;
 use harvest_common::delegate::DELEGATE_PARAMETERS;
+use harvest_common::ghostkey_index::IndexParameters;
 use harvest_common::mailbox::MailboxParameters;
 use harvest_common::reputation::ReputationParameters;
 use harvest_common::store::StoreParameters;
@@ -139,6 +140,11 @@ fn run() -> Result<(), String> {
             "mailbox_contract",
             Kind::Contract,
             placeholder_params_cbor::<MailboxParameters>()?,
+        ),
+        (
+            "index_contract",
+            Kind::Contract,
+            placeholder_params_cbor::<IndexParameters>()?,
         ),
         (
             "harvest_delegate",

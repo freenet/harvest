@@ -92,6 +92,12 @@ impl AddressGuardParams for crate::mailbox::MailboxParameters {
     }
 }
 
+impl AddressGuardParams for crate::ghostkey_index::IndexParameters {
+    fn address_guard_placeholder() -> Self {
+        Self::new(placeholder_verifying_key())
+    }
+}
+
 impl AddressGuardParams for crate::reputation::ReputationParameters {
     fn address_guard_placeholder() -> Self {
         Self {
@@ -107,6 +113,7 @@ impl AddressGuardParams for crate::reputation::ReputationParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ghostkey_index::IndexParameters;
     use crate::mailbox::MailboxParameters;
     use crate::reputation::ReputationParameters;
     use crate::store::StoreParameters;
@@ -127,6 +134,10 @@ mod tests {
             assert_eq!(
                 placeholder_params_cbor::<MailboxParameters>().unwrap(),
                 placeholder_params_cbor::<MailboxParameters>().unwrap()
+            );
+            assert_eq!(
+                placeholder_params_cbor::<IndexParameters>().unwrap(),
+                placeholder_params_cbor::<IndexParameters>().unwrap()
             );
         }
     }
@@ -158,6 +169,11 @@ mod tests {
         let store = placeholder_params_cbor::<StoreParameters>().unwrap();
         let mailbox = placeholder_params_cbor::<MailboxParameters>().unwrap();
         let reputation = placeholder_params_cbor::<ReputationParameters>().unwrap();
+        let index = placeholder_params_cbor::<IndexParameters>().unwrap();
+        assert!(index.len() > 1);
+        assert_ne!(index, mailbox, "same key, but a different struct");
+        assert_ne!(index, store);
+        assert_ne!(index, reputation);
         assert_ne!(store, mailbox);
         assert_ne!(store, reputation);
         assert_ne!(mailbox, reputation);

@@ -1,0 +1,26 @@
+[package]
+name = "index-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Harvest Ghost Key index contract: the stores a Ghost Key has backed (harvest#93 phase 1c)"
+
+[dependencies]
+harvest-common = { workspace = true }
+freenet-stdlib = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
