@@ -143,7 +143,28 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
     request_id: RequestId,
     ghostkey_fingerprint: &str,
     peer_public_keys: &[Vec<u8>],
+    store_verifying_key: Option<[u8; 32]>,
 ) -> HarvestDelegateResponse {
+    // A store with its own key reads with the inbox key that key derives
+    // (harvest#93 phase 1b): the same on every device holding the store
+    // key, so a second device, or one that recovered the key after a
+    // delegate re-key, reads the same messages.
+    if let Some(store_key) = store_verifying_key {
+        let secret = ed25519_dalek::VerifyingKey::from_bytes(&store_key)
+            .ok()
+            .and_then(|vk| crate::store_keys::load(store, &vk))
+            .map(|sk| harvest_common::custody::inbox_secret(&sk));
+        return match secret {
+            Some(secret) => {
+                conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
+            }
+            None => HarvestDelegateResponse::ConversationKeys {
+                request_id,
+                ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+                result: Err("this device does not hold that store's key".into()),
+            },
+        };
+    }
     let Some(secret) = store
         .get_secret(&x25519_sk_key(ghostkey_fingerprint))
         .and_then(seed_from_stored)
@@ -158,6 +179,16 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
         };
     };
 
+    conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
+}
+
+/// The conversation keys `secret` shares with each well-formed peer key.
+fn conversation_keys_from(
+    request_id: RequestId,
+    ghostkey_fingerprint: &str,
+    secret: &StaticSecret,
+    peer_public_keys: &[Vec<u8>],
+) -> HarvestDelegateResponse {
     let derived = peer_public_keys
         .iter()
         .filter_map(|peer| {
@@ -1062,6 +1093,7 @@ mod tests {
             7,
             FP,
             &[buyer_public.as_bytes().to_vec()],
+            None,
         ));
 
         assert_eq!(derived.len(), 1);
@@ -1084,6 +1116,46 @@ mod tests {
         );
     }
 
+    /// A store with its own key reads with the inbox key that key derives
+    /// (harvest#93 phase 1b): a buyer who encrypted to the store's published
+    /// inbox key is read, and the Ghost Key's per-device key is not used.
+    /// A device without the store key is refused, not answered with the
+    /// per-device key. Mutated red by ignoring `store_verifying_key`.
+    #[test]
+    fn a_store_key_reads_with_the_inbox_key_it_derives() {
+        let mut store = MemSecrets::default();
+        let device_public = public_key(&init_encryption_key(&mut store, FP));
+        let store_sk = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        assert!(crate::store_keys::keep(&mut store, &store_sk));
+        let inbox = PublicKey::from(&harvest_common::custody::inbox_secret(&store_sk));
+        assert_ne!(inbox.as_bytes().to_vec(), device_public);
+
+        let buyer_secret = StaticSecret::from([42u8; 32]);
+        let buyer_public = PublicKey::from(&buyer_secret);
+        let shared = buyer_secret.diffie_hellman(&inbox).to_bytes();
+        let derived = keys(&derive_conversation_keys(
+            &store,
+            7,
+            FP,
+            &[buyer_public.as_bytes().to_vec()],
+            Some(store_sk.verifying_key().to_bytes()),
+        ));
+        assert_eq!(
+            derived[0].buyer_to_seller,
+            conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller)
+        );
+
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x5b; 32]);
+        let message = error_message(&derive_conversation_keys(
+            &store,
+            8,
+            FP,
+            &[buyer_public.as_bytes().to_vec()],
+            Some(other.verifying_key().to_bytes()),
+        ));
+        assert!(message.contains("store's key"), "{message}");
+    }
+
     /// Answers are paired by peer key, not by position, and a malformed entry
     /// does not shift the others onto the wrong buyer.
     ///
@@ -1104,6 +1176,7 @@ mod tests {
             1,
             FP,
             &[a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+            None,
         ));
         let with_a_dud = keys(&derive_conversation_keys(
             &store,
@@ -1114,6 +1187,7 @@ mod tests {
                 vec![0u8; 5], // not a public key at all
                 b.as_bytes().to_vec(),
             ],
+            None,
         ));
 
         assert_eq!(all.len(), 2);
@@ -1155,6 +1229,7 @@ mod tests {
             1,
             FP,
             &[vec![0u8; 32], good.as_bytes().to_vec()],
+            None,
         ));
 
         assert_eq!(
@@ -1209,6 +1284,7 @@ mod tests {
             1,
             FP,
             &[peer.as_bytes().to_vec()],
+            None,
         ));
         assert!(
             message.contains("no encryption key"),

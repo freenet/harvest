@@ -5,11 +5,16 @@
 //!
 //! One secret per store key, `harvest:store_sk:{base58 verifying key}`, holding
 //! the 32-byte seed. [`create`] mints one from the host's RNG and answers the
-//! public half; [`sign`] signs one of a store's own records with it. The seed
-//! is not handed out: no request returns it, the UI only ever holds a
-//! signature, and the export to a successor generation hides this family
-//! (`crate::migration::WithoutStoreKeys`). Phase 1b's custody adds the one
-//! way a copy leaves: wrapped, to a backing Ghost Key, in store state.
+//! public half; [`sign`] signs one of a store's own records with it. No
+//! request returns the seed in the clear, and the export to a successor
+//! generation hides this family (`crate::migration::WithoutStoreKeys`).
+//! Phase 1b's custody adds the one way a copy leaves: wrapped, to a backing
+//! Ghost Key, in store state ([`wrap_for`]). The wrapping key derives from a
+//! vault signature the CALLER supplies, so the Harvest web app's origin is
+//! trusted with the seed in principle: a UI built to could open the copy it
+//! asked for. This UI does not; that is a property of the UI, not a
+//! guarantee this delegate makes to anyone who can speak as the Harvest
+//! origin.
 //!
 //! The key starts with `harvest:` for the reason `handlers.rs` gives: a key
 //! outside that prefix is silently left behind by every future delegate
@@ -44,6 +49,7 @@
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_migrate::SecretStore;
+use harvest_common::custody;
 use harvest_common::delegate::{HarvestDelegateResponse, RequestId, StoreKeySignature};
 
 /// Where every store key's secret lives.
@@ -200,6 +206,139 @@ pub(crate) fn sign<S: SecretStore>(
     )
 }
 
+/// Wrap the store key to a backing Ghost Key, and sign the copy with the
+/// store key (harvest#93 phase 1b).
+///
+/// The vault's signature is checked (`custody::WrapSecret::from_sign_result`:
+/// the wrap message for THIS store, under the current webapp scope, verifying
+/// under the backing key), used, and dropped with the `WrapSecret` at the end
+/// of this call. It is never kept.
+pub(crate) fn wrap_for<S: SecretStore>(
+    secrets: &S,
+    request_id: RequestId,
+    store_verifying_key: [u8; 32],
+    backer_verifying_key: [u8; 32],
+    scoped_payload: &[u8],
+    signature: &[u8],
+) -> HarvestDelegateResponse {
+    let answer = |result: Result<custody::AuthorizedCopy, String>| {
+        HarvestDelegateResponse::StoreKeyWrapped {
+            request_id,
+            store_verifying_key,
+            result: result.map(Box::new),
+        }
+    };
+    answer((|| {
+        let store = VerifyingKey::from_bytes(&store_verifying_key)
+            .map_err(|_| "that is not a store key".to_string())?;
+        let backer = VerifyingKey::from_bytes(&backer_verifying_key)
+            .map_err(|_| "that is not a Ghost Key".to_string())?;
+        let key = load(secrets, &store)
+            .ok_or("this device does not hold the key for that store, so it cannot wrap it")?;
+        let scope = custody::WrapScope::current();
+        let secret = custody::WrapSecret::from_sign_result(
+            scoped_payload,
+            signature,
+            &backer,
+            &store,
+            scope,
+        )
+        .map_err(|e| format!("the vault's signature is not a wrap signature: {e}"))?;
+        let wrapped = custody::wrap_store_key(&key, &secret).map_err(|e| e.to_string())?;
+        let copy = custody::StoreKeyCopy {
+            store,
+            backer,
+            scope,
+            wrapped,
+        };
+        let payload = harvest_common::to_cbor(&copy)?;
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(&key, payload)?;
+        Ok(custody::AuthorizedCopy {
+            copy,
+            scoped_payload,
+            signature,
+        })
+    })())
+}
+
+/// Recover a store key from a wrapped copy, and keep it (harvest#93 phase
+/// 1b). The one writer besides [`create`], through [`keep`], and only after
+/// `custody::unwrap_store_key` has checked the seed IS the store's key.
+pub(crate) fn unwrap<S: SecretStore>(
+    secrets: &mut S,
+    request_id: RequestId,
+    store_verifying_key: [u8; 32],
+    backer_verifying_key: [u8; 32],
+    scoped_payload: &[u8],
+    signature: &[u8],
+    wrapped: &custody::WrappedStoreKey,
+) -> HarvestDelegateResponse {
+    let answer = |result| HarvestDelegateResponse::StoreKeyRecovered {
+        request_id,
+        store_verifying_key,
+        result,
+    };
+    let recovered = (|| {
+        let store = VerifyingKey::from_bytes(&store_verifying_key)
+            .map_err(|_| "that is not a store key".to_string())?;
+        let backer = VerifyingKey::from_bytes(&backer_verifying_key)
+            .map_err(|_| "that is not a Ghost Key".to_string())?;
+        let secret = custody::WrapSecret::from_sign_result(
+            scoped_payload,
+            signature,
+            &backer,
+            &store,
+            custody::WrapScope::current(),
+        )
+        .map_err(|e| format!("the vault's signature is not a wrap signature: {e}"))?;
+        custody::unwrap_store_key(wrapped, &secret).map_err(|e| e.to_string())
+    })();
+    match recovered {
+        Err(why) => answer(Err(why)),
+        Ok(key) => {
+            let held = secrets
+                .list_secrets(STORE_KEY_PREFIX.as_bytes())
+                .contains(&store_key_secret(&key.verifying_key()));
+            if !held && secrets.list_secrets(STORE_KEY_PREFIX.as_bytes()).len() >= MAX_STORE_KEYS {
+                return answer(Err(format!(
+                    "this delegate already holds {MAX_STORE_KEYS} store keys, the most it keeps"
+                )));
+            }
+            if keep(secrets, &key) {
+                answer(Ok(()))
+            } else {
+                answer(Err("the recovered store key could not be saved".into()))
+            }
+        }
+    }
+}
+
+/// The public halves of a store's derived keys (harvest#93 phase 1b).
+pub(crate) fn subkeys<S: SecretStore>(
+    secrets: &S,
+    request_id: RequestId,
+    store_verifying_key: [u8; 32],
+) -> HarvestDelegateResponse {
+    let result = (|| {
+        let store = VerifyingKey::from_bytes(&store_verifying_key)
+            .map_err(|_| "that is not a store key".to_string())?;
+        let key =
+            load(secrets, &store).ok_or("this device does not hold the key for that store")?;
+        let inbox = custody::inbox_secret(&key);
+        let record_public_key = custody::record_public_key_der(&key).map_err(|e| e.to_string())?;
+        Ok(harvest_common::delegate::StoreSubkeyInfo {
+            inbox_public_key: x25519_dalek::PublicKey::from(&inbox).to_bytes(),
+            record_public_key,
+        })
+    })();
+    HarvestDelegateResponse::StoreSubkeys {
+        request_id,
+        store_verifying_key,
+        result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +481,283 @@ mod tests {
             HarvestDelegateResponse::StoreKeyCreated { result: Err(_), .. }
         ));
         assert!(keys.iter().all(|key| load(&secrets, key).is_some()));
+    }
+
+    // --- Custody (harvest#93 phase 1b) ---------------------------------
+
+    fn ghost() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    /// What the vault answers for `SignMessage { message }` from the Harvest
+    /// web app: its signature over the scoped payload.
+    fn vault_sign(key: &SigningKey, message: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer;
+        let scoped = ghostkey_common::to_cbor(&ghostkey_common::ScopedPayload {
+            requestor: harvest_common::expected_harvest_requestor(),
+            payload: message,
+        })
+        .unwrap();
+        let sig = key.sign(&scoped).to_bytes().to_vec();
+        (scoped, sig)
+    }
+
+    fn wrapped(response: HarvestDelegateResponse) -> Result<custody::AuthorizedCopy, String> {
+        match response {
+            HarvestDelegateResponse::StoreKeyWrapped { result, .. } => result.map(|copy| *copy),
+            other => panic!("expected a wrap answer, got {other:?}"),
+        }
+    }
+
+    fn recovered(response: HarvestDelegateResponse) -> Result<(), String> {
+        match response {
+            HarvestDelegateResponse::StoreKeyRecovered { result, .. } => result,
+            other => panic!("expected a recovery answer, got {other:?}"),
+        }
+    }
+
+    /// The whole custody loop: the device that made the store wraps its key
+    /// to the backing Ghost Key and signs the copy; a device that has lost
+    /// every delegate secret (a delegate re-key) recovers the key from that
+    /// copy with nothing but the Ghost Key's vault signature, and can sign
+    /// for the store again.
+    #[test]
+    fn a_device_with_a_backing_ghost_key_recovers_the_store_key() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let (scoped, sig) = vault_sign(&ghost(), custody::wrap_message(&store));
+        let copy = wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+        ))
+        .expect("the store's own device wraps its key");
+        copy.verify(&store)
+            .expect("a copy the store contract accepts");
+        assert_eq!(copy.copy.backer, ghost().verifying_key());
+        assert_eq!(copy.copy.scope, custody::WrapScope::current());
+
+        // Everything lost.
+        let mut fresh = MemSecrets::default();
+        assert!(load(&fresh, &store).is_none());
+        recovered(unwrap(
+            &mut fresh,
+            2,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+            &copy.copy.wrapped,
+        ))
+        .expect("the backing Ghost Key opens it");
+        assert!(load(&fresh, &store).is_some(), "and the key is kept");
+        assert!(signed(sign(
+            &fresh,
+            3,
+            store.to_bytes(),
+            harvest_common::to_cbor(&StoreClosure { store }).unwrap()
+        ))
+        .is_ok());
+    }
+
+    /// Only the wrap message for THIS store, signed by the named backer,
+    /// opens or makes a copy. A signature the vault made for anything else,
+    /// or by another Ghost Key, is refused before any key is derived.
+    #[test]
+    fn a_signature_that_is_not_this_stores_wrap_signature_is_refused() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let other_store = SigningKey::from_bytes(&[0x77; 32]).verifying_key();
+        let backer = ghost().verifying_key().to_bytes();
+
+        let (scoped, sig) = vault_sign(&ghost(), custody::wrap_message(&other_store));
+        assert!(wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            backer,
+            &scoped,
+            &sig
+        ))
+        .is_err());
+
+        let (scoped, sig) = vault_sign(
+            &SigningKey::from_bytes(&[9; 32]),
+            custody::wrap_message(&store),
+        );
+        assert!(wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            backer,
+            &scoped,
+            &sig
+        ))
+        .is_err());
+
+        let (scoped, sig) = vault_sign(&ghost(), b"not a wrap message".to_vec());
+        assert!(wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            backer,
+            &scoped,
+            &sig
+        ))
+        .is_err());
+    }
+
+    /// Recovery respects the 64-key cap, except for a key the delegate
+    /// already holds. Mutated red by removing the cap check in `unwrap`.
+    #[test]
+    fn recovery_stops_at_the_cap_unless_the_key_is_already_held() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let (scoped, sig) = vault_sign(&ghost(), custody::wrap_message(&store));
+        let copy = wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+        ))
+        .unwrap();
+        let recover = |secrets: &mut MemSecrets| {
+            recovered(unwrap(
+                secrets,
+                2,
+                store.to_bytes(),
+                ghost().verifying_key().to_bytes(),
+                &scoped,
+                &sig,
+                &copy.copy.wrapped,
+            ))
+        };
+
+        let mut full = MemSecrets::default();
+        for _ in 0..MAX_STORE_KEYS {
+            created(&mut full);
+        }
+        assert!(recover(&mut full).is_err(), "no 65th key");
+        assert!(load(&full, &store).is_none());
+
+        for _ in 1..MAX_STORE_KEYS {
+            created(&mut device);
+        }
+        recover(&mut device).expect("a key already held is not a new one");
+    }
+
+    /// Recovering against the WRONG store key keeps nothing: store A's copy
+    /// presented as store B's (with B's genuine wrap signature) does not
+    /// open, and A's signature presented for B is not a wrap signature for
+    /// B (#99 review). Nothing is kept for either store.
+    #[test]
+    fn recovering_against_the_wrong_store_key_keeps_nothing() {
+        let mut device = MemSecrets::default();
+        let a = created(&mut device);
+        let b = created(&mut device);
+        let (scoped_a, sig_a) = vault_sign(&ghost(), custody::wrap_message(&a));
+        let (scoped_b, sig_b) = vault_sign(&ghost(), custody::wrap_message(&b));
+        let copy_a = wrapped(wrap_for(
+            &device,
+            1,
+            a.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped_a,
+            &sig_a,
+        ))
+        .unwrap();
+
+        let mut fresh = MemSecrets::default();
+        let backer = ghost().verifying_key().to_bytes();
+        let as_b_with_bs_signature = recovered(unwrap(
+            &mut fresh,
+            2,
+            b.to_bytes(),
+            backer,
+            &scoped_b,
+            &sig_b,
+            &copy_a.copy.wrapped,
+        ));
+        assert!(
+            as_b_with_bs_signature.is_err(),
+            "A's copy does not open as B's"
+        );
+        let as_b_with_as_signature = recovered(unwrap(
+            &mut fresh,
+            3,
+            b.to_bytes(),
+            backer,
+            &scoped_a,
+            &sig_a,
+            &copy_a.copy.wrapped,
+        ));
+        assert!(
+            as_b_with_as_signature
+                .unwrap_err()
+                .contains("not a wrap signature"),
+            "A's signature is not B's wrap signature"
+        );
+        assert!(fresh.list_secrets(STORE_KEY_PREFIX.as_bytes()).is_empty());
+        assert!(load(&fresh, &a).is_none() && load(&fresh, &b).is_none());
+    }
+
+    /// A copy opened under the wrong Ghost Key's signature, or a corrupt one,
+    /// recovers nothing and keeps nothing.
+    #[test]
+    fn a_copy_that_does_not_open_keeps_nothing() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let (scoped, sig) = vault_sign(&ghost(), custody::wrap_message(&store));
+        let mut copy = wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+        ))
+        .unwrap();
+        copy.copy.wrapped.ciphertext[0] ^= 1;
+        let mut fresh = MemSecrets::default();
+        assert!(recovered(unwrap(
+            &mut fresh,
+            2,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+            &copy.copy.wrapped,
+        ))
+        .is_err());
+        assert!(fresh.list_secrets(STORE_KEY_PREFIX.as_bytes()).is_empty());
+    }
+
+    /// The published subkeys are the ones the store key derives: the inbox
+    /// key every device decrypts with, and the record key.
+    #[test]
+    fn the_subkeys_are_the_store_keys_derivations() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let key = load(&device, &store).unwrap();
+        match subkeys(&device, 1, store.to_bytes()) {
+            HarvestDelegateResponse::StoreSubkeys {
+                result: Ok(info), ..
+            } => {
+                assert_eq!(
+                    info.inbox_public_key,
+                    x25519_dalek::PublicKey::from(&custody::inbox_secret(&key)).to_bytes()
+                );
+                assert_eq!(
+                    info.record_public_key,
+                    custody::record_public_key_der(&key).unwrap()
+                );
+            }
+            other => panic!("expected subkeys, got {other:?}"),
+        }
     }
 }

@@ -856,17 +856,15 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             }
         }
 
-        for request in [
-            harvest_common::HarvestDelegateRequest::InitReputationKeys {
-                ghostkey_fingerprint: fingerprint.clone(),
-            },
-            // With the Ghost Key, so a retry of a creation that did not
-            // finish gets the same store key back (#98 review, M1).
-            harvest_common::HarvestDelegateRequest::CreateStoreKey {
-                request_id: store_key_request,
-                ghostkey_fingerprint: Some(fingerprint.clone()),
-            },
-        ] {
+        // The store key. Its record and inbox keys derive from it (harvest#93
+        // phase 1b), and `on_store_key_created` asks for them, so creation no
+        // longer mints a per-device reputation or messaging key. Sent with
+        // the Ghost Key, so a retry of a creation that did not finish gets
+        // the same store key back (#98 review, M1).
+        for request in [harvest_common::HarvestDelegateRequest::CreateStoreKey {
+            request_id: store_key_request,
+            ghostkey_fingerprint: Some(fingerprint.clone()),
+        }] {
             let payload = match harvest_common::to_cbor(&request) {
                 Ok(payload) => payload,
                 Err(e) => {
@@ -880,16 +878,8 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             }
         }
 
-        // And the messaging key, so the store publishes with one. Sent here
-        // rather than waited on: a store that publishes without it is a
-        // store buyers cannot message, which `store_details_gap` reports and
-        // re-publishing repairs. A store whose creation hangs waiting for a
-        // fourth delegate answer has no name at all.
-        request_encryption_key(fingerprint.clone()).await;
-
         dioxus::logger::tracing::info!(
-            "Sent GetCertificate + InitReputationKeys + CreateStoreKey + InitEncryptionKey for \
-             {fingerprint} -- store creation pending"
+            "Sent GetCertificate + CreateStoreKey for {fingerprint} -- store creation pending"
         );
     });
 }

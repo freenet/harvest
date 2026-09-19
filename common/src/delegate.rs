@@ -77,6 +77,13 @@ pub enum HarvestDelegateRequest {
         /// Raw 32-byte X25519 public keys, as they appear in
         /// [`crate::mailbox::EncryptedMessage::sender_public_key`].
         peer_public_keys: Vec<Vec<u8>>,
+        /// The store whose inbox the peers wrote to (harvest#93 phase 1b).
+        /// When set, the keys derive from that store's inbox key, which
+        /// derives from the store key (`custody::inbox_secret`), so every
+        /// device holding the store key reads the same messages. `None` is
+        /// the per-device key of a Ghost Key, for a store made before it.
+        #[serde(default)]
+        store_verifying_key: Option<[u8; 32]>,
     },
 
     /// Keep a buyer's conversation secret so it outlives the browser tab.
@@ -344,9 +351,14 @@ pub enum HarvestDelegateRequest {
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
     /// this delegate on this device. Answered with
     /// [`HarvestDelegateResponse::StoreKeyCreated`], which carries the public
-    /// half only. No request returns the secret, and the export to a
-    /// successor generation leaves store keys out (phase 1b recovers them
-    /// from their wrapped copies instead).
+    /// half only. No request returns the seed in the clear, and the export to
+    /// a successor generation leaves store keys out (phase 1b recovers them
+    /// from their wrapped copies instead). The one way a copy leaves is
+    /// `WrapStoreKeyFor`, sealed under a key the caller's wrap signature
+    /// derives; since the caller supplies that signature, the Harvest web
+    /// app's origin is trusted with the seed in principle, and keeping it
+    /// out of the UI is how the UI is built, not something this delegate
+    /// can enforce.
     ///
     /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
     /// the store's state, so another device can recover it); until then a
@@ -380,6 +392,44 @@ pub enum HarvestDelegateRequest {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
         payload: Vec<u8>,
+    },
+
+    // === Store-key custody (harvest#93 phase 1b) ===
+    /// Wrap the store key to a backing Ghost Key, from the vault's signature
+    /// over `custody::wrap_message(store)` (made under the current webapp
+    /// scope), and sign the resulting copy with the store key. Answered with
+    /// [`HarvestDelegateResponse::StoreKeyWrapped`]: the copy, ready to
+    /// publish. The signature is a secret; the delegate drops it when done.
+    WrapStoreKeyFor {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        backer_verifying_key: [u8; 32],
+        scoped_payload: Vec<u8>,
+        /// The vault's wrap signature: a secret. See [`WrapSignature`].
+        signature: WrapSignature,
+    },
+
+    /// Recover a store key from a wrapped copy in the store's state, with the
+    /// vault's signature over the wrap message. The delegate checks the
+    /// signature, opens the copy, checks the seed IS this store's key, keeps
+    /// it, and answers [`HarvestDelegateResponse::StoreKeyRecovered`] with no
+    /// secret in it.
+    UnwrapStoreKey {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        backer_verifying_key: [u8; 32],
+        scoped_payload: Vec<u8>,
+        /// The vault's wrap signature: a secret. See [`WrapSignature`].
+        signature: WrapSignature,
+        wrapped: crate::custody::WrappedStoreKey,
+    },
+
+    /// The public halves of the keys that derive from a store key: its inbox
+    /// (X25519) key and its record (RSA) key. Answered with
+    /// [`HarvestDelegateResponse::StoreSubkeys`].
+    GetStoreSubkeys {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
     },
 }
 
@@ -562,6 +612,27 @@ pub enum HarvestDelegateResponse {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
         result: Result<StoreKeySignature, String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::WrapStoreKeyFor`].
+    StoreKeyWrapped {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<Box<crate::custody::AuthorizedCopy>, String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::UnwrapStoreKey`].
+    StoreKeyRecovered {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<(), String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::GetStoreSubkeys`].
+    StoreSubkeys {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<StoreSubkeyInfo, String>,
     },
 
     StoreList {
@@ -903,6 +974,33 @@ pub struct StoreRegistration {
     pub store_verifying_key: Option<[u8; 32]>,
 }
 
+/// A vault signature over a custody wrap message, carried from the UI to the
+/// delegate (harvest#93 phase 1b).
+///
+/// It is a SECRET: whoever holds it can derive the key that opens a wrapped
+/// copy of a store's key. This newtype exists so it cannot be printed by
+/// accident: `HarvestDelegateRequest` derives `Debug`, and a bare `Vec<u8>`
+/// would print. `#[serde(transparent)]`, so the wire encoding is just the
+/// bytes. Same pattern as [`ConversationSecret`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct WrapSignature(pub Vec<u8>);
+
+impl core::fmt::Debug for WrapSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("WrapSignature(redacted)")
+    }
+}
+
+/// The public halves of the keys a store key derives (harvest#93 phase 1b).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreSubkeyInfo {
+    /// X25519: what buyers encrypt to (`StoreInfoV1::encryption_public_key`).
+    pub inbox_public_key: [u8; 32],
+    /// RSA-2048, PKCS#1 DER (`StoreInfoV1::record_public_key`).
+    pub record_public_key: Vec<u8>,
+}
+
 /// A store-key signature: the envelope and the Ed25519 signature over it, the
 /// two fields every signed record in a store carries.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1061,9 +1159,14 @@ mod tests {
             R::StoreKeyCreated { .. } => (23, false),
             // A signature over a store record, published as it is.
             R::StoreUpdateSigned { .. } => (24, false),
+            // A wrapped copy: ciphertext meant for store state, published.
+            R::StoreKeyWrapped { .. } => (25, false),
+            R::StoreKeyRecovered { .. } => (26, false),
+            // The derived keys' PUBLIC halves.
+            R::StoreSubkeys { .. } => (27, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 25;
+    const RESPONSE_VARIANTS: usize = 28;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1097,9 +1200,13 @@ mod tests {
             Q::CreateStoreKey { .. } => (22, false),
             // A store record to be signed and published.
             Q::SignStoreUpdate { .. } => (23, false),
+            // The vault's wrap signature, which opens the wrapped copy.
+            Q::WrapStoreKeyFor { .. } => (24, true),
+            Q::UnwrapStoreKey { .. } => (25, true),
+            Q::GetStoreSubkeys { .. } => (26, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 24;
+    const REQUEST_VARIANTS: usize = 27;
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1264,6 +1371,24 @@ mod tests {
                     signature: vec![19u8; 64],
                 }),
             },
+            R::StoreKeyWrapped {
+                request_id: 45,
+                store_verifying_key: [17u8; 32],
+                result: Err("no".into()),
+            },
+            R::StoreKeyRecovered {
+                request_id: 46,
+                store_verifying_key: [17u8; 32],
+                result: Ok(()),
+            },
+            R::StoreSubkeys {
+                request_id: 47,
+                store_verifying_key: [17u8; 32],
+                result: Ok(StoreSubkeyInfo {
+                    inbox_public_key: [20u8; 32],
+                    record_public_key: vec![21u8; 8],
+                }),
+            },
         ]
     }
 
@@ -1290,6 +1415,7 @@ mod tests {
                 request_id: 42,
                 ghostkey_fingerprint: fp(),
                 peer_public_keys: vec![vec![1u8; 32]],
+                store_verifying_key: Some([17u8; 32]),
             },
             Q::StoreBuyerConversation {
                 request_id: 42,
@@ -1383,6 +1509,28 @@ mod tests {
                 request_id: 44,
                 store_verifying_key: [17u8; 32],
                 payload: vec![18u8; 8],
+            },
+            Q::WrapStoreKeyFor {
+                request_id: 45,
+                store_verifying_key: [17u8; 32],
+                backer_verifying_key: [1u8; 32],
+                scoped_payload: vec![18u8; 8],
+                signature: WrapSignature(vec![SECRET_BYTE; 64]),
+            },
+            Q::UnwrapStoreKey {
+                request_id: 46,
+                store_verifying_key: [17u8; 32],
+                backer_verifying_key: [1u8; 32],
+                scoped_payload: vec![18u8; 8],
+                signature: WrapSignature(vec![SECRET_BYTE; 64]),
+                wrapped: crate::custody::WrappedStoreKey {
+                    scheme: 1,
+                    ciphertext: vec![19u8; 48],
+                },
+            },
+            Q::GetStoreSubkeys {
+                request_id: 47,
+                store_verifying_key: [17u8; 32],
             },
         ]
     }

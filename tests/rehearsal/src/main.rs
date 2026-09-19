@@ -213,6 +213,7 @@ fn make_info(sk: &SigningKey, fingerprint: &str, name: &str, version: u32) -> Au
         store_name: name.to_string(),
         description: "A store planted at a predecessor generation".into(),
         encryption_public_key: None,
+        record_public_key: None,
     };
     let (scoped_payload, signature) = scoped_sign(sk, &info);
     AuthorizedStoreInfoV1 {

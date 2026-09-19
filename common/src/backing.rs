@@ -600,6 +600,8 @@ pub enum StoreKeyMessage {
     BackingAcceptance,
     Retirement,
     Closure,
+    /// A wrapped copy of the store key (harvest#93 phase 1b).
+    Copy,
 }
 
 /// Which kind of store-key message `payload` is, or `None` if it is none of
@@ -628,6 +630,8 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
         Some(StoreKeyMessage::Retirement)
     } else if is::<StoreClosure>(payload) {
         Some(StoreKeyMessage::Closure)
+    } else if is::<crate::custody::StoreKeyCopy>(payload) {
+        Some(StoreKeyMessage::Copy)
     } else {
         None
     }
@@ -1476,6 +1480,318 @@ mod tests {
                     .expect("a delta of a valid state applies");
                 r.apply_delta(&r.clone(), &params(), &Some(second.clone()))
                     .expect("a delta of a valid state applies");
+                r.verify(&r, &params()).expect("valid");
+                crate::to_cbor(&r).unwrap()
+            };
+            assert_eq!(apply2(x, y), apply2(y, x), "delta order changed the result");
+        }
+    }
+
+    // --- Wrapped copies of the store key (harvest#93 phase 1b) -------------
+
+    fn copy_by(
+        signer: &SigningKey,
+        backer: &SigningKey,
+        scope: u8,
+        tag: u8,
+    ) -> crate::custody::AuthorizedCopy {
+        let copy = crate::custody::StoreKeyCopy {
+            store: store_key().verifying_key(),
+            backer: backer.verifying_key(),
+            scope: crate::custody::WrapScope([scope; 32]),
+            wrapped: crate::custody::WrappedStoreKey {
+                scheme: crate::custody::SCHEME_V1,
+                ciphertext: vec![tag; crate::custody::WRAPPED_LEN_V1],
+            },
+        };
+        let (scoped_payload, signature) = store_sign(signer, &copy);
+        crate::custody::AuthorizedCopy {
+            copy,
+            scoped_payload,
+            signature,
+        }
+    }
+
+    fn copy(backer: &SigningKey, scope: u8, tag: u8) -> crate::custody::AuthorizedCopy {
+        copy_by(&store_key(), backer, scope, tag)
+    }
+
+    fn with_copies(
+        backings: Vec<AuthorizedBacking>,
+        retirements: Vec<AuthorizedRetirement>,
+        copies: Vec<crate::custody::AuthorizedCopy>,
+    ) -> Result<StoreStateV1, String> {
+        let mut delta = delta_with(backings, retirements, vec![]);
+        delta.copies = (!copies.is_empty()).then_some(copies);
+        apply(&StoreStateV1::default(), delta)
+    }
+
+    /// A copy is the store key's to publish, for a Ghost Key that backs the
+    /// store, in the v1 shape. Mutated red by removing the signature, owner
+    /// and shape checks from `AuthorizedCopy::verify`, and the
+    /// held-and-unretired check from `StoreStateV1::verify`.
+    #[test]
+    fn a_wrapped_copy_is_the_store_keys_for_a_backer_it_holds() {
+        let ok = with_copies(
+            vec![backing(&ghost(1), 100)],
+            vec![],
+            vec![copy(&ghost(1), 7, 1)],
+        )
+        .expect("the store key's copy for its own backer");
+        assert_eq!(ok.copies.records.len(), 1);
+
+        // Signed by someone else.
+        assert!(with_copies(
+            vec![backing(&ghost(1), 100)],
+            vec![],
+            vec![copy_by(&ghost(9), &ghost(1), 7, 1)]
+        )
+        .is_err());
+        // Malformed ciphertext.
+        let mut bad = copy(&ghost(1), 7, 1);
+        bad.copy.wrapped.ciphertext.pop();
+        let (scoped_payload, signature) = store_sign(&store_key(), &bad.copy);
+        bad.scoped_payload = scoped_payload;
+        bad.signature = signature;
+        assert!(with_copies(vec![backing(&ghost(1), 100)], vec![], vec![bad]).is_err());
+
+        // A whole state holding a copy for a retired Ghost Key is refused.
+        let mut state = with_copies(
+            vec![backing(&ghost(1), 100)],
+            vec![retirement(&ghost(1))],
+            vec![],
+        )
+        .unwrap();
+        let tombstoned = copy(&ghost(1), 7, 1);
+        state
+            .copies
+            .records
+            .insert(harvest_slot(&tombstoned), tombstoned);
+        assert!(state.verify(&state, &params()).is_err());
+    }
+
+    /// A copy may arrive before the backing it is for, and is kept whichever
+    /// order the two arrive in; a copy for a retired key is dropped
+    /// whichever order THOSE arrive in (the #98 merge-law re-check, applied
+    /// to custody). Mutated red by requiring a held backing in
+    /// `normalize_copies`, and by not dropping retired backers' copies.
+    #[test]
+    fn a_copy_arriving_before_its_backing_is_kept_and_a_retired_one_never_is() {
+        let step = |base: &StoreStateV1, d: crate::store::StoreStateV1Delta| {
+            let mut r = base.clone();
+            r.apply_delta(&base.clone(), &params(), &Some(d)).unwrap();
+            r.verify(&r, &params()).expect("valid");
+            r
+        };
+        let mut copy_delta = delta_with(vec![], vec![], vec![]);
+        copy_delta.copies = Some(vec![copy(&ghost(1), 7, 1)]);
+        let back = delta_with(vec![backing(&ghost(1), 100)], vec![], vec![]);
+        let retire = delta_with(vec![], vec![retirement(&ghost(1))], vec![]);
+        let empty = StoreStateV1::default();
+
+        let copy_first = step(&step(&empty, copy_delta.clone()), back.clone());
+        let back_first = step(&step(&empty, back.clone()), copy_delta.clone());
+        assert_eq!(copy_first, back_first);
+        assert_eq!(copy_first.copies.records.len(), 1, "the copy survives");
+
+        let then_retired = step(&copy_first, retire.clone());
+        let retired_first = step(&step(&empty, retire), copy_delta);
+        assert!(then_retired.copies.records.is_empty());
+        assert!(retired_first.copies.records.is_empty());
+    }
+
+    fn harvest_slot(copy: &crate::custody::AuthorizedCopy) -> Bytes32 {
+        crate::custody::AuthorizedCopy::slot_for(&copy.copy.backer, &copy.copy.scope)
+    }
+
+    /// The retirement is the custody tombstone (section 6.3, check 4): it
+    /// drops the retired key's copies, and a copy for that key arriving
+    /// later, under any scope, from a stale peer or a fresh wrap, is dropped
+    /// too. Mutated red by not filtering retired backers in
+    /// `normalize_copies`.
+    #[test]
+    fn retiring_a_backer_tombstones_every_copy_it_had_or_will_have() {
+        let backed = with_copies(
+            vec![backing(&ghost(1), 100), backing(&ghost(2), 200)],
+            vec![],
+            vec![copy(&ghost(1), 7, 1), copy(&ghost(2), 7, 2)],
+        )
+        .unwrap();
+        let retired = with_copies(
+            vec![backing(&ghost(1), 100)],
+            vec![retirement(&ghost(1))],
+            vec![],
+        )
+        .unwrap();
+        let mut merged = backed.clone();
+        merged.merge(&backed.clone(), &params(), &retired).unwrap();
+        assert_eq!(merged.copies.records.len(), 1);
+        assert!(merged
+            .copies
+            .records
+            .values()
+            .all(|c| c.copy.backer == ghost(2).verifying_key()));
+
+        // A re-wrap for the retired key under a NEW scope does not bring its
+        // access back.
+        let mut late = merged.clone();
+        let mut delta = delta_with(vec![], vec![], vec![]);
+        delta.copies = Some(vec![copy(&ghost(1), 8, 3)]);
+        late.apply_delta(&merged.clone(), &params(), &Some(delta))
+            .expect("dropped, not refused: a merge never fails");
+        assert_eq!(late, merged);
+    }
+
+    /// A copy goes with its backing when the bound cuts it, so the merge of
+    /// two valid states is valid: the one survivor is not a copy for a key
+    /// that no longer backs the store. Mutated red by keeping copies of
+    /// unbacked keys in `normalize_copies`.
+    #[test]
+    fn a_cut_backing_takes_its_copies_with_it() {
+        let mut keys: Vec<SigningKey> = (0..MAX_BACKINGS as u32 + 1)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&(i + 1000).to_le_bytes());
+                SigningKey::from_bytes(&seed)
+            })
+            .collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        let largest = keys.last().unwrap().clone();
+        let a = with_copies(
+            vec![backing(&largest, 100)],
+            vec![],
+            vec![copy(&largest, 7, 1)],
+        )
+        .unwrap();
+        let b = with(
+            keys[..MAX_BACKINGS]
+                .iter()
+                .map(|k| backing(k, 100))
+                .collect(),
+            vec![],
+        );
+        let mut ab = a.clone();
+        ab.merge(&a.clone(), &params(), &b)
+            .expect("a merge of valid states succeeds");
+        assert!(!ab
+            .backings
+            .records
+            .contains_key(&Bytes32(largest.verifying_key().to_bytes())));
+        assert!(
+            ab.copies.records.is_empty(),
+            "the copy went with its backing"
+        );
+        ab.verify(&ab, &params()).expect("and the result is valid");
+    }
+
+    /// A copy the store key signed that names another store is refused: the
+    /// signature alone does not say which store the seed belongs to. Mutated
+    /// red by removing the store check from `AuthorizedCopy::verify`.
+    #[test]
+    fn a_copy_naming_another_store_is_refused() {
+        let mut other = copy(&ghost(1), 7, 1);
+        other.copy.store = ghost(8).verifying_key();
+        let (scoped_payload, signature) = store_sign(&store_key(), &other.copy);
+        other.scoped_payload = scoped_payload;
+        other.signature = signature;
+        assert!(with_copies(vec![backing(&ghost(1), 100)], vec![], vec![other]).is_err());
+    }
+
+    /// At most `MAX_SCOPES_PER_BACKER` copies per backer, the smallest scopes,
+    /// and the merge stays total past it. Mutated red by keeping the largest
+    /// scopes.
+    #[test]
+    fn a_backer_keeps_its_smallest_scopes_past_the_bound() {
+        let max = crate::custody::MAX_SCOPES_PER_BACKER;
+        let copies: Vec<_> = (0..=max as u8)
+            .map(|i| copy(&ghost(1), 10 + i, i))
+            .collect();
+        let state = with_copies(vec![backing(&ghost(1), 100)], vec![], copies)
+            .expect("past the bound the merge still succeeds");
+        let mut scopes: Vec<u8> = state
+            .copies
+            .records
+            .values()
+            .map(|c| c.copy.scope.0[0])
+            .collect();
+        scopes.sort();
+        assert_eq!(scopes, (10..10 + max as u8).collect::<Vec<_>>());
+    }
+
+    /// Copies obey the merge laws with backings, retirements and the bound
+    /// in play. Seeded; byte-level.
+    #[test]
+    fn seeded_random_stores_with_copies_obey_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let backings = vec![
+            backing(&ghost(1), 100),
+            backing(&ghost(2), 200),
+            backing(&ghost(3), 300),
+        ];
+        let retirements = vec![retirement(&ghost(1)), retirement(&ghost(3))];
+        let copies: Vec<_> = [1u8, 2, 3]
+            .iter()
+            .flat_map(|g| (0..6u8).map(move |sc| (*g, sc)))
+            .map(|(g, sc)| copy(&ghost(g), 20 + sc, g ^ sc))
+            .collect();
+        let mut rng = Rng::new(0xc0_91e5);
+        let mut states = Vec::new();
+        for _ in 0..40 {
+            let mut b = rng.subset(&backings, 3);
+            if b.is_empty() {
+                b.push(backings[0].clone());
+            }
+            let r = rng.subset(&retirements, 2);
+            let c = rng.subset(&copies, 8);
+            // Sometimes no backing at all: copies and retirements may arrive
+            // before the backings they name.
+            if rng.below(4) == 0 {
+                b.clear();
+            }
+            states.push(with_copies(b, r, c).expect("generated state"));
+        }
+        assert_laws(
+            &states,
+            300,
+            &mut rng,
+            |a, b| {
+                let mut merged = a.clone();
+                merged.merge(&a.clone(), &params(), b).expect("never fails");
+                merged.verify(&merged, &params()).expect("valid");
+                merged
+            },
+            |s| crate::to_cbor(s).unwrap(),
+        );
+
+        // Delta order: stale-summary deltas, and deltas carrying one part
+        // only, applied in either order give the same state.
+        let empty = StoreStateV1::default();
+        let stale = empty.summarize(&empty, &params());
+        let mut deltas = Vec::new();
+        for s in &states {
+            let Some(d) = s.delta(s, &params(), &stale) else {
+                continue;
+            };
+            deltas.push(d.clone());
+            let mut only_copies = d.clone();
+            only_copies.backings = None;
+            only_copies.retirements = None;
+            deltas.push(only_copies);
+            let mut no_copies = d;
+            no_copies.copies = None;
+            deltas.push(no_copies);
+        }
+        for _ in 0..300 {
+            let base = &states[rng.below(states.len())];
+            let x = &deltas[rng.below(deltas.len())];
+            let y = &deltas[rng.below(deltas.len())];
+            let apply2 = |a: &crate::store::StoreStateV1Delta,
+                          b: &crate::store::StoreStateV1Delta| {
+                let mut r = base.clone();
+                r.apply_delta(&base.clone(), &params(), &Some(a.clone()))
+                    .expect("applies");
+                r.apply_delta(&r.clone(), &params(), &Some(b.clone()))
+                    .expect("applies");
                 r.verify(&r, &params()).expect("valid");
                 crate::to_cbor(&r).unwrap()
             };

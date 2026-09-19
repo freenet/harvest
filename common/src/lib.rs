@@ -16,6 +16,7 @@
 pub mod address;
 pub mod backing;
 pub mod bitcoin_delegate;
+pub mod custody;
 pub mod delegate;
 pub mod feedback;
 pub mod listing;

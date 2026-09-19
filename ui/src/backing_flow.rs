@@ -255,6 +255,9 @@ impl AppState {
                 if let Some(pending) = self.pending_store_creation.as_mut() {
                     pending.store_verifying_key = Some(key);
                 }
+                // The record and inbox keys derive from the store key
+                // (harvest#93 phase 1b); creation waits on them.
+                self.request_store_subkeys(key);
                 self.start_store_creation_if_ready();
             }
             Err(why) => {
@@ -604,7 +607,7 @@ pub(crate) mod tests {
 
     /// `(scoped_payload, signature)` over `data`, as the vault or the Harvest
     /// delegate builds it.
-    fn sign<T: serde::Serialize>(key: &SigningKey, data: &T) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn sign<T: serde::Serialize>(key: &SigningKey, data: &T) -> (Vec<u8>, Vec<u8>) {
         let scoped = harvest_common::backing::store_key_envelope(
             harvest_common::to_cbor(data).expect("serialize"),
         )
@@ -906,6 +909,7 @@ pub(crate) mod tests {
             store_name: "Bean Shop".to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         });
         // Checked once the store key is known (a retry must be able to
         // resume its own store; see `a_retry_is_not_refused_...`).
@@ -1043,6 +1047,7 @@ pub(crate) mod tests {
             store_name: "Old Shop".to_string(),
             description: "since 2026".to_string(),
             encryption_public_key: None,
+            record_public_key: None,
         });
         store.listings = vec![harvest_common::listing::AuthorizedListing {
             listing,
@@ -1105,7 +1110,7 @@ pub(crate) mod tests {
 
     /// A signed backing of the store keyed by `store` seed by the Ghost Key
     /// `backer` seed, dated `height`.
-    fn signed_backing(store: u8, backer: u8, height: u32) -> AuthorizedBacking {
+    pub(crate) fn signed_backing(store: u8, backer: u8, height: u32) -> AuthorizedBacking {
         let store_key = SigningKey::from_bytes(&[store; 32]);
         let ghost = SigningKey::from_bytes(&[backer; 32]);
         let statement = BackingStatement {
@@ -1138,7 +1143,12 @@ pub(crate) mod tests {
     /// way the ingest path keeps it, with each backing's certificate already
     /// judged genuine (no test holds Freenet's master key, so the verdict is
     /// seeded into the cache `backing_view` consults).
-    fn load_backed(state: &mut AppState, id: u8, store: u8, backings: Vec<AuthorizedBacking>) {
+    pub(crate) fn load_backed(
+        state: &mut AppState,
+        id: u8,
+        store: u8,
+        backings: Vec<AuthorizedBacking>,
+    ) {
         for b in &backings {
             state.certificate_verdicts.borrow_mut().insert(
                 (

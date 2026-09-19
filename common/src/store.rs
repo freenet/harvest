@@ -229,6 +229,19 @@ pub struct StoreInfoV1 {
     /// on 2026-09-05, `missing field `encryption_public_key``.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_public_key: Option<[u8; 32]>,
+    /// The store's record (blind-signing RSA) public key, PKCS#1 DER, derived
+    /// from the store key (harvest#93 phase 1b,
+    /// `custody::record_public_key_der`).
+    ///
+    /// Published so every device holding the store key can CHECK its own
+    /// derivation against it rather than trust it silently: RSA key
+    /// generation is not a function the `rsa` crate promises to keep stable,
+    /// so a crate bump could derive a different key from the same seed, and
+    /// the record contract's address depends on it. `None` for a store
+    /// published before this existed. Skipped when absent for the reason
+    /// `encryption_public_key` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_public_key: Option<Vec<u8>>,
 }
 
 /// Store info signed by the store key (harvest#93; by the seller's Ghost Key
@@ -259,6 +272,7 @@ impl Default for AuthorizedStoreInfoV1 {
                 store_name: String::new(),
                 description: String::new(),
                 encryption_public_key: None,
+                record_public_key: None,
             },
             scoped_payload: Vec::new(),
             signature: Vec::new(),
@@ -1006,6 +1020,16 @@ pub struct StoreStateV1 {
         skip_serializing_if = "SignedSetV1::<AuthorizedClosure>::is_empty"
     )]
     pub closed: ClosedV1,
+    /// The store key, wrapped to each backing Ghost Key, one copy per
+    /// (backer, webapp scope), each signed by the store key (harvest#93
+    /// phase 1b). A copy is kept exactly while its backer holds a backing
+    /// that is not retired: the retirement is the tombstone. See
+    /// [`crate::custody`] and [`StoreStateV1::normalize_backings`].
+    #[serde(
+        default,
+        skip_serializing_if = "SignedSetV1::<crate::custody::AuthorizedCopy>::is_empty"
+    )]
+    pub copies: crate::custody::CopiesV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -1026,6 +1050,8 @@ pub struct StoreStateV1Summary {
     pub retirements: <RetirementsV1 as ComposableState>::Summary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub closed: <ClosedV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: <crate::custody::CopiesV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -1053,6 +1079,8 @@ pub struct StoreStateV1Delta {
     pub retirements: Option<<RetirementsV1 as ComposableState>::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<<ClosedV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<<crate::custody::CopiesV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -1067,6 +1095,7 @@ impl StoreStateV1 {
             || !self.backings.is_empty()
             || !self.retirements.is_empty()
             || !self.closed.is_empty()
+            || !self.copies.is_empty()
     }
 
     /// Apply the store-wide bound on backings and retirements (harvest#93
@@ -1118,14 +1147,20 @@ impl StoreStateV1 {
         let max = crate::backing::MAX_BACKINGS;
         let slots = self.backing_slots();
         if slots.len() > max {
-            for slot in slots.into_iter().skip(max) {
-                self.backings.records.remove(&slot);
-                self.retirements.records.remove(&slot);
+            let cut: BTreeSet<Bytes32> = slots.into_iter().skip(max).collect();
+            for slot in &cut {
+                self.backings.records.remove(slot);
+                self.retirements.records.remove(slot);
             }
+            self.copies
+                .records
+                .retain(|_, copy| !cut.contains(&Bytes32(copy.copy.backer.to_bytes())));
         }
+        self.normalize_copies();
     }
 
-    /// Every Ghost Key with a backing or a retirement here, smallest first:
+    /// Every Ghost Key with a backing, a retirement or a wrapped copy here,
+    /// smallest first:
     /// the slots [`Self::normalize_backings`] ranks.
     fn backing_slots(&self) -> BTreeSet<Bytes32> {
         self.backings
@@ -1133,7 +1168,60 @@ impl StoreStateV1 {
             .keys()
             .chain(self.retirements.records.keys())
             .copied()
+            .chain(
+                self.copies
+                    .records
+                    .values()
+                    .map(|copy| Bytes32(copy.copy.backer.to_bytes())),
+            )
             .collect()
+    }
+
+    /// Keep a wrapped copy of the store key unless its backer is retired, at
+    /// most [`crate::custody::MAX_SCOPES_PER_BACKER`] per backer (the
+    /// smallest scopes), and only while its backer's slot survives the bound
+    /// in [`Self::normalize_backings`] (harvest#93 phase 1b).
+    ///
+    /// The retirement is the custody tombstone (section 6.3, check 4): one
+    /// signed act stops a key being current and stops it recovering the store
+    /// key from state, and a copy written under a new scope after the
+    /// retirement, or arriving late from a stale peer, is dropped here.
+    ///
+    /// A copy need not name a backing this replica holds: it may arrive
+    /// before its backing, and is kept either way, for the same reason a
+    /// retirement is (the #98 merge-law re-check): a rule keyed on what else
+    /// happened to arrive first depends on arrival order. The copy's backer
+    /// takes a slot in the bound like a backing or a retirement does.
+    ///
+    /// Total and associative in any arrival order: the slot bound is top-N
+    /// over the union of slots; the retired filter depends only on the
+    /// retirements, which share their slots with the copies they drop; and
+    /// the per-backer bound is top-N over scope bytes, which the per-slot
+    /// merge cannot change, because a copy's slot IS its (backer, scope).
+    fn normalize_copies(&mut self) {
+        let retirements = &self.retirements.records;
+        self.copies
+            .records
+            .retain(|_, copy| !retirements.contains_key(&Bytes32(copy.copy.backer.to_bytes())));
+        let mut by_backer: BTreeMap<[u8; 32], Vec<(crate::custody::WrapScope, Bytes32)>> =
+            BTreeMap::new();
+        for (slot, copy) in &self.copies.records {
+            by_backer
+                .entry(copy.copy.backer.to_bytes())
+                .or_default()
+                .push((copy.copy.scope, *slot));
+        }
+        for (_, mut scopes) in by_backer {
+            if scopes.len() > crate::custody::MAX_SCOPES_PER_BACKER {
+                scopes.sort();
+                for (_, slot) in scopes
+                    .into_iter()
+                    .skip(crate::custody::MAX_SCOPES_PER_BACKER)
+                {
+                    self.copies.records.remove(&slot);
+                }
+            }
+        }
     }
 
     /// The parent the children are verified under. They read the owner and
@@ -1167,6 +1255,8 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.retirements)?;
         next.closed
             .apply_delta(&parent, parameters, &delta.closed)?;
+        next.copies
+            .apply_delta(&parent, parameters, &delta.copies)?;
         next.normalize_backings();
         *self = next;
         Ok(())
@@ -1212,7 +1302,8 @@ impl ComposableState for StoreStateV1 {
         self.listings.verify(&parent, parameters)?;
         self.orders.verify(&parent, parameters)?;
         // The store-wide rule `normalize_backings` keeps: at most
-        // `MAX_BACKINGS` Ghost Keys with a backing or a retirement. A state
+        // `MAX_BACKINGS` Ghost Keys with a backing, a retirement or a wrapped
+        // copy. A state
         // that breaks it is one no merge produces. A retirement need not
         // name a held backing (see `normalize_backings`).
         let slots = self.backing_slots().len();
@@ -1223,6 +1314,28 @@ impl ComposableState for StoreStateV1 {
                 crate::backing::MAX_BACKINGS
             ));
         }
+        // Every wrapped copy is for a backer that is not retired, and no
+        // backer has more than `MAX_SCOPES_PER_BACKER` (see
+        // `normalize_copies`). A copy need not name a held backing.
+        let mut per_backer: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        for copy in self.copies.records.values() {
+            let backer = Bytes32(copy.copy.backer.to_bytes());
+            if self.retirements.records.contains_key(&backer) {
+                return Err(
+                    "a wrapped copy of the store key is for a Ghost Key whose backing is retired"
+                        .into(),
+                );
+            }
+            let n = per_backer.entry(backer.0).or_default();
+            *n += 1;
+            if *n > crate::custody::MAX_SCOPES_PER_BACKER {
+                return Err(format!(
+                    "a Ghost Key has more than {} wrapped copies of the store key",
+                    crate::custody::MAX_SCOPES_PER_BACKER
+                ));
+            }
+        }
+        self.copies.verify(&parent, parameters)?;
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
         self.closed.verify(&parent, parameters)
@@ -1242,6 +1355,7 @@ impl ComposableState for StoreStateV1 {
             backings: self.backings.summarize(&parent, parameters),
             retirements: self.retirements.summarize(&parent, parameters),
             closed: self.closed.summarize(&parent, parameters),
+            copies: self.copies.summarize(&parent, parameters),
         }
     }
 
@@ -1282,6 +1396,7 @@ impl ComposableState for StoreStateV1 {
                 .retirements
                 .delta(&parent, parameters, &base.retirements),
             closed: self.closed.delta(&parent, parameters, &base.closed),
+            copies: self.copies.delta(&parent, parameters, &base.copies),
         };
         if delta.info.is_none()
             && delta.listings.is_none()
@@ -1289,6 +1404,7 @@ impl ComposableState for StoreStateV1 {
             && delta.backings.is_none()
             && delta.retirements.is_none()
             && delta.closed.is_none()
+            && delta.copies.is_none()
         {
             None
         } else {
@@ -3168,6 +3284,7 @@ mod order_tests {
                 store_name: format!("Shop v{version}"),
                 description: String::new(),
                 encryption_public_key: None,
+                record_public_key: None,
             };
             let (scoped_payload, signature) = sign_scoped(&seller, &info);
             AuthorizedStoreInfoV1 {
@@ -3902,6 +4019,7 @@ mod order_tests {
                 store_name: format!("version {version}"),
                 description: String::new(),
                 encryption_public_key: None,
+                record_public_key: None,
             };
             let (scoped_payload, signature) = sign_scoped(owner, &info);
             AuthorizedStoreInfoV1 {
