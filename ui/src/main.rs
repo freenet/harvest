@@ -7,6 +7,7 @@ mod backing_flow;
 mod bitcoin_generation;
 mod bitcoin_inbox;
 mod components;
+mod custody_flow;
 mod document_title;
 mod gateway;
 mod ghostkey_cert;

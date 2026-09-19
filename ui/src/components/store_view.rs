@@ -614,6 +614,7 @@ mod buy_control_tests {
                 store_name: "Hot sauce".to_string(),
                 description: String::new(),
                 encryption_public_key: encryption_key,
+                record_public_key: None,
             }),
             seller_verifying_key: identity,
             ..Default::default()
@@ -695,6 +696,7 @@ mod listing_buy_gate_tests {
                 store_name: "Hot sauce".to_string(),
                 description: String::new(),
                 encryption_public_key: Some([1u8; 32]),
+                record_public_key: None,
             }),
             seller_verifying_key: Some([2u8; 32]),
             ..Default::default()

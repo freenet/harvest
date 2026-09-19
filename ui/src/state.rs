@@ -271,7 +271,31 @@ pub struct AppState {
     /// which is taken as soon as its inputs arrive, this stays set through
     /// the backing signatures and the PUTs, so a second click cannot start a
     /// second store. See `backing_flow`.
-    pub store_creation_in_flight: Option<String>,
+        pub store_creation_in_flight: Option<String>,
+
+    /// The public halves of the keys each store key derives, by store key,
+    /// as this device's delegate reported them (harvest#93 phase 1b).
+    pub store_subkeys: HashMap<[u8; 32], harvest_common::delegate::StoreSubkeyInfo>,
+
+    /// Store keys whose subkeys have been asked for this session.
+    pub store_subkeys_requested: HashSet<[u8; 32]>,
+
+    /// Custody requests waiting on the vault's wrap signature, by store key,
+    /// and then on the Harvest delegate's answer. See `custody_flow`.
+    pub pending_custody: std::collections::BTreeMap<[u8; 32], crate::custody_flow::CustodyRequest>,
+
+    /// (store key, backing key) pairs custody has been started for this
+    /// session, so a store's state arriving again does not ask the vault
+    /// again.
+        pub custody_attempted: HashSet<([u8; 32], [u8; 32])>,
+
+    /// Off-target only: custody requests that would have gone to the
+    /// Harvest delegate, and copies that would have been published, recorded
+    /// so the flow can be followed in a test. See `custody_flow`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub custody_sent: Vec<harvest_common::HarvestDelegateRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub copies_to_publish: Vec<(Vec<u8>, harvest_common::custody::AuthorizedCopy)>,
 
     /// A backing signed by both keys for a creation whose publish then
     /// failed, kept so a retry reuses it (#98 review, M1): the Harvest
@@ -546,6 +570,35 @@ fn spawn_inbox_entry_signature(pending: crate::bitcoin_inbox::PendingInboxEntry)
         };
         if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
             withdraw(format!("send for signing: {e}"));
+        }
+    });
+}
+
+/// Send one request to the Harvest delegate, logging (never showing) a
+/// failure. For requests whose answer is the only thing that matters, and
+/// which carry their own correlation.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_harvest_request(
+    request: harvest_common::HarvestDelegateRequest,
+    what: &'static str,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::ReadableExt;
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .harvest_delegate_key
+            .clone()
+        else {
+            dioxus::logger::tracing::warn!("could not send {what}: no Harvest delegate");
+            return;
+        };
+        match harvest_common::to_cbor(&request) {
+            Ok(payload) => {
+                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                    dioxus::logger::tracing::warn!("could not send {what}: {e}");
+                }
+            }
+            Err(e) => dioxus::logger::tracing::warn!("could not encode {what}: {e}"),
         }
     });
 }
@@ -861,10 +914,11 @@ impl PendingStoreEdit {
     /// all has no name, no description and no reputation link, which is
     /// worse. `store_details_gap` reports the missing key afterwards so the
     /// seller has a route back to it.
-    fn store_info(
+        fn store_info(
         &self,
         certificate_pem: String,
         encryption_public_key: Option<[u8; 32]>,
+        record_public_key: Option<Vec<u8>>,
     ) -> StoreInfoV1 {
         StoreInfoV1 {
             version: self.next_version,
@@ -873,7 +927,8 @@ impl PendingStoreEdit {
             reputation_contract_id: self.reputation_contract_id,
             store_name: self.details.store_name.clone(),
             description: self.details.description.clone(),
-            encryption_public_key,
+                        encryption_public_key,
+            record_public_key,
         }
     }
 }
@@ -2508,7 +2563,8 @@ impl AppState {
                     let backing_state = harvest_common::store::StoreStateV1 {
                         owner: store_state.owner,
                         backings: store_state.backings.clone(),
-                        retirements: store_state.retirements.clone(),
+                                                retirements: store_state.retirements.clone(),
+                        copies: store_state.copies.clone(),
                         ..Default::default()
                     };
                     let backers: Vec<ed25519_dalek::VerifyingKey> = store_state
@@ -2539,7 +2595,12 @@ impl AppState {
                     // The Ghost Key behind this store may also back another
                     // store this reader has loaded, and the reverse: re-apply
                     // the one-store-per-key rule across all of them.
-                    self.refresh_backing_verdicts();
+                                        self.refresh_backing_verdicts();
+
+                    // Keep this store's key recoverable from its backing Ghost
+                    // Key, or recover it here if this device has lost it
+                    // (harvest#93 phase 1b). See `custody_flow`.
+                    self.start_custody_for(&contract_id);
 
                     // One of our stores, held by another key: say so, once.
                     if let Some(held) = self.foreign_store_owner(&contract_id) {
@@ -2736,10 +2797,15 @@ impl AppState {
         self.pending_conversation_key_requests
             .insert(request_id, wanted.clone());
         Some(
-            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                        harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
                 request_id,
                 ghostkey_fingerprint,
                 peer_public_keys: wanted,
+                // A store with its own key reads with the inbox key that key
+                // derives (harvest#93 phase 1b), the same on every device.
+                store_verifying_key: self
+                    .store_owner_key(store_contract_id)
+                    .map(|key| key.to_bytes()),
             },
         )
     }
@@ -4959,7 +5025,7 @@ impl AppState {
     /// Called both when the edit is submitted (the certificate is usually
     /// already cached by then) and whenever a certificate arrives, so
     /// neither order needs special handling.
-    fn start_store_edit_if_ready(&mut self) -> bool {
+    pub(crate) fn start_store_edit_if_ready(&mut self) -> bool {
         let Some(edit) = self.pending_store_edit.as_ref() else {
             return false;
         };
@@ -4975,10 +5041,27 @@ impl AppState {
             return false;
         };
 
-        let encryption_public_key = self
-            .encryption_public_keys
-            .get(&edit.ghostkey_fingerprint)
-            .copied();
+                // A store with its own key publishes the keys it derives (harvest#93
+        // phase 1b), so every device agrees on them; wait for them if this
+        // device has not asked yet. A store made before store keys keeps the
+        // per-device key of its Ghost Key.
+        let (encryption_public_key, record_public_key) =
+            match self.store_owner_key(&edit.store_contract_id) {
+                Some(store_key) => match self.store_subkeys.get(&store_key.to_bytes()) {
+                    Some(sub) => (Some(sub.inbox_public_key), Some(sub.record_public_key.clone())),
+                    None => {
+                        self.pending_store_edit = Some(edit);
+                        self.request_store_subkeys(store_key.to_bytes());
+                        return false;
+                    }
+                },
+                None => (
+                    self.encryption_public_keys
+                        .get(&edit.ghostkey_fingerprint)
+                        .copied(),
+                    None,
+                ),
+            };
         if encryption_public_key.is_none() {
             info!(
                 "Publishing store details for {} with no encryption key -- buyers will be told \
@@ -4986,7 +5069,7 @@ impl AppState {
                 edit.ghostkey_fingerprint
             );
         }
-        let info = edit.store_info(certificate_pem, encryption_public_key);
+                let info = edit.store_info(certificate_pem, encryption_public_key, record_public_key);
         info!(
             "Publishing details for store {:?} at version {}",
             &edit.store_contract_id[..8.min(edit.store_contract_id.len())],
@@ -5662,12 +5745,10 @@ impl AppState {
                     .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
                 self.start_reputation_migration(&ghostkey_fingerprint);
 
-                if let Some(pending) = self.pending_store_creation.as_mut() {
-                    if pending.ghostkey_fingerprint == ghostkey_fingerprint {
-                        pending.rsa_public_key_der = Some(rsa_public_key_der);
-                    }
-                }
-                self.start_store_creation_if_ready();
+                                // A store's record key now derives from its store key
+                // (harvest#93 phase 1b): creation takes it from
+                // `StoreSubkeys`, not from this per-device key.
+                let _ = rsa_public_key_der;
             }
 
             HarvestDelegateResponse::RsaPublicKey {
@@ -5685,13 +5766,11 @@ impl AppState {
             } => match <[u8; 32]>::try_from(x25519_public_key.as_slice()) {
                 Ok(key) => {
                     info!("Encryption key ready for {ghostkey_fingerprint}");
+                                        // Kept for a store made before store keys; a store with
+                    // one publishes the inbox key its store key derives
+                    // (harvest#93 phase 1b, `StoreSubkeys`).
                     self.encryption_public_keys
                         .insert(ghostkey_fingerprint.clone(), key);
-                    if let Some(pending) = self.pending_store_creation.as_mut() {
-                        if pending.ghostkey_fingerprint == ghostkey_fingerprint {
-                            pending.encryption_public_key = Some(key);
-                        }
-                    }
                 }
                 // Refused rather than padded or truncated into something the
                 // seller would sign into a permanent record and no buyer
@@ -5865,9 +5944,27 @@ impl AppState {
                 self.remembered_stores = Some(stores);
             }
 
-            HarvestDelegateResponse::StoreKeyCreated { request_id, result } => {
+                        HarvestDelegateResponse::StoreKeyCreated { request_id, result } => {
                 self.on_store_key_created(request_id, result);
             }
+
+            HarvestDelegateResponse::StoreKeyWrapped {
+                store_verifying_key,
+                result,
+                ..
+            } => self.on_store_key_wrapped(store_verifying_key, result),
+
+            HarvestDelegateResponse::StoreKeyRecovered {
+                store_verifying_key,
+                result,
+                ..
+            } => self.on_store_key_recovered(store_verifying_key, result),
+
+            HarvestDelegateResponse::StoreSubkeys {
+                store_verifying_key,
+                result,
+                ..
+            } => self.on_store_subkeys(store_verifying_key, result),
 
             HarvestDelegateResponse::StoreUpdateSigned {
                 request_id,
@@ -6201,9 +6298,13 @@ impl AppState {
         // A creation waiting on the vault (its certificate, or the Ghost
         // Key's backing statement) will never finish now; release it so the
         // seller can try again. The caller says why.
-        if creation_stopped {
+                if creation_stopped {
             self.store_creation_in_flight = None;
         }
+        // Custody waits on the vault too. The attempt stays recorded, so a
+        // refused prompt is not raised again on every state arrival; a reload
+        // tries again.
+        self.pending_custody.clear();
     }
 
     /// Handle a response from the ghostkey delegate.
@@ -6362,8 +6463,18 @@ impl AppState {
                 scoped_payload,
                 signature,
                 certificate_pem,
-            } => {
+                        } => {
                 info!("Received signature from ghostkey delegate");
+                // A custody wrap signature is a SECRET, and is routed before
+                // anything else sees it (harvest#93 phase 1b): straight to
+                // the Harvest delegate, never into `pending_signatures` or
+                // any path that publishes.
+                if signed_message_bytes(&scoped_payload)
+                    .is_some_and(|message| harvest_common::custody::is_wrap_message(&message))
+                {
+                    self.on_wrap_signature(scoped_payload, signature);
+                    return;
+                }
                 self.on_signature(Signer::GhostKey, scoped_payload, signature, certificate_pem);
             }
 
@@ -8115,6 +8226,7 @@ mod tests {
                 store_name: name.to_string(),
                 description: String::new(),
                 encryption_public_key: None,
+                record_public_key: None,
             }),
             ..Default::default()
         }
@@ -8394,10 +8506,25 @@ mod tests {
         }
     }
 
+        /// The record key's arrival. Since harvest#93 phase 1b it is the
+    /// `StoreSubkeys` answer for the store key the creation made, not a
+    /// per-Ghost-Key RSA key; "someone else" is an answer about another
+    /// store key.
     fn rsa_keys_initialized(fingerprint: &str) -> HarvestDelegateResponse {
-        HarvestDelegateResponse::ReputationKeysInitialized {
-            ghostkey_fingerprint: fingerprint.to_string(),
-            rsa_public_key_der: vec![9u8; 8],
+        let store = if fingerprint == FINGERPRINT {
+            crate::state::test_store_key()
+        } else {
+            ed25519_dalek::SigningKey::from_bytes(&[0x3d; 32])
+                .verifying_key()
+                .to_bytes()
+        };
+        HarvestDelegateResponse::StoreSubkeys {
+            request_id: 1,
+            store_verifying_key: store,
+            result: Ok(harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [4u8; 32],
+                record_public_key: vec![9u8; 8],
+            }),
         }
     }
 
@@ -8491,7 +8618,35 @@ mod tests {
         assert!(pending.rsa_public_key_der.is_none());
     }
 
-    const STORE_ID: [u8; 32] = [1u8; 32];
+        const STORE_ID: [u8; 32] = [1u8; 32];
+    const STORE_INBOX_KEY: [u8; 32] = [0x1b; 32];
+    const STORE_RECORD_KEY: [u8; 4] = [0x2e; 4];
+
+    /// A store with its own key publishes the keys its store key derives
+    /// (harvest#93 phase 1b), not the per-device key of its Ghost Key, and
+    /// an edit waits for them rather than publishing without. Mutated red by
+    /// taking the per-device key for a keyed store.
+    #[test]
+    fn an_edit_publishes_the_keys_the_store_key_derives() {
+        let mut state = seller_with_store(Some(published_info(1, "Bean Shop", REPUTATION_ID)));
+        state.encryption_public_keys.insert(FINGERPRINT.to_string(), [0x99; 32]);
+        state.certificates.insert(FINGERPRINT.to_string(), "CERT".to_string());
+        let subkeys = state.store_subkeys.remove(&test_store_key()).unwrap();
+        state
+            .publish_store_details(&STORE_ID, typed_details())
+            .expect("the seller owns this store");
+        assert!(queued_store_info(&state).is_none(), "waits for the store's keys");
+        assert!(state.store_subkeys_requested.contains(&test_store_key()));
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreSubkeys {
+            request_id: 1,
+            store_verifying_key: test_store_key(),
+            result: Ok(subkeys),
+        });
+        let info = queued_store_info(&state).expect("published once they arrive");
+        assert_eq!(info.encryption_public_key, Some(STORE_INBOX_KEY));
+        assert_eq!(info.record_public_key.as_deref(), Some(&STORE_RECORD_KEY[..]));
+    }
     /// `registration(1, ..)` files the store's reputation contract under this.
     const REPUTATION_ID: [u8; 32] = [2u8; 32];
 
@@ -8504,15 +8659,25 @@ mod tests {
             store_name: name.to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         }
     }
 
     /// A seller who owns one store, optionally with published details.
-    fn seller_with_store(published: Option<StoreInfoV1>) -> AppState {
+        fn seller_with_store(published: Option<StoreInfoV1>) -> AppState {
         let mut state = AppState {
             my_stores: HashMap::from([(FINGERPRINT.to_string(), vec![registration(1, None)])]),
             ..AppState::default()
         };
+        // The keys the store key derives, as the delegate reported them
+        // (harvest#93 phase 1b): an edit publishes them.
+        state.store_subkeys.insert(
+            test_store_key(),
+            harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: STORE_INBOX_KEY,
+                record_public_key: STORE_RECORD_KEY.to_vec(),
+            },
+        );
         if let Some(info) = published {
             state
                 .browsing_stores
@@ -9619,6 +9784,7 @@ mod tests {
             store_name: "Loaded".to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         });
 
         assert!(!state.note_store_link_failed(&[9u8; 32], "didn't load"));
@@ -9866,6 +10032,7 @@ mod invoice_tests {
             store_name: "Store".to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         });
     }
 
@@ -12193,11 +12360,17 @@ mod delegate_correlation_tests {
     ///
     /// Observed red by removing that check.
     #[test]
-    fn a_creation_does_not_adopt_another_identitys_rsa_key() {
+        fn a_creation_does_not_adopt_another_identitys_rsa_key() {
         let mut state = with_another_creation_in_flight();
 
         state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
             ghostkey_fingerprint: OURS.to_string(),
+            rsa_public_key_der: vec![7u8; 16],
+        });
+        // Nor, since harvest#93 phase 1b, the matching identity's per-device
+        // key: a store's record key derives from its store key.
+        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+            ghostkey_fingerprint: THEIRS.to_string(),
             rsa_public_key_der: vec![7u8; 16],
         });
 
@@ -12210,11 +12383,15 @@ mod delegate_correlation_tests {
             "a creation adopted an RSA key answered about a different identity"
         );
 
-        // The matching answer IS adopted, so the assertion above is not
-        // passing because the field is never filled.
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
-            ghostkey_fingerprint: THEIRS.to_string(),
-            rsa_public_key_der: vec![8u8; 16],
+                // The creation's own store key's subkeys ARE adopted, so the
+        // assertion above is not passing because the field is never filled.
+        state.on_delegate_response(HarvestDelegateResponse::StoreSubkeys {
+            request_id: 1,
+            store_verifying_key: crate::state::test_store_key(),
+            result: Ok(harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [1u8; 32],
+                record_public_key: vec![8u8; 16],
+            }),
         });
         assert_eq!(
             state
@@ -18722,6 +18899,7 @@ mod store_code_tests {
             store_name: "Bean Shop".to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         });
 
         let (rows, hidden) = state.store_list_rows(false);
