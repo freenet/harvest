@@ -55,8 +55,11 @@ pub async fn connect(
 
     info!("Connecting to Freenet node at: {node_address}");
 
+    // Not the browser's error text: Chrome's SyntaxError quotes the whole
+    // URL ("The URL '<url>' is invalid."), token included, and this string
+    // is logged by the caller and shown as the connection status.
     let websocket = web_sys::WebSocket::new(&websocket_url)
-        .map_err(|e| format!("Failed to create WebSocket: {:?}", e))?;
+        .map_err(|_| format!("could not open the websocket to {node_address}"))?;
 
     let (response_tx, response_rx) = mpsc::unbounded();
     let (ready_tx, ready_rx) = futures::channel::oneshot::channel();

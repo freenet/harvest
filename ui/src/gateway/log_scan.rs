@@ -137,15 +137,6 @@ const VETTED: &[Vetted] = &[
               pointer record",
     },
     Vetted {
-        file: "gateway/connection.rs",
-        expr: "e",
-        ty: "wasm_bindgen::JsValue (from WebSocket::new)",
-        why: "the browser's error for a WebSocket that could not be created. \
-              Browsers word it without echoing the URL's query (Chrome, Firefox: \
-              a SyntaxError naming the scheme or the URL as invalid); the one \
-              assumption here worth rechecking if that changes",
-    },
-    Vetted {
         file: "state.rs",
         expr: "&contract_id[..8.min(contract_id.len())]",
         ty: "&[u8]",
@@ -715,7 +706,11 @@ fn scan(src: &str) -> Vec<(usize, Finding)> {
                             }
                         }
                     }
-                    i = close;
+                    // Continue INSIDE the arguments, not past them: a
+                    // `format!("{r:?}")` nested in them is a call site of its
+                    // own. The outer macro's findings come only from its own
+                    // format string, above.
+                    i = open + 1;
                     continue;
                 }
             }
@@ -880,6 +875,12 @@ fn the_scanner_sees_every_shape() {
             vec![D("r".into())],
         ),
         (r#"let a = format_args!("{:?}", r);"#, vec![D("r".into())]),
+        // Nested inside another macro's arguments.
+        (r#"info!("{}", format!("{:?}", r));"#, vec![D("r".into())]),
+        (
+            r#"info!("{}", format_args!("{:?}", r));"#,
+            vec![D("r".into())],
+        ),
         (r#"write!(f, "{:?}", r)?;"#, vec![D("r".into())]),
         (
             r#"writeln!(f, "{:?}", r)?; writeln!(f)?;"#,
