@@ -547,6 +547,7 @@ fn assert_candidate_addresses(
     println!("  migrate::store_candidate_ids, checked against the node's own derivation:");
     let mut saw_legacy = false;
     let mut saw_whole_key = false;
+    let mut saw_code = false;
 
     for (entry, got) in newest_first.iter().zip(&derived) {
         let (_, shape) = ENCODING_BY_GENERATION
@@ -569,7 +570,10 @@ fn assert_candidate_addresses(
                 saw_whole_key = true;
                 whole_key.clone()
             }
-            Shape::Code => code.clone(),
+            Shape::Code => {
+                saw_code = true;
+                code.clone()
+            }
         };
         let (_, expected) = container(&wasm, params);
 
@@ -592,9 +596,9 @@ fn assert_candidate_addresses(
     // Without generations on BOTH sides this checks nothing about the split:
     // deriving every id under one encoding would pass.
     assert!(
-        saw_legacy && saw_whole_key,
-        "the registry must span the parameter split for this check to mean anything \
-         (legacy seen: {saw_legacy}, whole key seen: {saw_whole_key})"
+        saw_legacy && saw_whole_key && saw_code,
+        "the registry must span every parameter split for this check to mean anything \
+         (legacy seen: {saw_legacy}, whole key seen: {saw_whole_key}, code seen: {saw_code})"
     );
 }
 
