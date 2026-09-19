@@ -1844,3 +1844,104 @@ than a complete one.
 A store owned by a store key is found at its predecessor addresses by that
 key, which a Ghost Key cannot derive, so each registered store key gets its
 own migration probe (`migrate_ops::start_store_key_migration`).
+
+## Phase 1b: what was built
+
+Phase 1b of #93 is store key custody: every device a seller uses gets the
+same store key, and a device that lost it (for example after a delegate
+re-key, which does not carry delegate secrets across) gets it back from
+its backing Ghost Key. The mechanism is the one the spike validated
+("Store key custody" above). This section records where the build differs
+from the phase 1 API sketch and what it leaves for later.
+
+### Wrapped copies in store state
+
+- The store's state gains `copies`: one `AuthorizedCopy` per (backing
+  Ghost Key, webapp scope), holding the store key's seed sealed under the
+  key the Ghost Key's wrap signature derives (`common/src/custody.rs`).
+  The sketch called this set `custody`.
+- **Each copy is signed by the store key.** The sketch did not say so. An
+  unsigned copy could be replaced by anyone, and the smaller-encoding rule
+  on a clash would then let a third party choose which copy every replica
+  keeps. The contract checks the signature and the copy's shape. It cannot
+  check that a ciphertext opens, and does not need to: the delegate checks
+  that the recovered seed is this store's key before keeping it.
+- **The retirement is the tombstone.** A copy is kept exactly while its
+  backer holds a backing that is not retired
+  (`StoreStateV1::normalize_copies`, called from `normalize_backings`), so
+  one signed retirement stops a key being current and stops it recovering
+  the store key from state. A copy that arrives after the retirement, from
+  a stale peer or written under a new scope, is dropped. `verify` refuses a
+  state holding a copy for a key that does not back the store, or whose
+  backing is retired.
+- **At most four scopes per backer** (`MAX_SCOPES_PER_BACKER`). Past it the
+  smallest scope bytes are kept. That is top-N over the slot, the same
+  argument as the backings bound, so the merge stays total and associative.
+  A scope changes only when Harvest's webapp container id changes, so this
+  bounds a store key's holder, not honest use.
+
+### Who does what
+
+- The UI asks the vault for `SignMessage { message: wrap_message(store) }`.
+  The `SignResult` arm recognises a wrap message (any version, by its
+  `harvest/store-key-wrap/` prefix) before anything else sees it and hands
+  it to `custody_flow::on_wrap_signature`, never to `pending_signatures` or
+  a publish path. The signature travels to the Harvest delegate inside
+  `WrapSignature`, whose `Debug` is redacted. The UI never holds the
+  store's seed. harvest#96 (the fix for #94) is a prerequisite: it stops
+  the UI logging vault responses verbatim.
+- The delegate checks the signature is the wrap signature for this store,
+  under the current scope, from this backer (`WrapSecret::from_sign_result`),
+  then either wraps and signs a copy (`WrapStoreKeyFor`) or opens a copy,
+  checks the seed is the store's key, and keeps it (`UnwrapStoreKey`,
+  through `store_keys::keep`, the same custody seam phase 1a built). The
+  signature is dropped at the end of the request.
+- **When custody runs.** Whenever a store's state arrives, the UI decides
+  from the state alone and the Ghost Keys connected to the tab: wrap if it
+  holds the store key and the current backing has no copy under the current
+  scope; recover if it does not hold the key and there is such a copy;
+  otherwise nothing. Each (store, backer) pair is tried once per session, so
+  a declined vault prompt does not come back on every update. A recovered
+  store is registered again with its store key, its published record, and
+  the mailbox its backer addresses, so it reappears in My Store.
+
+### Derived keys
+
+- The store's inbox (X25519) key and its record (RSA-2048) key derive from
+  the store key (`custody::inbox_secret`, `custody::record_rsa_key`).
+  `GetStoreSubkeys` returns their public halves. `DeriveConversationKeys`
+  takes the store key and reads with the derived inbox key, so every
+  device holding the store key reads the same messages. A store made
+  before store keys (no store key registered) keeps its Ghost Key's
+  per-device key.
+- Creation and every edit of a store with a store key publish the derived
+  keys in `StoreInfoV1`: `encryption_public_key` is the inbox key, and the
+  new `record_public_key` is the record key's DER. Both wait for the
+  delegate's answer instead of falling back to the per-device key. The
+  record contract of a new store is addressed by the derived record key
+  and, as before, by the backing Ghost Key (phase 1d changes that).
+- **The record key is checked, not trusted.** RSA key generation is not a
+  function the `rsa` crate promises to keep stable, so when a device
+  derives a record key that differs from the published one, it says so and
+  tells the seller not to publish from that device. The known-answer test
+  in `custody/tests.rs` turns red on a crate bump that changes the output.
+
+### What phase 1b leaves where it was
+
+- **The mailbox is still addressed by the backing Ghost Key.** Only its
+  encryption key moved to the store key. Changing a store's backing would
+  still move its mailbox, so there is still no "change Ghost Key" or
+  "retire" control. Phase 1d re-addresses the mailbox.
+- A store key and its copies exist only for stores created (or moved) by
+  this build. Nothing published since phase 1a, because 1a, 1b and 1c are
+  merged and published together, so no 1a-only store needs a copy.
+- Recovery needs the backing Ghost Key connected in the tab's vault. A
+  device with no backing Ghost Key cannot recover, by design.
+- Recovery runs when the store's state is loaded on the device. A device
+  that does not know about the store (a new device, or one whose
+  registrations are gone) finds it by opening the store's link; nothing yet
+  finds a seller's stores from their Ghost Key alone. Phase 1c's Ghost Key
+  record is what makes that possible.
+- A retirement cannot take back a key someone has already unwrapped. A
+  compromised backing key means the store key is exposed too, and the
+  answer is the closed flag (section 6.4), not a rotation.

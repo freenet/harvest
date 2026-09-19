@@ -662,8 +662,9 @@ pub(crate) fn test_store_key() -> [u8; 32] {
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
     "this store has no store key on this device. A store made before stores had their own \
-     keys has to be moved to one first (My Store offers it); a store created on another \
-     device can only be signed for there until store keys can be recovered from a Ghost Key.";
+     keys has to be moved to one first (My Store offers it); for a store created on another \
+     device, open its link here with the Ghost Key that backs it connected, and Harvest \
+     recovers the key from the store.";
 
 /// Wrap a freshly-signed invoice as the record the store contract stores.
 ///

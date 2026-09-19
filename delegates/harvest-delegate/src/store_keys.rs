@@ -605,6 +605,47 @@ mod tests {
         .is_err());
     }
 
+    /// Recovery respects the 64-key cap, except for a key the delegate
+    /// already holds. Mutated red by removing the cap check in `unwrap`.
+    #[test]
+    fn recovery_stops_at_the_cap_unless_the_key_is_already_held() {
+        let mut device = MemSecrets::default();
+        let store = created(&mut device);
+        let (scoped, sig) = vault_sign(&ghost(), custody::wrap_message(&store));
+        let copy = wrapped(wrap_for(
+            &device,
+            1,
+            store.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped,
+            &sig,
+        ))
+        .unwrap();
+        let recover = |secrets: &mut MemSecrets| {
+            recovered(unwrap(
+                secrets,
+                2,
+                store.to_bytes(),
+                ghost().verifying_key().to_bytes(),
+                &scoped,
+                &sig,
+                &copy.copy.wrapped,
+            ))
+        };
+
+        let mut full = MemSecrets::default();
+        for _ in 0..MAX_STORE_KEYS {
+            created(&mut full);
+        }
+        assert!(recover(&mut full).is_err(), "no 65th key");
+        assert!(load(&full, &store).is_none());
+
+        for _ in 1..MAX_STORE_KEYS {
+            created(&mut device);
+        }
+        recover(&mut device).expect("a key already held is not a new one");
+    }
+
     /// A copy opened under the wrong Ghost Key's signature, or a corrupt one,
     /// recovers nothing and keeps nothing.
     #[test]
