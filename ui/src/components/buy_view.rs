@@ -470,6 +470,7 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
+        | PaymentBlocker::StoreClosed
         | PaymentBlocker::CommitmentNotTheSellers(_)
         | PaymentBlocker::CommitmentNotForThisBuyer
         | PaymentBlocker::CommitmentNotRequested

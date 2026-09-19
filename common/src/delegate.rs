@@ -881,7 +881,7 @@ pub struct StoreRegistration {
     /// `None` for a registration made before revision 2, when a store was
     /// owned by the Ghost Key it is registered under. Such a store cannot be
     /// signed for by this build; the UI moves it to a store key instead (see
-    /// `ui/src/reissue.rs`).
+    /// `ui/src/backing_flow.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_verifying_key: Option<[u8; 32]>,
 }

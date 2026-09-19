@@ -233,6 +233,17 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         "{certificate_warning(&store.certificate_status)}"
                     }
                 }
+
+                // Said first and plainly: a closed store's key may be in
+                // someone else's hands, so nothing on this page can be
+                // bought, and the record stays visible (harvest#93, 6.4).
+                if store.closed {
+                    p { class: "text-warning",
+                        "This store has closed. Its seller closed it because its key may be \
+                         in someone else's hands, so nothing here can be bought. Its record \
+                         stays visible."
+                    }
+                }
             }
 
             // Contact seller button
@@ -391,6 +402,11 @@ fn buyable(
     // read from `APP_STATE` here, so this is a pure function of what it is
     // handed and can be asserted without a Dioxus runtime.
     if owned {
+        return None;
+    }
+    // A closed store's key may be in someone else's hands (harvest#93): an
+    // order from it could be anybody's, so nothing here is bought.
+    if store.closed {
         return None;
     }
     Some(Buyable {
@@ -615,6 +631,16 @@ mod buy_control_tests {
     #[test]
     fn a_store_whose_identity_did_not_verify_cannot_be_bought_from() {
         let store = store_with(Some([1u8; 32]), None);
+        assert!(buyable(&store, STORE, false).is_none());
+    }
+
+    /// **A closed store cannot be bought from**, however well its identity
+    /// checks out: the key that signs its orders may be someone else's.
+    #[test]
+    fn a_closed_store_cannot_be_bought_from() {
+        let mut store = store_with(Some([1u8; 32]), Some([2u8; 32]));
+        assert!(buyable(&store, STORE, false).is_some());
+        store.closed = true;
         assert!(buyable(&store, STORE, false).is_none());
     }
 

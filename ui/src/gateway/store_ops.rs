@@ -90,6 +90,7 @@ fn listings_delta_bytes(
         info: None,
         listings: Some(listings),
         orders: None,
+        ..Default::default()
     })
     .map_err(|e| format!("serialize listing delta: {e}"))
 }
@@ -111,6 +112,7 @@ fn orders_delta_bytes(
         info: None,
         listings: None,
         orders: Some(orders),
+        ..Default::default()
     })
     .map_err(|e| format!("serialize order delta: {e}"))
 }
@@ -125,6 +127,7 @@ fn store_info_delta_bytes(
         info: Some(info),
         listings: None,
         orders: None,
+        ..Default::default()
     })
     .map_err(|e| format!("serialize store info delta: {e}"))
 }
@@ -181,23 +184,29 @@ pub fn store_contract_key(
 /// harvest delegate.
 #[cfg(target_arch = "wasm32")]
 pub async fn create_store_contracts(
-    seller_fingerprint: String,
-    seller_verifying_key_bytes: [u8; 32],
-    rsa_public_key_der: Vec<u8>,
-    certificate_pem: String,
-    // What the seller typed, as one value rather than three -- the three are
-    // never meaningful apart, and threading them separately is what pushed
-    // this past clippy's argument limit when the encryption key arrived.
-    details: crate::state::StoreDetails,
-    // The seller's long-term X25519 public key, if their delegate has
-    // produced one. See the field on `state::PendingStoreCreation` for why
-    // creation does not wait for it.
-    encryption_public_key: Option<[u8; 32]>,
+    // Everything creation gathered, as one value: see the fields of
+    // `state::PendingStoreCreation` for what each is and why creation does
+    // not wait for the encryption key.
+    creation: crate::state::PendingStoreCreation,
+    // The backing the new store is created with, signed by the Ghost Key and
+    // accepted by the store key (harvest#93). Its statement names the store
+    // key.
+    backing: harvest_common::backing::AuthorizedBacking,
 ) -> Result<(), String> {
-    let crate::state::StoreDetails {
+    let crate::state::PendingStoreCreation {
+        ghostkey_fingerprint: seller_fingerprint,
+        seller_verifying_key_bytes,
+        certificate_pem,
         store_name,
         description,
-    } = details;
+        rsa_public_key_der,
+        encryption_public_key,
+        store_verifying_key: _,
+        store_key_request: _,
+        carried_listings,
+    } = creation;
+    let rsa_public_key_der =
+        rsa_public_key_der.ok_or("the reputation key had not arrived; nothing was created")?;
     use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::{ReadableExt, WritableExt};
     use freenet_stdlib::prelude::*;
@@ -205,6 +214,11 @@ pub async fn create_store_contracts(
 
     let seller_vk = ed25519_dalek::VerifyingKey::from_bytes(&seller_verifying_key_bytes)
         .map_err(|e| format!("invalid verifying key: {e}"))?;
+    // The store's own key (harvest#93): it owns the store, its code is the
+    // store's address, and it signs everything the store holds. The Ghost Key
+    // above still addresses the mailbox and the reputation contract, which
+    // later phases of #93 move onto the store key.
+    let store_vk = backing.statement.store;
 
     // Helper to create a ContractContainer from WASM bytes and parameters
     fn make_contract(
@@ -258,11 +272,25 @@ pub async fn create_store_contracts(
     // frozen into every store's address, and made every store this function
     // created permanently incapable of accepting an on-chain payment -- is
     // recorded on `StoreParameters` itself, next to the field it is about.
-    let store_params = crate::migrate::store_params(&seller_vk);
+    let store_params = crate::migrate::store_params(&store_vk);
     let store_params_bytes = harvest_common::to_cbor(&store_params)
         .map_err(|e| format!("serialize store params: {e}"))?;
 
-    let store_state = harvest_common::store::StoreStateV1::default();
+    // The store's first state already holds its backing, which the store key
+    // accepted: so the store is claimed for the store key by something it
+    // signed, and a buyer who opens it before the details publish finds it
+    // backed rather than blank.
+    let store_state = harvest_common::store::StoreStateV1 {
+        owner: Some(store_vk),
+        backings: harvest_common::backing::BackingsV1 {
+            records: std::iter::once((
+                harvest_common::store::Bytes32(backing.statement.backer.to_bytes()),
+                backing,
+            ))
+            .collect(),
+        },
+        ..Default::default()
+    };
     let store_state_bytes =
         harvest_common::to_cbor(&store_state).map_err(|e| format!("serialize store state: {e}"))?;
 
@@ -299,6 +327,7 @@ pub async fn create_store_contracts(
         store_contract_id: store_id.as_bytes().to_vec(),
         reputation_contract_id: reputation_id.as_bytes().to_vec(),
         mailbox_contract_id: mailbox_id.as_bytes().to_vec(),
+        store_verifying_key: Some(store_vk.to_bytes()),
     };
     let payload = harvest_common::to_cbor(&register_request)
         .map_err(|e| format!("serialize register request: {e}"))?;
@@ -324,6 +353,7 @@ pub async fn create_store_contracts(
             reputation_contract_id: reputation_id.as_bytes().to_vec(),
             mailbox_contract_id: mailbox_id.as_bytes().to_vec(),
             store_contract_key: store_key_bytes,
+            store_verifying_key: Some(store_vk.to_bytes()),
         });
 
     // The mailbox id is known here and nowhere else in this session -- the
@@ -368,69 +398,29 @@ pub async fn create_store_contracts(
              message this seller until the details are published again"
         );
     }
-    request_store_info_signature(seller_fingerprint, store_id.as_bytes().to_vec(), info).await?;
+    {
+        let mut state = super::APP_STATE.write();
+        state.queue_store_info_signature(store_id.as_bytes().to_vec(), info);
+        // A store being moved from before revision 2 brings its listings,
+        // re-signed by the store key. Their ids derive from their terms,
+        // which name no seller, so each keeps its id. See
+        // `crate::backing_flow`.
+        for listing in carried_listings {
+            if let Err(e) = state.queue_listing_signature(
+                store_id.as_bytes().to_vec(),
+                seller_fingerprint.clone(),
+                listing,
+            ) {
+                warn!("a listing could not be carried into the new store: {e}");
+            }
+        }
+    }
 
     Ok(())
 }
 
 /// Ask the ghostkey delegate to sign a store's details, and queue them for
 /// publication when the signature comes back.
-#[cfg(target_arch = "wasm32")]
-async fn request_store_info_signature(
-    seller_fingerprint: String,
-    store_contract_id: Vec<u8>,
-    info: harvest_common::store::StoreInfoV1,
-) -> Result<(), String> {
-    use dioxus::prelude::{ReadableExt, WritableExt};
-
-    let gk_delegate_key = super::APP_STATE
-        .read()
-        .ghostkey_delegate_key
-        .clone()
-        .ok_or("ghostkey delegate not registered -- cannot sign store details")?;
-
-    // What the delegate signs is the CBOR of the info itself; `verify` checks
-    // the scoped payload wraps exactly these bytes.
-    let message = harvest_common::to_cbor(&info)
-        .map_err(|e| format!("serialize store info for signing: {e}"))?;
-
-    // Queue before sending: the response can arrive as soon as the send
-    // returns, and an answer with nothing queued is dropped.
-    super::APP_STATE.write().pending_signatures.push_back(
-        crate::state::PendingSignature::StoreInfo(crate::state::PendingStoreInfo {
-            info,
-            store_contract_id,
-        }),
-    );
-
-    let request = ghostkey_common::GhostkeyRequest::SignMessage {
-        fingerprint: seller_fingerprint,
-        message,
-    };
-    let payload =
-        ghostkey_common::to_cbor(&request).map_err(|e| format!("serialize SignMessage: {e}"))?;
-
-    if let Err(e) = super::send_delegate_message(&gk_delegate_key, payload).await {
-        // Nothing will answer, so don't leave an entry that would consume
-        // the next unrelated signature.
-        super::APP_STATE.write().pending_signatures.pop_back();
-        return Err(format!("send store info for signing: {e}"));
-    }
-    Ok(())
-}
-
-/// The `ContractKey` of a store the connected identity owns.
-///
-/// Written once and shared by every update path: three copies of "find the
-/// registration, then rebuild the key" is three chances for one of them to
-/// look somewhere slightly different, and the failure would be an update sent
-/// to a contract that does not exist.
-///
-/// `whats_missing` completes "this store is not one of yours -- ...", so each
-/// caller can still say what the seller was trying to do.
-///
-/// Also answers the key the store's records are signed by, which every delta
-/// names as the store's owner (harvest#52).
 #[cfg(target_arch = "wasm32")]
 fn owned_store_key(
     store_contract_id: &[u8],
@@ -445,9 +435,9 @@ fn owned_store_key(
         .flat_map(|stores| stores.iter())
         .find(|s| s.store_contract_id == store_contract_id)
         .ok_or_else(|| format!("this store is not one of yours -- {whats_missing}"))?;
-    let owner = state.store_owner_key(store_contract_id).ok_or_else(|| {
-        format!("the key of the identity that owns this store is not known yet -- {whats_missing}")
-    })?;
+    let owner = state
+        .store_owner_key(store_contract_id)
+        .ok_or_else(|| format!("{} -- {whats_missing}", crate::state::NO_STORE_KEY_MESSAGE))?;
     let (key, origin) = store_contract_key(registration)?;
     Ok((key, origin, owner))
 }
@@ -613,6 +603,7 @@ mod tests {
             reputation_contract_id: vec![4u8; 32],
             mailbox_contract_id: vec![5u8; 32],
             store_contract_key,
+            store_verifying_key: None,
         }
     }
 

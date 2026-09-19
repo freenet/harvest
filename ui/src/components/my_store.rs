@@ -42,6 +42,10 @@ struct StoreCard {
     /// click can't queue a duplicate publish -- see
     /// `state::AppState::store_publish_in_flight`.
     publish_in_flight: bool,
+    /// Whether this is a store made before stores had their own keys
+    /// (harvest#93): owned by the Ghost Key itself, so this build cannot sign
+    /// for it, and it is offered a move instead of the ordinary controls.
+    legacy: bool,
 }
 
 #[component]
@@ -205,7 +209,16 @@ fn IdentityCard(
     // per store: hooks cannot be created inside a loop.
     let mut editing_store = use_signal(|| Option::<Vec<u8>>::None);
     let fp = identity.fingerprint.clone();
-    let has_store = !stores.is_empty();
+    // A store this device can sign for: one with a store key (harvest#93).
+    // A store made before revision 2 does not count; it is offered a move.
+    let has_store = stores
+        .iter()
+        .any(|store| store.store_verifying_key.is_some());
+    let legacy_movable = APP_STATE
+        .read()
+        .legacy_store_to_move(&identity.fingerprint)
+        .is_some();
+    let moving = APP_STATE.read().pending_store_creation.is_some();
 
     // Buyers can only reach a store through a link the seller sends them, so
     // the seller has to be able to see it. Built here rather than in rsx
@@ -213,15 +226,25 @@ fn IdentityCard(
     //
     // Each store is labelled: a seller with two stores otherwise gets two
     // 44-character links with nothing to tell them apart.
-    // The identity's store code. One identity, one code: the code is a
-    // prefix of the key, so it names the same address for every store
-    // registration this identity holds at the current generation.
-    let code: Option<String> = identity
+    // A store made before revision 2 was addressed by the Ghost Key's own
+    // code; one since is addressed by its store key's (harvest#93).
+    let ghost_code: Option<String> = identity
         .verifying_key_bytes
         .as_deref()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
         .map(|key| harvest_common::store::store_code(&key));
+    // Stores made before revision 2 are shown only while there is nothing
+    // else: once a store has moved, the old one is the past, not a second
+    // store to manage.
+    let stores: Vec<harvest_common::StoreRegistration> = if has_store {
+        stores
+            .into_iter()
+            .filter(|store| store.store_verifying_key.is_some())
+            .collect()
+    } else {
+        stores
+    };
     let store_cards: Vec<StoreCard> = {
         let app_state = APP_STATE.read();
         stores
@@ -241,7 +264,14 @@ fn IdentityCard(
                 let browsing = app_state.browsing_stores.get(&store.store_contract_id);
                 let info = browsing.and_then(|browsing| browsing.info.as_ref());
                 let name = info.map(|info| info.store_name.clone());
+                let code: Option<String> = match store.store_verifying_key {
+                    Some(bytes) => ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+                        .ok()
+                        .map(|key| harvest_common::store::store_code(&key)),
+                    None => ghost_code.clone(),
+                };
                 Some(StoreCard {
+                    legacy: store.store_verifying_key.is_none(),
                     label: match code.as_deref() {
                         Some(code) => crate::store_link::store_label(code, name.as_deref()),
                         None => name.clone().unwrap_or_else(|| "Your store".to_string()),
@@ -300,8 +330,18 @@ fn IdentityCard(
                         onclick: move |_| show_listing_form.toggle(),
                         if show_listing_form() { "Cancel" } else { "Add Listing" }
                     }
-                } else if has_rsa_key {
+                } else if moving || (has_rsa_key && !legacy_movable) {
                     span { class: "text-warning", "Creating contracts..." }
+                } else if legacy_movable {
+                    button {
+                        class: "btn btn-sm btn-primary",
+                        disabled: !has_harvest_delegate,
+                        onclick: {
+                            let fp = identity.fingerprint.clone();
+                            move |_| move_legacy_store(fp.clone())
+                        },
+                        "Move this store"
+                    }
                 } else {
                     button {
                         class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
@@ -358,7 +398,15 @@ fn IdentityCard(
                         // lost, so the seller retypes them, and the edit is
                         // then published at a version the store contract
                         // discards as stale.
-                        if !card.details_resolved {
+                        if card.legacy {
+                            p { class: "text-warning",
+                                "This store was made before stores had keys of their own, so this \
+                                 version of Harvest cannot publish to it and buyers cannot pay it. \
+                                 Moving it gives it a key, backed by this Ghost Key, and carries \
+                                 its name, description and listings across. Its link changes, so \
+                                 share the new one; open orders are not carried."
+                            }
+                        } else if !card.details_resolved {
                             p { class: "text-muted text-italic",
                                 "Loading this store's published details…"
                             }
@@ -499,7 +547,7 @@ fn IdentityCard(
                 initial: StoreDetails::default(),
                 on_submit: move |details: StoreDetails| {
                     show_store_form.set(false);
-                    initiate_store_creation(identity.fingerprint.clone(), details);
+                    initiate_store_creation(identity.fingerprint.clone(), details, Vec::new());
                 },
             }
         }
@@ -660,134 +708,168 @@ fn publish_store_details(store_contract_id: Vec<u8>, details: StoreDetails) {
     }
 }
 
-/// Initiate the full store creation flow:
-/// 1. Set pending_store_creation with store details
-/// 2. Send InitReputationKeys to harvest delegate
-/// 3. When RSA key arrives, state.rs triggers create_store_contracts
-fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
+/// Initiate the full store creation flow (see `crate::backing_flow` for the
+/// whole of it):
+/// 1. Record the pending creation, with `carried_listings` for a store being
+///    moved from before revision 2 (empty otherwise).
+/// 2. Ask the vault for the Ghost Key's certificate, and the Harvest delegate
+///    for the reputation key, the messaging key and a new store key.
+/// 3. When all but the messaging key have arrived, the Ghost Key backs the
+///    new store key, the store key accepts it, and the contracts publish.
+fn initiate_store_creation(
+    _fingerprint: String,
+    _details: StoreDetails,
+    _carried_listings: Vec<Listing>,
+) {
     #[cfg(target_arch = "wasm32")]
     {
         let fingerprint = _fingerprint;
         let details = _details;
+        let carried_listings = _carried_listings;
 
-        wasm_bindgen_futures::spawn_local(async move {
-            // First, we need the ghostkey's verifying key and certificate.
-            // For now, we'll need the ghostkey delegate to provide these.
-            // The certificate PEM and verifying key bytes come from
-            // GhostkeyResponse::GhostKeyDetail or GhostkeyResponse::Certificate.
-            //
-            // For the initial implementation, we store the pending creation
-            // with placeholder values -- the verifying key will come from
-            // the ghostkey certificate when we have inter-delegate communication.
-            //
-            // TODO: Request GhostKeyDetail from ghostkey delegate to get
-            // certificate_pem and extract verifying key bytes.
-
-            let app_state = APP_STATE.read();
-            let delegate_key = match &app_state.harvest_delegate_key {
-                Some(k) => k.clone(),
-                None => {
-                    dioxus::logger::tracing::error!("Harvest delegate not registered");
-                    return;
-                }
-            };
-            drop(app_state);
-
-            // Try to get the verifying key from the already-loaded ghostkeys
-            let vk_bytes = {
-                let state = APP_STATE.read();
-                state
-                    .ghostkeys
-                    .iter()
-                    .find(|k| k.fingerprint == fingerprint)
-                    .and_then(|k| k.verifying_key_bytes.as_ref())
-                    .and_then(|b| {
-                        if b.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(b);
-                            Some(arr)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or([0u8; 32])
-            };
-
-            // Store the pending creation details
-            APP_STATE.write().pending_store_creation = Some(crate::state::PendingStoreCreation {
-                ghostkey_fingerprint: fingerprint.clone(),
-                seller_verifying_key_bytes: vk_bytes,
-                certificate_pem: String::new(),
-                store_name: details.store_name,
-                description: details.description,
-                rsa_public_key_der: None,
-                // Filled by `EncryptionKeyReady` below. Creation does not
-                // wait for it -- see the field's own documentation.
-                encryption_public_key: None,
-            });
-
-            // Step 1: Request the ghostkey certificate to get the verifying key
-            let app_state = APP_STATE.read();
-            let gk_delegate_key = match &app_state.ghostkey_delegate_key {
-                Some(k) => k.clone(),
-                None => {
-                    dioxus::logger::tracing::error!("Ghostkey delegate not registered");
-                    APP_STATE.write().pending_store_creation = None;
-                    return;
-                }
-            };
-            drop(app_state);
-
-            let cert_request = ghostkey_common::GhostkeyRequest::GetCertificate {
-                fingerprint: fingerprint.clone(),
-            };
-            let cert_payload = match ghostkey_common::to_cbor(&cert_request) {
-                Ok(p) => p,
-                Err(e) => {
-                    dioxus::logger::tracing::error!("Failed to serialize cert request: {}", e);
-                    return;
-                }
-            };
-
-            if let Err(e) =
-                crate::gateway::send_delegate_message(&gk_delegate_key, cert_payload).await
-            {
-                dioxus::logger::tracing::error!("Failed to request certificate: {}", e);
-                return;
-            }
-
-            // Step 2: Send InitReputationKeys to harvest delegate (in parallel)
-            let request = harvest_common::HarvestDelegateRequest::InitReputationKeys {
-                ghostkey_fingerprint: fingerprint.clone(),
-            };
-            let payload = match harvest_common::to_cbor(&request) {
-                Ok(p) => p,
-                Err(e) => {
-                    dioxus::logger::tracing::error!("Failed to serialize request: {}", e);
-                    return;
-                }
-            };
-
-            if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
-                dioxus::logger::tracing::error!("Failed to send InitReputationKeys: {}", e);
-                return;
-            }
-
-            // Step 3: and the messaging key, so the store publishes with one.
-            //
-            // Sent here rather than waited on: a store that publishes without
-            // it is a store buyers cannot message, which `store_details_gap`
-            // reports and re-publishing repairs. A store whose creation hangs
-            // waiting for a third delegate answer has no name at all.
-            request_encryption_key(fingerprint.clone()).await;
-
-            dioxus::logger::tracing::info!(
-                "Sent GetCertificate + InitReputationKeys + InitEncryptionKey for {} -- store \
-                 creation pending",
-                fingerprint
+        // The Ghost Key's verifying key, from the vault's own answer: the
+        // backing names it.
+        let vk_bytes = {
+            let state = APP_STATE.read();
+            state
+                .ghostkeys
+                .iter()
+                .find(|k| k.fingerprint == fingerprint)
+                .and_then(|k| k.verifying_key_bytes.as_deref())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        };
+        let Some(vk_bytes) = vk_bytes else {
+            APP_STATE.write().notifications.push(
+                "Store creation failed: the vault has not shared this Ghost Key's public key."
+                    .into(),
             );
-        });
+            return;
+        };
+        let store_key_request = APP_STATE.write().begin_store_creation(
+            fingerprint.clone(),
+            vk_bytes,
+            details,
+            carried_listings,
+        );
+        send_store_creation_requests(fingerprint, store_key_request);
     }
+}
+
+/// Move this Ghost Key's store made before revision 2 onto a store key of its
+/// own. See `crate::backing_flow` for what is carried and what is not.
+fn move_legacy_store(_fingerprint: String) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let fingerprint = _fingerprint;
+        let vk_bytes = {
+            let state = APP_STATE.read();
+            state
+                .ghostkeys
+                .iter()
+                .find(|k| k.fingerprint == fingerprint)
+                .and_then(|k| k.verifying_key_bytes.as_deref())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        };
+        let Some(vk_bytes) = vk_bytes else {
+            APP_STATE.write().notifications.push(
+                "Could not move the store: the vault has not shared this Ghost Key's public key."
+                    .into(),
+            );
+            return;
+        };
+        let started = APP_STATE.write().move_legacy_store(&fingerprint, vk_bytes);
+        match started {
+            Ok(store_key_request) => {
+                APP_STATE
+                    .write()
+                    .notifications
+                    .push("Moving your store to a key of its own…".into());
+                send_store_creation_requests(fingerprint, store_key_request);
+            }
+            Err(e) => APP_STATE
+                .write()
+                .notifications
+                .push(format!("Could not move the store: {e}")),
+        }
+    }
+}
+
+/// Send the four requests a store creation waits on. Each answer arrives
+/// through the ordinary response handlers and fills the pending creation;
+/// `AppState::start_store_creation_if_ready` decides when to go on.
+#[cfg(target_arch = "wasm32")]
+fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let fail = |why: String| {
+            dioxus::logger::tracing::error!("{why}");
+            let mut state = APP_STATE.write();
+            state.pending_store_creation = None;
+            state
+                .notifications
+                .push(format!("Store creation failed: {why}"));
+        };
+        let (Some(delegate_key), Some(gk_delegate_key)) = ({
+            let state = APP_STATE.read();
+            (
+                state.harvest_delegate_key.clone(),
+                state.ghostkey_delegate_key.clone(),
+            )
+        }) else {
+            fail("the Harvest delegate or the Ghost Key vault is not registered".into());
+            return;
+        };
+
+        let cert_request = ghostkey_common::GhostkeyRequest::GetCertificate {
+            fingerprint: fingerprint.clone(),
+        };
+        match ghostkey_common::to_cbor(&cert_request) {
+            Ok(payload) => {
+                if let Err(e) =
+                    crate::gateway::send_delegate_message(&gk_delegate_key, payload).await
+                {
+                    fail(format!("could not ask the vault for the certificate: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                fail(format!("serialize GetCertificate: {e}"));
+                return;
+            }
+        }
+
+        for request in [
+            harvest_common::HarvestDelegateRequest::InitReputationKeys {
+                ghostkey_fingerprint: fingerprint.clone(),
+            },
+            harvest_common::HarvestDelegateRequest::CreateStoreKey {
+                request_id: store_key_request,
+            },
+        ] {
+            let payload = match harvest_common::to_cbor(&request) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    fail(format!("serialize a delegate request: {e}"));
+                    return;
+                }
+            };
+            if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                fail(format!("could not reach the Harvest delegate: {e}"));
+                return;
+            }
+        }
+
+        // And the messaging key, so the store publishes with one. Sent here
+        // rather than waited on: a store that publishes without it is a
+        // store buyers cannot message, which `store_details_gap` reports and
+        // re-publishing repairs. A store whose creation hangs waiting for a
+        // fourth delegate answer has no name at all.
+        request_encryption_key(fingerprint.clone()).await;
+
+        dioxus::logger::tracing::info!(
+            "Sent GetCertificate + InitReputationKeys + CreateStoreKey + InitEncryptionKey for \
+             {fingerprint} -- store creation pending"
+        );
+    });
 }
 
 /// Ask the harvest delegate to mint (or recall) this identity's long-term
@@ -977,85 +1059,27 @@ fn extract_json_field<'a>(info: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn sign_and_submit_listing(_fingerprint: String, _listing: Listing) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let fingerprint = _fingerprint;
-        let listing = _listing;
-
-        wasm_bindgen_futures::spawn_local(async move {
-            let listing_bytes = match harvest_common::to_cbor(&listing) {
-                Ok(b) => b,
-                Err(e) => {
-                    dioxus::logger::tracing::error!("Failed to serialize listing: {}", e);
-                    return;
-                }
-            };
-
-            let app_state = APP_STATE.read();
-            let gk_delegate_key = match &app_state.ghostkey_delegate_key {
-                Some(k) => k.clone(),
-                None => {
-                    dioxus::logger::tracing::error!(
-                        "Ghostkey delegate not registered -- cannot sign listing"
-                    );
-                    APP_STATE
-                        .write()
-                        .notifications
-                        .push("Cannot sign listing: ghostkey delegate not available.".into());
-                    return;
-                }
-            };
-            drop(app_state);
-
-            let sign_request = ghostkey_common::GhostkeyRequest::SignMessage {
-                fingerprint: fingerprint.clone(),
-                message: listing_bytes,
-            };
-            let payload = match ghostkey_common::to_cbor(&sign_request) {
-                Ok(p) => p,
-                Err(e) => {
-                    dioxus::logger::tracing::error!("Failed to serialize sign request: {}", e);
-                    return;
-                }
-            };
-
-            // Find the store contract ID for this fingerprint
-            let store_contract_id = {
-                let state = APP_STATE.read();
-                state
-                    .my_stores
-                    .get(&fingerprint)
-                    .and_then(|stores| stores.first())
-                    .map(|s| s.store_contract_id.clone())
-            };
-
-            let title = listing.title.clone();
-            // Queue before sending. This used to be recorded afterwards, so
-            // a `SignResult` that arrived before the send returned found
-            // nothing waiting and the signed listing was dropped.
-            APP_STATE.write().pending_signatures.push_back(
-                crate::state::PendingSignature::Listing(crate::state::PendingListing {
-                    fingerprint: fingerprint.clone(),
-                    listing,
-                    store_contract_id,
-                }),
-            );
-
-            if let Err(e) = crate::gateway::send_delegate_message(&gk_delegate_key, payload).await {
-                dioxus::logger::tracing::error!("Failed to send SignMessage: {}", e);
-                // Nothing will answer this one, and leaving it queued would
-                // make it consume the next signature that arrives.
-                APP_STATE.write().pending_signatures.pop_back();
-                return;
-            }
-
-            dioxus::logger::tracing::info!(
-                "Sent listing for signing (fingerprint: {}, title: {})",
-                fingerprint,
-                title
-            );
-        });
+/// Sign a new listing with the store key and publish it (harvest#93).
+///
+/// The store is the Ghost Key's first store this device holds a store key
+/// for. A seller whose only store predates store keys is offered a move
+/// instead of this form, so reaching here without one is reported rather than
+/// signed for with the wrong key.
+fn sign_and_submit_listing(fingerprint: String, listing: Listing) {
+    let mut state = APP_STATE.write();
+    let Some(store_contract_id) = state.signable_store_for(&fingerprint) else {
+        state.notifications.push(format!(
+            "Cannot add the listing: {}",
+            crate::state::NO_STORE_KEY_MESSAGE
+        ));
+        return;
+    };
+    let title = listing.title.clone();
+    match state.queue_listing_signature(store_contract_id, fingerprint, listing) {
+        Ok(()) => dioxus::logger::tracing::info!("Sent listing for signing: {title}"),
+        Err(e) => state
+            .notifications
+            .push(format!("Cannot add the listing: {e}")),
     }
 }
 

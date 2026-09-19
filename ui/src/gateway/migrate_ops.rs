@@ -251,6 +251,50 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
 /// than remembered -- there is no way to call this without the key, and a
 /// missing key returns without starting anything rather than substituting a
 /// placeholder.
+/// Start the store probe for a store owned by a STORE key (harvest#93).
+///
+/// `start_identity_migration` probes the addresses a Ghost Key's store had,
+/// which is every store up to generation V18. A store made since is addressed
+/// by its own store key, which the Ghost Key cannot derive, so the next re-key
+/// would strand it at this generation's address unless it is probed by that
+/// key. The registration records the key, so this runs once per registered
+/// store key, from the delegate's `StoreList` answer.
+///
+/// The lineage walked is the whole store lineage: generations before V19
+/// never held a store at a store key's address, so their candidates are
+/// simply absent, which a probe already handles.
+pub fn start_store_key_migration(store_verifying_key: &[u8; 32]) {
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(store_verifying_key) else {
+        warn!("cannot migrate a store: its store key is not a valid key");
+        return;
+    };
+    let label = format!("store {}", harvest_common::store::store_code(&vk));
+    let store_params = migrate::store_params(&vk);
+    match (
+        migrate::encode_params(&store_params),
+        migrate::store_candidates(&vk),
+    ) {
+        (Ok(params), Ok(candidates)) => start(
+            Artifact::Store,
+            &label,
+            params,
+            STORE_CONTRACT_WASM,
+            move |_p| {
+                Session::Store(Box::new(ProbeSession::start_with_candidates(
+                    StoreOps {
+                        params: store_params.clone(),
+                        seller: vk,
+                    },
+                    local_snapshot(),
+                    candidates.clone(),
+                    migrate::fold_all_policy(),
+                )))
+            },
+        ),
+        (Err(e), _) | (_, Err(e)) => warn!("cannot migrate {label}: {e}"),
+    }
+}
+
 pub fn start_reputation_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
     let Some(vk) = verifying_key(verifying_key_bytes) else {
         return;
