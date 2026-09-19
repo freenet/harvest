@@ -2294,6 +2294,7 @@ fn signed_store_info(version: u32) -> harvest_common::store::AuthorizedStoreInfo
         store_name: format!("Shop v{version}"),
         description: String::new(),
         encryption_public_key: None,
+        record_public_key: None,
     };
     let scoped = ghostkey_common::ScopedPayload {
         requestor: ghostkey_common::SignatureRequestor::WebApp(

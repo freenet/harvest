@@ -387,11 +387,12 @@ pub async fn create_store_contracts(
             .ok_or("reputation contract id is not 32 bytes -- cannot publish store details")?,
         store_name,
         description,
-        // The delegate's answer to `InitEncryptionKey`, which the UI sends
-        // alongside `InitReputationKeys` when creation starts. `None` here is
-        // not fatal and is not silent: `state::store_details_gap` reports the
-        // missing key on the seller's own page, and re-publishing adds it.
+                // The inbox key the store key derives (harvest#93 phase 1b,
+        // `StoreSubkeys`), the same on every device holding the store key.
         encryption_public_key,
+        // And the record key, derived the same way and published so another
+        // device can check its own derivation.
+        record_public_key: Some(rsa_public_key_der.clone()),
     };
     if encryption_public_key.is_none() {
         warn!(
@@ -498,6 +499,35 @@ pub async fn submit_listing_by_id(
 /// Separate from creation because it cannot happen during it: the details
 /// have to be signed by the ghostkey delegate first, and that is a round-trip
 /// through `SignMessage`/`SignResult`.
+/// Publish a wrapped copy of the store key to one of our stores (harvest#93
+/// phase 1b), in the background. The copy is already signed by the store key
+/// (`WrapStoreKeyFor`); a failure is said out loud, since until the copy lands
+/// no other device can recover the store.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_publish_copy(store_contract_id: Vec<u8>, copy: harvest_common::custody::AuthorizedCopy) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+        use freenet_stdlib::prelude::*;
+        let result = async {
+            let (contract_key, _origin, owner) =
+                owned_store_key(&store_contract_id, "cannot back its key up")?;
+            let delta = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+                owner: Some(owner),
+                copies: Some(vec![copy]),
+                ..Default::default()
+            })
+            .map_err(|e| format!("serialize the copy: {e}"))?;
+            super::update_contract(&contract_key, UpdateData::Delta(StateDelta::from(delta))).await
+        }
+        .await;
+        if let Err(e) = result {
+            super::APP_STATE.write().notifications.push(format!(
+                "Your store's key could not be backed up to your Ghost Key: {e}"
+            ));
+        }
+    });
+}
+
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_store_info_by_id(
     store_contract_id: &[u8],
@@ -806,6 +836,7 @@ mod tests {
             store_name: "Bean Shop".to_string(),
             description: "Coffee".to_string(),
             encryption_public_key: None,
+            record_public_key: None,
         };
 
         // Exactly what `request_store_info_signature` sends as `message`.

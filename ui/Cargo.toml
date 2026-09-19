@@ -12,7 +12,7 @@ example-data = []
 no-sync = []
 
 [dependencies]
-harvest-common = { workspace = true }
+harvest-common = { workspace = true, features = ["custody"] }
 ghostkey-common = { workspace = true }
 freenet-bitcoin-common = { workspace = true }
 # Registering an order's payment address with the bridge (#59). `seal`

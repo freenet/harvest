@@ -271,6 +271,9 @@ impl AppState {
                 if let Some(pending) = self.pending_store_creation.as_mut() {
                     pending.store_verifying_key = Some(key);
                 }
+                // The record and inbox keys derive from the store key
+                // (harvest#93 phase 1b); creation waits on them.
+                self.request_store_subkeys(key);
                 self.start_store_creation_if_ready();
             }
             Err(why) => {
@@ -1037,6 +1040,7 @@ pub(crate) mod tests {
             store_name: "Bean Shop".to_string(),
             description: String::new(),
             encryption_public_key: None,
+            record_public_key: None,
         });
         // Checked once the store key is known (a retry must be able to
         // resume its own store; see `a_retry_is_not_refused_...`).
@@ -1176,6 +1180,7 @@ pub(crate) mod tests {
             store_name: "Old Shop".to_string(),
             description: "since 2026".to_string(),
             encryption_public_key: None,
+            record_public_key: None,
         });
         store.listings = vec![harvest_common::listing::AuthorizedListing {
             listing,
