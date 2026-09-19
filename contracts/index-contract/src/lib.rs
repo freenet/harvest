@@ -223,6 +223,46 @@ mod tests {
         ));
     }
 
+    /// A state that is not canonical CBOR is refused, even when it decodes
+    /// and every entry in it verifies: a second encoding of the same index
+    /// is a second set of bytes replicas would disagree about. Mutated red
+    /// by dropping the canonical check.
+    #[test]
+    fn a_non_canonical_encoding_is_refused() {
+        let good = state_of(vec![entry(1)]);
+        // A trailing byte: decodes (ciborium stops at the end of the item),
+        // re-encodes to fewer bytes.
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let refused =
+            Contract::validate_state(parameters(), State::from(trailing), RelatedContracts::new());
+        match refused {
+            Err(ContractError::InvalidUpdateWithInfo { reason }) => {
+                assert!(reason.contains("canonical"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            Contract::validate_state(parameters(), State::from(good), RelatedContracts::new()),
+            Ok(ValidateResult::Valid)
+        ));
+    }
+
+    /// An update that is neither a state nor a delta is refused rather than
+    /// ignored: the arms this contract understands are the two it merges.
+    #[test]
+    fn an_unexpected_update_kind_is_refused() {
+        let state = state_of(vec![entry(1)]);
+        let odd = UpdateData::StateAndDelta {
+            state: State::from(state_of(vec![entry(2)])),
+            delta: StateDelta::from(vec![]),
+        };
+        assert!(matches!(
+            Contract::update_state(parameters(), State::from(state), vec![odd]),
+            Err(ContractError::InvalidUpdate)
+        ));
+    }
+
     /// State and delta merges agree, and the empty state stays empty.
     #[test]
     fn a_delta_and_a_state_merge_to_the_same_bytes() {

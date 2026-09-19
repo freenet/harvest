@@ -302,8 +302,9 @@ pub struct AppState {
     /// backer's index, so it is published at most once per session.
     pub index_entries_published: HashSet<[u8; 32]>,
 
-    /// Stores loaded because an index listed them, in order.
-    pub indexed_stores_followed: Vec<Vec<u8>>,
+    /// Stores loaded because one of the USER'S OWN Ghost Key indexes listed
+    /// them, in order.
+    pub stores_from_my_indexes: Vec<Vec<u8>>,
 
     /// Off-target only: index entries recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]

@@ -29,8 +29,28 @@ pub fn single_entry_state(entry: IndexEntry) -> Result<Vec<u8>, String> {
 }
 
 /// PUT `entry` into `ghost_key`'s index, creating the index if it does not
-/// exist yet (a PUT of an existing contract merges). Resolves when the SEND
-/// succeeds, as every contract write here does.
+/// exist yet. Resolves when the SEND succeeds, as every contract write here
+/// does.
+///
+/// # A PUT of an existing contract merges, measured rather than assumed
+///
+/// Checked against a throwaway local node on 2026-09-19 (freenet 0.2.135,
+/// freenet-stdlib 0.10.0, `fdev` 0.3.295), with a probe contract whose
+/// `update_state` unions what it is given:
+///
+/// * PUT state A, GET: `[01, 02]`.
+/// * PUT state B to the same key, GET: `[01, 02, 03, 04]` -- the union, so
+///   the second PUT went through `update_state` rather than replacing or
+///   being refused. The node answers such a PUT with `UpdateResponse`
+///   rather than `PutResponse`, which this app does not branch on.
+/// * `Update` with a delta behaved identically.
+///
+/// freenet-core's `perform_contract_put` takes that path deliberately
+/// ("Contract already exists -- merge states locally and broadcast async"),
+/// calling `update_state` with the incoming state. One caveat from the same
+/// source, not exercised: a contract whose `update_state` returns
+/// `MissingRelated` is treated as no change. The index contract requests no
+/// related contracts, so it cannot reach that.
 #[cfg(target_arch = "wasm32")]
 pub async fn publish_entry(
     ghost_key: &ed25519_dalek::VerifyingKey,

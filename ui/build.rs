@@ -64,7 +64,22 @@ fn main() {
 
     for (file, out, const_name) in CONTRACT_REGISTRIES {
         let path = legacy.join(file);
-        if !MAY_BE_EMPTY.contains(file) {
+        if MAY_BE_EMPTY.contains(file) {
+            // The allowance expires the moment it is not needed: the first
+            // superseded generation appends a row here, and that row must
+            // also take this file out of `MAY_BE_EMPTY`, or the next
+            // artifact added to the list inherits a permanent exemption.
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("cannot read migration registry {}: {e}", path.display())
+            });
+            assert!(
+                !text.contains("[[entry]]"),
+                "migration registry {} has rows but is still listed in MAY_BE_EMPTY. Remove it \
+                 from that list: the allowance exists only while an artifact has no \
+                 predecessor at all.",
+                path.display()
+            );
+        } else {
             require_entries(&path);
         }
         freenet_migrate_build::codegen()

@@ -1,18 +1,31 @@
 //! Reading and keeping up each Ghost Key's index (harvest#93, phase 1c).
 //!
+//! # ONLY the user's own Ghost Keys
+//!
+//! This tab reads the index of a Ghost Key the user holds, and no other
+//! (#101 review). The index's job is "my devices find my stores". Reading a
+//! stranger's index, and then loading every store it lists, would let anyone
+//! publish a graph of keys, indexes and stores and make a visitor's tab walk
+//! it: entries are cheap to make (a certificate is only length-checked), each
+//! loaded store would lead to another index, and `refresh_backing_verdicts`
+//! runs over every loaded store, so the work grows faster than the graph. So
+//! nothing here follows an index that is not the user's, and nothing follows
+//! a store to another key's index.
+//!
 //! # What the index is used for here
 //!
-//! * **Finding a Ghost Key's stores.** For every Ghost Key connected to this
-//!   tab, the UI reads the key's index and loads every store it lists. That
-//!   is how a device that knows only the Ghost Key finds the stores behind
-//!   it; custody (`custody_flow`) then recovers the store key from a store
-//!   the key backs, which registers the store again. The Harvest delegate's
-//!   store list stays, as a cache of what this device already knows.
-//! * **One current store per Ghost Key.** When a store loads, the UI reads
-//!   the index of the Ghost Key currently backing it, and loads the stores
-//!   that lists too. `refresh_backing_verdicts` then sees the key's other
-//!   stores, so the rule (decision 6.2) covers stores the reader never
-//!   opened, not only the ones this tab happened to load.
+//! * **Finding the user's own stores.** For every Ghost Key connected to
+//!   this tab, the UI reads the key's index and loads every store it lists.
+//!   That is how a device that knows only the Ghost Key finds the stores
+//!   behind it; custody (`custody_flow`) then recovers the store key from a
+//!   store the key backs, which registers the store again. The Harvest
+//!   delegate's store list stays, as a cache of what this device knows.
+//! * **One current store per Ghost Key, for the keys the user holds.**
+//!   Loading those stores is what `refresh_backing_verdicts` needs to apply
+//!   decision 6.2 across them, which is the case that matters to a seller:
+//!   they are the one who can retire a backing. A buyer keeps the rule over
+//!   the stores their tab has loaded, as before; a buyer never enumerates a
+//!   seller's other stores.
 //! * **Keeping our own index complete.** When one of OUR stores loads (this
 //!   device holds its store key) and its current backer is connected here,
 //!   the store's backing statement is published into that key's index if the
@@ -45,7 +58,13 @@ pub struct IndexView {
 
 impl AppState {
     /// Read `ghost_key`'s index, once per session, and keep following it.
+    ///
+    /// Refused for a Ghost Key the user does not hold (#101 review): see
+    /// the module docs.
     pub(crate) fn watch_ghostkey_index(&mut self, ghost_key: [u8; 32]) {
+        if self.connected_ghost_key(&ghost_key).is_none() {
+            return;
+        }
         let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&ghost_key) else {
             return;
         };
@@ -140,7 +159,7 @@ impl AppState {
         if !self.note_store_subscribed(&id) {
             return;
         }
-        self.indexed_stores_followed.push(id.clone());
+        self.stores_from_my_indexes.push(id.clone());
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
@@ -149,20 +168,14 @@ impl AppState {
         });
     }
 
-    /// A store's state arrived: read its current backer's index (decision
-    /// 6.2), and keep our own index complete.
+    /// A store's state arrived: keep our own index complete.
+    ///
+    /// It does NOT read the store's backer's index. A store anyone can
+    /// publish would otherwise send this tab to a stranger's index and on to
+    /// every store that lists, each of which leads to another (#101 review).
+    /// The indexes this tab reads are the user's own, read when the Ghost
+    /// Keys arrive.
     pub(crate) fn on_store_state_for_index(&mut self, store_contract_id: &[u8]) {
-        let Some(loaded) = self.browsing_stores.get(store_contract_id) else {
-            return;
-        };
-        if let Some(backing) =
-            harvest_common::backing::current_backing(&loaded.backing_state, |network| {
-                self.tip_height(network)
-            })
-        {
-            let backer = backing.statement.backer.to_bytes();
-            self.watch_ghostkey_index(backer);
-        }
         self.ensure_indexed(store_contract_id);
     }
 
@@ -192,12 +205,31 @@ impl AppState {
             return;
         }
         let slot = entry.slot();
-        let listed = self
+        let index = self
             .ghostkey_indexes
             .values()
             .filter(|v| v.ghost_key == backer.to_bytes())
-            .filter_map(|v| v.index.as_ref())
-            .any(|index| index.entries.contains_key(&slot));
+            .find_map(|v| v.index.as_ref());
+        let listed = index.is_some_and(|index| index.entries.contains_key(&slot));
+        // A full index keeps the smallest store keys, so a store whose key
+        // sorts above every kept one will never be listed however often it
+        // is published (#101 review). Say so once instead of re-publishing
+        // it every session.
+        let never_fits = index.is_some_and(|index| {
+            index.entries.len() >= harvest_common::ghostkey_index::MAX_INDEX_ENTRIES
+                && index.entries.keys().all(|kept| *kept < slot)
+        });
+        if never_fits {
+            if self.index_entries_published.insert(owner.to_bytes()) {
+                self.notifications.push(format!(
+                    "This Ghost Key's index already lists {} stores, and this one sorts after \
+                     all of them, so it cannot be added. Retire a backing you no longer use, \
+                     or back this store with a different Ghost Key.",
+                    index.map_or(0, |i| i.entries.len())
+                ));
+            }
+            return;
+        }
         if listed || !self.index_entries_published.insert(owner.to_bytes()) {
             return;
         }
@@ -307,8 +339,8 @@ mod tests {
 
         let bytes = harvest_common::to_cbor(&index_of(&[0x71, 0x72])).unwrap();
         state.on_contract_state(index_id(backer_vk()), bytes);
-        assert!(state.indexed_stores_followed.contains(&store_id(0x71)));
-        assert!(state.indexed_stores_followed.contains(&store_id(0x72)));
+        assert!(state.stores_from_my_indexes.contains(&store_id(0x71)));
+        assert!(state.stores_from_my_indexes.contains(&store_id(0x72)));
         // Routed as an index, not taken for a store.
         assert!(!state.browsing_stores.contains_key(&index_id(backer_vk())));
     }
@@ -318,6 +350,7 @@ mod tests {
     #[test]
     fn an_index_that_does_not_verify_is_ignored() {
         let mut state = AppState::default();
+        connect(&mut state, backer_vk());
         state.watch_ghostkey_index(backer_vk());
         let mut index = index_of(&[0x71]);
         // Another key's backing, filed in this key's index.
@@ -327,20 +360,31 @@ mod tests {
             index_id(backer_vk()),
             harvest_common::to_cbor(&index).unwrap(),
         );
-        assert!(state.indexed_stores_followed.is_empty());
+        assert!(state.stores_from_my_indexes.is_empty());
         assert!(state.ghostkey_indexes[&index_id(backer_vk())]
             .index
             .is_none());
     }
 
-    /// A store that loads leads to its current backer's index, so the one
-    /// store per Ghost Key rule sees that key's other stores. Mutated red by
-    /// not watching the backer's index.
+    /// A store that loads does NOT send this tab to its backer's index
+    /// (#101 review): anyone can publish a store naming any Ghost Key, and
+    /// following it would walk a stranger's graph. Mutated red by watching
+    /// the backer's index from the store path, and by dropping the
+    /// user-holds-the-key check in `watch_ghostkey_index`.
     #[test]
-    fn a_loaded_store_leads_to_its_backers_index() {
+    fn a_loaded_store_does_not_lead_to_a_strangers_index() {
         let mut state = AppState::default();
         load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
         state.on_store_state_for_index(&[1u8; 32]);
+        assert!(state.ghostkey_indexes.is_empty(), "no stranger's index");
+
+        // Nor by asking directly: the key is not one the user holds.
+        state.watch_ghostkey_index(backer_vk());
+        assert!(state.ghostkey_indexes.is_empty());
+
+        // Once it IS the user's key, it is read.
+        connect(&mut state, backer_vk());
+        state.watch_ghostkey_index(backer_vk());
         assert!(state.ghostkey_indexes.contains_key(&index_id(backer_vk())));
     }
 
@@ -390,6 +434,82 @@ mod tests {
         );
         again.ensure_indexed(&[1u8; 32]);
         assert!(again.index_entries_to_publish.is_empty());
+    }
+
+    /// A Ghost Key's index is read once per session: a second ask does not
+    /// throw away the index that has arrived (#101 review). Mutated red by
+    /// dropping the dedup.
+    #[test]
+    fn an_index_is_read_once_per_session() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.watch_ghostkey_index(backer_vk());
+        state.on_contract_state(
+            index_id(backer_vk()),
+            harvest_common::to_cbor(&index_of(&[0x71])).unwrap(),
+        );
+        assert!(state.ghostkey_indexes[&index_id(backer_vk())]
+            .index
+            .is_some());
+        state.watch_ghostkey_index(backer_vk());
+        assert!(
+            state.ghostkey_indexes[&index_id(backer_vk())]
+                .index
+                .is_some(),
+            "asking again must not discard what arrived"
+        );
+    }
+
+    /// A store whose key sorts after every entry of a FULL index is never
+    /// listed, so it is not published again every session; the seller is
+    /// told once what to do instead (#101 review). Mutated red by
+    /// publishing anyway.
+    #[test]
+    fn a_store_that_cannot_fit_a_full_index_is_not_republished() {
+        use harvest_common::ghostkey_index::MAX_INDEX_ENTRIES;
+        let store_key = SigningKey::from_bytes(&[0x71; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_key),
+            }],
+        );
+        // An index full of keys that all sort BELOW this store's key.
+        let smaller: Vec<u8> = (0u8..=255)
+            .filter(|s| SigningKey::from_bytes(&[*s; 32]).verifying_key().to_bytes() < store_key)
+            .take(MAX_INDEX_ENTRIES)
+            .collect();
+        assert_eq!(smaller.len(), MAX_INDEX_ENTRIES, "enough smaller keys");
+        state.watch_ghostkey_index(backer_vk());
+        state.on_contract_state(
+            index_id(backer_vk()),
+            harvest_common::to_cbor(&index_of(&smaller)).unwrap(),
+        );
+
+        state.ensure_indexed(&[1u8; 32]);
+        state.ensure_indexed(&[1u8; 32]);
+        assert!(
+            state.index_entries_to_publish.is_empty(),
+            "publishing it cannot make it fit"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("cannot be added"))
+                .count(),
+            1,
+            "said once"
+        );
     }
 
     /// A store this device cannot sign for is never published by it.

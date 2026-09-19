@@ -126,8 +126,25 @@ impl IndexEntry {
     }
 }
 
-fn entry_bytes(entry: &IndexEntry) -> Vec<u8> {
-    crate::to_cbor(entry).unwrap_or_default()
+/// The encoding a clash and a summary are decided by.
+///
+/// An error is not papered over with empty bytes (#101 review): empty would
+/// compare SMALLER than every real encoding, so an entry that failed to
+/// serialize would win every tie-break and every digest. Every caller that
+/// can refuse does; `summarize` cannot, and uses a digest of the error
+/// instead, which differs from any real entry's digest.
+fn entry_bytes(entry: &IndexEntry) -> Result<Vec<u8>, String> {
+    crate::to_cbor(entry).map_err(|e| format!("an index entry did not serialize: {e}"))
+}
+
+/// BLAKE3 of an entry's encoding, for the summary and the tie-break.
+fn digest(entry: &IndexEntry) -> Bytes32 {
+    match entry_bytes(entry) {
+        Ok(bytes) => Bytes32(*blake3::hash(&bytes).as_bytes()),
+        // Not a real entry's digest, so a peer holding this slot asks for it
+        // rather than being told nothing is missing.
+        Err(_) => Bytes32([0xff; 32]),
+    }
 }
 
 /// A Ghost Key's index: one entry per store key.
@@ -165,12 +182,7 @@ impl GhostKeyIndexV1 {
     pub fn summarize(&self) -> IndexSummaryV1 {
         self.entries
             .iter()
-            .map(|(slot, entry)| {
-                (
-                    *slot,
-                    Bytes32(*blake3::hash(&entry_bytes(entry)).as_bytes()),
-                )
-            })
+            .map(|(slot, entry)| (*slot, digest(entry)))
             .collect()
     }
 
@@ -182,11 +194,7 @@ impl GhostKeyIndexV1 {
         let changed: Vec<IndexEntry> = self
             .entries
             .iter()
-            .filter(|(slot, entry)| {
-                theirs.get(*slot).is_none_or(|digest| {
-                    *digest != Bytes32(*blake3::hash(&entry_bytes(entry)).as_bytes())
-                })
-            })
+            .filter(|(slot, entry)| theirs.get(*slot).is_none_or(|held| *held != digest(entry)))
             .map(|(_, entry)| entry.clone())
             .collect();
         (!changed.is_empty()).then_some(changed)
@@ -200,16 +208,36 @@ impl GhostKeyIndexV1 {
         params: &IndexParameters,
         incoming: &[IndexEntry],
     ) -> Result<(), String> {
+        // BEFORE any signature is checked (#101 review): a delta is a `Vec`,
+        // so duplicates do not collapse into slots, and an unbounded one
+        // buys as many signature verifications as the sender cares to send.
+        // The most a delta can usefully carry is one entry per slot the
+        // index may hold.
+        let distinct: std::collections::BTreeSet<Bytes32> =
+            incoming.iter().map(IndexEntry::slot).collect();
+        if distinct.len() > MAX_INDEX_ENTRIES || incoming.len() > MAX_INDEX_ENTRIES {
+            return Err(format!(
+                "an index delta carries {} entries over {} store keys, the most it may carry is \
+                 {MAX_INDEX_ENTRIES}",
+                incoming.len(),
+                distinct.len()
+            ));
+        }
         for entry in incoming {
             entry.verify(&params.ghost_key)?;
         }
         for entry in incoming {
             let slot = entry.slot();
-            match self.entries.get(&slot) {
-                Some(held) if entry_bytes(held) <= entry_bytes(entry) => {}
-                _ => {
-                    self.entries.insert(slot, entry.clone());
-                }
+            // Explicit, because `Result`'s own ordering puts an error FIRST:
+            // comparing the encodings as `Result`s would let an entry that
+            // does not serialize win every clash.
+            let incoming_bytes = entry_bytes(entry)?;
+            let keep_incoming = match self.entries.get(&slot) {
+                Some(held) => entry_bytes(held)? > incoming_bytes,
+                None => true,
+            };
+            if keep_incoming {
+                self.entries.insert(slot, entry.clone());
             }
         }
         self.normalize();
@@ -280,11 +308,14 @@ mod tests {
         entry_by(&ghost(), &ghost(), store, height)
     }
 
+    /// Fold entries in, a delta's worth at a time: one delta may not carry
+    /// more than `MAX_INDEX_ENTRIES` (see `apply_delta`), so a fixture past
+    /// the bound arrives in several, as it would from a peer.
     fn with(entries: Vec<IndexEntry>) -> GhostKeyIndexV1 {
         let mut state = GhostKeyIndexV1::default();
-        state
-            .apply_delta(&params(), &entries)
-            .expect("valid entries");
+        for chunk in entries.chunks(MAX_INDEX_ENTRIES) {
+            state.apply_delta(&params(), chunk).expect("valid entries");
+        }
         state.verify(&params()).expect("a valid index");
         state
     }
@@ -385,6 +416,34 @@ mod tests {
             .clone();
         over.entries.insert(extra.slot(), extra);
         assert!(over.verify(&params()).is_err());
+    }
+
+    /// A delta may not carry more than the index can hold, and the cap is
+    /// applied BEFORE any signature is checked, so an oversized delta costs
+    /// nothing to refuse (#101 review). A whole STATE past the bound is
+    /// refused the same way, since a valid one never holds more. Mutated red
+    /// by removing the cap.
+    #[test]
+    fn an_oversized_delta_is_refused_before_it_is_verified() {
+        let mut state = GhostKeyIndexV1::default();
+        // The same slot over and over: a `Vec` does not collapse duplicates.
+        let repeated: Vec<IndexEntry> = (0..MAX_INDEX_ENTRIES + 1).map(|_| entry(1, 10)).collect();
+        let err = state
+            .apply_delta(&params(), &repeated)
+            .expect_err("a delta may not be unbounded");
+        assert!(err.contains("the most it may carry"), "{err}");
+        assert!(state.entries.is_empty(), "and nothing is folded in");
+
+        let many: Vec<IndexEntry> = (0..MAX_INDEX_ENTRIES as u32 + 1)
+            .map(|i| entry(i, 10))
+            .collect();
+        assert!(state.apply_delta(&params(), &many).is_err());
+
+        let mut oversized = GhostKeyIndexV1::default();
+        for e in many {
+            oversized.entries.insert(e.slot(), e);
+        }
+        assert!(state.merge(&params(), &oversized).is_err());
     }
 
     /// Seeded merge laws, past the bound, plus delta order: stale-summary

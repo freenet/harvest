@@ -1618,6 +1618,15 @@ could be republished to the Ghost Key record as a derived value, but that
 would be a cache with its own staleness, not a second source of truth, and it
 is not needed today.
 
+**What a reader can enumerate.** The index is public, as every contract is,
+and it is addressed by the Ghost Key alone, so anyone who learns a Ghost Key
+can read every store that key has backed. That is deliberate and costs
+nothing that section 2 does not already give away: both stores show the same
+Ghost Key anyway, and a seller who wants two stores kept apart uses two Ghost
+Keys, which share no index. Harvest's own UI reads only the indexes of keys
+the user holds (phase 1c), because a buyer has no use for a seller's other
+stores and following a stranger's index is a crawl anyone could aim.
+
 **Confidence.** High.
 
 ---
@@ -2024,16 +2033,25 @@ contract (decision 6.7).
 
 ### How the UI uses it (`ui/src/index_flow.rs`)
 
-- **Finding a Ghost Key's stores.** For every connected Ghost Key the UI
+- **Only the user's own Ghost Keys.** This tab reads the index of a key the
+  user holds, and no other. An index entry is cheap to make (the contract
+  length-checks a certificate and nothing more), so following a stranger's
+  index, and then every store it lists, and then those stores' backers'
+  indexes, is a crawl anyone could publish and aim at a visitor, with
+  `refresh_backing_verdicts` re-running over everything loaded. A buyer has
+  no use for a seller's other stores, so nothing follows a store to another
+  key's index.
+- **Finding the user's own stores.** For every connected Ghost Key the UI
   reads its index and loads every store listed. Phase 1b's custody then
   recovers the store key from a store the key backs (where a wrapped copy
   exists), which registers the store again. The Harvest delegate's store
   list stays as a cache. A store with no copy for a key this device has
   loads but is not registered.
-- **One current store per Ghost Key.** When a store loads, the UI reads the
-  index of its current backer and loads the stores that index lists, so
-  `refresh_backing_verdicts` sees the key's other stores and applies
-  decision 6.2 to them too, not only to what the tab happened to open.
+- **One current store per Ghost Key.** Loading the user's own stores is
+  what lets `refresh_backing_verdicts` apply decision 6.2 across them,
+  which is the case that matters: the seller is the one who can retire a
+  backing (My Store offers it). A buyer keeps the rule over the stores
+  their tab has loaded, as before.
 - **Keeping the index complete, and the migration onto it.** When one of
   our stores loads (this device holds its store key) and its current backer
   is connected here, the store's backing is published into that key's
@@ -2064,10 +2082,16 @@ contract (decision 6.7).
 
 ### What phase 1c leaves
 
-- A reader that has loaded a store but not yet its backer's index cannot
-  yet apply decision 6.2 to the key's other stores. It shows the verdict it
-  has; section 6.2 asked for "still being checked" in that window, and
-  that is not built.
+- A buyer applies decision 6.2 only across the stores their tab has
+  loaded, as before 1c. Reading the seller's index would cover more, and
+  is deliberately not done: see "Only the user's own Ghost Keys" above.
+  Section 6.2 also asked for "still being checked" in that window, which is
+  not built.
+- **A full index keeps the smallest store keys**, so once a Ghost Key has
+  64 entries a new store whose key sorts after all of them can never be
+  listed. The UI says so once and stops trying; the seller's way out is to
+  retire a backing they no longer use, or to back the store with another
+  Ghost Key. Reaching this takes 64 stores under one key.
 - My Store still lists registered stores. A store found through the index
   shows there once custody has recovered its key.
 - The migration rehearsal harness compiles the index lineage but does not
