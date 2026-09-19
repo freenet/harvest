@@ -9384,8 +9384,8 @@ mod invoice_tests {
         );
         // The other field that moved onto the order for the same reason. It
         // is optional by design, but the build knows its own value, so an
-        // invoice that omits it has silently lost the store contract's
-        // related-contract cross-check.
+        // invoice that omits it cannot be watched: the UI derives the
+        // address contract it subscribes to from this hash.
         assert_eq!(
             order.bitcoin_address_code_hash,
             resolved_address_generation().code_hash(),

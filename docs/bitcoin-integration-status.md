@@ -17,9 +17,10 @@ Bitcoin.
   arithmetic over the claim's asserted block height and a bridge-signed tip, so
   a trusted bridge key can assert a payment that never happened. See
   `freenet-bitcoin`'s `docs/trust-boundaries.md`.
-- The store contract reaches a paid order's `BitcoinAddressContract` through
-  Freenet's real related-contract mechanism, respecting the one-round limit —
-  as a strictly additive cross-check that can never make valid state invalid.
+- The store contract does not fetch any related contract: a paid order's
+  validity rests only on the proof embedded in it. (It used to fetch each paid
+  order's `BitcoinAddressContract` for a diagnostic log line; that was removed,
+  since contracts carry no diagnostics-only work.)
 - A private watch list in the delegate, never written to any contract.
 - A Payments UI that subscribes to contracts and updates live.
 - The bridge is deployed and observing real signet payments.

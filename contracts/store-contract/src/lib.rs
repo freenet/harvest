@@ -4,66 +4,9 @@ use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 
-use freenet_bitcoin_common::BitcoinAddressStateV1;
-use harvest_common::payment::OrderStatus;
 use harvest_common::store::{
     StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary,
 };
-
-/// How many related `BitcoinAddressContract` instances one `validate_state`
-/// call will ask Freenet to fetch.
-///
-/// Freenet's related-contract protocol gives a contract exactly one round
-/// trip per validation: returning `RequestRelated` again once the peer has
-/// already resolved a prior request is an error, not a second chance to ask
-/// for more. So every instance this call might ever want has to be named in
-/// the single `RequestRelated` response, which is what this bounds -- a
-/// store with more than 10 currently-Paid/PaymentReversed orders referencing
-/// distinct scripts simply forfeits the cross-check for the rest.
-const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
-
-/// Compute the `ContractInstanceId` a `BitcoinAddressContract` instance with
-/// these parameters would have, without holding that contract's WASM.
-///
-/// `ContractInstanceId` is `BLAKE3(BLAKE3(wasm) || params_bytes)`
-/// (`freenet_stdlib::ContractInstanceId::from_params_and_code`, via that
-/// crate's private `generate_id`). That constructor needs the actual WASM
-/// bytes so it can call `.hash()` on them -- it has no entry point that
-/// accepts a hash directly -- but the store contract never holds the
-/// Bitcoin contract's WASM; it only knows its hash, supplied out-of-band as
-/// `Order::bitcoin_address_code_hash`. So this replicates the same two-hash
-/// construction by hand instead of going through `ContractCode`.
-///
-/// This assumes the real `BitcoinAddressContract` was published with its
-/// `BitcoinAddressParameters` encoded via `ciborium` (as
-/// `bitcoin-address-contract`'s own `decode_params` expects) -- the hash is
-/// over the exact on-wire parameter bytes, not a semantic re-encoding, so a
-/// different encoder would silently compute the wrong id.
-///
-/// It used to have to assume something further and shakier: that the bridge
-/// list's ORDER matched whatever the address contract was actually deployed
-/// with, since the list came from the *store's* frozen parameters and had no
-/// necessary relationship to any particular order. Now that both the bridge
-/// list and the code hash travel in the order itself
-/// (`harvest_common::payment::Order`), the seller states them per invoice and
-/// signs them, so the address contract this names is the one the seller meant
-/// for this payment. A mismatch costs the cross-check for that order and
-/// nothing more -- see `validate_state` on why it is additive-only.
-/// The address contract an order names, as a `ContractInstanceId`.
-///
-/// A thin wrapper over `Order::bitcoin_address_instance_id`, which is where
-/// the derivation lives. It used to be a second hand-written copy of
-/// `BLAKE3(code_hash || cbor(parameters))` here -- the shape ranked first in
-/// `docs/untested-invariants.md`, where a duplicated contract-address
-/// derivation drifted and made every derived id name a contract that had
-/// never been published, silently.
-fn bitcoin_address_instance_id(
-    order: &harvest_common::payment::Order,
-) -> Option<ContractInstanceId> {
-    order
-        .bitcoin_address_instance_id()
-        .map(ContractInstanceId::new)
-}
 
 #[allow(dead_code)]
 struct Contract;
@@ -73,7 +16,7 @@ impl ContractInterface for Contract {
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-        related: RelatedContracts<'static>,
+        _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let bytes = state.as_ref();
         if bytes.is_empty() {
@@ -97,116 +40,19 @@ impl ContractInterface for Contract {
         // The embedded `OrderPaymentProof` on each order is the sole
         // authority on whether it is genuinely paid -- see
         // `harvest_common::payment`'s module docs for why. `verify` below
-        // re-checks that proof (among everything else) independent of
-        // anything past this point.
+        // re-checks that proof (among everything else).
+        //
+        // Validity is a pure function of this state and these parameters.
+        // Nothing here asks for related contracts: another contract's state
+        // replicates on its own schedule, so letting it affect the verdict
+        // would let two peers holding identical bytes disagree. An earlier
+        // version fetched each paid order's Bitcoin address contract anyway,
+        // purely to log a line when it held no claims; every peer paid up to
+        // ten fetches per validation for that, and it was removed.
         if let Err(e) = store_state.verify(&store_state, &parameters) {
             return Err(ContractError::InvalidUpdateWithInfo {
                 reason: format!("State verification failed: {e}"),
             });
-        }
-
-        // ---------------------------------------------------------------
-        // Related-contract cross-check against each Paid/PaymentReversed
-        // order's `BitcoinAddressContract`.
-        //
-        // THIS IS ADDITIVE ONLY. It can add corroborating information; it
-        // can NEVER make otherwise-valid state invalid, and every branch
-        // below is written so that no path through this section returns
-        // `Invalid`. That is deliberate and it is the single most important
-        // architectural fact in this file:
-        //
-        // A contract's verdict has to be a pure function of its own state
-        // and parameters, or replicas that evaluate it at different moments
-        // reach different answers and never converge. Related state is NOT
-        // under this contract's control -- it is a separate contract,
-        // replicated on its own schedule -- so a peer whose copy of it has
-        // not caught up yet (or hasn't fetched it at all, or is running
-        // with `bitcoin_address_code_hash: None` and therefore can't even
-        // compute which contract to ask for) would, if this cross-check
-        // were allowed to reject, judge a perfectly good order invalid
-        // purely because of replication timing. Two peers holding
-        // byte-identical `StoreStateV1` could then disagree about its
-        // validity, which is precisely the divergence a Freenet contract
-        // must never produce. The embedded proof is what makes validity
-        // self-contained; the related-contract lookup below exists only to
-        // fetch corroborating evidence for operators (surfaced via a log
-        // line), never to gate it.
-        // ---------------------------------------------------------------
-        let mut wanted_ids: Vec<ContractInstanceId> = Vec::new();
-        for record in store_state.orders.orders.values() {
-            if !matches!(
-                record.status,
-                OrderStatus::Paid | OrderStatus::PaymentReversed
-            ) {
-                continue;
-            }
-            // `None` means the order names no code hash, so there is nothing
-            // to compute a related instance id with -- skip that order's
-            // cross-check rather than guessing at one. See the field's doc
-            // comment on `Order`.
-            let Some(instance_id) = bitcoin_address_instance_id(&record.order) else {
-                continue;
-            };
-            if !wanted_ids.contains(&instance_id) {
-                wanted_ids.push(instance_id);
-            }
-            if wanted_ids.len() >= MAX_RELATED_CONTRACTS_PER_REQUEST {
-                break;
-            }
-        }
-
-        // An id already present as a key in `related` -- whether its state
-        // came back `Some` or `None` -- means Freenet already resolved a
-        // prior request for it; asking again would be the disallowed
-        // second round. Only an id that has NEVER been requested belongs in
-        // this call's (one and only) `RequestRelated`.
-        let already_requested: Vec<ContractInstanceId> =
-            related.states().map(|(id, _)| *id).collect();
-        let not_yet_requested: Vec<ContractInstanceId> = wanted_ids
-            .iter()
-            .filter(|id| !already_requested.contains(id))
-            .cloned()
-            .collect();
-
-        if !not_yet_requested.is_empty() {
-            return Ok(ValidateResult::RequestRelated(not_yet_requested));
-        }
-
-        // Every id we wanted has already been asked for (or we wanted none
-        // at all). Cross-check whatever came back purely for diagnostics --
-        // see the section header above for why this never affects the
-        // verdict.
-        for record in store_state.orders.orders.values() {
-            if !matches!(
-                record.status,
-                OrderStatus::Paid | OrderStatus::PaymentReversed
-            ) {
-                continue;
-            }
-            let Some(instance_id) = bitcoin_address_instance_id(&record.order) else {
-                continue;
-            };
-            let Some((_, Some(related_bytes))) =
-                related.states().find(|(id, _)| **id == instance_id)
-            else {
-                // Not fetched (beyond the cap above) or fetched and empty --
-                // nothing to cross-check against, and that is not evidence
-                // of anything either way.
-                continue;
-            };
-            let Ok(address_state) =
-                from_reader::<BitcoinAddressStateV1, &[u8]>(related_bytes.as_ref())
-            else {
-                continue;
-            };
-            if address_state.claims.claims.is_empty() && address_state.claims.scanned.is_empty() {
-                freenet_stdlib::log::info(&format!(
-                    "store-contract: order {} is {:?} but its referenced Bitcoin address \
-                     contract holds no claims at all (informational only -- the order's own \
-                     embedded proof remains authoritative)",
-                    record.order.id, record.status
-                ));
-            }
         }
 
         Ok(ValidateResult::Valid)
@@ -517,83 +363,32 @@ mod tests {
         bytes
     }
 
+    /// A paid order validates on its embedded proof alone, whether or not it
+    /// names the build of its Bitcoin address contract. The contract never
+    /// asks for related contracts: it used to fetch the address contract of
+    /// each paid order purely for a log line, and that fetch is gone.
     #[test]
-    fn skips_related_request_when_code_hash_absent() {
+    fn a_paid_order_validates_without_asking_for_related_contracts() {
         let seller = seller_key();
         let bridge = bridge_key();
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], None);
-        let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller);
+        for code_hash in [None, Some([42u8; 32])] {
+            let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], code_hash);
+            let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
+            let params = params_bytes(&seller);
 
-        let result = Contract::validate_state(
-            Parameters::from(params),
-            State::from(state_bytes),
-            RelatedContracts::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ValidateResult::Valid,
-            "with no code hash configured, validate_state must skip the related-contract \
-             request entirely and still accept the (embedded-proof-verified) order"
-        );
-    }
-
-    #[test]
-    fn requests_related_contract_for_a_paid_order_when_code_hash_known() {
-        let seller = seller_key();
-        let bridge = bridge_key();
-        let code_hash = [42u8; 32];
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
-        let expected_id = bitcoin_address_instance_id(&order).expect("the order names a build");
-
-        let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller);
-
-        let result = Contract::validate_state(
-            Parameters::from(params),
-            State::from(state_bytes),
-            RelatedContracts::new(),
-        )
-        .unwrap();
-        match result {
-            ValidateResult::RequestRelated(ids) => {
-                assert_eq!(ids, vec![expected_id]);
-            }
-            other => panic!("expected RequestRelated, got {other:?}"),
+            let result = Contract::validate_state(
+                Parameters::from(params),
+                State::from(state_bytes),
+                RelatedContracts::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                ValidateResult::Valid,
+                "a paid order must validate on its own embedded proof, with no \
+                 related-contract request (code hash {code_hash:?})"
+            );
         }
-    }
-
-    #[test]
-    fn validates_once_related_state_resolves_even_if_it_came_back_empty() {
-        let seller = seller_key();
-        let bridge = bridge_key();
-        let code_hash = [42u8; 32];
-        let order = make_order(&[0x00, 0x14, 0xaa, 0xbb], Some(code_hash));
-        let expected_id = bitcoin_address_instance_id(&order).expect("the order names a build");
-
-        let (state_bytes, _id) = paid_store_state_bytes(&seller, &bridge, order);
-        let params = params_bytes(&seller);
-
-        // Simulate Freenet's second invocation: the id we would have asked
-        // for is already a key in `related`, with no state behind it (the
-        // related contract was not found, or simply hasn't been created
-        // yet). This must NOT trigger a second `RequestRelated` -- that
-        // would be the disallowed second round -- and it must NOT make the
-        // order invalid: the embedded proof remains authoritative.
-        let mut map: HashMap<ContractInstanceId, Option<State<'static>>> = HashMap::new();
-        map.insert(expected_id, None);
-        let related = RelatedContracts::from(map);
-
-        let result =
-            Contract::validate_state(Parameters::from(params), State::from(state_bytes), related)
-                .unwrap();
-        assert_eq!(
-            result,
-            ValidateResult::Valid,
-            "an order whose related contract came back empty must still validate, on the \
-             strength of its own embedded proof"
-        );
     }
 
     /// harvest#77, at the layer that decides. A store state holding an order

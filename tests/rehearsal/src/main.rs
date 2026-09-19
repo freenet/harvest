@@ -441,12 +441,24 @@ fn read_wasm(path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// The parameter encoding a store generation was published under.
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    /// `{seller_verifying_key, trusted_bitcoin_bridges, bitcoin_address_code_hash}`, 109 B.
+    Legacy,
+    /// `{seller_verifying_key}`, 56 B.
+    WholeKey,
+    /// `{store_code}`, 29 B: harvest#52 onwards, and the current build.
+    Code,
+}
+
 /// Every registry generation is walked at the address it ACTUALLY has.
 ///
 /// This is the part `freenet_migrate` cannot do on its own:
 /// `ContractLineageEntry` carries only a code hash, so the crate derives every
 /// predecessor from one set of parameter bytes, and the store's encoding
-/// changed twice -- 56 bytes for V1, 109 for V2..=V5, 56 again from V6. Each
+/// changed three times -- 56 bytes for V1, 109 for V2..=V5, 56 again for
+/// V6..=V16, and 29 (the store code) from V17. Each
 /// generation is checked against an id derived the way the NODE derives one
 /// (`WrappedContract::key`), from that generation's real WASM out of git
 /// history and the parameters it shipped with.
@@ -465,52 +477,57 @@ fn read_wasm(path: &Path) -> Vec<u8> {
 /// under test cannot catch that code having the boundary wrong, and the
 /// boundary WAS wrong -- it put V1, the only generation ever published, on the
 /// legacy side.
-const ENCODING_BY_GENERATION: &[(u32, bool)] = &[
-    (1, false),
-    (2, true),
-    (3, true),
-    (4, true),
-    (5, true),
-    (6, false),
-    // V7: visibility-only change to `StoreParameters`, so the encoding is
-    // unchanged at 56 bytes. See the same table in `ui/src/migrate/tests.rs`.
-    (7, false),
-    // V8, V9 and V10 were added on 2026-09-09, having been missed when each
-    // generation was recorded. The table went stale at V8 (2026-09-06) and the
-    // harness has been panicking on the length assertion below ever since,
-    // unnoticed because it needs a live node and does not run in CI. Note what
-    // that says about the reassurance above: looking generations up BY NUMBER
-    // did fix the index-shift bug it was written for, and it does not stop
-    // this table needing a row per generation. Adding one is still part of
-    // recording a generation.
-    //
-    // All three are `false` for the same reason V8 and V9 are in the sibling
-    // table: none of them touched `StoreParameters`, whose encoding is still
-    // 56 bytes.
-    (8, false),
-    (9, false),
-    (10, false),
-    // V11..=V16 were missed the same way and added with harvest#52. All are
-    // the 56-byte whole-key shape; V16 is the last of them, because harvest#52
-    // made the parameter a code. `false` here means "whole key", which since
-    // harvest#52 is no longer the CURRENT encoding -- see
-    // `assert_candidate_addresses`.
-    (11, false),
-    (12, false),
-    (13, false),
-    (14, false),
-    (15, false),
-    (16, false),
-];
+const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
+    use Shape::{Code, Legacy, WholeKey};
+    &[
+        (1, WholeKey),
+        (2, Legacy),
+        (3, Legacy),
+        (4, Legacy),
+        (5, Legacy),
+        (6, WholeKey),
+        // V7: visibility-only change to `StoreParameters`, so the encoding is
+        // unchanged at 56 bytes. See the same table in `ui/src/migrate/tests.rs`.
+        (7, WholeKey),
+        // V8, V9 and V10 were added on 2026-09-09, having been missed when each
+        // generation was recorded. The table went stale at V8 (2026-09-06) and the
+        // harness has been panicking on the length assertion below ever since,
+        // unnoticed because it needs a live node and does not run in CI. Note what
+        // that says about the reassurance above: looking generations up BY NUMBER
+        // did fix the index-shift bug it was written for, and it does not stop
+        // this table needing a row per generation. Adding one is still part of
+        // recording a generation.
+        //
+        // All three are `WholeKey` for the same reason V8 and V9 are in the sibling
+        // table: none of them touched `StoreParameters`, whose encoding is still
+        // 56 bytes.
+        (8, WholeKey),
+        (9, WholeKey),
+        (10, WholeKey),
+        // V11..=V16 were missed the same way and added with harvest#52. All are
+        // the 56-byte whole-key shape; V16 is the last of them, because harvest#52
+        // made the parameter a code.
+        (11, WholeKey),
+        (12, WholeKey),
+        (13, WholeKey),
+        (14, WholeKey),
+        (15, WholeKey),
+        (16, WholeKey),
+        // V17: the build at `bc57dac` (harvest#52), the first addressed by the
+        // store code. Superseded by dropping the store contract's diagnostic-only
+        // related-contract fetch.
+        (17, Code),
+    ]
+};
 
-/// Every recorded generation is published under the three-field (`legacy`)
-/// or the whole-key shape; none is under today's code shape, which only the
-/// current build uses. So `current` here is the whole-key encoding.
+/// Every recorded generation is published under one of three shapes: the
+/// three-field (`legacy`), the whole key, or (V17 onwards) the store code.
 fn assert_candidate_addresses(
     repo: &Path,
     vk: &VerifyingKey,
     legacy: &Parameters<'static>,
-    current: &Parameters<'static>,
+    whole_key: &Parameters<'static>,
+    code: &Parameters<'static>,
 ) {
     let derived = migrate::store_candidate_ids(vk).expect("derive candidates");
     let mut newest_first: Vec<_> = migrate::store_lineage().iter().collect();
@@ -529,10 +546,10 @@ fn assert_candidate_addresses(
 
     println!("  migrate::store_candidate_ids, checked against the node's own derivation:");
     let mut saw_legacy = false;
-    let mut saw_current = false;
+    let mut saw_whole_key = false;
 
     for (entry, got) in newest_first.iter().zip(&derived) {
-        let (_, is_legacy) = ENCODING_BY_GENERATION
+        let (_, shape) = ENCODING_BY_GENERATION
             .iter()
             .find(|(g, _)| *g == entry.generation)
             .unwrap_or_else(|| {
@@ -543,37 +560,41 @@ fn assert_candidate_addresses(
             });
 
         let wasm = legacy_wasm_from_git(repo, "store_contract", &hex::encode(entry.code_hash));
-        let params = if *is_legacy {
-            saw_legacy = true;
-            legacy.clone()
-        } else {
-            saw_current = true;
-            current.clone()
+        let params = match shape {
+            Shape::Legacy => {
+                saw_legacy = true;
+                legacy.clone()
+            }
+            Shape::WholeKey => {
+                saw_whole_key = true;
+                whole_key.clone()
+            }
+            Shape::Code => code.clone(),
         };
         let (_, expected) = container(&wasm, params);
 
         println!(
-            "    V{} {} params -> {}",
+            "    V{} {:?} params -> {}",
             entry.generation,
-            if *is_legacy { "legacy " } else { "current" },
+            shape,
             got
         );
         assert_eq!(
             *got,
             expected,
             "generation {} must be walked at the address it was published under \
-             ({} parameter encoding)",
+             ({:?} parameter encoding)",
             entry.generation,
-            if *is_legacy { "legacy" } else { "current" }
+            shape
         );
     }
 
     // Without generations on BOTH sides this checks nothing about the split:
     // deriving every id under one encoding would pass.
     assert!(
-        saw_legacy && saw_current,
+        saw_legacy && saw_whole_key,
         "the registry must span the parameter split for this check to mean anything \
-         (legacy seen: {saw_legacy}, current seen: {saw_current})"
+         (legacy seen: {saw_legacy}, whole key seen: {saw_whole_key})"
     );
 }
 
@@ -631,7 +652,7 @@ async fn main() {
     // The arithmetic that matters: the ids migrate.rs will walk must equal the
     // ids the node addresses those generations by -- every generation, each
     // under the parameter encoding IT shipped with.
-    assert_candidate_addresses(&repo, &vk, &legacy, &whole_key_params(&vk));
+    assert_candidate_addresses(&repo, &vk, &legacy, &whole_key_params(&vk), &curr_p);
 
     for (generation, want) in PLANT_AT {
         let row = migrate::store_lineage()

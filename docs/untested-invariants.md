@@ -247,9 +247,7 @@ have tripped. Its own claims are covered.
 
 | Line | Claim | Caught? |
 |---|---|---|
-| 100 | The related-contract cross-check "is ADDITIVE ONLY … can NEVER make otherwise-valid state invalid, and every branch below is written so that no path through this section returns `Invalid`". | **Partly, and the untested half is the dangerous one.** `validates_once_related_state_resolves_even_if_it_came_back_empty` covers related state coming back *empty*. Nothing covers related state coming back **populated and contradicting** the embedded proof — the case where an implementation would most naturally return `Invalid`. |
-| 118 | Divergence "is precisely what a Freenet contract must never produce". | **No.** This is the *reason* for line 100 and is not separately testable within one process; it needs two peers with different related-state views. |
-| 150 | "Only an id that has NEVER been requested belongs in this call's (one and only) `RequestRelated`" — asking twice is disallowed. | **Yes** — `skips_related_request_when_code_hash_absent`, `requests_related_contract_for_a_paid_order_when_code_hash_known`, and the empty-resolve test above. |
+| — | The contract asks for no related contracts: validity is a pure function of the state and parameters. | **Yes** -- `a_paid_order_validates_without_asking_for_related_contracts`, for a paid order with and without a code hash. The three rows that stood here described the related-contract cross-check (additive-only, one request round); that code was removed, so they no longer describe anything. |
 
 ## `contracts/mailbox-contract/src/lib.rs`, `contracts/reputation-contract/src/lib.rs`
 
@@ -929,19 +927,19 @@ form of that change; a rename, unusual spacing, or a fourth parameter struct
 added elsewhere slips past it. It is a guard on a review-visible change, not
 the thing that makes the invariant true.
 
-### 2. `contracts/store-contract/src/lib.rs:100` — the cross-check is additive only
+### 2. `contracts/store-contract/src/lib.rs:100` — the cross-check is additive only — **CLOSED BY REMOVAL 2026-09-18**
 
-**Convergence, and therefore money.** If any path through the related-contract
-section can return `Invalid`, two peers holding byte-identical `StoreStateV1`
-can disagree about its validity purely because one has fetched the Bitcoin
-address contract and the other has not. Divergence in a payments contract means
-peers disagreeing about whether an order is paid.
+**Convergence, and therefore money.** The risk was that a future edit to the
+related-contract section would return `Invalid` on a populated, contradicting
+Bitcoin address state, so two peers holding byte-identical `StoreStateV1`
+could disagree about its validity depending on which had fetched it. Nothing
+tested that half; a comment was the whole enforcement.
 
-The tested half is the benign one — related state came back empty. The untested
-half is related state that came back **populated and contradicting**, which is
-exactly where a future edit would most naturally add a rejection, because at
-that point the contract appears to hold evidence of a problem. The comment says
-loudly not to, and a comment is currently the whole enforcement.
+The section is gone. It never affected validity and existed only to log a line
+when an address contract held no claims, while every peer paid up to ten
+fetches per validation for it. With no related-contract request in
+`validate_state` there is no related state for an edit to gate on, which is a
+stronger guard than a test of the absence would be.
 
 ### 3. `common/src/store.rs:470` and `:476` — the `OrdersV1::verify` guards
 ### **CONFIRMED BY EXECUTION 2026-09-05, still open**

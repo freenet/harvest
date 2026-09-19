@@ -38,9 +38,9 @@
 //!
 //! ## Why the proof is embedded rather than fetched
 //!
-//! Harvest *does* use Freenet's related-contract mechanism to reach the
-//! `BitcoinAddressContract` (see the store contract's `validate_state`), but
-//! the authoritative gate is the embedded proof, and that is deliberate.
+//! The store contract never consults the `BitcoinAddressContract`: the
+//! embedded proof is the only gate, and that is deliberate. (The UI reads the
+//! address contract to show a buyer what has arrived; contracts do not.)
 //!
 //! A contract's verdict has to be a pure function of its own inputs, or
 //! replicas that evaluate it at different moments reach different answers and
@@ -50,8 +50,8 @@
 //! self-contained and monotonic — once a proof verifies it verifies forever,
 //! on every peer, regardless of replication timing.
 //!
-//! The related contract is therefore used for **discovery and
-//! cross-checking**, never as the thing that can make existing state invalid.
+//! The address contract is therefore used by clients for **discovery**,
+//! never by a contract, and never as the thing that can make state invalid.
 //!
 //! ### What embedding costs
 //!
@@ -411,10 +411,10 @@ pub struct Order {
     /// BLAKE3 hash of the `BitcoinAddressContract` WASM whose instance
     /// observes this order's payment address.
     ///
-    /// Used only for the store contract's related-contract cross-check, which
-    /// is additive-only (see that file's `validate_state`). The store contract
-    /// never holds the Bitcoin contract's WASM, so it has to be told the hash;
-    /// `None` simply skips the cross-check for this order and forfeits nothing
+    /// Used by clients to find the address contract that watches this order's
+    /// payment (see [`Order::bitcoin_address_instance_id`]); no contract reads
+    /// it. A client never holds the Bitcoin contract's WASM, so it is told the
+    /// hash; `None` means the order cannot be watched and forfeits nothing
     /// else, since the embedded [`OrderPaymentProof`] stays authoritative
     /// either way.
     ///
@@ -586,9 +586,9 @@ impl Order {
     ///
     /// # Why this is HERE and not at either call site
     ///
-    /// Two things need it and they are in different crates: the store
-    /// contract, to cross-check an order against the address contract's own
-    /// state, and the UI, so a buyer can see what has already arrived at the
+    /// It lives in the shared crate because a derivation of a contract's
+    /// address belongs next to the parameters it hashes. The UI uses it so a
+    /// buyer can see what has already arrived at the
     /// address they are about to pay. A hand-maintained second copy of a
     /// contract-address derivation is the defect this repository ranks first
     /// in `docs/untested-invariants.md` -- `create_store_contracts` held one
@@ -667,8 +667,8 @@ impl Order {
 ///   That is the convergence argument in this module's header, and it is not
 ///   negotiable: related state replicates on its own schedule, so gating on it
 ///   would let two peers holding byte-identical state disagree about whether
-///   it is valid. The store contract does fetch it (`validate_state`), but
-///   only ever to log a discrepancy.
+///   it is valid. The store contract does not fetch it at all; only clients
+///   read it.
 /// - **It cannot be fixed in the merge either**, which is the tempting place,
 ///   since `merge_order` holds both records and could demand that a reversal's
 ///   claims be a superset of the `Paid` record's. That breaks convergence in

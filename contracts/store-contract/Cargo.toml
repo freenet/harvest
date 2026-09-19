@@ -8,7 +8,6 @@ description = "Harvest store contract: per-seller product listings with ghostkey
 
 [dependencies]
 harvest-common = { workspace = true }
-freenet-bitcoin-common = { workspace = true }
 freenet-stdlib = { workspace = true }
 freenet-scaffold = { workspace = true }
 ciborium = { workspace = true }

@@ -302,6 +302,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // and the state gained its owner. The last generation
                 // addressed by the whole key.
                 "95f464c47796ec638185bb023a37e60dff3a63ecbe115824a3be1bb28c82067d",
+                // V17, from `git show bc57dac:ui/public/contracts/store_contract.wasm`.
+                // Superseded by removing the diagnostic-only related-contract
+                // fetch from `validate_state`. The first generation addressed
+                // by the store code; state and validity unchanged.
+                "7c56e044b2f69825f209500c54c433038e1be5b3e5cc59b78a92bf4173175f68",
             ],
         ),
         (
@@ -806,7 +811,7 @@ fn superseded_store_generations_are_probed_under_their_own_parameter_encoding() 
 /// asks the code under test what the answer is. V1 once sat on the wrong
 /// side of a boundary for exactly that reason.
 const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
-    use StoreParamShape::{WholeKey, WholeKeyWithBitcoinFields};
+    use StoreParamShape::{Code, WholeKey, WholeKeyWithBitcoinFields};
     &[
         (1, WholeKey),
         (2, WholeKeyWithBitcoinFields),
@@ -841,6 +846,9 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // parameter a code. Still the whole key, 56B per
         // `scripts/check-code-hashes.sh` on that commit.
         (16, WholeKey),
+        // V17: the build at `bc57dac` (harvest#52), the first addressed by
+        // the store code, 29B.
+        (17, Code),
     ]
 };
 
@@ -1287,6 +1295,61 @@ fn a_whole_key_store_is_found_and_carried_into_the_code_addressed_contract() {
     merged
         .verify(&merged, &store_params(&vk))
         .expect("the carried store is one the code-addressed contract accepts");
+}
+
+/// **A code-addressed generation carries forward as it is.** V17 is the
+/// first store generation addressed by the store code, and the change that
+/// superseded it (dropping the diagnostic-only related-contract fetch) left
+/// state, validity and parameters alone. So a seller's V17 store, which
+/// already names its owner, is found at the address today's CODE parameters
+/// derive and verifies against the current contract unchanged.
+///
+/// Mutated red by deriving V17 under the whole-key encoding (moving
+/// `LAST_WHOLE_KEY_STORE_PARAM_GENERATION` to 17): the probe then asks for an
+/// address V17 never had and recovers nothing.
+#[test]
+fn a_code_addressed_store_is_carried_into_the_next_generation() {
+    use freenet_scaffold::ComposableState;
+    let vk = seller_vk();
+    let v17 = store_lineage()
+        .iter()
+        .find(|e| e.generation == 17)
+        .expect("V17 is recorded");
+    let v17_address = current_id(&v17.code_hash, &store_params_encoded());
+    let mut predecessor = store_with(&[signed_listing("Coffee")]);
+    predecessor.info = signed_store_info(1);
+    predecessor.owner = Some(vk);
+    predecessor
+        .verify(&predecessor, &store_params(&vk))
+        .expect("the fixture is a state V17 accepted");
+    let bytes = store_bytes(&predecessor);
+
+    let session = ProbeSession::start_with_candidates(
+        store_ops(),
+        StoreStateV1::default(),
+        store_candidates(&vk).expect("candidates"),
+        fold_all_policy(),
+    );
+    let (outcome, _) = run(session, |id| {
+        if id == v17_address {
+            Answer::State(bytes.clone())
+        } else {
+            Answer::Absent
+        }
+    });
+    let Outcome::Recovered { merged, source, .. } = outcome else {
+        panic!("expected a recovery, got {}", describe(&outcome));
+    };
+    assert_eq!(source, v17_address);
+    assert_eq!(merged.owner, Some(vk));
+    assert_eq!(merged.listings.listings.len(), 1);
+    assert_eq!(
+        merged.info, predecessor.info,
+        "the store's details carry over"
+    );
+    merged
+        .verify(&merged, &store_params(&vk))
+        .expect("the carried store is one the current contract accepts");
 }
 
 /// Fold-all reaches past the newest populated generation.
