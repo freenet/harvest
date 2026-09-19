@@ -216,10 +216,12 @@ pub(crate) fn wrap_for<S: SecretStore>(
     scoped_payload: &[u8],
     signature: &[u8],
 ) -> HarvestDelegateResponse {
-    let answer = |result| HarvestDelegateResponse::StoreKeyWrapped {
-        request_id,
-        store_verifying_key,
-        result,
+    let answer = |result: Result<custody::AuthorizedCopy, String>| {
+        HarvestDelegateResponse::StoreKeyWrapped {
+            request_id,
+            store_verifying_key,
+            result: result.map(Box::new),
+        }
     };
     answer((|| {
         let store = VerifyingKey::from_bytes(&store_verifying_key)
@@ -497,7 +499,7 @@ mod tests {
 
     fn wrapped(response: HarvestDelegateResponse) -> Result<custody::AuthorizedCopy, String> {
         match response {
-            HarvestDelegateResponse::StoreKeyWrapped { result, .. } => result,
+            HarvestDelegateResponse::StoreKeyWrapped { result, .. } => result.map(|copy| *copy),
             other => panic!("expected a wrap answer, got {other:?}"),
         }
     }

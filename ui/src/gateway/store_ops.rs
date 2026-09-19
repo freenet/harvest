@@ -387,7 +387,7 @@ pub async fn create_store_contracts(
             .ok_or("reputation contract id is not 32 bytes -- cannot publish store details")?,
         store_name,
         description,
-                // The inbox key the store key derives (harvest#93 phase 1b,
+        // The inbox key the store key derives (harvest#93 phase 1b,
         // `StoreSubkeys`), the same on every device holding the store key.
         encryption_public_key,
         // And the record key, derived the same way and published so another
@@ -504,7 +504,10 @@ pub async fn submit_listing_by_id(
 /// (`WrapStoreKeyFor`); a failure is said out loud, since until the copy lands
 /// no other device can recover the store.
 #[cfg(target_arch = "wasm32")]
-pub fn spawn_publish_copy(store_contract_id: Vec<u8>, copy: harvest_common::custody::AuthorizedCopy) {
+pub fn spawn_publish_copy(
+    store_contract_id: Vec<u8>,
+    copy: harvest_common::custody::AuthorizedCopy,
+) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
         use freenet_stdlib::prelude::*;

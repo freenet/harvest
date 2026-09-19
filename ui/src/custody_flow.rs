@@ -154,11 +154,11 @@ impl AppState {
     /// wrap signature nobody asked for is dropped, and nothing about it is
     /// logged.
     pub(crate) fn on_wrap_signature(&mut self, scoped_payload: Vec<u8>, signature: Vec<u8>) {
-        let Some(store) = harvest_common::from_cbor::<ghostkey_common::ScopedPayload>(
-            &scoped_payload,
-        )
-        .ok()
-        .and_then(|scoped| custody::wrap_message_store(&scoped.payload)) else {
+        let Some(store) =
+            harvest_common::from_cbor::<ghostkey_common::ScopedPayload>(&scoped_payload)
+                .ok()
+                .and_then(|scoped| custody::wrap_message_store(&scoped.payload))
+        else {
             return;
         };
         let store = store.to_bytes();
@@ -207,7 +207,8 @@ impl AppState {
                 #[cfg(target_arch = "wasm32")]
                 crate::gateway::store_ops::spawn_publish_copy(pending.store_contract_id, copy);
                 #[cfg(not(target_arch = "wasm32"))]
-                self.copies_to_publish.push((pending.store_contract_id, copy));
+                self.copies_to_publish
+                    .push((pending.store_contract_id, copy));
             }
             Err(why) => self.notifications.push(format!(
                 "Your store's key could not be backed up to your Ghost Key: {why}. Another \
@@ -364,7 +365,10 @@ fn spawn_wrap_signature_request(fingerprint: String, store: [u8; 32]) {
         use dioxus::prelude::{ReadableExt, WritableExt};
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
-            crate::gateway::APP_STATE.write().pending_custody.remove(&store);
+            crate::gateway::APP_STATE
+                .write()
+                .pending_custody
+                .remove(&store);
         };
         let Ok(store_vk) = ed25519_dalek::VerifyingKey::from_bytes(&store) else {
             fail("not a store key".into());
@@ -384,11 +388,351 @@ fn spawn_wrap_signature_request(fingerprint: String, store: [u8; 32]) {
         };
         match ghostkey_common::to_cbor(&request) {
             Ok(payload) => {
-                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await
+                {
                     fail(format!("could not ask the vault: {e}"));
                 }
             }
             Err(e) => fail(format!("serialize SignMessage: {e}")),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backing_flow::tests::{load_backed, sign, signed_backing};
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use harvest_common::custody::{StoreKeyCopy, WrappedStoreKey};
+    use harvest_common::{HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration};
+
+    const FINGERPRINT: &str = "fp-backer";
+    const STORE: u8 = 0x71;
+    const BACKER: u8 = 0x41;
+    const ID: u8 = 1;
+
+    fn store_vk() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[STORE; 32]).verifying_key()
+    }
+
+    fn backer_vk() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[BACKER; 32]).verifying_key()
+    }
+
+    fn connect_backer(state: &mut AppState) {
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: FINGERPRINT.to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: Some(backer_vk().to_bytes().to_vec()),
+            backed_up: false,
+        });
+    }
+
+    fn register(state: &mut AppState) {
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![ID; 32],
+                reputation_contract_id: vec![ID + 1; 32],
+                mailbox_contract_id: vec![ID + 2; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_vk().to_bytes()),
+            }],
+        );
+    }
+
+    fn wrapped() -> WrappedStoreKey {
+        WrappedStoreKey {
+            scheme: custody::SCHEME_V1,
+            ciphertext: vec![0xc0; custody::WRAPPED_LEN_V1],
+        }
+    }
+
+    fn add_copy(state: &mut AppState, scope: WrapScope) {
+        let copy = StoreKeyCopy {
+            store: store_vk(),
+            backer: backer_vk(),
+            scope,
+            wrapped: wrapped(),
+        };
+        let (scoped_payload, signature) = sign(&SigningKey::from_bytes(&[STORE; 32]), &copy);
+        let authorized = AuthorizedCopy {
+            copy,
+            scoped_payload,
+            signature,
+        };
+        let loaded = state.browsing_stores.get_mut(&vec![ID; 32]).unwrap();
+        loaded
+            .backing_state
+            .copies
+            .records
+            .insert(AuthorizedCopy::slot_for(&backer_vk(), &scope), authorized);
+    }
+
+    /// A store owned by `STORE`, currently backed by `BACKER`, which is
+    /// connected to this tab.
+    fn backed_store() -> AppState {
+        let mut state = AppState::default();
+        load_backed(
+            &mut state,
+            ID,
+            STORE,
+            vec![signed_backing(STORE, BACKER, 10)],
+        );
+        connect_backer(&mut state);
+        state
+    }
+
+    fn purpose(state: &AppState) -> Option<CustodyPurpose> {
+        state.custody_needed(&[ID; 32]).map(|r| r.purpose)
+    }
+
+    /// The four cases the decision distinguishes. Mutated red by swapping the
+    /// `held` arms of the match, and by dropping the scope from `copy_for`.
+    #[test]
+    fn custody_wraps_a_held_key_and_recovers_a_lost_one() {
+        // Held, no copy: wrap.
+        let mut state = backed_store();
+        register(&mut state);
+        assert_eq!(purpose(&state), Some(CustodyPurpose::Wrap));
+        // Held, copy under the current scope: nothing to do.
+        add_copy(&mut state, WrapScope::current());
+        assert_eq!(purpose(&state), None);
+
+        // Held, copy only under an older scope: wrap again for this one.
+        let mut state = backed_store();
+        register(&mut state);
+        add_copy(&mut state, WrapScope([0xee; 32]));
+        assert_eq!(purpose(&state), Some(CustodyPurpose::Wrap));
+
+        // Not held, copy: recover it.
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        assert_eq!(purpose(&state), Some(CustodyPurpose::Recover(wrapped())));
+
+        // Not held, no copy: nothing a device can do.
+        let state = backed_store();
+        assert_eq!(purpose(&state), None);
+    }
+
+    /// Custody needs the backing Ghost Key in this tab's vault, and asks once
+    /// per (store, backer) per session. Mutated red by dropping each guard.
+    #[test]
+    fn custody_needs_the_backer_connected_and_asks_once() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.ghostkeys.clear();
+        assert_eq!(purpose(&state), None, "the backer is not connected");
+
+        connect_backer(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        assert!(state.pending_custody.contains_key(&store_vk().to_bytes()));
+        assert_eq!(purpose(&state), None, "one request at a time");
+
+        state.pending_custody.clear();
+        assert_eq!(purpose(&state), None, "a declined prompt is not re-asked");
+    }
+
+    /// A retired backing is the custody tombstone: a store whose only
+    /// backing is retired asks for nothing, even with its copy still visible
+    /// to a stale reader.
+    #[test]
+    fn a_store_with_no_current_backing_needs_no_custody() {
+        let mut state = AppState::default();
+        load_backed(&mut state, ID, STORE, Vec::new());
+        connect_backer(&mut state);
+        register(&mut state);
+        assert_eq!(purpose(&state), None);
+    }
+
+    fn wrap_sign_result() -> ghostkey_common::GhostkeyResponse {
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(
+                freenet_stdlib::prelude::ContractInstanceId::new(WrapScope::current().0),
+            ),
+            payload: custody::wrap_message(&store_vk()),
+        };
+        let scoped_payload = ghostkey_common::to_cbor(&scoped).expect("encode");
+        let signature = SigningKey::from_bytes(&[BACKER; 32])
+            .sign(&scoped_payload)
+            .to_bytes()
+            .to_vec();
+        ghostkey_common::GhostkeyResponse::SignResult {
+            scoped_payload,
+            signature,
+            certificate_pem: "CERT".to_string(),
+        }
+    }
+
+    /// The wrap signature is a secret: it goes to the Harvest delegate and
+    /// nowhere else, and never consumes a signature something else is
+    /// waiting for. Mutated red by removing the `is_wrap_message` routing in
+    /// the `SignResult` arm.
+    #[test]
+    fn a_wrap_signature_goes_to_the_delegate_and_never_to_the_signing_queue() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        state
+            .pending_signatures
+            .push_back(crate::backing_flow::tests::pending_backing_statement());
+
+        state.on_ghostkey_response(wrap_sign_result());
+
+        assert_eq!(state.pending_signatures.len(), 1, "the queue is untouched");
+        match state.custody_sent.as_slice() {
+            [HarvestDelegateRequest::WrapStoreKeyFor {
+                store_verifying_key,
+                backer_verifying_key,
+                ..
+            }] => {
+                assert_eq!(*store_verifying_key, store_vk().to_bytes());
+                assert_eq!(*backer_verifying_key, backer_vk().to_bytes());
+            }
+            other => panic!("expected one WrapStoreKeyFor, got {other:?}"),
+        }
+    }
+
+    /// A wrap signature nobody asked for is dropped, not forwarded.
+    #[test]
+    fn an_unrequested_wrap_signature_is_dropped() {
+        let mut state = backed_store();
+        state.on_ghostkey_response(wrap_sign_result());
+        assert!(state.custody_sent.is_empty());
+    }
+
+    /// The same signature on a device without the key asks the delegate to
+    /// unwrap the copy the store holds.
+    #[test]
+    fn recovery_sends_the_stores_copy_to_unwrap() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_for(&[ID; 32]);
+        state.on_ghostkey_response(wrap_sign_result());
+        match state.custody_sent.as_slice() {
+            [HarvestDelegateRequest::UnwrapStoreKey { wrapped: sent, .. }] => {
+                assert_eq!(*sent, wrapped())
+            }
+            other => panic!("expected one UnwrapStoreKey, got {other:?}"),
+        }
+    }
+
+    /// A recovered key makes the store this device's again: registered under
+    /// its backer, with its store key, its published record and the mailbox
+    /// its backer addresses. Mutated red by skipping the merge.
+    #[test]
+    fn a_recovered_store_is_registered_again() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
+            Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: FINGERPRINT.to_string(),
+                reputation_contract_id: [0x0e; 32],
+                store_name: "Bean Shop".to_string(),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            });
+        state.start_custody_for(&[ID; 32]);
+        assert_eq!(state.store_owner_key(&[ID; 32]), None);
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+
+        assert_eq!(state.store_owner_key(&[ID; 32]), Some(store_vk()));
+        let registration = &state.my_stores[FINGERPRINT][0];
+        assert_eq!(registration.reputation_contract_id, vec![0x0e; 32]);
+        let mailbox = crate::gateway::mailbox_ops::mailbox_contract_key(&backer_vk())
+            .unwrap()
+            .id()
+            .as_bytes()
+            .to_vec();
+        assert_eq!(registration.mailbox_contract_id, mailbox);
+        assert!(state.pending_custody.is_empty());
+    }
+
+    /// A failed recovery registers nothing and says so.
+    #[test]
+    fn a_failed_recovery_registers_nothing() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_for(&[ID; 32]);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Err("wrong key".into()),
+        });
+        assert!(state.my_stores.is_empty());
+        assert!(state.notifications.iter().any(|n| n.contains("wrong key")));
+    }
+
+    /// A wrapped copy is published to the store it came from.
+    #[test]
+    fn a_wrapped_copy_is_published() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        let copy = AuthorizedCopy {
+            copy: StoreKeyCopy {
+                store: store_vk(),
+                backer: backer_vk(),
+                scope: WrapScope::current(),
+                wrapped: wrapped(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+        };
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyWrapped {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(Box::new(copy.clone())),
+        });
+        assert_eq!(state.copies_to_publish, vec![(vec![ID; 32], copy)]);
+    }
+
+    fn subkeys(record: Vec<u8>) -> HarvestDelegateResponse {
+        HarvestDelegateResponse::StoreSubkeys {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [0x1b; 32],
+                record_public_key: record,
+            }),
+        }
+    }
+
+    /// A device that derives a different record key from the one the store
+    /// publishes says so; one that agrees says nothing. Mutated red by
+    /// removing the comparison.
+    #[test]
+    fn a_record_key_that_disagrees_with_the_published_one_is_reported() {
+        for (derived, warned) in [(vec![1, 2, 3], false), (vec![9, 9, 9], true)] {
+            let mut state = backed_store();
+            state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
+                Some(harvest_common::store::StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: FINGERPRINT.to_string(),
+                    reputation_contract_id: [0x0e; 32],
+                    store_name: "Bean Shop".to_string(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    record_public_key: Some(vec![1, 2, 3]),
+                });
+            state.on_delegate_response(subkeys(derived));
+            assert_eq!(
+                state
+                    .notifications
+                    .iter()
+                    .any(|n| n.contains("different record key")),
+                warned
+            );
+        }
+    }
 }

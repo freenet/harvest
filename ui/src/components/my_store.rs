@@ -944,7 +944,7 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             }
         }
 
-                dioxus::logger::tracing::info!(
+        dioxus::logger::tracing::info!(
             "Sent GetCertificate + CreateStoreKey for {fingerprint} -- store creation pending"
         );
     });
