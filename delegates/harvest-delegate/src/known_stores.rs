@@ -26,10 +26,13 @@
 //!
 //! There is deliberately no request that removes one of these. See
 //! `HarvestDelegateRequest::SetStoreArchived` for why the operation a buyer
-//! is offered is "archive". Held structurally: every function here is
-//! generic over `SecretStore` alone, which has no removal, so deleting a
-//! record would need a new bound -- and `tests::nothing_here_can_delete_a_record`
-//! stops compiling with one.
+//! is offered is "archive". Held structurally, but only this far: every
+//! function in THIS module is generic over `SecretStore` alone, which has no
+//! removal, so one of them deleting a record would need a new bound, and
+//! `tests::nothing_here_can_delete_a_record` stops compiling for any function
+//! it calls that gains one. It does not cover the rest of the crate: the
+//! handlers hold `RemovableSecrets`, and nothing stops code there from
+//! removing a `harvest:known_store:` key directly.
 //!
 //! # One list per node, not per Ghost Key
 //!

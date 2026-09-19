@@ -53,6 +53,18 @@ pub fn StoreView() -> Element {
     }
 }
 
+/// Whether a pasted link names a store the old way, from its fragment or
+/// query string: the same check a followed link gets.
+fn typed_is_old_format_link(typed: &str) -> bool {
+    let typed = typed.trim();
+    let fragment = typed.split_once('#').map(|(_, f)| f);
+    let query = typed
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or(q));
+    fragment.is_some_and(crate::store_link::is_old_format_link)
+        || query.is_some_and(crate::store_link::is_old_format_link)
+}
+
 /// The stores this node has visited, a way to open one by its code, and
 /// archiving (harvest#52).
 ///
@@ -81,11 +93,13 @@ fn StoreList() -> Element {
             typed.set(String::new());
             crate::store_link::open_store(params);
         }
-        None => typed_error.set(Some(
+        None => typed_error.set(Some(if typed_is_old_format_link(&typed()) {
+            crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string()
+        } else {
             "That is not a store code. A store code is 16 letters and digits, the part of a \
              store link after \"store=\"."
-                .to_string(),
-        )),
+                .to_string()
+        })),
     };
 
     rsx! {
@@ -663,5 +677,22 @@ mod listing_buy_gate_tests {
             for_listing(&bad).is_none(),
             "and one whose certificate is not this seller's is not"
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_link_tests {
+    use super::typed_is_old_format_link;
+
+    /// A pasted pre-#52 link gets the old-format notice, like a followed one.
+    #[test]
+    fn a_pasted_old_link_is_recognised() {
+        let old = bs58::encode([5u8; 32]).into_string();
+        assert!(typed_is_old_format_link(&format!(
+            "http://127.0.0.1:7509/v1/contract/web/x/#store={old}"
+        )));
+        assert!(typed_is_old_format_link(&format!(" ?store={old}\n")));
+        assert!(!typed_is_old_format_link("3Bn8xWqLd6Tz9Kf"));
+        assert!(!typed_is_old_format_link(&old), "a bare id is not a link");
     }
 }

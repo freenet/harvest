@@ -866,7 +866,7 @@ mod tests {
 
     /// Two signing keys whose verifying keys share a two-character code, the
     /// lower-ranked first. `harvest-common`'s `claim_tests` explain why two
-    /// characters stand in for twelve; the contract accepts a code of any
+    /// characters stand in for sixteen; the contract accepts a code of any
     /// length, which is what makes this reachable at all.
     fn two_keys_sharing_a_code() -> (SigningKey, SigningKey, String) {
         let mut seen: HashMap<String, SigningKey> = HashMap::new();

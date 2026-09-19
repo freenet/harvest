@@ -1754,16 +1754,17 @@ impl AppState {
     }
 
     /// What to ask the harvest delegate once it is registered: remember
-    /// whatever was opened before it existed, or, if nothing was, just list
-    /// what it holds. Either answer is the whole list.
+    /// whatever was opened before it existed, then list what it holds.
+    ///
+    /// The list request comes last even though a successful remember answers
+    /// with the whole list: a remember that is refused answers with an error
+    /// instead, and without the list the store list would stay on "still
+    /// asking" for the rest of the session.
     pub fn remembered_store_requests(&mut self) -> Vec<harvest_common::HarvestDelegateRequest> {
-        let queued = std::mem::take(&mut self.stores_to_remember);
-        if queued.is_empty() {
-            return vec![harvest_common::HarvestDelegateRequest::ListRememberedStores];
-        }
-        queued
+        std::mem::take(&mut self.stores_to_remember)
             .into_iter()
             .map(|store_code| harvest_common::HarvestDelegateRequest::RememberStore { store_code })
+            .chain([harvest_common::HarvestDelegateRequest::ListRememberedStores])
             .collect()
     }
 
@@ -17913,9 +17914,13 @@ mod store_code_tests {
         ));
         assert_eq!(
             state.remembered_store_requests(),
-            vec![harvest_common::HarvestDelegateRequest::RememberStore {
-                store_code: "3Bn8xWqLd6Tz9Kf2".to_string()
-            }]
+            vec![
+                harvest_common::HarvestDelegateRequest::RememberStore {
+                    store_code: "3Bn8xWqLd6Tz9Kf2".to_string()
+                },
+                // Last, so a refused remember still leaves the list answered.
+                harvest_common::HarvestDelegateRequest::ListRememberedStores,
+            ]
         );
         assert!(
             state.stores_to_remember.is_empty(),

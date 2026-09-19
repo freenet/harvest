@@ -910,6 +910,27 @@ fn each_store_generation_is_derived_under_the_encoding_it_shipped_with() {
     );
 }
 
+/// **The whole-key encoding, as literal bytes.** V1 and V6..=V16 live at
+/// addresses derived from exactly these bytes for the key of seed `[1; 32]`,
+/// taken from `main` before harvest#52 (the parameters `main`'s
+/// `StoreParameters::new` produced). Every other test here rebuilds the
+/// bytes through the same serde path as the code under test, so a
+/// dependency change to how a `VerifyingKey` or a struct encodes would move
+/// both sides together and pass; this one would not.
+#[test]
+fn the_whole_key_encoding_is_the_bytes_main_published_under() {
+    const MAIN_SEED_1_PARAMS: &str = "a17473656c6c65725f766572696679696e675f6b657958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+    let vk = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+    assert_eq!(
+        hex::encode(whole_key_store_params_cbor(&vk).expect("encode").as_ref()),
+        MAIN_SEED_1_PARAMS
+    );
+    assert_eq!(
+        hex::encode(whole_key_store_param_bytes(&vk)),
+        MAIN_SEED_1_PARAMS
+    );
+}
+
 /// `migrate`'s address arithmetic agrees with the one the NODE uses.
 ///
 /// Everything in this module derives instance ids with
@@ -1126,14 +1147,6 @@ fn a_populated_predecessor_is_recovered_and_seals() {
     assert_eq!(seal, Seal::Seal);
 }
 
-/// **harvest#52, end to end.** A seller's store at V16 -- addressed by the
-/// whole key, its state naming no owner -- is found at the address the
-/// whole-key encoding derives, and carried into a state the CODE-addressed
-/// contract accepts, owned by that seller.
-///
-/// Both halves are needed, and each fails silently without the other: probed
-/// under today's code parameters the V16 address is one it never had, and
-/// carried without an owner every record is refused by the new contract.
 /// **The owner fill-in never reassigns a store.** A local snapshot owned by
 /// a DIFFERENT key (the case where another key holds the seller's address)
 /// is merged with the seller's whole-key predecessor. The fill-in names the
@@ -1142,7 +1155,13 @@ fn a_populated_predecessor_is_recovered_and_seals() {
 /// decides between the two owners by the contract's own rule.
 ///
 /// Mutated red by dropping the `is_none()` guard in `name_whole_key_owner`,
-/// which the review found survived every other test.
+/// which the review found survived every other test. It is the FIRST
+/// assertion, the direct call, that kills that mutation. The merge half below
+/// passes either way (with the guard gone the snapshot is renamed to the
+/// seller and then refused by its signatures instead of by its owner), and
+/// is kept because it pins what the fold does with such a snapshot, not
+/// because it guards the fill-in. Do not trim the first assertion as
+/// redundant with it.
 #[test]
 fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     let other = SigningKey::from_bytes(&[0x3cu8; 32]);
@@ -1217,6 +1236,14 @@ fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     assert!(lost[0].contains("could not be merged"), "{}", lost[0]);
 }
 
+/// **harvest#52, end to end.** A seller's store at V16 -- addressed by the
+/// whole key, its state naming no owner -- is found at the address the
+/// whole-key encoding derives, and carried into a state the CODE-addressed
+/// contract accepts, owned by that seller.
+///
+/// Both halves are needed, and each fails silently without the other: probed
+/// under today's code parameters the V16 address is one it never had, and
+/// carried without an owner every record is refused by the new contract.
 #[test]
 fn a_whole_key_store_is_found_and_carried_into_the_code_addressed_contract() {
     use freenet_scaffold::ComposableState;
