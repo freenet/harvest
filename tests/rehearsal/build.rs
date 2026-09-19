@@ -18,6 +18,11 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
         "legacy_mailbox_contract.rs",
         "LEGACY_MAILBOX_CONTRACT",
     ),
+    (
+        "index_contract.toml",
+        "legacy_index_contract.rs",
+        "LEGACY_INDEX_CONTRACT",
+    ),
 ];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (

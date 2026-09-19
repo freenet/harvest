@@ -56,8 +56,9 @@ done
 # The four artifacts whose compiled bytes are network addresses. Keep in step
 # with the workspace members under contracts/ and delegates/; a crate missing
 # from this list is a crate the drift guard does not watch.
-crates=(reputation-contract store-contract mailbox-contract harvest-delegate)
-artifacts=(reputation_contract store_contract mailbox_contract harvest_delegate)
+crates=(reputation-contract store-contract mailbox-contract index-contract harvest-delegate)
+artifacts=(reputation_contract store_contract mailbox_contract index_contract harvest_delegate)
+crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract delegates/harvest-delegate)
 
 # `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
 # freenet/ghostkeys, not built here, so nothing in this workspace can move it.
@@ -85,6 +86,23 @@ export RUSTFLAGS="\
 ${RUSTFLAGS:-}"
 
 cd "$workspace"
+
+# HARVEST_ALLOW_MISSING_CRATES=1 is for ONE caller: the drift guard building
+# the merge base with THIS branch's script, where an artifact this branch
+# introduces (the Ghost Key index, harvest#93 phase 1c) does not exist yet.
+# The comparison then reports that artifact as new rather than silently
+# passing it. Anywhere else a missing crate is an error.
+if [ "${HARVEST_ALLOW_MISSING_CRATES:-0}" = "1" ]; then
+  keep_crates=(); keep_artifacts=()
+  for i in "${!crates[@]}"; do
+    if [ -d "$workspace/${crate_dirs[$i]}" ]; then
+      keep_crates+=("${crates[$i]}"); keep_artifacts+=("${artifacts[$i]}")
+    else
+      echo "warning: ${crate_dirs[$i]} is absent here; not building ${artifacts[$i]}" >&2
+    fi
+  done
+  crates=("${keep_crates[@]}"); artifacts=("${keep_artifacts[@]}")
+fi
 
 # One invocation for all four. This is NOT cosmetic: cargo unifies features
 # across the packages it is asked to build in a single invocation, so building

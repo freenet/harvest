@@ -212,7 +212,7 @@ jobs:
             echo "| artifact | committed | rebuilt | |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
+          for a in reputation_contract store_contract mailbox_contract index_contract harvest_delegate; do
             committed="ui/public/contracts/$a.wasm"
             built="target/wasm32-unknown-unknown/release/$a.wasm"
             # A missing file is a failure, never a silent skip -- an artifact

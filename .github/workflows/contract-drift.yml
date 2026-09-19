@@ -256,7 +256,9 @@ jobs:
             export HARVEST_ALLOW_UNLOCKED=1
           fi
 
-          ( cd "$base_dir" && ./scripts/build-contract-wasm.sh | tee /tmp/base.log )
+          # An artifact this branch introduces has no crate at the base; build
+          # what is there and let the comparison report the new one.
+          ( cd "$base_dir" && HARVEST_ALLOW_MISSING_CRATES=1 ./scripts/build-contract-wasm.sh | tee /tmp/base.log )
           mkdir -p /tmp/base
           cp "$base_dir/target/wasm32-unknown-unknown/release/"*.wasm /tmp/base/
 
@@ -316,10 +318,19 @@ jobs:
             echo "|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          for a in reputation_contract store_contract mailbox_contract harvest_delegate; do
+          for a in reputation_contract store_contract mailbox_contract index_contract harvest_delegate; do
             # Missing on either side is a failure, never a silent skip: a
             # renamed or dropped artifact would otherwise pass this job by
             # having nothing to compare.
+            # New in this PR: nothing at the base to compare, which is a new
+            # address rather than a moved one. Still needs the label, so it
+            # is seen.
+            if [ ! -f "/tmp/base/$a.wasm" ] && [ -f "/tmp/head/$a.wasm" ]; then
+              echo "::error::$a is NEW in this PR (no artifact at the merge base); label this PR contract-rekey-acknowledged if intended"
+              echo "| \`$a\` | — | new | — | — | :new: **NEW** |" >> "$GITHUB_STEP_SUMMARY"
+              moved=1
+              continue
+            fi
             if [ ! -f "/tmp/base/$a.wasm" ] || [ ! -f "/tmp/head/$a.wasm" ]; then
               echo "::error::$a.wasm is missing from one side of the comparison"
               echo "| \`$a\` | — | — | — | — | :x: missing |" >> "$GITHUB_STEP_SUMMARY"

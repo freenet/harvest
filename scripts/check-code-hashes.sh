@@ -65,6 +65,7 @@ pairs=(
   "store_contract:legacy/store_contract.toml"
   "reputation_contract:legacy/reputation_contract.toml"
   "mailbox_contract:legacy/mailbox_contract.toml"
+  "index_contract:legacy/index_contract.toml"
   "harvest_delegate:legacy/harvest_delegate.toml"
 )
 

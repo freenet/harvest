@@ -1,0 +1,22 @@
+# Superseded generations of the Harvest Ghost Key index contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# NO ROWS YET, deliberately. The index is new in harvest#93 phase 1c: no
+# generation of it was ever published before this one, so there is nothing to
+# probe. `ui/build.rs` lists this file in `MAY_BE_EMPTY` for that reason
+# alone. The change that first supersedes the current generation must append
+# its code hash here, and remove this file from `MAY_BE_EMPTY` in the same
+# change, so an empty registry can never again pass for a complete one.
+#
+# Instance ids are derived per Ghost Key: `BLAKE3(code_hash || cbor(
+# IndexParameters))`, whose single field is the Ghost Key's verifying key, so
+# every generation is derivable from the Ghost Key alone.
+#
+# The state is a map from store key to the Ghost Key's signed backing
+# statement for that store, grow-only, the smaller encoding on a clash,
+# bounded to the smallest `MAX_INDEX_ENTRIES` store keys. Any valid state of
+# one generation is a valid state of the next while `IndexEntry` and
+# `BackingStatement` keep their shapes, so a fold is plain data transfer.
