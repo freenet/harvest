@@ -60,29 +60,38 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::listing::verify_scoped_signature;
 use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 
-/// How many backings one store will hold.
+/// How many backings one store holds.
 ///
-/// A backing needs a Ghost Key's signature, and a Ghost Key costs a donation,
-/// so only a seller who has bought this many keys can reach it. It bounds the
-/// state rather than anybody's behaviour: each backing carries a certificate
-/// (see [`MAX_CERTIFICATE_PEM_BYTES`]).
+/// It bounds the state: each backing carries a certificate of up to
+/// [`MAX_CERTIFICATE_PEM_BYTES`]. The contract does not check certificates,
+/// so any Ed25519 key can sign a backing statement, and whoever holds the
+/// store key can reach this bound for free. Nobody else can: every backing
+/// needs the store key's acceptance.
 ///
-/// # What happens past it
+/// # What happens past it: a total merge (harvest#93 review, Must Fix 1)
 ///
-/// `verify` refuses a state holding more, and `apply_delta` refuses a delta
-/// that would take a store past it. So the merge is not total beyond the cap:
-/// two replicas each holding a different full set would refuse each other.
-/// Only the store key can accept a backing, so only the seller can get there,
-/// and only by attaching more than this many Ghost Keys on two replicas
-/// before they converge. Dropping entries instead would make it total, at the
-/// price of the one property this set exists for: that no backing is ever
-/// removed. See `docs/untested-invariants.md`.
+/// Two replicas can each hold [`MAX_BACKINGS`] backings whose union holds
+/// more. The merge must still succeed, deterministically, and it must not
+/// carry anything else in the same update down with it. So the store keeps
+/// the [`MAX_BACKINGS`] backings whose Ghost Keys are SMALLEST by bytes and
+/// drops the rest ([`StoreStateV1::normalize_backings`]), and a retirement
+/// is kept exactly when its backing is.
+///
+/// Why this ranking: it depends on the slot (the Ghost Key) alone, never on
+/// which of two records for that slot a replica holds, so a merge cannot
+/// change a slot's rank. Top-N over a ranking the per-slot merge cannot
+/// change is associative, commutative and idempotent: a slot cut from one
+/// side ranks below that side's N-th slot, so it ranks below the N-th slot
+/// of any union containing that side and is cut again, whichever version of
+/// it returns. This is the argument `store::enforce_order_cap` rests on.
+///
+/// What it costs: past the bound, history is dropped (a backing, and with it
+/// its retirement). A dropped slot never returns to a replica that dropped
+/// it, so nothing is ever UN-retired; see
+/// [`StoreStateV1::normalize_backings`]. Only the store key's holder can get
+/// here, and a store whose key is in the wrong hands is closed, which this
+/// bound never touches: the closed flag is its own part of the state.
 pub const MAX_BACKINGS: usize = 64;
-
-/// How many retirements one store will hold. Same bound, same reasoning as
-/// [`MAX_BACKINGS`]: a retirement is signed by the store key alone, so only
-/// the seller can add one.
-pub const MAX_RETIREMENTS: usize = 64;
 
 /// The largest certificate a backing may carry, in bytes of PEM text.
 ///
@@ -116,10 +125,14 @@ pub struct BackingStatement {
     /// Which chain `block` is on. A block reference without its network is
     /// ambiguous: the heights of two chains overlap.
     pub network: BitcoinNetwork,
-    /// A recent Bitcoin block, chosen when the backing was made. It proves
-    /// the statement was written after that block, and it is what readers
-    /// order backings by (see [`current_backing`]). The same kind of
-    /// reference an order's anchor and a complaint carry.
+    /// A recent Bitcoin block, chosen when the backing was made: what readers
+    /// order backings by (see [`current_backing`]), and the same kind of
+    /// reference an order's anchor and a complaint carry. Readers check its
+    /// HEIGHT against their tip (a backing dated past it is not current yet);
+    /// phase 1a does not check the hash, which is carried so a reader can
+    /// check it against the tip contract's retained window later, the way an
+    /// order's anchor is checked. Until then it does not prove when the
+    /// backing was written.
     pub block: BlockAnchor,
 }
 
@@ -186,7 +199,10 @@ impl AuthorizedBacking {
 /// The store key's statement that a Ghost Key no longer backs the store.
 ///
 /// Per backing KEY, not per backing record, and permanent: a Ghost Key
-/// retired from a store can never back it again. That is what phase 1b's
+/// retired from a store can never back it again. It must name a Ghost Key the
+/// store holds a backing for (`StoreStateV1::verify`), so a store never holds
+/// more retirements than backings, and a retirement is kept exactly as long
+/// as its backing is (`StoreStateV1::normalize_backings`). That is what phase 1b's
 /// custody needs from it -- the same retirement is the tombstone that stops
 /// the retired key recovering the store key from state -- and one signed act
 /// cannot then have two effects that drift apart (section 6.3, check 4).
@@ -255,8 +271,6 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String>;
     /// What a verify error calls this kind of record.
     const WHAT: &'static str;
-    /// How many slots one store may fill.
-    const CAP: usize;
 }
 
 impl SignedRecord for AuthorizedBacking {
@@ -267,7 +281,6 @@ impl SignedRecord for AuthorizedBacking {
         self.verify(owner)
     }
     const WHAT: &'static str = "backing";
-    const CAP: usize = MAX_BACKINGS;
 }
 
 impl SignedRecord for AuthorizedRetirement {
@@ -278,7 +291,6 @@ impl SignedRecord for AuthorizedRetirement {
         self.verify(owner)
     }
     const WHAT: &'static str = "retirement";
-    const CAP: usize = MAX_RETIREMENTS;
 }
 
 impl SignedRecord for AuthorizedClosure {
@@ -288,10 +300,9 @@ impl SignedRecord for AuthorizedClosure {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    // `verify` requires the closure to name the owner and to sit in its own
+    // slot, so a store holds at most one: there is no bound to exceed.
     const WHAT: &'static str = "closure";
-    // `verify` requires the closure to name the owner, so only one slot can
-    // ever be filled; the cap only has to be at least that.
-    const CAP: usize = 1;
 }
 
 /// The CBOR bytes of a record, which is what two records for one slot are
@@ -310,11 +321,17 @@ fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
 /// one whose CBOR encoding is SMALLER, the same rule and for the same reason
 /// as `store::merge_order`'s equal-rank tie-break: it is a pure function of
 /// content, so every replica holding both picks the same one, and it rewards
-/// nobody for stapling bytes onto a genuine record. A per-slot minimum over a
-/// total order, united over slots, is idempotent, commutative and associative,
-/// which the seeded tests in `store::backing_tests` check on bytes.
+/// nobody for stapling bytes onto a genuine record. Note what that means: on
+/// a clash the SMALLER encoding wins, not the newer record; a signer who
+/// signs twice for one slot does not choose which one stays. A per-slot
+/// minimum over a total order, united over slots, is idempotent, commutative
+/// and associative, which the seeded tests in `backing::tests` check on
+/// bytes.
 ///
-/// No path removes a slot. That is the property the set exists for.
+/// Nothing in this type removes a slot. The one bound on the store's
+/// backings, and the rule that a retirement needs its backing, are applied
+/// over the whole store by `StoreStateV1::normalize_backings`; see
+/// [`MAX_BACKINGS`] for why that keeps every merge total.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
 pub struct SignedSetV1<T> {
@@ -361,14 +378,6 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        if self.records.len() > T::CAP {
-            return Err(format!(
-                "store holds {} {} records, the most it may hold is {}",
-                self.records.len(),
-                T::WHAT,
-                T::CAP
-            ));
-        }
         if self.records.is_empty() {
             return Ok(());
         }
@@ -448,14 +457,10 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         for record in incoming {
             next.merge_record(record.clone());
         }
-        if next.records.len() > T::CAP {
-            return Err(format!(
-                "this update would take the store to {} {} records, the most it may hold is {}",
-                next.records.len(),
-                T::WHAT,
-                T::CAP
-            ));
-        }
+        // No bound is applied here. The bound on backings, and the rule that
+        // a retirement needs its backing, are about the store as a whole, so
+        // `StoreStateV1::normalize_backings` applies them after every part
+        // has been merged; see [`MAX_BACKINGS`].
         *self = next;
         Ok(())
     }
@@ -511,22 +516,33 @@ pub fn current_backing(
     state: &StoreStateV1,
     tip_height: impl Fn(BitcoinNetwork) -> Option<u32>,
 ) -> Option<&AuthorizedBacking> {
-    state
-        .backings
-        .records
-        .iter()
-        .filter(|(slot, _)| !state.retirements.records.contains_key(*slot))
-        .map(|(_, backing)| backing)
-        .filter(|backing| {
-            tip_height(backing.statement.network)
-                .is_none_or(|tip| backing.statement.block.height <= tip)
-        })
-        .max_by_key(|backing| {
-            (
-                backing.statement.block.height,
-                backing.statement.backer.to_bytes(),
-            )
-        })
+    most_recent(
+        state
+            .backings
+            .records
+            .iter()
+            .filter(|(slot, _)| !state.retirements.records.contains_key(*slot))
+            .map(|(_, backing)| backing)
+            .filter(|backing| {
+                tip_height(backing.statement.network)
+                    .is_none_or(|tip| backing.statement.block.height <= tip)
+            }),
+    )
+}
+
+/// The most recent of `candidates`: highest block height, then largest
+/// backing key. A total order, so the answer does not depend on the order the
+/// candidates come in (pinned by
+/// `tests::the_most_recent_backing_does_not_depend_on_the_order_given`).
+fn most_recent<'a>(
+    candidates: impl Iterator<Item = &'a AuthorizedBacking>,
+) -> Option<&'a AuthorizedBacking> {
+    candidates.max_by_key(|backing| {
+        (
+            backing.statement.block.height,
+            backing.statement.backer.to_bytes(),
+        )
+    })
 }
 
 /// Whether the store has closed. See [`StoreClosure`].
@@ -1000,33 +1016,175 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_store_past_the_backing_cap_is_refused() {
-        let many: Vec<AuthorizedBacking> = (0..=MAX_BACKINGS as u32)
+    fn many_backings(n: usize) -> Vec<AuthorizedBacking> {
+        (0..n as u32)
             .map(|i| {
                 let mut seed = [0u8; 32];
                 seed[..4].copy_from_slice(&(i + 1000).to_le_bytes());
-                backing(&SigningKey::from_bytes(&seed), 100)
+                backing(&SigningKey::from_bytes(&seed), 100 + i)
             })
-            .collect();
-        // `apply_delta` itself refuses, not only the `verify` after it: the
-        // contract's `update_state` encodes what `apply_delta` produced.
+            .collect()
+    }
+
+    /// Past the bound the merge still succeeds (harvest#93 review, Must Fix
+    /// 1): it keeps the `MAX_BACKINGS` smallest Ghost Keys, and everything
+    /// else in the same update lands, the closed flag included.
+    ///
+    /// Mutated red by making `normalize_backings` keep the LARGEST keys, and
+    /// by skipping it.
+    #[test]
+    fn a_union_past_the_bound_keeps_the_smallest_keys_and_everything_else() {
+        let many = many_backings(MAX_BACKINGS + 3);
         let mut next = StoreStateV1::default();
-        let err = next
-            .apply_delta(
-                &StoreStateV1::default(),
-                &params(),
-                &Some(delta_with(many.clone(), vec![], vec![])),
-            )
-            .expect_err("one past the cap");
-        assert!(err.contains("most it may hold"), "{err}");
-        // And a state built past it directly does not verify.
-        let mut state = with(many[..MAX_BACKINGS].to_vec(), vec![]);
-        state
-            .backings
-            .records
-            .insert(many[MAX_BACKINGS].slot(), many[MAX_BACKINGS].clone());
+        next.apply_delta(
+            &StoreStateV1::default(),
+            &params(),
+            &Some(delta_with(
+                many.clone(),
+                vec![],
+                vec![closure_by(&store_key(), &store_key())],
+            )),
+        )
+        .expect("a merge past the bound never fails");
+        next.verify(&next, &params())
+            .expect("and yields a valid state");
+        assert_eq!(next.backings.records.len(), MAX_BACKINGS);
+        assert!(is_closed(&next), "the closure in the same update landed");
+        let mut slots: Vec<Bytes32> = many.iter().map(|b| b.slot()).collect();
+        slots.sort();
+        let kept: Vec<Bytes32> = next.backings.records.keys().copied().collect();
+        assert_eq!(kept, slots[..MAX_BACKINGS].to_vec(), "the smallest keys");
+
+        // A state built past it directly does not verify.
+        let mut state = next.clone();
+        let largest = many
+            .iter()
+            .find(|b| b.slot() == slots[MAX_BACKINGS])
+            .unwrap()
+            .clone();
+        state.backings.records.insert(largest.slot(), largest);
         assert!(state.verify(&state, &params()).is_err());
+    }
+
+    /// A retirement must name a backing the store holds, so a store never
+    /// holds more retirements than backings. Mutated red by removing the
+    /// check from `StoreStateV1::verify`.
+    #[test]
+    fn a_retirement_of_a_key_that_does_not_back_the_store_is_refused() {
+        let mut state = with(vec![backing(&ghost(1), 100)], vec![]);
+        let orphan = retirement(&ghost(2));
+        state.retirements.records.insert(orphan.slot(), orphan);
+        let err = state
+            .verify(&state, &params())
+            .expect_err("an orphan retirement");
+        assert!(err.contains("does not back this store"), "{err}");
+    }
+
+    /// A retirement is dropped exactly when its backing is cut, and a
+    /// backing once cut never comes back UN-retired: whatever a later merge
+    /// brings, the slot still ranks below the kept ones.
+    ///
+    /// Mutated red by keeping retirements whose backing was cut.
+    #[test]
+    fn a_cut_backing_takes_its_retirement_and_never_returns_unretired() {
+        let many = many_backings(MAX_BACKINGS + 1);
+        let mut slots: Vec<Bytes32> = many.iter().map(|b| b.slot()).collect();
+        slots.sort();
+        let by_slot = |slot: Bytes32| many.iter().find(|b| b.slot() == slot).unwrap().clone();
+        let largest = by_slot(slots[MAX_BACKINGS]);
+        let largest_key = largest.statement.backer;
+        let retire_largest = {
+            let retirement = Retirement {
+                backer: largest_key,
+            };
+            let (scoped_payload, signature) = store_sign(&store_key(), &retirement);
+            AuthorizedRetirement {
+                retirement,
+                scoped_payload,
+                signature,
+            }
+        };
+
+        // One replica holds the largest backing, retired, and a few others.
+        let a = apply(
+            &StoreStateV1::default(),
+            delta_with(
+                vec![largest.clone(), by_slot(slots[0])],
+                vec![retire_largest],
+                vec![],
+            ),
+        )
+        .unwrap();
+        // Another holds the full smallest set.
+        let b = with(
+            slots[..MAX_BACKINGS].iter().map(|s| by_slot(*s)).collect(),
+            vec![],
+        );
+        // A third holds the largest backing, NOT retired.
+        let c = with(vec![largest.clone()], vec![]);
+
+        let mut ab = a.clone();
+        ab.merge(&a.clone(), &params(), &b).unwrap();
+        assert!(!ab.backings.records.contains_key(&largest.slot()));
+        assert!(
+            ab.retirements.records.is_empty(),
+            "the retirement went with it"
+        );
+
+        let mut abc = ab.clone();
+        abc.merge(&ab.clone(), &params(), &c).unwrap();
+        assert!(
+            !abc.backings.records.contains_key(&largest.slot()),
+            "a cut backing does not come back, retired or not"
+        );
+        abc.verify(&abc, &params()).unwrap();
+    }
+
+    /// The certificate bound is inclusive: exactly `MAX_CERTIFICATE_PEM_BYTES`
+    /// is accepted. Mutated red by turning `>` into `>=`.
+    #[test]
+    fn a_certificate_of_exactly_the_bound_is_accepted() {
+        let mut statement = statement(&store_key(), &ghost(1), 100);
+        statement.certificate_pem = "x".repeat(MAX_CERTIFICATE_PEM_BYTES);
+        let (backer_scoped_payload, backer_signature) = vault_sign(&ghost(1), &statement);
+        let (acceptance_scoped_payload, acceptance_signature) = store_sign(
+            &store_key(),
+            &BackingAcceptance {
+                backing: statement.clone(),
+            },
+        );
+        let at_bound = AuthorizedBacking {
+            statement,
+            backer_scoped_payload,
+            backer_signature,
+            acceptance_scoped_payload,
+            acceptance_signature,
+        };
+        apply(
+            &StoreStateV1::default(),
+            delta_with(vec![at_bound], vec![], vec![]),
+        )
+        .expect("the bound itself is allowed");
+    }
+
+    /// The tie-break is part of the key, not an accident of map order: the
+    /// same candidates in either order give the same answer. Mutated red by
+    /// dropping the backing key from `most_recent`'s key.
+    #[test]
+    fn the_most_recent_backing_does_not_depend_on_the_order_given() {
+        let a = backing(&ghost(3), 300);
+        let b = backing(&ghost(4), 300);
+        let expected = if a.statement.backer.to_bytes() > b.statement.backer.to_bytes() {
+            a.statement.backer
+        } else {
+            b.statement.backer
+        };
+        for order in [[&a, &b], [&b, &a]] {
+            assert_eq!(
+                most_recent(order.into_iter()).unwrap().statement.backer,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1066,11 +1224,7 @@ mod tests {
             backing(&ghost(3), 300),
             backing(&ghost(4), 300),
         ];
-        let retirements = vec![
-            retirement(&ghost(1)),
-            retirement(&ghost(3)),
-            retirement(&ghost(8)),
-        ];
+        let retirements = vec![retirement(&ghost(1)), retirement(&ghost(3))];
         let closure = closure_by(&store_key(), &store_key());
 
         let mut rng = Rng::new(0x1a_ba_c1);
@@ -1083,7 +1237,10 @@ mod tests {
             } else {
                 vec![]
             };
-            if b.is_empty() && r.is_empty() && c.is_empty() {
+            // Always at least one backing, so the update claims the store
+            // even when its retirements name keys it does not back (which
+            // `normalize_backings` then drops).
+            if b.is_empty() {
                 b.push(backings[rng.below(backings.len())].clone());
             }
             states.push(
@@ -1126,6 +1283,98 @@ mod tests {
                 assert!(!is_closed(side) || is_closed(&merged));
             }
         }
+    }
+
+    /// The merge laws where it matters most: unions that exceed the bound.
+    /// Random stores over a pool of `MAX_BACKINGS + 8` backings, with
+    /// retirements, the closed flag and a listing, merged in every grouping;
+    /// every merge must succeed, verify, and carry the closure and listings
+    /// of either side (harvest#93 review, Must Fix 1).
+    #[test]
+    fn seeded_merges_past_the_bound_obey_the_merge_laws_and_drop_nothing_else() {
+        use crate::merge_laws::{assert_laws, Rng};
+        let pool = many_backings(MAX_BACKINGS + 8);
+        let retirements: Vec<AuthorizedRetirement> = pool
+            .iter()
+            .step_by(5)
+            .map(|b| {
+                let retirement = Retirement {
+                    backer: b.statement.backer,
+                };
+                let (scoped_payload, signature) = store_sign(&store_key(), &retirement);
+                AuthorizedRetirement {
+                    retirement,
+                    scoped_payload,
+                    signature,
+                }
+            })
+            .collect();
+        let closure = closure_by(&store_key(), &store_key());
+        let listing = {
+            let listing = crate::listing::Listing {
+                id: crate::listing::ListingId([0; 32]),
+                title: "Beans".into(),
+                description: String::new(),
+                kind: crate::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id();
+            let (scoped_payload, signature) = store_sign(&store_key(), &listing);
+            crate::listing::AuthorizedListing {
+                listing,
+                scoped_payload,
+                signature,
+                certificate_pem: String::new(),
+            }
+        };
+
+        let mut rng = Rng::new(0x0ca9_5eed);
+        let mut states = Vec::new();
+        for _ in 0..24 {
+            let mut b: Vec<AuthorizedBacking> =
+                pool.iter().filter(|_| rng.below(4) != 0).cloned().collect();
+            if b.is_empty() {
+                b.push(pool[0].clone());
+            }
+            let r = rng.subset(&retirements, 6);
+            let c = if rng.below(3) == 0 {
+                vec![closure.clone()]
+            } else {
+                vec![]
+            };
+            let mut delta = delta_with(b, r, c);
+            if rng.below(3) == 0 {
+                delta.listings = Some(vec![listing.clone()]);
+            }
+            states.push(apply(&StoreStateV1::default(), delta).expect("generated state"));
+        }
+        assert!(states
+            .iter()
+            .any(|s| s.backings.records.len() == MAX_BACKINGS));
+        let merge = |a: &StoreStateV1, b: &StoreStateV1| {
+            let mut merged = a.clone();
+            merged
+                .merge(&a.clone(), &params(), b)
+                .expect("a merge of valid states never fails");
+            merged
+                .verify(&merged, &params())
+                .expect("and yields a valid state");
+            for side in [a, b] {
+                assert!(
+                    !is_closed(side) || is_closed(&merged),
+                    "a closure was dropped"
+                );
+                assert!(
+                    side.listings.listings.len() <= merged.listings.listings.len(),
+                    "a listing was dropped"
+                );
+            }
+            merged
+        };
+        assert_laws(&states, 150, &mut rng, merge, |s| {
+            crate::to_cbor(s).unwrap()
+        });
     }
 
     #[test]

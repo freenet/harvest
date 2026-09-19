@@ -88,6 +88,62 @@ fn export_scope() -> ExportScope {
     ExportScope::Prefix(SECRET_KEY_PREFIX.to_vec())
 }
 
+/// The secret store as an export sees it: everything but the store keys.
+///
+/// A store key signs for a whole store (harvest#93), and handing its seed to
+/// a successor generation would be the one place it leaves this delegate.
+/// Phase 1b recovers store keys from their wrapped copies in store state
+/// instead, so nothing needs it exported. `freenet-migrate` scopes an export
+/// by prefix only, and store keys share Harvest's prefix, so they are hidden
+/// here: absent from every listing and unreadable, which is exactly what the
+/// export can reach.
+struct WithoutStoreKeys<'a, S>(&'a S);
+
+fn is_store_key(key: &[u8]) -> bool {
+    key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
+}
+
+impl<S: SecretStore> SecretStore for WithoutStoreKeys<'_, S> {
+    fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let mut keys = self.0.list_secrets(prefix);
+        keys.retain(|key| !is_store_key(key));
+        keys
+    }
+
+    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if is_store_key(key) {
+            return None;
+        }
+        self.0.get_secret(key)
+    }
+
+    fn has_secret(&self, key: &[u8]) -> bool {
+        !is_store_key(key) && self.0.has_secret(key)
+    }
+
+    fn set_secret(&mut self, _key: &[u8], _value: &[u8]) -> bool {
+        false
+    }
+}
+
+/// Export this generation's secrets to `origin`, if it may have them. The one
+/// path an export takes, so the tests drive exactly what `handle` does.
+fn export<S: SecretStore>(
+    store: &S,
+    origin: Option<&MessageOrigin>,
+    source_generation: u32,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let policy = origin_policy()?;
+    freenet_migrate::handle_export_request(
+        &WithoutStoreKeys(store),
+        origin,
+        &policy,
+        &export_scope(),
+        &ExportRequest { source_generation },
+    )
+    .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))
+}
+
 /// Handle a migration request from a successor generation.
 pub fn handle(
     ctx: &DelegateCtx,
@@ -96,15 +152,7 @@ pub fn handle(
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     match request {
         HarvestMigrationRequest::ExportSecrets { source_generation } => {
-            let policy = origin_policy()?;
-            freenet_migrate::handle_export_request(
-                &CtxStore(ctx),
-                origin,
-                &policy,
-                &export_scope(),
-                &ExportRequest { source_generation },
-            )
-            .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))
+            export(&CtxStore(ctx), origin, source_generation)
         }
         // `HarvestMigrationRequest` is `#[non_exhaustive]`, and a variant this
         // build does not know about must be refused rather than absorbed: an
@@ -204,6 +252,28 @@ mod tests {
                 "{expected} not exported"
             );
         }
+    }
+
+    /// A store key never leaves this delegate, not even to its own successor
+    /// (harvest#93 review, Should Fix 4): the export path hides the family.
+    ///
+    /// Mutated red by exporting through the raw store instead of
+    /// `WithoutStoreKeys`.
+    #[test]
+    fn a_store_key_is_never_exported() {
+        let mut s = store();
+        s.set_secret(b"harvest:store_sk:3Bn8xWqLd6Tz9Kf2", b"seed");
+        let msgs = export(&s, Some(&harvest_origin()), 4).expect("authorized");
+        let keys: Vec<Vec<u8>> = exported(&msgs)
+            .secrets
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(keys.iter().all(|k| !is_store_key(k)), "{keys:?}");
+        assert!(
+            keys.iter().any(|k| k == b"harvest:rsa_sk:fp1"),
+            "and everything else still goes"
+        );
     }
 
     /// The prefix scope is load-bearing, not decoration.

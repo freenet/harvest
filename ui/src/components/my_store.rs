@@ -218,7 +218,10 @@ fn IdentityCard(
         .read()
         .legacy_store_to_move(&identity.fingerprint)
         .is_some();
-    let moving = APP_STATE.read().pending_store_creation.is_some();
+    // Single-flight (harvest#93 review, Must Fix 3): set from the moment a
+    // creation or move starts until it is published or fails.
+    let creating =
+        APP_STATE.read().store_creation_in_flight.as_deref() == Some(identity.fingerprint.as_str());
 
     // Buyers can only reach a store through a link the seller sends them, so
     // the seller has to be able to see it. Built here rather than in rsx
@@ -330,7 +333,7 @@ fn IdentityCard(
                         onclick: move |_| show_listing_form.toggle(),
                         if show_listing_form() { "Cancel" } else { "Add Listing" }
                     }
-                } else if moving || (has_rsa_key && !legacy_movable) {
+                } else if creating {
                     span { class: "text-warning", "Creating contracts..." }
                 } else if legacy_movable {
                     button {
@@ -745,13 +748,19 @@ fn initiate_store_creation(
             );
             return;
         };
-        let store_key_request = APP_STATE.write().begin_store_creation(
+        let started = APP_STATE.write().begin_store_creation(
             fingerprint.clone(),
             vk_bytes,
             details,
             carried_listings,
         );
-        send_store_creation_requests(fingerprint, store_key_request);
+        match started {
+            Ok(store_key_request) => send_store_creation_requests(fingerprint, store_key_request),
+            Err(e) => APP_STATE
+                .write()
+                .notifications
+                .push(format!("Could not create the store: {e}")),
+        }
     }
 }
 
@@ -802,11 +811,7 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         let fail = |why: String| {
             dioxus::logger::tracing::error!("{why}");
-            let mut state = APP_STATE.write();
-            state.pending_store_creation = None;
-            state
-                .notifications
-                .push(format!("Store creation failed: {why}"));
+            APP_STATE.write().store_creation_failed(&why);
         };
         let (Some(delegate_key), Some(gk_delegate_key)) = ({
             let state = APP_STATE.read();

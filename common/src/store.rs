@@ -1069,6 +1069,53 @@ impl StoreStateV1 {
             || !self.closed.is_empty()
     }
 
+    /// Apply the store-wide bound on backings, and keep a retirement exactly
+    /// as long as its backing (harvest#93 review, Must Fix 1).
+    ///
+    /// Keeps the [`crate::backing::MAX_BACKINGS`] backings whose Ghost Keys
+    /// are smallest by bytes, then drops every retirement whose backing is
+    /// not among them. Never fails, so no merge of valid states fails, and it
+    /// touches nothing but these two sets: the closed flag, the details,
+    /// listings and orders in the same update always land.
+    ///
+    /// # Why this is a merge rather than a refusal
+    ///
+    /// It used to be a refusal: past the bound `apply_delta` returned an
+    /// error, which took the whole update down with it (a closure and a
+    /// listing riding in the same delta included), and left two replicas
+    /// each refusing the other for good. `fdev verify-merge` files a
+    /// contract error as "inconclusive", not as a violation, which is how it
+    /// passed.
+    ///
+    /// # Why it obeys the merge laws
+    ///
+    /// Kept backing slots are top-N over a ranking that depends on the slot
+    /// alone ([`crate::backing::MAX_BACKINGS`]), which is associative. Kept
+    /// retirements are `(union of retirements) ∩ (kept backing slots)`: a
+    /// valid input holds a retirement only for a backing it holds, and a slot
+    /// in the top N of a union is in the top N of every sub-union containing
+    /// it, so every grouping keeps the same retirements.
+    ///
+    /// # Why nothing is ever un-retired
+    ///
+    /// A retirement is dropped only with its backing. A dropped slot ranks
+    /// below N slots this replica keeps, and any later merge only adds slots,
+    /// so it can never rank back in: a backing, once cut, cannot return to
+    /// this replica without its retirement.
+    pub(crate) fn normalize_backings(&mut self) {
+        let max = crate::backing::MAX_BACKINGS;
+        if self.backings.records.len() > max {
+            let cut: Vec<Bytes32> = self.backings.records.keys().skip(max).copied().collect();
+            for slot in cut {
+                self.backings.records.remove(&slot);
+            }
+        }
+        let backings = &self.backings.records;
+        self.retirements
+            .records
+            .retain(|slot, _| backings.contains_key(slot));
+    }
+
     /// The parent the children are verified under. They read the owner and
     /// nothing else, so this is all of `self` they need -- and cloning a
     /// whole store, up to [`MAX_ORDERS`] orders with their payment proofs,
@@ -1100,6 +1147,7 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.retirements)?;
         next.closed
             .apply_delta(&parent, parameters, &delta.closed)?;
+        next.normalize_backings();
         *self = next;
         Ok(())
     }
@@ -1143,6 +1191,27 @@ impl ComposableState for StoreStateV1 {
         self.info.verify(&parent, parameters)?;
         self.listings.verify(&parent, parameters)?;
         self.orders.verify(&parent, parameters)?;
+        // The two store-wide rules `normalize_backings` keeps: at most
+        // `MAX_BACKINGS` backings, and every retirement names one of them.
+        // A state that breaks either is one no merge produces.
+        if self.backings.records.len() > crate::backing::MAX_BACKINGS {
+            return Err(format!(
+                "store holds {} backings, the most it keeps is {}",
+                self.backings.records.len(),
+                crate::backing::MAX_BACKINGS
+            ));
+        }
+        if let Some(orphan) = self
+            .retirements
+            .records
+            .keys()
+            .find(|slot| !self.backings.records.contains_key(*slot))
+        {
+            return Err(format!(
+                "a retirement names Ghost Key {}, which does not back this store",
+                bs58::encode(orphan.0).into_string()
+            ));
+        }
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
         self.closed.verify(&parent, parameters)

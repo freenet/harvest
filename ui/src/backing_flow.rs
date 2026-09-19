@@ -74,6 +74,31 @@ pub(crate) const NO_BLOCK_FOR_BACKING: &str =
     "Harvest has not loaded a recent Bitcoin block yet, and a store's backing has to name \
      one. Wait for the chain data to load and try again.";
 
+/// How many blocks behind the newest known one a new backing is dated.
+///
+/// A reader leaves out a backing dated above ITS tip
+/// (`harvest_common::backing::current_backing`), and a buyer's node can be a
+/// block or two behind the seller's. Dated at the seller's tip, a new store
+/// would read as unbacked to exactly those buyers until they caught up
+/// (harvest#93 review, Should Fix 5). Six blocks is about an hour, and the
+/// block only has to prove the backing was written after it.
+pub(crate) const BACKING_BLOCK_DEPTH: usize = 6;
+
+/// The block a backing made now is dated to: [`BACKING_BLOCK_DEPTH`] behind
+/// the newest this reader holds, or the oldest it holds if it holds fewer.
+pub(crate) fn backing_block(
+    tip: &crate::state::TipView,
+) -> Option<freenet_bitcoin_common::BlockAnchor> {
+    let row = tip
+        .recent_blocks
+        .get(BACKING_BLOCK_DEPTH)
+        .or_else(|| tip.recent_blocks.last())?;
+    Some(freenet_bitcoin_common::BlockAnchor {
+        height: row.height,
+        hash: row.hash,
+    })
+}
+
 impl AppState {
     /// Start creating a store for the Ghost Key `fingerprint`: record what is
     /// known, and return the request id `CreateStoreKey` must go out under.
@@ -81,13 +106,46 @@ impl AppState {
     /// `carried_listings` are listings to re-sign into the new store once it
     /// exists; empty for an ordinary new store. See
     /// [`AppState::move_legacy_store`].
+    ///
+    /// # Refused, rather than started, when (harvest#93 review, Must Fix 3)
+    ///
+    /// * a creation is already under way (`store_creation_in_flight` stays
+    ///   set until the store is published or creation fails, so a second
+    ///   click, or a retry while the first is still going, cannot make a
+    ///   second store backed by the same Ghost Key);
+    /// * the Ghost Key already backs a store this reader has loaded: a Ghost
+    ///   Key backs one store at a time (section 6.2), and a second store
+    ///   would make both count for nothing;
+    /// * there is no recent block to date the backing to, checked BEFORE a
+    ///   store key is minted, so a creation that could not finish does not
+    ///   burn one of the delegate's store-key slots.
     pub(crate) fn begin_store_creation(
         &mut self,
         fingerprint: String,
         seller_verifying_key_bytes: [u8; 32],
         details: StoreDetails,
         carried_listings: Vec<Listing>,
-    ) -> u64 {
+    ) -> Result<u64, String> {
+        if self.store_creation_in_flight.is_some() {
+            return Err("a store is already being created; wait for it to finish".into());
+        }
+        if let Some(name) = self.store_backed_by(&seller_verifying_key_bytes) {
+            return Err(format!(
+                "this Ghost Key already backs {name}. A Ghost Key backs one store at a time: \
+                 retire it there first, or use a different Ghost Key"
+            ));
+        }
+        let network = crate::gateway::bitcoin_config::default_network();
+        if self
+            .bitcoin
+            .tips
+            .get(&network)
+            .and_then(backing_block)
+            .is_none()
+        {
+            return Err(NO_BLOCK_FOR_BACKING.to_string());
+        }
+        self.store_creation_in_flight = Some(fingerprint.clone());
         let store_key_request = self.next_messaging_request_id();
         self.pending_store_creation = Some(PendingStoreCreation {
             ghostkey_fingerprint: fingerprint,
@@ -101,7 +159,35 @@ impl AppState {
             store_key_request: Some(store_key_request),
             carried_listings,
         });
-        store_key_request
+        Ok(store_key_request)
+    }
+
+    /// The name of a loaded store whose current backing is the Ghost Key
+    /// `backer`, if any: the seller-facing half of section 6.2.
+    pub(crate) fn store_backed_by(&self, backer: &[u8; 32]) -> Option<String> {
+        self.browsing_stores.values().find_map(|store| {
+            let view = store.backing.as_ref()?;
+            (view.backer == *backer).then(|| {
+                store
+                    .info
+                    .as_ref()
+                    .map(|info| info.store_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "another store".to_string())
+            })
+        })
+    }
+
+    /// A store creation (or move) has failed: say so, and release it so the
+    /// seller can try again. Every failure after [`Self::begin_store_creation`]
+    /// comes through here, because a failure that left
+    /// `store_creation_in_flight` set would leave "Creating contracts..." on
+    /// screen with no way to retry.
+    pub(crate) fn store_creation_failed(&mut self, why: &str) {
+        self.store_creation_in_flight = None;
+        self.pending_store_creation = None;
+        self.notifications
+            .push(format!("Store creation failed: {why}"));
     }
 
     /// The Harvest delegate answered `CreateStoreKey`.
@@ -126,9 +212,7 @@ impl AppState {
                 self.start_store_creation_if_ready();
             }
             Err(why) => {
-                self.pending_store_creation = None;
-                self.notifications
-                    .push(format!("Could not create a key for your store: {why}"));
+                self.store_creation_failed(&format!("no key could be made for the store: {why}"))
             }
         }
     }
@@ -144,26 +228,18 @@ impl AppState {
             .store_verifying_key
             .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
         else {
-            self.notifications
-                .push("Store creation failed: the store key is not a valid key.".into());
+            self.store_creation_failed("the store key is not a valid key.");
             return;
         };
         let Ok(backer) =
             ed25519_dalek::VerifyingKey::from_bytes(&creation.seller_verifying_key_bytes)
         else {
-            self.notifications
-                .push("Store creation failed: the Ghost Key's verifying key is not known.".into());
+            self.store_creation_failed("the Ghost Key's verifying key is not known.");
             return;
         };
         let network = crate::gateway::bitcoin_config::default_network();
-        let Some(block) = self
-            .bitcoin
-            .tips
-            .get(&network)
-            .and_then(|tip| tip.current_anchor())
-        else {
-            self.notifications
-                .push(format!("Store creation failed: {NO_BLOCK_FOR_BACKING}"));
+        let Some(block) = self.bitcoin.tips.get(&network).and_then(backing_block) else {
+            self.store_creation_failed(NO_BLOCK_FOR_BACKING);
             return;
         };
         let statement = BackingStatement {
@@ -202,8 +278,7 @@ impl AppState {
             PendingSignature::BackingAcceptance(Box::new(pending)),
             store_key,
         ) {
-            self.notifications
-                .push(format!("Store creation failed: {e}"));
+            self.store_creation_failed(&e);
         }
     }
 
@@ -226,9 +301,7 @@ impl AppState {
             acceptance_signature: signature,
         };
         if let Err(why) = backing.verify(&backing.statement.store) {
-            self.notifications.push(format!(
-                "Store creation failed: the backing did not verify ({why})."
-            ));
+            self.store_creation_failed(&format!("the backing did not verify ({why})."));
             return;
         }
         #[cfg(target_arch = "wasm32")]
@@ -317,15 +390,12 @@ impl AppState {
         let (_, details, listings) = self
             .legacy_store_to_move(fingerprint)
             .ok_or("there is no store made before store keys to move, or it has not loaded yet")?;
-        if self.pending_store_creation.is_some() {
-            return Err("a store is already being created; wait for it to finish".into());
-        }
-        Ok(self.begin_store_creation(
+        self.begin_store_creation(
             fingerprint.to_string(),
             seller_verifying_key_bytes,
             details,
             listings,
-        ))
+        )
     }
 }
 
@@ -341,9 +411,7 @@ fn spawn_backing_statement_signature(pending: PendingBacking) {
             dioxus::logger::tracing::error!("{reason}");
             let mut state = crate::gateway::APP_STATE.write();
             state.withdraw_pending_signature(&queued);
-            state
-                .notifications
-                .push(format!("Store creation failed: {reason}"));
+            state.store_creation_failed(&reason);
         };
         let Some(delegate_key) = crate::gateway::APP_STATE
             .read()
@@ -380,7 +448,7 @@ fn spawn_backing_statement_signature(pending: PendingBacking) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::state::{BackingView, BlockRow, PaymentBlocker, Signer, TipView};
+    use crate::state::{BlockRow, PaymentBlocker, Signer, TipView};
     use ed25519_dalek::{Signer as _, SigningKey};
     use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
     use harvest_common::delegate::StoreKeySignature;
@@ -403,12 +471,15 @@ pub(crate) mod tests {
             tip_height: Some(TIP),
             signed_tip: None,
             last_block_time: None,
-            recent_blocks: vec![BlockRow {
-                height: TIP,
-                hash: BlockHash([0x33; 32]),
-                tx_count: 1,
-                block_time: 0,
-            }],
+            // Newest first, ten deep.
+            recent_blocks: (0..10u32)
+                .map(|back| BlockRow {
+                    height: TIP - back,
+                    hash: BlockHash([0x33u8.wrapping_add(back as u8); 32]),
+                    tx_count: 1,
+                    block_time: 0,
+                })
+                .collect(),
         }
     }
 
@@ -509,15 +580,17 @@ pub(crate) mod tests {
     fn creation_waits_for_the_store_key_then_asks_the_ghost_key_to_back_it() {
         let mut state = AppState::default();
         state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
-        let request = state.begin_store_creation(
-            FINGERPRINT.to_string(),
-            ghost().verifying_key().to_bytes(),
-            StoreDetails {
-                store_name: "Bean Shop".to_string(),
-                description: String::new(),
-            },
-            Vec::new(),
-        );
+        let request = state
+            .begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails {
+                    store_name: "Bean Shop".to_string(),
+                    description: String::new(),
+                },
+                Vec::new(),
+            )
+            .expect("started");
         {
             let pending = state.pending_store_creation.as_mut().unwrap();
             pending.certificate_pem = "CERT".to_string();
@@ -543,8 +616,9 @@ pub(crate) mod tests {
         assert_eq!(statement.certificate_pem, "CERT");
         assert_eq!(statement.network, BitcoinNetwork::Signet);
         assert_eq!(
-            statement.block.height, TIP,
-            "dated to the newest block this reader has"
+            statement.block.height,
+            TIP - BACKING_BLOCK_DEPTH as u32,
+            "dated a few blocks behind the newest this reader has (Should Fix 5)"
         );
         assert!(state.pending_store_creation.is_none());
     }
@@ -552,18 +626,105 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_store_key_abandons_the_creation_and_says_so() {
         let mut state = AppState::default();
-        let request = state.begin_store_creation(
-            FINGERPRINT.to_string(),
-            ghost().verifying_key().to_bytes(),
-            StoreDetails::default(),
-            Vec::new(),
-        );
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
+        let request = state
+            .begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails::default(),
+                Vec::new(),
+            )
+            .expect("started");
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
             request_id: request,
             result: Err("full".to_string()),
         });
         assert!(state.pending_store_creation.is_none());
         assert!(state.notifications.iter().any(|n| n.contains("full")));
+        assert!(
+            state.store_creation_in_flight.is_none(),
+            "a failure releases the creation, so the seller can retry"
+        );
+    }
+
+    /// Single-flight (harvest#93 review, Must Fix 3): while a creation is
+    /// under way, however far it has got, a second is refused, including
+    /// after `pending_store_creation` has been taken. Mutated red by removing
+    /// the in-flight check from `begin_store_creation`.
+    #[test]
+    fn a_second_creation_is_refused_until_the_first_finishes() {
+        let mut state = AppState::default();
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
+        let start = |state: &mut AppState| {
+            state.begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails::default(),
+                Vec::new(),
+            )
+        };
+        start(&mut state).expect("the first starts");
+        // Its inputs arrive and the pending creation is taken, as it is in
+        // the real flow, long before the store is published.
+        state.pending_store_creation = None;
+        let err = start(&mut state).expect_err("a second is refused");
+        assert!(err.contains("already being created"), "{err}");
+
+        state.store_creation_failed("the vault said no");
+        start(&mut state).expect("after a failure the seller can try again");
+    }
+
+    /// A Ghost Key backs one store at a time (section 6.2): creating or
+    /// moving a store with one that already backs a loaded store is refused,
+    /// with the store named. Mutated red by removing the check.
+    #[test]
+    fn a_ghost_key_that_already_backs_a_store_cannot_back_another() {
+        let mut state = AppState::default();
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
+        let store = state.browsing_stores.entry(vec![9; 32]).or_default();
+        store.backing = Some(crate::state::BackingView {
+            store: [1; 32],
+            backer: ghost().verifying_key().to_bytes(),
+            certificate_status: crate::ghostkey_cert::CertificateStatus::Verified,
+            block_height: TIP,
+        });
+        store.info = Some(harvest_common::store::StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: String::new(),
+            reputation_contract_id: [0; 32],
+            store_name: "Bean Shop".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+        });
+        let err = state
+            .begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails::default(),
+                Vec::new(),
+            )
+            .expect_err("refused");
+        assert!(err.contains("already backs Bean Shop"), "{err}");
+        assert!(state.store_creation_in_flight.is_none());
+    }
+
+    /// With no block to date the backing to, nothing starts, and so no store
+    /// key is minted to be thrown away (Should Fix 8).
+    #[test]
+    fn with_no_block_no_creation_starts() {
+        let mut state = AppState::default();
+        let err = state
+            .begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails::default(),
+                Vec::new(),
+            )
+            .expect_err("no tip");
+        assert_eq!(err, NO_BLOCK_FOR_BACKING);
+        assert!(state.pending_store_creation.is_none());
+        assert!(state.store_creation_in_flight.is_none());
     }
 
     /// No block, no backing: the creation stops and the seller is told,
@@ -640,6 +801,7 @@ pub(crate) mod tests {
 
     fn legacy_seller() -> AppState {
         let mut state = AppState::default();
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
         state
             .my_stores
             .insert(FINGERPRINT.to_string(), vec![legacy_registration()]);
@@ -721,17 +883,78 @@ pub(crate) mod tests {
         assert_eq!(state.signable_store_for(FINGERPRINT), Some(vec![5; 32]));
     }
 
-    fn view(store: u8, backer: u8) -> BackingView {
-        BackingView {
-            store: SigningKey::from_bytes(&[store; 32])
-                .verifying_key()
-                .to_bytes(),
-            backer: SigningKey::from_bytes(&[backer; 32])
-                .verifying_key()
-                .to_bytes(),
-            certificate_status: crate::ghostkey_cert::CertificateStatus::Verified,
-            block_height: TIP,
+    /// A signed backing of the store keyed by `store` seed by the Ghost Key
+    /// `backer` seed, dated `height`.
+    fn signed_backing(store: u8, backer: u8, height: u32) -> AuthorizedBacking {
+        let store_key = SigningKey::from_bytes(&[store; 32]);
+        let ghost = SigningKey::from_bytes(&[backer; 32]);
+        let statement = BackingStatement {
+            store: store_key.verifying_key(),
+            backer: ghost.verifying_key(),
+            certificate_pem: format!("CERT-{backer}"),
+            network: BitcoinNetwork::Signet,
+            block: BlockAnchor {
+                height,
+                hash: BlockHash([1; 32]),
+            },
+        };
+        let (backer_scoped_payload, backer_signature) = sign(&ghost, &statement);
+        let (acceptance_scoped_payload, acceptance_signature) = sign(
+            &store_key,
+            &harvest_common::backing::BackingAcceptance {
+                backing: statement.clone(),
+            },
+        );
+        AuthorizedBacking {
+            statement,
+            backer_scoped_payload,
+            backer_signature,
+            acceptance_scoped_payload,
+            acceptance_signature,
         }
+    }
+
+    /// Load a store owned by `store`, holding `backings`, into `state` the
+    /// way the ingest path keeps it, with each backing's certificate already
+    /// judged genuine (no test holds Freenet's master key, so the verdict is
+    /// seeded into the cache `backing_view` consults).
+    fn load_backed(state: &mut AppState, id: u8, store: u8, backings: Vec<AuthorizedBacking>) {
+        for b in &backings {
+            state.certificate_verdicts.borrow_mut().insert(
+                (
+                    b.statement.certificate_pem.clone(),
+                    b.statement.backer.to_bytes(),
+                ),
+                crate::ghostkey_cert::CertificateStatus::Verified,
+            );
+        }
+        let backing_state = harvest_common::store::StoreStateV1 {
+            owner: Some(SigningKey::from_bytes(&[store; 32]).verifying_key()),
+            backings: harvest_common::backing::BackingsV1 {
+                records: backings
+                    .into_iter()
+                    .map(|b| {
+                        (
+                            harvest_common::store::Bytes32(b.statement.backer.to_bytes()),
+                            b,
+                        )
+                    })
+                    .collect(),
+            },
+            ..Default::default()
+        };
+        state
+            .browsing_stores
+            .entry(vec![id; 32])
+            .or_default()
+            .backing_state = backing_state;
+        state.refresh_backing_verdicts();
+    }
+
+    fn store_key_of(seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
     }
 
     /// A Ghost Key backing two loaded stores counts for NEITHER, and each
@@ -741,22 +964,9 @@ pub(crate) mod tests {
     #[test]
     fn a_key_backing_two_stores_counts_for_neither() {
         let mut state = AppState::default();
-        state
-            .browsing_stores
-            .entry(vec![1; 32])
-            .or_default()
-            .backing = Some(view(0x71, 0x41));
-        state
-            .browsing_stores
-            .entry(vec![2; 32])
-            .or_default()
-            .backing = Some(view(0x72, 0x41));
-        state
-            .browsing_stores
-            .entry(vec![3; 32])
-            .or_default()
-            .backing = Some(view(0x73, 0x42));
-        state.refresh_backing_verdicts();
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, 0x41, 10)]);
+        load_backed(&mut state, 2, 0x72, vec![signed_backing(0x72, 0x41, 10)]);
+        load_backed(&mut state, 3, 0x73, vec![signed_backing(0x73, 0x42, 10)]);
 
         for id in [vec![1u8; 32], vec![2u8; 32]] {
             let store = &state.browsing_stores[&id];
@@ -764,21 +974,57 @@ pub(crate) mod tests {
             assert!(store.seller_verifying_key.is_none());
             assert!(!store.certificate_status.is_verified());
         }
-        let third = &state.browsing_stores[&vec![3u8; 32]];
-        assert_eq!(third.store_verifying_key, Some(view(0x73, 0x42).store));
-        assert_eq!(third.seller_verifying_key, Some(view(0x73, 0x42).backer));
+        assert_eq!(
+            state.browsing_stores[&vec![3u8; 32]].store_verifying_key,
+            Some(store_key_of(0x73))
+        );
 
         // The second store's backing moves to another key: the first counts
         // again.
-        state
-            .browsing_stores
-            .get_mut(&vec![2u8; 32])
-            .unwrap()
-            .backing = Some(view(0x72, 0x43));
-        state.refresh_backing_verdicts();
+        load_backed(&mut state, 2, 0x72, vec![signed_backing(0x72, 0x43, 10)]);
         assert_eq!(
             state.browsing_stores[&vec![1u8; 32]].store_verifying_key,
-            Some(view(0x71, 0x41).store)
+            Some(store_key_of(0x71))
+        );
+    }
+
+    /// A backing dated above this reader's tip is not current yet, and
+    /// becomes current when the tip catches up, without the store's state
+    /// arriving again (harvest#93 review, Should Fix 5). Mutated red by not
+    /// recomputing the verdicts in `apply_tip_state`.
+    #[test]
+    fn a_tip_update_makes_a_backing_dated_ahead_of_it_current() {
+        let mut state = AppState::default();
+        let mut behind = tip();
+        behind.tip_height = Some(TIP - 10);
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, behind);
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, 0x41, TIP)]);
+        assert!(state.browsing_stores[&vec![1u8; 32]]
+            .store_verifying_key
+            .is_none());
+
+        // The tip contract reports the new block, through the real path.
+        let entry = freenet_bitcoin_common::SignedTipEntry::sign(
+            &SigningKey::from_bytes(&[0x22; 32]),
+            &freenet_bitcoin_common::TipEntryBody {
+                network: BitcoinNetwork::Signet,
+                anchor: BlockAnchor {
+                    height: TIP,
+                    hash: BlockHash([0x33; 32]),
+                },
+                prev_hash: BlockHash([0x32; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign a tip entry");
+        let mut tip_state = freenet_bitcoin_common::BitcoinTipStateV1::default();
+        tip_state.blocks.blocks.insert(TIP, entry);
+        state.apply_tip_state(BitcoinNetwork::Signet, &tip_state);
+        assert_eq!(
+            state.browsing_stores[&vec![1u8; 32]].store_verifying_key,
+            Some(store_key_of(0x71))
         );
     }
 
@@ -787,14 +1033,26 @@ pub(crate) mod tests {
     #[test]
     fn an_unverified_or_missing_backing_gives_no_identity() {
         let mut state = AppState::default();
-        let mut bad = view(0x71, 0x41);
-        bad.certificate_status =
-            crate::ghostkey_cert::CertificateStatus::Invalid("not genuine".to_string());
+        // Not seeded: "CERT-65" is judged for real, and is not a certificate.
+        let backing_state = harvest_common::store::StoreStateV1 {
+            owner: Some(SigningKey::from_bytes(&[0x71; 32]).verifying_key()),
+            backings: harvest_common::backing::BackingsV1 {
+                records: std::iter::once(signed_backing(0x71, 0x41, 10))
+                    .map(|b| {
+                        (
+                            harvest_common::store::Bytes32(b.statement.backer.to_bytes()),
+                            b,
+                        )
+                    })
+                    .collect(),
+            },
+            ..Default::default()
+        };
         state
             .browsing_stores
             .entry(vec![1; 32])
             .or_default()
-            .backing = Some(bad);
+            .backing_state = backing_state;
         state.browsing_stores.entry(vec![2; 32]).or_default();
         state.refresh_backing_verdicts();
         for id in [vec![1u8; 32], vec![2u8; 32]] {

@@ -294,7 +294,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 
             super::buy_view::Purchases { store_contract_id: contract_id.clone() }
 
-            StoreInvoices { orders: store.orders.clone() }
+            // No payment address on a store buyers must not pay: closed, or
+            // backed by nothing a reader can believe in (Must Fix 2).
+            if store.payable() {
+                StoreInvoices { orders: store.orders.clone() }
+            } else if !store.orders.is_empty() {
+                p { class: "text-muted",
+                    "This store's invoices are not shown: it has closed, or nothing vouches \
+                     for the key that signs them, so none of them should be paid."
+                }
+            }
         }
     }
 }

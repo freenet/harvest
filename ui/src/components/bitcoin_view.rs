@@ -86,7 +86,12 @@ fn active_network(bitcoin: &BitcoinState) -> BitcoinNetwork {
 /// connected Ghost Keys is buyer or seller. Depends on having browsed (or
 /// registered) the relevant store at least once -- same scoping `MyStore`
 /// already uses for listings.
-fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
+///
+/// An order still awaiting payment is left out when its store is not
+/// `payable` -- closed, or unbacked (harvest#93 review, Must Fix 2): its card
+/// would show a payment address nobody should use. Settled orders stay, as
+/// history.
+pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
     let my_fingerprints: std::collections::HashSet<&str> = app_state
         .ghostkeys
         .iter()
@@ -95,7 +100,11 @@ fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
         .values()
-        .flat_map(|s| s.orders.iter())
+        .flat_map(|s| {
+            s.orders
+                .iter()
+                .filter(move |o| s.payable() || o.status != OrderStatus::AwaitingPayment)
+        })
         .filter(|o| {
             my_fingerprints.contains(o.order.buyer_fingerprint.as_str())
                 || my_fingerprints.contains(o.order.seller_fingerprint.as_str())
@@ -828,6 +837,74 @@ enum BridgeNote {
     Recognised(String),
     /// At least one named bridge is a stranger.
     Unrecognised(String),
+}
+
+#[cfg(test)]
+mod payable_tests {
+    use super::*;
+
+    fn order(status: OrderStatus, seed: u8) -> AuthorizedOrder {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000 + seed as i64, 0).unwrap();
+        let order = harvest_common::payment::Order {
+            id: harvest_common::payment::OrderId([0u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "me".into(),
+            amount_sats: 1,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, seed],
+            payment_address: "tb1qtest".into(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            listing_tag: None,
+            created_at: ts,
+        }
+        .with_derived_id();
+        AuthorizedOrder {
+            order,
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// Must Fix 2: an order awaiting payment at a closed or unbacked store is
+    /// not listed under "Your orders", where its card would show the address;
+    /// a settled one still is. Mutated red by dropping the `payable` filter.
+    #[test]
+    fn an_awaiting_order_at_a_store_not_to_be_paid_is_not_listed() {
+        let mut state = crate::state::AppState::default();
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "me".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        let awaiting = order(OrderStatus::AwaitingPayment, 1);
+        let cancelled = order(OrderStatus::Cancelled, 2);
+        let store = state.browsing_stores.entry(vec![1; 32]).or_default();
+        store.orders = vec![awaiting.clone(), cancelled.clone()];
+        store.store_verifying_key = Some([7; 32]);
+        assert_eq!(my_orders(&state).len(), 2, "a payable store lists both");
+
+        for make_unpayable in [
+            |s: &mut crate::state::BrowsingStore| s.closed = true,
+            |s: &mut crate::state::BrowsingStore| s.store_verifying_key = None,
+        ] {
+            let mut state = state.clone();
+            make_unpayable(state.browsing_stores.get_mut(&vec![1u8; 32]).unwrap());
+            let shown = my_orders(&state);
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].status, OrderStatus::Cancelled);
+        }
+    }
 }
 
 #[cfg(test)]

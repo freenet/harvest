@@ -260,6 +260,19 @@ pub struct AppState {
     /// entry to withdraw. See `AppState::store_key_signature_failed`.
     pub pending_store_key_requests: std::collections::BTreeMap<u64, Vec<u8>>,
 
+    /// Certificate verdicts already reached, by (certificate, backing key).
+    /// See [`AppState::backing_view`].
+    pub certificate_verdicts:
+        std::cell::RefCell<HashMap<(String, [u8; 32]), crate::ghostkey_cert::CertificateStatus>>,
+
+    /// The Ghost Key a store is being created (or moved) for, from the moment
+    /// creation starts until the store is published or creation fails
+    /// (harvest#93 review, Must Fix 3). Unlike `pending_store_creation`,
+    /// which is taken as soon as its inputs arrive, this stays set through
+    /// the backing signatures and the PUTs, so a second click cannot start a
+    /// second store. See `backing_flow`.
+    pub store_creation_in_flight: Option<String>,
+
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -418,12 +431,14 @@ pub(crate) fn spawn_store_creation(
     backing: harvest_common::backing::AuthorizedBacking,
 ) {
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::store_ops::create_store_contracts(pending, backing).await {
-            dioxus::logger::tracing::error!("Store creation failed: {}", e);
-            crate::gateway::APP_STATE
-                .write()
-                .notifications
-                .push(format!("Store creation failed: {e}"));
+        match crate::gateway::store_ops::create_store_contracts(pending, backing).await {
+            // Published: the store now exists, so the single-flight marker
+            // is released (see `store_creation_in_flight`).
+            Ok(()) => crate::gateway::APP_STATE.write().store_creation_in_flight = None,
+            Err(e) => {
+                dioxus::logger::tracing::error!("Store creation failed: {}", e);
+                crate::gateway::APP_STATE.write().store_creation_failed(&e);
+            }
         }
     });
 }
@@ -776,6 +791,18 @@ fn unverified_listings(
         })
         .map(|authorized| authorized.listing.id.clone())
         .collect()
+}
+
+impl BrowsingStore {
+    /// Whether anything on this store may be offered to a buyer as payable
+    /// (harvest#93 review, Must Fix 2): the store is backed by a Ghost Key a
+    /// reader can believe in, and it has not closed. An unbacked store's
+    /// orders are signed by a key nothing vouches for, and a closed store's
+    /// key may be someone else's, so neither shows a payment address
+    /// anywhere: not on the store page, not under "Your orders".
+    pub fn payable(&self) -> bool {
+        !self.closed && self.store_verifying_key.is_some()
+    }
 }
 
 /// A store's current backing, as one reader found it (harvest#93).
@@ -1571,6 +1598,12 @@ pub struct BrowsingStore {
     /// The store's current backing as this reader found it, before the
     /// cross-store rule is applied. See [`AppState::refresh_backing_verdicts`].
     pub backing: Option<BackingView>,
+    /// The part of the store's state the backing rules read: its owner,
+    /// backings and retirements. Kept so the verdict can be recomputed when
+    /// the chain tip moves, not only when the store's state arrives
+    /// (harvest#93 review, Should Fix 5): a backing dated just above this
+    /// reader's tip becomes current as soon as the tip catches up.
+    pub backing_state: harvest_common::store::StoreStateV1,
     /// Whether the store has closed: its key signed the one-way closed flag
     /// (`harvest_common::backing::StoreClosure`). Buyers cannot pay a closed
     /// store; see [`PaymentBlocker::StoreClosed`].
@@ -1893,13 +1926,31 @@ impl AppState {
         let owner = state.owner?;
         let backing =
             harvest_common::backing::current_backing(state, |network| self.tip_height(network))?;
+        let key = (
+            backing.statement.certificate_pem.clone(),
+            backing.statement.backer.to_bytes(),
+        );
+        // A certificate chain check costs a blind-RSA verification, and this
+        // runs on every tip update for every loaded store, so a verdict is
+        // remembered: it is a pure function of the certificate and the key.
+        let remembered = self.certificate_verdicts.borrow().get(&key).cloned();
+        let certificate_status = match remembered {
+            Some(status) => status,
+            None => {
+                let status = crate::ghostkey_cert::verify_backing_certificate(
+                    &backing.statement.certificate_pem,
+                    &backing.statement.backer,
+                );
+                self.certificate_verdicts
+                    .borrow_mut()
+                    .insert(key, status.clone());
+                status
+            }
+        };
         Some(BackingView {
             store: owner.to_bytes(),
             backer: backing.statement.backer.to_bytes(),
-            certificate_status: crate::ghostkey_cert::verify_backing_certificate(
-                &backing.statement.certificate_pem,
-                &backing.statement.backer,
-            ),
+            certificate_status,
             block_height: backing.statement.block.height,
         })
     }
@@ -1916,6 +1967,18 @@ impl AppState {
     /// stores it has loaded, so this is as complete as that and no more; the
     /// Ghost Key record of phase 1c is what lets a reader look further.
     pub(crate) fn refresh_backing_verdicts(&mut self) {
+        // Which backing is current depends on the tip, so it is recomputed
+        // here, from each store's kept state, every time.
+        let views: Vec<(Vec<u8>, Option<BackingView>)> = self
+            .browsing_stores
+            .iter()
+            .map(|(id, store)| (id.clone(), self.backing_view(&store.backing_state)))
+            .collect();
+        for (id, view) in views {
+            if let Some(store) = self.browsing_stores.get_mut(&id) {
+                store.backing = view;
+            }
+        }
         let currents = self.browsing_stores.values().filter_map(|store| {
             let view = store.backing.as_ref()?;
             if !view.certificate_status.is_verified() {
@@ -2430,7 +2493,12 @@ impl AppState {
                     // its key also backs another store is applied across
                     // every loaded store by `refresh_backing_verdicts` below.
                     let owner = store_state.owner;
-                    let backing = self.backing_view(&store_state);
+                    let backing_state = harvest_common::store::StoreStateV1 {
+                        owner: store_state.owner,
+                        backings: store_state.backings.clone(),
+                        retirements: store_state.retirements.clone(),
+                        ..Default::default()
+                    };
                     let backers: Vec<ed25519_dalek::VerifyingKey> = store_state
                         .backings
                         .records
@@ -2442,7 +2510,7 @@ impl AppState {
                     let closed = harvest_common::backing::is_closed(&store_state);
 
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
-                    store.backing = backing;
+                    store.backing_state = backing_state;
                     store.closed = closed;
                     store.owner = owner.map(|key| key.to_bytes());
                     store.unverified_listings = unverified_listings;
@@ -4675,6 +4743,24 @@ impl AppState {
         ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
     }
 
+    /// The owner an update to one of OUR stores names: the store key, or,
+    /// for a store made before revision 2 (which has none), the key its
+    /// loaded state names (harvest#93 review, Should Fix 6).
+    ///
+    /// Only for updates that need no signature, of which there is one: a
+    /// settlement, which `Paid` evidence authorizes. Without the fallback an
+    /// open legacy invoice that was paid could never be published as Paid,
+    /// which is a regression this phase introduced. Anything signed still
+    /// goes through [`Self::store_owner_key`] and is refused for such a store.
+    pub fn delta_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
+        if let Some(key) = self.store_owner_key(store_contract_id) {
+            return Some(key);
+        }
+        self.store_owner_fingerprint(store_contract_id)?;
+        let held = self.browsing_stores.get(store_contract_id)?.owner?;
+        ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
+    }
+
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
         self.my_stores.iter().find_map(|(fingerprint, stores)| {
             stores
@@ -4981,7 +5067,7 @@ impl AppState {
                     && pending.signed_bytes().is_ok_and(|signed| signed == bytes)
             })
             .and_then(|at| self.pending_signatures.remove(at));
-        let what = match withdrawn {
+        let what = match &withdrawn {
             Some(PendingSignature::Listing(_)) => "your listing",
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
@@ -4989,6 +5075,12 @@ impl AppState {
             _ => "your store",
         };
         warn!("store key did not sign {what}: {reason}");
+        if matches!(withdrawn, Some(PendingSignature::BackingAcceptance(_))) {
+            self.store_creation_failed(&format!(
+                "the store's key did not accept the backing: {reason}"
+            ));
+            return;
+        }
         self.notifications.push(format!(
             "Could not sign {what} with your store's key: {reason}"
         ));
@@ -6070,8 +6162,19 @@ impl AppState {
     /// refused something. Store-key requests are the Harvest delegate's and
     /// are left alone: a vault refusal says nothing about them.
     fn drop_vault_signatures(&mut self) {
+        let creation_stopped = self.pending_store_creation.is_some()
+            || self
+                .pending_signatures
+                .iter()
+                .any(|pending| matches!(pending, PendingSignature::BackingStatement(_)));
         self.pending_signatures
             .retain(|pending| pending.signer() == Signer::StoreKey);
+        // A creation waiting on the vault (its certificate, or the Ghost
+        // Key's backing statement) will never finish now; release it so the
+        // seller can try again. The caller says why.
+        if creation_stopped {
+            self.store_creation_in_flight = None;
+        }
     }
 
     /// Handle a response from the ghostkey delegate.
@@ -6576,7 +6679,7 @@ impl AppState {
     }
 
     /// Fold a chain-tip contract's state into the live view for `network`.
-    fn apply_tip_state(
+    pub(crate) fn apply_tip_state(
         &mut self,
         network: BitcoinNetwork,
         state: &freenet_bitcoin_common::BitcoinTipStateV1,
@@ -6606,6 +6709,8 @@ impl AppState {
                 block_time: b.block_time,
             })
             .collect();
+        // A backing dated above the old tip may be current now.
+        self.refresh_backing_verdicts();
     }
 
     /// Fold an address contract's state into the live view for that watch.
@@ -18386,6 +18491,20 @@ mod store_code_tests {
             state.store_owner_key(&STORE),
             None,
             "a store made before store keys is not signed for with the Ghost Key"
+        );
+
+        // But a settlement, which needs no signature, can still be published
+        // to it, naming the owner its loaded state names (Should Fix 6).
+        assert_eq!(state.delta_owner_key(&STORE), None, "not loaded yet");
+        arrive(&mut state, &STORE, Some(&seller()));
+        assert_eq!(
+            state.delta_owner_key(&STORE),
+            Some(seller().verifying_key())
+        );
+        assert_eq!(
+            state.delta_owner_key(&[5u8; 32]),
+            None,
+            "never someone else's"
         );
     }
 

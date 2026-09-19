@@ -6,8 +6,10 @@
 //! One secret per store key, `harvest:store_sk:{base58 verifying key}`, holding
 //! the 32-byte seed. [`create`] mints one from the host's RNG and answers the
 //! public half; [`sign`] signs one of a store's own records with it. The seed
-//! never leaves this delegate: no request returns it, and the only thing the
-//! UI ever holds is a signature.
+//! is not handed out: no request returns it, the UI only ever holds a
+//! signature, and the export to a successor generation hides this family
+//! (`crate::migration::WithoutStoreKeys`). Phase 1b's custody adds the one
+//! way a copy leaves: wrapped, to a backing Ghost Key, in store state.
 //!
 //! The key starts with `harvest:` for the reason `handlers.rs` gives: a key
 //! outside that prefix is silently left behind by every future delegate

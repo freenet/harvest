@@ -344,7 +344,9 @@ pub enum HarvestDelegateRequest {
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
     /// this delegate on this device. Answered with
     /// [`HarvestDelegateResponse::StoreKeyCreated`], which carries the public
-    /// half only. The secret never leaves the delegate.
+    /// half only. No request returns the secret, and the export to a
+    /// successor generation leaves store keys out (phase 1b recovers them
+    /// from their wrapped copies instead).
     ///
     /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
     /// the store's state, so another device can recover it); until then a

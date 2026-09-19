@@ -1722,18 +1722,33 @@ left open, and what phase 1a deliberately does not do yet.
   about it.
 - Backings and retirements are grow-only sets keyed by the Ghost Key; the
   closed flag is the same kind of set with one possible slot. Two different
-  records for one slot resolve to the smaller CBOR encoding, as orders do.
-  No path removes an entry. A retirement is per Ghost Key and permanent,
-  which is the shape phase 1b's custody tombstone needs (section 6.3, check
-  4).
+  records for one slot resolve to the smaller CBOR encoding (not the newer
+  one), as orders do. A retirement is per Ghost Key and permanent, and must
+  name a Ghost Key the store holds a backing for, which is the shape phase
+  1b's custody tombstone needs (section 6.3, check 4).
 - The contract checks both signatures on a backing, the store key's on a
-  retirement and a closure, that each names this store, and bounds (64
-  backings, 64 retirements, a 4 KiB certificate). It checks nothing about
-  another contract, a certificate chain or a block reference.
-- **Bounds and the merge.** Beyond 64 backings the merge refuses rather than
-  dropping one, since dropping would break "a backing is never removed".
-  Only the store key can accept a backing, so only the seller can reach it,
-  by attaching more than 64 Ghost Keys on two replicas before they converge.
+  retirement and a closure, that each names this store, that each
+  retirement names a held backing, and bounds (64 backings, a 4 KiB
+  certificate). It checks nothing about another contract, a certificate
+  chain or a block reference.
+- **Bounds and the merge (after the PR #98 review, Must Fix 1).** Every
+  merge of valid states succeeds. Past 64 backings the store keeps the 64
+  whose Ghost Keys are smallest by bytes and drops the rest, each with its
+  retirement (`StoreStateV1::normalize_backings`). The ranking depends on
+  the slot alone, so the per-slot merge cannot change it, and top-N over
+  such a ranking is associative (the argument the order cap already rests
+  on); retirements are the union intersected with the kept backings, which
+  every grouping agrees on because a valid state holds a retirement only for
+  a backing it holds. A cut backing never returns to a replica that cut it,
+  so nothing is ever un-retired. The closed flag, details, listings and
+  orders are never touched by the bound, so a closure always propagates.
+  The first version refused a union past the bound instead, which took
+  everything else in the same update down with it and split replicas for
+  good; `fdev verify-merge` counts a contract error as "inconclusive", which
+  is how it passed. Certificates are not checked by the contract, so any
+  Ed25519 key can sign a backing statement and whoever holds the store key
+  can reach the bound for free; nobody else can, and that holder is the case
+  the closed flag is for.
 
 ### The reader rules
 
@@ -1761,6 +1776,24 @@ left open, and what phase 1a deliberately does not do yet.
   by the store key. Until then, changing a store's backing would move its
   mailbox, so phase 1a has no "change Ghost Key" or "retire" UI; the
   contract supports both.
+- **Deferred to phase 2 (the seller UI):** a control for the seller to
+  close their store (the contract, the reader rules and every buyer-facing
+  surface honour the closed flag, but nothing in the UI signs one yet), and
+  the Settings message for a Ghost Key that already backs another store
+  ("This Ghost Key already backs Mountain Valley Crafts. Retire it there
+  first, or use a different Ghost Key."). Phase 1a says the same thing when
+  a creation or a move is refused for that reason; the Settings screen it
+  belongs on does not exist yet.
+- **Creation is single-flight within a session.** A creation or move holds
+  `store_creation_in_flight` from the moment it starts until the store is
+  published or it fails, and a Ghost Key that already backs a loaded store
+  is refused. A reload in the middle of a creation clears the marker; the
+  second check is what then stops a duplicate, once the first store has
+  loaded.
+- **New backings are dated six blocks behind the newest known block**
+  (`BACKING_BLOCK_DEPTH`), so a buyer whose node is a little behind the
+  seller's does not see a new store as unbacked, and every loaded store's
+  verdict is recomputed when the tip moves.
 - Store details still carry `seller_fingerprint` and a `certificate_pem`, and
   listings a `certificate_pem`; readers now judge the backing's certificate
   for the store and accept any of the store's backers' certificates on a

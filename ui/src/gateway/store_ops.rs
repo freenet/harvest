@@ -419,8 +419,14 @@ pub async fn create_store_contracts(
     Ok(())
 }
 
-/// Ask the ghostkey delegate to sign a store's details, and queue them for
-/// publication when the signature comes back.
+/// The contract key of one of OUR stores, how it was found, and the owner a
+/// delta to it has to name.
+///
+/// The owner is `AppState::delta_owner_key`: the store key, or for a store
+/// made before revision 2, the key its loaded state names. That second case is
+/// what lets an open legacy invoice still be published as Paid, which needs
+/// no signature (harvest#93 review, Should Fix 6); anything that does need
+/// one is refused earlier, where it would have been signed.
 #[cfg(target_arch = "wasm32")]
 fn owned_store_key(
     store_contract_id: &[u8],
@@ -436,7 +442,7 @@ fn owned_store_key(
         .find(|s| s.store_contract_id == store_contract_id)
         .ok_or_else(|| format!("this store is not one of yours -- {whats_missing}"))?;
     let owner = state
-        .store_owner_key(store_contract_id)
+        .delta_owner_key(store_contract_id)
         .ok_or_else(|| format!("{} -- {whats_missing}", crate::state::NO_STORE_KEY_MESSAGE))?;
     let (key, origin) = store_contract_key(registration)?;
     Ok((key, origin, owner))

@@ -237,20 +237,6 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
     }
 }
 
-/// Start the reputation migration, which cannot run until the delegate has
-/// produced this identity's RSA public key.
-///
-/// **This is the ordering constraint, enforced.**
-/// `ReputationParameters::rsa_public_key_der` is that key, so it is an input to
-/// the reputation contract's address: without it there is no way to derive a
-/// predecessor id at all, and no way to derive the CURRENT one either. Running
-/// this before the key arrives would probe ids belonging to nobody, find
-/// nothing, and could seal that verdict over a recoverable instance.
-///
-/// [`migrate::reputation_probe_inputs`] is what makes that structural rather
-/// than remembered -- there is no way to call this without the key, and a
-/// missing key returns without starting anything rather than substituting a
-/// placeholder.
 /// Start the store probe for a store owned by a STORE key (harvest#93).
 ///
 /// `start_identity_migration` probes the addresses a Ghost Key's store had,
@@ -295,6 +281,20 @@ pub fn start_store_key_migration(store_verifying_key: &[u8; 32]) {
     }
 }
 
+/// Start the reputation migration, which cannot run until the delegate has
+/// produced this identity's RSA public key.
+///
+/// **This is the ordering constraint, enforced.**
+/// `ReputationParameters::rsa_public_key_der` is that key, so it is an input to
+/// the reputation contract's address: without it there is no way to derive a
+/// predecessor id at all, and no way to derive the CURRENT one either. Running
+/// this before the key arrives would probe ids belonging to nobody, find
+/// nothing, and could seal that verdict over a recoverable instance.
+///
+/// [`migrate::reputation_probe_inputs`] is what makes that structural rather
+/// than remembered -- there is no way to call this without the key, and a
+/// missing key returns without starting anything rather than substituting a
+/// placeholder.
 pub fn start_reputation_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
     let Some(vk) = verifying_key(verifying_key_bytes) else {
         return;
