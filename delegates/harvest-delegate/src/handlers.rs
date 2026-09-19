@@ -179,11 +179,13 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             request_id,
             ghostkey_fingerprint,
             peer_public_keys,
+            store_verifying_key,
         } => crate::messaging::derive_conversation_keys(
             store,
             request_id,
             &ghostkey_fingerprint,
             &peer_public_keys,
+            store_verifying_key,
         ),
 
         // The buyer's half of messaging: the secrets that make a seller's
@@ -354,6 +356,45 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_verifying_key,
             payload,
         } => crate::store_keys::sign(store, request_id, store_verifying_key, payload),
+
+        // Custody (harvest#93 phase 1b). The gate matters as much here: an
+        // unwrap writes a store key, and a wrap signs a copy with one.
+        HarvestDelegateRequest::WrapStoreKeyFor {
+            request_id,
+            store_verifying_key,
+            backer_verifying_key,
+            scoped_payload,
+            signature,
+        } => crate::store_keys::wrap_for(
+            store,
+            request_id,
+            store_verifying_key,
+            backer_verifying_key,
+            &scoped_payload,
+            &signature.0,
+        ),
+
+        HarvestDelegateRequest::UnwrapStoreKey {
+            request_id,
+            store_verifying_key,
+            backer_verifying_key,
+            scoped_payload,
+            signature,
+            wrapped,
+        } => crate::store_keys::unwrap(
+            store,
+            request_id,
+            store_verifying_key,
+            backer_verifying_key,
+            &scoped_payload,
+            &signature.0,
+            &wrapped,
+        ),
+
+        HarvestDelegateRequest::GetStoreSubkeys {
+            request_id,
+            store_verifying_key,
+        } => crate::store_keys::subkeys(store, request_id, store_verifying_key),
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),
@@ -981,6 +1022,7 @@ mod origin_gating_tests {
                 request_id: 1,
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
                 peer_public_keys: vec![vec![9u8; 32]],
+                store_verifying_key: None,
             },
         );
         assert!(

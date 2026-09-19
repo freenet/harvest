@@ -64,6 +64,16 @@ rsa = "0.9"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 aes-gcm = "0.10"
+# Store-key custody (harvest#93 phase 1b): HKDF over the vault's wrap
+# signature, zeroing for the secrets derived from it, a seeded RNG so the
+# record RSA key regenerates identically from the store key, and byte-string
+# encoding for wrapped copies in store state. `hkdf` is the only crate new to
+# the tree; it rides on the `hmac`/`sha2` already here. `rand_chacha` 0.3 is
+# the one on `rand_core` 0.6, which is what `rsa` 0.9 takes.
+hkdf = "0.12"
+zeroize = "1"
+rand_chacha = "0.3"
+serde_bytes = "0.11"
 
 # Utilities
 # default-features = false is load-bearing, not tidiness. chrono's default
