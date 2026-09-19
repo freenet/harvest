@@ -1682,3 +1682,115 @@ is not needed today.
   store today), `:1134` `MAX_REUSED_ADDRESS_SKIPS = 20`. Standing and the
   denominator: `docs/design/incentive-mechanism.md` Parts 4 and 7 ("nothing
   needs to know the transaction count"; no contract may gate on standing).
+
+---
+
+## Phase 1a: what was built
+
+Phase 1a of #93 (a store key, backings, the closed flag, and store content
+signed by the store key). This section records the choices the design above
+left open, and what phase 1a deliberately does not do yet.
+
+### The store key and where it lives
+
+- The store key is an Ed25519 key minted by the Harvest delegate from the
+  host RNG (`CreateStoreKey`) and kept in the delegate on the device that
+  made it, under `harvest:store_sk:{base58 key}`. The UI never holds the
+  secret; it asks the delegate to sign (`SignStoreUpdate`), and the delegate
+  signs only a store's own records (store details, listings, orders, an
+  order's status, a backing acceptance, a retirement, a closure), refusing
+  anything else.
+- The store key's signature uses the same `ScopedPayload` envelope the Ghost
+  Key vault produces, with the Harvest webapp as requestor, so one verifier
+  (`verify_scoped_signature`) checks both kinds of signature.
+- **The custody seam.** `delegates/harvest-delegate/src/store_keys.rs` has one
+  reader of the secret family (`load`) and one writer (`keep`). Phase 1b's
+  `WrapStoreKeyFor` and `UnwrapStoreKey` go through those two functions, so
+  adding custody adds callers rather than a second place that knows where a
+  store key lives. Until phase 1b, a store key exists on one device only, and
+  a delegate re-key (which loses delegate secrets, since nothing drives the
+  export handshake yet) leaves the store readable but unsignable. That is the
+  gap custody closes.
+
+### Backings, retirements and the closed flag
+
+- A backing is a `BackingStatement` (the store key, the backing Ghost Key,
+  its certificate, and a network-qualified Bitcoin block reference) signed
+  by the Ghost Key through the vault, plus the store key's signature over a
+  `BackingAcceptance` wrapping it. The tier is read from the certificate by
+  readers; it is not a separate field, so the store cannot contradict itself
+  about it.
+- Backings and retirements are grow-only sets keyed by the Ghost Key; the
+  closed flag is the same kind of set with one possible slot. Two different
+  records for one slot resolve to the smaller CBOR encoding, as orders do.
+  No path removes an entry. A retirement is per Ghost Key and permanent,
+  which is the shape phase 1b's custody tombstone needs (section 6.3, check
+  4).
+- The contract checks both signatures on a backing, the store key's on a
+  retirement and a closure, that each names this store, and bounds (64
+  backings, 64 retirements, a 4 KiB certificate). It checks nothing about
+  another contract, a certificate chain or a block reference.
+- **Bounds and the merge.** Beyond 64 backings the merge refuses rather than
+  dropping one, since dropping would break "a backing is never removed".
+  Only the store key can accept a backing, so only the seller can reach it,
+  by attaching more than 64 Ghost Keys on two replicas before they converge.
+
+### The reader rules
+
+- **Current backing:** of the backings no retirement names, the one with the
+  highest block height, with the backing key's bytes breaking a tie; a
+  backing dated above the reader's tip for its network is left out (with no
+  tip for that network nothing is left out). Height is the only time signal
+  a backing carries; the seller chooses it, and gains nothing by it, since
+  the way to make a new backing current is to retire the old one, which is
+  what the UI does. `harvest_common::backing::current_backing`.
+- **One store per Ghost Key:** a Ghost Key that is the current backing of
+  two stores the reader has loaded counts for neither
+  (`keys_backing_several_stores`, applied across every loaded store by
+  `AppState::refresh_backing_verdicts`). A reader knows only the stores it
+  has loaded; phase 1c's Ghost Key record is what lets it look further.
+- A store's identity, for a buyer, is its store key, and only when its
+  current backing's certificate chains to Freenet's master key and certifies
+  the backing key. Orders are checked against the store key. A closed store
+  is refused before anything else (`PaymentBlocker::StoreClosed`).
+
+### What phase 1a leaves where it was
+
+- The mailbox is still addressed by the backing Ghost Key, and the record by
+  the Ghost Key and the per-device RSA key. Phases 1b and 1d re-address them
+  by the store key. Until then, changing a store's backing would move its
+  mailbox, so phase 1a has no "change Ghost Key" or "retire" UI; the
+  contract supports both.
+- Store details still carry `seller_fingerprint` and a `certificate_pem`, and
+  listings a `certificate_pem`; readers now judge the backing's certificate
+  for the store and accept any of the store's backers' certificates on a
+  listing. Phase 1e removes the redundant fields.
+
+### How an existing store moves to the new model
+
+Every store up to generation V18 was owned by its seller's Ghost Key. The
+current contract accepts such a state as it is (its owner is only a key, and
+every record verifies against it), so the migration probe carries it forward
+by data transfer, as before. It arrives with no backing, so every reader
+treats it as unbacked and buyers' software will not pay it.
+
+On the seller's device, My Store offers to move it ("Move this store"). The
+move runs store creation with the old store's name, description and
+listings: a new store key, a backing by the old owner Ghost Key, the details
+and every listing re-signed by the store key. Listing ids derive from terms
+that name no seller, so each listing keeps its id. The new store has a new
+store code, so a new link. Orders are not carried: an open invoice is
+payable only within about eight hours of its anchor, and a Paid order stays
+readable at the old store. The old store is left where it was, unbacked.
+
+A move needs the Ghost Key's signature, so only its owner's device can do it.
+That gives up "any UI can migrate" for this one transition, which
+`docs/design/migratability.md` accepts only when "new accepts old" is
+impossible. Here the contract does accept the old state; what cannot be
+carried without the owner is the new ownership, which is the point of the
+change. Harvest is pre-launch, so this is the simplest correct path rather
+than a complete one.
+
+A store owned by a store key is found at its predecessor addresses by that
+key, which a Ghost Key cannot derive, so each registered store key gets its
+own migration probe (`migrate_ops::start_store_key_migration`).

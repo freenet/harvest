@@ -1009,11 +1009,16 @@ mod tests {
                 backing(&SigningKey::from_bytes(&seed), 100)
             })
             .collect();
-        let err = apply(
-            &StoreStateV1::default(),
-            delta_with(many.clone(), vec![], vec![]),
-        )
-        .expect_err("one past the cap");
+        // `apply_delta` itself refuses, not only the `verify` after it: the
+        // contract's `update_state` encodes what `apply_delta` produced.
+        let mut next = StoreStateV1::default();
+        let err = next
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(delta_with(many.clone(), vec![], vec![])),
+            )
+            .expect_err("one past the cap");
         assert!(err.contains("most it may hold"), "{err}");
         // And a state built past it directly does not verify.
         let mut state = with(many[..MAX_BACKINGS].to_vec(), vec![]);
