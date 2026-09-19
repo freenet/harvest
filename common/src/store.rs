@@ -1200,9 +1200,9 @@ impl StoreStateV1 {
     /// merge cannot change, because a copy's slot IS its (backer, scope).
     fn normalize_copies(&mut self) {
         let retirements = &self.retirements.records;
-        self.copies.records.retain(|_, copy| {
-            !retirements.contains_key(&Bytes32(copy.copy.backer.to_bytes()))
-        });
+        self.copies
+            .records
+            .retain(|_, copy| !retirements.contains_key(&Bytes32(copy.copy.backer.to_bytes())));
         let mut by_backer: BTreeMap<[u8; 32], Vec<(crate::custody::WrapScope, Bytes32)>> =
             BTreeMap::new();
         for (slot, copy) in &self.copies.records {

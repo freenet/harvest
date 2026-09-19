@@ -1164,9 +1164,14 @@ mod tests {
             R::StoreKeyCreated { .. } => (23, false),
             // A signature over a store record, published as it is.
             R::StoreUpdateSigned { .. } => (24, false),
+            // A wrapped copy: ciphertext meant for store state, published.
+            R::StoreKeyWrapped { .. } => (25, false),
+            R::StoreKeyRecovered { .. } => (26, false),
+            // The derived keys' PUBLIC halves.
+            R::StoreSubkeys { .. } => (27, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 25;
+    const RESPONSE_VARIANTS: usize = 28;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1200,9 +1205,13 @@ mod tests {
             Q::CreateStoreKey { .. } => (22, false),
             // A store record to be signed and published.
             Q::SignStoreUpdate { .. } => (23, false),
+            // The vault's wrap signature, which opens the wrapped copy.
+            Q::WrapStoreKeyFor { .. } => (24, true),
+            Q::UnwrapStoreKey { .. } => (25, true),
+            Q::GetStoreSubkeys { .. } => (26, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 24;
+    const REQUEST_VARIANTS: usize = 27;
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1367,6 +1376,24 @@ mod tests {
                     signature: vec![19u8; 64],
                 }),
             },
+            R::StoreKeyWrapped {
+                request_id: 45,
+                store_verifying_key: [17u8; 32],
+                result: Err("no".into()),
+            },
+            R::StoreKeyRecovered {
+                request_id: 46,
+                store_verifying_key: [17u8; 32],
+                result: Ok(()),
+            },
+            R::StoreSubkeys {
+                request_id: 47,
+                store_verifying_key: [17u8; 32],
+                result: Ok(StoreSubkeyInfo {
+                    inbox_public_key: [20u8; 32],
+                    record_public_key: vec![21u8; 8],
+                }),
+            },
         ]
     }
 
@@ -1393,6 +1420,7 @@ mod tests {
                 request_id: 42,
                 ghostkey_fingerprint: fp(),
                 peer_public_keys: vec![vec![1u8; 32]],
+                store_verifying_key: Some([17u8; 32]),
             },
             Q::StoreBuyerConversation {
                 request_id: 42,
@@ -1487,6 +1515,28 @@ mod tests {
                 request_id: 44,
                 store_verifying_key: [17u8; 32],
                 payload: vec![18u8; 8],
+            },
+            Q::WrapStoreKeyFor {
+                request_id: 45,
+                store_verifying_key: [17u8; 32],
+                backer_verifying_key: [1u8; 32],
+                scoped_payload: vec![18u8; 8],
+                signature: WrapSignature(vec![SECRET_BYTE; 64]),
+            },
+            Q::UnwrapStoreKey {
+                request_id: 46,
+                store_verifying_key: [17u8; 32],
+                backer_verifying_key: [1u8; 32],
+                scoped_payload: vec![18u8; 8],
+                signature: WrapSignature(vec![SECRET_BYTE; 64]),
+                wrapped: crate::custody::WrappedStoreKey {
+                    scheme: 1,
+                    ciphertext: vec![19u8; 48],
+                },
+            },
+            Q::GetStoreSubkeys {
+                request_id: 47,
+                store_verifying_key: [17u8; 32],
             },
         ]
     }
