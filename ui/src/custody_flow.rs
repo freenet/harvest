@@ -534,6 +534,25 @@ mod tests {
         assert_eq!(purpose(&state), None, "a declined prompt is not re-asked");
     }
 
+    /// A store with a custody request in flight gets no second one, even for
+    /// a backer not yet attempted (its backing changed mid-request).
+    /// Mutated red by removing the in-flight check.
+    #[test]
+    fn a_store_with_a_request_in_flight_gets_no_second_one() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.pending_custody.insert(
+            store_vk().to_bytes(),
+            CustodyRequest {
+                store_contract_id: vec![ID; 32],
+                backer: [0; 32],
+                fingerprint: "another".into(),
+                purpose: CustodyPurpose::Wrap,
+            },
+        );
+        assert_eq!(purpose(&state), None);
+    }
+
     /// A retired backing is the custody tombstone: a store whose only
     /// backing is retired asks for nothing, even with its copy still visible
     /// to a stale reader.

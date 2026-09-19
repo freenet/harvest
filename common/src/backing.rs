@@ -1606,6 +1606,61 @@ mod tests {
         assert_eq!(late, merged);
     }
 
+    /// A copy goes with its backing when the bound cuts it, so the merge of
+    /// two valid states is valid: the one survivor is not a copy for a key
+    /// that no longer backs the store. Mutated red by keeping copies of
+    /// unbacked keys in `normalize_copies`.
+    #[test]
+    fn a_cut_backing_takes_its_copies_with_it() {
+        let mut keys: Vec<SigningKey> = (0..MAX_BACKINGS as u32 + 1)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&(i + 1000).to_le_bytes());
+                SigningKey::from_bytes(&seed)
+            })
+            .collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        let largest = keys.last().unwrap().clone();
+        let a = with_copies(
+            vec![backing(&largest, 100)],
+            vec![],
+            vec![copy(&largest, 7, 1)],
+        )
+        .unwrap();
+        let b = with(
+            keys[..MAX_BACKINGS]
+                .iter()
+                .map(|k| backing(k, 100))
+                .collect(),
+            vec![],
+        );
+        let mut ab = a.clone();
+        ab.merge(&a.clone(), &params(), &b)
+            .expect("a merge of valid states succeeds");
+        assert!(!ab
+            .backings
+            .records
+            .contains_key(&Bytes32(largest.verifying_key().to_bytes())));
+        assert!(
+            ab.copies.records.is_empty(),
+            "the copy went with its backing"
+        );
+        ab.verify(&ab, &params()).expect("and the result is valid");
+    }
+
+    /// A copy the store key signed that names another store is refused: the
+    /// signature alone does not say which store the seed belongs to. Mutated
+    /// red by removing the store check from `AuthorizedCopy::verify`.
+    #[test]
+    fn a_copy_naming_another_store_is_refused() {
+        let mut other = copy(&ghost(1), 7, 1);
+        other.copy.store = ghost(8).verifying_key();
+        let (scoped_payload, signature) = store_sign(&store_key(), &other.copy);
+        other.scoped_payload = scoped_payload;
+        other.signature = signature;
+        assert!(with_copies(vec![backing(&ghost(1), 100)], vec![], vec![other]).is_err());
+    }
+
     /// At most `MAX_SCOPES_PER_BACKER` copies per backer, the smallest scopes,
     /// and the merge stays total past it. Mutated red by keeping the largest
     /// scopes.

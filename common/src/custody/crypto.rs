@@ -260,3 +260,55 @@ pub fn record_public_key_der(store_sk: &SigningKey) -> Result<Vec<u8>, CustodyEr
         .map(|der| der.as_bytes().to_vec())
         .map_err(|_| CustodyError::Malformed("rsa public key encode"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    /// What a copy opens to is kept only if it IS the store's key: a copy
+    /// sealed under this store's wrapping key over another key's seed (which
+    /// only the store key's holder could make, since `wrap_store_key`
+    /// refuses) is refused, not handed back. Mutated red by removing the
+    /// check at the end of `unwrap_store_key`.
+    #[test]
+    fn a_copy_that_opens_to_another_key_is_refused() {
+        let ghost = SigningKey::from_bytes(&[1; 32]);
+        let store = SigningKey::from_bytes(&[2; 32]);
+        let other = SigningKey::from_bytes(&[3; 32]);
+        let scope = WrapScope::current();
+        let scoped = ghostkey_common::to_cbor(&ghostkey_common::ScopedPayload {
+            requestor: scope.requestor(),
+            payload: wrap_message(&store.verifying_key()),
+        })
+        .unwrap();
+        let signature = ghost.sign(&scoped).to_bytes();
+        let secret = WrapSecret::from_sign_result(
+            &scoped,
+            &signature,
+            &ghost.verifying_key(),
+            &store.verifying_key(),
+            scope,
+        )
+        .unwrap();
+        let (key, nonce) = secret.aead_key_nonce();
+        let ciphertext = Aes256Gcm::new_from_slice(key.as_slice())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: other.to_bytes().as_slice(),
+                    aad: &secret.aad(),
+                },
+            )
+            .unwrap();
+        let wrapped = WrappedStoreKey {
+            scheme: SCHEME_V1,
+            ciphertext,
+        };
+        assert_eq!(
+            unwrap_store_key(&wrapped, &secret).unwrap_err(),
+            CustodyError::NotThisStoresKey
+        );
+    }
+}
