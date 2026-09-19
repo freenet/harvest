@@ -31,7 +31,7 @@ pub use bitcoin_delegate::{
     DerivedAddress, PaymentXpubStatus, WatchedPayment,
 };
 pub use delegate::{
-    ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
+    BackupString, ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
     HarvestDelegateResponse, ImportedConversation, RecalledConversation, RememberedStore,
     StoreRegistration, TransactionRecord,
 };

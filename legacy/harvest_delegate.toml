@@ -151,3 +151,10 @@ description = "Superseded by harvest#52. This delegate gained the remembered-sto
 date = "2026-09-18"
 code_hash = "da3c9ca1819663314512aa08378374a88be9701a83f0034c37af9cbc81e1c7a0"
 delegate_key = "87c497a6869b2ac1cfd9ac7e17f48d63b051e0b0331cbc43a076cd016636f73e"
+
+[[entry]]
+version = "V16"
+date = "2026-09-18"
+description = "Superseded by harvest#94 (secrets in the UI's logs). No behaviour changed; what moved is `Debug`. `ConversationKey` and `RecalledConversation` now write their `Debug` by hand and print `redacted` for the two direction keys, and the conversation backup string travels as `BackupString`, a `#[serde(transparent)]` newtype over `String` (so the wire is unchanged and a backup made by either build imports into the other) whose `Debug` prints `BackupString(redacted)`. The delegate compiles these impls, so its code hash moved; the three contracts did not, because the new `log_summary` helpers are behind `harvest-common`'s `log-summary` feature, which only the UI enables. The parameters are unchanged (empty). As before, nothing drives the export handshake yet, so the secrets this generation holds do not survive the re-key; pre-launch, no user holds data under it."
+code_hash = "4fae20e120a968fe6651529ed8eb36fa04bd98a8fcc6c52f69206cdb6fae1444"
+delegate_key = "8a560f6bbe11d50c0bd37247d83c6f626d97ff6c292ee66723aaa0b114f791cd"

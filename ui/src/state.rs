@@ -3026,7 +3026,7 @@ impl AppState {
     ) -> harvest_common::HarvestDelegateRequest {
         harvest_common::HarvestDelegateRequest::ImportBuyerConversation {
             request_id: self.next_messaging_request_id(),
-            backup,
+            backup: harvest_common::BackupString(backup),
         }
     }
 
@@ -5437,7 +5437,7 @@ impl AppState {
 
             HarvestDelegateResponse::BuyerConversationExported {
                 request_id, result, ..
-            } => self.on_conversation_exported(request_id, result),
+            } => self.on_conversation_exported(request_id, result.map(|backup| backup.0)),
 
             HarvestDelegateResponse::BuyerConversationImported { result, .. } => {
                 self.on_conversation_imported(result)
@@ -5500,7 +5500,7 @@ impl AppState {
             }
 
             _ => {
-                info!("Unhandled delegate response: {:?}", response);
+                info!("Unhandled delegate response: {}", response.log_summary());
             }
         }
     }
@@ -6077,7 +6077,10 @@ impl AppState {
             // ghostkey-common bump.
             #[allow(clippy::wildcard_enum_match_arm)]
             _ => {
-                info!("Unhandled ghostkey response: {:?}", response);
+                info!(
+                    "Unhandled ghostkey response: {}",
+                    crate::gateway::response_handler::ghostkey_response_summary(&response)
+                );
             }
         }
     }
@@ -6242,7 +6245,10 @@ impl AppState {
             // than failing to build. Worth re-auditing on every bump.
             #[allow(clippy::wildcard_enum_match_arm)]
             _ => {
-                info!("Unhandled bitcoin delegate response: {:?}", response);
+                info!(
+                    "Unhandled bitcoin delegate response: {}",
+                    response.log_summary()
+                );
             }
         }
     }
@@ -12490,7 +12496,9 @@ mod buyer_backup_tests {
             request_id: asked(&request),
             store_contract_id: STORE.to_vec(),
             buyer_public_key: tag,
-            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+            result: Ok(harvest_common::BackupString(
+                "harvest-conv-backup-v2:abc".to_string(),
+            )),
         });
 
         let on_screen = state
@@ -12519,7 +12527,9 @@ mod buyer_backup_tests {
             request_id,
             store_contract_id: STORE.to_vec(),
             buyer_public_key: tag,
-            result: Ok("harvest-conv-backup-v2:SECRETMATERIAL".to_string()),
+            result: Ok(harvest_common::BackupString(
+                "harvest-conv-backup-v2:SECRETMATERIAL".to_string(),
+            )),
         });
         let printed = format!("{:?}", state.conversation_backup_on_screen);
         assert!(
@@ -12765,7 +12775,9 @@ mod buyer_backup_tests {
             request_id: 4321,
             store_contract_id: STORE.to_vec(),
             buyer_public_key: [9u8; 32],
-            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+            result: Ok(harvest_common::BackupString(
+                "harvest-conv-backup-v2:abc".to_string(),
+            )),
         });
         assert!(
             state.conversation_backup_on_screen.is_none(),
@@ -12785,7 +12797,9 @@ mod buyer_backup_tests {
             request_id,
             store_contract_id: ANOTHER_STORE.to_vec(),
             buyer_public_key: [0xFF; 32],
-            result: Ok("harvest-conv-backup-v2:abc".to_string()),
+            result: Ok(harvest_common::BackupString(
+                "harvest-conv-backup-v2:abc".to_string(),
+            )),
         });
         let on_screen = state
             .conversation_backup_on_screen

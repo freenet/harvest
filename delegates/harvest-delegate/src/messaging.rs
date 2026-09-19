@@ -51,8 +51,8 @@
 use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{
-    ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateResponse,
-    ImportedConversation, RecalledConversation, RequestId,
+    BackupString, ConversationKey, ConversationSecret, EvictedConversation,
+    HarvestDelegateResponse, ImportedConversation, RecalledConversation, RequestId,
 };
 use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -775,10 +775,13 @@ pub(crate) fn export_buyer_conversation<S: SecretStore>(
         ));
     };
 
-    exported(encode_backup(&BuyerConversationBackupV2 {
-        store_contract_id: id,
-        conversation,
-    }))
+    exported(
+        encode_backup(&BuyerConversationBackupV2 {
+            store_contract_id: id,
+            conversation,
+        })
+        .map(BackupString),
+    )
 }
 
 /// Take one saved backup and make its conversation readable here.
@@ -1788,7 +1791,7 @@ mod buyer_conversation_backup_tests {
         }
     }
 
-    fn exported(response: &HarvestDelegateResponse) -> &Result<String, String> {
+    fn exported(response: &HarvestDelegateResponse) -> &Result<BackupString, String> {
         match response {
             HarvestDelegateResponse::BuyerConversationExported { result, .. } => result,
             other => panic!("expected BuyerConversationExported, got {other:?}"),
@@ -1822,6 +1825,7 @@ mod buyer_conversation_backup_tests {
         exported(&export_buyer_conversation(store, 1, store_contract_id, tag))
             .as_ref()
             .expect("must export")
+            .0
             .clone()
     }
 

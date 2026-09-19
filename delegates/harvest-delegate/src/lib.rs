@@ -381,7 +381,7 @@ mod boundary_tests {
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ImportBuyerConversation {
                 request_id: 1,
-                backup: "harvest-conv-backup-v2:whatever".into(),
+                backup: harvest_common::BackupString("harvest-conv-backup-v2:whatever".into()),
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::MarkConversationBackedUp {

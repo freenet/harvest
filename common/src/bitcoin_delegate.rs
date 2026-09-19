@@ -293,6 +293,35 @@ pub enum BitcoinDelegateResponse {
     },
 }
 
+#[cfg(any(test, feature = "log-summary"))]
+impl BitcoinDelegateResponse {
+    /// A one-line description for a log: the variant and its request id.
+    ///
+    /// Same reasoning as `HarvestDelegateResponse::log_summary`
+    /// (harvest#94): nothing here is a spending key, but the payment xpub
+    /// names every address a seller will ever be paid at, and a log line is
+    /// not where to decide that each time. Exhaustive, so a new variant has
+    /// to be given a line.
+    pub fn log_summary(&self) -> String {
+        use BitcoinDelegateResponse as R;
+        let (name, request_id) = match self {
+            R::Watched { request_id, .. } => ("Watched", Some(request_id)),
+            R::Unwatched { request_id, .. } => ("Unwatched", Some(request_id)),
+            R::WatchList { .. } => ("WatchList", None),
+            R::OrderAssociated { request_id, .. } => ("OrderAssociated", Some(request_id)),
+            R::BridgeConfigured { request_id, .. } => ("BridgeConfigured", Some(request_id)),
+            R::Bridge { .. } => ("Bridge", None),
+            R::PaymentXpubSet { request_id, .. } => ("PaymentXpubSet", Some(request_id)),
+            R::PaymentXpub { .. } => ("PaymentXpub", None),
+            R::OrderAddress { request_id, .. } => ("OrderAddress", Some(request_id)),
+        };
+        match request_id {
+            Some(id) => format!("{name} (request {id})"),
+            None => name.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -242,7 +242,7 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         ),
 
         HarvestDelegateRequest::ImportBuyerConversation { request_id, backup } => {
-            crate::messaging::import_buyer_conversation(store, request_id, &backup)
+            crate::messaging::import_buyer_conversation(store, request_id, &backup.0)
         }
 
         HarvestDelegateRequest::MarkConversationBackedUp {
@@ -1100,7 +1100,7 @@ mod origin_gating_tests {
             Some(&a_different_web_app()),
             HarvestDelegateRequest::ImportBuyerConversation {
                 request_id: 3,
-                backup: "harvest-conv-backup-v2:whatever".to_string(),
+                backup: harvest_common::BackupString("harvest-conv-backup-v2:whatever".to_string()),
             },
         );
         assert!(refusal_message(&response).contains("Harvest web app"));
