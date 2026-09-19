@@ -36,7 +36,7 @@ getrandom = { workspace = true }
 # tables for speed on an operation that runs twice per invoice, and the
 # compiled bytes of this module are the delegate's on-network address.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
-hmac = { version = "0.12", default-features = false }
+hmac = { version = "0.13", default-features = false }
 ripemd = { version = "0.1", default-features = false }
 # "check" for the Base58Check envelope every extended key is wrapped in.
 bs58 = { workspace = true, features = ["check"] }
