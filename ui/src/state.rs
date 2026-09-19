@@ -273,6 +273,14 @@ pub struct AppState {
     /// second store. See `backing_flow`.
     pub store_creation_in_flight: Option<String>,
 
+    /// A backing signed by both keys for a creation whose publish then
+    /// failed, kept so a retry reuses it (#98 review, M1): the Harvest
+    /// delegate answers the same store key to the retry (see
+    /// `CreateStoreKey`), and with this the retry asks for no signature
+    /// again and publishes the SAME store. Cleared once a store is
+    /// published, or when the delegate answers a different key.
+    pub resumable_backing: Option<harvest_common::backing::AuthorizedBacking>,
+
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -434,7 +442,11 @@ pub(crate) fn spawn_store_creation(
         match crate::gateway::store_ops::create_store_contracts(pending, backing).await {
             // Published: the store now exists, so the single-flight marker
             // is released (see `store_creation_in_flight`).
-            Ok(()) => crate::gateway::APP_STATE.write().store_creation_in_flight = None,
+            Ok(()) => {
+                let mut state = crate::gateway::APP_STATE.write();
+                state.store_creation_in_flight = None;
+                state.resumable_backing = None;
+            }
             Err(e) => {
                 dioxus::logger::tracing::error!("Store creation failed: {}", e);
                 crate::gateway::APP_STATE.write().store_creation_failed(&e);
@@ -5875,8 +5887,21 @@ impl AppState {
             },
 
             HarvestDelegateResponse::Error { message } => {
-                self.notifications
-                    .push(format!("Delegate error: {message}"));
+                // A creation waiting on `CreateStoreKey` never gets its
+                // answer once the delegate has refused (#98 review, L1): an
+                // Error carries no request id, and the only request a
+                // creation has outstanding with this delegate at that stage
+                // is that one.
+                if self
+                    .pending_store_creation
+                    .as_ref()
+                    .is_some_and(|p| p.store_verifying_key.is_none())
+                {
+                    self.store_creation_failed(&format!("the Harvest delegate refused: {message}"));
+                } else {
+                    self.notifications
+                        .push(format!("Delegate error: {message}"));
+                }
             }
 
             _ => {

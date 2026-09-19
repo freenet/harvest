@@ -80,8 +80,12 @@ pub(crate) const NO_BLOCK_FOR_BACKING: &str =
 /// (`harvest_common::backing::current_backing`), and a buyer's node can be a
 /// block or two behind the seller's. Dated at the seller's tip, a new store
 /// would read as unbacked to exactly those buyers until they caught up
-/// (harvest#93 review, Should Fix 5). Six blocks is about an hour, and the
-/// block only has to prove the backing was written after it.
+/// (harvest#93 review, Should Fix 5). Six blocks is about an hour.
+///
+/// The block is also how readers ORDER backings (the highest is current),
+/// so a new backing dated six blocks back ranks below one dated within the
+/// last hour. That costs nothing in practice: a new backing becomes current
+/// by retiring the old one, not by outranking it.
 pub(crate) const BACKING_BLOCK_DEPTH: usize = 6;
 
 /// The block a backing made now is dated to: [`BACKING_BLOCK_DEPTH`] behind
@@ -129,12 +133,11 @@ impl AppState {
         if self.store_creation_in_flight.is_some() {
             return Err("a store is already being created; wait for it to finish".into());
         }
-        if let Some(name) = self.store_backed_by(&seller_verifying_key_bytes) {
-            return Err(format!(
-                "this Ghost Key already backs {name}. A Ghost Key backs one store at a time: \
-                 retire it there first, or use a different Ghost Key"
-            ));
-        }
+        // Section 6.2 is checked once the store key is known
+        // (`on_store_key_created`), not here: a retry of a creation whose
+        // store already exists must not be refused by that very store, and
+        // until the delegate answers, this tab cannot tell which store a
+        // retry resumes (#98 review, M1).
         let network = crate::gateway::bitcoin_config::default_network();
         if self
             .bitcoin
@@ -163,11 +166,17 @@ impl AppState {
     }
 
     /// The name of a loaded store whose current backing is the Ghost Key
-    /// `backer`, if any: the seller-facing half of section 6.2.
-    pub(crate) fn store_backed_by(&self, backer: &[u8; 32]) -> Option<String> {
+    /// `backer`, if any: the seller-facing half of section 6.2. A store
+    /// owned by `except` (the store a retry is re-creating) does not count.
+    pub(crate) fn store_backed_by(
+        &self,
+        backer: &[u8; 32],
+        except: Option<[u8; 32]>,
+    ) -> Option<String> {
         self.browsing_stores.values().find_map(|store| {
             let view = store.backing.as_ref()?;
-            (view.backer == *backer).then(|| {
+            let owner = store.backing_state.owner.map(|k| k.to_bytes());
+            (view.backer == *backer && (except.is_none() || owner != except)).then(|| {
                 store
                     .info
                     .as_ref()
@@ -190,6 +199,22 @@ impl AppState {
             .push(format!("Store creation failed: {why}"));
     }
 
+    /// The seller gave up on a creation that is not finishing (#98 review,
+    /// L1): release it and withdraw the signatures it asked for. The store
+    /// key and any signed backing are kept, so trying again resumes it.
+    pub(crate) fn cancel_store_creation(&mut self) {
+        self.pending_signatures.retain(|pending| {
+            !matches!(
+                pending,
+                PendingSignature::BackingStatement(_) | PendingSignature::BackingAcceptance(_)
+            )
+        });
+        self.store_creation_in_flight = None;
+        self.pending_store_creation = None;
+        self.notifications
+            .push("Store creation cancelled. Trying again picks up where it stopped.".to_string());
+    }
+
     /// The Harvest delegate answered `CreateStoreKey`.
     ///
     /// Only the answer to the request the pending creation made is taken: a
@@ -208,7 +233,28 @@ impl AppState {
         }
         match result {
             Ok(key) => {
-                pending.store_verifying_key = Some(key);
+                // The delegate answers the same key to a retry; a backing
+                // kept for another key is for a creation that is gone.
+                if self
+                    .resumable_backing
+                    .as_ref()
+                    .is_some_and(|b| b.statement.store.to_bytes() != key)
+                {
+                    self.resumable_backing = None;
+                }
+                // Section 6.2 again, now the key is known: a store of this
+                // key is the one being resumed, not another store.
+                let backer = pending.seller_verifying_key_bytes;
+                if let Some(name) = self.store_backed_by(&backer, Some(key)) {
+                    self.store_creation_failed(&format!(
+                        "this Ghost Key already backs {name}. A Ghost Key backs one store at a \
+                         time: retire it there first, or use a different Ghost Key"
+                    ));
+                    return;
+                }
+                if let Some(pending) = self.pending_store_creation.as_mut() {
+                    pending.store_verifying_key = Some(key);
+                }
                 self.start_store_creation_if_ready();
             }
             Err(why) => {
@@ -224,6 +270,16 @@ impl AppState {
     /// the backing being dated to nothing: readers order backings by that
     /// block (`harvest_common::backing::current_backing`).
     pub(crate) fn begin_backing(&mut self, creation: PendingStoreCreation) {
+        // A retry: the backing both keys signed last time is reused, so no
+        // signature is asked for again and the same store is published.
+        if let Some(backing) = self.resumable_backing.clone().filter(|b| {
+            Some(b.statement.store.to_bytes()) == creation.store_verifying_key
+                && b.statement.backer.to_bytes() == creation.seller_verifying_key_bytes
+                && b.verify(&b.statement.store).is_ok()
+        }) {
+            self.publish_backed_store(creation, backing);
+            return;
+        }
         let Some(store_key) = creation
             .store_verifying_key
             .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
@@ -304,10 +360,15 @@ impl AppState {
             self.store_creation_failed(&format!("the backing did not verify ({why})."));
             return;
         }
+        self.resumable_backing = Some(backing.clone());
+        self.publish_backed_store(pending.creation, backing);
+    }
+
+    fn publish_backed_store(&mut self, creation: PendingStoreCreation, backing: AuthorizedBacking) {
         #[cfg(target_arch = "wasm32")]
-        crate::state::spawn_store_creation(pending.creation, backing);
+        crate::state::spawn_store_creation(creation, backing);
         #[cfg(not(target_arch = "wasm32"))]
-        self.created_backings.push((pending.creation, backing));
+        self.created_backings.push((creation, backing));
     }
 
     /// Queue a listing for the store key's signature, for the store
@@ -378,6 +439,24 @@ impl AppState {
                     .collect(),
             ))
         })
+    }
+
+    /// Whether the Ghost Key `fingerprint` has a store made before revision 2
+    /// whose state has not arrived yet, and no revision-2 store: My Store
+    /// waits for it rather than offering "Create Store", which would make a
+    /// second store instead of moving this one (#98 review, L3).
+    pub(crate) fn legacy_store_loading(&self, fingerprint: &str) -> bool {
+        let Some(stores) = self.my_stores.get(fingerprint) else {
+            return false;
+        };
+        !stores.iter().any(|s| s.store_verifying_key.is_some())
+            && stores.iter().any(|s| {
+                s.store_verifying_key.is_none()
+                    && self
+                        .browsing_stores
+                        .get(&s.store_contract_id)
+                        .is_none_or(|loaded| loaded.owner.is_none())
+            })
     }
 
     /// Move the Ghost Key `fingerprint`'s pre-revision-2 store onto a new
@@ -677,6 +756,137 @@ pub(crate) mod tests {
     /// A Ghost Key backs one store at a time (section 6.2): creating or
     /// moving a store with one that already backs a loaded store is refused,
     /// with the store named. Mutated red by removing the check.
+    /// Start a creation for `ghost()` and hand it every input but the store
+    /// key.
+    fn started(state: &mut AppState) -> u64 {
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, tip());
+        let request = state
+            .begin_store_creation(
+                FINGERPRINT.to_string(),
+                ghost().verifying_key().to_bytes(),
+                StoreDetails {
+                    store_name: "Bean Shop".to_string(),
+                    description: String::new(),
+                },
+                Vec::new(),
+            )
+            .expect("started");
+        let pending = state.pending_store_creation.as_mut().unwrap();
+        pending.certificate_pem = "CERT".to_string();
+        pending.rsa_public_key_der = Some(vec![1]);
+        request
+    }
+
+    /// A publish that failed after both keys signed the backing is retried
+    /// with the SAME store key (the delegate resumes it) and the SAME
+    /// backing, asking for no signature again, so the same store is
+    /// published (#98 review, M1). Mutated red by not keeping the backing
+    /// and by not reusing it.
+    #[test]
+    fn a_retry_after_a_failed_publish_reuses_the_key_and_the_backing() {
+        let mut state = AppState::default();
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        let dated = queued_statement(&state).expect("asked to back");
+        state.on_ghostkey_response(vault_answer(&ghost(), &dated));
+        state.on_delegate_response(store_key_answer(&store_key(), &dated));
+        let (_, first) = state.created_backings.pop().expect("published once");
+        // The PUT failed.
+        state.store_creation_failed("the node refused the PUT");
+        assert!(state.store_creation_in_flight.is_none());
+
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        assert!(
+            state.pending_signatures.is_empty(),
+            "no signature is asked for again"
+        );
+        let (_, again) = state.created_backings.pop().expect("published again");
+        assert_eq!(again, first, "the same backing, so the same store");
+    }
+
+    /// The store a retry is re-creating does not count against section
+    /// 6.2: its Ghost Key backs it, and that is the point. Another store it
+    /// backs still does. Mutated red by dropping the `except` owner.
+    #[test]
+    fn a_retry_is_not_refused_by_the_store_it_is_re_creating() {
+        let mut state = AppState::default();
+        load_backed(&mut state, 9, 0x62, vec![signed_backing(0x62, 0x61, 10)]);
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        assert!(
+            state.store_creation_in_flight.is_some(),
+            "resumed, not refused: {:?}",
+            state.notifications
+        );
+
+        // A different key answered while the Ghost Key backs that store: a
+        // second store, refused.
+        let mut state = AppState::default();
+        load_backed(&mut state, 9, 0x62, vec![signed_backing(0x62, 0x61, 10)]);
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(SigningKey::from_bytes(&[0x63; 32])
+                .verifying_key()
+                .to_bytes()),
+        });
+        assert!(state.store_creation_in_flight.is_none());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("already backs")));
+    }
+
+    /// A delegate Error while the creation waits for its store key releases
+    /// it; Cancel releases it at any stage and withdraws its signatures
+    /// (#98 review, L1). Mutated red by removing each.
+    #[test]
+    fn a_stalled_creation_can_be_released() {
+        let mut state = AppState::default();
+        started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::Error {
+            message: "no".into(),
+        });
+        assert!(state.store_creation_in_flight.is_none());
+
+        let mut state = AppState::default();
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        assert!(!state.pending_signatures.is_empty(), "waiting on the vault");
+        state.cancel_store_creation();
+        assert!(state.store_creation_in_flight.is_none());
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// A store made before revision 2 that has not loaded holds back
+    /// "Create Store"; once loaded it is offered a move instead (#98
+    /// review, L3). Mutated red by returning false.
+    #[test]
+    fn an_unloaded_legacy_store_holds_back_creation() {
+        let mut state = AppState::default();
+        state
+            .my_stores
+            .insert(FINGERPRINT.to_string(), vec![legacy_registration()]);
+        assert!(state.legacy_store_loading(FINGERPRINT));
+        let id = legacy_registration().store_contract_id;
+        state.browsing_stores.entry(id).or_default().owner = Some([0x61; 32]);
+        assert!(!state.legacy_store_loading(FINGERPRINT));
+        assert!(!AppState::default().legacy_store_loading(FINGERPRINT));
+    }
+
     #[test]
     fn a_ghost_key_that_already_backs_a_store_cannot_back_another() {
         let mut state = AppState::default();
@@ -697,16 +907,26 @@ pub(crate) mod tests {
             description: String::new(),
             encryption_public_key: None,
         });
-        let err = state
+        // Checked once the store key is known (a retry must be able to
+        // resume its own store; see `a_retry_is_not_refused_...`).
+        let request = state
             .begin_store_creation(
                 FINGERPRINT.to_string(),
                 ghost().verifying_key().to_bytes(),
                 StoreDetails::default(),
                 Vec::new(),
             )
-            .expect_err("refused");
-        assert!(err.contains("already backs Bean Shop"), "{err}");
+            .expect("started");
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("already backs Bean Shop")));
         assert!(state.store_creation_in_flight.is_none());
+        assert!(queued_statement(&state).is_none(), "nothing signed");
     }
 
     /// With no block to date the backing to, nothing starts, and so no store

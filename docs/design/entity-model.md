@@ -1791,12 +1791,22 @@ left open, and what phase 1a deliberately does not do yet.
   first, or use a different Ghost Key."). Phase 1a says the same thing when
   a creation or a move is refused for that reason; the Settings screen it
   belongs on does not exist yet.
-- **Creation is single-flight within a session.** A creation or move holds
-  `store_creation_in_flight` from the moment it starts until the store is
-  published or it fails, and a Ghost Key that already backs a loaded store
-  is refused. A reload in the middle of a creation clears the marker; the
-  second check is what then stops a duplicate, once the first store has
-  loaded.
+- **Creation is single-flight, and a retry resumes it (#98 review, M1).**
+  Within a tab, a creation or move holds `store_creation_in_flight` from the
+  moment it starts until the store is published, it fails, or the seller
+  cancels it. Across tabs and reloads, the Harvest delegate remembers the
+  store key it minted for a Ghost Key's creation until `RegisterStore`
+  names it, and answers the same key to every `CreateStoreKey` for that
+  Ghost Key until then. The store code, and so the contract id, derives
+  from the store key, so a second tab or a retry re-publishes the SAME
+  store rather than making a second one. A backing both keys signed is kept
+  for the session and reused by a retry, so no signature is asked for
+  again. The section 6.2 check runs once the key is known, and a store
+  owned by that key does not count against it, so a retry is never refused
+  by the store it is re-creating. A delegate error while a creation waits
+  for its key releases it, and a Cancel control releases a creation at any
+  stage. While a store made before revision 2 has not loaded, My Store
+  waits rather than offering "Create Store".
 - **New backings are dated six blocks behind the newest known block**
   (`BACKING_BLOCK_DEPTH`), so a buyer whose node is a little behind the
   seller's does not see a new store as unbacked, and every loaded store's

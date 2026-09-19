@@ -49,6 +49,45 @@ use harvest_common::delegate::{HarvestDelegateResponse, RequestId, StoreKeySigna
 /// Where every store key's secret lives.
 pub(crate) const STORE_KEY_PREFIX: &str = "harvest:store_sk:";
 
+/// Where the store key of a Ghost Key's unfinished store creation is
+/// remembered, until `RegisterStore` names it (#98 review, M1). Holds the
+/// 32-byte verifying key, not a secret; an empty value means none.
+pub(crate) const CREATION_PREFIX: &str = "harvest:store_creation:";
+
+/// The secret key a Ghost Key's unfinished creation is remembered under.
+pub(crate) fn creation_secret(fingerprint: &str) -> Vec<u8> {
+    format!("{CREATION_PREFIX}{fingerprint}").into_bytes()
+}
+
+/// The store key of `fingerprint`'s unfinished store creation, if one is
+/// remembered and this delegate still holds its key.
+pub(crate) fn unfinished_creation<S: SecretStore>(
+    secrets: &S,
+    fingerprint: &str,
+) -> Option<SigningKey> {
+    let bytes: [u8; 32] = secrets
+        .get_secret(&creation_secret(fingerprint))?
+        .try_into()
+        .ok()?;
+    load(secrets, &VerifyingKey::from_bytes(&bytes).ok()?)
+}
+
+/// `fingerprint`'s store creation finished with the store key `store`:
+/// forget it, so the next creation mints a new key. A registration naming
+/// another key (an older store re-registered) leaves it alone.
+pub(crate) fn finish_creation<S: SecretStore>(
+    secrets: &mut S,
+    fingerprint: &str,
+    store: &[u8; 32],
+) {
+    if secrets
+        .get_secret(&creation_secret(fingerprint))
+        .is_some_and(|held| held.as_slice() == store.as_slice())
+    {
+        secrets.set_secret(&creation_secret(fingerprint), &[]);
+    }
+}
+
 /// How many store keys one delegate holds.
 ///
 /// A seller has one store and, rarely, a few; this bounds what a UI stuck in a
@@ -85,15 +124,23 @@ pub(crate) fn keep<S: SecretStore>(secrets: &mut S, key: &SigningKey) -> bool {
     secrets.set_secret(&store_key_secret(&key.verifying_key()), key.as_bytes())
 }
 
-/// Mint a store key.
+/// Mint a store key, or, for a Ghost Key whose last store creation did not
+/// finish, answer the key that creation minted (see `CreateStoreKey`).
 pub(crate) fn create<S: SecretStore>(
     secrets: &mut S,
     request_id: RequestId,
+    fingerprint: Option<&str>,
 ) -> HarvestDelegateResponse {
     let refuse = |message: String| HarvestDelegateResponse::StoreKeyCreated {
         request_id,
         result: Err(message),
     };
+    if let Some(key) = fingerprint.and_then(|fp| unfinished_creation(secrets, fp)) {
+        return HarvestDelegateResponse::StoreKeyCreated {
+            request_id,
+            result: Ok(key.verifying_key().to_bytes()),
+        };
+    }
     let held = secrets.list_secrets(STORE_KEY_PREFIX.as_bytes()).len();
     if held >= MAX_STORE_KEYS {
         return refuse(format!(
@@ -110,6 +157,12 @@ pub(crate) fn create<S: SecretStore>(
     let key = SigningKey::from_bytes(&seed);
     if !keep(secrets, &key) {
         return refuse("the store key could not be saved, so no store was created".into());
+    }
+    if let Some(fp) = fingerprint {
+        // Written before the UI can publish anything under this key, so a
+        // retry from any tab resumes it. Best effort: without it a retry
+        // mints a new key, which is what happened before.
+        secrets.set_secret(&creation_secret(fp), key.verifying_key().as_bytes());
     }
     HarvestDelegateResponse::StoreKeyCreated {
         request_id,
@@ -155,7 +208,7 @@ mod tests {
     use harvest_common::listing::verify_scoped_signature;
 
     fn created(secrets: &mut MemSecrets) -> VerifyingKey {
-        match create(secrets, 7) {
+        match create(secrets, 7, None) {
             HarvestDelegateResponse::StoreKeyCreated {
                 request_id: 7,
                 result: Ok(bytes),
@@ -244,9 +297,40 @@ mod tests {
         let mut secrets = MemSecrets::default();
         secrets.writes_fail = true;
         assert!(matches!(
-            create(&mut secrets, 1),
+            create(&mut secrets, 1, None),
             HarvestDelegateResponse::StoreKeyCreated { result: Err(_), .. }
         ));
+    }
+
+    /// A Ghost Key's unfinished store creation gets the SAME key back on
+    /// every retry, from any tab, until the store is registered; then a new
+    /// one (#98 review, M1). Mutated red by skipping the lookup in `create`
+    /// and by never finishing.
+    #[test]
+    fn a_retried_creation_gets_the_same_store_key_until_registered() {
+        let mut secrets = MemSecrets::default();
+        let key = |r: HarvestDelegateResponse| match r {
+            HarvestDelegateResponse::StoreKeyCreated { result: Ok(k), .. } => k,
+            other => panic!("expected a store key, got {other:?}"),
+        };
+        let first = key(create(&mut secrets, 1, Some("fp-a")));
+        assert_eq!(key(create(&mut secrets, 2, Some("fp-a"))), first, "resumed");
+        assert_ne!(
+            key(create(&mut secrets, 3, Some("fp-b"))),
+            first,
+            "per Ghost Key"
+        );
+        assert_ne!(key(create(&mut secrets, 4, None)), first, "an old UI mints");
+
+        // Another key registered for fp-a does not end it; its own does.
+        finish_creation(&mut secrets, "fp-a", &[9u8; 32]);
+        assert_eq!(key(create(&mut secrets, 5, Some("fp-a"))), first);
+        finish_creation(&mut secrets, "fp-a", &first);
+        assert_ne!(
+            key(create(&mut secrets, 6, Some("fp-a"))),
+            first,
+            "finished"
+        );
     }
 
     #[test]
@@ -254,7 +338,7 @@ mod tests {
         let mut secrets = MemSecrets::default();
         let keys: Vec<VerifyingKey> = (0..MAX_STORE_KEYS).map(|_| created(&mut secrets)).collect();
         assert!(matches!(
-            create(&mut secrets, 1),
+            create(&mut secrets, 1, None),
             HarvestDelegateResponse::StoreKeyCreated { result: Err(_), .. }
         ));
         assert!(keys.iter().all(|key| load(&secrets, key).is_some()));

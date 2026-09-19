@@ -351,7 +351,22 @@ pub enum HarvestDelegateRequest {
     /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
     /// the store's state, so another device can recover it); until then a
     /// store key lives on the device that created it and nowhere else.
-    CreateStoreKey { request_id: RequestId },
+    ///
+    /// # Resumable per Ghost Key (#98 review, M1)
+    ///
+    /// With `ghostkey_fingerprint`, the delegate remembers the key it minted
+    /// for that Ghost Key's store creation until `RegisterStore` names it, and
+    /// answers the SAME key to every later `CreateStoreKey` for that Ghost
+    /// Key until then: from another tab, after a reload, or on a retry after
+    /// a failed PUT. The store's code, and so its contract id, derives from
+    /// the store key, so a retry re-publishes the same store instead of
+    /// making a second one. Without it (a request from an older UI), a fresh
+    /// key every time, as before.
+    CreateStoreKey {
+        request_id: RequestId,
+        #[serde(default)]
+        ghostkey_fingerprint: Option<String>,
+    },
 
     /// Sign `payload` with the store key named by `store_verifying_key`.
     ///
@@ -1360,7 +1375,10 @@ mod tests {
                 archived: true,
             },
             Q::ListRememberedStores,
-            Q::CreateStoreKey { request_id: 43 },
+            Q::CreateStoreKey {
+                request_id: 43,
+                ghostkey_fingerprint: Some(fp()),
+            },
             Q::SignStoreUpdate {
                 request_id: 44,
                 store_verifying_key: [17u8; 32],

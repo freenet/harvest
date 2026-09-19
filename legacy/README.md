@@ -46,6 +46,13 @@ the split in `ui/src/migrate.rs` is still yours to write.
   if the current hash already appears in a registry, which is the sign that a
   rebuild happened without the entry being appended.
 * **Never delete a row.** A removed generation is a generation nothing probes.
+* **Record what reached `main`, not every build.** A row is for WASM that
+  was committed on `main` (and so could have been published, or run by
+  anyone building `main`), recorded when a later change supersedes it. An
+  intermediate build that existed only on an open PR branch, rebuilt before
+  that PR merged, never held anyone's data and gets no row; a stack of PRs
+  merged and published together records only the generation it replaces
+  on `main`.
 * **A new generation must be migratable from every generation that has held
   user data.** Appending a row here is not enough on its own: if the change
   also alters how a record's identity or signature preimage is derived, the

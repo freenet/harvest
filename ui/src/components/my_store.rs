@@ -222,6 +222,10 @@ fn IdentityCard(
     // creation or move starts until it is published or fails.
     let creating =
         APP_STATE.read().store_creation_in_flight.as_deref() == Some(identity.fingerprint.as_str());
+    // A store made before revision 2 that has not loaded yet: offering
+    // "Create Store" now would make a second store instead of moving this
+    // one (#98 review, L3).
+    let legacy_loading = APP_STATE.read().legacy_store_loading(&identity.fingerprint);
 
     // Buyers can only reach a store through a link the seller sends them, so
     // the seller has to be able to see it. Built here rather than in rsx
@@ -334,7 +338,15 @@ fn IdentityCard(
                         if show_listing_form() { "Cancel" } else { "Add Listing" }
                     }
                 } else if creating {
-                    span { class: "text-warning", "Creating contracts..." }
+                    span { class: "text-warning", "Creating contracts... " }
+                    // A creation can stall on an answer that never comes
+                    // (#98 review, L1). Cancelling keeps the store key and
+                    // any signed backing, so trying again resumes it.
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| APP_STATE.write().cancel_store_creation(),
+                        "Cancel"
+                    }
                 } else if legacy_movable {
                     button {
                         class: "btn btn-sm btn-primary",
@@ -345,6 +357,8 @@ fn IdentityCard(
                         },
                         "Move this store"
                     }
+                } else if legacy_loading {
+                    span { class: "text-muted text-italic", "Loading your existing store…" }
                 } else {
                     button {
                         class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
@@ -846,8 +860,11 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             harvest_common::HarvestDelegateRequest::InitReputationKeys {
                 ghostkey_fingerprint: fingerprint.clone(),
             },
+            // With the Ghost Key, so a retry of a creation that did not
+            // finish gets the same store key back (#98 review, M1).
             harvest_common::HarvestDelegateRequest::CreateStoreKey {
                 request_id: store_key_request,
+                ghostkey_fingerprint: Some(fingerprint.clone()),
             },
         ] {
             let payload = match harvest_common::to_cbor(&request) {
