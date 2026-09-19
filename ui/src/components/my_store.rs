@@ -42,6 +42,72 @@ struct StoreCard {
     /// click can't queue a duplicate publish -- see
     /// `state::AppState::store_publish_in_flight`.
     publish_in_flight: bool,
+    /// What the store has published for sale, as the card lists it.
+    listings: Vec<ListingRow>,
+}
+
+/// One line in an identity card's list of listings.
+#[derive(Clone, Debug, PartialEq)]
+struct ListingRow {
+    title: String,
+    price: Option<String>,
+}
+
+fn listing_rows(listings: &[harvest_common::listing::AuthorizedListing]) -> Vec<ListingRow> {
+    listings
+        .iter()
+        .map(|l| ListingRow {
+            title: l.listing.title.clone(),
+            price: l
+                .listing
+                .price
+                .as_ref()
+                .map(|price| format!("{} {}", price.amount, price.currency)),
+        })
+        .collect()
+}
+
+/// How an identity is named on its card: the label the seller gave it in the
+/// vault, else the start of its fingerprint.
+fn identity_title(identity: &ghostkey_common::GhostKeyInfo) -> String {
+    match identity.label.as_deref().map(str::trim) {
+        Some(label) if !label.is_empty() => label.to_string(),
+        _ => truncate_fingerprint(&identity.fingerprint),
+    }
+}
+
+/// "3 listings", with the singular spelled properly.
+fn listing_count(n: usize) -> String {
+    match n {
+        1 => "1 listing".to_string(),
+        n => format!("{n} listings"),
+    }
+}
+
+/// What an identity card says about its inbox.
+fn inbox_summary(message_count: usize) -> String {
+    match message_count {
+        0 => "No one has written to this store yet.".to_string(),
+        1 => "1 message.".to_string(),
+        n => format!("{n} messages."),
+    }
+}
+
+/// What an identity card says about its reputation, and the class to show it
+/// in. Colour only where it means something: the same two classes the
+/// storefront uses, so a seller sees their record as buyers see it.
+fn reputation_summary(negative_feedback: usize) -> (&'static str, String) {
+    match negative_feedback {
+        0 => ("reputation-clean", "Clean record".to_string()),
+        1 => (
+            "reputation-negative",
+            "1 negative feedback entry".to_string(),
+        ),
+        n => (
+            "reputation-negative",
+            format!("{n} negative feedback entries"),
+        ),
+    }
 }
 
 #[component]
@@ -63,6 +129,10 @@ pub fn MyStore() -> Element {
                     has_harvest_delegate: app_state.harvest_delegate_key.is_some(),
                 }
                 ConnectAnother { in_flight: in_flight }
+                // Once, below every identity, because it is not any one
+                // identity's: one key and one address counter per device,
+                // shared by every Ghost Key and store (harvest#79).
+                super::invoice_form::DevicePaymentKey {}
             }
         }
     }
@@ -73,18 +143,19 @@ fn NoIdentity(in_flight: bool) -> Element {
     rsx! {
         div { class: "card empty-state",
             p {
-                "Harvest needs a ghostkey identity to sign your store listings."
+                "Harvest needs a Ghost Key to sign your store listings. "
+                "Each Ghost Key is one seller: one store, one inbox, one reputation."
             }
             p {
                 "If you've already created one, share it with Harvest below. "
-                "Otherwise, visit the Ghostkey Vault to create one."
+                "Otherwise, visit the Ghost Key Vault to create one."
             }
             div { style: "margin-top: 16px;",
                 button {
                     class: "btn btn-primary",
                     disabled: in_flight,
                     onclick: move |_| connect_ghostkey(),
-                    if in_flight { "Waiting for vault…" } else { "Connect a ghostkey" }
+                    if in_flight { "Waiting for vault\u{2026}" } else { "Connect a Ghost Key" }
                 }
             }
         }
@@ -95,15 +166,27 @@ fn NoIdentity(in_flight: bool) -> Element {
 /// access to ANOTHER one. Without this, the empty-state's "Connect"
 /// button disappears after the first successful share and there's no
 /// path to add a second identity.
+///
+/// Says what that means, because it is not "add an account to this shop": a
+/// second Ghost Key is a second seller, with a store, inbox and reputation of
+/// its own, and nothing carries over between them (harvest#79).
 #[component]
 fn ConnectAnother(in_flight: bool) -> Element {
     rsx! {
-        div { style: "margin-top: 16px;",
+        div { class: "form-group", style: "margin-top: 16px;",
             button {
                 class: "btn",
                 disabled: in_flight,
                 onclick: move |_| connect_ghostkey(),
-                if in_flight { "Waiting for vault…" } else { "Connect another ghostkey" }
+                if in_flight {
+                    "Waiting for vault\u{2026}"
+                } else {
+                    "Open another store under a separate Ghost Key"
+                }
+            }
+            p { class: "text-muted", style: "font-size: 0.85rem; margin-top: 6px;",
+                "The new store gets its own inbox and its own reputation, which starts \
+                 empty. Nothing carries over from the stores above."
             }
         }
     }
@@ -137,10 +220,9 @@ pub(crate) fn connect_ghostkey() {
                 dioxus::logger::tracing::warn!(
                     "Ghostkey delegate not yet registered; cannot request access"
                 );
-                APP_STATE
-                    .write()
-                    .notifications
-                    .push("Still connecting to the gateway — please try again in a moment.".into());
+                APP_STATE.write().notifications.push(
+                    "Still connecting to your Freenet node. Please try again in a moment.".into(),
+                );
                 return;
             }
         }
@@ -172,7 +254,9 @@ fn IdentityList(
 ) -> Element {
     rsx! {
         div {
-            h3 { "Your Identities" }
+            p { class: "text-muted", style: "margin-bottom: var(--space-md);",
+                "Each Ghost Key is one seller: one store, one inbox, one reputation."
+            }
 
             if !has_harvest_delegate {
                 p { class: "text-warning",
@@ -192,6 +276,14 @@ fn IdentityList(
     }
 }
 
+/// One Ghost Key, and everything that belongs to it: its store (name, share
+/// link, listings, invoices), its inbox and its reputation.
+///
+/// One card per identity because the store, mailbox and reputation contracts
+/// are all parameterised by the identity's key: they are three facets of one
+/// seller, and a layout that put them in separate places read as three
+/// independent things (harvest#79). The device-wide payment key is the one
+/// thing deliberately NOT in here; see `DevicePaymentKey`.
 #[component]
 fn IdentityCard(
     identity: ghostkey_common::GhostKeyInfo,
@@ -201,18 +293,16 @@ fn IdentityCard(
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
     let mut show_store_form = use_signal(|| false);
+    let mut show_inbox = use_signal(|| false);
     // Which store's details form is open, if any. One signal rather than one
     // per store: hooks cannot be created inside a loop.
     let mut editing_store = use_signal(|| Option::<Vec<u8>>::None);
     let fp = identity.fingerprint.clone();
-    let has_store = !stores.is_empty();
+    let title = identity_title(&identity);
 
     // Buyers can only reach a store through a link the seller sends them, so
-    // the seller has to be able to see it. Built here rather than in rsx
-    // because it needs the page URL, which native builds don't have.
+    // the seller has to be able to see it.
     //
-    // Each store is labelled: a seller with two stores otherwise gets two
-    // 44-character links with nothing to tell them apart.
     // The identity's store code. One identity, one code: the code is a
     // prefix of the key, so it names the same address for every store
     // registration this identity holds at the current generation.
@@ -275,53 +365,53 @@ fn IdentityCard(
                         .map(|browsing| browsing.certificate_status.clone())
                         .unwrap_or_default(),
                     publish_in_flight: app_state.store_publish_in_flight(&store.store_contract_id),
+                    listings: browsing
+                        .map(|browsing| listing_rows(&browsing.listings))
+                        .unwrap_or_default(),
                     contract_id: store.store_contract_id.clone(),
                 })
             })
             .collect()
     };
 
+    // The inbox and reputation this identity's card reports, read from the
+    // same store its listings go to. `None` until the identity has a store.
+    let facets = APP_STATE.read().seller_facets(&identity.fingerprint);
+
     rsx! {
-        div { class: "identity-card",
-            div {
-                span { class: "identity-name",
-                    if let Some(ref label) = identity.label {
-                        "{label}"
-                    } else {
-                        "{truncate_fingerprint(&identity.fingerprint)}"
-                    }
-                }
+        div { class: "card",
+            div { class: "identity-header",
+                span { class: "identity-kind", "Ghost Key" }
+                span { class: "identity-name", "{title}" }
                 span { class: "identity-tier", "{describe_notary_info(&identity.notary_info)}" }
             }
-            div {
-                if has_store {
-                    button {
-                        class: if show_listing_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
-                        onclick: move |_| show_listing_form.toggle(),
-                        if show_listing_form() { "Cancel" } else { "Add Listing" }
-                    }
-                } else if has_rsa_key {
-                    span { class: "text-warning", "Creating contracts..." }
-                } else {
-                    button {
-                        class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
-                        disabled: !has_harvest_delegate,
-                        onclick: move |_| show_store_form.toggle(),
-                        if show_store_form() { "Cancel" } else { "Create Store" }
-                    }
-                }
-            }
-        }
 
-        if !store_cards.is_empty() {
-            div { class: "store-share",
-                p { class: "text-muted",
-                    "Share this link so buyers can open your store:"
+            // ---- Store ----
+            div { class: "identity-section",
+                h4 { "Store" }
+
+                if store_cards.is_empty() {
+                    if has_rsa_key {
+                        p { class: "text-muted text-italic", "Creating your store\u{2026}" }
+                    } else {
+                        p { class: "text-muted",
+                            "This Ghost Key has no store yet. Creating one also sets up its \
+                             inbox and reputation."
+                        }
+                        button {
+                            class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
+                            disabled: !has_harvest_delegate,
+                            onclick: move |_| show_store_form.toggle(),
+                            if show_store_form() { "Cancel" } else { "Create Store" }
+                        }
+                    }
                 }
-                for card in store_cards.iter().cloned() {
-                    div { class: "store-share-row",
+
+                for (index, card) in store_cards.iter().cloned().enumerate() {
+                    div { class: "store-share",
                         span { class: "store-share-label", "{card.label}" }
                         if let Some(ref link) = card.link {
+                            p { class: "text-muted", "Share this link so buyers can open your store:" }
                             // Styled as a value to copy rather than a form
                             // field: it is readonly, and dressed as an input
                             // it read as something to edit.
@@ -458,20 +548,6 @@ fn IdentityCard(
                                 }
                             }
 
-                            // The invoice FORM sits under the store it
-                            // issues on -- an invoice goes to one store's
-                            // contract, and a seller with two stores has to be
-                            // able to tell which. The payment KEY inside this
-                            // panel is not per-store: it is one key and one
-                            // derivation counter for the whole app, shown here
-                            // because this is where it is needed. The panel
-                            // says so rather than letting the placement imply
-                            // otherwise.
-                            super::invoice_form::StorePayments {
-                                store_contract_id: card.contract_id.clone(),
-                                seller_fingerprint: fp.clone(),
-                            }
-
                             if editing_store() == Some(card.contract_id.clone()) {
                                 StoreDetailsForm {
                                     heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
@@ -488,28 +564,110 @@ fn IdentityCard(
                             }
                         }
                     }
+
+                    // Listings go to the identity's first store (see
+                    // `AppState::primary_store_id`), so they are shown, and
+                    // added, there.
+                    if index == 0 {
+                        div { class: "form-group",
+                            if card.details_resolved {
+                                if card.listings.is_empty() {
+                                    p { class: "text-muted text-italic", "No listings yet." }
+                                } else {
+                                    p { class: "section-count", style: "margin-bottom: 0;",
+                                        "{listing_count(card.listings.len())}"
+                                    }
+                                    ul { class: "identity-listings",
+                                        for (i, row) in card.listings.iter().enumerate() {
+                                            li { key: "{i}",
+                                                span { "{row.title}" }
+                                                if let Some(ref price) = row.price {
+                                                    span { class: "text-muted", "{price}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            button {
+                                class: if show_listing_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
+                                onclick: move |_| show_listing_form.toggle(),
+                                if show_listing_form() { "Cancel" } else { "Add Listing" }
+                            }
+                        }
+                    }
+
+                    // An invoice goes to one store's contract, so the form
+                    // and the invoices issued sit with the store. The key the
+                    // addresses come from does not: see `DevicePaymentKey`.
+                    if card.details_resolved {
+                        super::invoice_form::StoreInvoices {
+                            store_contract_id: card.contract_id.clone(),
+                            seller_fingerprint: fp.clone(),
+                        }
+                    }
+                }
+
+                if show_store_form() {
+                    StoreDetailsForm {
+                        heading: "Create Your Store",
+                        submit_label: "Create Store",
+                        initial: StoreDetails::default(),
+                        on_submit: {
+                            let fingerprint = identity.fingerprint.clone();
+                            move |details: StoreDetails| {
+                                show_store_form.set(false);
+                                initiate_store_creation(fingerprint.clone(), details);
+                            }
+                        },
+                    }
+                }
+
+                if show_listing_form() {
+                    ListingForm {
+                        on_submit: {
+                            let fp = fp.clone();
+                            move |listing: Listing| {
+                                show_listing_form.set(false);
+                                sign_and_submit_listing(fp.clone(), listing);
+                            }
+                        },
+                    }
                 }
             }
-        }
 
-        if show_store_form() {
-            StoreDetailsForm {
-                heading: "Create Your Store",
-                submit_label: "Create Store",
-                initial: StoreDetails::default(),
-                on_submit: move |details: StoreDetails| {
-                    show_store_form.set(false);
-                    initiate_store_creation(identity.fingerprint.clone(), details);
-                },
-            }
-        }
+            if let Some(facets) = facets {
+                // ---- Inbox ----
+                div { class: "identity-section",
+                    h4 { "Inbox" }
+                    p { class: "text-muted", "{inbox_summary(facets.message_count)}" }
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| show_inbox.toggle(),
+                        if show_inbox() { "Close inbox" } else { "Open inbox" }
+                    }
+                    if show_inbox() {
+                        div { style: "margin-top: var(--space-md);",
+                            super::message_view::MessageView {
+                                store_contract_id: facets.store_contract_id.clone(),
+                            }
+                        }
+                    }
+                }
 
-        if show_listing_form() {
-            ListingForm {
-                on_submit: move |listing: Listing| {
-                    show_listing_form.set(false);
-                    sign_and_submit_listing(fp.clone(), listing);
-                },
+                // ---- Reputation ----
+                div { class: "identity-section",
+                    h4 { "Reputation" }
+                    {
+                        let (class, summary) = reputation_summary(facets.negative_feedback);
+                        rsx! { p { class: "{class}", "{summary}" } }
+                    }
+                    p { class: "text-muted", style: "font-size: 0.85rem;",
+                        "Buyers see this record beside your store. Harvest records only \
+                         complaints, so a clean record is the best there is. It belongs to \
+                         this Ghost Key alone."
+                    }
+                }
             }
         }
     }
@@ -1235,5 +1393,72 @@ mod notary_info_tests {
     fn a_date_alone_is_still_worth_showing() {
         let info = r#"{"delegate-key-created":"2024-08-13 15:45:36"}"#;
         assert_eq!(describe_notary_info(info), "donated 13 August 2024");
+    }
+}
+
+#[cfg(test)]
+mod identity_card_tests {
+    use super::*;
+
+    fn identity(label: Option<&str>, fingerprint: &str) -> ghostkey_common::GhostKeyInfo {
+        ghostkey_common::GhostKeyInfo {
+            fingerprint: fingerprint.to_string(),
+            label: label.map(str::to_string),
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        }
+    }
+
+    #[test]
+    fn an_identity_is_titled_by_its_label_else_its_fingerprint() {
+        assert_eq!(
+            identity_title(&identity(Some("Pottery"), "abcdef")),
+            "Pottery"
+        );
+        assert_eq!(
+            identity_title(&identity(None, "XpmTN6FBHAmQ1234567")),
+            "XpmTN6FBHAmQ..."
+        );
+        // A blank label names nothing, so the fingerprint is used.
+        assert_eq!(identity_title(&identity(Some("  "), "short")), "short");
+    }
+
+    #[test]
+    fn the_inbox_summary_counts_messages() {
+        assert_eq!(inbox_summary(0), "No one has written to this store yet.");
+        assert_eq!(inbox_summary(1), "1 message.");
+        assert_eq!(inbox_summary(4), "4 messages.");
+    }
+
+    /// Coloured only when there is something to see: a clean record uses the
+    /// storefront's own clean class, and any complaint the negative one.
+    #[test]
+    fn the_reputation_summary_matches_what_buyers_see() {
+        assert_eq!(
+            reputation_summary(0),
+            ("reputation-clean", "Clean record".to_string())
+        );
+        assert_eq!(
+            reputation_summary(1),
+            (
+                "reputation-negative",
+                "1 negative feedback entry".to_string()
+            )
+        );
+        assert_eq!(
+            reputation_summary(3),
+            (
+                "reputation-negative",
+                "3 negative feedback entries".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn listings_are_counted_in_plain_english() {
+        assert_eq!(listing_count(1), "1 listing");
+        assert_eq!(listing_count(2), "2 listings");
+        assert_eq!(listing_count(0), "0 listings");
     }
 }

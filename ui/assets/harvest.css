@@ -764,6 +764,60 @@ h4 {
   font-size: 0.85rem;
 }
 
+/* ---- My Store: one card per Ghost Key (harvest#79) ----
+ * The card holds the identity's store, inbox and reputation as sections of
+ * one thing, separated by hairlines rather than nested boxes, so the three
+ * read as facets of one seller. */
+
+.identity-header {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-xs) 0;
+}
+
+.identity-kind {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-right: var(--space-sm);
+}
+
+.identity-section {
+  border-top: 1px solid var(--border);
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+}
+
+.identity-section h4 {
+  margin-bottom: var(--space-sm);
+}
+
+.identity-section p {
+  margin-bottom: var(--space-sm);
+}
+
+.identity-listings {
+  list-style: none;
+  margin: var(--space-xs) 0 var(--space-sm);
+  padding: 0;
+}
+
+.identity-listings li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-xs) 0;
+  font-size: 0.9rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.identity-listings li:last-child {
+  border-bottom: none;
+}
+
 /* ---- Warning text ---- */
 
 .text-warning {

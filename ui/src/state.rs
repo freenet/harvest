@@ -1569,6 +1569,18 @@ pub struct BrowsingStore {
     pub sent_messages: Vec<SentMessage>,
 }
 
+/// One Ghost Key's inbox and reputation, as its card on My Store shows them.
+/// See [`AppState::seller_facets`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SellerFacets {
+    /// The store all three belong to.
+    pub store_contract_id: Vec<u8>,
+    /// Entries in the store's mailbox, readable or not.
+    pub message_count: usize,
+    /// Negative feedback entries on the store's reputation contract.
+    pub negative_feedback: usize,
+}
+
 /// A message this browser sealed and handed to the local node.
 ///
 /// `sent_at` is when the send was attempted, not when anything was
@@ -4515,6 +4527,41 @@ impl AppState {
                 .iter()
                 .any(|store| store.store_contract_id == store_contract_id)
                 .then(|| fingerprint.clone())
+        })
+    }
+
+    /// The store a Ghost Key sells from: the one its listings are published
+    /// to (`sign_and_submit_listing` takes the first registration), and so the
+    /// one whose inbox and reputation are that identity's.
+    ///
+    /// One Ghost Key is one seller: the store, mailbox and reputation
+    /// contracts are all parameterised by the identity's key, so there is one
+    /// of each per Ghost Key. A second registration for the same identity is
+    /// a transient (a store mid-migration), not a second shop.
+    pub fn primary_store_id(&self, fingerprint: &str) -> Option<Vec<u8>> {
+        self.my_stores
+            .get(fingerprint)?
+            .first()
+            .map(|store| store.store_contract_id.clone())
+    }
+
+    /// What My Store says about one Ghost Key's inbox and reputation, or
+    /// `None` while the identity has no store (and so neither).
+    ///
+    /// Read through [`Self::primary_store_id`] so each identity's card counts
+    /// its OWN mailbox and its OWN feedback. A seller with two Ghost Keys has
+    /// two separate records, and the card must never show one identity's
+    /// messages or complaints under the other.
+    pub fn seller_facets(&self, fingerprint: &str) -> Option<SellerFacets> {
+        let store_contract_id = self.primary_store_id(fingerprint)?;
+        let negative_feedback = self
+            .browsing_stores
+            .get(&store_contract_id)
+            .map_or(0, |store| store.feedback.len());
+        Some(SellerFacets {
+            message_count: self.mailbox_entries(&store_contract_id).len(),
+            negative_feedback,
+            store_contract_id,
         })
     }
 
@@ -18038,5 +18085,122 @@ mod store_code_tests {
         assert_eq!(rows[1].code, plain, "archived after the rest");
         assert_eq!(rows[1].label, format!("Store {plain}"), "labelled by code");
         assert!(rows[1].archived);
+    }
+}
+
+#[cfg(test)]
+mod seller_facets_tests {
+    //! My Store shows each Ghost Key as one seller: one store, one inbox, one
+    //! reputation (harvest#79). These pin that each identity's card reads its
+    //! OWN store's mailbox and feedback, never another identity's.
+    use super::*;
+    use harvest_common::feedback::{FeedbackCategory, FeedbackToken};
+    use harvest_common::mailbox::EncryptedMessage;
+    use harvest_common::reputation::FeedbackEntry;
+
+    const ALICE: &str = "fp-alice";
+    const BOB: &str = "fp-bob";
+
+    fn registration(id: u8) -> StoreRegistration {
+        StoreRegistration {
+            store_contract_id: vec![id; 32],
+            reputation_contract_id: vec![id + 100; 32],
+            mailbox_contract_id: vec![id + 200; 32],
+            store_contract_key: None,
+        }
+    }
+
+    fn feedback(n: u8) -> FeedbackEntry {
+        FeedbackEntry {
+            token: FeedbackToken::new([0u8; 32], [n; 32]),
+            signature: Vec::new(),
+            category: FeedbackCategory::NonDelivery,
+            comment: String::new(),
+            submitted_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
+            entry_signature: Vec::new(),
+        }
+    }
+
+    fn message(text: &str) -> EncryptedMessage {
+        crate::messaging::BuyerConversation::open(&[9u8; 32])
+            .expect("open")
+            .seal(text.to_string())
+            .expect("seal")
+    }
+
+    /// Two identities, each with its own store. Alice's has two messages and
+    /// no feedback; Bob's has none and one complaint.
+    fn two_sellers() -> AppState {
+        let mut state = AppState::default();
+        state.my_stores.insert(ALICE.into(), vec![registration(1)]);
+        state.my_stores.insert(BOB.into(), vec![registration(2)]);
+        state
+            .browsing_stores
+            .entry(vec![1u8; 32])
+            .or_default()
+            .mailbox_messages = vec![message("hello"), message("still there?")];
+        state
+            .browsing_stores
+            .entry(vec![2u8; 32])
+            .or_default()
+            .feedback = vec![feedback(7)];
+        state
+    }
+
+    #[test]
+    fn each_identity_counts_its_own_inbox_and_reputation() {
+        let state = two_sellers();
+
+        let alice = state.seller_facets(ALICE).expect("alice has a store");
+        assert_eq!(alice.store_contract_id, vec![1u8; 32]);
+        assert_eq!(alice.message_count, 2);
+        assert_eq!(alice.negative_feedback, 0, "Bob's complaint is not Alice's");
+
+        let bob = state.seller_facets(BOB).expect("bob has a store");
+        assert_eq!(bob.store_contract_id, vec![2u8; 32]);
+        assert_eq!(bob.message_count, 0, "Alice's messages are not Bob's");
+        assert_eq!(bob.negative_feedback, 1);
+    }
+
+    /// No store means no inbox and no reputation to show, rather than an
+    /// empty inbox and a "clean record" for a seller who has neither.
+    #[test]
+    fn an_identity_without_a_store_has_no_facets() {
+        let state = two_sellers();
+        assert_eq!(state.seller_facets("fp-carol"), None);
+        assert_eq!(state.primary_store_id("fp-carol"), None);
+    }
+
+    /// The store whose state has not arrived yet still names its facets, at
+    /// zero: the card shows the store's sections while it loads.
+    #[test]
+    fn a_store_whose_state_has_not_arrived_reads_as_empty() {
+        let mut state = AppState::default();
+        state.my_stores.insert(ALICE.into(), vec![registration(3)]);
+        let facets = state.seller_facets(ALICE).expect("registered");
+        assert_eq!(facets.store_contract_id, vec![3u8; 32]);
+        assert_eq!(facets.message_count, 0);
+        assert_eq!(facets.negative_feedback, 0);
+    }
+
+    /// The card's inbox and reputation belong to the store listings are
+    /// published to, which is the FIRST registration. A later one (a store
+    /// mid-migration) must not be the one read.
+    #[test]
+    fn the_primary_store_is_the_first_registration() {
+        let mut state = AppState::default();
+        state
+            .my_stores
+            .insert(ALICE.into(), vec![registration(4), registration(5)]);
+        state
+            .browsing_stores
+            .entry(vec![5u8; 32])
+            .or_default()
+            .feedback = vec![feedback(1)];
+
+        assert_eq!(state.primary_store_id(ALICE), Some(vec![4u8; 32]));
+        let facets = state.seller_facets(ALICE).expect("registered");
+        assert_eq!(facets.store_contract_id, vec![4u8; 32]);
+        assert_eq!(facets.negative_feedback, 0);
     }
 }

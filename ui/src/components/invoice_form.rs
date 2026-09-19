@@ -45,10 +45,15 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
     bitcoin_config::settleable_networks()
 }
 
-/// The seller-side payments panel for one store: the payment key, the form
-/// that issues an invoice against a listing, and the invoices already issued.
+/// The invoices for one store: the form that issues an invoice against a
+/// listing, and the invoices already issued.
+///
+/// The payment KEY is deliberately not in here. It is one key and one address
+/// counter for the whole device, shared by every Ghost Key and every store, so
+/// it is shown once, outside the per-identity cards ([`DevicePaymentKey`]).
+/// Inside a store's section it read as that store's setting (harvest#79).
 #[component]
-pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
+pub fn StoreInvoices(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
     let mut show_form = use_signal(|| false);
 
     let (xpub, xpub_loaded, store_loaded, listings, orders, live, needs_reissue) = {
@@ -85,19 +90,24 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
     };
 
     rsx! {
-        div { class: "card",
-            h4 { "Payments" }
+        div {
+            h4 { "Invoices" }
 
-            PaymentKeyPanel { xpub: xpub.clone(), xpub_loaded }
-
-            if xpub.is_some() {
+            if !xpub_loaded {
+                p { class: "text-muted text-italic", "Checking your payment key\u{2026}" }
+            } else if xpub.is_none() {
+                p { class: "text-muted",
+                    "Set your payment key below before issuing an invoice. Every invoice, \
+                     from any of your stores, takes its address from that one key."
+                }
+            } else {
                 if !store_loaded {
                     p { class: "text-muted text-italic",
                         "Loading this store's listings\u{2026}"
                     }
                 } else if listings.is_empty() {
                     p { class: "text-muted text-italic",
-                        "Add a listing first \u{2014} an invoice is issued against one, so a \
+                        "Add a listing first. An invoice is issued against one, so a \
                          buyer can see what they are paying for."
                     }
                 } else {
@@ -189,6 +199,29 @@ pub fn PaymentWatchNote() -> Element {
     }
 }
 
+/// The device's payment key, shown once on My Store below every Ghost Key.
+///
+/// One key (and one address counter) per device, held by this node's harvest
+/// delegate and shared by every Ghost Key and store. It sits outside the
+/// per-identity cards because inside one it read as that store's setting
+/// (harvest#79).
+#[component]
+pub fn DevicePaymentKey() -> Element {
+    let (xpub, xpub_loaded) = {
+        let state = APP_STATE.read();
+        (
+            state.bitcoin.payment_xpub.clone(),
+            state.bitcoin.payment_xpub_loaded,
+        )
+    };
+    rsx! {
+        div { class: "card",
+            h3 { "Payment key for all your stores on this device" }
+            PaymentKeyPanel { xpub, xpub_loaded }
+        }
+    }
+}
+
 /// Show the configured payment key, or take one.
 #[component]
 fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded: bool) -> Element {
@@ -212,7 +245,7 @@ fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded:
                     "{status.next_index} address(es) from this key are already taken, \
                      counting the orders your stores have published, so the next invoice \
                      gets a new one. "
-                    "This key is shared by every store and every Ghost Key in this app."
+                    "Every Ghost Key and every store on this device uses this one key."
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -374,8 +407,8 @@ fn InvoiceForm(
             }
             p { class: "text-muted",
                 "Naming a buyer records who the invoice was issued to. It does not stop "
-                "somebody else paying it \u{2014} Bitcoin has no way to tell who sent a "
-                "payment \u{2014} so treat it as a label, not a restriction."
+                "somebody else paying it (Bitcoin has no way to tell who sent a "
+                "payment), so treat it as a label, not a restriction."
             }
 
             label { class: "form-label", "Confirmations required" }
@@ -408,7 +441,7 @@ fn InvoiceForm(
                             .find(|l| l.listing.id.to_string() == chosen())
                         else {
                             APP_STATE.write().notifications.push(
-                                "That listing is no longer on this store \u{2014} pick another."
+                                "That listing is no longer on this store. Pick another."
                                     .to_string(),
                             );
                             return;
