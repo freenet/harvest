@@ -194,6 +194,7 @@ impl AppState {
     /// screen with no way to retry.
     pub(crate) fn store_creation_failed(&mut self, why: &str) {
         self.store_creation_in_flight = None;
+        self.store_publishing = false;
         self.pending_store_creation = None;
         self.notifications
             .push(format!("Store creation failed: {why}"));
@@ -203,6 +204,11 @@ impl AppState {
     /// L1): release it and withdraw the signatures it asked for. The store
     /// key and any signed backing are kept, so trying again resumes it.
     pub(crate) fn cancel_store_creation(&mut self) {
+        // Once the PUTs are under way the creation finishes or fails on its
+        // own; releasing it here would let a second one start beside it.
+        if self.store_publishing {
+            return;
+        }
         self.pending_signatures.retain(|pending| {
             !matches!(
                 pending,
@@ -365,6 +371,7 @@ impl AppState {
     }
 
     fn publish_backed_store(&mut self, creation: PendingStoreCreation, backing: AuthorizedBacking) {
+        self.store_publishing = true;
         #[cfg(target_arch = "wasm32")]
         crate::state::spawn_store_creation(creation, backing);
         #[cfg(not(target_arch = "wasm32"))]
@@ -869,6 +876,24 @@ pub(crate) mod tests {
         state.cancel_store_creation();
         assert!(state.store_creation_in_flight.is_none());
         assert!(state.pending_signatures.is_empty());
+
+        // Once the PUTs are under way, Cancel does nothing (#98 re-check):
+        // the single-flight marker stays until the creation ends.
+        let mut state = AppState::default();
+        let request = started(&mut state);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
+            request_id: request,
+            result: Ok(store_key().verifying_key().to_bytes()),
+        });
+        let dated = queued_statement(&state).expect("asked to back");
+        state.on_ghostkey_response(vault_answer(&ghost(), &dated));
+        state.on_delegate_response(store_key_answer(&store_key(), &dated));
+        assert!(state.store_publishing);
+        state.cancel_store_creation();
+        assert!(
+            state.store_creation_in_flight.is_some(),
+            "not released mid-PUT"
+        );
     }
 
     /// A store made before revision 2 that has not loaded holds back

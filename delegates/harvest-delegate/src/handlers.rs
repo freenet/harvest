@@ -323,7 +323,30 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::CreateStoreKey {
             request_id,
             ghostkey_fingerprint,
-        } => crate::store_keys::create(store, request_id, ghostkey_fingerprint.as_deref()),
+            another_store,
+        } => {
+            // Section 6.2 across the device (see `CreateStoreKey`): a Ghost
+            // Key with a registered store-key store gets no NEW key unless
+            // the seller asked for another store. Its unfinished creation,
+            // if any, is still resumed.
+            if let Some(fp) = ghostkey_fingerprint.as_deref() {
+                if !another_store
+                    && crate::store_keys::unfinished_creation(store, fp).is_none()
+                    && load_stores(store, fp)
+                        .iter()
+                        .any(|s| s.store_verifying_key.is_some())
+                {
+                    return HarvestDelegateResponse::StoreKeyCreated {
+                        request_id,
+                        result: Err("this Ghost Key already backs a store on this device. A \
+                                     Ghost Key backs one store at a time: retire it there \
+                                     first, or use a different Ghost Key"
+                            .into()),
+                    };
+                }
+            }
+            crate::store_keys::create(store, request_id, ghostkey_fingerprint.as_deref())
+        }
 
         HarvestDelegateRequest::SignStoreUpdate {
             request_id,
@@ -723,36 +746,69 @@ mod origin_gating_tests {
     ///
     /// Mutated red by removing the `authorize` call from `handle`.
     /// Registering the store ends its creation: the same `CreateStoreKey`
-    /// answered the same key before, and a new one after (#98 review, M1).
-    /// Mutated red by not finishing in `handle_register_store`.
+    /// answered the same key before; after, a NEW key is refused unless the
+    /// seller asks for another store (#98 review M1 and re-check). Mutated
+    /// red by not finishing in `handle_register_store` and by removing the
+    /// refusal.
     #[test]
     fn registering_a_store_ends_its_resumable_creation() {
         let mut store = MemSecrets::default();
-        let mint = |store: &mut MemSecrets, id| match handle(
+        let first = mint(&mut store, 1, false).unwrap();
+        assert_eq!(mint(&mut store, 2, false).unwrap(), first);
+        register_as(&mut store, vec![7; 32], Some(first));
+        let refused = mint(&mut store, 3, false).expect_err("one store per Ghost Key");
+        assert!(refused.contains("already backs a store"), "{refused}");
+        let second = mint(&mut store, 4, true).expect("asked for on purpose");
+        assert_ne!(second, first);
+    }
+
+    /// The duplicate-registration branch ends the creation too: a store
+    /// registered first without its key (an older UI) and again with it.
+    /// Mutated red by not finishing on that branch.
+    #[test]
+    fn a_repeated_registration_naming_the_key_ends_the_creation() {
+        let mut store = MemSecrets::default();
+        let first = mint(&mut store, 1, false).unwrap();
+        register_as(&mut store, vec![7; 32], None);
+        assert_eq!(
+            mint(&mut store, 2, false).unwrap(),
+            first,
+            "not finished yet"
+        );
+        register_as(&mut store, vec![7; 32], Some(first));
+        assert!(
+            crate::store_keys::unfinished_creation(&store, FINGERPRINT).is_none(),
+            "finished by the duplicate registration"
+        );
+    }
+
+    fn mint(store: &mut MemSecrets, id: u64, another_store: bool) -> Result<[u8; 32], String> {
+        match handle(
             store,
             Some(&harvest()),
             HarvestDelegateRequest::CreateStoreKey {
                 request_id: id,
                 ghostkey_fingerprint: Some(FINGERPRINT.to_string()),
+                another_store,
             },
         ) {
-            HarvestDelegateResponse::StoreKeyCreated { result: Ok(k), .. } => k,
-            other => panic!("expected a store key, got {other:?}"),
-        };
-        let first = mint(&mut store, 1);
-        assert_eq!(mint(&mut store, 2), first);
+            HarvestDelegateResponse::StoreKeyCreated { result, .. } => result,
+            other => panic!("expected a store key answer, got {other:?}"),
+        }
+    }
+
+    fn register_as(store: &mut MemSecrets, id: Vec<u8>, key: Option<[u8; 32]>) {
         handle(
-            &mut store,
+            store,
             Some(&harvest()),
             HarvestDelegateRequest::RegisterStore {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
-                store_contract_id: vec![7; 32],
+                store_contract_id: id,
                 reputation_contract_id: vec![1],
                 mailbox_contract_id: vec![2],
-                store_verifying_key: Some(first),
+                store_verifying_key: key,
             },
         );
-        assert_ne!(mint(&mut store, 3), first);
     }
 
     #[test]
@@ -764,6 +820,7 @@ mod origin_gating_tests {
             HarvestDelegateRequest::CreateStoreKey {
                 request_id: 1,
                 ghostkey_fingerprint: None,
+                another_store: false,
             },
         );
         assert!(refusal_message(&refused).contains("Harvest web app"));
@@ -776,6 +833,7 @@ mod origin_gating_tests {
             HarvestDelegateRequest::CreateStoreKey {
                 request_id: 2,
                 ghostkey_fingerprint: None,
+                another_store: false,
             },
         ) {
             HarvestDelegateResponse::StoreKeyCreated {

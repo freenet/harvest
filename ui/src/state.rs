@@ -281,6 +281,12 @@ pub struct AppState {
     /// published, or when the delegate answers a different key.
     pub resumable_backing: Option<harvest_common::backing::AuthorizedBacking>,
 
+    /// The store's contracts are being PUT: the creation can no longer be
+    /// cancelled (#98 re-check). Cancelling here released the single-flight
+    /// marker while the PUTs ran on, so a second creation could start and a
+    /// late failure of the first would then wipe it.
+    pub store_publishing: bool,
+
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -445,6 +451,7 @@ pub(crate) fn spawn_store_creation(
             Ok(()) => {
                 let mut state = crate::gateway::APP_STATE.write();
                 state.store_creation_in_flight = None;
+                state.store_publishing = false;
                 state.resumable_backing = None;
             }
             Err(e) => {

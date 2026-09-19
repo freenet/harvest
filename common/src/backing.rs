@@ -336,9 +336,10 @@ fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
 /// bytes.
 ///
 /// Nothing in this type removes a slot. The one bound on the store's
-/// backings, and the rule that a retirement needs its backing, are applied
-/// over the whole store by `StoreStateV1::normalize_backings`; see
-/// [`MAX_BACKINGS`] for why that keeps every merge total.
+/// backings and retirements (one ranking over both, a key's backing and
+/// retirement kept or cut together) is applied over the whole store by
+/// `StoreStateV1::normalize_backings`; see [`MAX_BACKINGS`] for why that
+/// keeps every merge total.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
 pub struct SignedSetV1<T> {
@@ -464,10 +465,9 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         for record in incoming {
             next.merge_record(record.clone());
         }
-        // No bound is applied here. The bound on backings, and the rule that
-        // a retirement needs its backing, are about the store as a whole, so
-        // `StoreStateV1::normalize_backings` applies them after every part
-        // has been merged; see [`MAX_BACKINGS`].
+        // No bound is applied here. The bound on backings and retirements
+        // is about the store as a whole, so `StoreStateV1::normalize_backings`
+        // applies it after every part has been merged; see [`MAX_BACKINGS`].
         *self = next;
         Ok(())
     }

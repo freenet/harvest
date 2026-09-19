@@ -1805,8 +1805,13 @@ left open, and what phase 1a deliberately does not do yet.
   owned by that key does not count against it, so a retry is never refused
   by the store it is re-creating. A delegate error while a creation waits
   for its key releases it, and a Cancel control releases a creation at any
-  stage. While a store made before revision 2 has not loaded, My Store
-  waits rather than offering "Create Store".
+  stage until its contracts are being published; from then on it finishes
+  or fails by itself, so no second creation can start beside it. Across
+  tabs, the Harvest delegate refuses a NEW store key to a Ghost Key that
+  already has a store-key store registered on the device, unless the
+  request says the seller asked for another store (no UI asks yet). While
+  a store made before revision 2 has not loaded, My Store waits rather than
+  offering "Create Store".
 - **New backings are dated six blocks behind the newest known block**
   (`BACKING_BLOCK_DEPTH`), so a buyer whose node is a little behind the
   seller's does not see a new store as unbacked, and every loaded store's

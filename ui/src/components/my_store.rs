@@ -222,6 +222,8 @@ fn IdentityCard(
     // creation or move starts until it is published or fails.
     let creating =
         APP_STATE.read().store_creation_in_flight.as_deref() == Some(identity.fingerprint.as_str());
+    // No Cancel once the PUTs have started (#98 re-check).
+    let publishing = APP_STATE.read().store_publishing;
     // A store made before revision 2 that has not loaded yet: offering
     // "Create Store" now would make a second store instead of moving this
     // one (#98 review, L3).
@@ -342,10 +344,12 @@ fn IdentityCard(
                     // A creation can stall on an answer that never comes
                     // (#98 review, L1). Cancelling keeps the store key and
                     // any signed backing, so trying again resumes it.
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: move |_| APP_STATE.write().cancel_store_creation(),
-                        "Cancel"
+                    if !publishing {
+                        button {
+                            class: "btn btn-sm btn-outline",
+                            onclick: move |_| APP_STATE.write().cancel_store_creation(),
+                            "Cancel"
+                        }
                     }
                 } else if legacy_movable {
                     button {
@@ -865,6 +869,7 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
             harvest_common::HarvestDelegateRequest::CreateStoreKey {
                 request_id: store_key_request,
                 ghostkey_fingerprint: Some(fingerprint.clone()),
+                another_store: false,
             },
         ] {
             let payload = match harvest_common::to_cbor(&request) {

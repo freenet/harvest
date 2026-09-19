@@ -362,10 +362,20 @@ pub enum HarvestDelegateRequest {
     /// the store key, so a retry re-publishes the same store instead of
     /// making a second one. Without it (a request from an older UI), a fresh
     /// key every time, as before.
+    ///
+    /// # One store per Ghost Key, on this device (#98 re-check)
+    ///
+    /// With `ghostkey_fingerprint`, a Ghost Key that already has a store
+    /// registered here with a store key is refused a NEW key (its unfinished
+    /// creation is still resumed), unless `another_store` says the seller
+    /// asked for a second store on purpose. This is section 6.2 across every
+    /// tab of the device, where the UI's check sees only what one tab loaded.
     CreateStoreKey {
         request_id: RequestId,
         #[serde(default)]
         ghostkey_fingerprint: Option<String>,
+        #[serde(default)]
+        another_store: bool,
     },
 
     /// Sign `payload` with the store key named by `store_verifying_key`.
@@ -1378,6 +1388,7 @@ mod tests {
             Q::CreateStoreKey {
                 request_id: 43,
                 ghostkey_fingerprint: Some(fp()),
+                another_store: false,
             },
             Q::SignStoreUpdate {
                 request_id: 44,
