@@ -16337,6 +16337,46 @@ mod buy_flow_tests {
         );
     }
 
+    /// A commitment is the STORE key's to sign since harvest#93, and the
+    /// Ghost Key behind the store only backs it: the check that decides
+    /// whether a buyer may pay reads the store key, and a store whose Ghost
+    /// Key is some other key entirely is still payable.
+    ///
+    /// Mutated red by checking the commitment against `seller_verifying_key`
+    /// (the Ghost Key) in `payment_blockers`.
+    #[test]
+    fn a_commitment_is_checked_against_the_store_key_not_the_ghost_key() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let ghost = ed25519_dalek::SigningKey::from_bytes(&[0x3c; 32])
+            .verifying_key()
+            .to_bytes();
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.seller_verifying_key = Some(ghost);
+            store.store_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        }
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            Vec::new(),
+            "signed by the store key, backed by a different Ghost Key: payable"
+        );
+
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .store_verifying_key = Some(ghost);
+        assert!(matches!(
+            purchases(&state)[0].blockers.as_slice(),
+            [PaymentBlocker::CommitmentNotTheSellers(_)]
+        ));
+    }
+
     /// **Every input `payment_blockers` reads either yields a verdict or a
     /// blocker -- absence never reads as approval.**
     ///

@@ -852,20 +852,70 @@ mod tests {
         assert!(err.contains("not signed by the Ghost Key"), "{err}");
     }
 
+    /// A Ghost Key's "I back store X" cannot be attached to store Y, even by
+    /// Y's own key: the statement names the store it backs.
+    ///
+    /// Mutated red by removing the `statement.store != *owner` check from
+    /// `AuthorizedBacking::verify`.
     #[test]
     fn a_backing_for_another_store_is_refused() {
         let other_store = SigningKey::from_bytes(&[0x77; 32]);
-        // Genuinely signed by both halves -- for a different store.
-        let elsewhere = backing_by(&other_store, &ghost(1), &other_store, 100);
+        // The Ghost Key backs OTHER store, and THIS store's key countersigns
+        // it: every signature is genuine and the store key accepted it.
+        let elsewhere = backing_by(&other_store, &ghost(1), &store_key(), 100);
         let err = apply(
             &StoreStateV1::default(),
             delta_with(vec![elsewhere], vec![], vec![]),
         )
         .expect_err("a backing names the store it backs");
-        assert!(
-            err.contains("different store key") || err.contains("does not begin"),
-            "{err}"
-        );
+        assert!(err.contains("different store key"), "{err}");
+    }
+
+    /// A record filed under a slot that is not its own would let a store
+    /// hold two backings by one Ghost Key, and let a retirement of one key
+    /// sit where another's is looked up.
+    ///
+    /// Mutated red by removing the slot check from `SignedSetV1::verify`.
+    #[test]
+    fn a_record_under_someone_elses_slot_is_refused() {
+        let mut state = with(vec![backing(&ghost(1), 100)], vec![]);
+        let misfiled = backing(&ghost(2), 200);
+        state
+            .backings
+            .records
+            .insert(Bytes32(ghost(3).verifying_key().to_bytes()), misfiled);
+        let err = state
+            .verify(&state, &params())
+            .expect_err("a record under another key's slot");
+        assert!(err.contains("slot"), "{err}");
+    }
+
+    /// The whole state is checked, not only what arrives as a delta: a PUT
+    /// or a whole-state update carrying a forged backing, retirement or
+    /// closure must be refused as surely as a delta carrying one.
+    ///
+    /// Mutated red by removing the `backings`, `retirements` or `closed`
+    /// `verify` call from `StoreStateV1::verify`.
+    #[test]
+    fn a_whole_state_with_a_forged_record_is_refused() {
+        let base = with(vec![backing(&ghost(1), 100)], vec![]);
+
+        let mut forged_retirement = base.clone();
+        let r = retirement_by(&ghost(9), &ghost(1));
+        forged_retirement.retirements.records.insert(r.slot(), r);
+        assert!(forged_retirement
+            .verify(&forged_retirement, &params())
+            .is_err());
+
+        let mut forged_closure = base.clone();
+        let c = closure_by(&ghost(9), &store_key());
+        forged_closure.closed.records.insert(c.slot(), c);
+        assert!(forged_closure.verify(&forged_closure, &params()).is_err());
+
+        let mut forged_backing = base.clone();
+        let b = backing_by(&store_key(), &ghost(2), &ghost(9), 200);
+        forged_backing.backings.records.insert(b.slot(), b);
+        assert!(forged_backing.verify(&forged_backing, &params()).is_err());
     }
 
     #[test]
