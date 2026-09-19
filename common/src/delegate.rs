@@ -77,6 +77,13 @@ pub enum HarvestDelegateRequest {
         /// Raw 32-byte X25519 public keys, as they appear in
         /// [`crate::mailbox::EncryptedMessage::sender_public_key`].
         peer_public_keys: Vec<Vec<u8>>,
+        /// The store whose inbox the peers wrote to (harvest#93 phase 1b).
+        /// When set, the keys derive from that store's inbox key, which
+        /// derives from the store key (`custody::inbox_secret`), so every
+        /// device holding the store key reads the same messages. `None` is
+        /// the per-device key of a Ghost Key, for a store made before it.
+        #[serde(default)]
+        store_verifying_key: Option<[u8; 32]>,
     },
 
     /// Keep a buyer's conversation secret so it outlives the browser tab.
@@ -381,6 +388,44 @@ pub enum HarvestDelegateRequest {
         store_verifying_key: [u8; 32],
         payload: Vec<u8>,
     },
+
+    // === Store-key custody (harvest#93 phase 1b) ===
+    /// Wrap the store key to a backing Ghost Key, from the vault's signature
+    /// over `custody::wrap_message(store)` (made under the current webapp
+    /// scope), and sign the resulting copy with the store key. Answered with
+    /// [`HarvestDelegateResponse::StoreKeyWrapped`]: the copy, ready to
+    /// publish. The signature is a secret; the delegate drops it when done.
+    WrapStoreKeyFor {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        backer_verifying_key: [u8; 32],
+        scoped_payload: Vec<u8>,
+        /// The vault's wrap signature: a secret. See [`WrapSignature`].
+        signature: WrapSignature,
+    },
+
+    /// Recover a store key from a wrapped copy in the store's state, with the
+    /// vault's signature over the wrap message. The delegate checks the
+    /// signature, opens the copy, checks the seed IS this store's key, keeps
+    /// it, and answers [`HarvestDelegateResponse::StoreKeyRecovered`] with no
+    /// secret in it.
+    UnwrapStoreKey {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        backer_verifying_key: [u8; 32],
+        scoped_payload: Vec<u8>,
+        /// The vault's wrap signature: a secret. See [`WrapSignature`].
+        signature: WrapSignature,
+        wrapped: crate::custody::WrappedStoreKey,
+    },
+
+    /// The public halves of the keys that derive from a store key: its inbox
+    /// (X25519) key and its record (RSA) key. Answered with
+    /// [`HarvestDelegateResponse::StoreSubkeys`].
+    GetStoreSubkeys {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+    },
 }
 
 /// A store this node remembers visiting.
@@ -562,6 +607,27 @@ pub enum HarvestDelegateResponse {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
         result: Result<StoreKeySignature, String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::WrapStoreKeyFor`].
+    StoreKeyWrapped {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<crate::custody::AuthorizedCopy, String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::UnwrapStoreKey`].
+    StoreKeyRecovered {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<(), String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::GetStoreSubkeys`].
+    StoreSubkeys {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<StoreSubkeyInfo, String>,
     },
 
     StoreList {
@@ -901,6 +967,33 @@ pub struct StoreRegistration {
     /// `ui/src/backing_flow.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_verifying_key: Option<[u8; 32]>,
+}
+
+/// A vault signature over a custody wrap message, carried from the UI to the
+/// delegate (harvest#93 phase 1b).
+///
+/// It is a SECRET: whoever holds it can derive the key that opens a wrapped
+/// copy of a store's key. This newtype exists so it cannot be printed by
+/// accident: `HarvestDelegateRequest` derives `Debug`, and a bare `Vec<u8>`
+/// would print. `#[serde(transparent)]`, so the wire encoding is just the
+/// bytes. Same pattern as [`ConversationSecret`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct WrapSignature(pub Vec<u8>);
+
+impl core::fmt::Debug for WrapSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("WrapSignature(redacted)")
+    }
+}
+
+/// The public halves of the keys a store key derives (harvest#93 phase 1b).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreSubkeyInfo {
+    /// X25519: what buyers encrypt to (`StoreInfoV1::encryption_public_key`).
+    pub inbox_public_key: [u8; 32],
+    /// RSA-2048, PKCS#1 DER (`StoreInfoV1::record_public_key`).
+    pub record_public_key: Vec<u8>,
 }
 
 /// A store-key signature: the envelope and the Ed25519 signature over it, the

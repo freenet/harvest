@@ -143,7 +143,28 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
     request_id: RequestId,
     ghostkey_fingerprint: &str,
     peer_public_keys: &[Vec<u8>],
+    store_verifying_key: Option<[u8; 32]>,
 ) -> HarvestDelegateResponse {
+    // A store with its own key reads with the inbox key that key derives
+    // (harvest#93 phase 1b): the same on every device holding the store
+    // key, so a second device, or one that recovered the key after a
+    // delegate re-key, reads the same messages.
+    if let Some(store_key) = store_verifying_key {
+        let secret = ed25519_dalek::VerifyingKey::from_bytes(&store_key)
+            .ok()
+            .and_then(|vk| crate::store_keys::load(store, &vk))
+            .map(|sk| harvest_common::custody::inbox_secret(&sk));
+        return match secret {
+            Some(secret) => {
+                conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
+            }
+            None => HarvestDelegateResponse::ConversationKeys {
+                request_id,
+                ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+                result: Err("this device does not hold that store's key".into()),
+            },
+        };
+    }
     let Some(secret) = store
         .get_secret(&x25519_sk_key(ghostkey_fingerprint))
         .and_then(seed_from_stored)
@@ -158,6 +179,16 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
         };
     };
 
+    conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
+}
+
+/// The conversation keys `secret` shares with each well-formed peer key.
+fn conversation_keys_from(
+    request_id: RequestId,
+    ghostkey_fingerprint: &str,
+    secret: &StaticSecret,
+    peer_public_keys: &[Vec<u8>],
+) -> HarvestDelegateResponse {
     let derived = peer_public_keys
         .iter()
         .filter_map(|peer| {
@@ -1062,6 +1093,7 @@ mod tests {
             7,
             FP,
             &[buyer_public.as_bytes().to_vec()],
+            None,
         ));
 
         assert_eq!(derived.len(), 1);
@@ -1104,6 +1136,7 @@ mod tests {
             1,
             FP,
             &[a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+            None,
         ));
         let with_a_dud = keys(&derive_conversation_keys(
             &store,
@@ -1114,6 +1147,7 @@ mod tests {
                 vec![0u8; 5], // not a public key at all
                 b.as_bytes().to_vec(),
             ],
+            None,
         ));
 
         assert_eq!(all.len(), 2);
@@ -1155,6 +1189,7 @@ mod tests {
             1,
             FP,
             &[vec![0u8; 32], good.as_bytes().to_vec()],
+            None,
         ));
 
         assert_eq!(
@@ -1209,6 +1244,7 @@ mod tests {
             1,
             FP,
             &[peer.as_bytes().to_vec()],
+            None,
         ));
         assert!(
             message.contains("no encryption key"),

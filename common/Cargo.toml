@@ -22,15 +22,40 @@ chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
+# Wrapped store-key copies are byte strings in store state, which the contract
+# decodes, so this one is not behind `custody`.
+serde_bytes = { workspace = true }
+# Store-key custody's cryptography (harvest#93 phase 1b), behind `custody`:
+# the Harvest delegate and the UI need it; the contracts check only shapes and
+# signatures and never compile it.
+hkdf = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Enables `freenet_bitcoin_common::spv::testing`, so `store` module tests
 # build genuine SPV proofs rather than stubbing out payment verification.
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+# Custody tests check the wrap message cannot be read as an inbox entry, the
+# one other domain-tagged message Harvest asks the vault to sign.
+freenet-bitcoin-inbox = { workspace = true }
 
 [features]
 default = ["ghostkey"]
 ghostkey = ["dep:ghostkey-common"]
+# Store-key custody's cryptography: wrapping the store key to a backing Ghost
+# Key's vault signature, unwrapping it, and deriving the store's inbox and
+# record keys. Enabled by the delegate and the UI; never by a contract.
+custody = [
+    "ghostkey",
+    "dep:hkdf",
+    "dep:aes-gcm",
+    "dep:x25519-dalek",
+    "dep:zeroize",
+    "dep:rand_chacha",
+]
 # The contract-address guard: fixed placeholder parameter values and the
 # `harvest-addresses` binary that turns them into addresses. OFF by default and
 # never enabled by a contract build. This crate is compiled into all three

@@ -11,7 +11,7 @@ default = ["freenet-main-delegate"]
 freenet-main-delegate = []
 
 [dependencies]
-harvest-common = { workspace = true }
+harvest-common = { workspace = true, features = ["custody"] }
 freenet-bitcoin-common = { workspace = true }
 freenet-stdlib = { workspace = true }
 # The delegate half: `handle_export_request` plus the origin policy that gates
@@ -52,6 +52,10 @@ x25519-dalek = { version = "2.0", default-features = false, features = ["alloc",
 # string and the scriptPubKey are derived together here, in one place, because
 # an Order carries both and they must denote the same output.
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The custody tests sign as the Ghost Key vault does.
+ghostkey-common = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

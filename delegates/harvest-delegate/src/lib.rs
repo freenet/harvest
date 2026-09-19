@@ -414,6 +414,7 @@ mod boundary_tests {
                 request_id: 1,
                 ghostkey_fingerprint: "fp".into(),
                 peer_public_keys: vec![vec![1u8; 32]],
+                store_verifying_key: None,
             })
             .expect("cbor"),
             // The buyer's half. `ListBuyerConversations` answers the keys
