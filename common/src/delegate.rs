@@ -613,7 +613,7 @@ pub enum HarvestDelegateResponse {
     StoreKeyWrapped {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
-        result: Result<crate::custody::AuthorizedCopy, String>,
+        result: Result<Box<crate::custody::AuthorizedCopy>, String>,
     },
 
     /// Answer to [`HarvestDelegateRequest::UnwrapStoreKey`].

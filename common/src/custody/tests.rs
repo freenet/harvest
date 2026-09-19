@@ -157,6 +157,7 @@ fn store_info() -> crate::store::StoreInfoV1 {
         store_name: "harvest/store-key-wrap/v1".into(),
         description: String::new(),
         encryption_public_key: None,
+        record_public_key: None,
     }
 }
 

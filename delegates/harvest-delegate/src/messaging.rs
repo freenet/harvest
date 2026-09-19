@@ -1116,6 +1116,46 @@ mod tests {
         );
     }
 
+    /// A store with its own key reads with the inbox key that key derives
+    /// (harvest#93 phase 1b): a buyer who encrypted to the store's published
+    /// inbox key is read, and the Ghost Key's per-device key is not used.
+    /// A device without the store key is refused, not answered with the
+    /// per-device key. Mutated red by ignoring `store_verifying_key`.
+    #[test]
+    fn a_store_key_reads_with_the_inbox_key_it_derives() {
+        let mut store = MemSecrets::default();
+        let device_public = public_key(&init_encryption_key(&mut store, FP));
+        let store_sk = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        assert!(crate::store_keys::keep(&mut store, &store_sk));
+        let inbox = PublicKey::from(&harvest_common::custody::inbox_secret(&store_sk));
+        assert_ne!(inbox.as_bytes().to_vec(), device_public);
+
+        let buyer_secret = StaticSecret::from([42u8; 32]);
+        let buyer_public = PublicKey::from(&buyer_secret);
+        let shared = buyer_secret.diffie_hellman(&inbox).to_bytes();
+        let derived = keys(&derive_conversation_keys(
+            &store,
+            7,
+            FP,
+            &[buyer_public.as_bytes().to_vec()],
+            Some(store_sk.verifying_key().to_bytes()),
+        ));
+        assert_eq!(
+            derived[0].buyer_to_seller,
+            conversation_key_from_dh(&shared, MessageDirection::BuyerToSeller)
+        );
+
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x5b; 32]);
+        let message = error_message(&derive_conversation_keys(
+            &store,
+            8,
+            FP,
+            &[buyer_public.as_bytes().to_vec()],
+            Some(other.verifying_key().to_bytes()),
+        ));
+        assert!(message.contains("store's key"), "{message}");
+    }
+
     /// Answers are paired by peer key, not by position, and a malformed entry
     /// does not shift the others onto the wrong buyer.
     ///
