@@ -206,13 +206,14 @@ impl AuthorizedBacking {
 /// The store key's statement that a Ghost Key no longer backs the store.
 ///
 /// Per backing KEY, not per backing record, and permanent: a Ghost Key
-/// retired from a store can never back it again. It must name a Ghost Key the
-/// store holds a backing for (`StoreStateV1::verify`), so a store never holds
-/// more retirements than backings, and a retirement is kept exactly as long
-/// as its backing is (`StoreStateV1::normalize_backings`). That is what phase 1b's
-/// custody needs from it -- the same retirement is the tombstone that stops
-/// the retired key recovering the store key from state -- and one signed act
-/// cannot then have two effects that drift apart (section 6.3, check 4).
+/// retired from a store can never back it again. It need not name a Ghost
+/// Key the store holds a backing for: it may arrive first, and it shares its
+/// key's slot in the store-wide bound, so it is kept or cut together with
+/// that key's backing (`StoreStateV1::normalize_backings`). That is what
+/// phase 1b's custody needs from it -- the same retirement is the tombstone
+/// that stops the retired key recovering the store key from state, in any
+/// arrival order -- and one signed act cannot then have two effects that
+/// drift apart (section 6.3, check 4).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Retirement {
     pub backer: VerifyingKey,

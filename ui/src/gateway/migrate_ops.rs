@@ -60,7 +60,9 @@ use crate::migrate::{self, Artifact, MailboxOps, ProbeSession, ReputationOps, Se
 
 use super::migrate_gate::{self, Admission, SessionWalks};
 use super::migrate_seal::{self, Disposition, ForwardPut, SuccessorReference};
-use super::store_ops::{MAILBOX_CONTRACT_WASM, REPUTATION_CONTRACT_WASM, STORE_CONTRACT_WASM};
+use super::store_ops::{
+    INDEX_CONTRACT_WASM, MAILBOX_CONTRACT_WASM, REPUTATION_CONTRACT_WASM, STORE_CONTRACT_WASM,
+};
 
 /// One probe's state machine plus the context needed to act on its result.
 struct Probe {
@@ -93,6 +95,7 @@ enum Session {
     Store(Box<ProbeSession<StoreOps>>),
     Reputation(Box<ProbeSession<ReputationOps>>),
     Mailbox(Box<ProbeSession<MailboxOps>>),
+    Index(Box<ProbeSession<migrate::IndexOps>>),
 }
 
 /// The recovered state to PUT forward, already CBOR-encoded.
@@ -234,6 +237,31 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
             },
         ),
         Err(e) => warn!("cannot migrate mailbox for {fingerprint}: {e}"),
+    }
+
+    // The Ghost Key's index (harvest#93 phase 1c), addressed by the key
+    // alone. Its lineage is empty until a generation is superseded; wired now
+    // so that re-key only has to record a row.
+    let index_params = migrate::index_params(&vk);
+    match migrate::encode_params(&index_params) {
+        Ok(params) => start(
+            Artifact::Index,
+            fingerprint,
+            params,
+            INDEX_CONTRACT_WASM,
+            |p| {
+                Session::Index(Box::new(ProbeSession::start(
+                    migrate::IndexOps {
+                        params: index_params.clone(),
+                    },
+                    local_snapshot(),
+                    p,
+                    migrate::index_lineage(),
+                    migrate::fold_all_policy(),
+                )))
+            },
+        ),
+        Err(e) => warn!("cannot migrate the Ghost Key index for {fingerprint}: {e}"),
     }
 }
 
@@ -556,6 +584,7 @@ fn pump(mut probe: Probe) {
         Session::Store(s) => s.next_get(),
         Session::Reputation(s) => s.next_get(),
         Session::Mailbox(s) => s.next_get(),
+        Session::Index(s) => s.next_get(),
     };
 
     let Some(candidate) = next else {
@@ -603,6 +632,7 @@ pub fn deliver_state(id: &ContractInstanceId, bytes: &[u8]) -> bool {
         Session::Store(s) => s.on_state(*id, bytes),
         Session::Reputation(s) => s.on_state(*id, bytes),
         Session::Mailbox(s) => s.on_state(*id, bytes),
+        Session::Index(s) => s.on_state(*id, bytes),
     }
     pump(probe);
     true
@@ -621,6 +651,7 @@ pub fn deliver_absent(id: &ContractInstanceId) -> bool {
         Session::Store(s) => s.on_absent(*id),
         Session::Reputation(s) => s.on_absent(*id),
         Session::Mailbox(s) => s.on_absent(*id),
+        Session::Index(s) => s.on_absent(*id),
     }
     pump(probe);
     true
@@ -636,6 +667,7 @@ fn deliver_unknown(id: ContractInstanceId) {
         Session::Store(s) => s.on_unknown(id),
         Session::Reputation(s) => s.on_unknown(id),
         Session::Mailbox(s) => s.on_unknown(id),
+        Session::Index(s) => s.on_unknown(id),
     }
     pump(probe);
 }
@@ -773,6 +805,19 @@ fn finish(mut probe: Probe) {
                 let forward = match outcome {
                     freenet_migrate::Outcome::Recovered { merged, .. } => {
                         encode_forward(&merged, MAILBOX_CONTRACT_WASM)
+                    }
+                    _ => None,
+                };
+                (note, seal, forward)
+            }
+            None => return,
+        },
+        Session::Index(s) => match s.take_result() {
+            Some((outcome, seal)) => {
+                let note = migrate::describe(&outcome);
+                let forward = match outcome {
+                    freenet_migrate::Outcome::Recovered { merged, .. } => {
+                        encode_forward(&merged, INDEX_CONTRACT_WASM)
                     }
                     _ => None,
                 };

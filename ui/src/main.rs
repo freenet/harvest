@@ -11,6 +11,7 @@ mod custody_flow;
 mod document_title;
 mod gateway;
 mod ghostkey_cert;
+mod index_flow;
 mod markdown;
 mod messaging;
 mod migrate;

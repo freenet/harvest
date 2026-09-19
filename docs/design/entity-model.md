@@ -1986,3 +1986,89 @@ from the phase 1 API sketch and what it leaves for later.
 - A retirement cannot take back a key someone has already unwrapped. A
   compromised backing key means the store key is exposed too, and the
   answer is the closed flag (section 6.4), not a rotation.
+
+## Phase 1c: what was built
+
+Phase 1c of #93 is the Ghost Key record, built as the minimal index that
+decision 6.8 settled on: a contract addressed by the Ghost Key alone, listing
+the stores the key has backed. It holds no complaints, and it reads no other
+contract (decision 6.7).
+
+### The index contract
+
+- A new artifact, `index_contract` (`contracts/index-contract`, rules in
+  `common/src/ghostkey_index.rs`). Its only parameter is the Ghost Key's
+  verifying key, so anyone holding the key derives the address.
+- An entry is the `BackingStatement` the Ghost Key signed through the vault
+  when it backed a store, with that signature: the backer's half of the
+  store's own `AuthorizedBacking`. Publishing one needs no second vault
+  prompt. The contract checks that the statement names this Ghost Key, that
+  its signature verifies, and that the certificate is within the backing
+  bound.
+- One entry per store key, grow-only, the smaller encoding on a clash. At
+  most 64 entries: past that, the entries with the smallest store keys are
+  kept. That is top-N over the slot, the argument `MAX_BACKINGS` rests on,
+  so the merge is total and order-independent. Only the Ghost Key's holder
+  can add an entry, so only that holder can reach the bound.
+- **Retirement is not recorded in the index.** The design sketch said the
+  index would list the stores a key "has backed and retired". Retirements
+  are signed by the STORE key and live in the store, so the index lists
+  places to look and the store says whether the backing stands, whether
+  it is retired and whether it is current. A second copy of the retirement
+  would be a second source that can disagree, the thing decision 6.8
+  removes.
+- **An entry does not prove a backing.** The Ghost Key alone signs it, so
+  it can name any store key. A reader never takes an entry as a backing. It
+  follows it to the store, where the backing needs the store key's
+  acceptance.
+
+### How the UI uses it (`ui/src/index_flow.rs`)
+
+- **Finding a Ghost Key's stores.** For every connected Ghost Key the UI
+  reads its index and loads every store listed. Phase 1b's custody then
+  recovers the store key from a store the key backs (where a wrapped copy
+  exists), which registers the store again. The Harvest delegate's store
+  list stays as a cache. A store with no copy for a key this device has
+  loads but is not registered.
+- **One current store per Ghost Key.** When a store loads, the UI reads the
+  index of its current backer and loads the stores that index lists, so
+  `refresh_backing_verdicts` sees the key's other stores and applies
+  decision 6.2 to them too, not only to what the tab happened to open.
+- **Keeping the index complete, and the migration onto it.** When one of
+  our stores loads (this device holds its store key) and its current backer
+  is connected here, the store's backing is published into that key's
+  index unless the index already lists it, at most once per session. That
+  single rule covers a new store, a moved store, and every store made
+  before the index existed, with no vault prompt.
+- An index state is routed by its contract id, never by guessing at the
+  bytes, and is used only if every entry verifies.
+
+### Re-key bookkeeping
+
+- `legacy/index_contract.toml` exists with no rows: nothing was ever
+  published at an earlier index address. `ui/build.rs` allows that one
+  registry to be empty (`MAY_BE_EMPTY`), and the change that first
+  supersedes the index must add its row and remove that allowance. The
+  migration probe is wired for the index (`Artifact::Index`) so that
+  change only has to append a row.
+- The build script, `check-code-hashes.sh`, `harvest-addresses`, the
+  address guard's placeholders, and the CI and drift workflows list the
+  new artifact. The drift guard builds the merge base with this branch's
+  script. The index crate does not exist at the base, so
+  `HARVEST_ALLOW_MISSING_CRATES=1` (set by the drift guard only) skips it
+  there, and the comparison reports the artifact as NEW rather than
+  missing.
+- Every other artifact moved with `harvest-common`. No new rows are added
+  for them: 1a, 1b and 1c publish together, and the generation they replace
+  is the one `main` records.
+
+### What phase 1c leaves
+
+- A reader that has loaded a store but not yet its backer's index cannot
+  yet apply decision 6.2 to the key's other stores. It shows the verdict it
+  has; section 6.2 asked for "still being checked" in that window, and
+  that is not built.
+- My Store still lists registered stores. A store found through the index
+  shows there once custody has recovered its key.
+- The migration rehearsal harness compiles the index lineage but does not
+  exercise the index contract.

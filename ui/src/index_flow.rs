@@ -1,0 +1,404 @@
+//! Reading and keeping up each Ghost Key's index (harvest#93, phase 1c).
+//!
+//! # What the index is used for here
+//!
+//! * **Finding a Ghost Key's stores.** For every Ghost Key connected to this
+//!   tab, the UI reads the key's index and loads every store it lists. That
+//!   is how a device that knows only the Ghost Key finds the stores behind
+//!   it; custody (`custody_flow`) then recovers the store key from a store
+//!   the key backs, which registers the store again. The Harvest delegate's
+//!   store list stays, as a cache of what this device already knows.
+//! * **One current store per Ghost Key.** When a store loads, the UI reads
+//!   the index of the Ghost Key currently backing it, and loads the stores
+//!   that lists too. `refresh_backing_verdicts` then sees the key's other
+//!   stores, so the rule (decision 6.2) covers stores the reader never
+//!   opened, not only the ones this tab happened to load.
+//! * **Keeping our own index complete.** When one of OUR stores loads (this
+//!   device holds its store key) and its current backer is connected here,
+//!   the store's backing statement is published into that key's index if the
+//!   index does not already hold it. That covers a new store, a moved store,
+//!   and every store made before the index existed (the migration of phase
+//!   1a/1b stores onto the index), with no vault prompt: an entry is the
+//!   backer's half of the store's own backing.
+//!
+//! # What an index is NOT taken for
+//!
+//! An entry is signed by the Ghost Key alone, so it can name any store key.
+//! It is only a place to look. Whether the key backs the store, whether that
+//! backing is retired and whether it is current come from the store's own
+//! state, as before.
+
+use std::collections::HashSet;
+
+use harvest_common::ghostkey_index::{GhostKeyIndexV1, IndexEntry, IndexParameters};
+
+use crate::state::AppState;
+
+/// One Ghost Key's index as this tab knows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IndexView {
+    /// The Ghost Key the index belongs to.
+    pub ghost_key: [u8; 32],
+    /// Its state, once it has arrived and verified.
+    pub index: Option<GhostKeyIndexV1>,
+}
+
+impl AppState {
+    /// Read `ghost_key`'s index, once per session, and keep following it.
+    pub(crate) fn watch_ghostkey_index(&mut self, ghost_key: [u8; 32]) {
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&ghost_key) else {
+            return;
+        };
+        let Ok(key) = crate::gateway::index_ops::index_contract_key(&vk) else {
+            return;
+        };
+        let id = key.id().as_bytes().to_vec();
+        if self.ghostkey_indexes.contains_key(&id) {
+            return;
+        }
+        self.ghostkey_indexes.insert(
+            id.clone(),
+            IndexView {
+                ghost_key,
+                index: None,
+            },
+        );
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
+                dioxus::logger::tracing::warn!("could not read a Ghost Key's index: {e}");
+            }
+        });
+    }
+
+    /// Read the index of every Ghost Key connected to this tab.
+    pub(crate) fn watch_connected_indexes(&mut self) {
+        let keys: Vec<[u8; 32]> = self
+            .ghostkeys
+            .iter()
+            .filter_map(|k| k.verifying_key_bytes.as_deref())
+            .filter_map(|b| <[u8; 32]>::try_from(b).ok())
+            .collect();
+        for key in keys {
+            self.watch_ghostkey_index(key);
+        }
+    }
+
+    /// If `contract_id` is a Ghost Key index this tab is following, take
+    /// its state and return `true`; otherwise `false`, and the caller goes on.
+    ///
+    /// Routed by id, never by trying to decode: an index's CBOR is a map with
+    /// one defaulted field, which a store state decode could take for an
+    /// empty store.
+    pub(crate) fn on_index_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
+        let Some(view) = self.ghostkey_indexes.get(contract_id) else {
+            return false;
+        };
+        let ghost_key = view.ghost_key;
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&ghost_key) else {
+            return true;
+        };
+        let index = match harvest_common::from_cbor::<GhostKeyIndexV1>(state_bytes) {
+            Ok(index) => index,
+            Err(e) => {
+                dioxus::logger::tracing::warn!("a Ghost Key's index did not decode: {e}");
+                return true;
+            }
+        };
+        // Not trusted because a node served it: every entry must be the Ghost
+        // Key's own signed statement, or none of it is used.
+        if let Err(e) = index.verify(&IndexParameters::new(vk)) {
+            dioxus::logger::tracing::warn!("a Ghost Key's index did not verify: {e}");
+            return true;
+        }
+        let stores: Vec<[u8; 32]> = index.store_keys().map(|k| k.to_bytes()).collect();
+        if let Some(view) = self.ghostkey_indexes.get_mut(contract_id) {
+            view.index = Some(index);
+        }
+        for store in stores {
+            self.follow_indexed_store(&store);
+        }
+        // Our stores backed by this key may be missing from it.
+        let ours: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
+        for id in ours {
+            self.ensure_indexed(&id);
+        }
+        true
+    }
+
+    /// Load the store owned by `store_key`, if it is not loaded already.
+    fn follow_indexed_store(&mut self, store_key: &[u8; 32]) {
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(store_key) else {
+            return;
+        };
+        let Ok(id) =
+            crate::gateway::store_ops::store_instance_id(&crate::migrate::store_params(&vk))
+        else {
+            return;
+        };
+        let id = id.as_bytes().to_vec();
+        if !self.note_store_subscribed(&id) {
+            return;
+        }
+        self.indexed_stores_followed.push(id.clone());
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
+                dioxus::logger::tracing::warn!("could not load a store a Ghost Key backs: {e}");
+            }
+        });
+    }
+
+    /// A store's state arrived: read its current backer's index (decision
+    /// 6.2), and keep our own index complete.
+    pub(crate) fn on_store_state_for_index(&mut self, store_contract_id: &[u8]) {
+        let Some(loaded) = self.browsing_stores.get(store_contract_id) else {
+            return;
+        };
+        if let Some(backing) =
+            harvest_common::backing::current_backing(&loaded.backing_state, |network| {
+                self.tip_height(network)
+            })
+        {
+            let backer = backing.statement.backer.to_bytes();
+            self.watch_ghostkey_index(backer);
+        }
+        self.ensure_indexed(store_contract_id);
+    }
+
+    /// Publish our store's backing into its current backer's index, if this
+    /// device holds the store key, the backer is connected here, and neither
+    /// the index nor this session already holds it.
+    pub(crate) fn ensure_indexed(&mut self, store_contract_id: &[u8]) {
+        let Some(loaded) = self.browsing_stores.get(store_contract_id) else {
+            return;
+        };
+        let Some(owner) = loaded.backing_state.owner else {
+            return;
+        };
+        if self.store_owner_key(store_contract_id) != Some(owner) {
+            return;
+        }
+        let Some(backing) =
+            harvest_common::backing::current_backing(&loaded.backing_state, |network| {
+                self.tip_height(network)
+            })
+        else {
+            return;
+        };
+        let backer = backing.statement.backer;
+        let entry = IndexEntry::from_backing(backing);
+        if self.connected_ghost_key(&backer.to_bytes()).is_none() {
+            return;
+        }
+        let slot = entry.slot();
+        let listed = self
+            .ghostkey_indexes
+            .values()
+            .filter(|v| v.ghost_key == backer.to_bytes())
+            .filter_map(|v| v.index.as_ref())
+            .any(|index| index.entries.contains_key(&slot));
+        if listed || !self.index_entries_published.insert(owner.to_bytes()) {
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::index_ops::publish_entry(&backer, entry).await {
+                dioxus::logger::tracing::warn!(
+                    "could not add a store to its Ghost Key's index: {e}"
+                );
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.index_entries_to_publish
+            .push((backer.to_bytes(), entry));
+    }
+
+    /// The fingerprint of a connected Ghost Key whose verifying key is `key`.
+    pub(crate) fn connected_ghost_key(&self, key: &[u8; 32]) -> Option<String> {
+        self.ghostkeys
+            .iter()
+            .find(|k| k.verifying_key_bytes.as_deref() == Some(key.as_slice()))
+            .map(|k| k.fingerprint.clone())
+    }
+
+    /// The store keys `ghost_key`'s index lists, if it has arrived.
+    #[allow(dead_code)]
+    pub(crate) fn indexed_stores(&self, ghost_key: &[u8; 32]) -> Option<HashSet<[u8; 32]>> {
+        self.ghostkey_indexes
+            .values()
+            .find(|v| v.ghost_key == *ghost_key)
+            .and_then(|v| v.index.as_ref())
+            .map(|index| index.store_keys().map(|k| k.to_bytes()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backing_flow::tests::{load_backed, signed_backing};
+    use ed25519_dalek::SigningKey;
+
+    const BACKER: u8 = 0x41;
+
+    fn backer_vk() -> [u8; 32] {
+        SigningKey::from_bytes(&[BACKER; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    fn index_id(key: [u8; 32]) -> Vec<u8> {
+        crate::gateway::index_ops::index_contract_key(
+            &ed25519_dalek::VerifyingKey::from_bytes(&key).unwrap(),
+        )
+        .unwrap()
+        .id()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn store_id(seed: u8) -> Vec<u8> {
+        crate::gateway::store_ops::store_instance_id(&crate::migrate::store_params(
+            &SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+        ))
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn index_of(stores: &[u8]) -> GhostKeyIndexV1 {
+        let mut index = GhostKeyIndexV1::default();
+        let entries: Vec<IndexEntry> = stores
+            .iter()
+            .map(|s| IndexEntry::from_backing(&signed_backing(*s, BACKER, 10)))
+            .collect();
+        index
+            .apply_delta(
+                &IndexParameters::new(
+                    ed25519_dalek::VerifyingKey::from_bytes(&backer_vk()).unwrap(),
+                ),
+                &entries,
+            )
+            .unwrap();
+        index
+    }
+
+    fn connect(state: &mut AppState, key: [u8; 32]) {
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: Some(key.to_vec()),
+            backed_up: false,
+        });
+    }
+
+    /// A connected Ghost Key's index is read, and every store it lists is
+    /// loaded: how a device that knows only the key finds its stores.
+    /// Mutated red by not following the listed stores.
+    #[test]
+    fn a_ghost_keys_index_leads_to_every_store_it_lists() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::GhostKeyList {
+            keys: state.ghostkeys.clone(),
+        });
+        assert!(state.ghostkey_indexes.contains_key(&index_id(backer_vk())));
+
+        let bytes = harvest_common::to_cbor(&index_of(&[0x71, 0x72])).unwrap();
+        state.on_contract_state(index_id(backer_vk()), bytes);
+        assert!(state.indexed_stores_followed.contains(&store_id(0x71)));
+        assert!(state.indexed_stores_followed.contains(&store_id(0x72)));
+        // Routed as an index, not taken for a store.
+        assert!(!state.browsing_stores.contains_key(&index_id(backer_vk())));
+    }
+
+    /// An index holding an entry the Ghost Key did not sign is not used at
+    /// all. Mutated red by skipping the verify.
+    #[test]
+    fn an_index_that_does_not_verify_is_ignored() {
+        let mut state = AppState::default();
+        state.watch_ghostkey_index(backer_vk());
+        let mut index = index_of(&[0x71]);
+        // Another key's backing, filed in this key's index.
+        let foreign = IndexEntry::from_backing(&signed_backing(0x72, 0x42, 10));
+        index.entries.insert(foreign.slot(), foreign);
+        state.on_contract_state(
+            index_id(backer_vk()),
+            harvest_common::to_cbor(&index).unwrap(),
+        );
+        assert!(state.indexed_stores_followed.is_empty());
+        assert!(state.ghostkey_indexes[&index_id(backer_vk())]
+            .index
+            .is_none());
+    }
+
+    /// A store that loads leads to its current backer's index, so the one
+    /// store per Ghost Key rule sees that key's other stores. Mutated red by
+    /// not watching the backer's index.
+    #[test]
+    fn a_loaded_store_leads_to_its_backers_index() {
+        let mut state = AppState::default();
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state.on_store_state_for_index(&[1u8; 32]);
+        assert!(state.ghostkey_indexes.contains_key(&index_id(backer_vk())));
+    }
+
+    /// Our store, backed by a connected Ghost Key, is published into that
+    /// key's index once, and not while the index already lists it. Mutated
+    /// red by never publishing, and by publishing again.
+    #[test]
+    fn our_store_is_added_to_its_backers_index_once() {
+        let store_key = SigningKey::from_bytes(&[0x71; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut state = AppState::default();
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_key),
+            }],
+        );
+        // Not connected: nothing published (only the backer can say so).
+        state.ensure_indexed(&[1u8; 32]);
+        assert!(state.index_entries_to_publish.is_empty());
+
+        connect(&mut state, backer_vk());
+        state.ensure_indexed(&[1u8; 32]);
+        state.ensure_indexed(&[1u8; 32]);
+        assert_eq!(state.index_entries_to_publish.len(), 1, "once");
+        let (ghost, entry) = &state.index_entries_to_publish[0];
+        assert_eq!(*ghost, backer_vk());
+        assert_eq!(entry.statement.store.to_bytes(), store_key);
+        entry
+            .verify(&ed25519_dalek::VerifyingKey::from_bytes(&backer_vk()).unwrap())
+            .expect("an entry the index contract accepts");
+
+        // A fresh session whose index already lists it publishes nothing.
+        let mut again = state.clone();
+        again.index_entries_to_publish.clear();
+        again.index_entries_published.clear();
+        again.watch_ghostkey_index(backer_vk());
+        again.on_contract_state(
+            index_id(backer_vk()),
+            harvest_common::to_cbor(&index_of(&[0x71])).unwrap(),
+        );
+        again.ensure_indexed(&[1u8; 32]);
+        assert!(again.index_entries_to_publish.is_empty());
+    }
+
+    /// A store this device cannot sign for is never published by it.
+    #[test]
+    fn a_store_we_do_not_hold_is_not_published() {
+        let mut state = AppState::default();
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        connect(&mut state, backer_vk());
+        state.ensure_indexed(&[1u8; 32]);
+        assert!(state.index_entries_to_publish.is_empty());
+    }
+}

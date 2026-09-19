@@ -294,6 +294,21 @@ pub struct AppState {
     /// (`custody_flow::CUSTODY_TIMEOUT_MS`).
     pub custody_started_ms: std::collections::BTreeMap<[u8; 32], u64>,
 
+    /// The Ghost Key indexes this tab follows, by index contract id
+    /// (harvest#93 phase 1c). See `index_flow`.
+    pub ghostkey_indexes: HashMap<Vec<u8>, crate::index_flow::IndexView>,
+
+    /// Store keys whose backing this session has published into their
+    /// backer's index, so it is published at most once per session.
+    pub index_entries_published: HashSet<[u8; 32]>,
+
+    /// Stores loaded because an index listed them, in order.
+    pub indexed_stores_followed: Vec<Vec<u8>>,
+
+    /// Off-target only: index entries recorded instead of published.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub index_entries_to_publish: Vec<([u8; 32], harvest_common::ghostkey_index::IndexEntry)>,
+
     /// (store key, backing key) pairs custody has been started for this
     /// session, so a store's state arriving again does not ask the vault
     /// again.
@@ -2464,6 +2479,11 @@ impl AppState {
         if self.bitcoin.retired_contracts.contains(&contract_id) {
             return;
         }
+        // A Ghost Key's index, routed by id before anything guesses at the
+        // bytes (harvest#93 phase 1c; see `index_flow`).
+        if self.on_index_state(&contract_id, &state_bytes) {
+            return;
+        }
 
         // Try Bitcoin tip / address contracts first. Which one a contract id
         // names is decided when we start subscribing to it (see
@@ -2652,6 +2672,9 @@ impl AppState {
                     // store's keys are checked too, and a block lifts when a
                     // later check agrees (#99 re-check).
                     self.recheck_record_key(&contract_id);
+                    // The backer's index, for the one-store-per-key rule and
+                    // to keep our own index complete (harvest#93 phase 1c).
+                    self.on_store_state_for_index(&contract_id);
 
                     // One of our stores, held by another key: say so, once.
                     if let Some(held) = self.foreign_store_owner(&contract_id) {
@@ -6531,6 +6554,9 @@ impl AppState {
                 // A newly connected Ghost Key may back a store whose key this
                 // device lacks, or holds (#99 review).
                 self.start_custody_where_needed();
+                // And its index lists the stores it backs, which is how a
+                // device that knows only the key finds them (phase 1c).
+                self.watch_connected_indexes();
             }
 
             ghostkey_common::GhostkeyResponse::SignResult {

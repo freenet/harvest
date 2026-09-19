@@ -24,6 +24,7 @@ pub(crate) const REPUTATION_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/reputation_contract.wasm");
 pub const MAILBOX_CONTRACT_WASM: &[u8] =
     include_bytes!("../../public/contracts/mailbox_contract.wasm");
+pub const INDEX_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/index_contract.wasm");
 
 /// The code hash of the store contract this build bundles.
 ///

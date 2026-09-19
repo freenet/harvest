@@ -934,6 +934,23 @@ killed all five.
 | `custody_flow::recovered_registration` mailbox | A recovered store registers the mailbox the store actually uses. | **No, not always.** It derives the mailbox from the RECOVERING backer; the store's mailbox is the founding Ghost Key's. They agree until a store has a second backer, which no UI control makes yet. Phase 1d re-addresses the mailbox by the store key. |
 | Mailbox address | Changing a store's backing keeps its mailbox. | **No, and not true yet.** Phase 1b moves the mailbox's encryption key to the store key, not its address, which is still derived from the backing Ghost Key. Phase 1d re-addresses it. |
 
+### The Ghost Key index: harvest#93 phase 1c (added 2026-09-19)
+
+A contract addressed by the Ghost Key alone, listing the stores it has
+backed. Mutation results below were each observed red with the named guard
+removed or inverted, by a scripted run (`cargo test` filtered to the named
+test, original file restored after each), unless the row says otherwise.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `common/src/ghostkey_index.rs::IndexEntry::verify`, `GhostKeyIndexV1::verify` | An entry is the Ghost Key's own backing statement, signed by it, in its store key's slot, with a bounded certificate; an index holds at most `MAX_INDEX_ENTRIES`; a refused delta leaves the index unchanged. | **Yes** -- `an_entry_is_the_ghost_keys_own_signed_statement`, `an_entry_under_another_slot_is_refused`, `the_certificate_is_bounded`, `past_the_bound_the_smallest_store_keys_are_kept`; red with the backer, signature, slot, certificate and bound checks removed, and with the verify-before-merge removed. |
+| `GhostKeyIndexV1::apply_delta`, `merge`, `normalize` | Grow-only, smaller encoding on a clash, the smallest store keys past the bound; idempotent, commutative, associative, and order-independent for stale-summary deltas. | **Yes** -- `a_clash_resolves_to_the_smaller_encoding_either_way`, `seeded_indexes_obey_the_merge_laws_and_delta_order` (past the bound, 200 law and 200 delta-order cases), `a_delta_brings_the_receiver_up_to_the_sender`; red with the tie-break flipped, the largest kept, and the bound skipped. `fdev verify-merge` on `index`, `index-cap` (unions past the bound, delta steps) and `index-bad`: see the PR. |
+| An index entry | Proves the Ghost Key backs the store. | **No, by design.** The Ghost Key alone signs it, so it can name any store key. Readers follow it to the store, whose backing needs the store key's acceptance. |
+| `ui/src/index_flow.rs` reading | A connected Ghost Key's index is read and every store it lists is loaded; an index that does not verify is not used at all; a loaded store leads to its current backer's index; an index is routed by its id, never taken for a store. | **Yes** -- `a_ghost_keys_index_leads_to_every_store_it_lists`, `an_index_that_does_not_verify_is_ignored`, `a_loaded_store_leads_to_its_backers_index`; red with the following, the verify, the routing, the `GhostKeyList` hook and the backer watch removed. |
+| `index_flow::ensure_indexed` | Our store, backed by a connected Ghost Key, is published into that key's index once per session, and not while the index lists it; a store this device cannot sign for is never published by it. | **Yes** -- `our_store_is_added_to_its_backers_index_once`, `a_store_we_do_not_hold_is_not_published`; red with each guard removed. The PUT itself is wasm-only. |
+| `gateway/index_ops::index_contract_key` | The index address this build derives is the one the node computes. | **Yes** -- `the_derived_index_key_is_the_one_the_node_computes`. |
+| Decision 6.2 before the backer's index arrives | A reader shows a key's stake as still being checked until it has the key's index. | **No, not built.** It shows the verdict from the stores it has loaded. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

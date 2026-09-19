@@ -11,6 +11,7 @@ mod connection;
 mod delegate_api;
 // Buyer -> seller messaging. The address derivation and the delta shape are
 // pure and host-testable; only the send itself needs a browser.
+pub mod index_ops;
 pub mod mailbox_ops;
 // Secret-free one-line descriptions of delegate traffic: the only way a
 // response reaches a log (harvest#94).

@@ -107,6 +107,7 @@ use freenet_migrate::{
     ProbeStateOps, SelectionPolicy,
 };
 use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
+use harvest_common::ghostkey_index::{GhostKeyIndexV1, IndexParameters};
 use harvest_common::mailbox::{MailboxParameters, MailboxStateV1};
 use harvest_common::reputation::{ReputationParameters, ReputationStateV1};
 use harvest_common::store::{StoreParameters, StoreStateV1};
@@ -128,6 +129,10 @@ mod mailbox_gen {
     include!(concat!(env!("OUT_DIR"), "/legacy_mailbox_contract.rs"));
 }
 #[allow(dead_code)]
+mod index_gen {
+    include!(concat!(env!("OUT_DIR"), "/legacy_index_contract.rs"));
+}
+#[allow(dead_code)]
 mod delegate_gen {
     include!(concat!(env!("OUT_DIR"), "/legacy_harvest_delegate.rs"));
 }
@@ -145,6 +150,16 @@ pub fn reputation_lineage() -> &'static [ContractLineageEntry] {
 /// Superseded generations of the mailbox contract, oldest first.
 pub fn mailbox_lineage() -> &'static [ContractLineageEntry] {
     mailbox_gen::LEGACY_MAILBOX_CONTRACT
+}
+
+/// Superseded generations of the Ghost Key index contract, oldest first.
+///
+/// Empty: the index is new in harvest#93 phase 1c, so no earlier generation
+/// was ever published (see `legacy/index_contract.toml`). The probe is wired
+/// all the same, so the re-key that first supersedes it only has to append a
+/// row.
+pub fn index_lineage() -> &'static [ContractLineageEntry] {
+    index_gen::LEGACY_INDEX_CONTRACT
 }
 
 /// Superseded generations of the harvest delegate, oldest first.
@@ -165,6 +180,7 @@ pub enum Artifact {
     Store,
     Reputation,
     Mailbox,
+    Index,
 }
 
 impl Artifact {
@@ -173,6 +189,7 @@ impl Artifact {
             Artifact::Store => "store",
             Artifact::Reputation => "reputation",
             Artifact::Mailbox => "mailbox",
+            Artifact::Index => "index",
         }
     }
 
@@ -181,6 +198,7 @@ impl Artifact {
             Artifact::Store => store_lineage(),
             Artifact::Reputation => reputation_lineage(),
             Artifact::Mailbox => mailbox_lineage(),
+            Artifact::Index => index_lineage(),
         }
     }
 }
@@ -372,6 +390,11 @@ pub fn store_candidates(
 
 pub fn mailbox_params(owner_verifying_key: &ed25519_dalek::VerifyingKey) -> MailboxParameters {
     MailboxParameters::new(*owner_verifying_key)
+}
+
+/// The parameters a Ghost Key's index is published under: the key alone.
+pub fn index_params(ghost_key: &ed25519_dalek::VerifyingKey) -> IndexParameters {
+    IndexParameters::new(*ghost_key)
 }
 
 pub fn reputation_params(
@@ -876,6 +899,59 @@ pub(crate) fn merge_reputation_reporting_discard(
     params: &ReputationParameters,
 ) -> FoldOutcome<ReputationStateV1> {
     fold_or_keep_primary("reputation", base, |base| base.merge(params, other))
+}
+
+/// Merge rules for a Ghost Key index's state: the contract's own merge,
+/// which keeps only entries the Ghost Key signed.
+pub struct IndexOps {
+    pub params: IndexParameters,
+}
+
+impl ProbeStateOps for IndexOps {
+    type State = GhostKeyIndexV1;
+
+    fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
+        decode_probed_state("index", bytes)
+    }
+
+    fn is_real(&self, state: &Self::State) -> bool {
+        !state.entries.is_empty()
+    }
+
+    fn merge_with_local(&self, recovered: Self::State, local: &Self::State) -> Self::State {
+        merge_index(recovered, local, &self.params)
+    }
+
+    fn merge_generations(&self, newer: Self::State, older: Self::State) -> Self::State {
+        merge_index(newer, &older, &self.params)
+    }
+}
+
+/// Fold `other` into `base`, keeping `base` whole if `other` holds an entry
+/// this generation refuses: a predecessor's index is data, and a bad entry in
+/// it is dropped with the rest of that fold rather than let through.
+pub(crate) fn merge_index(
+    mut base: GhostKeyIndexV1,
+    other: &GhostKeyIndexV1,
+    params: &IndexParameters,
+) -> GhostKeyIndexV1 {
+    let before = base.clone();
+    let kept: Vec<_> = other
+        .entries
+        .values()
+        .filter(|e| e.verify(params.ghost_key()).is_ok())
+        .cloned()
+        .collect();
+    if kept.len() != other.entries.len() {
+        probe_warn(&format!(
+            "migration fold: {} Ghost Key index entr(ies) did not verify and were left behind",
+            other.entries.len() - kept.len()
+        ));
+    }
+    match base.apply_delta(params, &kept) {
+        Ok(()) => base,
+        Err(_) => before,
+    }
 }
 
 /// Merge rules for a mailbox's state.
