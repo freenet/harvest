@@ -284,6 +284,12 @@ pub struct AppState {
     /// and then on the Harvest delegate's answer. See `custody_flow`.
     pub pending_custody: std::collections::BTreeMap<[u8; 32], crate::custody_flow::CustodyRequest>,
 
+    /// Store keys whose record key, as this device derives it, differs from
+    /// the one the store publishes (#99 review). No edit is published from
+    /// this device for such a store: it would publish a record key that is
+    /// not the store's.
+    pub record_key_mismatch: HashSet<[u8; 32]>,
+
     /// (store key, backing key) pairs custody has been started for this
     /// session, so a store's state arriving again does not ask the vault
     /// again.
@@ -5042,6 +5048,17 @@ impl AppState {
         let Some(edit) = self.pending_store_edit.take() else {
             return false;
         };
+        if self
+            .store_owner_key(&edit.store_contract_id)
+            .is_some_and(|key| self.record_key_mismatch.contains(&key.to_bytes()))
+        {
+            self.notifications.push(
+                "Not published: this device derives a different record key for this store than \
+                 the one it publishes. Publish from a device that agrees."
+                    .to_string(),
+            );
+            return false;
+        }
 
         // A store with its own key publishes the keys it derives (harvest#93
         // phase 1b), so every device agrees on them; wait for them if this
@@ -5896,6 +5913,9 @@ impl AppState {
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
                 self.refresh_same_address_orders();
                 self.republish_withheld();
+                // Which stores this device holds a key for decides wrap or
+                // recover (#99 review).
+                self.start_custody_where_needed();
 
                 // Nothing else re-fetches these after a reload: the seller's
                 // own store is subscribed at creation time and never again,
@@ -6462,6 +6482,9 @@ impl AppState {
                 {
                     let _ = (newly_shared, needs_encryption_key, all_identities);
                 }
+                // A newly connected Ghost Key may back a store whose key this
+                // device lacks, or holds (#99 review).
+                self.start_custody_where_needed();
             }
 
             ghostkey_common::GhostkeyResponse::SignResult {
@@ -6481,6 +6504,9 @@ impl AppState {
                     return;
                 }
                 self.on_signature(Signer::GhostKey, scoped_payload, signature, certificate_pem);
+                // The vault may be free now for a custody request that was
+                // deferred while it was busy.
+                self.start_custody_where_needed();
             }
 
             ghostkey_common::GhostkeyResponse::Certificate {
@@ -7516,15 +7542,19 @@ impl AppState {
     /// Whether the seller has a signature of their own outstanding: anything
     /// queued that is not a watch request, a store being created or edited, or
     /// an access prompt.
-    fn user_signature_under_way(&self) -> bool {
+    pub(crate) fn user_signature_under_way(&self) -> bool {
         // Only what the VAULT was asked to sign. A store-key signature is the
         // Harvest delegate's to answer, so a vault refusal cannot be about it.
+        // A custody request counts (#99 review): it is a vault prompt the
+        // seller sees, so a refusal while it waits must not be taken for a
+        // watch request's, and watch requests hold back behind it.
         self.pending_signatures.iter().any(|pending| {
             pending.signer() == Signer::GhostKey
                 && !matches!(pending, PendingSignature::InboxEntry(_))
         }) || self.pending_store_creation.is_some()
             || self.pending_store_edit.is_some()
             || self.request_any_access_in_flight
+            || !self.pending_custody.is_empty()
     }
 
     /// Whether a refusal naming `fingerprint` is to be taken as a watch

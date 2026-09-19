@@ -351,9 +351,14 @@ pub enum HarvestDelegateRequest {
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
     /// this delegate on this device. Answered with
     /// [`HarvestDelegateResponse::StoreKeyCreated`], which carries the public
-    /// half only. No request returns the secret, and the export to a
-    /// successor generation leaves store keys out (phase 1b recovers them
-    /// from their wrapped copies instead).
+    /// half only. No request returns the seed in the clear, and the export to
+    /// a successor generation leaves store keys out (phase 1b recovers them
+    /// from their wrapped copies instead). The one way a copy leaves is
+    /// `WrapStoreKeyFor`, sealed under a key the caller's wrap signature
+    /// derives; since the caller supplies that signature, the Harvest web
+    /// app's origin is trusted with the seed in principle, and keeping it
+    /// out of the UI is how the UI is built, not something this delegate
+    /// can enforce.
     ///
     /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
     /// the store's state, so another device can recover it); until then a

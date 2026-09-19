@@ -42,10 +42,12 @@
 //! third party can plant or replace one. Copies live in the store's
 //! `copies` set, one per (backer, scope). The contract checks shape and
 //! signature; it cannot check that a ciphertext opens, and never needs to.
-//! `StoreStateV1::normalize_backings` keeps a copy exactly while its backer
-//! holds a backing that is not retired: the backing's retirement is the
-//! custody tombstone, so one signed act stops a key being current AND stops
-//! it recovering the store key from state (section 6.3, check 4).
+//! `StoreStateV1::normalize_backings` keeps a copy unless its backer is
+//! retired (or its slot is cut by the store-wide bound): the backing's
+//! retirement is the custody tombstone, so one signed act stops a key being
+//! current AND stops it recovering the store key from state (section 6.3,
+//! check 4), in any arrival order. A copy need not name a backing the
+//! replica holds; it may arrive first (the #98 merge-law re-check).
 
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};

@@ -459,6 +459,14 @@ fn handle_get_rsa_public_key<S: SecretStore>(
     }
 }
 
+/// Blind-sign a feedback token with the Ghost Key's per-device RSA key.
+///
+/// KNOWN GAP (harvest#93 phase 1b, #99 review): a store created since phase
+/// 1b addresses its record contract by the record key its STORE KEY derives
+/// (`custody::record_rsa_key`), not by this per-device key, so a token signed
+/// here would not verify against that record. Nothing reaches this today:
+/// feedback submission is not wired (#53). The store-key path belongs with
+/// that work; recorded in `docs/untested-invariants.md`.
 fn handle_blind_sign<S: SecretStore>(
     store: &S,
     request_id: u64,

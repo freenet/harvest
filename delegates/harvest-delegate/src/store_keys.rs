@@ -5,11 +5,16 @@
 //!
 //! One secret per store key, `harvest:store_sk:{base58 verifying key}`, holding
 //! the 32-byte seed. [`create`] mints one from the host's RNG and answers the
-//! public half; [`sign`] signs one of a store's own records with it. The seed
-//! is not handed out: no request returns it, the UI only ever holds a
-//! signature, and the export to a successor generation hides this family
-//! (`crate::migration::WithoutStoreKeys`). Phase 1b's custody adds the one
-//! way a copy leaves: wrapped, to a backing Ghost Key, in store state.
+//! public half; [`sign`] signs one of a store's own records with it. No
+//! request returns the seed in the clear, and the export to a successor
+//! generation hides this family (`crate::migration::WithoutStoreKeys`).
+//! Phase 1b's custody adds the one way a copy leaves: wrapped, to a backing
+//! Ghost Key, in store state ([`wrap_for`]). The wrapping key derives from a
+//! vault signature the CALLER supplies, so the Harvest web app's origin is
+//! trusted with the seed in principle: a UI built to could open the copy it
+//! asked for. This UI does not; that is a property of the UI, not a
+//! guarantee this delegate makes to anyone who can speak as the Harvest
+//! origin.
 //!
 //! The key starts with `harvest:` for the reason `handlers.rs` gives: a key
 //! outside that prefix is silently left behind by every future delegate
@@ -644,6 +649,61 @@ mod tests {
             created(&mut device);
         }
         recover(&mut device).expect("a key already held is not a new one");
+    }
+
+    /// Recovering against the WRONG store key keeps nothing: store A's copy
+    /// presented as store B's (with B's genuine wrap signature) does not
+    /// open, and A's signature presented for B is not a wrap signature for
+    /// B (#99 review). Nothing is kept for either store.
+    #[test]
+    fn recovering_against_the_wrong_store_key_keeps_nothing() {
+        let mut device = MemSecrets::default();
+        let a = created(&mut device);
+        let b = created(&mut device);
+        let (scoped_a, sig_a) = vault_sign(&ghost(), custody::wrap_message(&a));
+        let (scoped_b, sig_b) = vault_sign(&ghost(), custody::wrap_message(&b));
+        let copy_a = wrapped(wrap_for(
+            &device,
+            1,
+            a.to_bytes(),
+            ghost().verifying_key().to_bytes(),
+            &scoped_a,
+            &sig_a,
+        ))
+        .unwrap();
+
+        let mut fresh = MemSecrets::default();
+        let backer = ghost().verifying_key().to_bytes();
+        let as_b_with_bs_signature = recovered(unwrap(
+            &mut fresh,
+            2,
+            b.to_bytes(),
+            backer,
+            &scoped_b,
+            &sig_b,
+            &copy_a.copy.wrapped,
+        ));
+        assert!(
+            as_b_with_bs_signature.is_err(),
+            "A's copy does not open as B's"
+        );
+        let as_b_with_as_signature = recovered(unwrap(
+            &mut fresh,
+            3,
+            b.to_bytes(),
+            backer,
+            &scoped_a,
+            &sig_a,
+            &copy_a.copy.wrapped,
+        ));
+        assert!(
+            as_b_with_as_signature
+                .unwrap_err()
+                .contains("not a wrap signature"),
+            "A's signature is not B's wrap signature"
+        );
+        assert!(fresh.list_secrets(STORE_KEY_PREFIX.as_bytes()).is_empty());
+        assert!(load(&fresh, &a).is_none() && load(&fresh, &b).is_none());
     }
 
     /// A copy opened under the wrong Ghost Key's signature, or a corrupt one,

@@ -14,14 +14,19 @@
 //!   to the Harvest delegate (`WrapStoreKeyFor`), which wraps the store key
 //!   and signs the copy, and publishes the copy. This covers a new store, a
 //!   store whose backing changed, and a change of webapp scope.
-//! * **Recover.** The store is NOT registered here with a store key, its
-//!   current backing is a connected Ghost Key, and it holds a copy for that
-//!   key under the current scope: this device lost the key (a delegate
+//! * **Recover.** The store is NOT registered here with a store key, one of
+//!   its unretired backings is a connected Ghost Key, and it holds a copy for
+//!   that key under the current scope: this device lost the key (a delegate
 //!   re-key, which does not carry secrets across) or never had it (a second
 //!   device). The same vault signature goes to `UnwrapStoreKey`, which opens
 //!   the copy, checks the seed IS this store's key, and keeps it; the store
 //!   is then registered again, so it reappears in My Store.
 //! * Nothing, otherwise.
+//!
+//! Recovery can go through any backer whose backing is not retired, not only
+//! the current one; wrapping is for the current backer. The decision runs
+//! again when the connected Ghost Keys or the store registrations change, and
+//! when the vault answers.
 //!
 //! # The signature is a secret, and never touches the publish path
 //!
@@ -29,8 +34,24 @@
 //! `on_ghostkey_response` before anything else looks at it (`state.rs`, the
 //! `SignResult` arm) and sent straight to the Harvest delegate inside a
 //! redacting `WrapSignature`. The UI never holds the store key: the delegate
-//! wraps and unwraps. Logging the vault's responses verbatim is fixed by
-//! harvest#96 (#94), which this stack sits on.
+//! wraps and unwraps. The vault's responses are logged as summaries since
+//! harvest#96 (#94), which is on `main` beneath this stack: a `SignResult`
+//! logs as its bare name, nothing of its payload
+//! (`gateway::log_summary::ghostkey_response_summary`, pinned by
+//! `a_vault_response_summary_prints_no_secret`).
+//!
+//! This is a property of this UI, not something the delegate enforces: the
+//! Harvest web app's origin is trusted, and it supplies the wrap signature,
+//! so a UI built to could open any copy it asks for.
+//!
+//! # One vault prompt at a time
+//!
+//! A vault refusal names no request, so custody is started only while
+//! nothing else waits on the vault (the seller's own signatures, a watch
+//! request, another custody request), and counts as the seller's own work
+//! while it waits, so watch requests hold back and a refusal is not taken
+//! for a watch request's. If the seller starts signing while a custody
+//! prompt is open, a refusal cannot be told apart and drops both.
 //!
 //! # Once per session
 //!
@@ -87,6 +108,14 @@ impl AppState {
     /// Decide what custody work `store_contract_id` needs, record it, and
     /// start it. See the module docs.
     pub(crate) fn start_custody_for(&mut self, store_contract_id: &[u8]) {
+        // One vault prompt at a time: a refusal names no request, so while
+        // custody and anything else wait on the vault, nobody could tell
+        // whose prompt was refused (#99 review). Deferred, not recorded as
+        // attempted: `start_custody_where_needed` runs again when the vault
+        // answers, and on every Ghost Key list, store list and store state.
+        if self.vault_work_outstanding() {
+            return;
+        }
         let Some(request) = self.custody_needed(store_contract_id) else {
             return;
         };
@@ -113,37 +142,91 @@ impl AppState {
         let _ = fingerprint;
     }
 
+    /// Re-decide custody for every loaded store: when the Ghost Keys
+    /// connected to this tab change, when the store registrations arrive,
+    /// and when the vault has answered and a deferred request can start.
+    pub(crate) fn start_custody_where_needed(&mut self) {
+        let ids: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
+        for id in ids {
+            self.start_custody_for(&id);
+        }
+    }
+
+    /// Whether anything is waiting on the Ghost Key vault: the seller's own
+    /// signatures, a watch request, or a custody request.
+    fn vault_work_outstanding(&self) -> bool {
+        self.user_signature_under_way()
+            || self
+                .pending_signatures
+                .iter()
+                .any(|p| matches!(p, crate::state::PendingSignature::InboxEntry(_)))
+    }
+
     /// The custody request a loaded store calls for, if any. Pure over the
     /// state, so it is testable without a browser.
+    ///
+    /// Wrap is for the CURRENT backer only: that is the key readers treat
+    /// as the store's. Recovery can use any backer whose backing is not
+    /// retired and whose copy the store holds (#99 review): the current one
+    /// first, then the others, since a device may hold an older backing
+    /// Ghost Key and not the current one.
     pub(crate) fn custody_needed(&self, store_contract_id: &[u8]) -> Option<CustodyRequest> {
         let loaded = self.browsing_stores.get(store_contract_id)?;
         let state = &loaded.backing_state;
         let owner = state.owner?;
-        let backing =
-            harvest_common::backing::current_backing(state, |network| self.tip_height(network))?;
-        let backer = backing.statement.backer;
-        let backer_bytes = backer.to_bytes();
-        if self
-            .custody_attempted
-            .contains(&(owner.to_bytes(), backer_bytes))
-            || self.pending_custody.contains_key(&owner.to_bytes())
-        {
+        if self.pending_custody.contains_key(&owner.to_bytes()) {
             return None;
         }
-        let fingerprint = self.connected_fingerprint(&backer_bytes)?;
         let scope = WrapScope::current();
-        let held = self.store_owner_key(store_contract_id) == Some(owner);
-        let copy = copy_for(state, &backer, &scope);
-        let purpose = match (held, copy) {
-            (true, None) => CustodyPurpose::Wrap,
-            (false, Some(copy)) => CustodyPurpose::Recover(copy.copy.wrapped.clone()),
-            _ => return None,
+        let current =
+            harvest_common::backing::current_backing(state, |network| self.tip_height(network))
+                .map(|b| b.statement.backer);
+        let attempted = |backer: &ed25519_dalek::VerifyingKey| {
+            self.custody_attempted
+                .contains(&(owner.to_bytes(), backer.to_bytes()))
         };
-        Some(CustodyRequest {
-            store_contract_id: store_contract_id.to_vec(),
-            backer: backer_bytes,
-            fingerprint,
-            purpose,
+        let request = |backer: &ed25519_dalek::VerifyingKey, fingerprint, purpose| {
+            Some(CustodyRequest {
+                store_contract_id: store_contract_id.to_vec(),
+                backer: backer.to_bytes(),
+                fingerprint,
+                purpose,
+            })
+        };
+        if self.store_owner_key(store_contract_id) == Some(owner) {
+            let backer = current?;
+            if attempted(&backer) || copy_for(state, &backer, &scope).is_some() {
+                return None;
+            }
+            let fingerprint = self.connected_fingerprint(&backer.to_bytes())?;
+            return request(&backer, fingerprint, CustodyPurpose::Wrap);
+        }
+        // Not held: recover through any unretired backer this tab has, the
+        // current one first.
+        let mut backers: Vec<ed25519_dalek::VerifyingKey> = state
+            .backings
+            .records
+            .values()
+            .map(|b| b.statement.backer)
+            .filter(|b| {
+                !state
+                    .retirements
+                    .records
+                    .contains_key(&harvest_common::store::Bytes32(b.to_bytes()))
+            })
+            .collect();
+        backers.sort_by_key(|b| (Some(*b) != current, b.to_bytes()));
+        backers.into_iter().find_map(|backer| {
+            if attempted(&backer) {
+                return None;
+            }
+            let copy = copy_for(state, &backer, &scope)?;
+            let fingerprint = self.connected_fingerprint(&backer.to_bytes())?;
+            request(
+                &backer,
+                fingerprint,
+                CustodyPurpose::Recover(copy.copy.wrapped.clone()),
+            )
         })
     }
 
@@ -166,6 +249,16 @@ impl AppState {
             dioxus::logger::tracing::warn!("a wrap signature arrived that nothing asked for");
             return;
         };
+        if self.harvest_delegate_key.is_none() {
+            // Nothing would ever answer; say so rather than wait forever.
+            self.pending_custody.remove(&store);
+            self.notifications.push(
+                "Your store's key could not be backed up or recovered: the Harvest delegate is \
+                 not registered. Reload to try again."
+                    .into(),
+            );
+            return;
+        }
         let request_id = self.next_messaging_request_id();
         let signature = harvest_common::delegate::WrapSignature(signature);
         let request = match &pending.purpose {
@@ -240,6 +333,9 @@ impl AppState {
         self.merge_store_registrations(&pending.fingerprint, vec![registration.clone()]);
         self.notifications
             .push("Recovered your store's key from your Ghost Key.".into());
+        // Check what this device derives against what the store publishes
+        // before anything is published from here (#99 review).
+        self.request_store_subkeys(store);
         #[cfg(target_arch = "wasm32")]
         crate::state::spawn_harvest_request(
             harvest_common::HarvestDelegateRequest::RegisterStore {
@@ -348,12 +444,17 @@ impl AppState {
                 .flatten()
         });
         if published.is_some_and(|published| published != info.record_public_key) {
+            // Blocked, not only reported (#99 review): an edit from here
+            // would publish a record key that is not the store's.
+            self.record_key_mismatch.insert(*store);
             self.notifications.push(
                 "This device derives a different record key for your store than the one it \
-                 publishes. Do not publish from this device until this is resolved: its build \
-                 of Harvest may generate keys differently."
+                 publishes, so it will not publish the store's details: its build of Harvest \
+                 may generate keys differently. Publish from a device that agrees."
                     .into(),
             );
+        } else {
+            self.record_key_mismatch.remove(store);
         }
     }
 }
@@ -365,10 +466,11 @@ fn spawn_wrap_signature_request(fingerprint: String, store: [u8; 32]) {
         use dioxus::prelude::{ReadableExt, WritableExt};
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
-            crate::gateway::APP_STATE
-                .write()
-                .pending_custody
-                .remove(&store);
+            let mut state = crate::gateway::APP_STATE.write();
+            state.pending_custody.remove(&store);
+            state.notifications.push(format!(
+                "Your store's key could not be backed up or recovered: {why}. Reload to try again."
+            ));
         };
         let Ok(store_vk) = ed25519_dalek::VerifyingKey::from_bytes(&store) else {
             fail("not a store key".into());
@@ -481,6 +583,10 @@ mod tests {
             vec![signed_backing(STORE, BACKER, 10)],
         );
         connect_backer(&mut state);
+        state.harvest_delegate_key = Some(freenet_stdlib::prelude::DelegateKey::new(
+            [0xA1; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xA1; 32]),
+        ));
         state
     }
 
@@ -551,6 +657,157 @@ mod tests {
             },
         );
         assert_eq!(purpose(&state), None);
+    }
+
+    /// A device that does not hold the key can recover through a backer
+    /// that is not the current one, as long as its backing is not retired;
+    /// wrapping is only ever for the current backer (#99 review). Mutated
+    /// red by considering the current backer alone.
+    #[test]
+    fn recovery_can_use_any_unretired_backer() {
+        const OLD: u8 = 0x42;
+        let mut state = AppState::default();
+        // BACKER is current (higher block); OLD backed it earlier.
+        load_backed(
+            &mut state,
+            ID,
+            STORE,
+            vec![
+                signed_backing(STORE, BACKER, 10),
+                signed_backing(STORE, OLD, 5),
+            ],
+        );
+        let old = SigningKey::from_bytes(&[OLD; 32]).verifying_key();
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "fp-old".to_string(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: Some(old.to_bytes().to_vec()),
+            backed_up: false,
+        });
+        let copy = StoreKeyCopy {
+            store: store_vk(),
+            backer: old,
+            scope: WrapScope::current(),
+            wrapped: wrapped(),
+        };
+        let (scoped_payload, signature) = sign(&SigningKey::from_bytes(&[STORE; 32]), &copy);
+        state
+            .browsing_stores
+            .get_mut(&vec![ID; 32])
+            .unwrap()
+            .backing_state
+            .copies
+            .records
+            .insert(
+                AuthorizedCopy::slot_for(&old, &WrapScope::current()),
+                AuthorizedCopy {
+                    copy,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        let request = state.custody_needed(&[ID; 32]).expect("recovers");
+        assert_eq!(request.backer, old.to_bytes());
+        assert_eq!(request.fingerprint, "fp-old");
+        assert_eq!(request.purpose, CustodyPurpose::Recover(wrapped()));
+
+        // Holding the key, the old backer is not wrapped for.
+        register(&mut state);
+        assert_eq!(purpose(&state), None, "the current backer is not connected");
+    }
+
+    /// Custody waits while anything else waits on the vault, and counts as
+    /// the seller's own vault work while it waits (#99 review). Mutated red
+    /// by dropping the deferral and by not counting custody.
+    #[test]
+    fn custody_is_the_only_vault_prompt_while_it_waits() {
+        let mut state = backed_store();
+        register(&mut state);
+        state
+            .pending_signatures
+            .push_back(crate::backing_flow::tests::pending_backing_statement());
+        state.start_custody_for(&[ID; 32]);
+        assert!(
+            state.pending_custody.is_empty(),
+            "deferred behind the vault"
+        );
+        assert!(
+            state.custody_attempted.is_empty(),
+            "deferred, not recorded as tried"
+        );
+
+        state.pending_signatures.clear();
+        state.start_custody_where_needed();
+        assert!(
+            !state.pending_custody.is_empty(),
+            "started once the vault is free"
+        );
+        assert!(
+            state.user_signature_under_way(),
+            "and counts as the seller's"
+        );
+    }
+
+    /// Custody is decided again when the Ghost Keys connected to the tab
+    /// arrive, not only when store state does (#99 review). Mutated red by
+    /// removing the call from the `GhostKeyList` arm.
+    #[test]
+    fn a_ghost_key_list_starts_custody() {
+        let mut state = backed_store();
+        register(&mut state);
+        let keys = state.ghostkeys.clone();
+        state.ghostkeys.clear();
+        state.start_custody_where_needed();
+        assert!(state.pending_custody.is_empty());
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::GhostKeyList { keys });
+        assert!(!state.pending_custody.is_empty());
+    }
+
+    /// Custody is decided again when the store registrations arrive: a
+    /// store list naming the store's key makes this device a holder, so the
+    /// key is wrapped (#99 review). Mutated red by removing the call from
+    /// the `StoreList` arm.
+    #[test]
+    fn a_store_list_starts_custody() {
+        let mut state = backed_store();
+        state.start_custody_where_needed();
+        assert!(state.pending_custody.is_empty(), "not held, no copy");
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            stores: vec![StoreRegistration {
+                store_contract_id: vec![ID; 32],
+                reputation_contract_id: vec![ID + 1; 32],
+                mailbox_contract_id: vec![ID + 2; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_vk().to_bytes()),
+            }],
+        });
+        assert_eq!(
+            state
+                .pending_custody
+                .get(&store_vk().to_bytes())
+                .map(|r| r.purpose.clone()),
+            Some(CustodyPurpose::Wrap)
+        );
+    }
+
+    /// With no Harvest delegate registered, a wrap signature is not left
+    /// waiting forever: the request is dropped and the seller told (#99
+    /// review). Mutated red by removing the check.
+    #[test]
+    fn with_no_harvest_delegate_custody_is_dropped_and_said() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        state.harvest_delegate_key = None;
+        state.on_ghostkey_response(wrap_sign_result());
+        assert!(state.pending_custody.is_empty());
+        assert!(state.custody_sent.is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("Harvest delegate is not registered")));
     }
 
     /// A retired backing is the custody tombstone: a store whose only
@@ -674,6 +931,12 @@ mod tests {
             .to_vec();
         assert_eq!(registration.mailbox_contract_id, mailbox);
         assert!(state.pending_custody.is_empty());
+        assert!(
+            state
+                .store_subkeys_requested
+                .contains(&store_vk().to_bytes()),
+            "the recovered key's record key is checked against the published one"
+        );
     }
 
     /// A failed recovery registers nothing and says so.
@@ -751,6 +1014,11 @@ mod tests {
                     .iter()
                     .any(|n| n.contains("different record key")),
                 warned
+            );
+            assert_eq!(
+                state.record_key_mismatch.contains(&store_vk().to_bytes()),
+                warned,
+                "and a mismatch blocks publishing (#99 review)"
             );
         }
     }
