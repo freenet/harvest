@@ -14,6 +14,7 @@
 // would have re-keyed the artifacts it exists to watch.
 #[cfg(feature = "address-guard")]
 pub mod address;
+pub mod backing;
 pub mod bitcoin_delegate;
 pub mod delegate;
 pub mod feedback;
