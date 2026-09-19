@@ -1555,13 +1555,49 @@ mod tests {
         bad.signature = signature;
         assert!(with_copies(vec![backing(&ghost(1), 100)], vec![], vec![bad]).is_err());
 
-        // A whole state holding a copy for a Ghost Key that does not back the
-        // store is refused (a delta carrying one has it dropped instead; see
-        // below).
-        let mut state = ok.clone();
-        let orphan = copy(&ghost(2), 7, 1);
-        state.copies.records.insert(harvest_slot(&orphan), orphan);
+        // A whole state holding a copy for a retired Ghost Key is refused.
+        let mut state = with_copies(
+            vec![backing(&ghost(1), 100)],
+            vec![retirement(&ghost(1))],
+            vec![],
+        )
+        .unwrap();
+        let tombstoned = copy(&ghost(1), 7, 1);
+        state
+            .copies
+            .records
+            .insert(harvest_slot(&tombstoned), tombstoned);
         assert!(state.verify(&state, &params()).is_err());
+    }
+
+    /// A copy may arrive before the backing it is for, and is kept whichever
+    /// order the two arrive in; a copy for a retired key is dropped
+    /// whichever order THOSE arrive in (the #98 merge-law re-check, applied
+    /// to custody). Mutated red by requiring a held backing in
+    /// `normalize_copies`, and by not dropping retired backers' copies.
+    #[test]
+    fn a_copy_arriving_before_its_backing_is_kept_and_a_retired_one_never_is() {
+        let step = |base: &StoreStateV1, d: crate::store::StoreStateV1Delta| {
+            let mut r = base.clone();
+            r.apply_delta(&base.clone(), &params(), &Some(d)).unwrap();
+            r.verify(&r, &params()).expect("valid");
+            r
+        };
+        let mut copy_delta = delta_with(vec![], vec![], vec![]);
+        copy_delta.copies = Some(vec![copy(&ghost(1), 7, 1)]);
+        let back = delta_with(vec![backing(&ghost(1), 100)], vec![], vec![]);
+        let retire = delta_with(vec![], vec![retirement(&ghost(1))], vec![]);
+        let empty = StoreStateV1::default();
+
+        let copy_first = step(&step(&empty, copy_delta.clone()), back.clone());
+        let back_first = step(&step(&empty, back.clone()), copy_delta.clone());
+        assert_eq!(copy_first, back_first);
+        assert_eq!(copy_first.copies.records.len(), 1, "the copy survives");
+
+        let then_retired = step(&copy_first, retire.clone());
+        let retired_first = step(&step(&empty, retire), copy_delta);
+        assert!(then_retired.copies.records.is_empty());
+        assert!(retired_first.copies.records.is_empty());
     }
 
     fn harvest_slot(copy: &crate::custody::AuthorizedCopy) -> Bytes32 {
@@ -1707,6 +1743,11 @@ mod tests {
             }
             let r = rng.subset(&retirements, 2);
             let c = rng.subset(&copies, 8);
+            // Sometimes no backing at all: copies and retirements may arrive
+            // before the backings they name.
+            if rng.below(4) == 0 {
+                b.clear();
+            }
             states.push(with_copies(b, r, c).expect("generated state"));
         }
         assert_laws(
@@ -1721,6 +1762,41 @@ mod tests {
             },
             |s| crate::to_cbor(s).unwrap(),
         );
+
+        // Delta order: stale-summary deltas, and deltas carrying one part
+        // only, applied in either order give the same state.
+        let empty = StoreStateV1::default();
+        let stale = empty.summarize(&empty, &params());
+        let mut deltas = Vec::new();
+        for s in &states {
+            let Some(d) = s.delta(s, &params(), &stale) else {
+                continue;
+            };
+            deltas.push(d.clone());
+            let mut only_copies = d.clone();
+            only_copies.backings = None;
+            only_copies.retirements = None;
+            deltas.push(only_copies);
+            let mut no_copies = d;
+            no_copies.copies = None;
+            deltas.push(no_copies);
+        }
+        for _ in 0..300 {
+            let base = &states[rng.below(states.len())];
+            let x = &deltas[rng.below(deltas.len())];
+            let y = &deltas[rng.below(deltas.len())];
+            let apply2 = |a: &crate::store::StoreStateV1Delta,
+                          b: &crate::store::StoreStateV1Delta| {
+                let mut r = base.clone();
+                r.apply_delta(&base.clone(), &params(), &Some(a.clone()))
+                    .expect("applies");
+                r.apply_delta(&r.clone(), &params(), &Some(b.clone()))
+                    .expect("applies");
+                r.verify(&r, &params()).expect("valid");
+                crate::to_cbor(&r).unwrap()
+            };
+            assert_eq!(apply2(x, y), apply2(y, x), "delta order changed the result");
+        }
     }
 
     #[test]
