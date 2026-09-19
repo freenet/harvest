@@ -52,6 +52,9 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
         crate::markers::marker_secret_key("v1.store.aa.bb"),
         crate::messaging::buyer_conversation_key(&[3u8; 32], &[4u8; 32]),
         crate::known_stores::known_store_key("3Bn8xWqLd6Tz9Kf2"),
+        crate::store_keys::store_key_secret(
+            &ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key(),
+        ),
     ]
 }
 
@@ -272,12 +275,17 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_contract_id,
             reputation_contract_id,
             mailbox_contract_id,
+            store_verifying_key,
         } => handle_register_store(
             store,
             &ghostkey_fingerprint,
-            store_contract_id,
-            reputation_contract_id,
-            mailbox_contract_id,
+            StoreRegistration {
+                store_contract_id,
+                reputation_contract_id,
+                mailbox_contract_id,
+                store_contract_key: None,
+                store_verifying_key,
+            },
         ),
 
         HarvestDelegateRequest::ListStores {
@@ -307,6 +315,19 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         } => crate::known_stores::set_archived(store, &store_code, archived),
 
         HarvestDelegateRequest::ListRememberedStores => crate::known_stores::list(store),
+
+        // Store keys (harvest#93). Behind the same gate as everything else,
+        // and the gate matters most here: `SignStoreUpdate` signs for a whole
+        // store, so an ungated caller would own it.
+        HarvestDelegateRequest::CreateStoreKey { request_id } => {
+            crate::store_keys::create(store, request_id)
+        }
+
+        HarvestDelegateRequest::SignStoreUpdate {
+            request_id,
+            store_verifying_key,
+            payload,
+        } => crate::store_keys::sign(store, request_id, store_verifying_key, payload),
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),
@@ -567,28 +588,21 @@ fn save_stores<S: SecretStore>(
 fn handle_register_store<S: SecretStore>(
     store: &mut S,
     ghostkey_fingerprint: &str,
-    store_contract_id: Vec<u8>,
-    reputation_contract_id: Vec<u8>,
-    mailbox_contract_id: Vec<u8>,
+    registration: StoreRegistration,
 ) -> HarvestDelegateResponse {
     let mut stores = load_stores(store, ghostkey_fingerprint);
 
     // Check for duplicate (same store contract)
     if stores
         .iter()
-        .any(|s| s.store_contract_id == store_contract_id)
+        .any(|s| s.store_contract_id == registration.store_contract_id)
     {
         return HarvestDelegateResponse::StoreRegistered {
             ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
         };
     }
 
-    stores.push(StoreRegistration {
-        store_contract_id,
-        reputation_contract_id,
-        mailbox_contract_id,
-        store_contract_key: None,
-    });
+    stores.push(registration);
     save_stores(store, ghostkey_fingerprint, &stores);
 
     HarvestDelegateResponse::StoreRegistered {
@@ -634,6 +648,7 @@ mod origin_gating_tests {
             store_contract_id: store_contract_id.to_vec(),
             reputation_contract_id: vec![1],
             mailbox_contract_id: vec![2],
+            store_verifying_key: None,
         }
     }
 
@@ -687,6 +702,50 @@ mod origin_gating_tests {
                 assert_eq!(ids, vec![SELLERS_STORE.to_vec()], "wrong registry contents");
             }
             other => panic!("expected a StoreList, got {other:?}"),
+        }
+    }
+
+    /// A store key signs for a whole store, so the gate is the whole of what
+    /// stops another web app granted access to this node from publishing
+    /// listings, invoices or a closure in the seller's name. Neither minting
+    /// nor signing answers anyone but Harvest.
+    ///
+    /// Mutated red by removing the `authorize` call from `handle`.
+    #[test]
+    fn another_web_app_can_neither_mint_nor_use_a_store_key() {
+        let mut store = MemSecrets::default();
+        let refused = handle(
+            &mut store,
+            Some(&a_different_web_app()),
+            HarvestDelegateRequest::CreateStoreKey { request_id: 1 },
+        );
+        assert!(refusal_message(&refused).contains("Harvest web app"));
+        assert!(store.is_empty(), "a foreign web app minted a store key");
+
+        // Harvest mints one; the foreign app still cannot sign with it.
+        let store_key = match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::CreateStoreKey { request_id: 2 },
+        ) {
+            HarvestDelegateResponse::StoreKeyCreated {
+                result: Ok(key), ..
+            } => key,
+            other => panic!("Harvest must be able to mint a store key: {other:?}"),
+        };
+        let closure = harvest_common::backing::StoreClosure {
+            store: ed25519_dalek::VerifyingKey::from_bytes(&store_key).unwrap(),
+        };
+        let sign = |request_id| HarvestDelegateRequest::SignStoreUpdate {
+            request_id,
+            store_verifying_key: store_key,
+            payload: to_cbor(&closure).unwrap(),
+        };
+        let refused = handle(&mut store, Some(&a_different_web_app()), sign(3));
+        assert!(refusal_message(&refused).contains("Harvest web app"));
+        match handle(&mut store, Some(&harvest()), sign(4)) {
+            HarvestDelegateResponse::StoreUpdateSigned { result: Ok(_), .. } => {}
+            other => panic!("Harvest must be able to sign with its store key: {other:?}"),
         }
     }
 

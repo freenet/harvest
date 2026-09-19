@@ -268,6 +268,11 @@ pub enum HarvestDelegateRequest {
         store_contract_id: Vec<u8>,
         reputation_contract_id: Vec<u8>,
         mailbox_contract_id: Vec<u8>,
+        /// The store's own key (harvest#93), which owns the store and signs
+        /// for it. `None` only from a UI older than revision 2, whose stores
+        /// were owned by the Ghost Key itself.
+        #[serde(default)]
+        store_verifying_key: Option<[u8; 32]>,
     },
 
     /// List all stores registered for a ghostkey identity.
@@ -334,6 +339,31 @@ pub enum HarvestDelegateRequest {
     /// One list per node, shared by every Ghost Key on it (and by a buyer
     /// with none): the records are keyed by store code alone.
     ListRememberedStores,
+
+    // === Store keys (harvest#93, revision 2) ===
+    /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
+    /// this delegate on this device. Answered with
+    /// [`HarvestDelegateResponse::StoreKeyCreated`], which carries the public
+    /// half only. The secret never leaves the delegate.
+    ///
+    /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
+    /// the store's state, so another device can recover it); until then a
+    /// store key lives on the device that created it and nowhere else.
+    CreateStoreKey { request_id: RequestId },
+
+    /// Sign `payload` with the store key named by `store_verifying_key`.
+    ///
+    /// `payload` must be one of a store's own records, as
+    /// [`crate::backing::classify_store_key_message`] recognises them; the
+    /// delegate refuses anything else. Answered with
+    /// [`HarvestDelegateResponse::StoreUpdateSigned`], carrying the
+    /// `ScopedPayload` envelope and signature exactly as a vault `SignResult`
+    /// would, so the UI files it the same way.
+    SignStoreUpdate {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        payload: Vec<u8>,
+    },
 }
 
 /// A store this node remembers visiting.
@@ -501,6 +531,20 @@ pub enum HarvestDelegateResponse {
 
     StoreRegistered {
         ghostkey_fingerprint: String,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::CreateStoreKey`]: the new store
+    /// key's public half, or why none was made.
+    StoreKeyCreated {
+        request_id: RequestId,
+        result: Result<[u8; 32], String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::SignStoreUpdate`].
+    StoreUpdateSigned {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<StoreKeySignature, String>,
     },
 
     StoreList {
@@ -832,6 +876,22 @@ pub struct StoreRegistration {
     /// This includes both the instance ID and the code hash.
     #[serde(default)]
     pub store_contract_key: Option<Vec<u8>>,
+    /// The store key that owns this store (harvest#93).
+    ///
+    /// `None` for a registration made before revision 2, when a store was
+    /// owned by the Ghost Key it is registered under. Such a store cannot be
+    /// signed for by this build; the UI moves it to a store key instead (see
+    /// `ui/src/reissue.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_verifying_key: Option<[u8; 32]>,
+}
+
+/// A store-key signature: the envelope and the Ed25519 signature over it, the
+/// two fields every signed record in a store carries.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreKeySignature {
+    pub scoped_payload: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.

@@ -1957,6 +1957,7 @@ dependencies = [
  "bs58",
  "chrono",
  "ciborium",
+ "ed25519-dalek",
  "freenet-bitcoin-common",
  "freenet-migrate",
  "freenet-stdlib",

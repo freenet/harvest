@@ -9,6 +9,7 @@ mod messaging;
 mod migration;
 mod origin;
 mod secrets;
+mod store_keys;
 
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface,
