@@ -12,8 +12,7 @@ example-data = []
 no-sync = []
 
 [dependencies]
-# `log-summary`: the secret-free log lines for delegate responses (harvest#94).
-harvest-common = { workspace = true, features = ["log-summary"] }
+harvest-common = { workspace = true }
 ghostkey-common = { workspace = true }
 freenet-bitcoin-common = { workspace = true }
 # Registering an order's payment address with the bridge (#59). `seal`

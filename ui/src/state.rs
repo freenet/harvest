@@ -5500,7 +5500,10 @@ impl AppState {
             }
 
             _ => {
-                info!("Unhandled delegate response: {}", response.log_summary());
+                info!(
+                    "Unhandled delegate response: {}",
+                    crate::gateway::log_summary::harvest_response_summary(&response)
+                );
             }
         }
     }
@@ -6079,7 +6082,7 @@ impl AppState {
             _ => {
                 info!(
                     "Unhandled ghostkey response: {}",
-                    crate::gateway::response_handler::ghostkey_response_summary(&response)
+                    crate::gateway::log_summary::ghostkey_response_summary(&response)
                 );
             }
         }
@@ -6247,7 +6250,7 @@ impl AppState {
             _ => {
                 info!(
                     "Unhandled bitcoin delegate response: {}",
-                    response.log_summary()
+                    crate::gateway::log_summary::bitcoin_response_summary(&response)
                 );
             }
         }

@@ -115,7 +115,10 @@ pub struct BridgeEndpoint {
 ///
 /// This is the same arrangement a merchant already runs with any watch-only
 /// point-of-sale setup, and the one-time cost is pasting one string.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// `Debug` redacts the xpub (harvest#94): it links every address the seller
+/// will be paid at, and `AppState` derives `Debug` over this.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct PaymentXpubStatus {
     /// The account xpub as the seller pasted it. Public by construction --
     /// this is not a secret in the sense a signing key is, but it IS a
@@ -157,8 +160,12 @@ pub struct DerivedAddress {
 pub const PUBLISHED_INDEX_GAP: u32 = 100;
 
 /// Requests the UI sends the delegate about Bitcoin payments.
+///
+/// `Debug` is written by hand so `SetPaymentXpub` can redact its xpub; see
+/// [`PaymentXpubStatus`]. Every arm names every field, so a field added to a
+/// variant does not compile until somebody decides whether it may print.
 #[non_exhaustive]
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub enum BitcoinDelegateRequest {
     /// Start watching a script. Purely local until the delegate asks a bridge
     /// to synchronize it.
@@ -293,31 +300,85 @@ pub enum BitcoinDelegateResponse {
     },
 }
 
-#[cfg(any(test, feature = "log-summary"))]
-impl BitcoinDelegateResponse {
-    /// A one-line description for a log: the variant and its request id.
-    ///
-    /// Same reasoning as `HarvestDelegateResponse::log_summary`
-    /// (harvest#94): nothing here is a spending key, but the payment xpub
-    /// names every address a seller will ever be paid at, and a log line is
-    /// not where to decide that each time. Exhaustive, so a new variant has
-    /// to be given a line.
-    pub fn log_summary(&self) -> String {
-        use BitcoinDelegateResponse as R;
-        let (name, request_id) = match self {
-            R::Watched { request_id, .. } => ("Watched", Some(request_id)),
-            R::Unwatched { request_id, .. } => ("Unwatched", Some(request_id)),
-            R::WatchList { .. } => ("WatchList", None),
-            R::OrderAssociated { request_id, .. } => ("OrderAssociated", Some(request_id)),
-            R::BridgeConfigured { request_id, .. } => ("BridgeConfigured", Some(request_id)),
-            R::Bridge { .. } => ("Bridge", None),
-            R::PaymentXpubSet { request_id, .. } => ("PaymentXpubSet", Some(request_id)),
-            R::PaymentXpub { .. } => ("PaymentXpub", None),
-            R::OrderAddress { request_id, .. } => ("OrderAddress", Some(request_id)),
-        };
-        match request_id {
-            Some(id) => format!("{name} (request {id})"),
-            None => name.to_string(),
+impl core::fmt::Debug for PaymentXpubStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Self {
+            xpub: _,
+            network,
+            next_index,
+        } = self;
+        f.debug_struct("PaymentXpubStatus")
+            .field("xpub", &crate::delegate::Redacted)
+            .field("network", network)
+            .field("next_index", next_index)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for BitcoinDelegateRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::delegate::Redacted;
+        match self {
+            Self::Watch { request_id, watch } => f
+                .debug_struct("Watch")
+                .field("request_id", request_id)
+                .field("watch", watch)
+                .finish(),
+            Self::Unwatch {
+                request_id,
+                network,
+                script_pubkey,
+            } => f
+                .debug_struct("Unwatch")
+                .field("request_id", request_id)
+                .field("network", network)
+                .field("script_pubkey", script_pubkey)
+                .finish(),
+            Self::ListWatched => f.write_str("ListWatched"),
+            Self::AssociateOrder {
+                request_id,
+                network,
+                script_pubkey,
+                order_id,
+                expected_amount_sats,
+            } => f
+                .debug_struct("AssociateOrder")
+                .field("request_id", request_id)
+                .field("network", network)
+                .field("script_pubkey", script_pubkey)
+                .field("order_id", order_id)
+                .field("expected_amount_sats", expected_amount_sats)
+                .finish(),
+            Self::ConfigureBridge {
+                request_id,
+                endpoint,
+            } => f
+                .debug_struct("ConfigureBridge")
+                .field("request_id", request_id)
+                .field("endpoint", endpoint)
+                .finish(),
+            Self::GetBridge => f.write_str("GetBridge"),
+            Self::SetPaymentXpub {
+                request_id,
+                xpub: _,
+                network,
+                published_scripts,
+            } => f
+                .debug_struct("SetPaymentXpub")
+                .field("request_id", request_id)
+                .field("xpub", &Redacted)
+                .field("network", network)
+                .field("published_scripts", published_scripts)
+                .finish(),
+            Self::GetPaymentXpub => f.write_str("GetPaymentXpub"),
+            Self::DeriveOrderAddress {
+                request_id,
+                published_scripts,
+            } => f
+                .debug_struct("DeriveOrderAddress")
+                .field("request_id", request_id)
+                .field("published_scripts", published_scripts)
+                .finish(),
         }
     }
 }

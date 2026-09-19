@@ -38,14 +38,6 @@ ghostkey = ["dep:ghostkey-common"]
 # hashes -- a guard that re-keys the artifacts it watches. The gate is a
 # guarantee where a measurement was needed.
 address-guard = []
-# `log_summary` on the delegate response enums: a one-line, secret-free
-# description for the UI's logs (harvest#94). OFF by default and enabled only
-# by `harvest-ui`, for the same reason as `address-guard`: this crate is
-# compiled into every contract and the delegate, and the ungated version moved
-# all four code hashes although none of them calls it (its string literals
-# shift the data section). Always compiled under `cfg(test)`, where the
-# redaction test exercises it.
-log-summary = []
 
 # `required-features` keeps the binary out of every build that does not ask for
 # it, including the contract builds. CI lints and compiles it explicitly (see

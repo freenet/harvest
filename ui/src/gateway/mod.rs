@@ -12,6 +12,9 @@ mod delegate_api;
 // Buyer -> seller messaging. The address derivation and the delta shape are
 // pure and host-testable; only the send itself needs a browser.
 pub mod mailbox_ops;
+// Secret-free one-line descriptions of delegate traffic: the only way a
+// response reaches a log (harvest#94).
+pub mod log_summary;
 // The migration probe's I/O half. wasm-only: it exists to drive the gateway's
 // shared response handler, which has no native counterpart. Every decision it
 // makes lives in `crate::migrate`, which is target-independent and tested on

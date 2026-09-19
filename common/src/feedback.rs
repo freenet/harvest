@@ -14,7 +14,12 @@ pub enum FeedbackCategory {
 /// The buyer creates this, blinds it, sends the blinded version to the seller for
 /// signing, then unblinds the signature. The unblinded token + signature can later
 /// be submitted to the seller's reputation contract as negative feedback.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// `Debug` prints the target contract and redacts `nonce` and `entry_key`
+/// (harvest#94): printed beside the blinded token the buyer sent the seller,
+/// they undo the unlinkability blind signing provides. Until the entry is
+/// published they are the buyer's private knowledge.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct FeedbackToken {
     /// Which reputation contract this token targets (ContractInstanceId bytes).
     pub target_reputation_contract: [u8; 32],
@@ -72,6 +77,24 @@ impl FeedbackToken {
             nonce: Self::nonce_for(&entry_key),
             entry_key,
         }
+    }
+}
+
+// Keep this AFTER `impl FeedbackToken`. Rustc numbers a module's impl blocks
+// in source order and the number is part of each method's symbol, so placing
+// it first renames `nonce_for` in the reputation contract's WASM and re-keys
+// that contract (measured on harvest#96).
+impl core::fmt::Debug for FeedbackToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::delegate::Redacted;
+        f.debug_struct("FeedbackToken")
+            .field(
+                "target_reputation_contract",
+                &self.target_reputation_contract,
+            )
+            .field("nonce", &Redacted)
+            .field("entry_key", &Redacted)
+            .finish()
     }
 }
 

@@ -467,9 +467,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // `harvest:known_store:` secret family.
             "da3c9ca1819663314512aa08378374a88be9701a83f0034c37af9cbc81e1c7a0".to_string(),
             // V16, from `git show bc57dac:ui/public/contracts/harvest_delegate.wasm`.
-            // Superseded by harvest#94: `ConversationKey` and
-            // `RecalledConversation` redact their keys under `Debug`, and the
-            // backup string is a redacting `BackupString`. Wire unchanged.
+            // Superseded by harvest#94: the protocol types that hold keys,
+            // backup strings, the xpub and the private half of a feedback
+            // token redact themselves under `Debug`. Wire unchanged.
             "4fae20e120a968fe6651529ed8eb36fa04bd98a8fcc6c52f69206cdb6fae1444".to_string(),
         ],
     );

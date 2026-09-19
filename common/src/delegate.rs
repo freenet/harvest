@@ -543,109 +543,6 @@ pub enum HarvestDelegateResponse {
     },
 }
 
-#[cfg(any(test, feature = "log-summary"))]
-impl HarvestDelegateResponse {
-    /// A one-line description for a log: the variant, and the request id or
-    /// Ghost Key fingerprint it answers where it has one. Nothing else.
-    ///
-    /// # Why not `{:?}`
-    ///
-    /// The UI used to log every response with `{:?}` at `info!`, which
-    /// release builds keep, and several responses carry secrets: conversation
-    /// keys, backup strings (harvest#94). Those types now redact themselves,
-    /// but a log line is not the place to find out whether the next
-    /// secret-bearing field remembered to -- so the log names the answer and
-    /// the handler that consumes it says what it did.
-    ///
-    /// Exhaustive on purpose: a new variant does not compile until it is
-    /// given a line here, which is the moment to decide what of it is safe
-    /// to print.
-    pub fn log_summary(&self) -> String {
-        use HarvestDelegateResponse as R;
-        let (name, id): (&str, Option<String>) = match self {
-            R::ReputationKeysInitialized {
-                ghostkey_fingerprint,
-                ..
-            } => (
-                "ReputationKeysInitialized",
-                Some(ghostkey_fingerprint.clone()),
-            ),
-            R::RsaPublicKey {
-                ghostkey_fingerprint,
-                ..
-            } => ("RsaPublicKey", Some(ghostkey_fingerprint.clone())),
-            R::EncryptionKeyReady {
-                ghostkey_fingerprint,
-                ..
-            } => ("EncryptionKeyReady", Some(ghostkey_fingerprint.clone())),
-            R::BuyerConversationStored { request_id, .. } => (
-                "BuyerConversationStored",
-                Some(format!("request {request_id}")),
-            ),
-            R::BuyerConversationList { request_id, .. } => (
-                "BuyerConversationList",
-                Some(format!("request {request_id}")),
-            ),
-            R::BuyerConversationExported { request_id, .. } => (
-                "BuyerConversationExported",
-                Some(format!("request {request_id}")),
-            ),
-            R::BuyerConversationImported { request_id, .. } => (
-                "BuyerConversationImported",
-                Some(format!("request {request_id}")),
-            ),
-            R::BuyerConversationMarkedBackedUp { request_id, .. } => (
-                "BuyerConversationMarkedBackedUp",
-                Some(format!("request {request_id}")),
-            ),
-            R::BuyerConversationForgotten { request_id, .. } => (
-                "BuyerConversationForgotten",
-                Some(format!("request {request_id}")),
-            ),
-            R::ConversationKeys {
-                request_id,
-                ghostkey_fingerprint,
-                ..
-            } => (
-                "ConversationKeys",
-                Some(format!("request {request_id}, {ghostkey_fingerprint}")),
-            ),
-            R::BlindSignatureResult { request_id, .. } => (
-                "BlindSignatureResult",
-                Some(format!("request {request_id}")),
-            ),
-            R::ListingCreated { request_id, .. } => {
-                ("ListingCreated", Some(format!("request {request_id}")))
-            }
-            R::TransactionRecorded { request_id, .. } => {
-                ("TransactionRecorded", Some(format!("request {request_id}")))
-            }
-            R::BlindSignatureRecorded { request_id, .. } => (
-                "BlindSignatureRecorded",
-                Some(format!("request {request_id}")),
-            ),
-            R::TransactionList { .. } => ("TransactionList", None),
-            R::ContractUpdate { .. } => ("ContractUpdate", None),
-            R::ContractState { .. } => ("ContractState", None),
-            R::StoreRegistered {
-                ghostkey_fingerprint,
-            } => ("StoreRegistered", Some(ghostkey_fingerprint.clone())),
-            R::StoreList {
-                ghostkey_fingerprint,
-                ..
-            } => ("StoreList", Some(ghostkey_fingerprint.clone())),
-            R::RememberedStores { .. } => ("RememberedStores", None),
-            R::MigrationMarker { .. } => ("MigrationMarker", None),
-            R::MigrationMarkerRecorded { .. } => ("MigrationMarkerRecorded", None),
-            R::Error { .. } => ("Error", None),
-        };
-        match id {
-            Some(id) => format!("{name} ({id})"),
-            None => name.to_string(),
-        }
-    }
-}
-
 /// One buyer's ephemeral public key and BOTH conversation keys derived from
 /// it.
 ///
@@ -864,7 +761,7 @@ impl core::fmt::Debug for BackupString {
 /// hand and print this in place of each secret, so the field is visibly
 /// present but its bytes never reach a formatter. Pinned by
 /// `no_delegate_message_prints_a_secret`.
-struct Redacted;
+pub(crate) struct Redacted;
 
 impl core::fmt::Debug for Redacted {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -878,6 +775,21 @@ impl core::fmt::Debug for ConversationKey {
             .field("peer_public_key", &self.peer_public_key)
             .field("buyer_to_seller", &Redacted)
             .field("seller_to_buyer", &Redacted)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for TransactionRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TransactionRecord")
+            .field("transaction_id", &self.transaction_id)
+            .field("our_token", &self.our_token)
+            .field("our_blinded_token", &Redacted)
+            .field(
+                "blind_signature",
+                &self.blind_signature.as_ref().map(|_| Redacted),
+            )
+            .field("created_at", &self.created_at)
             .finish()
     }
 }
@@ -914,7 +826,12 @@ pub struct StoreRegistration {
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+///
+/// `Debug` redacts the blinded token and the blind signature: printed beside
+/// the unblinded token they are exactly the link blind signing exists to
+/// break (which buyer holds which feedback slot). The token itself redacts
+/// its own key and nonce; see [`FeedbackToken`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct TransactionRecord {
     pub transaction_id: String,
     /// Our unblinded feedback token (can be submitted to counterparty's reputation contract).
@@ -977,8 +894,15 @@ mod tests {
     }
     // === harvest#94: nothing the delegate protocol carries prints a secret ===
 
-    /// Every field of a sample below that holds key material is filled with
+    /// Every field of a sample below that must not print is filled with
     /// this byte, or with [`SECRET_TEXT`] if it is a string.
+    ///
+    /// **Adding a field that holds key material (or anything else that must
+    /// not reach a log)? Fill it with `SECRET` / `SECRET_TEXT` in its
+    /// variant's sample.** Classification below is per VARIANT, so a second
+    /// secret field on a variant already marked secret-bearing is checked
+    /// only if its sample carries the sentinel there too -- nothing else in
+    /// this test can notice it.
     const SECRET_BYTE: u8 = 0xA7;
     const SECRET: [u8; 32] = [SECRET_BYTE; 32];
     const SECRET_TEXT: &str = "hvbk1-SECRET-BACKUP-TEXT";
@@ -986,10 +910,15 @@ mod tests {
     /// What a printed secret looks like: `{:?}` of a byte array is decimal,
     /// and a hand-rolled hex dump would be the other obvious slip. Three in a
     /// row, because a single `167` occurs by chance in any hash.
+    ///
+    /// Whitespace is removed first: `{:#?}` puts every array element on its
+    /// own line, so `167, 167, 167` never appears in pretty output even when
+    /// every byte of the key does.
     fn leaked(printed: &str) -> Option<&'static str> {
-        ["167, 167, 167", "a7a7a7", "A7A7A7", "SECRET"]
+        let squashed: String = printed.chars().filter(|c| !c.is_whitespace()).collect();
+        ["167,167,167", "a7a7a7", "A7A7A7", "SECRET"]
             .into_iter()
-            .find(|needle| printed.contains(needle))
+            .find(|needle| squashed.contains(needle))
     }
 
     /// Whether `value`'s wire encoding carries the sentinel secret -- proof
@@ -1031,7 +960,9 @@ mod tests {
             R::ListingCreated { .. } => (11, false),
             R::TransactionRecorded { .. } => (12, false),
             R::BlindSignatureRecorded { .. } => (13, false),
-            R::TransactionList { .. } => (14, false),
+            // Our unblinded token (nonce, entry key) beside the blinded one:
+            // together they link the buyer to their feedback slot.
+            R::TransactionList { .. } => (14, true),
             R::ContractUpdate { .. } => (15, false),
             R::ContractState { .. } => (16, false),
             R::StoreRegistered { .. } => (17, false),
@@ -1062,7 +993,8 @@ mod tests {
             Q::ImportBuyerConversation { .. } => (9, true),
             Q::MarkConversationBackedUp { .. } => (10, false),
             Q::CreateListing { .. } => (11, false),
-            Q::BeginTransaction { .. } => (12, false),
+            // The unblinded token (nonce, entry key); see `TransactionList`.
+            Q::BeginTransaction { .. } => (12, true),
             Q::RecordBlindSignature { .. } => (13, false),
             Q::ListTransactions => (14, false),
             Q::RegisterStore { .. } => (15, false),
@@ -1075,6 +1007,18 @@ mod tests {
         }
     }
     const REQUEST_VARIANTS: usize = 22;
+
+    /// A feedback token whose private parts are the sentinel. Built
+    /// directly rather than with `FeedbackToken::new`, which would derive
+    /// the nonce and so put a hash, not the sentinel, where it must not
+    /// print.
+    fn private_token() -> FeedbackToken {
+        FeedbackToken {
+            target_reputation_contract: [9u8; 32],
+            nonce: SECRET,
+            entry_key: SECRET,
+        }
+    }
 
     fn recalled() -> RecalledConversation {
         RecalledConversation {
@@ -1170,9 +1114,9 @@ mod tests {
             R::TransactionList {
                 transactions: vec![TransactionRecord {
                     transaction_id: "tx-one".into(),
-                    our_token: FeedbackToken::new([9u8; 32], [10u8; 32]),
-                    our_blinded_token: vec![11u8; 16],
-                    blind_signature: Some(vec![12u8; 16]),
+                    our_token: private_token(),
+                    our_blinded_token: SECRET.to_vec(),
+                    blind_signature: Some(SECRET.to_vec()),
                     created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
                         .expect("timestamp"),
                 }],
@@ -1288,7 +1232,10 @@ mod tests {
             Q::BeginTransaction {
                 request_id: 42,
                 transaction_id: "tx-one".into(),
-                our_token: FeedbackToken::new([9u8; 32], [10u8; 32]),
+                our_token: private_token(),
+                // Not the sentinel: the seller holds the blinded token
+                // already, and with the token's own key and nonce redacted
+                // it links nothing on its own.
                 our_blinded_token: vec![11u8; 16],
             },
             Q::RecordBlindSignature {
@@ -1326,12 +1273,7 @@ mod tests {
 
     /// Check one sample: classified correctly, and nothing printed from it
     /// shows the secret.
-    fn check_sample<T: Serialize + core::fmt::Debug>(
-        what: &str,
-        value: &T,
-        secret_bearing: bool,
-        extra_prints: &[String],
-    ) {
+    fn check_sample<T: Serialize + core::fmt::Debug>(what: &str, value: &T, secret_bearing: bool) {
         assert_eq!(
             carries_secret(value),
             secret_bearing,
@@ -1344,63 +1286,231 @@ mod tests {
                 "carries"
             },
         );
-        for printed in [format!("{value:?}"), format!("{value:#?}")]
-            .iter()
-            .chain(extra_prints)
-        {
-            if let Some(needle) = leaked(printed) {
+        for printed in [format!("{value:?}"), format!("{value:#?}")] {
+            if let Some(needle) = leaked(&printed) {
                 panic!("{what} printed its secret ({needle:?} found): {printed}");
             }
         }
     }
 
+    /// Every Bitcoin-surface response variant, as for [`classify_response`].
+    fn classify_bitcoin_response(r: &crate::BitcoinDelegateResponse) -> (usize, bool) {
+        use crate::BitcoinDelegateResponse as B;
+        match r {
+            B::Watched { .. } => (0, false),
+            B::Unwatched { .. } => (1, false),
+            B::WatchList { .. } => (2, false),
+            B::OrderAssociated { .. } => (3, false),
+            B::BridgeConfigured { .. } => (4, false),
+            B::Bridge { .. } => (5, false),
+            // The payment xpub, which links every address it derives.
+            B::PaymentXpubSet { .. } => (6, true),
+            B::PaymentXpub { .. } => (7, true),
+            B::OrderAddress { .. } => (8, false),
+        }
+    }
+    const BITCOIN_RESPONSE_VARIANTS: usize = 9;
+
+    /// Every Bitcoin-surface request variant, as for [`classify_response`].
+    fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
+        use crate::BitcoinDelegateRequest as B;
+        match r {
+            B::Watch { .. } => (0, false),
+            B::Unwatch { .. } => (1, false),
+            B::ListWatched => (2, false),
+            B::AssociateOrder { .. } => (3, false),
+            B::ConfigureBridge { .. } => (4, false),
+            B::GetBridge => (5, false),
+            // The payment xpub, as pasted.
+            B::SetPaymentXpub { .. } => (6, true),
+            B::GetPaymentXpub => (7, false),
+            B::DeriveOrderAddress { .. } => (8, false),
+        }
+    }
+    const BITCOIN_REQUEST_VARIANTS: usize = 9;
+
+    fn watch() -> crate::WatchedPayment {
+        crate::WatchedPayment {
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xde, 0xad],
+            address: "tb1qexample".into(),
+            label: Some("rent".into()),
+            order_id: None,
+            expected_amount_sats: Some(50_000),
+            contract_id: None,
+            added_at_ms: 1_700_000_000_000,
+            bridge_synced: false,
+            last_error: None,
+        }
+    }
+
+    fn xpub_status() -> crate::PaymentXpubStatus {
+        crate::PaymentXpubStatus {
+            xpub: SECRET_TEXT.into(),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            next_index: 3,
+        }
+    }
+
+    fn bitcoin_response_samples() -> Vec<crate::BitcoinDelegateResponse> {
+        use crate::BitcoinDelegateResponse as B;
+        let endpoint = crate::BridgeEndpoint {
+            url: "https://bridge.example".into(),
+            bridge_id: freenet_bitcoin_common::BridgeId([1u8; 32]),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            auth: crate::BridgeAuthMode::Open,
+        };
+        vec![
+            B::Watched {
+                request_id: 42,
+                result: Ok(watch()),
+            },
+            B::Unwatched {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::WatchList {
+                watches: vec![watch()],
+            },
+            B::OrderAssociated {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::BridgeConfigured {
+                request_id: 42,
+                result: Ok(()),
+            },
+            B::Bridge {
+                endpoint: Some(endpoint),
+            },
+            B::PaymentXpubSet {
+                request_id: 42,
+                result: Ok(xpub_status()),
+                matched_scripts: vec![vec![2u8; 22]],
+            },
+            B::PaymentXpub {
+                status: Some(xpub_status()),
+            },
+            B::OrderAddress {
+                request_id: 42,
+                result: Ok(crate::DerivedAddress {
+                    index: 3,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    script_pubkey: vec![2u8; 22],
+                    address: "tb1qexample".into(),
+                }),
+                matched_scripts: vec![],
+            },
+        ]
+    }
+
+    fn bitcoin_request_samples() -> Vec<crate::BitcoinDelegateRequest> {
+        use crate::BitcoinDelegateRequest as B;
+        vec![
+            B::Watch {
+                request_id: 42,
+                watch: watch(),
+            },
+            B::Unwatch {
+                request_id: 42,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                script_pubkey: vec![2u8; 22],
+            },
+            B::ListWatched,
+            B::AssociateOrder {
+                request_id: 42,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                script_pubkey: vec![2u8; 22],
+                order_id: crate::OrderId([5u8; 32]),
+                expected_amount_sats: 50_000,
+            },
+            B::ConfigureBridge {
+                request_id: 42,
+                endpoint: crate::BridgeEndpoint {
+                    url: "https://bridge.example".into(),
+                    bridge_id: freenet_bitcoin_common::BridgeId([1u8; 32]),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    auth: crate::BridgeAuthMode::Open,
+                },
+            },
+            B::GetBridge,
+            B::SetPaymentXpub {
+                request_id: 42,
+                xpub: SECRET_TEXT.into(),
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                published_scripts: vec![vec![2u8; 22]],
+            },
+            B::GetPaymentXpub,
+            B::DeriveOrderAddress {
+                request_id: 42,
+                published_scripts: vec![],
+            },
+        ]
+    }
+
+    /// Run every sample through [`check_sample`] and fail on any variant
+    /// `classify` knows of that has no sample.
+    fn check_all<T: Serialize + core::fmt::Debug>(
+        what: &str,
+        samples: Vec<T>,
+        classify: impl Fn(&T) -> (usize, bool),
+        variants: usize,
+    ) {
+        let mut seen = vec![false; variants];
+        for sample in samples {
+            let (index, secret_bearing) = classify(&sample);
+            seen[index] = true;
+            check_sample(&format!("{what} variant {index}"), &sample, secret_bearing);
+        }
+        let missing: Vec<usize> = (0..variants).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "no sample of {what} variant(s) {missing:?}"
+        );
+    }
+
     /// **No request or response the harvest delegate speaks prints a
-    /// secret, under `{:?}`, `{:#?}` or `log_summary`** (harvest#94).
+    /// secret, under `{:?}` or `{:#?}`** (harvest#94).
     ///
-    /// Every variant is sampled -- `classify_*` is exhaustive, and the
-    /// coverage check below fails until a new variant has a sample -- and
-    /// each sample puts the sentinel in every field that holds key material.
-    /// `carries_secret` then confirms the sentinel really is in the value,
-    /// so a clean print is a redaction and not an absent secret.
+    /// Covers both enums on each of its two surfaces. Every variant is
+    /// sampled -- the `classify_*` functions are exhaustive, and the coverage
+    /// check fails until a new variant has a sample -- and each sample puts
+    /// the sentinel in every field that must not print. `carries_secret` then
+    /// confirms the sentinel really is in the value, so a clean print is a
+    /// redaction and not an absent secret.
+    ///
+    /// The UI's one-line log summaries are tested beside them in
+    /// `harvest-ui`'s `gateway::log_summary`.
     #[test]
     fn no_delegate_message_prints_a_secret() {
-        let mut seen = [false; RESPONSE_VARIANTS];
-        for response in response_samples() {
-            let (index, secret_bearing) = classify_response(&response);
-            seen[index] = true;
-            check_sample(
-                &format!("response variant {index}"),
-                &response,
-                secret_bearing,
-                &[response.log_summary()],
-            );
-        }
-        let missing: Vec<usize> = (0..RESPONSE_VARIANTS).filter(|i| !seen[*i]).collect();
-        assert!(
-            missing.is_empty(),
-            "no sample of response variant(s) {missing:?}"
+        check_all(
+            "response",
+            response_samples(),
+            classify_response,
+            RESPONSE_VARIANTS,
         );
-
-        let mut seen = [false; REQUEST_VARIANTS];
-        for request in request_samples() {
-            let (index, secret_bearing) = classify_request(&request);
-            seen[index] = true;
-            check_sample(
-                &format!("request variant {index}"),
-                &request,
-                secret_bearing,
-                &[],
-            );
-        }
-        let missing: Vec<usize> = (0..REQUEST_VARIANTS).filter(|i| !seen[*i]).collect();
-        assert!(
-            missing.is_empty(),
-            "no sample of request variant(s) {missing:?}"
+        check_all(
+            "request",
+            request_samples(),
+            classify_request,
+            REQUEST_VARIANTS,
+        );
+        check_all(
+            "bitcoin response",
+            bitcoin_response_samples(),
+            classify_bitcoin_response,
+            BITCOIN_RESPONSE_VARIANTS,
+        );
+        check_all(
+            "bitcoin request",
+            bitcoin_request_samples(),
+            classify_bitcoin_request,
+            BITCOIN_REQUEST_VARIANTS,
         );
 
         // And the secret-bearing types on their own, which is how they would
         // reach a log from anywhere but the enums.
-        check_sample("RecalledConversation", &recalled(), true, &[]);
+        check_sample("RecalledConversation", &recalled(), true);
         check_sample(
             "ConversationKey",
             &ConversationKey {
@@ -1409,10 +1519,11 @@ mod tests {
                 seller_to_buyer: SECRET,
             },
             true,
-            &[],
         );
-        check_sample("BackupString", &BackupString(SECRET_TEXT.into()), true, &[]);
-        check_sample("ConversationSecret", &ConversationSecret(SECRET), true, &[]);
+        check_sample("BackupString", &BackupString(SECRET_TEXT.into()), true);
+        check_sample("ConversationSecret", &ConversationSecret(SECRET), true);
+        check_sample("FeedbackToken", &private_token(), true);
+        check_sample("PaymentXpubStatus", &xpub_status(), true);
     }
 
     /// The redaction is a `Debug` property only: a `BackupString` is exactly
@@ -1424,18 +1535,5 @@ mod tests {
             crate::to_cbor(&BackupString("hvbk1-abc".into())).expect("cbor"),
             crate::to_cbor(&"hvbk1-abc").expect("cbor"),
         );
-    }
-
-    /// `log_summary` says which answer it was and for what, so the log is
-    /// still useful after dropping the payload.
-    #[test]
-    fn a_log_summary_names_the_variant_and_the_request() {
-        let summary = HarvestDelegateResponse::ConversationKeys {
-            request_id: 42,
-            ghostkey_fingerprint: "fp-one".into(),
-            result: Ok(vec![]),
-        }
-        .log_summary();
-        assert_eq!(summary, "ConversationKeys (request 42, fp-one)");
     }
 }
