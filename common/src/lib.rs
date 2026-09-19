@@ -15,6 +15,8 @@
 #[cfg(feature = "address-guard")]
 pub mod address;
 pub mod bitcoin_delegate;
+#[cfg(feature = "custody")]
+pub mod custody;
 pub mod delegate;
 pub mod feedback;
 pub mod listing;

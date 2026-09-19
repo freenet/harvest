@@ -1,0 +1,80 @@
+Store-key custody spike: probe of the REAL ghostkeys vault signing handler.
+Not for upstream. Apply to a scratch clone of freenet/ghostkeys (tested at 298fa82):
+  git apply ghostkeys-vault-probe.patch && cargo test -p ghostkey-delegate custody_probe -- --nocapture
+It prints the scoped payload and signature pinned as VAULT_SCOPED_PAYLOAD / VAULT_SIGNATURE
+in common/src/custody/tests.rs, and asserts they are equal across two calls and two vaults.
+
+diff --git a/delegates/ghostkey-delegate/src/handlers.rs b/delegates/ghostkey-delegate/src/handlers.rs
+index b25823b..7bf2f26 100644
+--- a/delegates/ghostkey-delegate/src/handlers.rs
++++ b/delegates/ghostkey-delegate/src/handlers.rs
+@@ -1482,3 +1482,69 @@ mod tests {
+         }
+     }
+ }
++
++/// Harvest custody spike probe (NOT for upstream): drives the real
++/// `handle_sign` for a fixed Ghost Key seed and a fixed requestor, on two
++/// independent in-memory vaults ("devices"), and prints the result so
++/// Harvest's known-answer vector can be tied to what the vault really emits.
++#[cfg(test)]
++mod custody_probe {
++    use super::*;
++    use crate::env::MemEnv;
++    use freenet_stdlib::prelude::ContractInstanceId;
++
++    fn hex(b: &[u8]) -> String {
++        b.iter().map(|x| format!("{x:02x}")).collect()
++    }
++
++    fn device(sk: &SigningKey, cert: &GhostkeyCertificateV1, app: &SignatureRequestor) -> (MemEnv, String) {
++        let mut env = MemEnv::new();
++        let vault = SignatureRequestor::WebApp(ContractInstanceId::new([1u8; 32]));
++        let fp = seed_ghostkey(&mut env, cert, sk, &vault);
++        assert!(permissions::grant_third_party(&mut env, &fp, app));
++        (env, fp)
++    }
++
++    fn sign(env: &MemEnv, fp: &str, msg: &[u8], app: &SignatureRequestor) -> (Vec<u8>, Vec<u8>) {
++        match handle_sign(env, fp, msg, app) {
++            GhostkeyResponse::SignResult { scoped_payload, signature, .. } => (scoped_payload, signature),
++            other => panic!("expected SignResult, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn wrap_signature_is_deterministic_across_calls_and_devices() {
++        let (cert, _) = test_ghostkey(100);
++        let sk = SigningKey::from_bytes(&[0x42u8; 32]);
++        let store_vk = SigningKey::from_bytes(&[0x51u8; 32]).verifying_key();
++        let mut msg = b"harvest/store-key-wrap/v1\0".to_vec();
++        msg.extend_from_slice(store_vk.as_bytes());
++        let app = SignatureRequestor::WebApp(ContractInstanceId::new([7u8; 32]));
++
++        let (dev_a, fp_a) = device(&sk, &cert, &app);
++        let (dev_b, fp_b) = device(&sk, &cert, &app);
++        let a1 = sign(&dev_a, &fp_a, &msg, &app);
++        let a2 = sign(&dev_a, &fp_a, &msg, &app);
++        let b1 = sign(&dev_b, &fp_b, &msg, &app);
++        assert_eq!(a1, a2, "same device, two calls");
++        assert_eq!(a1, b1, "two devices");
++
++        // Harvest's own model of the bytes: ScopedPayload CBOR + plain RFC 8032.
++        let scoped = to_cbor(&ScopedPayload { requestor: app.clone(), payload: msg.clone() }).unwrap();
++        assert_eq!(a1.0, scoped, "scoped bytes match Harvest's model");
++        assert_eq!(a1.1, sk.sign(&scoped).to_bytes().to_vec(), "plain Ed25519 over the scoped bytes");
++
++        // Another requestor: a different signature over the same message.
++        let other = SignatureRequestor::WebApp(ContractInstanceId::new([8u8; 32]));
++        let (dev_c, fp_c) = device(&sk, &cert, &other);
++        let c = sign(&dev_c, &fp_c, &msg, &other);
++        assert_ne!(a1.1, c.1, "requestor scoping changes the signature");
++
++        // Without a grant the vault refuses rather than signs.
++        let stranger = SignatureRequestor::WebApp(ContractInstanceId::new([9u8; 32]));
++        assert!(matches!(handle_sign(&dev_a, &fp_a, &msg, &stranger), GhostkeyResponse::PermissionDenied { .. }));
++
++        println!("PROBE scoped_payload={}", hex(&a1.0));
++        println!("PROBE signature={}", hex(&a1.1));
++    }
++}

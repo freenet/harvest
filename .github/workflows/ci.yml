@@ -58,6 +58,17 @@ jobs:
           cargo clippy --locked -p harvest-common --features address-guard --all-targets -- -D warnings
           cargo test --locked -p harvest-common --features address-guard
 
+      # Store-key custody (`harvest-common/custody`) is OFF by default for the
+      # same reason as the address guard: nothing that builds a contract may
+      # compile it until a contract actually needs it. Until then this is the
+      # only step that compiles `common/src/custody.rs`, so without it the
+      # known-answer vectors and merge-law tests would never run.
+      - name: clippy and test store-key custody
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p harvest-common --features custody --all-targets -- -D warnings
+          cargo test --locked -p harvest-common --features custody custody
+
       # `tests/rehearsal` is a SEPARATE cargo workspace -- deliberately, so
       # that building or locking it can never move a dependency version the
       # contracts compile against and re-key an artifact. The cost of that

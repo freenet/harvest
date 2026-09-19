@@ -22,15 +22,39 @@ chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
+# Store-key custody (spike). Optional so the contracts, which build this crate
+# with default features, are byte-for-byte unaffected.
+hkdf = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
+serde_bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Enables `freenet_bitcoin_common::spv::testing`, so `store` module tests
 # build genuine SPV proofs rather than stubbing out payment verification.
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+# Custody tests check the wrap message cannot be read as an inbox entry, the
+# one other domain-tagged message Harvest asks the vault to sign.
+freenet-bitcoin-inbox = { workspace = true }
 
 [features]
 default = ["ghostkey"]
 ghostkey = ["dep:ghostkey-common"]
+# Store-key custody (design revision 2, section 3 / 6.3). OFF by default: this
+# crate is compiled into every contract and the delegate, and unreferenced code
+# here has moved their code hashes before (see `address-guard`). Test with
+# `cargo test -p harvest-common --features custody custody`.
+custody = [
+    "ghostkey",
+    "dep:hkdf",
+    "dep:aes-gcm",
+    "dep:x25519-dalek",
+    "dep:zeroize",
+    "dep:rand_chacha",
+    "dep:serde_bytes",
+]
 # The contract-address guard: fixed placeholder parameter values and the
 # `harvest-addresses` binary that turns them into addresses. OFF by default and
 # never enabled by a contract build. This crate is compiled into all three
