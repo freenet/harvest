@@ -149,16 +149,39 @@ impl AppState {
         #[cfg(target_arch = "wasm32")]
         {
             spawn_wrap_signature_request(fingerprint, store);
-            wasm_bindgen_futures::spawn_local(async {
-                gloo_timers::future::TimeoutFuture::new(CUSTODY_TIMEOUT_MS as u32).await;
-                use dioxus::prelude::WritableExt;
-                crate::gateway::APP_STATE
-                    .write()
-                    .expire_custody(crate::state::now_ms());
+            // Re-checked rather than fired once: a one-shot timer that
+            // goes off a millisecond early leaves the request pending for
+            // the session (#101 review), so this keeps looking while the
+            // request is still there.
+            wasm_bindgen_futures::spawn_local(async move {
+                use dioxus::prelude::{ReadableExt, WritableExt};
+                for _ in 0..4 {
+                    gloo_timers::future::TimeoutFuture::new((CUSTODY_TIMEOUT_MS / 2).max(1) as u32)
+                        .await;
+                    crate::gateway::APP_STATE
+                        .write()
+                        .expire_custody(crate::state::now_ms());
+                    if !crate::gateway::APP_STATE
+                        .read()
+                        .pending_custody
+                        .contains_key(&store)
+                    {
+                        return;
+                    }
+                }
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = fingerprint;
+    }
+
+    /// Take a custody request off the pending list, with the timestamp the
+    /// timeout reads. The two are removed together everywhere: a timestamp
+    /// left behind would time out the NEXT request for that store as soon
+    /// as it started.
+    pub(crate) fn take_custody(&mut self, store: &[u8; 32]) -> Option<CustodyRequest> {
+        self.custody_started_ms.remove(store);
+        self.pending_custody.remove(store)
     }
 
     /// Give up every custody request older than [`CUSTODY_TIMEOUT_MS`], say
@@ -170,9 +193,14 @@ impl AppState {
             .pending_custody
             .keys()
             .filter(|store| {
+                // A request with no timestamp is NOT instantly expired
+                // (#101 review): `start_custody_for` records one, so a
+                // missing one means something else put the request there,
+                // and giving it up here would be a guess. The timer that
+                // fires for it re-checks, so nothing is stuck for long.
                 started
                     .get(*store)
-                    .is_none_or(|t| now_ms.saturating_sub(*t) >= CUSTODY_TIMEOUT_MS)
+                    .is_some_and(|t| now_ms.saturating_sub(*t) >= CUSTODY_TIMEOUT_MS)
             })
             .copied()
             .collect();
@@ -299,7 +327,7 @@ impl AppState {
         };
         if self.harvest_delegate_key.is_none() {
             // Nothing would ever answer; say so rather than wait forever.
-            self.pending_custody.remove(&store);
+            self.take_custody(&store);
             self.notifications.push(
                 "Your store's key could not be backed up or recovered: the Harvest delegate is \
                  not registered. Reload to try again."
@@ -340,7 +368,7 @@ impl AppState {
         store: [u8; 32],
         result: Result<AuthorizedCopy, String>,
     ) {
-        let Some(pending) = self.pending_custody.remove(&store) else {
+        let Some(pending) = self.take_custody(&store) else {
             return;
         };
         match result {
@@ -361,7 +389,7 @@ impl AppState {
     /// The delegate recovered the store key: register the store again, so it
     /// is this device's store once more.
     pub(crate) fn on_store_key_recovered(&mut self, store: [u8; 32], result: Result<(), String>) {
-        let Some(pending) = self.pending_custody.remove(&store) else {
+        let Some(pending) = self.take_custody(&store) else {
             return;
         };
         if let Err(why) = result {
@@ -436,13 +464,17 @@ impl AppState {
             return;
         }
         let request_id = self.next_messaging_request_id();
+        // Sent through the path that clears the marker when the send fails
+        // (#101 review): the marker is what stops a second ask, so leaving
+        // it set after a failed send means the delegate is never asked
+        // again this session and a creation waiting on the answer hangs.
         #[cfg(target_arch = "wasm32")]
-        crate::state::spawn_harvest_request(
+        spawn_subkeys_request(
+            store,
             harvest_common::HarvestDelegateRequest::GetStoreSubkeys {
                 request_id,
                 store_verifying_key: store,
             },
-            "the store's derived keys",
         );
         #[cfg(not(target_arch = "wasm32"))]
         let _ = request_id;
@@ -497,17 +529,24 @@ impl AppState {
     }
 
     /// Fill the pending creation for the store key `store` from the subkeys
-    /// this session holds for it. Whether they were there.
+    /// this session holds for it.
+    ///
+    /// Returns whether a creation was FILLED, which is what the caller acts
+    /// on (#101 review): it asks the delegate when this says no, and
+    /// answering "the subkeys are here" for a creation that is not this
+    /// store's would leave that creation waiting on a request nobody made.
     pub(crate) fn fill_creation_from_subkeys(&mut self, store: [u8; 32]) -> bool {
-        let Some(info) = self.store_subkeys.get(&store) else {
+        let Some(info) = self.store_subkeys.get(&store).cloned() else {
             return false;
         };
-        if let Some(pending) = self.pending_store_creation.as_mut() {
-            if pending.store_verifying_key == Some(store) {
-                pending.rsa_public_key_der = Some(info.record_public_key.clone());
-                pending.encryption_public_key = Some(info.inbox_public_key);
-            }
+        let Some(pending) = self.pending_store_creation.as_mut() else {
+            return false;
+        };
+        if pending.store_verifying_key != Some(store) {
+            return false;
         }
+        pending.rsa_public_key_der = Some(info.record_public_key);
+        pending.encryption_public_key = Some(info.inbox_public_key);
         true
     }
 
@@ -544,6 +583,39 @@ impl AppState {
     }
 }
 
+/// Ask the Harvest delegate for a store's derived keys; if the request
+/// cannot be sent, forget that it was asked so a retry asks again.
+#[cfg(target_arch = "wasm32")]
+fn spawn_subkeys_request(store: [u8; 32], request: harvest_common::HarvestDelegateRequest) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::{ReadableExt, WritableExt};
+        let fail = |why: String| {
+            dioxus::logger::tracing::warn!("the store's derived keys were not asked for: {why}");
+            crate::gateway::APP_STATE
+                .write()
+                .store_subkeys_requested
+                .remove(&store);
+        };
+        let Some(delegate_key) = crate::gateway::APP_STATE
+            .read()
+            .harvest_delegate_key
+            .clone()
+        else {
+            fail("the Harvest delegate is not registered".into());
+            return;
+        };
+        match harvest_common::to_cbor(&request) {
+            Ok(payload) => {
+                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await
+                {
+                    fail(format!("could not reach the Harvest delegate: {e}"));
+                }
+            }
+            Err(e) => fail(format!("could not encode the request: {e}")),
+        }
+    });
+}
+
 /// Send a custody request to the Harvest delegate; if it cannot be sent,
 /// give the request up and say so, rather than leave it pending (#99
 /// re-check).
@@ -554,7 +626,7 @@ fn spawn_custody_request(store: [u8; 32], request: harvest_common::HarvestDelega
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
             let mut state = crate::gateway::APP_STATE.write();
-            state.pending_custody.remove(&store);
+            state.take_custody(&store);
             state.notifications.push(format!(
                 "Your store's key could not be backed up or recovered: {why}. Reload to try again."
             ));
@@ -587,7 +659,7 @@ fn spawn_wrap_signature_request(fingerprint: String, store: [u8; 32]) {
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
             let mut state = crate::gateway::APP_STATE.write();
-            state.pending_custody.remove(&store);
+            state.take_custody(&store);
             state.notifications.push(format!(
                 "Your store's key could not be backed up or recovered: {why}. Reload to try again."
             ));
@@ -964,6 +1036,85 @@ mod tests {
         set_published(&mut state, vec![9, 9, 9]);
         state.recheck_record_key(&[ID; 32]);
         assert!(state.record_key_mismatch.is_empty(), "lifted");
+    }
+
+    /// `fill_creation_from_subkeys` says whether it FILLED a creation, not
+    /// whether the subkeys exist (#101 review): a creation for another
+    /// store is not filled, and the caller must go on to ask. Mutated red
+    /// by answering true for a creation of a different store.
+    #[test]
+    fn filling_a_creation_answers_whether_it_filled_one() {
+        let mut state = backed_store();
+        let other = SigningKey::from_bytes(&[0x7e; 32])
+            .verifying_key()
+            .to_bytes();
+        state.store_subkeys.insert(
+            other,
+            harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [0x1b; 32],
+                record_public_key: vec![0x2e; 4],
+            },
+        );
+        assert!(
+            !state.fill_creation_from_subkeys(other),
+            "no creation at all"
+        );
+
+        state.pending_store_creation = Some(crate::state::PendingStoreCreation {
+            another_store: false,
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            seller_verifying_key_bytes: backer_vk().to_bytes(),
+            certificate_pem: String::new(),
+            store_name: "Bean Shop".into(),
+            description: String::new(),
+            rsa_public_key_der: None,
+            encryption_public_key: None,
+            store_verifying_key: Some(store_vk().to_bytes()),
+            store_key_request: Some(1),
+            carried_listings: Vec::new(),
+        });
+        assert!(
+            !state.fill_creation_from_subkeys(other),
+            "another store's keys fill nothing"
+        );
+        assert!(state
+            .pending_store_creation
+            .as_ref()
+            .unwrap()
+            .rsa_public_key_der
+            .is_none());
+    }
+
+    /// A custody request taken off the pending list takes its timestamp
+    /// with it, so the NEXT request for that store is not expired the
+    /// moment it starts (#101 review). Mutated red by leaving the
+    /// timestamp behind.
+    #[test]
+    fn a_finished_custody_request_leaves_no_timestamp_behind() {
+        let mut state = backed_store();
+        register(&mut state);
+        state.start_custody_for(&[ID; 32]);
+        let started = state.custody_started_ms[&store_vk().to_bytes()];
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyWrapped {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Err("no".into()),
+        });
+        assert!(state.pending_custody.is_empty());
+        assert!(state.custody_started_ms.is_empty(), "and its timestamp");
+
+        // A request with no timestamp is not expired on sight.
+        state.pending_custody.insert(
+            store_vk().to_bytes(),
+            CustodyRequest {
+                store_contract_id: vec![ID; 32],
+                backer: [0; 32],
+                fingerprint: "fp".into(),
+                purpose: CustodyPurpose::Wrap,
+            },
+        );
+        state.expire_custody(started + CUSTODY_TIMEOUT_MS * 10);
+        assert!(!state.pending_custody.is_empty(), "not a guess");
     }
 
     /// With no Harvest delegate registered, a wrap signature is not left

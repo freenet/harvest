@@ -6373,6 +6373,7 @@ impl AppState {
         // refused prompt is not raised again on every state arrival; a reload
         // tries again.
         self.pending_custody.clear();
+        self.custody_started_ms.clear();
     }
 
     /// Handle a response from the ghostkey delegate.
