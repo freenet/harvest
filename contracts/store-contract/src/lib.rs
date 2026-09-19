@@ -594,6 +594,7 @@ mod tests {
                 info: None,
                 listings: None,
                 orders: None,
+                ..Default::default()
             },
             &mut delta,
         )

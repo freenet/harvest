@@ -25,6 +25,7 @@ chrono = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 # Per-order Bitcoin address derivation (src/bip32.rs). Public BIP-32
 # derivation only -- no private key is held or produced anywhere in this

@@ -268,6 +268,11 @@ pub enum HarvestDelegateRequest {
         store_contract_id: Vec<u8>,
         reputation_contract_id: Vec<u8>,
         mailbox_contract_id: Vec<u8>,
+        /// The store's own key (harvest#93), which owns the store and signs
+        /// for it. `None` only from a UI older than revision 2, whose stores
+        /// were owned by the Ghost Key itself.
+        #[serde(default)]
+        store_verifying_key: Option<[u8; 32]>,
     },
 
     /// List all stores registered for a ghostkey identity.
@@ -334,6 +339,48 @@ pub enum HarvestDelegateRequest {
     /// One list per node, shared by every Ghost Key on it (and by a buyer
     /// with none): the records are keyed by store code alone.
     ListRememberedStores,
+
+    // === Store keys (harvest#93, revision 2) ===
+    /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
+    /// this delegate on this device. Answered with
+    /// [`HarvestDelegateResponse::StoreKeyCreated`], which carries the public
+    /// half only. No request returns the secret, and the export to a
+    /// successor generation leaves store keys out (phase 1b recovers them
+    /// from their wrapped copies instead).
+    ///
+    /// Phase 1b adds custody (the key wrapped to each backing Ghost Key in
+    /// the store's state, so another device can recover it); until then a
+    /// store key lives on the device that created it and nowhere else.
+    ///
+    /// # Resumable per Ghost Key (#98 review, M1)
+    ///
+    /// With `ghostkey_fingerprint`, the delegate remembers the key it minted
+    /// for that Ghost Key's store creation until `RegisterStore` names it, and
+    /// answers the SAME key to every later `CreateStoreKey` for that Ghost
+    /// Key until then: from another tab, after a reload, or on a retry after
+    /// a failed PUT. The store's code, and so its contract id, derives from
+    /// the store key, so a retry re-publishes the same store instead of
+    /// making a second one. Without it (a request from an older UI), a fresh
+    /// key every time, as before.
+    CreateStoreKey {
+        request_id: RequestId,
+        #[serde(default)]
+        ghostkey_fingerprint: Option<String>,
+    },
+
+    /// Sign `payload` with the store key named by `store_verifying_key`.
+    ///
+    /// `payload` must be one of a store's own records, as
+    /// [`crate::backing::classify_store_key_message`] recognises them; the
+    /// delegate refuses anything else. Answered with
+    /// [`HarvestDelegateResponse::StoreUpdateSigned`], carrying the
+    /// `ScopedPayload` envelope and signature exactly as a vault `SignResult`
+    /// would, so the UI files it the same way.
+    SignStoreUpdate {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        payload: Vec<u8>,
+    },
 }
 
 /// A store this node remembers visiting.
@@ -501,6 +548,20 @@ pub enum HarvestDelegateResponse {
 
     StoreRegistered {
         ghostkey_fingerprint: String,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::CreateStoreKey`]: the new store
+    /// key's public half, or why none was made.
+    StoreKeyCreated {
+        request_id: RequestId,
+        result: Result<[u8; 32], String>,
+    },
+
+    /// Answer to [`HarvestDelegateRequest::SignStoreUpdate`].
+    StoreUpdateSigned {
+        request_id: RequestId,
+        store_verifying_key: [u8; 32],
+        result: Result<StoreKeySignature, String>,
     },
 
     StoreList {
@@ -832,6 +893,22 @@ pub struct StoreRegistration {
     /// This includes both the instance ID and the code hash.
     #[serde(default)]
     pub store_contract_key: Option<Vec<u8>>,
+    /// The store key that owns this store (harvest#93).
+    ///
+    /// `None` for a registration made before revision 2, when a store was
+    /// owned by the Ghost Key it is registered under. Such a store cannot be
+    /// signed for by this build; the UI moves it to a store key instead (see
+    /// `ui/src/backing_flow.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_verifying_key: Option<[u8; 32]>,
+}
+
+/// A store-key signature: the envelope and the Ed25519 signature over it, the
+/// two fields every signed record in a store carries.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StoreKeySignature {
+    pub scoped_payload: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 /// A record of a feedback token exchange, stored locally by the delegate.
@@ -980,9 +1057,13 @@ mod tests {
             R::MigrationMarker { .. } => (20, false),
             R::MigrationMarkerRecorded { .. } => (21, false),
             R::Error { .. } => (22, false),
+            // The store key's public half only; the seed never leaves.
+            R::StoreKeyCreated { .. } => (23, false),
+            // A signature over a store record, published as it is.
+            R::StoreUpdateSigned { .. } => (24, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 23;
+    const RESPONSE_VARIANTS: usize = 25;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1013,9 +1094,12 @@ mod tests {
             Q::RememberStore { .. } => (19, false),
             Q::SetStoreArchived { .. } => (20, false),
             Q::ListRememberedStores => (21, false),
+            Q::CreateStoreKey { .. } => (22, false),
+            // A store record to be signed and published.
+            Q::SignStoreUpdate { .. } => (23, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 22;
+    const REQUEST_VARIANTS: usize = 24;
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1148,6 +1232,7 @@ mod tests {
                     reputation_contract_id: vec![15u8; 32],
                     mailbox_contract_id: vec![16u8; 32],
                     store_contract_key: None,
+                    store_verifying_key: Some([17u8; 32]),
                 }],
             },
             R::RememberedStores {
@@ -1166,6 +1251,18 @@ mod tests {
             },
             R::Error {
                 message: "refused".into(),
+            },
+            R::StoreKeyCreated {
+                request_id: 43,
+                result: Ok([17u8; 32]),
+            },
+            R::StoreUpdateSigned {
+                request_id: 44,
+                store_verifying_key: [17u8; 32],
+                result: Ok(StoreKeySignature {
+                    scoped_payload: vec![18u8; 8],
+                    signature: vec![19u8; 64],
+                }),
             },
         ]
     }
@@ -1258,6 +1355,7 @@ mod tests {
                 store_contract_id: store(),
                 reputation_contract_id: vec![15u8; 32],
                 mailbox_contract_id: vec![16u8; 32],
+                store_verifying_key: Some([17u8; 32]),
             },
             Q::ListStores {
                 ghostkey_fingerprint: fp(),
@@ -1277,6 +1375,15 @@ mod tests {
                 archived: true,
             },
             Q::ListRememberedStores,
+            Q::CreateStoreKey {
+                request_id: 43,
+                ghostkey_fingerprint: Some(fp()),
+            },
+            Q::SignStoreUpdate {
+                request_id: 44,
+                store_verifying_key: [17u8; 32],
+                payload: vec![18u8; 8],
+            },
         ]
     }
 

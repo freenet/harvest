@@ -22,6 +22,15 @@ because each still contains material the explainer cut for length:
   it is what makes the exit-scam protection work, so it cannot be optimised away
   without giving up the protection.
 
+## The entity model (revision 2)
+
+- **[entity-model.md](entity-model.md)** is the approved design for what a
+  store, a Ghost Key, a backing and a record are, and how the UI shows them
+  (freenet/harvest#93). It is implemented in phases; each phase's choices are
+  recorded at the end of the file. Where it and the documents above disagree
+  about who owns a store, it wins: a store has its own key, and Ghost Keys
+  back it.
+
 ## Engineering notes
 
 These are about the code rather than the mechanism.

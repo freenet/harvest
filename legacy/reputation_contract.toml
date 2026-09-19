@@ -92,3 +92,9 @@ version = "V12"
 description = "Superseded by harvest#52, which changed `harvest-common` (the store parameters and state, and the delegate's remembered-store requests). `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed, and this contract's did not: nothing it verifies or merges changed, and `ReputationParameters` is field-for-field what it was (the change does not touch it; `cargo make code-hashes` reports 158 B of parameters). Every V12 state verifies against V13 unchanged."
 date = "2026-09-18"
 code_hash = "58c9632d415d46d333c25e6299878c736460854ca4cdd01e0162fda88ce1f22b"
+
+[[entry]]
+version = "V13"
+description = "Superseded by harvest#93 phase 1a, which changed `harvest-common` (a store key owns a store; backings, retirements and the closed flag in the store's state; the delegate's store-key requests). `harvest-common` is compiled into every artifact here, so its changes move these bytes whether or not this artifact's own behaviour changed, and this contract's did not: nothing it verifies or merges changed, and `ReputationParameters` is field-for-field what it was (the record is still addressed by the Ghost Key and the per-device RSA key; phase 1d re-addresses it by the store key). Every V13 state verifies against V14 unchanged. Built at `bc57dac` (PR #91)."
+date = "2026-09-18"
+code_hash = "bf1f3c47e6888c686ca9e6b74d9eee6692c94c9de6b3a7eed68a2a27e027a947"

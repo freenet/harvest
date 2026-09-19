@@ -254,6 +254,42 @@ pub struct AppState {
     /// legibility; it is not the correlation mechanism.
     pub pending_signatures: std::collections::VecDeque<PendingSignature>,
 
+    /// `SignStoreUpdate` requests in flight, as request id -> the bytes they
+    /// asked to have signed. An answer is matched by those bytes, as a vault
+    /// answer is; a REFUSAL carries only the id, and this is how it finds the
+    /// entry to withdraw. See `AppState::store_key_signature_failed`.
+    pub pending_store_key_requests: std::collections::BTreeMap<u64, Vec<u8>>,
+
+    /// Certificate verdicts already reached, by (certificate, backing key).
+    /// See [`AppState::backing_view`].
+    pub certificate_verdicts:
+        std::cell::RefCell<HashMap<(String, [u8; 32]), crate::ghostkey_cert::CertificateStatus>>,
+
+    /// The Ghost Key a store is being created (or moved) for, from the moment
+    /// creation starts until the store is published or creation fails
+    /// (harvest#93 review, Must Fix 3). Unlike `pending_store_creation`,
+    /// which is taken as soon as its inputs arrive, this stays set through
+    /// the backing signatures and the PUTs, so a second click cannot start a
+    /// second store. See `backing_flow`.
+    pub store_creation_in_flight: Option<String>,
+
+    /// A backing signed by both keys for a creation whose publish then
+    /// failed, kept so a retry reuses it (#98 review, M1): the Harvest
+    /// delegate answers the same store key to the retry (see
+    /// `CreateStoreKey`), and with this the retry asks for no signature
+    /// again and publishes the SAME store. Cleared once a store is
+    /// published, or when the delegate answers a different key.
+    pub resumable_backing: Option<harvest_common::backing::AuthorizedBacking>,
+
+    /// Off-target only: a store whose backing completed, recorded instead of
+    /// published, so the creation flow can be followed in a test without a
+    /// browser. See `backing_flow`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub created_backings: Vec<(
+        PendingStoreCreation,
+        harvest_common::backing::AuthorizedBacking,
+    )>,
+
     /// Invoices the seller has asked to issue, waiting on the payment address
     /// the delegate is deriving for each, keyed by the `DeriveOrderAddress`
     /// request id.
@@ -378,48 +414,43 @@ pub struct PendingStoreCreation {
     /// alongside `InitReputationKeys`, and generating a 2048-bit RSA key
     /// takes far longer than 32 random bytes. Nothing here relies on that.
     pub encryption_public_key: Option<[u8; 32]>,
+    /// The new store's own key (harvest#93), filled by the harvest delegate's
+    /// `StoreKeyCreated`. `None` until it arrives; creation waits on it,
+    /// since without it there is no store to create.
+    pub store_verifying_key: Option<[u8; 32]>,
+    /// The request id `CreateStoreKey` went out under, so only its own
+    /// answer fills `store_verifying_key`.
+    pub store_key_request: Option<u64>,
+    /// Listings to re-sign into the new store once it exists: the listings
+    /// of a store made before revision 2, being moved to a store key (see
+    /// `crate::backing_flow`). Empty for an ordinary new store.
+    pub carried_listings: Vec<harvest_common::listing::Listing>,
 }
 
-/// Publish the three contracts of a store whose inputs are all present.
+/// Publish the three contracts of a store whose inputs are all present, and
+/// whose backing has been signed by both keys.
 ///
-/// Split out of `AppState::start_store_creation_if_ready` so the gate itself
-/// compiles and is testable off-target: everything below here needs a browser.
+/// Split out of the backing flow (`crate::backing_flow`) so everything that
+/// decides what gets published compiles and is testable off-target:
+/// everything below here needs a browser.
 #[cfg(target_arch = "wasm32")]
-fn spawn_store_creation(pending: PendingStoreCreation) {
-    let PendingStoreCreation {
-        ghostkey_fingerprint,
-        seller_verifying_key_bytes,
-        certificate_pem,
-        store_name,
-        description,
-        rsa_public_key_der,
-        encryption_public_key,
-    } = pending;
-    // The gate only releases once this is `Some`; treat it as a no-op rather
-    // than a panic if that ever stops being true.
-    let Some(rsa_public_key_der) = rsa_public_key_der else {
-        return;
-    };
-
+pub(crate) fn spawn_store_creation(
+    pending: PendingStoreCreation,
+    backing: harvest_common::backing::AuthorizedBacking,
+) {
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::store_ops::create_store_contracts(
-            ghostkey_fingerprint,
-            seller_verifying_key_bytes,
-            rsa_public_key_der,
-            certificate_pem,
-            StoreDetails {
-                store_name,
-                description,
-            },
-            encryption_public_key,
-        )
-        .await
-        {
-            dioxus::logger::tracing::error!("Store creation failed: {}", e);
-            crate::gateway::APP_STATE
-                .write()
-                .notifications
-                .push(format!("Store creation failed: {e}"));
+        match crate::gateway::store_ops::create_store_contracts(pending, backing).await {
+            // Published: the store now exists, so the single-flight marker
+            // is released (see `store_creation_in_flight`).
+            Ok(()) => {
+                let mut state = crate::gateway::APP_STATE.write();
+                state.store_creation_in_flight = None;
+                state.resumable_backing = None;
+            }
+            Err(e) => {
+                dioxus::logger::tracing::error!("Store creation failed: {}", e);
+                crate::gateway::APP_STATE.write().store_creation_failed(&e);
+            }
         }
     });
 }
@@ -519,58 +550,66 @@ fn spawn_inbox_entry_signature(pending: crate::bitcoin_inbox::PendingInboxEntry)
     });
 }
 
-/// Ask the ghostkey delegate to sign a store's details.
+/// Ask the Harvest delegate to sign one of a store's own records with the
+/// store key (harvest#93).
 ///
-/// The request is already queued by the time this runs, because the answer
-/// can arrive as soon as the send returns and an answer matching nothing is
-/// dropped. If the send itself fails, withdraw it again: nothing will ever
+/// The request is already queued, under `request_id`, by the time this runs
+/// (see `AppState::request_store_key_signature`), because the answer can
+/// arrive as soon as the send returns and an answer matching nothing is
+/// dropped. If the send itself fails, it is withdrawn: nothing will ever
 /// answer it.
 #[cfg(target_arch = "wasm32")]
-fn spawn_store_info_signature(fingerprint: String, pending: PendingStoreInfo) {
+fn spawn_store_key_signature(request_id: u64, store_verifying_key: [u8; 32], payload: Vec<u8>) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::{ReadableExt, WritableExt};
 
-        let queued = PendingSignature::StoreInfo(pending.clone());
-        let withdraw = |reason: String| {
-            dioxus::logger::tracing::error!("{reason}");
-            let mut state = crate::gateway::APP_STATE.write();
-            state.withdraw_pending_signature(&queued);
-            state
-                .notifications
-                .push(format!("Could not publish your store's details: {reason}"));
+        let fail = |reason: String| {
+            crate::gateway::APP_STATE
+                .write()
+                .store_key_signature_failed(request_id, &reason);
         };
-
         let Some(delegate_key) = crate::gateway::APP_STATE
             .read()
-            .ghostkey_delegate_key
+            .harvest_delegate_key
             .clone()
         else {
-            withdraw("ghostkey delegate not registered".to_string());
+            fail("the Harvest delegate is not registered".to_string());
             return;
         };
-        let message = match harvest_common::to_cbor(&pending.info) {
-            Ok(message) => message,
-            Err(e) => {
-                withdraw(format!("serialize store details for signing: {e}"));
-                return;
-            }
+        let request = harvest_common::HarvestDelegateRequest::SignStoreUpdate {
+            request_id,
+            store_verifying_key,
+            payload,
         };
-        let request = ghostkey_common::GhostkeyRequest::SignMessage {
-            fingerprint,
-            message,
-        };
-        let payload = match ghostkey_common::to_cbor(&request) {
+        let payload = match harvest_common::to_cbor(&request) {
             Ok(payload) => payload,
             Err(e) => {
-                withdraw(format!("serialize SignMessage: {e}"));
+                fail(format!("serialize SignStoreUpdate: {e}"));
                 return;
             }
         };
         if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
-            withdraw(format!("send store details for signing: {e}"));
+            fail(format!("send for signing: {e}"));
         }
     });
 }
+
+/// The store key test fixtures register their stores under: a store this
+/// device can sign for (harvest#93). A test about a store made before
+/// revision 2 registers `None` instead.
+#[cfg(test)]
+pub(crate) fn test_store_key() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
+        .verifying_key()
+        .to_bytes()
+}
+
+/// What a seller is told when they try to publish to a store this device has
+/// no store key for (harvest#93).
+pub(crate) const NO_STORE_KEY_MESSAGE: &str =
+    "this store has no store key on this device. A store made before stores had their own \
+     keys has to be moved to one first (My Store offers it); a store created on another \
+     device can only be signed for there until store keys can be recovered from a Ghost Key.";
 
 /// Wrap a freshly-signed invoice as the record the store contract stores.
 ///
@@ -635,61 +674,6 @@ fn spawn_address_reuse_check(contract_id: [u8; 32], request_id: u64) {
         crate::gateway::APP_STATE
             .write()
             .on_address_reuse_timeout(&contract_id, request_id);
-    });
-}
-
-/// Ask the ghostkey delegate to sign an invoice.
-///
-/// Same discipline as `spawn_store_info_signature`: the request is queued
-/// before this runs, and a failed send withdraws it rather than leaving an
-/// entry that would consume an unrelated signature.
-#[cfg(target_arch = "wasm32")]
-fn spawn_order_signature(pending: PendingOrder) {
-    wasm_bindgen_futures::spawn_local(async move {
-        use dioxus::prelude::{ReadableExt, WritableExt};
-
-        let queued = PendingSignature::Order(Box::new(pending.clone()));
-        let withdraw = |reason: String| {
-            dioxus::logger::tracing::error!("{reason}");
-            let mut state = crate::gateway::APP_STATE.write();
-            state.withdraw_pending_signature(&queued);
-            state
-                .notifications
-                .push(format!("Could not issue the invoice: {reason}"));
-        };
-
-        let Some(delegate_key) = crate::gateway::APP_STATE
-            .read()
-            .ghostkey_delegate_key
-            .clone()
-        else {
-            withdraw("ghostkey delegate not registered".to_string());
-            return;
-        };
-        // What the delegate signs is the CBOR of the order itself;
-        // `AuthorizedOrder::verify_terms` checks the scoped payload wraps
-        // exactly these bytes.
-        let message = match harvest_common::to_cbor(&pending.order) {
-            Ok(message) => message,
-            Err(e) => {
-                withdraw(format!("serialize the invoice for signing: {e}"));
-                return;
-            }
-        };
-        let request = ghostkey_common::GhostkeyRequest::SignMessage {
-            fingerprint: pending.fingerprint.clone(),
-            message,
-        };
-        let payload = match ghostkey_common::to_cbor(&request) {
-            Ok(payload) => payload,
-            Err(e) => {
-                withdraw(format!("serialize SignMessage: {e}"));
-                return;
-            }
-        };
-        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
-            withdraw(format!("send the invoice for signing: {e}"));
-        }
     });
 }
 
@@ -789,36 +773,68 @@ pub fn store_details_gap(
 
 /// Which of a store's listings carry a certificate that does not verify.
 ///
-/// Every listing in a store normally carries the seller's one certificate, so
-/// the common case is one verification for the whole page and byte-equality
-/// for the rest. The fast path is sound because the verdict is a pure
-/// function of `(pem, contract_id)` and the contract id is fixed here: equal
-/// bytes cannot reach a different answer.
+/// Every listing in a store normally carries its backing Ghost Key's one
+/// certificate, so the common case is one verification for the whole page
+/// and byte-equality for the rest. The fast path is sound because the verdict
+/// is a pure function of `(pem, backers)` and the backers are fixed here:
+/// equal bytes cannot reach a different answer.
+///
+/// A listing's certificate may name any Ghost Key that has backed the store,
+/// retired or current (harvest#93): see
+/// `ghostkey_cert::verify_record_certificate`.
 fn unverified_listings(
     listings: &[AuthorizedListing],
-    contract_id: &[u8],
-    owner: Option<&ed25519_dalek::VerifyingKey>,
-    store_certificate_pem: &str,
-    store_status: &crate::ghostkey_cert::CertificateStatus,
+    backers: &[ed25519_dalek::VerifyingKey],
 ) -> HashSet<harvest_common::listing::ListingId> {
+    let mut verdicts: HashMap<&str, bool> = HashMap::new();
     listings
         .iter()
         .filter(|authorized| {
-            let verified = if authorized.certificate_pem == store_certificate_pem {
-                store_status.is_verified()
-            } else {
-                crate::ghostkey_cert::verify_store_certificate(
-                    &authorized.certificate_pem,
-                    contract_id,
-                    owner,
-                )
-                .is_verified()
-            };
+            let verified = *verdicts
+                .entry(authorized.certificate_pem.as_str())
+                .or_insert_with(|| {
+                    crate::ghostkey_cert::verify_record_certificate(
+                        &authorized.certificate_pem,
+                        backers,
+                    )
+                    .is_verified()
+                });
             !verified
         })
         .map(|authorized| authorized.listing.id.clone())
         .collect()
 }
+
+impl BrowsingStore {
+    /// Whether anything on this store may be offered to a buyer as payable
+    /// (harvest#93 review, Must Fix 2): the store is backed by a Ghost Key a
+    /// reader can believe in, and it has not closed. An unbacked store's
+    /// orders are signed by a key nothing vouches for, and a closed store's
+    /// key may be someone else's, so neither shows a payment address
+    /// anywhere: not on the store page, not under "Your orders".
+    pub fn payable(&self) -> bool {
+        !self.closed && self.store_verifying_key.is_some()
+    }
+}
+
+/// A store's current backing, as one reader found it (harvest#93).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackingView {
+    /// The store key.
+    pub store: [u8; 32],
+    /// The Ghost Key backing it.
+    pub backer: [u8; 32],
+    /// Whether the backing's certificate chains to Freenet's master key and
+    /// certifies `backer`.
+    pub certificate_status: crate::ghostkey_cert::CertificateStatus,
+    /// The block the backing is dated to.
+    pub block_height: u32,
+}
+
+/// What a buyer is told about a store whose Ghost Key also backs another.
+pub(crate) const BACKS_SEVERAL_STORES: &str =
+    "this Ghost Key also backs another store, and a Ghost Key backs one store at a time, so \
+     it counts for neither until one of the two backings is retired";
 
 /// Store details entered by the seller and waiting on the certificate.
 #[derive(Clone, Debug)]
@@ -862,7 +878,8 @@ impl PendingStoreEdit {
     }
 }
 
-/// Something waiting on the ghostkey delegate's `SignResult`.
+/// Something waiting on a signature: the Ghost Key vault's `SignResult`, or
+/// the Harvest delegate's `StoreUpdateSigned` for the store key (harvest#93).
 #[derive(Clone, Debug)]
 pub enum PendingSignature {
     Listing(PendingListing),
@@ -874,18 +891,60 @@ pub enum PendingSignature {
     Order(Box<PendingOrder>),
     /// A request asking the bridge to watch a seller's payment addresses.
     InboxEntry(Box<crate::bitcoin_inbox::PendingInboxEntry>),
+    /// A Ghost Key's statement that it backs a new store, from the vault.
+    BackingStatement(Box<crate::backing_flow::PendingBacking>),
+    /// The store key's acceptance of that statement, from the Harvest
+    /// delegate.
+    BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
+}
+
+/// Which key a pending signature is asked of, and so which answer may settle
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signer {
+    /// A Ghost Key, through the vault's `SignMessage`.
+    GhostKey,
+    /// A store key, through the Harvest delegate's `SignStoreUpdate`.
+    StoreKey,
 }
 
 impl PendingSignature {
-    /// The exact bytes this request handed the delegate as
-    /// `SignMessage::message`, which is what comes back inside the
-    /// `ScopedPayload`. See `signed_message_bytes`.
-    fn signed_bytes(&self) -> Result<Vec<u8>, String> {
+    /// The exact bytes this request asked to have signed, which is what comes
+    /// back inside the `ScopedPayload`. See `signed_message_bytes`.
+    pub(crate) fn signed_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::InboxEntry(pending) => Ok(pending.signing_payload.clone()),
+            PendingSignature::BackingStatement(pending) => {
+                harvest_common::to_cbor(&pending.statement)
+            }
+            PendingSignature::BackingAcceptance(pending) => {
+                harvest_common::to_cbor(&harvest_common::backing::BackingAcceptance {
+                    backing: pending.statement.clone(),
+                })
+            }
+        }
+    }
+
+    /// Who signs this. A store's own records are the store key's since
+    /// harvest#93; a Ghost Key signs only its backing statement and the
+    /// bridge watch requests, which are about the Ghost Key itself.
+    ///
+    /// An answer from the other signer never settles an entry, even over the
+    /// same bytes: a vault signature over a listing is not a signature the
+    /// store contract accepts from a store key's store, and applying one
+    /// would publish a record the contract refuses in silence.
+    pub(crate) fn signer(&self) -> Signer {
+        match self {
+            PendingSignature::Listing(_)
+            | PendingSignature::StoreInfo(_)
+            | PendingSignature::Order(_)
+            | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
+            PendingSignature::InboxEntry(_) | PendingSignature::BackingStatement(_) => {
+                Signer::GhostKey
+            }
         }
     }
 }
@@ -1224,7 +1283,19 @@ pub enum PaymentBlocker {
     CommitmentNotPublished,
     /// This store's identity key is unknown -- its ghostkey certificate did
     /// not verify, or has not arrived -- so nothing can be checked against it.
+    ///
+    /// Since harvest#93: the store has no current backing by a Ghost Key
+    /// whose certificate holds up, or that Ghost Key also backs another store
+    /// (`AppState::refresh_backing_verdicts`).
     SellerIdentityUnknown,
+    /// The store has closed: its store key signed the one-way closed flag,
+    /// which a seller does when the store key must be treated as exposed
+    /// (harvest#93, section 6.4). Whoever holds the key can still sign
+    /// orders, so nothing it publishes can be trusted to be the seller's.
+    ///
+    /// Checked before anything else, because it is true of every order the
+    /// store has.
+    StoreClosed,
     /// A commitment exists under this id, but it is not this seller's.
     ///
     /// Carries the verifier's own words, because the difference between "the
@@ -1373,6 +1444,10 @@ impl PaymentBlocker {
                 .to_string(),
             PaymentBlocker::SellerIdentityUnknown => "This store's identity does not check out, \
                  so nothing here can be tied to the seller. Do not pay."
+                .to_string(),
+            PaymentBlocker::StoreClosed => "This store has closed. Its seller closed it because \
+                 its key may be in someone else's hands, so an order from it may not be the \
+                 seller's. Do not pay."
                 .to_string(),
             PaymentBlocker::CommitmentNotTheSellers(why) => format!(
                 "The published order is not signed by this store's seller ({why}). Do not pay."
@@ -1524,6 +1599,27 @@ pub struct BrowsingStore {
     /// that their store's address is held by another key (harvest#52): see
     /// [`AppState::foreign_store_owner`].
     pub owner: Option<[u8; 32]>,
+    /// The store key, when the store is backed by a Ghost Key a reader can
+    /// believe in: set exactly when [`Self::seller_verifying_key`] is, and
+    /// then equal to [`Self::owner`] (harvest#93).
+    ///
+    /// This, not the Ghost Key, is what the store's orders are signed by, so
+    /// it is what a buyer checks a commitment against. The Ghost Key stays in
+    /// `seller_verifying_key` because the mailbox is still addressed by it.
+    pub store_verifying_key: Option<[u8; 32]>,
+    /// The store's current backing as this reader found it, before the
+    /// cross-store rule is applied. See [`AppState::refresh_backing_verdicts`].
+    pub backing: Option<BackingView>,
+    /// The part of the store's state the backing rules read: its owner,
+    /// backings and retirements. Kept so the verdict can be recomputed when
+    /// the chain tip moves, not only when the store's state arrives
+    /// (harvest#93 review, Should Fix 5): a backing dated just above this
+    /// reader's tip becomes current as soon as the tip catches up.
+    pub backing_state: harvest_common::store::StoreStateV1,
+    /// Whether the store has closed: its key signed the one-way closed flag
+    /// (`harvest_common::backing::StoreClosure`). Buyers cannot pay a closed
+    /// store; see [`PaymentBlocker::StoreClosed`].
+    pub closed: bool,
     /// Listings whose own certificate did not verify against this store.
     ///
     /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
@@ -1820,6 +1916,120 @@ impl AppState {
         (rows, hidden)
     }
 
+    /// The newest block height this reader has seen on `network`, if any.
+    pub(crate) fn tip_height(
+        &self,
+        network: freenet_bitcoin_common::BitcoinNetwork,
+    ) -> Option<u32> {
+        self.bitcoin
+            .tips
+            .get(&network)
+            .and_then(|tip| tip.tip_height)
+    }
+
+    /// A store's current backing and the verdict on its certificate, from
+    /// the store's state alone (harvest#93). `None` for a store with no
+    /// current backing: never backed, every backing retired, or backed only
+    /// by a reference dated past this reader's tip.
+    pub(crate) fn backing_view(
+        &self,
+        state: &harvest_common::store::StoreStateV1,
+    ) -> Option<BackingView> {
+        let owner = state.owner?;
+        let backing =
+            harvest_common::backing::current_backing(state, |network| self.tip_height(network))?;
+        let key = (
+            backing.statement.certificate_pem.clone(),
+            backing.statement.backer.to_bytes(),
+        );
+        // A certificate chain check costs a blind-RSA verification, and this
+        // runs on every tip update for every loaded store, so a verdict is
+        // remembered: it is a pure function of the certificate and the key.
+        let remembered = self.certificate_verdicts.borrow().get(&key).cloned();
+        let certificate_status = match remembered {
+            Some(status) => status,
+            None => {
+                let status = crate::ghostkey_cert::verify_backing_certificate(
+                    &backing.statement.certificate_pem,
+                    &backing.statement.backer,
+                );
+                self.certificate_verdicts
+                    .borrow_mut()
+                    .insert(key, status.clone());
+                status
+            }
+        };
+        Some(BackingView {
+            store: owner.to_bytes(),
+            backer: backing.statement.backer.to_bytes(),
+            certificate_status,
+            block_height: backing.statement.block.height,
+        })
+    }
+
+    /// Decide, for every loaded store, whether its backing counts: set
+    /// `seller_verifying_key`, `store_verifying_key` and `certificate_status`
+    /// from each store's [`BackingView`] and the rule that a Ghost Key backs
+    /// one store at a time (harvest#93, section 6.2).
+    ///
+    /// Across every store at once because the rule is about pairs: a store
+    /// loading can take away another store's standing, and one being retired
+    /// can give it back. A key found backing two stores counts for NEITHER,
+    /// in this reader, until one backing is retired. A reader only knows the
+    /// stores it has loaded, so this is as complete as that and no more; the
+    /// Ghost Key record of phase 1c is what lets a reader look further.
+    pub(crate) fn refresh_backing_verdicts(&mut self) {
+        // Which backing is current depends on the tip, so it is recomputed
+        // here, from each store's kept state, every time.
+        let views: Vec<(Vec<u8>, Option<BackingView>)> = self
+            .browsing_stores
+            .iter()
+            .map(|(id, store)| (id.clone(), self.backing_view(&store.backing_state)))
+            .collect();
+        for (id, view) in views {
+            if let Some(store) = self.browsing_stores.get_mut(&id) {
+                store.backing = view;
+            }
+        }
+        let currents = self.browsing_stores.values().filter_map(|store| {
+            let view = store.backing.as_ref()?;
+            if !view.certificate_status.is_verified() {
+                return None;
+            }
+            Some((
+                ed25519_dalek::VerifyingKey::from_bytes(&view.store).ok()?,
+                ed25519_dalek::VerifyingKey::from_bytes(&view.backer).ok()?,
+            ))
+        });
+        let conflicted = harvest_common::backing::keys_backing_several_stores(currents);
+        for store in self.browsing_stores.values_mut() {
+            let (status, counts) = match &store.backing {
+                None => (crate::ghostkey_cert::CertificateStatus::Absent, false),
+                Some(view) if conflicted.contains(&view.backer) => (
+                    crate::ghostkey_cert::CertificateStatus::Invalid(
+                        BACKS_SEVERAL_STORES.to_string(),
+                    ),
+                    false,
+                ),
+                Some(view) => (
+                    view.certificate_status.clone(),
+                    view.certificate_status.is_verified(),
+                ),
+            };
+            store.certificate_status = status;
+            match store.backing.as_ref().filter(|_| counts) {
+                Some(view) => {
+                    store.seller_verifying_key = Some(view.backer);
+                    store.store_verifying_key = Some(view.store);
+                }
+                None => {
+                    store.seller_verifying_key = None;
+                    store.store_verifying_key = None;
+                }
+            }
+        }
+    }
+
     /// The key holding one of OUR stores' addresses, when it is not ours.
     ///
     /// # Why this has to be looked for
@@ -2006,6 +2216,12 @@ impl AppState {
                 Some(existing) => {
                     if registration.store_contract_key.is_none() {
                         registration.store_contract_key = existing.store_contract_key.take();
+                    }
+                    // Nor may an answer that does not carry the store key
+                    // (harvest#93) take away one this tab already knows: the
+                    // store would become one it cannot sign for.
+                    if registration.store_verifying_key.is_none() {
+                        registration.store_verifying_key = existing.store_verifying_key;
                     }
                     *existing = registration;
                 }
@@ -2279,33 +2495,35 @@ impl AppState {
                     // which is what binds a certificate to THIS store: a genuine
                     // certificate issued to somebody else passes every other check
                     // there is. See `crate::ghostkey_cert`.
+                    //
+                    // Since harvest#93 the certificate that matters is the
+                    // current BACKING's: the store key signs everything, and
+                    // a Ghost Key's only statement about the store is that it
+                    // backs it. Which backing is current, and whether its
+                    // certificate holds up, are reader rules
+                    // (`harvest_common::backing::current_backing`); whether
+                    // its key also backs another store is applied across
+                    // every loaded store by `refresh_backing_verdicts` below.
                     let owner = store_state.owner;
-                    let certificate_status = crate::ghostkey_cert::verify_store_certificate(
-                        &store_state.info.info.certificate_pem,
-                        &contract_id,
-                        owner.as_ref(),
-                    );
-                    // The same check, kept for the mailbox address rather
-                    // than for display -- see `BrowsingStore::
-                    // seller_verifying_key` for why it is not recomputed
-                    // where it is used.
-                    let seller_verifying_key = crate::ghostkey_cert::store_verifying_key(
-                        &store_state.info.info.certificate_pem,
-                        &contract_id,
-                        owner.as_ref(),
-                    )
-                    .map(|key| key.to_bytes());
-                    let unverified_listings = unverified_listings(
-                        &store_state.listings.listings,
-                        &contract_id,
-                        owner.as_ref(),
-                        &store_state.info.info.certificate_pem,
-                        &certificate_status,
-                    );
+                    let backing_state = harvest_common::store::StoreStateV1 {
+                        owner: store_state.owner,
+                        backings: store_state.backings.clone(),
+                        retirements: store_state.retirements.clone(),
+                        ..Default::default()
+                    };
+                    let backers: Vec<ed25519_dalek::VerifyingKey> = store_state
+                        .backings
+                        .records
+                        .values()
+                        .map(|backing| backing.statement.backer)
+                        .collect();
+                    let unverified_listings =
+                        unverified_listings(&store_state.listings.listings, &backers);
+                    let closed = harvest_common::backing::is_closed(&store_state);
 
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
-                    store.certificate_status = certificate_status;
-                    store.seller_verifying_key = seller_verifying_key;
+                    store.backing_state = backing_state;
+                    store.closed = closed;
                     store.owner = owner.map(|key| key.to_bytes());
                     store.unverified_listings = unverified_listings;
                     // `Some` even at version 0: `None` means "not loaded yet"
@@ -2317,6 +2535,11 @@ impl AppState {
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.reputation_contract_id = Some(reputation_id.clone());
+
+                    // The Ghost Key behind this store may also back another
+                    // store this reader has loaded, and the reverse: re-apply
+                    // the one-store-per-key rule across all of them.
+                    self.refresh_backing_verdicts();
 
                     // One of our stores, held by another key: say so, once.
                     if let Some(held) = self.foreign_store_owner(&contract_id) {
@@ -2452,7 +2675,7 @@ impl AppState {
     }
 
     /// Allocate the next id for a messaging request.
-    fn next_messaging_request_id(&mut self) -> u64 {
+    pub(crate) fn next_messaging_request_id(&mut self) -> u64 {
         self.next_messaging_request_id += 1;
         self.next_messaging_request_id
     }
@@ -4031,6 +4254,17 @@ impl AppState {
         }
     }
 
+    /// [`Self::payment_blockers`] for a fresh conversation and no published
+    /// commitment, so a test can ask what a store-level condition does
+    /// without building an order.
+    #[cfg(test)]
+    pub(crate) fn payment_blockers_for_test(&self, store: &BrowsingStore) -> Vec<PaymentBlocker> {
+        let seller = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([7u8; 32]));
+        let conversation =
+            crate::messaging::BuyerConversation::open(seller.as_bytes()).expect("a conversation");
+        self.payment_blockers(store, &conversation, None)
+    }
+
     /// What stands between this buyer and paying one commitment.
     ///
     /// Ordered so the first blocker is the one worth showing first: what is
@@ -4049,10 +4283,18 @@ impl AppState {
     ) -> Vec<PaymentBlocker> {
         use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
 
+        // Before anything about the order: a closed store's key may be in
+        // someone else's hands, so no order from it is safe, published or not.
+        if store.closed {
+            return vec![PaymentBlocker::StoreClosed];
+        }
         let Some(commitment) = commitment else {
             return vec![PaymentBlocker::CommitmentNotPublished];
         };
-        let Some(seller_key) = store.seller_verifying_key else {
+        // The STORE key, which signs the store's orders since harvest#93, and
+        // only when the store is backed by a Ghost Key a reader can believe
+        // in (`refresh_backing_verdicts`).
+        let Some(seller_key) = store.store_verifying_key else {
             return vec![PaymentBlocker::SellerIdentityUnknown];
         };
         let Ok(seller_key) = ed25519_dalek::VerifyingKey::from_bytes(&seller_key) else {
@@ -4498,15 +4740,37 @@ impl AppState {
     /// The verifying key of the identity that owns `store_contract_id`, which
     /// is the key every record the store holds must be signed by and the
     /// owner every update to it names (harvest#52).
+    ///
+    /// The store's own key since harvest#93, as its registration records it.
+    /// `None` for a store that is not ours, and for one made before revision
+    /// 2, which was owned by its Ghost Key and has no store key: this build
+    /// cannot sign for it, and `crate::backing_flow` moves it to one.
     pub fn store_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
-        let fingerprint = self.store_owner_fingerprint(store_contract_id)?;
         let bytes = self
-            .ghostkeys
-            .iter()
-            .find(|k| k.fingerprint == fingerprint)?
-            .verifying_key_bytes
-            .as_deref()?;
-        ed25519_dalek::VerifyingKey::from_bytes(bytes.try_into().ok()?).ok()
+            .my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .find(|store| store.store_contract_id == store_contract_id)?
+            .store_verifying_key?;
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
+    }
+
+    /// The owner an update to one of OUR stores names: the store key, or,
+    /// for a store made before revision 2 (which has none), the key its
+    /// loaded state names (harvest#93 review, Should Fix 6).
+    ///
+    /// Only for updates that need no signature, of which there is one: a
+    /// settlement, which `Paid` evidence authorizes. Without the fallback an
+    /// open legacy invoice that was paid could never be published as Paid,
+    /// which is a regression this phase introduced. Anything signed still
+    /// goes through [`Self::store_owner_key`] and is refused for such a store.
+    pub fn delta_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
+        if let Some(key) = self.store_owner_key(store_contract_id) {
+            return Some(key);
+        }
+        self.store_owner_fingerprint(store_contract_id)?;
+        let held = self.browsing_stores.get(store_contract_id)?.owner?;
+        ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
     }
 
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
@@ -4523,7 +4787,7 @@ impl AppState {
     /// Matched on the bytes it asked to have signed, the same way an incoming
     /// answer is matched, so this cannot withdraw a different request that
     /// happens to sit at the same position.
-    fn withdraw_pending_signature(&mut self, withdrawn: &PendingSignature) {
+    pub(crate) fn withdraw_pending_signature(&mut self, withdrawn: &PendingSignature) {
         let Ok(bytes) = withdrawn.signed_bytes() else {
             return;
         };
@@ -4735,7 +4999,7 @@ impl AppState {
             .entry(edit.store_contract_id.clone())
             .or_insert(info.version);
         *queued = (*queued).max(info.version);
-        self.queue_store_info_signature(edit.ghostkey_fingerprint, edit.store_contract_id, info);
+        self.queue_store_info_signature(edit.store_contract_id, info);
         true
     }
 
@@ -4744,23 +5008,94 @@ impl AppState {
     /// The queueing is deliberately not behind a target gate: it is the part
     /// that decides what gets published, so it stays testable off-target.
     /// Only the delegate round-trip needs a browser.
-    fn queue_store_info_signature(
+    ///
+    /// Signed by the store's own key since harvest#93. A store with no store
+    /// key on this device (one made before revision 2, or one whose key is
+    /// not held here) cannot be signed for, and the seller is told.
+    pub(crate) fn queue_store_info_signature(
         &mut self,
-        ghostkey_fingerprint: String,
         store_contract_id: Vec<u8>,
         info: StoreInfoV1,
     ) {
+        let Some(store_key) = self.store_owner_key(&store_contract_id) else {
+            self.notifications.push(format!(
+                "Could not publish your store's details: {}",
+                NO_STORE_KEY_MESSAGE
+            ));
+            return;
+        };
         let pending = PendingStoreInfo {
             info,
             store_contract_id,
         };
-        self.pending_signatures
-            .push_back(PendingSignature::StoreInfo(pending.clone()));
+        if let Err(e) = self
+            .request_store_key_signature(PendingSignature::StoreInfo(pending), store_key.to_bytes())
+        {
+            self.notifications
+                .push(format!("Could not publish your store's details: {e}"));
+        }
+    }
 
+    /// Queue `pending` for a store-key signature and ask the Harvest delegate
+    /// for it (harvest#93).
+    ///
+    /// Queued here, before anything is sent, for the reason every signature
+    /// request is: the answer can arrive as soon as the send returns. The
+    /// request id is remembered against the signed bytes so a refusal, which
+    /// carries only the id, can withdraw the right entry.
+    pub(crate) fn request_store_key_signature(
+        &mut self,
+        pending: PendingSignature,
+        store_verifying_key: [u8; 32],
+    ) -> Result<(), String> {
+        debug_assert_eq!(pending.signer(), Signer::StoreKey);
+        let bytes = pending.signed_bytes()?;
+        let request_id = self.next_messaging_request_id();
+        self.pending_store_key_requests
+            .insert(request_id, bytes.clone());
+        self.pending_signatures.push_back(pending);
         #[cfg(target_arch = "wasm32")]
-        spawn_store_info_signature(ghostkey_fingerprint, pending);
+        spawn_store_key_signature(request_id, store_verifying_key, bytes);
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = ghostkey_fingerprint;
+        let _ = (store_verifying_key, bytes);
+        Ok(())
+    }
+
+    /// The Harvest delegate did not sign what `request_id` asked for, or the
+    /// request never reached it: withdraw that entry and say so.
+    ///
+    /// A store being created whose acceptance failed is abandoned with it:
+    /// nothing else would ever complete it.
+    pub(crate) fn store_key_signature_failed(&mut self, request_id: u64, reason: &str) {
+        let Some(bytes) = self.pending_store_key_requests.remove(&request_id) else {
+            warn!("a store-key signature failed for a request nothing is waiting on: {reason}");
+            return;
+        };
+        let withdrawn = self
+            .pending_signatures
+            .iter()
+            .position(|pending| {
+                pending.signer() == Signer::StoreKey
+                    && pending.signed_bytes().is_ok_and(|signed| signed == bytes)
+            })
+            .and_then(|at| self.pending_signatures.remove(at));
+        let what = match &withdrawn {
+            Some(PendingSignature::Listing(_)) => "your listing",
+            Some(PendingSignature::StoreInfo(_)) => "your store's details",
+            Some(PendingSignature::Order(_)) => "the invoice",
+            Some(PendingSignature::BackingAcceptance(_)) => "your new store",
+            _ => "your store",
+        };
+        warn!("store key did not sign {what}: {reason}");
+        if matches!(withdrawn, Some(PendingSignature::BackingAcceptance(_))) {
+            self.store_creation_failed(&format!(
+                "the store's key did not accept the backing: {reason}"
+            ));
+            return;
+        }
+        self.notifications.push(format!(
+            "Could not sign {what} with your store's key: {reason}"
+        ));
     }
 
     /// Start issuing an invoice against a listing in a store the seller owns.
@@ -5234,17 +5569,26 @@ impl AppState {
             order.payment_address
         );
 
+        let Some(store_key) = self.store_owner_key(&invoice.store_contract_id) else {
+            self.notifications.push(format!(
+                "Could not issue the invoice: {}",
+                NO_STORE_KEY_MESSAGE
+            ));
+            return;
+        };
         let pending = PendingOrder {
             fingerprint: invoice.seller_fingerprint,
             order,
             store_contract_id: invoice.store_contract_id,
             reply_to: invoice.reply_to,
         };
-        self.pending_signatures
-            .push_back(PendingSignature::Order(Box::new(pending.clone())));
-
-        #[cfg(target_arch = "wasm32")]
-        spawn_order_signature(pending);
+        if let Err(e) = self.request_store_key_signature(
+            PendingSignature::Order(Box::new(pending)),
+            store_key.to_bytes(),
+        ) {
+            self.notifications
+                .push(format!("Could not issue the invoice: {e}"));
+        }
     }
 
     /// Publish a new store's contracts, once every input creation needs has
@@ -5280,12 +5624,13 @@ impl AppState {
     /// `on_ghostkey_response` in the first place -- the gateway routed every
     /// one of them to the Harvest handler by trial CBOR decode. See
     /// `gateway::response_handler::DelegateSender`.
-    fn start_store_creation_if_ready(&mut self) {
+    pub(crate) fn start_store_creation_if_ready(&mut self) {
         let ready = matches!(
             self.pending_store_creation.as_ref(),
             Some(pending)
                 if !pending.certificate_pem.is_empty()
                     && pending.rsa_public_key_der.is_some()
+                    && pending.store_verifying_key.is_some()
         );
         if !ready {
             return;
@@ -5295,14 +5640,14 @@ impl AppState {
         };
 
         info!(
-            "Store creation inputs complete for {} -- publishing contracts",
+            "Store creation inputs complete for {} -- asking the Ghost Key to back the store",
             pending.ghostkey_fingerprint
         );
 
-        #[cfg(target_arch = "wasm32")]
-        spawn_store_creation(pending);
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = pending;
+        // A store is created backed (harvest#93): the Ghost Key signs that it
+        // backs the new store key, the store key accepts it, and only then
+        // are the contracts published. See `crate::backing_flow`.
+        self.begin_backing(pending);
     }
 
     /// Handle a response from the harvest delegate.
@@ -5488,15 +5833,75 @@ impl AppState {
                     }
                     self.register_store_mailbox(&store_contract_id, &mailbox_contract_id);
                 }
+
+                // A store owned by a store key (harvest#93) is found at its
+                // predecessor addresses by that key, which the Ghost Key's
+                // own migration cannot derive. Deferred, like every migration
+                // start from a response handler: a write guard is held here
+                // (see `start_reputation_migration`).
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let store_keys: Vec<[u8; 32]> = self
+                        .my_stores
+                        .get(&ghostkey_fingerprint)
+                        .map(|stores| {
+                            stores
+                                .iter()
+                                .filter_map(|s| s.store_verifying_key)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !store_keys.is_empty() {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            for key in store_keys {
+                                crate::gateway::migrate_ops::start_store_key_migration(&key);
+                            }
+                        });
+                    }
+                }
             }
 
             HarvestDelegateResponse::RememberedStores { stores } => {
                 self.remembered_stores = Some(stores);
             }
 
+            HarvestDelegateResponse::StoreKeyCreated { request_id, result } => {
+                self.on_store_key_created(request_id, result);
+            }
+
+            HarvestDelegateResponse::StoreUpdateSigned {
+                request_id,
+                store_verifying_key: _,
+                result,
+            } => match result {
+                Ok(signed) => {
+                    self.pending_store_key_requests.remove(&request_id);
+                    self.on_signature(
+                        Signer::StoreKey,
+                        signed.scoped_payload,
+                        signed.signature,
+                        String::new(),
+                    );
+                }
+                Err(why) => self.store_key_signature_failed(request_id, &why),
+            },
+
             HarvestDelegateResponse::Error { message } => {
-                self.notifications
-                    .push(format!("Delegate error: {message}"));
+                // A creation waiting on `CreateStoreKey` never gets its
+                // answer once the delegate has refused (#98 review, L1): an
+                // Error carries no request id, and the only request a
+                // creation has outstanding with this delegate at that stage
+                // is that one.
+                if self
+                    .pending_store_creation
+                    .as_ref()
+                    .is_some_and(|p| p.store_verifying_key.is_none())
+                {
+                    self.store_creation_failed(&format!("the Harvest delegate refused: {message}"));
+                } else {
+                    self.notifications
+                        .push(format!("Delegate error: {message}"));
+                }
             }
 
             _ => {
@@ -5558,6 +5963,246 @@ impl AppState {
             wasm_bindgen_futures::spawn_local(async move {
                 crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
             });
+        }
+    }
+
+    /// A signature has arrived, from the Ghost Key vault or from the store
+    /// key: settle the request it answers and publish what it completes.
+    ///
+    /// `certificate_pem` is the vault's, and empty for a store-key signature.
+    pub(crate) fn on_signature(
+        &mut self,
+        signer: Signer,
+        scoped_payload: Vec<u8>,
+        signature: Vec<u8>,
+        certificate_pem: String,
+    ) {
+        // Match the answer to its request by the bytes that were
+        // signed, not by queue position. `SignResult` carries no
+        // correlation id, so position is the obvious choice -- but it
+        // is only correct while answers come back in the order they
+        // were asked for, and it fails silently when they do not: the
+        // signature is grafted onto the wrong object, and what lands
+        // on the network is a record whose signature does not cover
+        // it. The contract then rejects it with nothing to say about
+        // why, which is indistinguishable from never having sent it.
+        //
+        // The scoped payload names its own request (see
+        // `signed_message_bytes`), so use that instead. An answer
+        // matching nothing outstanding is dropped rather than applied
+        // to whatever happens to be at the head of the queue: those
+        // bytes could not verify against any object we hold, so
+        // there is nothing useful to do with them.
+        //
+        // And only by an entry asked of THIS signer (harvest#93): the same
+        // bytes asked of the store key are not settled by a Ghost Key's
+        // signature over them, which the store would refuse.
+        let matched = signed_message_bytes(&scoped_payload).and_then(|message| {
+            self.pending_signatures
+                .iter()
+                .position(|pending| {
+                    pending.signer() == signer
+                        && pending.signed_bytes().is_ok_and(|bytes| bytes == message)
+                })
+                .and_then(|at| self.pending_signatures.remove(at))
+        });
+        match matched {
+            Some(PendingSignature::Listing(pending)) => {
+                // The listing carries the certificate of the Ghost Key backing
+                // the store, as it always has; the store key signs it, and the
+                // store key has no certificate of its own.
+                let certificate_pem = self
+                    .certificates
+                    .get(&pending.fingerprint)
+                    .cloned()
+                    .unwrap_or(certificate_pem);
+                let authorized = AuthorizedListing {
+                    listing: pending.listing,
+                    scoped_payload,
+                    signature,
+                    certificate_pem,
+                };
+                info!(
+                    "Constructed AuthorizedListing: {}",
+                    authorized.listing.title
+                );
+
+                // Submit to the store contract if we know which one
+                #[cfg(target_arch = "wasm32")]
+                if let Some(store_id) = pending.store_contract_id {
+                    let listing = authorized.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) =
+                            crate::gateway::store_ops::submit_listing_by_id(&store_id, listing)
+                                .await
+                        {
+                            dioxus::logger::tracing::error!("Failed to submit listing: {}", e);
+                            crate::gateway::APP_STATE
+                                .write()
+                                .notifications
+                                .push(format!("Failed to submit listing: {e}"));
+                        }
+                    });
+                }
+
+                self.signed_listings_ready.push(authorized);
+            }
+            Some(PendingSignature::StoreInfo(pending)) => {
+                let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
+                    info: pending.info,
+                    scoped_payload,
+                    signature,
+                };
+                info!(
+                    "Constructed AuthorizedStoreInfoV1: {}",
+                    authorized.info.store_name
+                );
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let store_id = pending.store_contract_id;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = crate::gateway::store_ops::submit_store_info_by_id(
+                            &store_id, authorized,
+                        )
+                        .await
+                        {
+                            dioxus::logger::tracing::error!(
+                                "Failed to publish store details: {}",
+                                e
+                            );
+                            crate::gateway::APP_STATE
+                                .write()
+                                .notifications
+                                .push(format!(
+                                    "Store created, but its name and description could not \
+                                 be published: {e}"
+                                ));
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = authorized;
+            }
+            Some(PendingSignature::Order(pending)) => {
+                let authorized = authorize_new_order(pending.order, scoped_payload, signature);
+                info!(
+                    "Constructed AuthorizedOrder {} for {} sats",
+                    authorized.order.id.short(),
+                    authorized.order.amount_sats
+                );
+
+                // Tell the buyer which commitment is theirs, if this
+                // invoice answers a request. Done here rather than
+                // left as a second thing for the seller to do: a
+                // published commitment nobody was told about is one
+                // the buyer cannot recognise, so accepting has to
+                // produce both halves or neither.
+                //
+                // The two are dispatched independently and may land
+                // in either order. That is safe rather than merely
+                // tolerable: a buyer holding an acceptance for a
+                // commitment that has not arrived reads
+                // `CommitmentNotPublished` and does not pay, which is
+                // the same answer they would get from a seller who
+                // never published at all.
+                self.announce_acceptance(
+                    &pending.store_contract_id,
+                    pending.reply_to,
+                    &authorized.order.id,
+                );
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let store_id = pending.store_contract_id;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) =
+                            crate::gateway::store_ops::submit_order_by_id(&store_id, authorized)
+                                .await
+                        {
+                            dioxus::logger::tracing::error!("Failed to publish the invoice: {}", e);
+                            crate::gateway::APP_STATE
+                                .write()
+                                .notifications
+                                .push(format!(
+                                    "The invoice was signed but could not be published: {e}"
+                                ));
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = (authorized, pending.store_contract_id);
+                }
+            }
+            Some(PendingSignature::InboxEntry(pending)) => {
+                let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                let contract_key = pending.contract_key;
+                let submitted = self.on_inbox_entry_signed(
+                    *pending,
+                    certificate_pem,
+                    scoped_payload,
+                    signature,
+                    now_ms,
+                );
+                #[cfg(target_arch = "wasm32")]
+                if let Some(bytes) = submitted {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        use freenet_stdlib::prelude::{StateDelta, UpdateData};
+                        // A failure here needs no retry of its own:
+                        // the request never lands, and once its grace
+                        // has passed it is due again.
+                        if let Err(e) = crate::gateway::update_contract(
+                            &contract_key,
+                            UpdateData::Delta(StateDelta::from(bytes)),
+                        )
+                        .await
+                        {
+                            dioxus::logger::tracing::warn!(
+                                "could not submit a watch request to the bridge inbox: {e}"
+                            );
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = (submitted, contract_key);
+            }
+            Some(PendingSignature::BackingStatement(pending)) => {
+                self.on_backing_statement_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::BackingAcceptance(pending)) => {
+                self.on_backing_accepted(*pending, scoped_payload, signature);
+            }
+            None => {
+                let from = match signer {
+                    Signer::GhostKey => "Ghost Key",
+                    Signer::StoreKey => "store key",
+                };
+                warn!(
+                    "a {from} signature matches none of the {} outstanding signature request(s) \
+                     -- dropping it",
+                    self.pending_signatures.len()
+                );
+            }
+        }
+    }
+
+    /// Drop every signature request the vault was asked for, after the vault
+    /// refused something. Store-key requests are the Harvest delegate's and
+    /// are left alone: a vault refusal says nothing about them.
+    fn drop_vault_signatures(&mut self) {
+        let creation_stopped = self.pending_store_creation.is_some()
+            || self
+                .pending_signatures
+                .iter()
+                .any(|pending| matches!(pending, PendingSignature::BackingStatement(_)));
+        self.pending_signatures
+            .retain(|pending| pending.signer() == Signer::StoreKey);
+        // A creation waiting on the vault (its certificate, or the Ghost
+        // Key's backing statement) will never finish now; release it so the
+        // seller can try again. The caller says why.
+        if creation_stopped {
+            self.store_creation_in_flight = None;
         }
     }
 
@@ -5719,201 +6364,7 @@ impl AppState {
                 certificate_pem,
             } => {
                 info!("Received signature from ghostkey delegate");
-                // Match the answer to its request by the bytes that were
-                // signed, not by queue position. `SignResult` carries no
-                // correlation id, so position is the obvious choice -- but it
-                // is only correct while answers come back in the order they
-                // were asked for, and it fails silently when they do not: the
-                // signature is grafted onto the wrong object, and what lands
-                // on the network is a record whose signature does not cover
-                // it. The contract then rejects it with nothing to say about
-                // why, which is indistinguishable from never having sent it.
-                //
-                // The scoped payload names its own request (see
-                // `signed_message_bytes`), so use that instead. An answer
-                // matching nothing outstanding is dropped rather than applied
-                // to whatever happens to be at the head of the queue: those
-                // bytes could not verify against any object we hold, so
-                // there is nothing useful to do with them.
-                let matched = signed_message_bytes(&scoped_payload).and_then(|message| {
-                    self.pending_signatures
-                        .iter()
-                        .position(|pending| {
-                            pending.signed_bytes().is_ok_and(|bytes| bytes == message)
-                        })
-                        .and_then(|at| self.pending_signatures.remove(at))
-                });
-                match matched {
-                    Some(PendingSignature::Listing(pending)) => {
-                        let authorized = AuthorizedListing {
-                            listing: pending.listing,
-                            scoped_payload,
-                            signature,
-                            certificate_pem,
-                        };
-                        info!(
-                            "Constructed AuthorizedListing: {}",
-                            authorized.listing.title
-                        );
-
-                        // Submit to the store contract if we know which one
-                        #[cfg(target_arch = "wasm32")]
-                        if let Some(store_id) = pending.store_contract_id {
-                            let listing = authorized.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Err(e) = crate::gateway::store_ops::submit_listing_by_id(
-                                    &store_id, listing,
-                                )
-                                .await
-                                {
-                                    dioxus::logger::tracing::error!(
-                                        "Failed to submit listing: {}",
-                                        e
-                                    );
-                                    crate::gateway::APP_STATE
-                                        .write()
-                                        .notifications
-                                        .push(format!("Failed to submit listing: {e}"));
-                                }
-                            });
-                        }
-
-                        self.signed_listings_ready.push(authorized);
-                    }
-                    Some(PendingSignature::StoreInfo(pending)) => {
-                        let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
-                            info: pending.info,
-                            scoped_payload,
-                            signature,
-                        };
-                        info!(
-                            "Constructed AuthorizedStoreInfoV1: {}",
-                            authorized.info.store_name
-                        );
-
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            let store_id = pending.store_contract_id;
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Err(e) = crate::gateway::store_ops::submit_store_info_by_id(
-                                    &store_id, authorized,
-                                )
-                                .await
-                                {
-                                    dioxus::logger::tracing::error!(
-                                        "Failed to publish store details: {}",
-                                        e
-                                    );
-                                    crate::gateway::APP_STATE
-                                        .write()
-                                        .notifications
-                                        .push(format!(
-                                        "Store created, but its name and description could not \
-                                         be published: {e}"
-                                    ));
-                                }
-                            });
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let _ = authorized;
-                    }
-                    Some(PendingSignature::Order(pending)) => {
-                        let authorized =
-                            authorize_new_order(pending.order, scoped_payload, signature);
-                        info!(
-                            "Constructed AuthorizedOrder {} for {} sats",
-                            authorized.order.id.short(),
-                            authorized.order.amount_sats
-                        );
-
-                        // Tell the buyer which commitment is theirs, if this
-                        // invoice answers a request. Done here rather than
-                        // left as a second thing for the seller to do: a
-                        // published commitment nobody was told about is one
-                        // the buyer cannot recognise, so accepting has to
-                        // produce both halves or neither.
-                        //
-                        // The two are dispatched independently and may land
-                        // in either order. That is safe rather than merely
-                        // tolerable: a buyer holding an acceptance for a
-                        // commitment that has not arrived reads
-                        // `CommitmentNotPublished` and does not pay, which is
-                        // the same answer they would get from a seller who
-                        // never published at all.
-                        self.announce_acceptance(
-                            &pending.store_contract_id,
-                            pending.reply_to,
-                            &authorized.order.id,
-                        );
-
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            let store_id = pending.store_contract_id;
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Err(e) = crate::gateway::store_ops::submit_order_by_id(
-                                    &store_id, authorized,
-                                )
-                                .await
-                                {
-                                    dioxus::logger::tracing::error!(
-                                        "Failed to publish the invoice: {}",
-                                        e
-                                    );
-                                    crate::gateway::APP_STATE
-                                        .write()
-                                        .notifications
-                                        .push(format!(
-                                        "The invoice was signed but could not be published: {e}"
-                                    ));
-                                }
-                            });
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            let _ = (authorized, pending.store_contract_id);
-                        }
-                    }
-                    Some(PendingSignature::InboxEntry(pending)) => {
-                        let now_ms =
-                            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-                        let contract_key = pending.contract_key;
-                        let submitted = self.on_inbox_entry_signed(
-                            *pending,
-                            certificate_pem,
-                            scoped_payload,
-                            signature,
-                            now_ms,
-                        );
-                        #[cfg(target_arch = "wasm32")]
-                        if let Some(bytes) = submitted {
-                            wasm_bindgen_futures::spawn_local(async move {
-                                use freenet_stdlib::prelude::{StateDelta, UpdateData};
-                                // A failure here needs no retry of its own:
-                                // the request never lands, and once its grace
-                                // has passed it is due again.
-                                if let Err(e) = crate::gateway::update_contract(
-                                    &contract_key,
-                                    UpdateData::Delta(StateDelta::from(bytes)),
-                                )
-                                .await
-                                {
-                                    dioxus::logger::tracing::warn!(
-                                        "could not submit a watch request to the bridge inbox: {e}"
-                                    );
-                                }
-                            });
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let _ = (submitted, contract_key);
-                    }
-                    None => {
-                        warn!(
-                            "SignResult matches none of the {} outstanding signature request(s) \
-                             -- dropping it",
-                            self.pending_signatures.len()
-                        );
-                    }
-                }
+                self.on_signature(Signer::GhostKey, scoped_payload, signature, certificate_pem);
             }
 
             ghostkey_common::GhostkeyResponse::Certificate {
@@ -5966,7 +6417,7 @@ impl AppState {
             ghostkey_common::GhostkeyResponse::Error { message } => {
                 self.notifications
                     .push(format!("Ghostkey error: {message}"));
-                self.pending_signatures.clear();
+                self.drop_vault_signatures();
                 // A failed `GetCertificate` surfaces here, and a creation or
                 // an edit waiting on that certificate would otherwise sit
                 // unfinished and unmentioned. `start_store_creation_if_ready`
@@ -5996,7 +6447,7 @@ impl AppState {
                     "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
                 );
                 self.request_any_access_in_flight = false;
-                self.pending_signatures.clear();
+                self.drop_vault_signatures();
                 self.pending_store_creation = None;
                 self.pending_store_edit = None;
             }
@@ -6016,7 +6467,7 @@ impl AppState {
                     "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
                 );
                 self.request_any_access_in_flight = false;
-                self.pending_signatures.clear();
+                self.drop_vault_signatures();
                 self.pending_store_creation = None;
                 self.pending_store_edit = None;
             }
@@ -6039,7 +6490,7 @@ impl AppState {
                 self.notifications
                     .push(format!("Ghostkey access denied for {fingerprint}."));
                 self.request_any_access_in_flight = false;
-                self.pending_signatures.clear();
+                self.drop_vault_signatures();
                 self.pending_store_creation = None;
                 self.pending_store_edit = None;
             }
@@ -6064,7 +6515,7 @@ impl AppState {
                     "Ghostkey {fingerprint} was not found in the vault."
                 ));
                 self.request_any_access_in_flight = false;
-                self.pending_signatures.clear();
+                self.drop_vault_signatures();
                 self.pending_store_creation = None;
                 self.pending_store_edit = None;
             }
@@ -6257,7 +6708,7 @@ impl AppState {
     }
 
     /// Fold a chain-tip contract's state into the live view for `network`.
-    fn apply_tip_state(
+    pub(crate) fn apply_tip_state(
         &mut self,
         network: BitcoinNetwork,
         state: &freenet_bitcoin_common::BitcoinTipStateV1,
@@ -6287,6 +6738,8 @@ impl AppState {
                 block_time: b.block_time,
             })
             .collect();
+        // A backing dated above the old tip may be current now.
+        self.refresh_backing_verdicts();
     }
 
     /// Fold an address contract's state into the live view for that watch.
@@ -6948,10 +7401,12 @@ impl AppState {
     /// queued that is not a watch request, a store being created or edited, or
     /// an access prompt.
     fn user_signature_under_way(&self) -> bool {
-        self.pending_signatures
-            .iter()
-            .any(|pending| !matches!(pending, PendingSignature::InboxEntry(_)))
-            || self.pending_store_creation.is_some()
+        // Only what the VAULT was asked to sign. A store-key signature is the
+        // Harvest delegate's to answer, so a vault refusal cannot be about it.
+        self.pending_signatures.iter().any(|pending| {
+            pending.signer() == Signer::GhostKey
+                && !matches!(pending, PendingSignature::InboxEntry(_))
+        }) || self.pending_store_creation.is_some()
             || self.pending_store_edit.is_some()
             || self.request_any_access_in_flight
     }
@@ -7472,6 +7927,7 @@ mod tests {
             reputation_contract_id: vec![id.wrapping_add(1); 32],
             mailbox_contract_id: vec![id.wrapping_add(2); 32],
             store_contract_key: key,
+            store_verifying_key: Some(crate::state::test_store_key()),
         }
     }
 
@@ -7484,6 +7940,27 @@ mod tests {
 
     /// The delegate cannot store a store's `ContractKey` -- `RegisterStore`
     /// has no field for it -- so every registration it hands back is keyless.
+    /// And the same for the store key (harvest#93): an answer that does not
+    /// carry it must not turn a store this tab can sign for into one it
+    /// cannot. Mutated red by removing the `store_verifying_key` carry-over
+    /// in `merge_store_registrations`.
+    #[test]
+    fn a_store_list_answer_keeps_a_locally_known_store_key() {
+        let mut state = AppState::default();
+        let mut known = registration(1, None);
+        known.store_verifying_key = Some(test_store_key());
+        state.merge_store_registrations(FINGERPRINT, vec![known]);
+
+        let mut answer = registration(1, None);
+        answer.store_verifying_key = None;
+        state.on_delegate_response(store_list(vec![answer]));
+
+        assert_eq!(
+            state.my_stores[FINGERPRINT][0].store_verifying_key,
+            Some(test_store_key())
+        );
+    }
+
     /// Losing the key breaks "Add Listing" for a store that exists, which is
     /// what a wholesale replace did. See `merge_store_registrations`.
     #[test]
@@ -7706,6 +8183,23 @@ mod tests {
         }
     }
 
+    /// The Harvest delegate's answer to a store-key signature request, as it
+    /// answers (harvest#93): the same envelope a vault `SignResult` carries.
+    fn store_key_answer_for(pending: &PendingSignature) -> HarvestDelegateResponse {
+        let scoped = ghostkey_common::ScopedPayload {
+            requestor: harvest_common::expected_harvest_requestor(),
+            payload: pending.signed_bytes().expect("serialize signed message"),
+        };
+        HarvestDelegateResponse::StoreUpdateSigned {
+            request_id: 99,
+            store_verifying_key: test_store_key(),
+            result: Ok(harvest_common::delegate::StoreKeySignature {
+                scoped_payload: harvest_common::to_cbor(&scoped).expect("serialize scoped payload"),
+                signature: vec![4, 5, 6],
+            }),
+        }
+    }
+
     fn pending_listing() -> PendingSignature {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
@@ -7745,7 +8239,7 @@ mod tests {
         state.pending_signatures.push_back(pending_store_info());
         state.pending_signatures.push_back(listing.clone());
 
-        state.on_ghostkey_response(sign_result_for(&listing));
+        state.on_delegate_response(store_key_answer_for(&listing));
 
         assert_eq!(
             state.signed_listings_ready.len(),
@@ -7774,7 +8268,7 @@ mod tests {
         let listing = pending_listing();
         state.pending_signatures.push_back(listing.clone());
 
-        state.on_ghostkey_response(sign_result_for(&listing));
+        state.on_delegate_response(store_key_answer_for(&listing));
 
         let signed = state
             .signed_listings_ready
@@ -7789,6 +8283,68 @@ mod tests {
             .expect("serialize"),
             "the scoped payload must wrap this listing's own bytes"
         );
+    }
+
+    /// A store's records are signed by its store key since harvest#93, so a
+    /// Ghost Key's signature over the same bytes must not settle them: the
+    /// store contract verifies against the store key, and would refuse the
+    /// record in silence. And the other way round for what the vault signs.
+    ///
+    /// Mutated red by dropping `pending.signer() == signer` from
+    /// `on_signature`'s match.
+    #[test]
+    fn an_answer_from_the_wrong_signer_settles_nothing() {
+        let mut state = AppState::default();
+        let listing = pending_listing();
+        state.pending_signatures.push_back(listing.clone());
+
+        state.on_ghostkey_response(sign_result_for(&listing));
+
+        assert!(state.signed_listings_ready.is_empty());
+        assert_eq!(
+            state.pending_signatures.len(),
+            1,
+            "still waiting on the store key"
+        );
+
+        state.on_delegate_response(store_key_answer_for(&listing));
+        assert_eq!(state.signed_listings_ready.len(), 1);
+    }
+
+    /// A store-key refusal carries only its request id; it has to withdraw
+    /// exactly the request that asked, and tell the seller.
+    ///
+    /// Mutated red by making `store_key_signature_failed` withdraw nothing.
+    #[test]
+    fn a_refused_store_key_signature_withdraws_its_own_request_only() {
+        let mut state = AppState::default();
+        state.pending_signatures.push_back(pending_store_info());
+        let listing = pending_listing();
+        state
+            .request_store_key_signature(listing, test_store_key())
+            .expect("queued");
+        let request_id = *state
+            .pending_store_key_requests
+            .keys()
+            .next()
+            .expect("the request is remembered by id");
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreUpdateSigned {
+            request_id,
+            store_verifying_key: test_store_key(),
+            result: Err("this device does not hold the key".to_string()),
+        });
+
+        assert_eq!(state.pending_signatures.len(), 1);
+        assert!(matches!(
+            state.pending_signatures.front(),
+            Some(PendingSignature::StoreInfo(_))
+        ));
+        assert!(state.pending_store_key_requests.is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("does not hold the key")));
     }
 
     /// An answer with nothing queued must be dropped, not applied to
@@ -7832,6 +8388,9 @@ mod tests {
             description: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
+            store_verifying_key: Some(crate::state::test_store_key()),
+            store_key_request: None,
+            carried_listings: Vec::new(),
         }
     }
 
@@ -7980,7 +8539,9 @@ mod tests {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
                 PendingSignature::Listing(_)
                 | PendingSignature::Order(_)
-                | PendingSignature::InboxEntry(_) => None,
+                | PendingSignature::InboxEntry(_)
+                | PendingSignature::BackingStatement(_)
+                | PendingSignature::BackingAcceptance(_) => None,
             })
     }
 
@@ -8329,10 +8890,32 @@ mod tests {
     #[test]
     fn an_ingested_store_carries_a_verdict_about_its_certificate() {
         let mut state = AppState::default();
-        ingest(
-            &mut state,
-            &store_state_with("-----BEGIN CERT-----", vec![]),
+        // Since harvest#93 the verdict is about the current BACKING's
+        // certificate, not the one in the store's details.
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]).verifying_key();
+        let backer = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]).verifying_key();
+        let mut store = store_state_with("", vec![]);
+        store.owner = Some(owner);
+        store.backings.records.insert(
+            harvest_common::store::Bytes32(backer.to_bytes()),
+            harvest_common::backing::AuthorizedBacking {
+                statement: harvest_common::backing::BackingStatement {
+                    store: owner,
+                    backer,
+                    certificate_pem: "-----BEGIN CERT-----".to_string(),
+                    network: BitcoinNetwork::Signet,
+                    block: freenet_bitcoin_common::BlockAnchor {
+                        height: 1,
+                        hash: freenet_bitcoin_common::BlockHash([1; 32]),
+                    },
+                },
+                backer_scoped_payload: Vec::new(),
+                backer_signature: Vec::new(),
+                acceptance_scoped_payload: Vec::new(),
+                acceptance_signature: Vec::new(),
+            },
         );
+        ingest(&mut state, &store);
 
         let store = state
             .browsing_stores
@@ -8388,51 +8971,26 @@ mod tests {
         );
     }
 
-    /// The fast path: a listing carrying the store's own certificate inherits
-    /// the store's verdict rather than being re-verified. It is only sound
-    /// because the verdict is a pure function of the bytes and the contract
-    /// id, so this pins both directions -- a matching certificate rides the
-    /// store's `Verified`, a different one does not.
+    /// Every listing's certificate is judged against the store's backers
+    /// (harvest#93), not inherited from the store's verdict: two listings
+    /// carrying the same text share one verdict, and it is theirs. A
+    /// certificate that verifies needs Freenet's master key, which no test
+    /// here holds, so this pins the refusing half; `ghostkey_cert`'s own
+    /// tests pin the accepting half against a test authority.
     #[test]
-    fn a_listing_reusing_the_stores_certificate_inherits_its_verdict() {
+    fn a_listings_certificate_is_judged_against_the_stores_backers() {
         let sellers = "-----BEGIN SELLER CERT-----";
-        let strangers = "-----BEGIN STRANGER CERT-----";
-        let listings = vec![listing_with(1, sellers), listing_with(2, strangers)];
+        let listings = vec![listing_with(1, sellers), listing_with(2, sellers)];
+        let backer = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
 
-        let marked = unverified_listings(
-            &listings,
-            &STORE_ID,
-            None,
-            sellers,
-            &crate::ghostkey_cert::CertificateStatus::Verified,
-        );
-
-        assert!(
-            !marked.contains(&harvest_common::listing::ListingId([1u8; 32])),
-            "a listing carrying the store's own verified certificate is verified"
-        );
-        assert!(
-            marked.contains(&harvest_common::listing::ListingId([2u8; 32])),
-            "a listing carrying somebody else's certificate is not"
-        );
-    }
-
-    /// And when the store's own certificate failed, nothing under it can
-    /// inherit a pass.
-    #[test]
-    fn listings_inherit_a_failed_store_certificate_too() {
-        let sellers = "-----BEGIN SELLER CERT-----";
-        let listings = vec![listing_with(1, sellers)];
-
-        let marked = unverified_listings(
-            &listings,
-            &STORE_ID,
-            None,
-            sellers,
-            &crate::ghostkey_cert::CertificateStatus::Invalid("nope".to_string()),
-        );
+        let marked = unverified_listings(&listings, &[backer]);
 
         assert!(marked.contains(&harvest_common::listing::ListingId([1u8; 32])));
+        assert!(marked.contains(&harvest_common::listing::ListingId([2u8; 32])));
+        assert!(
+            unverified_listings(&listings, &[]).len() == 2,
+            "a store nobody backs vouches for no listing"
+        );
     }
 
     /// State arriving after the deadline fired wins. Treating a store that
@@ -8519,7 +9077,9 @@ mod tests {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
                 PendingSignature::Listing(_)
                 | PendingSignature::Order(_)
-                | PendingSignature::InboxEntry(_) => None,
+                | PendingSignature::InboxEntry(_)
+                | PendingSignature::BackingStatement(_)
+                | PendingSignature::BackingAcceptance(_) => None,
             })
             .collect();
         assert_eq!(
@@ -8706,14 +9266,19 @@ mod tests {
         deliver(state, &delegate_key(0xB2), &payload);
     }
 
-    /// A delegate error or a denied prompt invalidates everything queued --
-    /// none of it will ever be answered, and a leftover entry would consume
-    /// the next unrelated signature.
+    /// A vault error or a denied prompt invalidates everything the VAULT was
+    /// asked to sign -- none of it will ever be answered, and a leftover entry
+    /// would consume the next unrelated signature. What the store key was
+    /// asked to sign is the Harvest delegate's to answer (harvest#93), and a
+    /// vault refusal says nothing about it, so it stays.
     #[test]
-    fn a_denied_prompt_clears_the_whole_queue() {
+    fn a_denied_prompt_clears_what_the_vault_was_asked_and_nothing_else() {
         let mut state = state_with_delegates();
         state.pending_signatures.push_back(pending_store_info());
         state.pending_signatures.push_back(pending_listing());
+        state
+            .pending_signatures
+            .push_back(crate::backing_flow::tests::pending_backing_statement());
 
         from_ghostkey(
             &mut state,
@@ -8721,7 +9286,11 @@ mod tests {
                 message: "nope".to_string(),
             },
         );
-        assert!(state.pending_signatures.is_empty());
+        assert_eq!(state.pending_signatures.len(), 2);
+        assert!(state
+            .pending_signatures
+            .iter()
+            .all(|pending| pending.signer() == Signer::StoreKey));
     }
 
     /// The bug this routing exists to prevent, stated as a property.
@@ -8926,6 +9495,9 @@ mod tests {
             description: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
+            store_verifying_key: Some(crate::state::test_store_key()),
+            store_key_request: None,
+            carried_listings: Vec::new(),
         });
 
         from_ghostkey(
@@ -8959,6 +9531,9 @@ mod tests {
             description: String::new(),
             rsa_public_key_der: None,
             encryption_public_key: None,
+            store_verifying_key: Some(crate::state::test_store_key()),
+            store_key_request: None,
+            carried_listings: Vec::new(),
         });
         state.pending_signatures.push_back(pending_store_info());
         state.request_any_access_in_flight = true;
@@ -8971,7 +9546,13 @@ mod tests {
         );
 
         assert!(state.pending_store_creation.is_none());
-        assert!(state.pending_signatures.is_empty());
+        assert!(
+            state
+                .pending_signatures
+                .iter()
+                .all(|pending| pending.signer() == Signer::StoreKey),
+            "only the store key's own requests outlive a vault refusal"
+        );
         assert!(!state.request_any_access_in_flight);
         assert!(!state.notifications.is_empty());
     }
@@ -9240,6 +9821,7 @@ mod invoice_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state.bitcoin.payment_xpub = Some(PaymentXpubStatus {
@@ -9340,17 +9922,21 @@ mod invoice_tests {
         }
     }
 
-    /// A `SignResult` shaped the way the ghostkey delegate answers: the
-    /// request's own message, wrapped verbatim as `ScopedPayload::payload`.
-    fn sign_result_for(pending: &PendingSignature) -> ghostkey_common::GhostkeyResponse {
+    /// The Harvest delegate's answer to a store-key signature request
+    /// (harvest#93): the request's own message, wrapped verbatim as
+    /// `ScopedPayload::payload`, as a vault `SignResult` would carry it.
+    fn store_key_answer_for(pending: &PendingSignature) -> HarvestDelegateResponse {
         let scoped = ghostkey_common::ScopedPayload {
             requestor: harvest_common::expected_harvest_requestor(),
             payload: pending.signed_bytes().expect("serialize signed message"),
         };
-        ghostkey_common::GhostkeyResponse::SignResult {
-            scoped_payload: harvest_common::to_cbor(&scoped).expect("serialize scoped payload"),
-            signature: vec![4, 5, 6],
-            certificate_pem: String::new(),
+        HarvestDelegateResponse::StoreUpdateSigned {
+            request_id: 99,
+            store_verifying_key: crate::state::test_store_key(),
+            result: Ok(harvest_common::delegate::StoreKeySignature {
+                scoped_payload: harvest_common::to_cbor(&scoped).expect("serialize scoped payload"),
+                signature: vec![4, 5, 6],
+            }),
         }
     }
 
@@ -9507,6 +10093,7 @@ mod invoice_tests {
                 reputation_contract_id: vec![12u8; 32],
                 mailbox_contract_id: vec![13u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state
@@ -10414,7 +11001,7 @@ mod invoice_tests {
             .find(|p| matches!(p, PendingSignature::Order(_)))
             .expect("the invoice is queued")
             .clone();
-        state.on_ghostkey_response(sign_result_for(&order_request));
+        state.on_delegate_response(store_key_answer_for(&order_request));
 
         assert_eq!(
             state.pending_signatures.len(),
@@ -10736,6 +11323,7 @@ mod mailbox_read_tests {
             reputation_contract_id: vec![3u8; 32],
             mailbox_contract_id: vec![4u8; 32],
             store_contract_key: None,
+            store_verifying_key: Some(crate::state::test_store_key()),
         }
     }
 
@@ -11204,6 +11792,9 @@ mod mailbox_read_tests {
                 description: String::new(),
                 rsa_public_key_der: None,
                 encryption_public_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+                store_key_request: None,
+                carried_listings: Vec::new(),
             }),
             ..AppState::default()
         };
@@ -11292,6 +11883,7 @@ mod conversation_tests {
                 reputation_contract_id: vec![3u8; 32],
                 mailbox_contract_id: vec![4u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state.browsing_stores.entry(STORE.to_vec()).or_default();
@@ -11553,6 +12145,9 @@ mod delegate_correlation_tests {
                 description: String::new(),
                 rsa_public_key_der: None,
                 encryption_public_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+                store_key_request: None,
+                carried_listings: Vec::new(),
             }),
             ..AppState::default()
         }
@@ -11666,6 +12261,7 @@ mod delegate_correlation_tests {
                 reputation_contract_id: vec![2u8; 32],
                 mailbox_contract_id: vec![3u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         });
 
@@ -11732,6 +12328,7 @@ mod buyer_persistence_tests {
         };
         let store = state.browsing_stores.entry(STORE.to_vec()).or_default();
         store.seller_verifying_key = Some(seller_identity());
+        store.store_verifying_key = Some(seller_identity());
         state
     }
 
@@ -13106,6 +13703,7 @@ mod nonce_collision_tests {
                 reputation_contract_id: vec![3u8; 32],
                 mailbox_contract_id: vec![4u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         seller.browsing_stores.entry(STORE.to_vec()).or_default();
@@ -13426,6 +14024,7 @@ mod buy_flow_tests {
             .get_mut(STORE)
             .expect("begin_browsing creates it");
         store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        store.store_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
         store.orders = vec![published.clone()];
         store.conversations = vec![conversation];
         store.mailbox_messages = vec![acceptance];
@@ -13479,6 +14078,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state.bitcoin.payment_xpub = Some(harvest_common::PaymentXpubStatus {
@@ -13623,7 +14223,7 @@ mod buy_flow_tests {
             "the invoice must remember which request it answers"
         );
 
-        state.on_ghostkey_response(order_sign_result(&queued));
+        state.on_delegate_response(order_sign_result(&queued));
 
         let sent = &state.browsing_stores[STORE].sent_messages;
         assert_eq!(sent.len(), 1, "accepting writes one message to the buyer");
@@ -13635,7 +14235,7 @@ mod buy_flow_tests {
     }
 
     /// A `SignResult` shaped the way the ghostkey delegate answers.
-    fn order_sign_result(pending: &PendingOrder) -> ghostkey_common::GhostkeyResponse {
+    fn order_sign_result(pending: &PendingOrder) -> HarvestDelegateResponse {
         use freenet_stdlib::prelude::ContractInstanceId;
 
         let message = harvest_common::to_cbor(&pending.order).expect("serialize");
@@ -13652,10 +14252,15 @@ mod buy_flow_tests {
             .sign(&scoped_payload)
             .to_bytes()
             .to_vec();
-        ghostkey_common::GhostkeyResponse::SignResult {
-            scoped_payload,
-            signature,
-            certificate_pem: String::new(),
+        // Signed by the store key since harvest#93, so it comes back from the
+        // Harvest delegate, not the vault.
+        HarvestDelegateResponse::StoreUpdateSigned {
+            request_id: 1,
+            store_verifying_key: seller_signing_key().verifying_key().to_bytes(),
+            result: Ok(harvest_common::delegate::StoreKeySignature {
+                scoped_payload,
+                signature,
+            }),
         }
     }
 
@@ -14239,6 +14844,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state
@@ -14490,6 +15096,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         super::invoice_tests::store_state_arrived(&mut state, STORE);
@@ -14576,6 +15183,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![12u8; 32],
                 mailbox_contract_id: vec![13u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         assert!(state.publish_settled_orders(STORE).is_empty());
@@ -14695,6 +15303,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![12u8; 32],
                 mailbox_contract_id: vec![13u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             });
         state.store_state_unavailable.insert(vec![0x5e; 32]);
         match state.settlement_hold(&order.order) {
@@ -14941,6 +15550,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state
@@ -14975,6 +15585,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state
@@ -15860,6 +16471,46 @@ mod buy_flow_tests {
         );
     }
 
+    /// A commitment is the STORE key's to sign since harvest#93, and the
+    /// Ghost Key behind the store only backs it: the check that decides
+    /// whether a buyer may pay reads the store key, and a store whose Ghost
+    /// Key is some other key entirely is still payable.
+    ///
+    /// Mutated red by checking the commitment against `seller_verifying_key`
+    /// (the Ghost Key) in `payment_blockers`.
+    #[test]
+    fn a_commitment_is_checked_against_the_store_key_not_the_ghost_key() {
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let ghost = ed25519_dalek::SigningKey::from_bytes(&[0x3c; 32])
+            .verifying_key()
+            .to_bytes();
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.seller_verifying_key = Some(ghost);
+            store.store_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        }
+        assert_eq!(
+            purchases(&state)[0].blockers,
+            Vec::new(),
+            "signed by the store key, backed by a different Ghost Key: payable"
+        );
+
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .store_verifying_key = Some(ghost);
+        assert!(matches!(
+            purchases(&state)[0].blockers.as_slice(),
+            [PaymentBlocker::CommitmentNotTheSellers(_)]
+        ));
+    }
+
     /// **Every input `payment_blockers` reads either yields a verdict or a
     /// blocker -- absence never reads as approval.**
     ///
@@ -15917,10 +16568,12 @@ mod buy_flow_tests {
             (
                 "the store's identity key",
                 Box::new(|s: &mut AppState| {
+                    // The store key: what a commitment is checked against
+                    // since harvest#93, set only when the store is backed.
                     s.browsing_stores
                         .get_mut(STORE)
                         .expect("store")
-                        .seller_verifying_key = None;
+                        .store_verifying_key = None;
                 }),
             ),
             (
@@ -16599,6 +17252,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![10u8; 32],
                 mailbox_contract_id: vec![11u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state
@@ -16616,6 +17270,7 @@ mod buy_flow_tests {
         state.begin_browsing(STORE.to_vec());
         let store = state.browsing_stores.get_mut(STORE).expect("the store");
         store.seller_verifying_key = Some(seller_key);
+        store.store_verifying_key = Some(seller_key);
         store.orders = orders;
         state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
             inbox::bridge(),
@@ -17259,6 +17914,7 @@ mod buy_flow_tests {
                 reputation_contract_id: vec![12u8; 32],
                 mailbox_contract_id: vec![13u8; 32],
                 store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
             }],
         );
         state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
@@ -17274,6 +17930,7 @@ mod buy_flow_tests {
         theirs.order.payment_script_pubkey = vec![0x00, 0x14, 0x42];
         let store = state.browsing_stores.get_mut(OTHER).expect("the store");
         store.seller_verifying_key = Some(second.id().0);
+        store.store_verifying_key = Some(second.id().0);
         store.orders = vec![theirs];
 
         serve_inbox(&mut state, &inbox::open_inbox());
@@ -17694,6 +18351,7 @@ mod payment_blocker_wording_tests {
         let all = vec![
             PaymentBlocker::CommitmentNotPublished,
             PaymentBlocker::SellerIdentityUnknown,
+            PaymentBlocker::StoreClosed,
             PaymentBlocker::CommitmentNotTheSellers("the signature is not theirs".to_string()),
             PaymentBlocker::CommitmentNotForThisBuyer,
             PaymentBlocker::NoTrustedBridge,
@@ -17726,6 +18384,7 @@ mod payment_blocker_wording_tests {
             match blocker {
                 PaymentBlocker::CommitmentNotPublished
                 | PaymentBlocker::SellerIdentityUnknown
+                | PaymentBlocker::StoreClosed
                 | PaymentBlocker::CommitmentNotTheSellers(_)
                 | PaymentBlocker::CommitmentNotForThisBuyer
                 | PaymentBlocker::NoTrustedBridge
@@ -17758,7 +18417,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 17;
+    const EVERY_BLOCKER: usize = 18;
 
     /// **Every blocker says something, and says it as prose.**
     ///
@@ -17817,6 +18476,7 @@ mod store_code_tests {
                     reputation_contract_id: vec![9u8; 32],
                     mailbox_contract_id: vec![10u8; 32],
                     store_contract_key: None,
+                    store_verifying_key: Some(seller().verifying_key().to_bytes()),
                 }],
             )]),
             ..AppState::default()
@@ -17842,14 +18502,39 @@ mod store_code_tests {
         );
     }
 
+    /// The owner every update names is the STORE key the registration
+    /// records (harvest#93), never the Ghost Key the store is registered
+    /// under: a store made before revision 2 has no store key, and this
+    /// build cannot sign for it.
     #[test]
     fn the_owner_of_our_store_is_the_key_every_update_names() {
-        let state = seller_state();
+        let mut state = seller_state();
         assert_eq!(
             state.store_owner_key(&STORE),
             Some(seller().verifying_key())
         );
         assert_eq!(state.store_owner_key(&[1u8; 32]), None, "not ours");
+
+        state.my_stores.get_mut(FP).unwrap()[0].store_verifying_key = None;
+        assert_eq!(
+            state.store_owner_key(&STORE),
+            None,
+            "a store made before store keys is not signed for with the Ghost Key"
+        );
+
+        // But a settlement, which needs no signature, can still be published
+        // to it, naming the owner its loaded state names (Should Fix 6).
+        assert_eq!(state.delta_owner_key(&STORE), None, "not loaded yet");
+        arrive(&mut state, &STORE, Some(&seller()));
+        assert_eq!(
+            state.delta_owner_key(&STORE),
+            Some(seller().verifying_key())
+        );
+        assert_eq!(
+            state.delta_owner_key(&[5u8; 32]),
+            None,
+            "never someone else's"
+        );
     }
 
     /// **The loud refusal.** The contract ignores an outranked owner's

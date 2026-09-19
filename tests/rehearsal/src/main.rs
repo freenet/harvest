@@ -517,6 +517,11 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // store code. Superseded by dropping the store contract's diagnostic-only
         // related-contract fetch.
         (17, Code),
+        // V18: the build at `f6afc74` (#95). Still the store code, 29 B, and still
+        // the code of the seller's Ghost Key: harvest#93 changed whose key the
+        // code is a prefix of, not the encoding. Superseded by harvest#93 phase
+        // 1a (a store key owns the store).
+        (18, Code),
     ]
 };
 
@@ -593,8 +598,11 @@ fn assert_candidate_addresses(
         );
     }
 
-    // Without generations on BOTH sides this checks nothing about the split:
-    // deriving every id under one encoding would pass.
+    // Without generations of EVERY shape this checks nothing about the splits
+    // between them: deriving every id under one encoding would pass. There are
+    // three shapes, so two boundaries (V1/V2 and V5/V6 around the three-field
+    // band, and V16/V17 into the store code), and the walk has to have met all
+    // three shapes for either boundary to have been exercised.
     assert!(
         saw_legacy && saw_whole_key && saw_code,
         "the registry must span every parameter split for this check to mean anything \
@@ -693,6 +701,9 @@ async fn main() {
             listings: vec![make_listing(&seller, &fp, "gen5-listing", 1_756_000_000)],
         },
         orders: Default::default(),
+        // Empty, and so not written out: the bytes are exactly the ones a
+        // whole-key generation holds (harvest#93 added these parts).
+        ..Default::default()
     };
     let v4_state = StoreStateV1 {
         owner: None,
@@ -701,6 +712,9 @@ async fn main() {
             listings: vec![make_listing(&seller, &fp, "gen4-listing", 1_755_000_000)],
         },
         orders: Default::default(),
+        // Empty, and so not written out: the bytes are exactly the ones a
+        // whole-key generation holds (harvest#93 added these parts).
+        ..Default::default()
     };
 
     let v5_bytes = harvest_common::to_cbor(&v5_state).unwrap();

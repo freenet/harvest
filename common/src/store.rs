@@ -1,13 +1,23 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 
+use crate::backing::{
+    AuthorizedBacking, AuthorizedClosure, AuthorizedRetirement, BackingsV1, ClosedV1,
+    RetirementsV1, SignedSetV1,
+};
 use crate::listing::{verify_scoped_signature, AuthorizedListing, ListingId};
 use crate::payment::{AuthorizedOrder, OrderId};
 
-/// How many base58 characters of the seller's verifying key make a store code.
+/// How many base58 characters of the store key make a store code.
+///
+/// The store key, not a Ghost Key (harvest#93, revision 2): a store has its
+/// own Ed25519 key, and Ghost Keys back it (see [`crate::backing`]). Before
+/// revision 2 the code was a prefix of the seller's Ghost Key, and everything
+/// below about grinding costs carries over unchanged, because it is about a
+/// prefix of an Ed25519 key, whichever key that is.
 ///
 /// 16 (harvest#52, decided by @sanity in two steps). A code pins
 /// 58^16 ~= 2^93.7 keys; taking one chosen seller's address needs a keypair
@@ -37,14 +47,18 @@ const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopq
 ///
 /// Every 32-byte value encodes to at least 32 base58 characters (each leading
 /// zero byte is a `1`), so the slice always exists.
-pub fn store_code(seller_verifying_key: &VerifyingKey) -> String {
-    let encoded = bs58::encode(seller_verifying_key.as_bytes()).into_string();
+pub fn store_code(store_verifying_key: &VerifyingKey) -> String {
+    let encoded = bs58::encode(store_verifying_key.as_bytes()).into_string();
     encoded[..STORE_CODE_LEN.min(encoded.len())].to_string()
 }
 
 /// Immutable parameters for a store contract, set at creation time.
 ///
-/// # A prefix of the seller's key, not the key (harvest#52)
+/// # A prefix of the store key, not the key (harvest#52)
+///
+/// The store key since harvest#93. Every generation up to and including V18
+/// (`legacy/store_contract.toml`) was addressed by the seller's GHOST KEY
+/// instead; see `ui/src/migrate.rs` for how those are found and carried.
 ///
 /// Parameters are hashed into the contract's address, so they are what a link
 /// has to carry. The whole key made that a 44-character contract id; a
@@ -61,8 +75,10 @@ pub fn store_code(seller_verifying_key: &VerifyingKey) -> String {
 ///
 /// # Why there is only one field
 ///
-/// Anything here is frozen for the store's entire life. The seller's key
-/// genuinely is the store's identity, so freezing it is correct. The Bitcoin
+/// Anything here is frozen for the store's entire life. The store key
+/// genuinely is the store's identity, so freezing it is correct; the Ghost
+/// Key behind the store is not, which is why it is not here (a store's
+/// backing can change, harvest#93). The Bitcoin
 /// trust configuration used to live here too -- `trusted_bitcoin_bridges` and
 /// `bitcoin_address_code_hash` -- and being frozen was fatal to it: every
 /// store the UI created was published with an empty bridge list, which made
@@ -80,7 +96,7 @@ pub fn store_code(seller_verifying_key: &VerifyingKey) -> String {
 /// different key").
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreParameters {
-    /// The store code: a prefix of the seller's base58 verifying key.
+    /// The store code: a prefix of the base58 store key.
     ///
     /// `pub(crate)` on purpose -- see [`StoreParameters::new`].
     ///
@@ -96,7 +112,7 @@ pub struct StoreParameters {
 }
 
 impl StoreParameters {
-    /// The only way to build these parameters from a seller's key.
+    /// The only way to build these parameters from a store key.
     ///
     /// # Why the fields are not public
     ///
@@ -116,9 +132,9 @@ impl StoreParameters {
     ///
     /// Private fields are what actually holds it: a second derivation outside
     /// this crate does not compile.
-    pub fn new(seller_verifying_key: VerifyingKey) -> Self {
+    pub fn new(store_verifying_key: VerifyingKey) -> Self {
         Self {
-            store_code: store_code(&seller_verifying_key),
+            store_code: store_code(&store_verifying_key),
         }
     }
 
@@ -215,11 +231,14 @@ pub struct StoreInfoV1 {
     pub encryption_public_key: Option<[u8; 32]>,
 }
 
-/// Store info signed by the seller's ghostkey via the ghostkey delegate.
+/// Store info signed by the store key (harvest#93; by the seller's Ghost Key
+/// before revision 2).
 ///
-/// Uses the ScopedPayload format from the ghostkey delegate's SignResult:
-/// the signature is over the CBOR-encoded ScopedPayload which wraps the
-/// CBOR-encoded StoreInfoV1 as its payload.
+/// Uses the ScopedPayload envelope the Ghost Key vault's `SignResult` uses,
+/// which the Harvest delegate builds for the store key
+/// ([`crate::backing::sign_with_store_key`]): the signature is over the
+/// CBOR-encoded ScopedPayload, which wraps the CBOR-encoded StoreInfoV1 as its
+/// payload.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedStoreInfoV1 {
     pub info: StoreInfoV1,
@@ -844,7 +863,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 /// Every child of [`StoreStateV1`] verifies through this, so a store with no
 /// owner can hold nothing that needs a signature -- which is everything but
 /// the empty default.
-fn owner_key(parent: &StoreStateV1) -> Result<&VerifyingKey, String> {
+pub(crate) fn owner_key(parent: &StoreStateV1) -> Result<&VerifyingKey, String> {
     parent.owner.as_ref().ok_or_else(|| {
         "this store has no owner yet, so nothing in it can be verified: a store's first \
          signed record has to name the key that signed it"
@@ -865,10 +884,11 @@ fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
 /// # The owner, and binding a store to one key (harvest#52)
 ///
 /// [`StoreParameters`] carry only a [`STORE_CODE_LEN`]-character prefix of
-/// the seller's key, so the address alone does not say whose store it is.
+/// the store key, so the address alone does not say whose store it is.
 /// The state does: [`StoreStateV1::owner`] is the full key, it must begin
 /// with the code ([`StoreParameters::admits`]), and every record the store
-/// holds -- its details, listings and orders -- is verified against it. An
+/// holds -- its details, listings, orders, and the acceptance of each backing,
+/// each retirement and the closure -- is verified against it. An
 /// owner therefore arrives only alongside something it signed; a state that
 /// names an owner and holds nothing it signed is refused, because a key alone
 /// proves nothing (anyone can write down a curve point that begins with a
@@ -921,12 +941,20 @@ fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
 /// different key"); see the decision on harvest#52 for why there is no second
 /// address to move to.
 ///
+/// # The owner is the store key (harvest#93)
+///
+/// Since revision 2 the owner is the store's own key, not a Ghost Key. It
+/// signs the details, listings and orders, and it accepts every backing. A
+/// Ghost Key's only statement about a store is its backing, held in
+/// [`StoreStateV1::backings`]; see [`crate::backing`].
+///
 /// # What is NOT bound here
 ///
-/// Whether the owner is the person whose ghostkey certificate the store
-/// publishes. That is `ui/src/ghostkey_cert.rs`'s question, and it now
-/// compares the certified key with this field rather than re-deriving the
-/// address, since a prefix can no longer tell two keys apart on its own.
+/// Whether the store is backed by a Ghost Key whose certificate holds up,
+/// which one is current, and whether that key also backs another store. Those
+/// are reader rules ([`crate::backing::current_backing`] and
+/// `ui/src/ghostkey_cert.rs`), because a certificate chain and another store's
+/// state are not this contract's to check.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct StoreStateV1 {
     /// The store's owner, or `None` for a store nobody has published to.
@@ -951,6 +979,33 @@ pub struct StoreStateV1 {
     /// that was never written.
     #[serde(default)]
     pub orders: OrdersV1,
+    /// Every Ghost Key that has ever backed this store, with the store key's
+    /// acceptance of each (harvest#93). Grow-only: the contract refuses to
+    /// drop one. See [`crate::backing`].
+    ///
+    /// `default` so a state written before backings existed still decodes,
+    /// and `skip_serializing_if` so a state holding none encodes exactly as
+    /// it did then: `validate_state` requires a state to re-encode to its own
+    /// bytes, and an empty map written out would be bytes no earlier state
+    /// had.
+    #[serde(
+        default,
+        skip_serializing_if = "SignedSetV1::<AuthorizedBacking>::is_empty"
+    )]
+    pub backings: BackingsV1,
+    /// Every retirement of a backing key, signed by the store key. Grow-only,
+    /// like `backings`, and serialized the same way for the same reason.
+    #[serde(
+        default,
+        skip_serializing_if = "SignedSetV1::<AuthorizedRetirement>::is_empty"
+    )]
+    pub retirements: RetirementsV1,
+    /// The closed flag: empty, or the store key's signed closure. One-way.
+    #[serde(
+        default,
+        skip_serializing_if = "SignedSetV1::<AuthorizedClosure>::is_empty"
+    )]
+    pub closed: ClosedV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -963,6 +1018,14 @@ pub struct StoreStateV1Summary {
     pub info: <AuthorizedStoreInfoV1 as ComposableState>::Summary,
     pub listings: <ListingsV1 as ComposableState>::Summary,
     pub orders: <OrdersV1 as ComposableState>::Summary,
+    /// `default` and skipped when empty, so a summary of a store with no
+    /// backings is byte-for-byte what it was before they existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backings: <BackingsV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retirements: <RetirementsV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed: <ClosedV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -982,6 +1045,14 @@ pub struct StoreStateV1Delta {
     pub info: Option<<AuthorizedStoreInfoV1 as ComposableState>::Delta>,
     pub listings: Option<<ListingsV1 as ComposableState>::Delta>,
     pub orders: Option<<OrdersV1 as ComposableState>::Delta>,
+    /// `default` and skipped when absent, so a delta carrying none of the
+    /// revision-2 parts encodes exactly as it did before they existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backings: Option<<BackingsV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirements: Option<<RetirementsV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<<ClosedV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -993,6 +1064,76 @@ impl StoreStateV1 {
         self.info.info.version > 0
             || !self.listings.listings.is_empty()
             || !self.orders.orders.is_empty()
+            || !self.backings.is_empty()
+            || !self.retirements.is_empty()
+            || !self.closed.is_empty()
+    }
+
+    /// Apply the store-wide bound on backings and retirements (harvest#93
+    /// review, Must Fix 1, and the #98 merge-law re-check).
+    ///
+    /// Ranks ONE set of slots, every Ghost Key that has a backing or a
+    /// retirement here, keeps the [`crate::backing::MAX_BACKINGS`] smallest
+    /// by bytes, and keeps a backing or a retirement exactly when its slot
+    /// is kept. A retirement need not name a backing this replica holds.
+    /// Never fails, so no merge of valid states fails, and it touches
+    /// nothing but these two sets: the closed flag, the details, listings
+    /// and orders in the same update always land.
+    ///
+    /// # Why this is a merge rather than a refusal
+    ///
+    /// It used to be a refusal: past the bound `apply_delta` returned an
+    /// error, which took the whole update down with it (a closure and a
+    /// listing riding in the same delta included), and left two replicas
+    /// each refusing the other for good. `fdev verify-merge` files a
+    /// contract error as "inconclusive", not as a violation, which is how it
+    /// passed.
+    ///
+    /// # Why one slot set, and not "a retirement needs its backing"
+    ///
+    /// The previous version kept backings by rank and then dropped every
+    /// retirement whose backing was not held. That depends on arrival
+    /// order: a retirement of X arriving before X's backing was dropped,
+    /// and the backing, arriving next, stood unretired, while the other
+    /// order kept X retired. Deltas computed against a stale summary deliver
+    /// exactly that order, and the sender never resends, so a key was
+    /// un-retired for good (`fdev`'s `delta_permutation_invariance`, 18
+    /// violations over `store-r98race` and `store-r98retire`).
+    ///
+    /// # Why it obeys the merge laws, in any arrival order
+    ///
+    /// The ranking depends on the slot alone, never on which record a slot
+    /// holds, and the kept set is the top N of the union of every slot seen,
+    /// which is associative, commutative and idempotent: a slot cut from one
+    /// side ranks below that side's N-th slot, so it ranks below the N-th
+    /// slot of any union containing that side and is cut again. A backing
+    /// and a retirement for one key share a slot, so they are kept or cut
+    /// together, whichever arrived first.
+    ///
+    /// # Why nothing is ever un-retired
+    ///
+    /// A retirement is dropped only when its slot is cut, and a cut slot
+    /// never ranks back in, so its backing cannot return either.
+    pub(crate) fn normalize_backings(&mut self) {
+        let max = crate::backing::MAX_BACKINGS;
+        let slots = self.backing_slots();
+        if slots.len() > max {
+            for slot in slots.into_iter().skip(max) {
+                self.backings.records.remove(&slot);
+                self.retirements.records.remove(&slot);
+            }
+        }
+    }
+
+    /// Every Ghost Key with a backing or a retirement here, smallest first:
+    /// the slots [`Self::normalize_backings`] ranks.
+    fn backing_slots(&self) -> BTreeSet<Bytes32> {
+        self.backings
+            .records
+            .keys()
+            .chain(self.retirements.records.keys())
+            .copied()
+            .collect()
     }
 
     /// The parent the children are verified under. They read the owner and
@@ -1020,6 +1161,13 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.listings)?;
         next.orders
             .apply_delta(&parent, parameters, &delta.orders)?;
+        next.backings
+            .apply_delta(&parent, parameters, &delta.backings)?;
+        next.retirements
+            .apply_delta(&parent, parameters, &delta.retirements)?;
+        next.closed
+            .apply_delta(&parent, parameters, &delta.closed)?;
+        next.normalize_backings();
         *self = next;
         Ok(())
     }
@@ -1062,7 +1210,22 @@ impl ComposableState for StoreStateV1 {
         let parent = self.owner_only();
         self.info.verify(&parent, parameters)?;
         self.listings.verify(&parent, parameters)?;
-        self.orders.verify(&parent, parameters)
+        self.orders.verify(&parent, parameters)?;
+        // The store-wide rule `normalize_backings` keeps: at most
+        // `MAX_BACKINGS` Ghost Keys with a backing or a retirement. A state
+        // that breaks it is one no merge produces. A retirement need not
+        // name a held backing (see `normalize_backings`).
+        let slots = self.backing_slots().len();
+        if slots > crate::backing::MAX_BACKINGS {
+            return Err(format!(
+                "store holds backings or retirements for {slots} Ghost Keys, the most it keeps \
+                 is {}",
+                crate::backing::MAX_BACKINGS
+            ));
+        }
+        self.backings.verify(&parent, parameters)?;
+        self.retirements.verify(&parent, parameters)?;
+        self.closed.verify(&parent, parameters)
     }
 
     fn summarize(
@@ -1076,6 +1239,9 @@ impl ComposableState for StoreStateV1 {
             info: self.info.summarize(&parent, parameters),
             listings: self.listings.summarize(&parent, parameters),
             orders: self.orders.summarize(&parent, parameters),
+            backings: self.backings.summarize(&parent, parameters),
+            retirements: self.retirements.summarize(&parent, parameters),
+            closed: self.closed.summarize(&parent, parameters),
         }
     }
 
@@ -1111,8 +1277,19 @@ impl ComposableState for StoreStateV1 {
             info: self.info.delta(&parent, parameters, &base.info),
             listings: self.listings.delta(&parent, parameters, &base.listings),
             orders: self.orders.delta(&parent, parameters, &base.orders),
+            backings: self.backings.delta(&parent, parameters, &base.backings),
+            retirements: self
+                .retirements
+                .delta(&parent, parameters, &base.retirements),
+            closed: self.closed.delta(&parent, parameters, &base.closed),
         };
-        if delta.info.is_none() && delta.listings.is_none() && delta.orders.is_none() {
+        if delta.info.is_none()
+            && delta.listings.is_none()
+            && delta.orders.is_none()
+            && delta.backings.is_none()
+            && delta.retirements.is_none()
+            && delta.closed.is_none()
+        {
             None
         } else {
             Some(delta)
