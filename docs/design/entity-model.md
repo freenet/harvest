@@ -1212,9 +1212,10 @@ carries A's complaints to B.
   would invite a seller to back many stores and let readers divide.
 - *Merge laws.* Nothing to add. The Ghost Key record (section 3) already holds
   the key's backings and retirements as grow-only sets.
-- *Cost.* One reader rule and one Settings message: "This Ghost Key already
-  backs Mountain Valley Crafts. Retire it there first, or use a different Ghost
-  Key."
+- *Cost.* One reader rule and one Settings message. (The wording first
+  sketched here named retiring the other backing; there is no retire control,
+  so the message offers a different Ghost Key or a deliberate second store.
+  See "No retire control" under phase 1a.)
 - *UX.* Matches what section 2 already tells a seller: "Use a different Ghost
   Key if you want the two kept apart." No privacy is lost, since both stores
   would have shown the same key anyway.
@@ -1802,11 +1803,11 @@ left open, and what phase 1a deliberately does not do yet.
 - **Deferred to phase 2 (the seller UI):** a control for the seller to
   close their store (the contract, the reader rules and every buyer-facing
   surface honour the closed flag, but nothing in the UI signs one yet), and
-  the Settings message for a Ghost Key that already backs another store
-  ("This Ghost Key already backs Mountain Valley Crafts. Retire it there
-  first, or use a different Ghost Key."). Phase 1a says the same thing when
-  a creation or a move is refused for that reason; the Settings screen it
-  belongs on does not exist yet.
+  a Settings message for a Ghost Key that already backs another store. The
+  wording this section used to give for that message told the seller to
+  retire the other backing; with no retire control (above) it must not, and
+  phase 1a's own refusals no longer do. It should offer a different Ghost
+  Key, or a second store under this one on purpose.
 - **Creation is single-flight, and a retry resumes it (#98 review, M1).**
   Within a tab, a creation or move holds `store_creation_in_flight` from the
   moment it starts until the store is published, it fails, or the seller

@@ -385,8 +385,9 @@ fn IdentityCard(
             div { class: "store-share",
                 p { class: "text-warning",
                     "This Ghost Key already backs {offer.other_store}. A Ghost Key backs one \
-                     store at a time, so opening a second one under it makes buyers treat \
-                     BOTH as unbacked until one backing is retired."
+                     store at a time, so a buyer who has loaded both will treat BOTH as \
+                     unbacked and will not pay either. This version has no way to undo that: \
+                     use a different Ghost Key unless you mean it."
                 }
                 button {
                     class: "btn btn-sm btn-outline",

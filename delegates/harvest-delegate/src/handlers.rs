@@ -339,8 +339,9 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
                     return HarvestDelegateResponse::StoreKeyCreated {
                         request_id,
                         result: Err("this Ghost Key already backs a store on this device. A \
-                                     Ghost Key backs one store at a time: retire it there \
-                                     first, or use a different Ghost Key"
+                                     Ghost Key backs one store at a time: use a different \
+                                     Ghost Key, or open a second store under this one on \
+                                     purpose"
                             .into()),
                     };
                 }

@@ -851,7 +851,7 @@ pub struct BackingView {
 /// What a buyer is told about a store whose Ghost Key also backs another.
 pub(crate) const BACKS_SEVERAL_STORES: &str =
     "this Ghost Key also backs another store, and a Ghost Key backs one store at a time, so \
-     it counts for neither until one of the two backings is retired";
+     it counts for neither";
 
 /// Store details entered by the seller and waiting on the certificate.
 #[derive(Clone, Debug)]
