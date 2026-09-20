@@ -161,7 +161,18 @@ impl AppState {
         }
         self.stores_from_my_indexes.push(id.clone());
         #[cfg(target_arch = "wasm32")]
+        let store_key = *store_key;
+        #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
+            // The CURRENT generation's id is derived above; a store still
+            // living under a predecessor generation answers at neither it
+            // nor anything this device knows (#101 re-review S4). A
+            // REGISTERED store gets this from `StoresForGhostkey`; a store
+            // found through the index has no registration yet, and recovery
+            // is exactly what the index is for, so it needs the same probe.
+            // Started here, off the response handler, because a write guard
+            // is held at the call site.
+            crate::gateway::migrate_ops::start_store_key_migration(&store_key);
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
                 dioxus::logger::tracing::warn!("could not load a store a Ghost Key backs: {e}");
             }
@@ -220,11 +231,14 @@ impl AppState {
                 && index.entries.keys().all(|kept| *kept < slot)
         });
         if never_fits {
-            if self.index_entries_published.insert(owner.to_bytes()) {
+            // Its OWN marker (#101 re-review S1). Marking the store as
+            // published here is what stopped it ever being published if a
+            // slot freed later in the session.
+            if self.index_never_fits_notified.insert(owner.to_bytes()) {
                 self.notifications.push(format!(
-                    "This Ghost Key's index already lists {} stores, and this one sorts after \
-                     all of them, so it cannot be added. Retire a backing you no longer use, \
-                     or back this store with a different Ghost Key.",
+                    "This Ghost Key's index already lists {} stores and cannot take another, \
+                     so a device that knows only the Ghost Key will not find this store. The \
+                     store itself is unaffected: share its link and buyers reach it as usual.",
                     index.map_or(0, |i| i.entries.len())
                 ));
             }
@@ -233,17 +247,36 @@ impl AppState {
         if listed || !self.index_entries_published.insert(owner.to_bytes()) {
             return;
         }
+        let owner_bytes = owner.to_bytes();
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = crate::gateway::index_ops::publish_entry(&backer, entry).await {
                 dioxus::logger::tracing::warn!(
                     "could not add a store to its Ghost Key's index: {e}"
                 );
+                // Let a later store or index update try again (#101
+                // re-review, Codex P2): the marker means "published", and a
+                // failed publish is not one.
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_index_publish_failed(&owner_bytes);
             }
         });
         #[cfg(not(target_arch = "wasm32"))]
+        let _ = owner_bytes;
+        #[cfg(not(target_arch = "wasm32"))]
         self.index_entries_to_publish
             .push((backer.to_bytes(), entry));
+    }
+
+    /// A store's index entry could not be published. Forget that it was,
+    /// so the next store or index update tries again (#101 re-review).
+    ///
+    /// Split out of the spawned publish so the state change is testable
+    /// off-target; only the publish itself needs a browser.
+    pub(crate) fn on_index_publish_failed(&mut self, store_key: &[u8; 32]) {
+        self.index_entries_published.remove(store_key);
     }
 
     /// The fingerprint of a connected Ghost Key whose verifying key is `key`.
@@ -505,10 +538,66 @@ mod tests {
             state
                 .notifications
                 .iter()
-                .filter(|n| n.contains("cannot be added"))
+                .filter(|n| n.contains("cannot take another"))
                 .count(),
             1,
             "said once"
+        );
+
+        // A slot frees later in the same session: the entry must then be
+        // published (#101 re-review S1). It was not, because the "said
+        // once" marker was the same set as the "published once" gate.
+        // Mutated red by marking `index_entries_published` in the
+        // `never_fits` branch again.
+        let fewer: Vec<u8> = smaller
+            .iter()
+            .copied()
+            .take(MAX_INDEX_ENTRIES - 1)
+            .collect();
+        state.on_contract_state(
+            index_id(backer_vk()),
+            harvest_common::to_cbor(&index_of(&fewer)).unwrap(),
+        );
+        state.ensure_indexed(&[1u8; 32]);
+        assert_eq!(
+            state.index_entries_to_publish.len(),
+            1,
+            "a freed slot must be taken"
+        );
+    }
+
+    /// A publish that FAILS is not remembered as one, so a later store or
+    /// index update tries again (#101 re-review, Codex P2). Mutated red by
+    /// dropping the `remove` in `on_index_publish_failed`.
+    #[test]
+    fn a_failed_index_publish_is_retried() {
+        let store_key = SigningKey::from_bytes(&[0x71; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        load_backed(&mut state, 1, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_key),
+            }],
+        );
+        state.ensure_indexed(&[1u8; 32]);
+        assert_eq!(state.index_entries_to_publish.len(), 1);
+        state.ensure_indexed(&[1u8; 32]);
+        assert_eq!(state.index_entries_to_publish.len(), 1, "published once");
+
+        state.on_index_publish_failed(&store_key);
+        state.ensure_indexed(&[1u8; 32]);
+        assert_eq!(
+            state.index_entries_to_publish.len(),
+            2,
+            "a failed publish must be retried"
         );
     }
 

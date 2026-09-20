@@ -300,7 +300,20 @@ pub struct AppState {
 
     /// Store keys whose backing this session has published into their
     /// backer's index, so it is published at most once per session.
+    ///
+    /// A store is removed again when its publish FAILS (#101 re-review S1),
+    /// so a transient error does not leave the store undiscoverable by
+    /// other devices until the seller reloads.
     pub index_entries_published: HashSet<[u8; 32]>,
+
+    /// Store keys whose seller has been told their backer's index is full
+    /// and sorts entirely below them.
+    ///
+    /// Deliberately NOT `index_entries_published` (#101 re-review S1): that
+    /// set is the "published once" gate, and using it as a "said once"
+    /// marker meant a slot freed later in the session could never be taken
+    /// -- the entry was already marked published, and nothing was said.
+    pub index_never_fits_notified: HashSet<[u8; 32]>,
 
     /// Stores loaded because one of the USER'S OWN Ghost Key indexes listed
     /// them, in order.
