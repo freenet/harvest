@@ -6545,6 +6545,9 @@ impl AppState {
                     .is_some_and(|message| harvest_common::custody::is_wrap_message(&message))
                 {
                     self.on_wrap_signature(scoped_payload, signature);
+                    // Its failure paths give the request up, which frees
+                    // the vault for a deferred one (#101 re-review S3).
+                    self.start_custody_where_needed();
                     return;
                 }
                 self.on_signature(Signer::GhostKey, scoped_payload, signature, certificate_pem);

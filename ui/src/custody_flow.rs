@@ -384,11 +384,24 @@ impl AppState {
                  device will not be able to recover it until this succeeds."
             )),
         }
+        // The vault is free again, so the store that was deferred behind
+        // this one can start (#101 re-review S3): `start_custody_for`
+        // refuses while ANY custody request is pending, so without this a
+        // second store waits for an unrelated event or a reload.
+        self.start_custody_where_needed();
     }
 
     /// The delegate recovered the store key: register the store again, so it
     /// is this device's store once more.
     pub(crate) fn on_store_key_recovered(&mut self, store: [u8; 32], result: Result<(), String>) {
+        self.on_store_key_recovered_inner(store, result);
+        // Every exit above releases the vault, so the store deferred behind
+        // this one can start (#101 re-review S3). Done here rather than at
+        // each `return` so a later early exit cannot forget it.
+        self.start_custody_where_needed();
+    }
+
+    fn on_store_key_recovered_inner(&mut self, store: [u8; 32], result: Result<(), String>) {
         let Some(pending) = self.take_custody(&store) else {
             return;
         };
@@ -512,6 +525,31 @@ impl AppState {
         self.start_store_edit_if_ready();
     }
 
+    /// The `GetStoreSubkeys` request could not be SENT.
+    ///
+    /// Split out of `spawn_subkeys_request` so the state change is testable
+    /// off-target (#101 re-review B4). Clearing the marker alone left
+    /// `store_creation_in_flight` set, so `begin_store_creation` refused
+    /// every later attempt and only a reload recovered. This is the same
+    /// release `on_store_subkeys` performs for a delegate ERROR; the two
+    /// differ only in whether the request reached the delegate.
+    pub(crate) fn on_subkeys_request_failed(&mut self, store: [u8; 32], why: &str) {
+        self.store_subkeys_requested.remove(&store);
+        if self
+            .pending_store_creation
+            .as_ref()
+            .is_some_and(|p| p.store_verifying_key == Some(store))
+        {
+            self.store_creation_failed(&format!("the store's keys could not be asked for: {why}"));
+            return;
+        }
+        // Not a creation: an edit or a custody check wanted them. Say so,
+        // rather than leaving the seller with a screen that never fills.
+        self.notifications.push(format!(
+            "Your store's derived keys could not be asked for: {why}. Reload to try again."
+        ));
+    }
+
     /// Check the record key again for the store `store_contract_id`, if this
     /// device has derived its store's subkeys.
     pub(crate) fn recheck_record_key(&mut self, store_contract_id: &[u8]) {
@@ -593,8 +631,7 @@ fn spawn_subkeys_request(store: [u8; 32], request: harvest_common::HarvestDelega
             dioxus::logger::tracing::warn!("the store's derived keys were not asked for: {why}");
             crate::gateway::APP_STATE
                 .write()
-                .store_subkeys_requested
-                .remove(&store);
+                .on_subkeys_request_failed(store, &why);
         };
         let Some(delegate_key) = crate::gateway::APP_STATE
             .read()
@@ -1261,6 +1298,121 @@ mod tests {
                 .store_subkeys_requested
                 .contains(&store_vk().to_bytes()),
             "the recovered key's record key is checked against the published one"
+        );
+    }
+
+    /// A subkeys request that cannot be SENT releases a creation waiting on
+    /// it (#101 re-review B4). Before this, only the marker was cleared, so
+    /// `store_creation_in_flight` stayed set and `begin_store_creation`
+    /// refused every later attempt for the session.
+    ///
+    /// Mutated red by dropping the `store_creation_failed` call, and by
+    /// dropping the `store_subkeys_requested.remove`.
+    #[test]
+    fn a_subkeys_send_failure_releases_the_creation() {
+        let mut state = AppState::default();
+        state.store_creation_in_flight = Some("fp".to_string());
+        state.pending_store_creation = Some(crate::state::PendingStoreCreation {
+            another_store: false,
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            seller_verifying_key_bytes: backer_vk().to_bytes(),
+            certificate_pem: String::new(),
+            store_name: "Bean Shop".into(),
+            description: String::new(),
+            rsa_public_key_der: None,
+            encryption_public_key: None,
+            store_verifying_key: Some(store_vk().to_bytes()),
+            store_key_request: Some(1),
+            carried_listings: Vec::new(),
+        });
+        state.store_subkeys_requested.insert(store_vk().to_bytes());
+
+        state.on_subkeys_request_failed(store_vk().to_bytes(), "the delegate is not registered");
+
+        assert!(
+            state.store_creation_in_flight.is_none(),
+            "a creation that can never finish must not hold the single-flight marker"
+        );
+        assert!(state.pending_store_creation.is_none());
+        assert!(
+            !state
+                .store_subkeys_requested
+                .contains(&store_vk().to_bytes()),
+            "a retry must be able to ask again"
+        );
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("not registered")));
+    }
+
+    /// The same failure with no creation waiting says so and asks nothing
+    /// else to fail: a custody check or an edit wanted the keys.
+    #[test]
+    fn a_subkeys_send_failure_without_a_creation_only_reports() {
+        let mut state = AppState::default();
+        state.store_subkeys_requested.insert(store_vk().to_bytes());
+        state.on_subkeys_request_failed(store_vk().to_bytes(), "could not reach the delegate");
+        assert!(state.store_creation_in_flight.is_none());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("could not reach the delegate")));
+    }
+
+    /// Custody runs one store at a time, and the NEXT one starts when the
+    /// first answers (#101 re-review S3). `start_custody_for` refuses while
+    /// any custody request is pending, so `start_custody_where_needed`
+    /// starts exactly one; without the restart in the response handlers the
+    /// rest waited for an unrelated event or a reload.
+    ///
+    /// Mutated red by removing the `start_custody_where_needed()` call from
+    /// `on_store_key_wrapped`.
+    #[test]
+    fn the_next_store_s_custody_starts_when_the_first_answers() {
+        const ID2: u8 = 2;
+        const STORE2: u8 = 0x72;
+        let store2_vk = SigningKey::from_bytes(&[STORE2; 32]).verifying_key();
+
+        let mut state = backed_store();
+        register(&mut state);
+        // A second store under the same Ghost Key, also held by this device.
+        load_backed(
+            &mut state,
+            ID2,
+            STORE2,
+            vec![signed_backing(STORE2, BACKER, 10)],
+        );
+        state
+            .my_stores
+            .get_mut(FINGERPRINT)
+            .unwrap()
+            .push(StoreRegistration {
+                store_contract_id: vec![ID2; 32],
+                reputation_contract_id: vec![ID2 + 1; 32],
+                mailbox_contract_id: vec![ID2 + 2; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store2_vk.to_bytes()),
+            });
+
+        state.start_custody_where_needed();
+        assert_eq!(
+            state.pending_custody.len(),
+            1,
+            "one vault prompt at a time (#99 review)"
+        );
+        let first = *state.pending_custody.keys().next().unwrap();
+        let second = if first == store_vk().to_bytes() {
+            store2_vk.to_bytes()
+        } else {
+            store_vk().to_bytes()
+        };
+
+        // The first answers. The second must then start on its own.
+        state.on_store_key_wrapped(first, Err("no".into()));
+        assert!(
+            state.pending_custody.contains_key(&second),
+            "the deferred store's custody must start when the vault frees up"
         );
     }
 
