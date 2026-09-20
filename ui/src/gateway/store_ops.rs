@@ -493,27 +493,6 @@ pub async fn submit_listing_by_id(
     Ok(())
 }
 
-/// Publish a signed retirement of a Ghost Key's backing to the store
-/// contract (harvest#93). The store keeps the backing record; what the
-/// retirement says is that it no longer counts.
-#[cfg(target_arch = "wasm32")]
-pub async fn submit_retirement_by_id(
-    store_contract_id: &[u8],
-    retirement: harvest_common::backing::AuthorizedRetirement,
-) -> Result<(), String> {
-    use freenet_stdlib::prelude::*;
-
-    let (contract_key, _origin, owner) =
-        owned_store_key(store_contract_id, "nothing to retire a backing from")?;
-    let delta = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
-        owner: Some(owner),
-        retirements: Some(vec![retirement]),
-        ..Default::default()
-    })
-    .map_err(|e| format!("serialize retirement delta: {e}"))?;
-    super::update_contract(&contract_key, UpdateData::Delta(StateDelta::from(delta))).await
-}
-
 /// Publish a store's signed details to its contract.
 ///
 /// Separate from creation because it cannot happen during it: the details

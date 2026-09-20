@@ -348,11 +348,6 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             crate::store_keys::create(store, request_id, ghostkey_fingerprint.as_deref())
         }
 
-        HarvestDelegateRequest::RetireStore {
-            ghostkey_fingerprint,
-            store_verifying_key,
-        } => handle_retire_store(store, &ghostkey_fingerprint, &store_verifying_key),
-
         HarvestDelegateRequest::SignStoreUpdate {
             request_id,
             store_verifying_key,
@@ -649,33 +644,6 @@ fn handle_register_store<S: SecretStore>(
     }
 }
 
-/// Forget the registration of the store owned by `store_verifying_key`.
-///
-/// The store key itself is KEPT: the store still exists, its records are
-/// still signed by that key, and a seller who retires a backing by mistake
-/// can back it again from this device. What goes is the registration, so
-/// `CreateStoreKey` stops answering "this Ghost Key already backs a store"
-/// and My Store stops listing it (harvest#93).
-fn handle_retire_store<S: SecretStore>(
-    store: &mut S,
-    ghostkey_fingerprint: &str,
-    store_verifying_key: &[u8; 32],
-) -> HarvestDelegateResponse {
-    let mut stores = load_stores(store, ghostkey_fingerprint);
-    let before = stores.len();
-    stores.retain(|s| s.store_verifying_key.as_ref() != Some(store_verifying_key));
-    let removed = stores.len() != before;
-    if removed {
-        save_stores(store, ghostkey_fingerprint, &stores);
-        crate::store_keys::finish_creation(store, ghostkey_fingerprint, store_verifying_key);
-    }
-    HarvestDelegateResponse::StoreRetired {
-        ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
-        store_verifying_key: *store_verifying_key,
-        removed,
-    }
-}
-
 fn handle_list_stores<S: SecretStore>(
     store: &S,
     ghostkey_fingerprint: &str,
@@ -792,53 +760,6 @@ mod origin_gating_tests {
         assert!(refused.contains("already backs a store"), "{refused}");
         let second = mint(&mut store, 4, true).expect("asked for on purpose");
         assert_ne!(second, first);
-    }
-
-    /// Retiring a store forgets its registration, so the Ghost Key may mint
-    /// a key for a new store; the store key itself is kept, so the store can
-    /// be backed again. Mutated red by not removing the registration.
-    #[test]
-    fn retiring_a_store_frees_the_ghost_key_and_keeps_the_key() {
-        let mut store = MemSecrets::default();
-        let first = mint(&mut store, 1, false).unwrap();
-        register_as(&mut store, vec![7; 32], Some(first));
-        assert!(mint(&mut store, 2, false).is_err(), "one store at a time");
-
-        let retired = handle(
-            &mut store,
-            Some(&harvest()),
-            HarvestDelegateRequest::RetireStore {
-                ghostkey_fingerprint: FINGERPRINT.to_string(),
-                store_verifying_key: first,
-            },
-        );
-        assert!(matches!(
-            retired,
-            HarvestDelegateResponse::StoreRetired { removed: true, .. }
-        ));
-        let second = mint(&mut store, 3, false).expect("free again");
-        assert_ne!(second, first);
-        assert!(
-            crate::store_keys::load(
-                &store,
-                &ed25519_dalek::VerifyingKey::from_bytes(&first).unwrap()
-            )
-            .is_some(),
-            "the retired store can still be signed for"
-        );
-        match handle(
-            &mut store,
-            Some(&harvest()),
-            HarvestDelegateRequest::RetireStore {
-                ghostkey_fingerprint: FINGERPRINT.to_string(),
-                store_verifying_key: first,
-            },
-        ) {
-            HarvestDelegateResponse::StoreRetired { removed, .. } => {
-                assert!(!removed, "nothing left to remove")
-            }
-            other => panic!("expected StoreRetired, got {other:?}"),
-        }
     }
 
     /// The duplicate-registration branch ends the creation too: a store

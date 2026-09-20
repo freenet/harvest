@@ -1783,21 +1783,22 @@ left open, and what phase 1a deliberately does not do yet.
   by the store key. Until then, changing a store's backing would move its
   mailbox, so phase 1a has no "change Ghost Key" or "retire" UI; the
   contract supports both.
-- **Retiring a backing, and the way out of a duplicate.** My Store offers
-  "Retire this Ghost Key's backing" for a store this device holds the key
-  for: the store key signs a `Retirement`, it is published to the store,
-  and the Harvest delegate forgets the store's registration
-  (`RetireStore`), so the Ghost Key can back a new store and My Store stops
-  listing it. The store key is kept, so a store retired by mistake can be
-  backed again. This is what makes section 6.2 safe to enforce: a Ghost Key
-  that backs two stores counts for NEITHER, which is easy to reach on a
-  second device, and retiring one backing puts it right.
+- **No retire control, decided 2026-09-20 (harvest#104).** One was built and
+  then removed before merge. Retirement is the second half of a swap -- this
+  document's own comparison table justifies it as "add the new Ghost Key as a
+  backer, retire the old one" and as replacing a leaked key -- and nothing in
+  the app can add a backing to a store that already exists, so what shipped
+  was the destructive half alone: the store could never be backed again, by
+  that key or any other. Retirement returns paired with "attach a backing to
+  an existing store", which is what makes either story work. The contract
+  keeps `Retirement` and its tombstone semantics; only the client control and
+  the `RetireStore` delegate request are gone.
 - **The refusal is escapable.** When a creation is refused because the
   Ghost Key already backs a store, My Store says which store and offers
   "Open a second store under it anyway". Confirming re-runs the creation
   with `another_store`, which turns off this tab's check and the delegate's
-  one. Both stores then read as unbacked until one backing is retired, and
-  the prompt says so.
+  one. With no retire control, this and using a different Ghost Key are the
+  only ways forward from the refusal.
 - **Deferred to phase 2 (the seller UI):** a control for the seller to
   close their store (the contract, the reader rules and every buyer-facing
   surface honour the closed flag, but nothing in the UI signs one yet), and

@@ -378,16 +378,6 @@ pub enum HarvestDelegateRequest {
         another_store: bool,
     },
 
-    /// Forget a store's registration on this device, after its backing has
-    /// been retired (harvest#93). The store itself is untouched: what this
-    /// removes is the delegate's record that this Ghost Key has a store, so
-    /// `CreateStoreKey` mints a key for the next one and My Store stops
-    /// listing it. Answered with [`HarvestDelegateResponse::StoreRetired`].
-    RetireStore {
-        ghostkey_fingerprint: String,
-        store_verifying_key: [u8; 32],
-    },
-
     /// Sign `payload` with the store key named by `store_verifying_key`.
     ///
     /// `payload` must be one of a store's own records, as
@@ -582,14 +572,6 @@ pub enum HarvestDelegateResponse {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
         result: Result<StoreKeySignature, String>,
-    },
-
-    /// Answer to [`HarvestDelegateRequest::RetireStore`]: whether a
-    /// registration was removed.
-    StoreRetired {
-        ghostkey_fingerprint: String,
-        store_verifying_key: [u8; 32],
-        removed: bool,
     },
 
     StoreList {
@@ -1089,10 +1071,9 @@ mod tests {
             R::StoreKeyCreated { .. } => (23, false),
             // A signature over a store record, published as it is.
             R::StoreUpdateSigned { .. } => (24, false),
-            R::StoreRetired { .. } => (25, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 26;
+    const RESPONSE_VARIANTS: usize = 25;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1126,10 +1107,9 @@ mod tests {
             Q::CreateStoreKey { .. } => (22, false),
             // A store record to be signed and published.
             Q::SignStoreUpdate { .. } => (23, false),
-            Q::RetireStore { .. } => (24, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 25;
+    const REQUEST_VARIANTS: usize = 24;
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1286,11 +1266,6 @@ mod tests {
                 request_id: 43,
                 result: Ok([17u8; 32]),
             },
-            R::StoreRetired {
-                ghostkey_fingerprint: fp(),
-                store_verifying_key: [17u8; 32],
-                removed: true,
-            },
             R::StoreUpdateSigned {
                 request_id: 44,
                 store_verifying_key: [17u8; 32],
@@ -1414,10 +1389,6 @@ mod tests {
                 request_id: 43,
                 ghostkey_fingerprint: Some(fp()),
                 another_store: false,
-            },
-            Q::RetireStore {
-                ghostkey_fingerprint: fp(),
-                store_verifying_key: [17u8; 32],
             },
             Q::SignStoreUpdate {
                 request_id: 44,

@@ -263,8 +263,8 @@ impl AppState {
                     self.offer_second_store(&name);
                     self.store_creation_failed(&format!(
                         "this Ghost Key already backs {name}. A Ghost Key backs one store at a \
-                         time: retire that backing (My Store offers it), use a different Ghost \
-                         Key, or open a second store under it on purpose"
+                         time: use a different Ghost Key, or open a second store under this one \
+                         on purpose"
                     ));
                     return;
                 }
@@ -530,156 +530,6 @@ impl AppState {
             false,
         )
     }
-}
-
-/// A backing on its way to being retired: the store key has been asked to
-/// sign the retirement (harvest#93).
-///
-/// # Why a seller must always be able to retire
-///
-/// A Ghost Key backs one store at a time (section 6.2), and a key that backs
-/// two counts for NEITHER in every reader: both stores read as unbacked and
-/// buyers' software will not pay them. That is easy to reach by accident on a
-/// second device, so the product has to offer the way out the rule names.
-/// This is it: the store key signs a `Retirement` for the backing, the store
-/// contract takes it, and the Harvest delegate forgets the store's
-/// registration (`RetireStore`) so this device can create or back another
-/// store. The store key is kept, so a retirement made by mistake can be
-/// followed by backing the store again.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PendingRetirement {
-    pub store_contract_id: Vec<u8>,
-    /// The Ghost Key whose backing is being retired.
-    pub backer: [u8; 32],
-    /// The store key, which signs it and whose registration is forgotten.
-    pub store_verifying_key: [u8; 32],
-    pub fingerprint: String,
-}
-
-impl PendingRetirement {
-    /// The record the store key is asked to sign.
-    pub(crate) fn retirement(&self) -> harvest_common::backing::Retirement {
-        harvest_common::backing::Retirement {
-            backer: ed25519_dalek::VerifyingKey::from_bytes(&self.backer)
-                .unwrap_or_else(|_| ed25519_dalek::VerifyingKey::from_bytes(&[0; 32]).unwrap()),
-        }
-    }
-}
-
-impl AppState {
-    /// Ask the store key to retire the Ghost Key `backer`'s backing of the
-    /// store `store_contract_id`.
-    ///
-    /// Refused when the backing is not this store's current one, or when this
-    /// device holds no store key for it: a retirement it cannot sign is a
-    /// request nothing would ever answer.
-    pub(crate) fn begin_retire_backing(
-        &mut self,
-        store_contract_id: Vec<u8>,
-        fingerprint: String,
-    ) -> Result<(), String> {
-        let store_key = self
-            .store_owner_key(&store_contract_id)
-            .ok_or(crate::state::NO_STORE_KEY_MESSAGE)?;
-        let loaded = self
-            .browsing_stores
-            .get(&store_contract_id)
-            .ok_or("this store has not loaded yet")?;
-        let backing = harvest_common::backing::current_backing(&loaded.backing_state, |network| {
-            self.tip_height(network)
-        })
-        .ok_or("this store has no backing to retire")?;
-        let pending = PendingRetirement {
-            store_contract_id,
-            backer: backing.statement.backer.to_bytes(),
-            store_verifying_key: store_key.to_bytes(),
-            fingerprint,
-        };
-        self.request_store_key_signature(
-            PendingSignature::Retirement(pending),
-            store_key.to_bytes(),
-        )
-    }
-
-    /// The store key signed the retirement: publish it, and forget the
-    /// store's registration so this device can back another store.
-    pub(crate) fn on_retirement_signed(
-        &mut self,
-        pending: PendingRetirement,
-        scoped_payload: Vec<u8>,
-        signature: Vec<u8>,
-    ) {
-        let retirement = harvest_common::backing::AuthorizedRetirement {
-            retirement: pending.retirement(),
-            scoped_payload,
-            signature,
-        };
-        let Ok(store_key) = ed25519_dalek::VerifyingKey::from_bytes(&pending.store_verifying_key)
-        else {
-            return;
-        };
-        if let Err(why) = retirement.verify(&store_key) {
-            self.notifications.push(format!(
-                "The retirement did not verify ({why}); nothing was published."
-            ));
-            return;
-        }
-        // Local first, so the seller sees the store leave My Store even if
-        // the network write is slow; the delegate is what makes it stick.
-        if let Some(stores) = self.my_stores.get_mut(&pending.fingerprint) {
-            stores.retain(|s| s.store_verifying_key != Some(pending.store_verifying_key));
-        }
-        self.notifications.push(
-            "Retired this Ghost Key's backing. The store stays where it is, and the Ghost Key \
-             can back a new store."
-                .to_string(),
-        );
-        #[cfg(target_arch = "wasm32")]
-        {
-            let id = pending.store_contract_id.clone();
-            let retire = retirement.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) =
-                    crate::gateway::store_ops::submit_retirement_by_id(&id, retire).await
-                {
-                    dioxus::logger::tracing::error!("could not publish the retirement: {e}");
-                }
-            });
-            spawn_retire_store(pending.fingerprint.clone(), pending.store_verifying_key);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        self.retirements_published
-            .push((pending.store_contract_id, retirement));
-    }
-}
-
-/// Tell the Harvest delegate to forget a retired store's registration.
-#[cfg(target_arch = "wasm32")]
-fn spawn_retire_store(ghostkey_fingerprint: String, store_verifying_key: [u8; 32]) {
-    wasm_bindgen_futures::spawn_local(async move {
-        use dioxus::prelude::ReadableExt;
-        let Some(delegate_key) = crate::gateway::APP_STATE
-            .read()
-            .harvest_delegate_key
-            .clone()
-        else {
-            dioxus::logger::tracing::warn!("no Harvest delegate: the registration was not removed");
-            return;
-        };
-        let request = harvest_common::HarvestDelegateRequest::RetireStore {
-            ghostkey_fingerprint,
-            store_verifying_key,
-        };
-        match harvest_common::to_cbor(&request) {
-            Ok(payload) => {
-                if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await
-                {
-                    dioxus::logger::tracing::warn!("could not retire the registration: {e}");
-                }
-            }
-            Err(e) => dioxus::logger::tracing::warn!("serialize RetireStore: {e}"),
-        }
-    });
 }
 
 /// Ask the vault to sign a backing statement. Same discipline as every other
@@ -1098,84 +948,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The way out of section 6.2: the store key signs a retirement, it is
-    /// published, and the store's registration goes, so the Ghost Key can
-    /// back a new store. The store key is kept. Mutated red by not
-    /// publishing and by not dropping the registration.
-    #[test]
-    fn a_seller_can_retire_a_backing() {
-        let mut state = AppState::default();
-        load_backed(&mut state, 1, 0x62, vec![signed_backing(0x62, 0x61, 10)]);
-        state.my_stores.insert(
-            FINGERPRINT.to_string(),
-            vec![harvest_common::StoreRegistration {
-                store_contract_id: vec![1; 32],
-                reputation_contract_id: vec![2; 32],
-                mailbox_contract_id: vec![3; 32],
-                store_contract_key: None,
-                store_verifying_key: Some(store_key().verifying_key().to_bytes()),
-            }],
-        );
-        state
-            .begin_retire_backing(vec![1; 32], FINGERPRINT.to_string())
-            .expect("the store key can sign it");
-        let retirement = harvest_common::backing::Retirement {
-            backer: ghost().verifying_key(),
-        };
-        let (scoped_payload, signature) = sign(&store_key(), &retirement);
-        state.on_delegate_response(HarvestDelegateResponse::StoreUpdateSigned {
-            request_id: 0,
-            store_verifying_key: store_key().verifying_key().to_bytes(),
-            result: Ok(StoreKeySignature {
-                scoped_payload,
-                signature,
-            }),
-        });
-        let (id, published) = state
-            .retirements_published
-            .pop()
-            .expect("the retirement is published");
-        assert_eq!(id, vec![1; 32]);
-        published
-            .verify(&store_key().verifying_key())
-            .expect("a retirement the store contract accepts");
-        assert_eq!(published.retirement.backer, ghost().verifying_key());
-        assert!(
-            state.my_stores[FINGERPRINT].is_empty(),
-            "the store leaves My Store, so the Ghost Key can back another"
-        );
-    }
-
-    /// Nothing is asked of a key this device does not hold, or of a store
-    /// with no backing to retire.
-    #[test]
-    fn retiring_needs_our_store_key_and_a_current_backing() {
-        let mut state = AppState::default();
-        load_backed(&mut state, 1, 0x62, vec![signed_backing(0x62, 0x61, 10)]);
-        let err = state
-            .begin_retire_backing(vec![1; 32], FINGERPRINT.to_string())
-            .expect_err("not our store");
-        assert!(err.contains("store key"), "{err}");
-
-        let mut state = AppState::default();
-        load_backed(&mut state, 1, 0x62, vec![]);
-        state.my_stores.insert(
-            FINGERPRINT.to_string(),
-            vec![harvest_common::StoreRegistration {
-                store_contract_id: vec![1; 32],
-                reputation_contract_id: vec![2; 32],
-                mailbox_contract_id: vec![3; 32],
-                store_contract_key: None,
-                store_verifying_key: Some(store_key().verifying_key().to_bytes()),
-            }],
-        );
-        let err = state
-            .begin_retire_backing(vec![1; 32], FINGERPRINT.to_string())
-            .expect_err("nothing to retire");
-        assert!(err.contains("no backing"), "{err}");
-        assert!(state.pending_signatures.is_empty());
-    }
-
     /// A refusal under section 6.2 is escapable: the seller is offered the
     /// second store, and confirming starts the creation again with
     /// `another_store`, which the delegate's own rule honours. Mutated red
@@ -1228,29 +1000,6 @@ pub(crate) mod tests {
             "the second store is being backed: {:?}",
             state.notifications
         );
-    }
-
-    /// A retirement whose signature does not verify publishes nothing and
-    /// says so: the store contract would refuse it, silently. Mutated red by
-    /// removing the check.
-    #[test]
-    fn a_retirement_that_does_not_verify_is_not_published() {
-        let mut state = AppState::default();
-        state.on_retirement_signed(
-            PendingRetirement {
-                store_contract_id: vec![1; 32],
-                backer: ghost().verifying_key().to_bytes(),
-                store_verifying_key: store_key().verifying_key().to_bytes(),
-                fingerprint: FINGERPRINT.to_string(),
-            },
-            vec![9; 32],
-            vec![9; 64],
-        );
-        assert!(state.retirements_published.is_empty());
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n.contains("did not verify")));
     }
 
     /// A store made before revision 2 that has not loaded holds back

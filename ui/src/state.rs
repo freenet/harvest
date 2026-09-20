@@ -292,11 +292,6 @@ pub struct AppState {
     /// (harvest#93 section 6.2). Cleared when they answer either way.
     pub second_store_offer: Option<SecondStoreOffer>,
 
-    /// Off-target only: retirements that would have been published, so the
-    /// retire flow can be followed in a test.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub retirements_published: Vec<(Vec<u8>, harvest_common::backing::AuthorizedRetirement)>,
-
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -918,8 +913,6 @@ pub enum PendingSignature {
     /// The store key's acceptance of that statement, from the Harvest
     /// delegate.
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
-    /// The store key's retirement of a Ghost Key's backing (harvest#93).
-    Retirement(crate::backing_flow::PendingRetirement),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -949,7 +942,6 @@ impl PendingSignature {
                     backing: pending.statement.clone(),
                 })
             }
-            PendingSignature::Retirement(pending) => harvest_common::to_cbor(&pending.retirement()),
         }
     }
 
@@ -966,8 +958,7 @@ impl PendingSignature {
             PendingSignature::Listing(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
-            | PendingSignature::BackingAcceptance(_)
-            | PendingSignature::Retirement(_) => Signer::StoreKey,
+            | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_) | PendingSignature::BackingStatement(_) => {
                 Signer::GhostKey
             }
@@ -979,11 +970,10 @@ impl PendingSignature {
 /// store under this Ghost Key anyway?".
 ///
 /// The refusal alone is a dead end: a Ghost Key that already backs a store
-/// cannot back another, and until the seller retires the first backing
-/// (My Store offers that) nothing else can be created under that key. Some
-/// sellers do want two stores under one key, knowing both then read as
-/// unbacked until one backing is retired, so the refusal is escapable rather
-/// than final.
+/// cannot back another, and nothing in this build can take a backing off a
+/// store (harvest#104), so the only other way forward is a different Ghost
+/// Key. Some sellers do want two stores under one key, so the refusal is
+/// escapable rather than final.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SecondStoreOffer {
     pub fingerprint: String,
@@ -5931,21 +5921,6 @@ impl AppState {
                 Err(why) => self.store_key_signature_failed(request_id, &why),
             },
 
-            HarvestDelegateResponse::StoreRetired {
-                ghostkey_fingerprint,
-                store_verifying_key,
-                removed,
-            } => {
-                info!(
-                    "Delegate {} the registration of a retired store for {ghostkey_fingerprint}",
-                    if removed { "removed" } else { "did not hold" }
-                );
-                // Whatever the delegate held, this device no longer lists it.
-                if let Some(stores) = self.my_stores.get_mut(&ghostkey_fingerprint) {
-                    stores.retain(|s| s.store_verifying_key != Some(store_verifying_key));
-                }
-            }
-
             HarvestDelegateResponse::Error { message } => {
                 // A creation waiting on `CreateStoreKey` never gets its
                 // answer once the delegate has refused (#98 review, L1): an
@@ -6232,9 +6207,6 @@ impl AppState {
             }
             Some(PendingSignature::BackingAcceptance(pending)) => {
                 self.on_backing_accepted(*pending, scoped_payload, signature);
-            }
-            Some(PendingSignature::Retirement(pending)) => {
-                self.on_retirement_signed(pending, scoped_payload, signature);
             }
             None => {
                 let from = match signer {
@@ -8605,8 +8577,7 @@ mod tests {
                 | PendingSignature::Order(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_)
-                | PendingSignature::Retirement(_) => None,
+                | PendingSignature::BackingAcceptance(_) => None,
             })
     }
 
@@ -9144,8 +9115,7 @@ mod tests {
                 | PendingSignature::Order(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_)
-                | PendingSignature::Retirement(_) => None,
+                | PendingSignature::BackingAcceptance(_) => None,
             })
             .collect();
         assert_eq!(

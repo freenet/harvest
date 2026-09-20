@@ -468,30 +468,6 @@ fn IdentityCard(
                         // lost, so the seller retypes them, and the edit is
                         // then published at a version the store contract
                         // discards as stale.
-                        if !card.legacy {
-                            // The way out of section 6.2: a Ghost Key that
-                            // backs two stores counts for neither, so a
-                            // seller must always be able to retire one.
-                            button {
-                                class: "btn btn-sm btn-outline",
-                                onclick: {
-                                    let id = card.contract_id.clone();
-                                    let fp = identity.fingerprint.clone();
-                                    move |_| {
-                                        let done = APP_STATE
-                                            .write()
-                                            .begin_retire_backing(id.clone(), fp.clone());
-                                        if let Err(e) = done {
-                                            APP_STATE
-                                                .write()
-                                                .notifications
-                                                .push(format!("Could not retire the backing: {e}"));
-                                        }
-                                    }
-                                },
-                                "Retire this Ghost Key's backing"
-                            }
-                        }
                         if card.legacy {
                             p { class: "text-warning",
                                 "This store was made before stores had keys of their own, so this \
