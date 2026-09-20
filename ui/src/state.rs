@@ -328,6 +328,26 @@ pub struct AppState {
     /// again.
     pub custody_attempted: HashSet<([u8; 32], [u8; 32])>,
 
+    /// How many times a custody request for `(store, backer)` failed to SEND.
+    ///
+    /// A send failure is not the same as the vault or the delegate refusing:
+    /// nothing was ever asked, so the attempt should not stay recorded the
+    /// way a timeout's does. But simply clearing `custody_attempted` would
+    /// retry on every store list, Ghost Key list and store state, notifying
+    /// each time. This bounds it: a few retries, then it stops and says so
+    /// once (#101 re-review, marker sweep).
+    pub custody_send_failures: HashMap<([u8; 32], [u8; 32]), u8>,
+
+    /// How many times publishing a store's index entry has failed, so a
+    /// permanently failing publish is not retried forever.
+    ///
+    /// `ensure_indexed` runs on EVERY store-state arrival, and
+    /// `on_index_publish_failed` clears the published marker so the next one
+    /// retries. Without a cap that is a retry at the store's update rate,
+    /// with no backoff and nothing said -- the inverse of the defect the
+    /// clearing was added to fix (#101 re-review, marker sweep).
+    pub index_publish_failures: HashMap<[u8; 32], u8>,
+
     /// Off-target only: custody requests that would have gone to the
     /// Harvest delegate, and copies that would have been published, recorded
     /// so the flow can be followed in a test. See `custody_flow`.
@@ -536,29 +556,43 @@ pub(crate) fn spawn_store_creation(
 }
 
 /// Ask the ghostkey delegate for an identity's certificate.
+///
+/// Every failure arm releases the edit parked on the answer. Nothing answers
+/// a request that never left the tab, and a parked `pending_store_edit` gates
+/// `vault_work_outstanding()`, so a silent failure here stopped all custody
+/// and all Bitcoin watch requests for the session (#101 re-review, marker
+/// sweep B1).
 #[cfg(target_arch = "wasm32")]
 fn request_certificate(fingerprint: String) {
     wasm_bindgen_futures::spawn_local(async move {
-        use dioxus::prelude::ReadableExt;
+        use dioxus::prelude::{ReadableExt, WritableExt};
 
+        let fail = |why: String| {
+            dioxus::logger::tracing::error!("certificate request: {why}");
+            crate::gateway::APP_STATE
+                .write()
+                .on_certificate_request_failed(&fingerprint, &why);
+        };
         let Some(delegate_key) = crate::gateway::APP_STATE
             .read()
             .ghostkey_delegate_key
             .clone()
         else {
-            dioxus::logger::tracing::error!("Ghostkey delegate not registered");
+            fail("the Ghost Key vault is not registered".into());
             return;
         };
-        let request = ghostkey_common::GhostkeyRequest::GetCertificate { fingerprint };
+        let request = ghostkey_common::GhostkeyRequest::GetCertificate {
+            fingerprint: fingerprint.clone(),
+        };
         let payload = match ghostkey_common::to_cbor(&request) {
             Ok(payload) => payload,
             Err(e) => {
-                dioxus::logger::tracing::error!("Failed to serialize GetCertificate: {e}");
+                fail(format!("could not encode the request: {e}"));
                 return;
             }
         };
         if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
-            dioxus::logger::tracing::error!("Failed to request certificate: {e}");
+            fail(format!("could not reach the vault: {e}"));
         }
     });
 }
@@ -5016,6 +5050,32 @@ impl AppState {
     ///
     /// Errors are returned rather than swallowed so the form can say why
     /// nothing happened.
+    /// The certificate request for `fingerprint` could not be SENT.
+    ///
+    /// Release the edit parked on its answer and say so. Split out so the
+    /// state change is testable off-target; only the send needs a browser.
+    ///
+    /// Nothing else answers a request that never left the tab, and
+    /// `pending_store_edit.is_some()` feeds `user_signature_under_way()`,
+    /// which gates `vault_work_outstanding()` -- so leaving it parked stopped
+    /// every custody wrap and recovery and every Bitcoin watch request for
+    /// the rest of the session, with no timeout (see the note on
+    /// `pending_store_edit`). Found by the marker sweep on #101, as a second
+    /// instance of the shape `release_waiters_on_subkeys` was written for.
+    pub(crate) fn on_certificate_request_failed(&mut self, fingerprint: &str, why: &str) {
+        if self
+            .pending_store_edit
+            .as_ref()
+            .is_some_and(|e| e.ghostkey_fingerprint == fingerprint)
+        {
+            self.pending_store_edit = None;
+            self.notifications.push(format!(
+                "Your store's details were not published: this device could not ask for your \
+                 Ghost Key's certificate ({why})."
+            ));
+        }
+    }
+
     pub fn publish_store_details(
         &mut self,
         store_contract_id: &[u8],
@@ -8876,6 +8936,44 @@ mod tests {
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_) => None,
             })
+    }
+
+    /// A certificate request that fails to SEND releases the edit parked on
+    /// its answer, so the vault is not blocked for the session (#101
+    /// re-review, marker sweep B1).
+    ///
+    /// `pending_store_edit.is_some()` feeds `user_signature_under_way()`,
+    /// which gates `vault_work_outstanding()`. Nothing answers a request that
+    /// never left the tab, and there is no timeout on the edit. Mutated red
+    /// by dropping the release.
+    #[test]
+    fn a_failed_certificate_request_releases_the_parked_edit() {
+        let mut state = AppState {
+            pending_store_edit: Some(PendingStoreEdit {
+                ghostkey_fingerprint: "fp".into(),
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: [2; 32],
+                next_version: 4,
+                details: Default::default(),
+            }),
+            ..Default::default()
+        };
+        assert!(state.user_signature_under_way(), "the edit holds the vault");
+
+        // Another identity's failure must not touch it.
+        state.on_certificate_request_failed("someone-else", "no vault");
+        assert!(
+            state.pending_store_edit.is_some(),
+            "not this edit's request"
+        );
+
+        state.on_certificate_request_failed("fp", "no vault");
+        assert!(state.pending_store_edit.is_none(), "released");
+        assert!(
+            !state.user_signature_under_way(),
+            "and the vault is free again"
+        );
+        assert!(state.notifications.iter().any(|n| n.contains("no vault")));
     }
 
     /// Version 0 is the uninitialized state: nothing was ever signed or

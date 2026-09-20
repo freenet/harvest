@@ -56,6 +56,11 @@ pub struct IndexView {
     pub index: Option<GhostKeyIndexV1>,
 }
 
+/// How many times a store's index entry publish may fail before this
+/// session gives up on it and tells the seller. Small on purpose: the
+/// retry is driven by store-state arrivals, which are frequent.
+const MAX_INDEX_PUBLISH_ATTEMPTS: u8 = 3;
+
 impl AppState {
     /// Read `ghost_key`'s index, once per session, and keep following it.
     ///
@@ -305,8 +310,18 @@ impl AppState {
     /// The GET for a store found through an index could not be sent. Forget
     /// that it was subscribed, so a later index update loads it again.
     pub(crate) fn on_indexed_store_load_failed(&mut self, store_contract_id: &[u8]) {
-        // Only if it never arrived: a loaded store is not re-fetched.
-        if self.browsing_stores.contains_key(store_contract_id) {
+        // Only if its STATE never arrived. `browsing_stores` holds
+        // PLACEHOLDER entries -- `begin_browsing` inserts one the moment a
+        // link is opened -- so testing for the key alone skipped the release
+        // for exactly the stores a link or a typed code had touched (marker
+        // sweep, #101 re-review). The siblings test the same way:
+        // `on_index_watch_failed` checks `index.is_none()` and
+        // `note_store_state_unavailable` checks `info.is_some()`.
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|s| s.info.is_some())
+        {
             return;
         }
         self.subscribed_stores.remove(store_contract_id);
@@ -320,6 +335,24 @@ impl AppState {
     /// Split out of the spawned publish so the state change is testable
     /// off-target; only the publish itself needs a browser.
     pub(crate) fn on_index_publish_failed(&mut self, store_key: &[u8; 32]) {
+        let failures = self.index_publish_failures.entry(*store_key).or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_INDEX_PUBLISH_ATTEMPTS {
+            // Stop, and say so once. `ensure_indexed` runs on every store
+            // state arrival, so clearing the marker forever would retry at
+            // the store's update rate with no backoff and in silence --
+            // which is its own defect, not a fix (#101 re-review, marker
+            // sweep). The marker stays set, which is what stops it.
+            if *failures == MAX_INDEX_PUBLISH_ATTEMPTS {
+                self.notifications.push(
+                    "This store could not be added to its Ghost Key's index, so a device that \
+                     knows only the Ghost Key will not find it. The store itself is unaffected: \
+                     share its link and buyers reach it as usual."
+                        .into(),
+                );
+            }
+            return;
+        }
         self.index_entries_published.remove(store_key);
     }
 
@@ -651,6 +684,50 @@ mod tests {
             "a failed GET must not hold the store for the session"
         );
         assert!(!state.stores_from_my_indexes.contains(&store_id));
+
+        // A PLACEHOLDER entry is not arrived state. `begin_browsing` inserts
+        // one the moment a link is opened, so testing `contains_key` skipped
+        // the release for exactly the stores a link had touched (#101
+        // re-review, marker sweep). Mutated red by testing for the key.
+        let placeholder = vec![0x44u8; 32];
+        assert!(state.note_store_subscribed(&placeholder));
+        state
+            .browsing_stores
+            .entry(placeholder.clone())
+            .or_default();
+        assert!(
+            state.browsing_stores[&placeholder].info.is_none(),
+            "a placeholder holds no details"
+        );
+        state.on_indexed_store_load_failed(&placeholder);
+        assert!(
+            state.note_store_subscribed(&placeholder),
+            "a placeholder must not block the release"
+        );
+
+        // But a store whose details HAVE arrived is left alone.
+        let loaded = vec![0x55u8; 32];
+        assert!(state.note_store_subscribed(&loaded));
+        let info = harvest_common::store::StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: String::new(),
+            reputation_contract_id: [0; 32],
+            store_name: "Loaded".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+            record_public_key: None,
+        };
+        state
+            .browsing_stores
+            .entry(loaded.clone())
+            .or_default()
+            .info = Some(info);
+        state.on_indexed_store_load_failed(&loaded);
+        assert!(
+            !state.note_store_subscribed(&loaded),
+            "state that arrived wins over a late send failure"
+        );
     }
 
     /// A publish that FAILS is not remembered as one, so a later store or
@@ -685,6 +762,33 @@ mod tests {
             state.index_entries_to_publish.len(),
             2,
             "a failed publish must be retried"
+        );
+
+        // But NOT forever. `ensure_indexed` runs on every store state
+        // arrival, so an unbounded clear is a retry storm with nothing said
+        // (#101 re-review, marker sweep). Mutated red by removing the cap.
+        for _ in 0..MAX_INDEX_PUBLISH_ATTEMPTS {
+            state.on_index_publish_failed(&store_key);
+            state.ensure_indexed(&[1u8; 32]);
+        }
+        let settled = state.index_entries_to_publish.len();
+        for _ in 0..5 {
+            state.on_index_publish_failed(&store_key);
+            state.ensure_indexed(&[1u8; 32]);
+        }
+        assert_eq!(
+            state.index_entries_to_publish.len(),
+            settled,
+            "past the cap it stops retrying"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("will not find it"))
+                .count(),
+            1,
+            "and says so exactly once"
         );
     }
 

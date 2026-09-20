@@ -952,6 +952,10 @@ test, original file restored after each), unless the row says otherwise.
 | `contracts/index-contract` entry points | A non-canonical encoding is refused even when it decodes and verifies; an update that is neither a state nor a delta is refused rather than ignored. | **Yes** -- `a_non_canonical_encoding_is_refused`, `an_unexpected_update_kind_is_refused`. |
 | `gateway/index_ops::publish_entry` | A PUT of an existing index contract merges through `update_state` rather than replacing it or being refused. | **Measured, not tested here.** Against a throwaway local node on 2026-09-19 (freenet 0.2.135, stdlib 0.10.0): PUT A then PUT B returned the union, and the node answered the second PUT with `UpdateResponse`. The evidence is recorded on `publish_entry`. A contract needing related contracts during `update_state` is a documented exception in freenet-core; the index requests none. |
 | `index_flow::ensure_indexed` | Our store, backed by a connected Ghost Key, is published into that key's index once per session, and not while the index lists it; a store this device cannot sign for is never published by it. | **Yes** -- `our_store_is_added_to_its_backers_index_once`, `a_store_we_do_not_hold_is_not_published`; red with each guard removed. The PUT itself is wasm-only. |
+| `state.rs::on_certificate_request_failed` | A certificate request that fails to SEND releases the store edit parked on its answer, so the vault is not blocked for the session. | **Yes** -- `a_failed_certificate_request_releases_the_parked_edit`; red with the release dropped. Asserts another identity's failure does not touch it. The send is wasm-only. |
+| `custody_flow::on_custody_send_failed` | A custody request that fails to SEND is retried a bounded number of times, then stops and tells the seller once. | **Yes** -- `a_custody_send_failure_retries_a_bounded_number_of_times`; red with the `custody_attempted` release dropped and with the cap removed. |
+| `index_flow::on_index_publish_failed` bound | A publish that keeps failing stops being retried and is reported once, rather than retrying at the store's update rate. | **Yes** -- asserted inside `a_failed_index_publish_is_retried`; red with the cap removed. |
+| `index_flow::on_indexed_store_load_failed` placeholder | A `browsing_stores` PLACEHOLDER entry (no details) does not count as arrived state, so the release still happens for a store a link had touched. | **Yes** -- asserted inside `a_failed_index_or_store_get_is_retried`; red with the `contains_key` test restored. |
 | `index_flow::on_index_watch_failed`, `on_indexed_store_load_failed` | A GET that fails to send does not leave the Ghost Key index marked as followed, nor the store marked as subscribed, so a later attempt retries; state that has already ARRIVED wins over a late send failure. | **Yes** -- `a_failed_index_or_store_get_is_retried`; red with each `remove` dropped. Found by two independent reviewers (#101 re-review); the GETs themselves are wasm-only. |
 | `index_flow::on_index_publish_failed` | A publish that FAILS is not remembered as one, so a later store or index update tries again. | **Yes** -- `a_failed_index_publish_is_retried`; red with the `remove` dropped. Only the call from the failed PUT is wasm-only. |
 | `index_flow::follow_indexed_store` predecessors | A store found through an index, and still living under an older store-contract generation, is probed at its predecessor addresses like a registered one. | **No, not driven by a test** (#101 re-review S4). `start_store_key_migration` is wasm-only, as is the whole probe; the call is compile-checked and mirrors the registered-store path in `state.rs`'s `StoresForGhostkey` handler. The live store-move E2E is what exercises it. |
@@ -1089,3 +1093,59 @@ worth doing anyway.
 
 `common/src/store.rs:272` (`to_cbor` is infallible) is unfalsifiable by test
 and would surface as a panic rather than a wrong answer.
+
+## A defect class: the optimistic marker (added 2026-09-20)
+
+Written down because it was found **nine times in one change**, and because
+the way it was found is the point.
+
+**The shape.** A set-membership or `Option` "already did this / in flight"
+marker is claimed BEFORE the operation it guards has succeeded, and the
+failure path does not release it. One transient failure then disables a
+capability for the rest of the session, with no timeout and no recovery but a
+page reload.
+
+**The tells, so it can be grepped for:**
+
+- `.insert(x)` used as a gate through its `bool` return -- "if this returns
+  false we already did it".
+- Any `spawn_local` whose failure arm only calls `warn!`/`error!` and does not
+  clear what the success path clears.
+- `self.x = Some(..)` set as an in-flight guard before an async send.
+
+**Why it is in this file.** Native tests are structurally blind to most of it:
+the failure arms live in `#[cfg(target_arch = "wasm32")]` blocks, so a green
+`cargo test --workspace` is not evidence that any marker is released. The fix
+that makes it testable is to split the state change out of the spawned send,
+as `on_subkeys_request_failed`, `on_index_publish_failed`,
+`on_index_watch_failed`, `on_indexed_store_load_failed`,
+`on_certificate_request_failed` and `on_custody_send_failed` all now do --
+then the release is reachable off-target and can be mutation-checked.
+
+**How it was found, which is the part worth copying.** Three instances turned
+up during the #93 phase-1 review, each spotted by a DIFFERENT reviewer, each
+by chance. Treating three-by-accident as a lower bound rather than a closed
+set, a deliberate sweep for the shape then found **nine more**. No reviewer
+had found the worst of them: `store_state_unavailable` being recorded from a
+send that never reached the network, which makes `publish_store_details` read
+"nothing is published", publish at version 1, and have the contract silently
+drop it as stale -- the exact silent loss of a seller's edit that field exists
+to prevent. A defect found repeatedly by accident is a class that has not been
+looked for.
+
+**The model to copy: `ui/src/gateway/migrate_ops.rs`.** It registers before
+every send too, but gives each registration BOTH a failure deliverer AND a
+timeout, and it is the only module in this codebase that does. Everything else
+claims a marker and hopes. Its `SESSION_WALKS` claim is never released, and
+that is argued in the type's own docs and pinned by tests -- a deliberate
+never-release with a written reason is fine; an accidental one is this class.
+
+**Clearing the marker is not automatically the fix.** A marker that gates work
+driven by a frequent event turns, when cleared, into an unbounded retry with
+no backoff and nothing said. One fix in this round introduced exactly that --
+`ensure_indexed` runs on every store-state arrival -- and had to be bounded
+afterwards. Cap the attempts and surface the failure at the cap:
+`MAX_INDEX_PUBLISH_ATTEMPTS`, `MAX_CUSTODY_SEND_ATTEMPTS`.
+
+**Six remaining instances are tracked in harvest#107**, fixed in the PR
+immediately after the phase-1 stack. Three of them block a purchase.

@@ -82,6 +82,10 @@ pub enum CustodyPurpose {
 /// requests and every other custody request.
 pub(crate) const CUSTODY_TIMEOUT_MS: u64 = crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS;
 
+/// How many times a custody request may fail to SEND before this session
+/// stops retrying it and tells the seller.
+const MAX_CUSTODY_SEND_ATTEMPTS: u8 = 3;
+
 /// A custody request waiting on the vault, then on the Harvest delegate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CustodyRequest {
@@ -185,6 +189,42 @@ impl AppState {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = fingerprint;
+    }
+
+    /// A custody request could not be SENT. Give it up, and let it be tried
+    /// again a bounded number of times.
+    ///
+    /// `take_custody` alone released the vault but left `custody_attempted`
+    /// set, so `custody_needed` refused the retry and store-key backup and
+    /// recovery were off for the session after one failed send (#101
+    /// re-review, marker sweep). A send failure is not a refusal -- nothing
+    /// was ever asked -- so it should not be recorded like the timeout the
+    /// "attempt stays recorded" rule was written for.
+    ///
+    /// Bounded rather than simply cleared: retries are driven by store lists,
+    /// Ghost Key lists and store states, so an unbounded clear would retry at
+    /// that rate and notify every time.
+    pub(crate) fn on_custody_send_failed(&mut self, store: [u8; 32], why: &str) {
+        let backer = self.take_custody(&store).map(|p| p.backer);
+        let Some(backer) = backer else {
+            return;
+        };
+        let failures = self
+            .custody_send_failures
+            .entry((store, backer))
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_CUSTODY_SEND_ATTEMPTS {
+            if *failures == MAX_CUSTODY_SEND_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Your store's key could not be backed up or recovered: {why}. Reload to try \
+                     again."
+                ));
+            }
+            return;
+        }
+        // Let the next store list or Ghost Key list try again.
+        self.custody_attempted.remove(&(store, backer));
     }
 
     /// Take a custody request off the pending list, with the timestamp the
@@ -765,11 +805,9 @@ fn spawn_custody_request(store: [u8; 32], request: harvest_common::HarvestDelega
         use dioxus::prelude::{ReadableExt, WritableExt};
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
-            let mut state = crate::gateway::APP_STATE.write();
-            state.take_custody(&store);
-            state.notifications.push(format!(
-                "Your store's key could not be backed up or recovered: {why}. Reload to try again."
-            ));
+            crate::gateway::APP_STATE
+                .write()
+                .on_custody_send_failed(store, &why);
         };
         let Some(delegate_key) = crate::gateway::APP_STATE
             .read()
@@ -798,11 +836,9 @@ fn spawn_wrap_signature_request(fingerprint: String, store: [u8; 32]) {
         use dioxus::prelude::{ReadableExt, WritableExt};
         let fail = |why: String| {
             dioxus::logger::tracing::warn!("custody: {why}");
-            let mut state = crate::gateway::APP_STATE.write();
-            state.take_custody(&store);
-            state.notifications.push(format!(
-                "Your store's key could not be backed up or recovered: {why}. Reload to try again."
-            ));
+            crate::gateway::APP_STATE
+                .write()
+                .on_custody_send_failed(store, &why);
         };
         let Ok(store_vk) = ed25519_dalek::VerifyingKey::from_bytes(&store) else {
             fail("not a store key".into());
@@ -1589,6 +1625,57 @@ mod tests {
                 "and the seller must be told (delegate_answered = {delegate_answered})"
             );
         }
+    }
+
+    /// A custody request that fails to SEND is retried, a bounded number of
+    /// times, and then stops and says so once (#101 re-review, marker sweep).
+    ///
+    /// Before this, one failed send left `custody_attempted` set and
+    /// store-key backup was off for the session. Mutated red by dropping the
+    /// `custody_attempted.remove`, and by removing the cap.
+    #[test]
+    fn a_custody_send_failure_retries_a_bounded_number_of_times() {
+        let mut state = backed_store();
+        register(&mut state);
+        let key = (store_vk().to_bytes(), backer_vk().to_bytes());
+
+        for attempt in 1..MAX_CUSTODY_SEND_ATTEMPTS {
+            state.start_custody_for(&[ID; 32]);
+            assert!(
+                state.pending_custody.contains_key(&store_vk().to_bytes()),
+                "attempt {attempt} must start"
+            );
+            state.on_custody_send_failed(store_vk().to_bytes(), "no delegate");
+            assert!(
+                !state.custody_attempted.contains(&key),
+                "attempt {attempt} must be retryable"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "and must not nag on attempt {attempt}"
+            );
+        }
+
+        // The last permitted attempt gives up and says so, once.
+        state.start_custody_for(&[ID; 32]);
+        state.on_custody_send_failed(store_vk().to_bytes(), "no delegate");
+        assert!(
+            state.custody_attempted.contains(&key),
+            "past the cap it stops retrying"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no delegate"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // Nothing restarts it, and nothing says it again.
+        state.start_custody_where_needed();
+        assert!(state.pending_custody.is_empty());
     }
 
     /// A late answer to a custody attempt that has already timed out does
