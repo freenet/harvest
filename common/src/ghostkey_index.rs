@@ -200,9 +200,21 @@ impl GhostKeyIndexV1 {
         (!changed.is_empty()).then_some(changed)
     }
 
-    /// Fold entries in. The whole delta is verified before any of it is
-    /// merged, so a refused delta leaves the index as it was. Never fails on
-    /// the bound: see [`Self::normalize`].
+    /// Fold entries in. Every entry is verified, and the bound checked,
+    /// before any of it is merged, so a delta refused for either reason
+    /// leaves the index exactly as it was. Never fails on the bound after
+    /// that point: see [`Self::normalize`].
+    ///
+    /// **One exception, and it is not structural:** `entry_bytes` is called
+    /// inside the merge loop and returns `Result`, so an encoding failure
+    /// there would return `Err` with some entries already inserted. It is
+    /// unreachable -- every entry in the loop has just been verified, which
+    /// decodes and re-encodes it, and every held entry was verified the same
+    /// way before it was stored -- but it is unreachable rather than
+    /// impossible. Making it structural means deciding into a clone and
+    /// committing at the end, which moves `common/`'s bytes and therefore
+    /// re-keys all four contracts; it belongs in the next change that re-keys
+    /// them anyway. Tracked in harvest#102.
     pub fn apply_delta(
         &mut self,
         params: &IndexParameters,
@@ -213,6 +225,14 @@ impl GhostKeyIndexV1 {
         // buys as many signature verifications as the sender cares to send.
         // The most a delta can usefully carry is one entry per slot the
         // index may hold.
+        //
+        // `incoming.len()` is what does the bounding. The `distinct.len()`
+        // arm cannot fire on its own (`distinct` is a set BUILT FROM
+        // `incoming`, so it is never larger) and is kept only because it
+        // reports both numbers in the message. In particular this does NOT
+        // enforce per-slot uniqueness: 64 copies of one entry are accepted
+        // and cost 64 verifications. That is bounded, which is the point,
+        // but it is not the stronger property the numbers suggest.
         let distinct: std::collections::BTreeSet<Bytes32> =
             incoming.iter().map(IndexEntry::slot).collect();
         if distinct.len() > MAX_INDEX_ENTRIES || incoming.len() > MAX_INDEX_ENTRIES {
@@ -228,9 +248,14 @@ impl GhostKeyIndexV1 {
         }
         for entry in incoming {
             let slot = entry.slot();
-            // Explicit, because `Result`'s own ordering puts an error FIRST:
-            // comparing the encodings as `Result`s would let an entry that
-            // does not serialize win every clash.
+            // Explicit, because comparing the encodings as `Result`s would
+            // order by VARIANT before bytes (`Ok` sorts before `Err`), so a
+            // clash would be decided by which side failed to serialize
+            // rather than by the smaller encoding. `?` refuses instead.
+            //
+            // A previous version of this comment said `Err` sorts first. It
+            // does not, and the claim was repeated downstream; the code was
+            // always right, the reason given for it was not.
             let incoming_bytes = entry_bytes(entry)?;
             let keep_incoming = match self.entries.get(&slot) {
                 Some(held) => entry_bytes(held)? > incoming_bytes,

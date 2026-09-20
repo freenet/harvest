@@ -6,3 +6,6 @@
 *.swp
 node_modules/
 dist/
+/tests/merge-laws/corpus*/
+/tests/merge-laws/results*/
+/tests/merge-laws/gen/target/

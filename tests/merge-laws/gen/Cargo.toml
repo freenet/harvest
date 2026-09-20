@@ -1,0 +1,26 @@
+[package]
+name = "harvest-merge-corpus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: NOT a member of the harvest workspace. Depends on the repo's
+# `common` crate by path so every state is built and signed with the
+# contracts' own types.
+[workspace]
+
+[dependencies]
+harvest-common = { path = "../../../common" }
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main", features = ["test-support"] }
+freenet-scaffold = "0.2.2"
+ghostkey-common = "0.3"
+ed25519-dalek = { version = "2.1", features = ["alloc", "serde"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+rsa = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+bincode = "1"
+blake3 = "1"
+bs58 = "0.5"
