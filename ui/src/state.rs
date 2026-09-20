@@ -6017,16 +6017,18 @@ impl AppState {
             }
 
             HarvestDelegateResponse::StoreKeyWrapped {
+                request_id,
                 store_verifying_key,
                 result,
-                ..
-            } => self.on_store_key_wrapped(store_verifying_key, result.map(|copy| *copy)),
+            } => {
+                self.on_store_key_wrapped(store_verifying_key, request_id, result.map(|copy| *copy))
+            }
 
             HarvestDelegateResponse::StoreKeyRecovered {
+                request_id,
                 store_verifying_key,
                 result,
-                ..
-            } => self.on_store_key_recovered(store_verifying_key, result),
+            } => self.on_store_key_recovered(store_verifying_key, request_id, result),
 
             HarvestDelegateResponse::StoreSubkeys {
                 store_verifying_key,

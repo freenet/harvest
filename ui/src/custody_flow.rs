@@ -89,6 +89,18 @@ pub struct CustodyRequest {
     pub backer: [u8; 32],
     pub fingerprint: String,
     pub purpose: CustodyPurpose,
+    /// The id the delegate request went out under, once it has been sent.
+    ///
+    /// The delegate answers by store key, and a store can have a SECOND
+    /// attempt under a different backer after the first timed out
+    /// (`expire_custody` frees the slot and `custody_needed` picks another
+    /// unretired backer). Without this, a late answer to the first attempt
+    /// is matched to the second by store key alone: an old error cancels a
+    /// live attempt, and an old success is registered with the wrong
+    /// backer's metadata, which decides the mailbox in
+    /// `recovered_registration`. `None` until the request is sent, so a
+    /// request still waiting on the vault has nothing to match.
+    pub request_id: Option<u64>,
 }
 
 /// The copy `state` holds for `backer` under `scope`, if any.
@@ -184,6 +196,37 @@ impl AppState {
         self.pending_custody.remove(store)
     }
 
+    /// Take the pending custody request for `store`, but ONLY if it is the
+    /// one `request_id` answers.
+    ///
+    /// A store can have a second attempt under a different backer once the
+    /// first has timed out, and the delegate answers by store key. Matching
+    /// by store key alone let a late answer to the first attempt consume the
+    /// second: an error cancelled a live attempt, and a success was
+    /// registered with the wrong backer, which is what
+    /// `recovered_registration` derives the mailbox from (#101 re-review,
+    /// Codex P2). A mismatched answer is dropped, leaving the live attempt
+    /// to its own reply or its timeout.
+    pub(crate) fn take_custody_answering(
+        &mut self,
+        store: &[u8; 32],
+        request_id: u64,
+    ) -> Option<CustodyRequest> {
+        match self.pending_custody.get(store) {
+            // Sent, and this is its answer.
+            Some(p) if p.request_id == Some(request_id) => self.take_custody(store),
+            // Sent under a different id: a late answer to an attempt that is
+            // already gone. Leave the live one alone.
+            Some(_) => {
+                dioxus::logger::tracing::warn!(
+                    "a custody answer arrived for a request that is no longer pending"
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Give up every custody request older than [`CUSTODY_TIMEOUT_MS`], say
     /// so, and let the vault take the next one. The attempt stays recorded,
     /// so it is not retried until a reload.
@@ -267,6 +310,7 @@ impl AppState {
                 backer: backer.to_bytes(),
                 fingerprint,
                 purpose,
+                request_id: None,
             })
         };
         if self.store_owner_key(store_contract_id) == Some(owner) {
@@ -336,6 +380,9 @@ impl AppState {
             return;
         }
         let request_id = self.next_messaging_request_id();
+        if let Some(pending) = self.pending_custody.get_mut(&store) {
+            pending.request_id = Some(request_id);
+        }
         let signature = harvest_common::delegate::WrapSignature(signature);
         let request = match &pending.purpose {
             CustodyPurpose::Wrap => harvest_common::HarvestDelegateRequest::WrapStoreKeyFor {
@@ -366,9 +413,10 @@ impl AppState {
     pub(crate) fn on_store_key_wrapped(
         &mut self,
         store: [u8; 32],
+        request_id: u64,
         result: Result<AuthorizedCopy, String>,
     ) {
-        let Some(pending) = self.take_custody(&store) else {
+        let Some(pending) = self.take_custody_answering(&store, request_id) else {
             return;
         };
         match result {
@@ -393,16 +441,26 @@ impl AppState {
 
     /// The delegate recovered the store key: register the store again, so it
     /// is this device's store once more.
-    pub(crate) fn on_store_key_recovered(&mut self, store: [u8; 32], result: Result<(), String>) {
-        self.on_store_key_recovered_inner(store, result);
+    pub(crate) fn on_store_key_recovered(
+        &mut self,
+        store: [u8; 32],
+        request_id: u64,
+        result: Result<(), String>,
+    ) {
+        self.on_store_key_recovered_inner(store, request_id, result);
         // Every exit above releases the vault, so the store deferred behind
         // this one can start (#101 re-review S3). Done here rather than at
         // each `return` so a later early exit cannot forget it.
         self.start_custody_where_needed();
     }
 
-    fn on_store_key_recovered_inner(&mut self, store: [u8; 32], result: Result<(), String>) {
-        let Some(pending) = self.take_custody(&store) else {
+    fn on_store_key_recovered_inner(
+        &mut self,
+        store: [u8; 32],
+        request_id: u64,
+        result: Result<(), String>,
+    ) {
+        let Some(pending) = self.take_custody_answering(&store, request_id) else {
             return;
         };
         if let Err(why) = result {
@@ -504,17 +562,16 @@ impl AppState {
         let info = match result {
             Ok(info) => info,
             Err(why) => {
-                // A creation waiting on these cannot finish.
-                if self
-                    .pending_store_creation
-                    .as_ref()
-                    .is_some_and(|p| p.store_verifying_key == Some(store))
-                {
-                    self.store_creation_failed(&format!(
-                        "the store's keys could not be derived: {why}"
+                // A creation or an edit waiting on these cannot finish.
+                // Previously this released a creation and said nothing at
+                // all when an edit was parked, which wedged the vault for
+                // the session (#101 re-review, lens B).
+                if !self.release_waiters_on_subkeys(store, &why) {
+                    self.notifications.push(format!(
+                        "Your store's derived keys could not be derived: {why}. Reload to try \
+                         again."
                     ));
                 }
-                self.store_subkeys_requested.remove(&store);
                 return;
             }
         };
@@ -525,29 +582,75 @@ impl AppState {
         self.start_store_edit_if_ready();
     }
 
-    /// The `GetStoreSubkeys` request could not be SENT.
+    /// A store's subkeys will not arrive. Release everything waiting on them.
     ///
-    /// Split out of `spawn_subkeys_request` so the state change is testable
-    /// off-target (#101 re-review B4). Clearing the marker alone left
-    /// `store_creation_in_flight` set, so `begin_store_creation` refused
-    /// every later attempt and only a reload recovered. This is the same
-    /// release `on_store_subkeys` performs for a delegate ERROR; the two
-    /// differ only in whether the request reached the delegate.
-    pub(crate) fn on_subkeys_request_failed(&mut self, store: [u8; 32], why: &str) {
+    /// Both failure paths must do this: the delegate answering `Err`, and the
+    /// request failing to send. Neither released a parked EDIT (#101
+    /// re-review, lens B), and that one is the dangerous omission.
+    /// `start_store_edit_if_ready` parks the edit in `pending_store_edit` and
+    /// asks for the subkeys; `pending_store_edit.is_some()` feeds
+    /// `user_signature_under_way()`, which gates `vault_work_outstanding()`.
+    /// So ONE failed subkeys request stopped every custody wrap and recovery
+    /// and every Bitcoin watch request for the rest of the session, with no
+    /// timeout on the edit and nothing but a reload to clear it. A realistic
+    /// trigger is a device whose delegate re-keyed: it still holds the
+    /// registration, so `store_owner_key` answers, but the delegate no longer
+    /// holds the store key -- which is the very situation custody recovery
+    /// exists to repair.
+    ///
+    /// Returns whether it already told the seller something, so the caller
+    /// does not say it twice.
+    fn release_waiters_on_subkeys(&mut self, store: [u8; 32], why: &str) -> bool {
         self.store_subkeys_requested.remove(&store);
+        let mut said = false;
         if self
             .pending_store_creation
             .as_ref()
             .is_some_and(|p| p.store_verifying_key == Some(store))
         {
-            self.store_creation_failed(&format!("the store's keys could not be asked for: {why}"));
-            return;
+            self.store_creation_failed(&format!("the store's keys could not be derived: {why}"));
+            said = true;
         }
-        // Not a creation: an edit or a custody check wanted them. Say so,
-        // rather than leaving the seller with a screen that never fills.
-        self.notifications.push(format!(
-            "Your store's derived keys could not be asked for: {why}. Reload to try again."
-        ));
+        // Matched the way `start_store_edit_if_ready` chose the store it
+        // asked for, so this releases that edit and no other.
+        let edit_id = self
+            .pending_store_edit
+            .as_ref()
+            .map(|e| e.store_contract_id.clone());
+        let edit_is_this_store = edit_id
+            .as_deref()
+            .and_then(|id| self.store_owner_key(id))
+            .is_some_and(|key| key.to_bytes() == store);
+        if edit_is_this_store {
+            self.pending_store_edit = None;
+            self.notifications.push(format!(
+                "Your store's details were not published: the keys it publishes them with \
+                 could not be derived ({why})."
+            ));
+            said = true;
+        }
+        said
+    }
+
+    /// The `GetStoreSubkeys` request could not be SENT.
+    ///
+    /// Split out of `spawn_subkeys_request` so the state change is testable
+    /// off-target (#101 re-review B4). Clearing the marker alone left
+    /// `store_creation_in_flight` set, so `begin_store_creation` refused
+    /// every later attempt and only a reload recovered.
+    ///
+    /// This and the delegate's `Err` answer now release the SAME things,
+    /// through `release_waiters_on_subkeys`. An earlier version of this
+    /// comment claimed they already did; they did not, and the difference
+    /// was a parked edit that nothing freed (#101 re-review, lens B).
+    pub(crate) fn on_subkeys_request_failed(&mut self, store: [u8; 32], why: &str) {
+        if !self.release_waiters_on_subkeys(store, why) {
+            // Nothing was waiting: a custody check asked. Say so rather than
+            // leaving the seller with a screen that never fills.
+            self.notifications.push(format!(
+                "Your store's derived keys could not be asked for: {why}. Reload to try again."
+            ));
+        }
     }
 
     /// Check the record key again for the store `store_contract_id`, if this
@@ -819,6 +922,18 @@ mod tests {
         state
     }
 
+    /// Mark the store's pending custody request as SENT under `id`, which is
+    /// what `on_wrap_signature` does once the vault has signed. Tests that
+    /// answer the delegate directly skip that step, and an answer is only
+    /// matched to a request that was actually sent (#101 re-review, Codex P2).
+    fn sent_under(state: &mut AppState, store: [u8; 32], id: u64) {
+        state
+            .pending_custody
+            .get_mut(&store)
+            .expect("a pending custody request")
+            .request_id = Some(id);
+    }
+
     fn purpose(state: &AppState) -> Option<CustodyPurpose> {
         state.custody_needed(&[ID; 32]).map(|r| r.purpose)
     }
@@ -883,6 +998,7 @@ mod tests {
                 backer: [0; 32],
                 fingerprint: "another".into(),
                 purpose: CustodyPurpose::Wrap,
+                request_id: None,
             },
         );
         assert_eq!(purpose(&state), None);
@@ -1131,6 +1247,7 @@ mod tests {
         let mut state = backed_store();
         register(&mut state);
         state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 0);
         let started = state.custody_started_ms[&store_vk().to_bytes()];
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyWrapped {
             request_id: 0,
@@ -1148,6 +1265,7 @@ mod tests {
                 backer: [0; 32],
                 fingerprint: "fp".into(),
                 purpose: CustodyPurpose::Wrap,
+                request_id: None,
             },
         );
         state.expire_custody(started + CUSTODY_TIMEOUT_MS * 10);
@@ -1275,6 +1393,7 @@ mod tests {
                 record_public_key: None,
             });
         state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 0);
         assert_eq!(state.store_owner_key(&[ID; 32]), None);
 
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
@@ -1409,11 +1528,110 @@ mod tests {
         };
 
         // The first answers. The second must then start on its own.
-        state.on_store_key_wrapped(first, Err("no".into()));
+        // The id is what the sent request went out under; set it as
+        // `on_wrap_signature` would.
+        state.pending_custody.get_mut(&first).unwrap().request_id = Some(7);
+        state.on_store_key_wrapped(first, 7, Err("no".into()));
         assert!(
             state.pending_custody.contains_key(&second),
             "the deferred store's custody must start when the vault frees up"
         );
+    }
+
+    /// A subkeys failure releases a parked EDIT, not just a creation (#101
+    /// re-review, lens B).
+    ///
+    /// This is the dangerous one: `pending_store_edit.is_some()` feeds
+    /// `user_signature_under_way()`, which gates `vault_work_outstanding()`,
+    /// so an edit nothing releases stops all custody and all watch requests
+    /// for the session. There is no timeout on it.
+    ///
+    /// Mutated red by dropping the edit release from
+    /// `release_waiters_on_subkeys`, for both the send failure and the
+    /// delegate's error.
+    #[test]
+    fn a_subkeys_failure_releases_a_parked_edit_and_unblocks_the_vault() {
+        for delegate_answered in [false, true] {
+            let mut state = backed_store();
+            register(&mut state);
+            state.pending_store_edit = Some(crate::state::PendingStoreEdit {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+                store_contract_id: vec![ID; 32],
+                reputation_contract_id: [2; 32],
+                next_version: 4,
+                details: Default::default(),
+            });
+            state.store_subkeys_requested.insert(store_vk().to_bytes());
+            assert!(
+                state.user_signature_under_way(),
+                "a parked edit holds the vault"
+            );
+
+            if delegate_answered {
+                state.on_store_subkeys(store_vk().to_bytes(), Err("no key here".into()));
+            } else {
+                state.on_subkeys_request_failed(store_vk().to_bytes(), "no key here");
+            }
+
+            assert!(
+                state.pending_store_edit.is_none(),
+                "the edit must be released (delegate_answered = {delegate_answered})"
+            );
+            assert!(
+                !state.user_signature_under_way(),
+                "and the vault must be free again (delegate_answered = {delegate_answered})"
+            );
+            assert!(
+                state
+                    .notifications
+                    .iter()
+                    .any(|n| n.contains("no key here")),
+                "and the seller must be told (delegate_answered = {delegate_answered})"
+            );
+        }
+    }
+
+    /// A late answer to a custody attempt that has already timed out does
+    /// NOT consume the attempt that replaced it (#101 re-review, Codex P2).
+    ///
+    /// The delegate answers by store key, and a store can have a second
+    /// attempt under a different backer once the first expires. Matching by
+    /// store key alone let the stale error cancel the live attempt, and a
+    /// stale success register the wrong backer -- which is what the mailbox
+    /// is derived from. Mutated red by matching on the store key alone.
+    #[test]
+    fn a_late_custody_answer_does_not_consume_the_next_attempt() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_for(&[ID; 32]);
+        // Attempt A is sent under id 1.
+        state
+            .pending_custody
+            .get_mut(&store_vk().to_bytes())
+            .unwrap()
+            .request_id = Some(1);
+        // It times out; attempt B replaces it, sent under id 2.
+        state.take_custody(&store_vk().to_bytes());
+        state.custody_attempted.clear();
+        state.start_custody_for(&[ID; 32]);
+        state
+            .pending_custody
+            .get_mut(&store_vk().to_bytes())
+            .unwrap()
+            .request_id = Some(2);
+
+        // A's answer arrives late. It must be ignored.
+        state.on_store_key_recovered(store_vk().to_bytes(), 1, Err("stale".into()));
+        assert!(
+            state.pending_custody.contains_key(&store_vk().to_bytes()),
+            "a stale answer must not cancel the live attempt"
+        );
+        assert!(state.my_stores.is_empty(), "and must not register anything");
+
+        // B's own answer settles it.
+        state.on_store_key_recovered(store_vk().to_bytes(), 2, Err("real".into()));
+        assert!(state.pending_custody.is_empty());
+        assert!(state.notifications.iter().any(|n| n.contains("real")));
     }
 
     /// A failed recovery registers nothing and says so.
@@ -1422,6 +1640,7 @@ mod tests {
         let mut state = backed_store();
         add_copy(&mut state, WrapScope::current());
         state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 0);
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
             request_id: 0,
             store_verifying_key: store_vk().to_bytes(),
@@ -1437,6 +1656,7 @@ mod tests {
         let mut state = backed_store();
         register(&mut state);
         state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 0);
         let copy = AuthorizedCopy {
             copy: StoreKeyCopy {
                 store: store_vk(),

@@ -1117,12 +1117,24 @@ mod tests {
 
     /// Whether `value`'s wire encoding carries the sentinel secret -- proof
     /// that a sample classified as secret-bearing really holds one, so a
-    /// clean `Debug` of it means something. ciborium writes a byte array as
-    /// an array of integers, each `0x18 0xA7`.
+    /// clean `Debug` of it means something. ciborium writes a plain byte
+    /// array as an array of integers, each `0x18 0xA7`.
+    ///
+    /// A `#[serde(with = "serde_bytes")]` field is NOT written that way --
+    /// it is one CBOR byte string, so the sentinel appears as a plain run of
+    /// `0xA7`. Without the third check below this function was structurally
+    /// blind to every such field (`WrappedStoreKey::ciphertext` is one), and
+    /// a sample classified as secret-bearing could pass vacuously because
+    /// nothing could see the secret it was supposed to be holding (#101
+    /// re-review, lens B).
     fn carries_secret<T: Serialize>(value: &T) -> bool {
         let wire = crate::to_cbor(value).expect("cbor");
         let array: Vec<u8> = [0x18, SECRET_BYTE].repeat(32);
+        let byte_string: Vec<u8> = [SECRET_BYTE].repeat(32);
         wire.windows(array.len()).any(|w| w == array.as_slice())
+            || wire
+                .windows(byte_string.len())
+                .any(|w| w == byte_string.as_slice())
             || wire
                 .windows(SECRET_TEXT.len())
                 .any(|w| w == SECRET_TEXT.as_bytes())
@@ -1217,6 +1229,11 @@ mod tests {
         }
     }
     const REQUEST_VARIANTS: usize = 27;
+
+    /// A valid Ed25519 verifying key for samples that need one.
+    fn sample_key() -> ed25519_dalek::VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
 
     /// A feedback token whose private parts are the sentinel. Built
     /// directly rather than with `FeedbackToken::new`, which would derive
@@ -1381,10 +1398,36 @@ mod tests {
                     signature: vec![19u8; 64],
                 }),
             },
+            // The Ok arm, deliberately. An `Err` sample never builds an
+            // `AuthorizedCopy`, so the Debug scan never saw the wrapped
+            // payload at all and this variant's check passed without running
+            // (#101 re-review, lens B).
+            //
+            // The ciphertext is NOT the sentinel, and that is the point: a
+            // wrapped copy is published in store state, so it is not key
+            // material and this variant is rightly classified `false`. What
+            // the sample buys is that the payload is actually constructed and
+            // actually printed. If `AuthorizedCopy`, `StoreKeyCopy` or
+            // `WrappedStoreKey` ever gains a field that DOES hold key
+            // material, fill that field with `SECRET` here and flip the
+            // classification to `true` -- `carries_secret` now sees
+            // `serde_bytes` fields, so it can check that claim.
             R::StoreKeyWrapped {
                 request_id: 45,
                 store_verifying_key: [17u8; 32],
-                result: Err("no".into()),
+                result: Ok(Box::new(crate::custody::AuthorizedCopy {
+                    copy: crate::custody::StoreKeyCopy {
+                        store: sample_key(),
+                        backer: sample_key(),
+                        scope: crate::custody::WrapScope([3u8; 32]),
+                        wrapped: crate::custody::WrappedStoreKey {
+                            scheme: crate::custody::SCHEME_V1,
+                            ciphertext: vec![0x5Au8; crate::custody::WRAPPED_LEN_V1],
+                        },
+                    },
+                    scoped_payload: vec![20u8; 8],
+                    signature: vec![21u8; 64],
+                })),
             },
             R::StoreKeyRecovered {
                 request_id: 46,
