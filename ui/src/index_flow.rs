@@ -86,6 +86,13 @@ impl AppState {
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
                 dioxus::logger::tracing::warn!("could not read a Ghost Key's index: {e}");
+                // The entry was claimed BEFORE the GET, and it is what stops
+                // a second attempt. Leaving it after a failed send disabled
+                // index discovery for the session on exactly the device that
+                // needs it -- a fresh one, recovering (#101 re-review, Codex
+                // P2 and lens B). Same defect shape as the publish marker.
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE.write().on_index_watch_failed(&id);
             }
         });
     }
@@ -175,6 +182,14 @@ impl AppState {
             crate::gateway::migrate_ops::start_store_key_migration(&store_key);
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
                 dioxus::logger::tracing::warn!("could not load a store a Ghost Key backs: {e}");
+                // `note_store_subscribed` claimed the id before the GET, so
+                // a failed send meant this store was never loaded and custody
+                // recovery never ran for it, for the session (#101 re-review,
+                // Codex P2 and lens B).
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_indexed_store_load_failed(&id);
             }
         });
     }
@@ -268,6 +283,35 @@ impl AppState {
         #[cfg(not(target_arch = "wasm32"))]
         self.index_entries_to_publish
             .push((backer.to_bytes(), entry));
+    }
+
+    /// The GET for a Ghost Key's index could not be sent. Forget that we are
+    /// following it, so a later `watch_connected_indexes` tries again.
+    ///
+    /// Split out of the spawned GET so the state change is testable
+    /// off-target; only the GET needs a browser.
+    pub(crate) fn on_index_watch_failed(&mut self, index_contract_id: &[u8]) {
+        // Only if nothing arrived in the meantime: a state that has already
+        // landed is the answer, and dropping the view would re-fetch it.
+        if self
+            .ghostkey_indexes
+            .get(index_contract_id)
+            .is_some_and(|v| v.index.is_none())
+        {
+            self.ghostkey_indexes.remove(index_contract_id);
+        }
+    }
+
+    /// The GET for a store found through an index could not be sent. Forget
+    /// that it was subscribed, so a later index update loads it again.
+    pub(crate) fn on_indexed_store_load_failed(&mut self, store_contract_id: &[u8]) {
+        // Only if it never arrived: a loaded store is not re-fetched.
+        if self.browsing_stores.contains_key(store_contract_id) {
+            return;
+        }
+        self.subscribed_stores.remove(store_contract_id);
+        self.stores_from_my_indexes
+            .retain(|id| id != store_contract_id);
     }
 
     /// A store's index entry could not be published. Forget that it was,
@@ -564,6 +608,49 @@ mod tests {
             1,
             "a freed slot must be taken"
         );
+    }
+
+    /// A failed GET does not leave the index marked as followed, or an
+    /// indexed store marked as subscribed (#101 re-review, Codex P2 and
+    /// lens B). Both markers are claimed BEFORE the send, and both gate
+    /// every later attempt, so a transient failure disabled index discovery
+    /// for the session -- on a fresh device, which is the one that needs it.
+    ///
+    /// Mutated red by dropping each `remove`.
+    #[test]
+    fn a_failed_index_or_store_get_is_retried() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.watch_ghostkey_index(backer_vk());
+        let id = index_id(backer_vk());
+        assert!(state.ghostkey_indexes.contains_key(&id), "followed");
+
+        state.on_index_watch_failed(&id);
+        assert!(
+            !state.ghostkey_indexes.contains_key(&id),
+            "a failed GET must not hold the index for the session"
+        );
+        state.watch_ghostkey_index(backer_vk());
+        assert!(state.ghostkey_indexes.contains_key(&id), "and can retry");
+
+        // An index whose state HAS arrived is not dropped by a late failure.
+        state.on_contract_state(id.clone(), harvest_common::to_cbor(&index_of(&[])).unwrap());
+        state.on_index_watch_failed(&id);
+        assert!(
+            state.ghostkey_indexes.contains_key(&id),
+            "state that arrived wins over a late send failure"
+        );
+
+        // The same for a store reached through an index.
+        let store_id = vec![0x33u8; 32];
+        assert!(state.note_store_subscribed(&store_id));
+        state.stores_from_my_indexes.push(store_id.clone());
+        state.on_indexed_store_load_failed(&store_id);
+        assert!(
+            state.note_store_subscribed(&store_id),
+            "a failed GET must not hold the store for the session"
+        );
+        assert!(!state.stores_from_my_indexes.contains(&store_id));
     }
 
     /// A publish that FAILS is not remembered as one, so a later store or
