@@ -64,6 +64,16 @@ change was the delta bound and the rewritten clash comparison, so the two corpor
 built to attack exactly that were the two not running, and the sweep reported
 clean. Add a corpus to `corpora` in the same change that adds it to `gen/`.
 
+**A concurrent rebuild used to corrupt a run, and no longer can.** The sweep
+runs for minutes. Rebuilding contract WASM in the same worktree meanwhile
+replaced the files it was reading, and the symptom was not a loud failure --
+it was one corpus producing no output at all, which reads exactly like a real
+refusal. The author of this note walked into it twice, so the coupling is
+removed rather than documented: `run.sh` snapshots the WASM into the results
+directory before any corpus runs and reads only that copy, and writes the
+BLAKE3 hashes to `results/wasm-hashes.txt` so a reported number always names
+the bytes it describes.
+
 **A stale bundle silently drops every delta law.** The state pass is driven by
 `--state`/`--transition` files; the `delta_*` laws can only be fed from the
 generator's `bundle-in.bin`, because the CLI has no `--delta`. A bundle embeds

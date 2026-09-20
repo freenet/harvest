@@ -17,6 +17,11 @@
 #     and fdev REFUSES a hash mismatch, so a stale bundle makes the second run
 #     fail loudly -- but running only the first (state) pass would silently
 #     skip every delta law. Regenerate the corpora whenever contract WASM moves.
+#   * The WASM is SNAPSHOTTED into the results dir before any corpus runs, and
+#     only the snapshot is read. A rebuild in the same worktree during a sweep
+#     used to replace the files mid-run, which shows up as one corpus producing
+#     no output at all -- indistinguishable from a real refusal. The hashes are
+#     written to results/wasm-hashes.txt so a number always names its bytes.
 set -uo pipefail
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${1:-$(cd "$W"/../.. && pwd)}"; shift || true
@@ -37,9 +42,32 @@ if [ ${#corpora[@]} -eq 0 ]; then
 fi
 props=(state_idempotence state_commutativity state_associativity emitted_state_validity update_determinism summary_determinism delta_determinism delta_idempotence delta_permutation_invariance self_delta_empty whole_state_self_delta reconciliation_cycle path_agreement transition_path_agreement)
 OUT="${OUT:-$W/results}"; mkdir -p "$OUT"
+
+# Snapshot the WASM before reading a single corpus, and read only the copy.
+#
+# The sweep runs for minutes and used to read $REPO/target/... live. A cargo
+# build in the same worktree replaces those files underneath it, and the
+# result is not a loud failure -- it is one corpus silently producing no
+# output, which reads exactly like a real refusal. That happened twice to the
+# author of the README note warning about it, so the coupling is removed
+# instead of documented: nothing this script reads can be rewritten while it
+# runs. The hashes go in the results, so a reported number always names the
+# bytes it describes.
+SNAP="$OUT/wasm"; mkdir -p "$SNAP"
+for a in store_contract reputation_contract mailbox_contract index_contract; do
+  src="$REPO/target/wasm32-unknown-unknown/release/$a.wasm"
+  [ -f "$src" ] && cp "$src" "$SNAP/$a.wasm"
+done
+if command -v b3sum >/dev/null 2>&1; then
+  (cd "$SNAP" && b3sum ./*.wasm) > "$OUT/wasm-hashes.txt" 2>/dev/null
+  echo "WASM under test (BLAKE3):"; sed 's/^/  /' "$OUT/wasm-hashes.txt"
+fi
 for c in "${corpora[@]}"; do
   contract="${c%%-*}_contract"
-  wasm="$REPO/target/wasm32-unknown-unknown/release/$contract.wasm"
+  wasm="$SNAP/$contract.wasm"
+  if [ ! -f "$wasm" ]; then
+    echo "== $c: NO WASM for $contract -- run scripts/build-contract-wasm.sh first"; continue
+  fi
   C="${CORPUS_ROOT:-$W/corpus}/$c"
   if [ ! -d "$C" ]; then
     echo "== $c: MISSING CORPUS at $C -- regenerate (see README.md)"; continue
