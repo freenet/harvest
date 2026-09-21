@@ -50,7 +50,16 @@ pub struct AppState {
     pub reputation_to_store: HashMap<Vec<u8>, Vec<u8>>,
 
     /// Maps mailbox contract IDs back to their store contract IDs.
+    ///
+    /// Doubles as the "already asked" record (`register_store_mailbox`), so
+    /// an entry here means both "this is the mailbox's owning store" and
+    /// "we have sent (or are still trying to send) its subscribe". Only
+    /// [`AppState::on_mailbox_subscribe_failed`] may remove an entry, and
+    /// only within its retry budget -- see `mailbox_subscribe_failures`.
     pub mailbox_to_store: HashMap<Vec<u8>, Vec<u8>>,
+    /// How many times a mailbox's subscribe has failed to SEND, keyed by
+    /// mailbox contract id (#107, marker sweep).
+    pub mailbox_subscribe_failures: HashMap<Vec<u8>, u8>,
 
     /// Our own stores (ghostkey fingerprint -> list of registrations).
     pub my_stores: HashMap<String, Vec<StoreRegistration>>,
@@ -80,7 +89,25 @@ pub struct AppState {
     /// version 1 for a store the network may hold at version 5, and the
     /// contract's last-writer-wins merge drops the edit silently. See
     /// `publish_store_details`.
+    ///
+    /// Only [`AppState::note_store_state_unavailable`]'s TIMEOUT caller may
+    /// insert here -- a GET that went out and was not answered really is
+    /// evidence. A failed SEND is not: see
+    /// `on_own_store_subscribe_send_failed`, which is the inverse instance
+    /// of the same class (#107, marker sweep) and must never insert here.
     pub store_state_unavailable: HashSet<Vec<u8>>,
+
+    /// How many times a seller's own-store subscribe has failed to SEND
+    /// (never even reached the network), keyed by store contract id.
+    ///
+    /// A send failure is not the same as a timeout: nothing was asked, so it
+    /// must not be recorded as `store_state_unavailable` the way the timeout
+    /// arm is (#107, marker sweep -- this is the inverse instance the class
+    /// write-up calls out: no reviewer found it because the bug is a marker
+    /// being set to the WRONG thing, not left unset). Bounded rather than
+    /// cleared unconditionally, since a ghostkey re-connecting resends
+    /// `ListStores` and could retry every time.
+    pub own_store_subscribe_failures: HashMap<Vec<u8>, u8>,
 
     /// The highest store-info version we have queued for signing per store,
     /// which the contract has not necessarily accepted yet.
@@ -1897,19 +1924,40 @@ impl std::fmt::Debug for ConversationBackup {
     }
 }
 
-/// GET-and-subscribe a contract we learned about from a delegate
-/// registration or from another contract's state. Failures are logged rather
-/// than propagated: these are background refreshes, not user actions.
-fn subscribe_in_background(what: &'static str, contract_id: Vec<u8>) {
+/// How many times a mailbox subscribe may fail to send before
+/// [`AppState::on_mailbox_subscribe_failed`] stops retrying and says so.
+const MAX_MAILBOX_SUBSCRIBE_ATTEMPTS: u8 = 3;
+
+/// GET-and-subscribe a store's mailbox contract, learned from the delegate's
+/// `StoreRegistration`.
+///
+/// `mailbox_to_store` is claimed as "already asked" before this send, and a
+/// failure here used to leave it claimed forever (#107, marker sweep): every
+/// later `StoreList` answer saw "already ours" and never asked again, so a
+/// seller's Inbox stayed empty for the rest of the session and a buyer's
+/// reply -- which they hold the keys to read -- was never fetched. Bounded
+/// rather than cleared unconditionally: a ghostkey re-connect resends
+/// `ListStores` and would otherwise retry every time.
+fn subscribe_to_mailbox(store_contract_id: Vec<u8>, mailbox_contract_id: Vec<u8>) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::get_contract_by_id(&contract_id).await {
-            dioxus::logger::tracing::error!("Failed to subscribe to {what} contract: {e}");
+        if let Err(e) = crate::gateway::get_contract_by_id(&mailbox_contract_id).await {
+            let why = e.to_string();
+            dioxus::logger::tracing::warn!("Failed to subscribe to mailbox contract: {why}");
+            use dioxus::prelude::WritableExt;
+            crate::gateway::APP_STATE
+                .write()
+                .on_mailbox_subscribe_failed(&store_contract_id, &mailbox_contract_id, &why);
         }
     });
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (what, contract_id);
+    let _ = (store_contract_id, mailbox_contract_id);
 }
+
+/// How many times a seller's own-store subscribe may fail to SEND before
+/// [`AppState::on_own_store_subscribe_send_failed`] stops retrying and says
+/// so.
+const MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS: u8 = 3;
 
 /// GET-and-subscribe one of the seller's own stores, and record the answer
 /// either way.
@@ -1920,15 +1968,25 @@ fn subscribe_in_background(what: &'static str, contract_id: Vec<u8>) {
 /// conclusion rather than staying indefinitely ambiguous -- otherwise a
 /// store stranded mid-creation could never be repaired, and one that is
 /// merely slow could be overwritten at version 1.
+///
+/// The two failure arms below are NOT interchangeable, and conflating them
+/// was the bug (#107, marker sweep): a SEND failure means nothing was ever
+/// asked, so it must not be recorded as `store_state_unavailable` --
+/// `publish_store_details` reads that as "published_version = 0" and
+/// publishes at version 1, which the contract's last-writer-wins merge then
+/// silently drops as stale against whatever real version is out there. Only
+/// a TIMEOUT -- a GET that truly went out and got no answer -- is evidence
+/// that nothing is published, and stays recorded as such.
 fn subscribe_to_own_store(contract_id: Vec<u8>) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
         if let Err(e) = crate::gateway::get_contract_by_id(&contract_id).await {
-            dioxus::logger::tracing::error!("Failed to subscribe to store contract: {e}");
+            let why = e.to_string();
+            dioxus::logger::tracing::warn!("Failed to subscribe to store contract: {why}");
             crate::gateway::APP_STATE
                 .write()
-                .note_store_state_unavailable(&contract_id);
+                .on_own_store_subscribe_send_failed(&contract_id, &why);
             return;
         }
         // `get_contract_by_id` reports only failures to SEND the GET. One
@@ -2427,6 +2485,46 @@ impl AppState {
         self.subscribed_stores.insert(store_contract_id.to_vec())
     }
 
+    /// A seller's own-store GET could not be SENT (the network was never
+    /// reached, as opposed to reached-and-not-answered). Forget that we are
+    /// subscribed, so the next `ListStores` answer -- a ghostkey re-connect
+    /// resends it -- tries again.
+    ///
+    /// This is deliberately NOT `note_store_state_unavailable`: that method
+    /// is for a GET that truly went out and got no answer, which is real
+    /// evidence the store is unpublished. A send failure is not evidence of
+    /// anything, and recording it as one is the inverse of the marker-sweep
+    /// class (#107) -- the version of this bug no reviewer found, because
+    /// the defect is a marker set to the WRONG value rather than left stuck.
+    ///
+    /// Bounded rather than cleared unconditionally: `subscribed_stores`
+    /// also dedupes repeat `ListStores` answers within a session, so an
+    /// unconditional clear would re-GET on every one of them.
+    ///
+    /// Split out of the spawned GET so the state change is testable
+    /// off-target; only the GET itself needs a browser.
+    pub(crate) fn on_own_store_subscribe_send_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        why: &str,
+    ) {
+        let failures = self
+            .own_store_subscribe_failures
+            .entry(store_contract_id.to_vec())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS {
+            if *failures == MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not reach the network to check on one of your stores: \
+                     {why}. Reload to try again."
+                ));
+            }
+            return;
+        }
+        self.subscribed_stores.remove(store_contract_id);
+    }
+
     /// Record that a store's GET went out and nothing came back within the
     /// deadline, so "no local state" now means "nothing is published there"
     /// rather than "not yet".
@@ -2504,7 +2602,54 @@ impl AppState {
             .mailbox_contract_id = Some(mailbox_contract_id.to_vec());
         self.mailbox_to_store
             .insert(mailbox_contract_id.to_vec(), store_contract_id.to_vec());
-        subscribe_in_background("mailbox", mailbox_contract_id.to_vec());
+        subscribe_to_mailbox(store_contract_id.to_vec(), mailbox_contract_id.to_vec());
+    }
+
+    /// A mailbox's subscribe could not be SENT. Forget it was asked for, so
+    /// the next `StoreList` answer -- a ghostkey re-connect resends it --
+    /// tries again.
+    ///
+    /// `register_store_mailbox`'s failure arm used to only log: nothing ever
+    /// released `mailbox_to_store`'s "already asked" claim, so a seller's
+    /// Inbox stayed empty and a buyer's reply was never fetched for the rest
+    /// of the session (#107, marker sweep). Bounded rather than cleared
+    /// unconditionally, since `mailbox_to_store` also dedupes repeat
+    /// `StoreList` answers within a session.
+    ///
+    /// Split out of the spawned GET so the state change is testable
+    /// off-target; only the GET itself needs a browser.
+    pub(crate) fn on_mailbox_subscribe_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        mailbox_contract_id: &[u8],
+        why: &str,
+    ) {
+        let failures = self
+            .mailbox_subscribe_failures
+            .entry(mailbox_contract_id.to_vec())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_MAILBOX_SUBSCRIBE_ATTEMPTS {
+            if *failures == MAX_MAILBOX_SUBSCRIBE_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not reach the network to check one of your stores' inbox: \
+                     {why}. Reload to try again."
+                ));
+            }
+            return;
+        }
+        // Only if it is still the mapping THIS send made: a second store's
+        // claim to the same mailbox id is refused above and never reaches
+        // here, but a stale in-flight failure from an already-superseded
+        // attempt must not undo a mapping that has since succeeded.
+        if self
+            .mailbox_to_store
+            .get(mailbox_contract_id)
+            .map(Vec::as_slice)
+            == Some(store_contract_id)
+        {
+            self.mailbox_to_store.remove(mailbox_contract_id);
+        }
     }
 
     /// Handle full contract state received from a GET response.
@@ -7315,10 +7460,49 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
-                    dioxus::logger::tracing::error!("Failed to subscribe tip contract: {e}");
+                    let why = e.to_string();
+                    dioxus::logger::tracing::warn!("Failed to subscribe tip contract: {why}");
+                    use dioxus::prelude::WritableExt;
+                    crate::gateway::APP_STATE
+                        .write()
+                        .on_tip_subscribe_failed(&bytes, &why);
                 }
             });
         }
+    }
+
+    /// A tip contract's subscribe could not be SENT. Forget that we are
+    /// subscribed, so the bridge's next generation refresh (or a fresh
+    /// resolution of the same generation) tries again.
+    ///
+    /// `register_tip_contract_with_id` claimed `bitcoin.subscribed` before
+    /// the subscribe, and its failure arm only logged: no `TipView` means no
+    /// invoice can be issued at all (`TipView::current_anchor` is `None`),
+    /// and the only thing that could repair it -- a change of tip generation
+    /// -- was blocked by the marker itself (#107, marker sweep).
+    ///
+    /// Bounded rather than cleared unconditionally: a permanently failing
+    /// subscribe would otherwise retry forever, silently, on the bridge's
+    /// refresh cadence. Split out of the spawned subscribe so the state
+    /// change is testable off-target; only the subscribe itself needs a
+    /// browser.
+    pub(crate) fn on_tip_subscribe_failed(&mut self, id: &[u8], why: &str) {
+        let failures = self
+            .bitcoin
+            .tip_subscribe_failures
+            .entry(id.to_vec())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_TIP_SUBSCRIBE_ATTEMPTS {
+            if *failures == MAX_TIP_SUBSCRIBE_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not reach the network's Bitcoin chain data: {why}. Reload to \
+                     try again."
+                ));
+            }
+            return;
+        }
+        self.bitcoin.subscribed.remove(id);
     }
 
     /// Track `bridge`'s request inbox at the generation its pointer names. A
@@ -7988,6 +8172,10 @@ pub fn watch_sync_status(watch: &WatchedPayment) -> WatchSyncStatus {
     WatchSyncStatus::Live
 }
 
+/// How many times a tip contract's subscribe may fail to send before
+/// [`AppState::on_tip_subscribe_failed`] stops retrying and says so.
+const MAX_TIP_SUBSCRIBE_ATTEMPTS: u8 = 3;
+
 /// Bitcoin/Payments state: bridge config, the user's private watch list, and
 /// live on-chain data mirrored from subscribed Bitcoin contracts.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -8047,6 +8235,13 @@ pub struct BitcoinState {
     /// Contract instance ids (tip and address) we've already issued a
     /// GET+subscribe for, so state churn doesn't resubscribe repeatedly.
     pub subscribed: HashSet<Vec<u8>>,
+    /// How many times a tip contract's subscribe has failed to SEND, keyed
+    /// by contract id. A send failure is not a refusal -- nothing was ever
+    /// asked -- so `subscribed` is released for a bounded number of
+    /// retries rather than left set forever (#107, marker sweep). The
+    /// bridge's 10-minute generation refresh is what drives the retry; the
+    /// cap stops it retrying past the point of being worth mentioning.
+    pub tip_subscribe_failures: HashMap<Vec<u8>, u8>,
     /// Tip contract id -> network, so an incoming state/update routes to
     /// the right `TipView` without guessing from the bytes.
     pub tip_contract_network: HashMap<Vec<u8>, BitcoinNetwork>,
@@ -9465,6 +9660,84 @@ mod tests {
         );
     }
 
+    /// A failed SEND for a seller's own store must NOT be recorded as
+    /// `store_state_unavailable` (#107, marker sweep) -- that field means "a
+    /// GET went out and nothing answered", which is real evidence the store
+    /// is unpublished. A send that never reached the network is not
+    /// evidence of anything, and treating it as one was the inverse instance
+    /// of the class no reviewer found: `publish_store_details` would then
+    /// publish at version 1 over whatever real version is out there, and the
+    /// contract's last-writer-wins merge would silently drop the edit.
+    #[test]
+    fn a_failed_own_store_subscribe_send_does_not_mark_it_unavailable() {
+        let mut state = seller_with_store(None);
+        state.note_store_subscribed(&STORE_ID);
+
+        state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
+
+        assert!(
+            !state.store_state_unavailable.contains(STORE_ID.as_slice()),
+            "a send failure is not evidence the store is unpublished"
+        );
+        assert!(
+            !state.store_details_are_resolved(&STORE_ID),
+            "so the seller still sees \"loading\", not an editable empty form"
+        );
+    }
+
+    /// A failed send releases `subscribed_stores` so the next `ListStores`
+    /// answer (a ghostkey re-connect resends it) retries -- bounded, so a
+    /// permanently failing send does not retry every re-connect forever.
+    #[test]
+    fn a_failed_own_store_subscribe_send_retries_a_bounded_number_of_times() {
+        let mut state = seller_with_store(None);
+
+        for attempt in 1..MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS {
+            assert!(
+                state.note_store_subscribed(&STORE_ID),
+                "attempt {attempt} must be free to (re-)subscribe"
+            );
+            state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
+            assert!(
+                !state.subscribed_stores.contains(STORE_ID.as_slice()),
+                "attempt {attempt} must release the marker so a later answer can retry"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "and must not nag on attempt {attempt}"
+            );
+        }
+
+        // The last permitted attempt gives up and says so, once.
+        state.note_store_subscribed(&STORE_ID);
+        state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
+        assert!(
+            state.subscribed_stores.contains(STORE_ID.as_slice()),
+            "past the cap it stops retrying, leaving the marker set"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // One more failure past the cap must not renotify.
+        state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "still exactly once"
+        );
+    }
+
     /// A store whose state has not arrived offers no edit form at all, so
     /// the seller never sees empty fields that look like lost details.
     #[test]
@@ -10020,6 +10293,88 @@ mod tests {
 
         assert_eq!(state.mailbox_to_store[&vec![9u8; 32]], vec![1u8; 32]);
         assert_eq!(state.mailbox_to_store.len(), 1);
+    }
+
+    /// A mailbox subscribe that never reached the network must not disable
+    /// the mailbox for the rest of the session (#107, marker sweep):
+    /// `mailbox_to_store` doubled as the "already asked" record, and its
+    /// failure arm only logged, so every later `StoreList` answer saw
+    /// "already ours" and never asked again -- a seller's Inbox stayed
+    /// empty and a buyer's reply, which they hold the keys to read, was
+    /// never fetched. Bounded rather than cleared forever, since a ghostkey
+    /// re-connect resends `StoreList`.
+    #[test]
+    fn a_mailbox_subscribe_failure_retries_a_bounded_number_of_times() {
+        let mut state = AppState::default();
+
+        for attempt in 1..MAX_MAILBOX_SUBSCRIBE_ATTEMPTS {
+            state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+            assert!(
+                state.mailbox_to_store.contains_key(&vec![9u8; 32]),
+                "attempt {attempt} must claim the mapping"
+            );
+            state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
+            assert!(
+                !state.mailbox_to_store.contains_key(&vec![9u8; 32]),
+                "attempt {attempt} must release the mapping so a later answer can retry"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "and must not nag on attempt {attempt}"
+            );
+        }
+
+        // The last permitted attempt gives up and says so, once.
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
+        assert_eq!(
+            state.mailbox_to_store[&vec![9u8; 32]],
+            vec![1u8; 32],
+            "past the cap it stops retrying, leaving the mapping in place"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // One more failure past the cap must not renotify or disturb the map.
+        state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
+        assert_eq!(state.mailbox_to_store[&vec![9u8; 32]], vec![1u8; 32]);
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "still exactly once"
+        );
+    }
+
+    /// A stale failure from an attempt that has since been superseded by a
+    /// successful mapping (the map now points elsewhere, or is unchanged
+    /// because the retry cap already stopped releasing it) must not undo
+    /// real state. Here: the mapping belongs to a DIFFERENT store than the
+    /// one the stale failure names, so it must be left alone.
+    #[test]
+    fn a_stale_mailbox_failure_does_not_undo_a_different_stores_mapping() {
+        let mut state = AppState::default();
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        // A second store's claim to the same mailbox id is refused and the
+        // first mapping stands (see `a_mailbox_stays_with_the_first_store`).
+        // A stale failure callback for that refused attempt must not remove
+        // the real owner's mapping.
+        state.on_mailbox_subscribe_failed(&[2u8; 32], &[9u8; 32], "stale");
+        assert_eq!(
+            state.mailbox_to_store[&vec![9u8; 32]],
+            vec![1u8; 32],
+            "a stale failure naming the wrong store must not touch the real mapping"
+        );
     }
 
     /// A link whose store never arrives has to end in a message, not in
@@ -18296,6 +18651,66 @@ mod buy_flow_tests {
                 .contains_key(&vec![1u8; 32])
                 && !state.bitcoin.retired_contracts.contains(&vec![1u8; 32]),
             "a generation can come back"
+        );
+    }
+
+    /// A tip contract subscribe that never reached the network must not
+    /// disable the tip for the rest of the session (#107, marker sweep):
+    /// `bitcoin.subscribed` was claimed before the send, and its failure arm
+    /// only logged, so nothing ever released it and no invoice could ever be
+    /// issued again. Bounded, not cleared forever, so a permanently failing
+    /// subscribe does not retry every 10 minutes in silence.
+    #[test]
+    fn a_tip_subscribe_failure_retries_a_bounded_number_of_times() {
+        let mut state = AppState::default();
+        let id = bs58::encode([7u8; 32]).into_string();
+        state.register_tip_contract_with_id(BitcoinNetwork::Signet, &id);
+        assert!(
+            state.bitcoin.subscribed.contains(&vec![7u8; 32]),
+            "the marker is claimed up front"
+        );
+
+        for attempt in 1..MAX_TIP_SUBSCRIBE_ATTEMPTS {
+            state.on_tip_subscribe_failed(&[7u8; 32], "no network");
+            assert!(
+                !state.bitcoin.subscribed.contains(&vec![7u8; 32]),
+                "attempt {attempt} must release the marker so a refresh can retry"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "and must not nag on attempt {attempt}"
+            );
+            // A later resolution of the same generation re-claims it, as the
+            // real caller (`register_tip_contract_with_id`) does.
+            state.bitcoin.subscribed.insert(vec![7u8; 32]);
+        }
+
+        // The last permitted attempt gives up and says so, once.
+        state.on_tip_subscribe_failed(&[7u8; 32], "no network");
+        assert!(
+            state.bitcoin.subscribed.contains(&vec![7u8; 32]),
+            "past the cap it stops retrying, leaving the marker set"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // One more failure past the cap must not renotify.
+        state.on_tip_subscribe_failed(&[7u8; 32], "no network");
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "still exactly once"
         );
     }
 

@@ -1119,8 +1119,10 @@ the failure arms live in `#[cfg(target_arch = "wasm32")]` blocks, so a green
 that makes it testable is to split the state change out of the spawned send,
 as `on_subkeys_request_failed`, `on_index_publish_failed`,
 `on_index_watch_failed`, `on_indexed_store_load_failed`,
-`on_certificate_request_failed` and `on_custody_send_failed` all now do --
-then the release is reachable off-target and can be mutation-checked.
+`on_certificate_request_failed`, `on_custody_send_failed`,
+`on_tip_subscribe_failed`, `on_mailbox_subscribe_failed` and
+`on_own_store_subscribe_send_failed` all now do -- then the release is
+reachable off-target and can be mutation-checked.
 
 **How it was found, which is the part worth copying.** Three instances turned
 up during the #93 phase-1 review, each spotted by a DIFFERENT reviewer, each
@@ -1147,5 +1149,11 @@ no backoff and nothing said. One fix in this round introduced exactly that --
 afterwards. Cap the attempts and surface the failure at the cap:
 `MAX_INDEX_PUBLISH_ATTEMPTS`, `MAX_CUSTODY_SEND_ATTEMPTS`.
 
-**Six remaining instances are tracked in harvest#107**, fixed in the PR
-immediately after the phase-1 stack. Three of them block a purchase.
+**Six remaining instances are tracked in harvest#107.** The three that block
+a purchase -- the Bitcoin tip contract subscribe, the mailbox subscribe, and
+the `store_state_unavailable` inverse described above -- are fixed in the PR
+immediately after the phase-1 stack (`on_tip_subscribe_failed`,
+`on_mailbox_subscribe_failed`, `on_own_store_subscribe_send_failed`). The
+remaining three (`bitcoin.subscribed`'s watch-contract flavor, conversation
+key requests, buyer conversation recalls / `stores_remembered`) are
+deliberately left for a follow-on PR.
