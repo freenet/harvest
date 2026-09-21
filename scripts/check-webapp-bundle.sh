@@ -87,9 +87,25 @@ REQUIRED=(
     contracts/store_contract.wasm
     contracts/reputation_contract.wasm
     contracts/mailbox_contract.wasm
+    contracts/index_contract.wasm
     contracts/harvest_delegate.wasm
     contracts/ghostkey_delegate.wasm
 )
+
+# KEEP THIS LIST IN STEP WITH THE OTHER TWO. The set of contract artifacts is
+# written out by hand in three places and they are checked at three different
+# times, so they can disagree for a whole release:
+#
+#   scripts/build-contract-wasm.sh   `artifacts=(...)`   -- what gets built
+#   scripts/check-code-hashes.sh     `pairs=(...)`       -- what gets a registry
+#   here                             `REQUIRED`          -- what must ship
+#
+# harvest#93 phase 1c added `index_contract` to the first two and not to this
+# one. Nothing noticed, because this script runs ONLY from `cargo make
+# publish-harvest` and never in CI: the whole stack went green and merged, and
+# the omission surfaced as a refused publish minutes later. The refusal was
+# correct -- an unhashed file it does not recognise is exactly what it is for --
+# but it was the last possible moment to find out. See harvest#108.
 
 MISSING=()
 for f in "${REQUIRED[@]}"; do
