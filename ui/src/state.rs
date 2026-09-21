@@ -2508,8 +2508,20 @@ impl AppState {
 
     /// Record that we have asked the gateway for a store contract. Returns
     /// `true` the first time, so the caller subscribes exactly once.
+    ///
+    /// A fresh claim also resets `own_store_subscribe_failures` (#107
+    /// re-review round 3): the failure counter is a LIFETIME count, and
+    /// without this, a store that ever crossed the retry cap once early in
+    /// a long session would get exactly one silent attempt on every later
+    /// external re-trigger for the rest of the session, with no
+    /// notification -- contradicting `on_own_store_subscribe_send_failed`'s
+    /// doc comment, which promises a fresh start.
     pub fn note_store_subscribed(&mut self, store_contract_id: &[u8]) -> bool {
-        self.subscribed_stores.insert(store_contract_id.to_vec())
+        let fresh = self.subscribed_stores.insert(store_contract_id.to_vec());
+        if fresh {
+            self.own_store_subscribe_failures.remove(store_contract_id);
+        }
+        fresh
     }
 
     /// A seller's own-store GET could not be SENT (the network was never
@@ -2645,6 +2657,10 @@ impl AppState {
             .mailbox_contract_id = Some(mailbox_contract_id.to_vec());
         self.mailbox_to_store
             .insert(mailbox_contract_id.to_vec(), store_contract_id.to_vec());
+        // A fresh claim gets its own full retry budget (#107 re-review
+        // round 3): see `note_store_subscribed`'s doc comment for why this
+        // reset has to happen at the claim, not just at a genuine arrival.
+        self.mailbox_subscribe_failures.remove(mailbox_contract_id);
         subscribe_to_mailbox(store_contract_id.to_vec(), mailbox_contract_id.to_vec());
     }
 
@@ -9873,9 +9889,18 @@ mod tests {
         );
 
         // A later external event (a fresh ListStores answer) re-claims the
-        // marker and tries again; one more failure must not renotify.
-        state.note_store_subscribed(&STORE_ID);
-        state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
+        // marker. It must get a genuinely FRESH retry budget, not one
+        // silent attempt for the rest of the session (#107 re-review round
+        // 3): `note_store_subscribed` resets the counter on every fresh
+        // claim, so the next failure must still say "retry", not give up.
+        assert!(
+            state.note_store_subscribed(&STORE_ID),
+            "the marker was released, so this must be a fresh claim"
+        );
+        assert!(
+            state.on_own_store_subscribe_send_failed(&STORE_ID, "no network"),
+            "a fresh claim must get a fresh budget, not inherit the earlier cap"
+        );
         assert_eq!(
             state
                 .notifications
@@ -9883,7 +9908,7 @@ mod tests {
                 .filter(|n| n.contains("no network"))
                 .count(),
             1,
-            "still exactly once"
+            "still exactly once -- this attempt is below the fresh cap"
         );
     }
 
@@ -10504,10 +10529,16 @@ mod tests {
         );
 
         // A later external event (a fresh StoreList answer, or a new
-        // message) re-claims the mapping and tries again; one more failure
-        // must not renotify.
+        // message) re-claims the mapping. It must get a genuinely FRESH
+        // retry budget, not one silent attempt for the rest of the session
+        // (#107 re-review round 3): `register_store_mailbox` resets the
+        // counter on every fresh claim, so the next failure must still say
+        // "retry", not give up.
         state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
-        state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
+        assert!(
+            state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network"),
+            "a fresh claim must get a fresh budget, not inherit the earlier cap"
+        );
         assert_eq!(
             state
                 .notifications
@@ -10515,7 +10546,7 @@ mod tests {
                 .filter(|n| n.contains("no network"))
                 .count(),
             1,
-            "still exactly once"
+            "still exactly once -- this attempt is below the fresh cap"
         );
     }
 
