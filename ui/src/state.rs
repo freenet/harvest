@@ -2524,13 +2524,24 @@ impl AppState {
     /// class (#107) -- the version of this bug no reviewer found, because
     /// the defect is a marker set to the WRONG value rather than left stuck.
     ///
-    /// Bounded rather than cleared unconditionally: `subscribed_stores`
-    /// also dedupes repeat `ListStores` answers within a session, so an
-    /// unconditional clear would re-GET on every one of them.
-    ///
     /// Returns whether the caller should retry -- see `subscribe_to_own_store`,
-    /// which schedules its own retry rather than depending on `ListStores`
-    /// being resent, because it is sent only once per ghostkey connect.
+    /// which schedules its own retry ITSELF on a timer rather than depending
+    /// on `ListStores` being resent, because it is sent only once per
+    /// ghostkey connect.
+    ///
+    /// `subscribed_stores` is left CLAIMED for every failure below the cap
+    /// (re-review, skeptical lens): the internal timer retry above calls
+    /// `subscribe_to_own_store` directly, never through
+    /// `note_store_subscribed`, so releasing the marker on every failure --
+    /// the first version of this fix did -- would let a concurrent
+    /// `ListStores` answer start a second, redundant attempt racing the
+    /// internal one, and would strand nothing to re-claim once this
+    /// function's own retry eventually succeeds (`subscribe_to_own_store`'s
+    /// success path only cancels the retry loop; it was never what claims
+    /// the marker). The marker is released only once the cap is reached and
+    /// this function gives up for good, so a LATER external event -- a
+    /// fresh `ListStores` answer, or a reload -- can start over from
+    /// scratch.
     ///
     /// Split out of the spawned GET so the state change is testable
     /// off-target; only the GET itself needs a browser.
@@ -2551,9 +2562,9 @@ impl AppState {
                      {why}. Reload to try again."
                 ));
             }
+            self.subscribed_stores.remove(store_contract_id);
             return false;
         }
-        self.subscribed_stores.remove(store_contract_id);
         true
     }
 
@@ -2644,13 +2655,28 @@ impl AppState {
     /// `register_store_mailbox`'s failure arm used to only log: nothing ever
     /// released `mailbox_to_store`'s "already asked" claim, so a seller's
     /// Inbox stayed empty and a buyer's reply was never fetched for the rest
-    /// of the session (#107, marker sweep). Bounded rather than cleared
-    /// unconditionally, since `mailbox_to_store` also dedupes repeat
-    /// `StoreList` answers within a session.
+    /// of the session (#107, marker sweep).
     ///
     /// Returns whether the caller should retry -- see `subscribe_to_mailbox`,
-    /// which schedules its own retry rather than depending on an external
-    /// event, because a buyer's subscribe has no such event to depend on.
+    /// which schedules its own retry ITSELF on a timer rather than
+    /// depending on an external event, because a buyer's subscribe has no
+    /// such event to depend on.
+    ///
+    /// `mailbox_to_store` is left CLAIMED for every failure below the cap
+    /// (re-review, skeptical lens): the internal timer retry above calls
+    /// `subscribe_to_mailbox` directly, never through `register_store_mailbox`,
+    /// so releasing the mapping on every failure -- the first version of
+    /// this fix did -- meant the SECOND attempt's failure callback found no
+    /// mapping, read that as "a stale callback that owns nothing," and
+    /// silently gave up with the counter stuck at 1 and no notification
+    /// ever shown: worse than the original bug, and on exactly the path
+    /// (a buyer's mailbox) Finding #1 was about. `mailbox_to_store` also
+    /// serves as the routing table for the mailbox's real state when it
+    /// arrives (see `on_contract_state`'s mailbox branch), so releasing it
+    /// mid-retry would have dropped that too. The mapping is released only
+    /// once the cap is reached and this function gives up for good, so a
+    /// LATER external event -- a new message, a fresh `StoreList` answer,
+    /// or a reload -- can start over from scratch.
     ///
     /// Split out of the spawned GET so the state change is testable
     /// off-target; only the GET itself needs a browser.
@@ -2667,7 +2693,10 @@ impl AppState {
         // today, since `register_store_mailbox` only ever inserts when the
         // id is absent and WASM runs one microtask at a time, but cheap to
         // guard -- can neither bump the failure count nor produce a
-        // notification for a mapping it does not own.
+        // notification for a mapping it does not own. Because the mapping
+        // now stays claimed across every failure below the cap, this check
+        // keeps matching for the SAME caller's own retries -- it only ever
+        // fails for a genuinely different store.
         if self
             .mailbox_to_store
             .get(mailbox_contract_id)
@@ -2688,9 +2717,9 @@ impl AppState {
                      {why}. Reload to try again."
                 ));
             }
+            self.mailbox_to_store.remove(mailbox_contract_id);
             return false;
         }
-        self.mailbox_to_store.remove(mailbox_contract_id);
         true
     }
 
@@ -9791,26 +9820,31 @@ mod tests {
         );
     }
 
-    /// A failed send releases `subscribed_stores` so the next `ListStores`
-    /// answer (a ghostkey re-connect resends it) retries -- bounded, so a
-    /// permanently failing send does not retry every re-connect forever.
+    /// A failed send tells the caller to retry itself, bounded -- matching
+    /// what `subscribe_to_own_store`'s internal timer retry actually does
+    /// (it never re-registers through `note_store_subscribed` between
+    /// attempts, so this test doesn't either; re-review, skeptical lens:
+    /// the first version of this test DID re-register every iteration,
+    /// which hid a real bug where the marker was released mid-retry and
+    /// the retry chain silently died -- see `on_own_store_subscribe_send_failed`'s
+    /// doc comment). `subscribed_stores` stays claimed for every failure
+    /// below the cap; only reaching the cap releases it, so a LATER
+    /// external `ListStores` answer can start fresh.
     #[test]
     fn a_failed_own_store_subscribe_send_retries_a_bounded_number_of_times() {
         let mut state = seller_with_store(None);
+        state.note_store_subscribed(&STORE_ID);
 
         for attempt in 1..MAX_OWN_STORE_SUBSCRIBE_ATTEMPTS {
-            assert!(
-                state.note_store_subscribed(&STORE_ID),
-                "attempt {attempt} must be free to (re-)subscribe"
-            );
             assert!(
                 state.on_own_store_subscribe_send_failed(&STORE_ID, "no network"),
                 "attempt {attempt} must tell the caller to retry itself, since ListStores is \
                  sent only once per ghostkey connect"
             );
             assert!(
-                !state.subscribed_stores.contains(STORE_ID.as_slice()),
-                "attempt {attempt} must release the marker so a later answer can retry"
+                state.subscribed_stores.contains(STORE_ID.as_slice()),
+                "attempt {attempt} must leave the marker claimed -- the internal retry never \
+                 goes back through note_store_subscribed to reclaim it"
             );
             assert!(
                 state.notifications.is_empty(),
@@ -9818,15 +9852,15 @@ mod tests {
             );
         }
 
-        // The last permitted attempt gives up and says so, once.
-        state.note_store_subscribed(&STORE_ID);
+        // The last permitted attempt gives up, says so once, and releases
+        // the marker so a LATER external event can start over.
         assert!(
             !state.on_own_store_subscribe_send_failed(&STORE_ID, "no network"),
             "past the cap it must tell the caller to stop"
         );
         assert!(
-            state.subscribed_stores.contains(STORE_ID.as_slice()),
-            "past the cap it stops retrying, leaving the marker set"
+            !state.subscribed_stores.contains(STORE_ID.as_slice()),
+            "past the cap it releases the marker for a future attempt"
         );
         assert_eq!(
             state
@@ -9838,7 +9872,9 @@ mod tests {
             "and says so exactly once"
         );
 
-        // One more failure past the cap must not renotify.
+        // A later external event (a fresh ListStores answer) re-claims the
+        // marker and tries again; one more failure must not renotify.
+        state.note_store_subscribed(&STORE_ID);
         state.on_own_store_subscribe_send_failed(&STORE_ID, "no network");
         assert_eq!(
             state
@@ -10414,26 +10450,32 @@ mod tests {
     /// failure arm only logged, so every later `StoreList` answer saw
     /// "already ours" and never asked again -- a seller's Inbox stayed
     /// empty and a buyer's reply, which they hold the keys to read, was
-    /// never fetched. Bounded rather than cleared forever, since a ghostkey
-    /// re-connect resends `StoreList`.
+    /// never fetched.
+    ///
+    /// Matches what `subscribe_to_mailbox`'s internal timer retry actually
+    /// does: it never re-registers through `register_store_mailbox` between
+    /// attempts, so this test doesn't either (re-review, skeptical lens --
+    /// the first version of this test DID re-register every iteration,
+    /// which hid a real bug: releasing the mapping mid-retry made the SECOND
+    /// attempt's failure look "stale/foreign" to the ownership check and the
+    /// retry chain died silently with no notification. See
+    /// `on_mailbox_subscribe_failed`'s doc comment).
     #[test]
     fn a_mailbox_subscribe_failure_retries_a_bounded_number_of_times() {
         let mut state = AppState::default();
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
 
         for attempt in 1..MAX_MAILBOX_SUBSCRIBE_ATTEMPTS {
-            state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
-            assert!(
-                state.mailbox_to_store.contains_key(&vec![9u8; 32]),
-                "attempt {attempt} must claim the mapping"
-            );
             assert!(
                 state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network"),
                 "attempt {attempt} must tell the caller to retry itself -- a buyer's subscribe \
                  has no StoreList-like event to depend on"
             );
             assert!(
-                !state.mailbox_to_store.contains_key(&vec![9u8; 32]),
-                "attempt {attempt} must release the mapping so a later answer can retry"
+                state.mailbox_to_store.contains_key(&vec![9u8; 32]),
+                "attempt {attempt} must leave the mapping claimed -- the internal retry never \
+                 goes back through register_store_mailbox to reclaim it, and the mapping is \
+                 also the routing table for the mailbox's real state when it arrives"
             );
             assert!(
                 state.notifications.is_empty(),
@@ -10441,16 +10483,15 @@ mod tests {
             );
         }
 
-        // The last permitted attempt gives up and says so, once.
-        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        // The last permitted attempt gives up, says so once, and releases
+        // the mapping so a LATER external event can start over.
         assert!(
             !state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network"),
             "past the cap it must tell the caller to stop"
         );
-        assert_eq!(
-            state.mailbox_to_store[&vec![9u8; 32]],
-            vec![1u8; 32],
-            "past the cap it stops retrying, leaving the mapping in place"
+        assert!(
+            !state.mailbox_to_store.contains_key(&vec![9u8; 32]),
+            "past the cap it releases the mapping for a future attempt"
         );
         assert_eq!(
             state
@@ -10462,9 +10503,11 @@ mod tests {
             "and says so exactly once"
         );
 
-        // One more failure past the cap must not renotify or disturb the map.
+        // A later external event (a fresh StoreList answer, or a new
+        // message) re-claims the mapping and tries again; one more failure
+        // must not renotify.
+        state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
         state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
-        assert_eq!(state.mailbox_to_store[&vec![9u8; 32]], vec![1u8; 32]);
         assert_eq!(
             state
                 .notifications
@@ -10485,9 +10528,10 @@ mod tests {
     fn a_genuine_mailbox_arrival_resets_the_send_failure_count() {
         let mut state = AppState::default();
         state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
+        // No re-registration between failures: matches what the real
+        // internal retry does (see `a_mailbox_subscribe_failure_retries_a_bounded_number_of_times`).
         for _ in 1..MAX_MAILBOX_SUBSCRIBE_ATTEMPTS {
             state.on_mailbox_subscribe_failed(&[1u8; 32], &[9u8; 32], "no network");
-            state.register_store_mailbox(&[1u8; 32], &[9u8; 32]);
         }
 
         state.on_contract_state(
