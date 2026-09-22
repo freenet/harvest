@@ -3103,7 +3103,27 @@ impl AppState {
                     // full retry budget rather than inheriting a lifetime
                     // count (#107 re-review, marker sweep).
                     self.bitcoin.tip_subscribe_failures.remove(&contract_id);
-                    self.apply_tip_state(network, &tip_state);
+                    // A fresher tip is exactly what settles an order whose
+                    // payment was already deep enough and only READ as
+                    // shallow (harvest#74): `assemble_on_chain_proof`
+                    // measures depth against this tip, so the claims can
+                    // have been in hand for an hour and the order still
+                    // reads as awaiting payment.
+                    //
+                    // Without this the re-read is very nearly inert. The
+                    // only other caller is the address arm below, so a tip
+                    // that arrives alone -- or a moment after the address
+                    // state it needed to be paired with -- left the order
+                    // waiting for some later, unrelated arrival. Every
+                    // store, for the same reason the address arm gives: the
+                    // tip does not say which order it completes.
+                    if self.apply_tip_state(network, &tip_state) {
+                        for store_contract_id in
+                            self.browsing_stores.keys().cloned().collect::<Vec<_>>()
+                        {
+                            self.publish_settled_orders(&store_contract_id);
+                        }
+                    }
                     return;
                 }
                 // This id was registered as a tip contract when we subscribed,
@@ -4499,6 +4519,31 @@ impl AppState {
     /// Widening to OUR orders rather than to every order keeps the property
     /// the narrower rule was protecting: an order this node is not party to
     /// still cannot stall anything, whoever wrote it.
+    ///
+    /// # The residual, and why it is not closed here (harvest#116)
+    ///
+    /// This sees every store IN `browsing_stores`, which for a buyer is the
+    /// stores opened this session. Two purchases in DIFFERENT stores sharing
+    /// one address are therefore twins only if both are open. Raised by the
+    /// external reviewer on harvest#75 and deliberately left open, because
+    /// the obvious gate makes the feature inert:
+    ///
+    /// [`Self::settlement_hold`]'s completeness check
+    /// ([`Self::unloaded_stores`]) works for a SELLER because what could
+    /// hold a twin is enumerable -- `my_stores`. A buyer's equivalent is
+    /// `remembered_stores`, and `sync_remembered_stores` only registers
+    /// those codes with the delegate; nothing fetches their state. So
+    /// withholding until they are all checked would withhold every buyer
+    /// settlement forever, which is exactly the dead end harvest#75 exists
+    /// to remove.
+    ///
+    /// What the case actually requires, stated so nobody re-derives it: one
+    /// seller, two of their stores, an address index reused between them
+    /// (harvest#77's subject), one buyer purchasing from both, and a single
+    /// payment large enough to satisfy both orders inside both windows.
+    /// Closing it properly means loading remembered stores' state, or keying
+    /// the twin check off the address contract rather than the store --
+    /// a different mechanism, tracked separately.
     pub fn refresh_same_address_orders(&mut self) {
         use harvest_common::payment::OrderStatus;
         // Collected owning its own script bytes, so the borrow of
@@ -7874,11 +7919,45 @@ impl AppState {
     }
 
     /// Fold a chain-tip contract's state into the live view for `network`.
+    ///
+    /// # A copy that is behind never wins (harvest#74)
+    ///
+    /// Returns whether the view moved, and **ignores a state whose tip is
+    /// lower than the one already held.** Before the periodic re-read this
+    /// was fed only by the subscription stream and replaced the view
+    /// outright; adding GETs on a timer means a delayed answer can land
+    /// AFTER a newer update, and replacing would move the tip backwards.
+    ///
+    /// That is not cosmetic. `assemble_on_chain_proof` measures confirmation
+    /// depth against this tip, so a regressed tip refuses a payment that is
+    /// deep enough -- the exact symptom #74 exists to remove, reintroduced by
+    /// #74's own mechanism. It is the same rule `apply_address_state` states
+    /// for claims: a copy that is behind differs from a current one only by
+    /// absence, so absence must not win.
+    ///
+    /// **The residual, stated rather than smoothed:** a genuine reorg lowers
+    /// the real tip, and this will then hold a signed tip one the bridge has
+    /// since moved past until the chain grows beyond it. That is not a
+    /// regression introduced here -- a reorg that invalidates a settled
+    /// payment is `PaymentReversed`'s job, and the design record notes that
+    /// status has no producer anywhere yet. Choosing the other direction
+    /// would trade an unhandled case for a live one.
     pub(crate) fn apply_tip_state(
         &mut self,
         network: BitcoinNetwork,
         state: &freenet_bitcoin_common::BitcoinTipStateV1,
-    ) {
+    ) -> bool {
+        let arriving = state.tip_height();
+        let held = self.bitcoin.tips.get(&network).and_then(|t| t.tip_height);
+        if let (Some(arriving), Some(held)) = (arriving, held) {
+            if arriving < held {
+                info!(
+                    "Ignoring a chain tip at {arriving} for {network:?}: this node already holds \
+                     {held}, so the arriving copy is behind"
+                );
+                return false;
+            }
+        }
         let recent = state.blocks.recent(RECENT_BLOCKS_KEPT);
         let last_block_time = recent.first().map(|b| b.block_time);
         let view = self.bitcoin.tips.entry(network).or_insert_with(|| TipView {
@@ -7906,6 +7985,7 @@ impl AppState {
             .collect();
         // A backing dated above the old tip may be current now.
         self.refresh_backing_verdicts();
+        true
     }
 
     /// Fold an address contract's state into the live view for that watch.
@@ -17639,6 +17719,30 @@ mod buy_flow_tests {
         id
     }
 
+    /// The bridge's tip contract state, topping out at `height`.
+    ///
+    /// Signed by the same bridge the paid-order fixtures settle against, so
+    /// a proof assembled from it verifies.
+    fn a_tip_state(height: u32) -> freenet_bitcoin_common::BitcoinTipStateV1 {
+        use freenet_bitcoin_common::{BlockHash, SignedTipEntry, TipEntryBody};
+
+        let mut state = freenet_bitcoin_common::BitcoinTipStateV1::default();
+        let entry = SignedTipEntry::sign(
+            &settling_bridge(),
+            &TipEntryBody {
+                network: BitcoinNetwork::Signet,
+                anchor: anchor(height),
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign the tip");
+        state.blocks.blocks.insert(height, entry);
+        state
+    }
+
     /// **An order still awaiting payment asks for the chain tip again
     /// (harvest#74).**
     ///
@@ -17714,6 +17818,102 @@ mod buy_flow_tests {
         assert!(
             !asked.contains(&other_network),
             "a network with nothing unsettled was asked about"
+        );
+    }
+
+    /// **A fresher tip settles the order it unblocks (harvest#74, external
+    /// review P2).**
+    ///
+    /// The re-read's whole purpose. `assemble_on_chain_proof` measures
+    /// confirmation depth against the tip, so claims can have been in hand
+    /// for an hour while the order still reads as awaiting payment -- and
+    /// the ONLY thing that changes is a newer tip. If the tip arm of
+    /// `on_contract_state` does not publish, nothing does until some later,
+    /// unrelated address or store arrival, which makes #74 very nearly
+    /// inert.
+    ///
+    /// Driven through `on_contract_state` with real CBOR rather than by
+    /// calling `apply_tip_state`, because the defect was in the ARM, not in
+    /// the fold: a test that called the fold directly would have passed
+    /// against the broken code.
+    #[test]
+    fn a_fresher_tip_settles_the_order_it_unblocks() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        let tip_id = a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+
+        // The claims are in hand, but this node's copy of the chain is
+        // behind the block the payment confirmed in, so the proof does not
+        // assemble and the order reads as awaiting payment. The held view is
+        // dropped first because a tip that is behind is refused once one is
+        // held -- which is the sibling test below.
+        state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
+        state.apply_tip_state(BitcoinNetwork::Signet, &a_tip_state(TIP_HEIGHT - 3));
+        assert!(
+            state.settled_orders(STORE).is_empty(),
+            "the fixture must start with the payment not yet provable"
+        );
+        assert!(state.settlements_submitted.is_empty());
+
+        // Now the tip contract answers with the current chain.
+        let fresh = a_tip_state(TIP_HEIGHT);
+        state.on_contract_state(
+            tip_id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&fresh).expect("cbor"),
+        );
+
+        assert!(
+            state.settlements_submitted.contains(&order.order.id),
+            "a fresher tip did not settle the order it unblocked"
+        );
+    }
+
+    /// **A tip that is behind does not move the view backwards (harvest#74,
+    /// external review P2).**
+    ///
+    /// Introduced by #74's own mechanism: before the periodic re-read this
+    /// view was fed only by the subscription stream, so replacing it
+    /// outright was safe enough. Adding GETs on a timer means a delayed
+    /// answer can land AFTER a newer update, and a regressed tip refuses a
+    /// payment that is deep enough -- the exact symptom #74 exists to
+    /// remove.
+    #[test]
+    fn a_chain_tip_that_is_behind_does_not_move_the_view_backwards() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        let tip_id = a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+
+        let current = a_tip_state(TIP_HEIGHT);
+        assert!(
+            state.apply_tip_state(BitcoinNetwork::Signet, &current),
+            "the current tip must be taken"
+        );
+        let held = state.bitcoin.tips[&BitcoinNetwork::Signet].clone();
+
+        // A GET answered from a peer that is a hundred blocks behind.
+        let stale = a_tip_state(TIP_HEIGHT - 100);
+        assert!(
+            !state.apply_tip_state(BitcoinNetwork::Signet, &stale),
+            "a tip that is behind must be refused"
+        );
+        assert_eq!(
+            state.bitcoin.tips[&BitcoinNetwork::Signet],
+            held,
+            "a stale answer moved the chain tip backwards"
+        );
+
+        // And it is refused through the real arrival path too, not just the
+        // fold -- so a settlement is not published off a regressed tip.
+        state.on_contract_state(
+            tip_id.to_vec(),
+            freenet_bitcoin_common::to_cbor(&stale).expect("cbor"),
+        );
+        assert_eq!(
+            state.bitcoin.tips[&BitcoinNetwork::Signet],
+            held,
+            "the arrival path let a stale tip through"
         );
     }
 
