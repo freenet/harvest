@@ -143,8 +143,82 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                             order: order.clone(),
                             live: super::bitcoin_view::live_address_for_order(&live, &order.order),
                         }
+                        if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
+                            CancelInvoice {
+                                store_contract_id: store_contract_id.clone(),
+                                order_id: order.order.id.clone(),
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The seller's control to cancel one unpaid invoice (harvest#53).
+///
+/// Two steps, because the second one is permanent: a cancellation cannot be
+/// withdrawn, and the confirmation says the one thing a seller might not
+/// expect -- that a payment already on its way still counts.
+///
+/// Offered for an unpaid invoice whether or not its payment window has
+/// closed. A lapsed invoice needs no cancelling, but saying so in public
+/// costs nothing and is what a stranger reading the store can see without
+/// a chain tip of their own.
+#[component]
+fn CancelInvoice(
+    store_contract_id: Vec<u8>,
+    order_id: harvest_common::payment::OrderId,
+) -> Element {
+    let mut confirming = use_signal(|| false);
+    let mut problem = use_signal(|| Option::<String>::None);
+    let pending = APP_STATE.read().cancellation_pending(&order_id);
+    let short = order_id.short();
+
+    if pending {
+        return rsx! {
+            p { class: "text-muted", "Cancelling invoice {short}\u{2026}" }
+        };
+    }
+    rsx! {
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        if confirming() {
+            p { class: "text-warning",
+                "Cancel invoice {short}? This is public and cannot be undone. If the buyer "
+                "has already paid, or pays anyway, their payment still counts and you owe "
+                "them the goods."
+            }
+            button {
+                class: "btn btn-sm btn-primary",
+                onclick: {
+                    let store_contract_id = store_contract_id.clone();
+                    let order_id = order_id.clone();
+                    move |_| {
+                        confirming.set(false);
+                        let result = APP_STATE
+                            .write()
+                            .cancel_invoice(&store_contract_id, &order_id);
+                        problem.set(result.err());
+                    }
+                },
+                "Yes, cancel it"
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| confirming.set(false),
+                "Keep it"
+            }
+        } else {
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    problem.set(None);
+                    confirming.set(true);
+                },
+                "Cancel invoice"
             }
         }
     }

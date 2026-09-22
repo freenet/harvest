@@ -535,8 +535,13 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     let reading = AddressReading::of(o, live.as_ref());
     // All of this is about the seller's own orders; see
     // `AppState::settlement_hold` and `refresh_same_address_orders`.
-    let (hold, late_is_another_orders, paid_maybe_twins) = {
+    let (hold, late_is_another_orders, paid_maybe_twins, tip_height) = {
         let state = APP_STATE.read();
+        let tip_height = state
+            .bitcoin
+            .tips
+            .get(&o.network)
+            .and_then(|tip| tip.tip_height);
         let hold = state
             .withheld_settlements
             .contains_key(&o.id)
@@ -557,8 +562,13 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
         } else {
             String::new()
         };
-        (hold, late, paid_maybe_twins)
+        (hold, late, paid_maybe_twins, tip_height)
     };
+    // Where the order stands after the payment question (harvest#53):
+    // reader-side windows against this reader's own tip.
+    let stage = crate::fulfilment::order_stage(&order, tip_height);
+    let stage_note = stage.describe(tip_height);
+    let offers_address = crate::fulfilment::offers_payment_address(&order, stage);
     let (status_class, status_text) = status_pill(order.status, &reading, hold.is_some());
     let order_id = o.id.clone();
 
@@ -569,6 +579,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 span { class: "{status_class}", "{status_text}" }
             }
             p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
+            if let Some(note) = stage_note {
+                p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
+            }
             if order.status == OrderStatus::AwaitingPayment {
                 if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
@@ -598,7 +611,12 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
             // this order. Showing one that is not would be handing somebody a
             // destination whose payment the order can never recognise -- see
             // `address_matches_script`.
-            if destination.payable() {
+            if !offers_address {
+                // Nothing to pay: the stage note above says why. The address
+                // of a cancelled, lapsed or settled order is not offered, so
+                // nobody sends coin the order will not recognise or does not
+                // need (harvest#53).
+            } else if destination.payable() {
                 // A readonly input rather than a paragraph, so the address can
                 // be selected and copied without hand-transcribing 42
                 // characters -- the same thing the store share link does, and
@@ -1264,7 +1282,7 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-fn format_sats(sats: u64) -> String {
+pub(crate) fn format_sats(sats: u64) -> String {
     format!("{:.8} BTC", sats as f64 / 100_000_000.0)
 }
 

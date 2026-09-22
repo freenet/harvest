@@ -9,6 +9,7 @@ mod bitcoin_inbox;
 mod components;
 mod custody_flow;
 mod document_title;
+mod fulfilment;
 mod gateway;
 mod ghostkey_cert;
 mod index_flow;
