@@ -941,6 +941,18 @@ fn outranks(a: &VerifyingKey, b: &VerifyingKey) -> bool {
 /// store, until the next summary exchange sends it the rest. Transient, and
 /// it needs two keys sharing a code to happen at all.
 ///
+/// The first sentence above is about a delta produced by [`Self::delta`],
+/// which really does carry everything the winner holds when it crosses
+/// owners. It is NOT true of a HAND-BUILT single-part delta -- the app sends
+/// those (`ui/gateway/store_ops::orders_delta_bytes` names one owner and one
+/// order and leaves every other part `None`), so one arriving at a replica
+/// holding an outranked owner switches that replica to the incoming owner
+/// with that single order and no info, listings, backings or closure until
+/// the next summary exchange. Same transient, same precondition of two keys
+/// sharing a code, but it is reached by a second route the paragraph above
+/// does not cover. Noted by the authorization lens on harvest#75; the
+/// behaviour predates it.
+///
 /// What it costs, stated plainly: a key with a smaller encoding that shares a
 /// seller's code takes the address even after the seller has published, and
 /// the seller's records stop being served. That is the same attack as

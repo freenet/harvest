@@ -4497,6 +4497,42 @@ impl AppState {
     /// payments: it records which orders COULD be confused, and
     /// [`Self::settlement_hold`] leaves those to the seller.
     ///
+    /// # The property this must have, which is NOT set equality
+    ///
+    /// The guard needs: **for every order this node may publish, the twin
+    /// set holds every order that could have consumed the same payment.**
+    /// Confusability is defined by (network, script, window) -- by the
+    /// CHAIN, not by who a party to the order is. So the twin set has to be
+    /// a SUPERSET of the publish set, and making the two equal is only half
+    /// the job.
+    ///
+    /// Both halves are real and they harm the same person. Publishing an
+    /// order we are not party to is fixed in `orders_we_may_settle`, which
+    /// narrows what may be published. The mirror is that a STRANGER's order
+    /// at the same reused address is invisible as a twin of OURS: their
+    /// payment lands in the address view our own order made us subscribe to
+    /// (the contract is keyed by script), `assemble_on_chain_proof` filters
+    /// claims by `script_id` and sums confirmed value in our window, and we
+    /// publish `Paid` for our order off money somebody else sent. The
+    /// seller then ships twice against one payment either way. Recorded as a
+    /// known limit of the contract in `store::known_limit_overlapping_
+    /// windows_on_a_reused_address_both_settle`; before harvest#75 the
+    /// seller's tab was the only publisher and DID see both, so it withheld,
+    /// and that protection would otherwise have been lost.
+    ///
+    /// So: where this node holds at least one order it may settle, the
+    /// store's WHOLE book is taken. A third party cannot poison that --
+    /// every order in a store is verified against that store's owner by
+    /// `OrdersV1::apply_delta`, so only the seller we are already
+    /// transacting with can add a decoy, and a seller griefing their own
+    /// buyer only delays their own sale (the order then waits for the
+    /// seller's own tab, which is the pre-#75 status quo). A store where we
+    /// hold nothing contributes nothing, which is also what keeps the
+    /// anti-stall property below.
+    ///
+    /// Identified by the authorization lens reviewing harvest#75, after a
+    /// first fix that made the two sets equal and left this half open.
+    ///
     /// # Whose orders are compared, and why it is not "own stores only"
     ///
     /// **Orders this node is party to** -- ones its own identities issued and
@@ -4549,12 +4585,29 @@ impl AppState {
         let mut ours: Vec<(BitcoinNetwork, Vec<u8>, SameAddressOrder)> = Vec::new();
         let mut seen = HashSet::new();
         let store_ids: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
+        let confusable = |record: &harvest_common::payment::AuthorizedOrder| {
+            record.status != OrderStatus::Cancelled
+                && !record.order.payment_script_pubkey.is_empty()
+                && record.order.payment_window().is_some()
+        };
         for store_contract_id in &store_ids {
-            for record in self.orders_we_may_settle(store_contract_id, |record| {
-                record.status != OrderStatus::Cancelled
-                    && !record.order.payment_script_pubkey.is_empty()
-                    && record.order.payment_window().is_some()
-            }) {
+            // A store where we hold nothing we could settle can contribute
+            // no twin of anything, so it costs nothing -- and this is the
+            // cheap test that keeps a buyer browsing many stores from paying
+            // a decryption sweep for each of them.
+            if self
+                .orders_we_may_settle(store_contract_id, confusable)
+                .is_empty()
+            {
+                continue;
+            }
+            // But where we DO hold one, take the store's WHOLE book, not
+            // just our own share of it. See this method's doc: the twin set
+            // has to be a superset of the publish set, not equal to it.
+            let Some(store) = self.browsing_stores.get(store_contract_id) else {
+                continue;
+            };
+            for record in store.orders.iter().filter(|r| confusable(r)) {
                 let order = &record.order;
                 let Some(window) = order.payment_window() else {
                     continue;
@@ -18000,17 +18053,8 @@ mod buy_flow_tests {
             .push(strangers.clone());
         state.refresh_same_address_orders();
 
-        // Our own order settles: one payment, one order, nothing ambiguous
-        // about it from here.
-        let published = state.publish_settled_orders(STORE);
-        assert_eq!(
-            published.len(),
-            1,
-            "the buyer's own order should still settle"
-        );
-        assert_eq!(published[0].order.id, order.order.id);
-
-        // The stranger's does not, and is not even a candidate.
+        // Direction 1 -- the publish set. The stranger's order is not even a
+        // candidate, so one payment cannot mark it paid.
         assert!(
             state
                 .settled_orders(STORE)
@@ -18018,10 +18062,67 @@ mod buy_flow_tests {
                 .all(|r| r.order.id != strangers.order.id),
             "one payment was used to mark a stranger's order paid"
         );
+
+        // Direction 2 -- the twin set, and the half a first fix left open.
+        // Our OWN order is withheld, because the stranger's order at the
+        // same address could have consumed the same payment. Getting this
+        // wrong is the same harm in the mirror: the address contract is
+        // keyed by script, so a stranger's payment lands in the view our own
+        // order made us subscribe to, and we would publish `Paid` for our
+        // order off money somebody else sent.
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "a payment that a stranger's order at the same address could have \
+             consumed was published anyway"
+        );
+        assert!(matches!(
+            state.settlement_hold(&order.order),
+            Some(SettlementHold::Twins(_))
+        ));
+        assert!(
+            state.withheld_settlements.contains_key(&order.order.id),
+            "and it is held rather than dropped"
+        );
         assert!(
             !state.settlements_submitted.contains(&strangers.order.id),
             "a stranger's order was published as Paid off somebody else's payment"
         );
+    }
+
+    /// **A store where we hold nothing still flags nothing (harvest#75).**
+    ///
+    /// The companion to the test above, and the property the widening must
+    /// not cost: [`AppState::refresh_same_address_orders`] takes a store's
+    /// WHOLE book only where this node holds an order it may settle. A
+    /// stranger copying our script into a store we have nothing in must not
+    /// be able to stall us -- that is what "own stores only" was protecting
+    /// before #75, and it survives the widening.
+    #[test]
+    fn a_store_we_hold_nothing_in_cannot_stall_a_settlement() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        // Another store entirely, holding an order that copies our script.
+        const ELSEWHERE: &[u8] = &[0x77; 32];
+        let mut decoy = order.clone();
+        decoy.order.buyer_fingerprint = "somebody-else".to_string();
+        let decoy = resigned(decoy, &seller_signing_key());
+        state.begin_browsing(ELSEWHERE.to_vec());
+        state
+            .browsing_stores
+            .get_mut(ELSEWHERE)
+            .expect("the other store")
+            .orders = vec![decoy];
+        state.refresh_same_address_orders();
+
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(
+            published.len(),
+            1,
+            "a store this node holds nothing in stalled a settlement"
+        );
+        assert_eq!(published[0].order.id, order.order.id);
     }
 
     /// **A fresher tip settles the order it unblocks (harvest#74, external
