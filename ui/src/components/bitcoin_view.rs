@@ -570,7 +570,7 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
     let stage_note = stage
         .describe(tip_height, order.status)
-        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height));
+        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height, sight));
     let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
     let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
@@ -848,7 +848,11 @@ impl AddressReading {
             && crate::fulfilment::accepts_new_payment(order, tip_height)
             && self.unconfirmed_sats > 0
             && self.in_window_sats.saturating_add(self.unconfirmed_sats) >= self.amount_sats;
-        crate::fulfilment::PaymentSight { covered, in_flight }
+        crate::fulfilment::PaymentSight {
+            covered,
+            in_flight,
+            ambiguous: false,
+        }
     }
 
     /// What to tell the seller when the address holds confirmed value that is

@@ -75,6 +75,13 @@ pub struct PaymentSight {
     /// would cover the amount -- while the window is still open for it to
     /// confirm in.
     pub in_flight: bool,
+    /// A payment covering the order is in sight, but it also falls inside
+    /// another order's window on the same (reused) address, so it may be that
+    /// order's. Not counted as settling this one -- `settlement_hold` leaves
+    /// that to the seller -- and not ignored either: while it stands the
+    /// order is neither lapsed nor "no payment recorded", because the seller
+    /// may yet confirm it (review round 4).
+    pub ambiguous: bool,
 }
 
 impl PaymentSight {
@@ -101,6 +108,9 @@ pub enum OrderStage {
     Cancelled {
         settle_until: Option<u32>,
         payment_seen: bool,
+        /// A covering payment is in sight that may be another order's
+        /// ([`PaymentSight::ambiguous`]).
+        payment_maybe: bool,
     },
     /// Paid, counting from `paid_at`; the seller is expected to despatch by
     /// `despatch_by`.
@@ -244,13 +254,14 @@ pub fn order_stage(
             OrderStage::Cancelled {
                 settle_until,
                 payment_seen: sight.settles(),
+                payment_maybe: sight.ambiguous,
             }
         }
         OrderStatus::AwaitingPayment => {
             let (Some(last), Some(tip)) = (last_settling_block(order), tip_height) else {
                 return OrderStage::Unknown;
             };
-            if tip > last && !sight.covered {
+            if tip > last && !sight.covered && !sight.ambiguous {
                 OrderStage::Lapsed { closed_at: last }
             } else {
                 OrderStage::AwaitingPayment { settle_until: last }
@@ -347,8 +358,18 @@ impl OrderStage {
                     .to_string(),
             ),
             OrderStage::Cancelled {
+                payment_maybe: true,
+                ..
+            } => Some(
+                "The seller cancelled this invoice. A payment at its address may be for this \
+                 invoice or for another one sharing the address; the seller has to confirm which. \
+                 If it is this invoice's, the order is paid and the seller owes the goods."
+                    .to_string(),
+            ),
+            OrderStage::Cancelled {
                 settle_until: Some(until),
                 payment_seen: false,
+                payment_maybe: false,
             } => Some(format!(
                 "The seller cancelled this invoice. A payment made in time still counts until \
                  block {until}{}, and the seller would then owe the goods.",
@@ -399,6 +420,10 @@ impl OrderStage {
                     payment_seen: true,
                     ..
                 }
+                | OrderStage::Cancelled {
+                    payment_maybe: true,
+                    ..
+                }
         )
     }
 }
@@ -446,16 +471,33 @@ pub fn accepts_new_payment(
 /// stretch where the address is withdrawn and the order has not lapsed. The
 /// card would otherwise hide the address with no reason given (review
 /// round 3).
-pub fn closed_window_note(order: &AuthorizedOrder, tip_height: Option<u32>) -> Option<String> {
+pub fn closed_window_note(
+    order: &AuthorizedOrder,
+    tip_height: Option<u32>,
+    sight: PaymentSight,
+) -> Option<String> {
     if order.status != OrderStatus::AwaitingPayment || accepts_new_payment(&order.order, tip_height)
     {
         return None;
     }
     let last = last_settling_block(order)?;
-    Some(format!(
-        "This invoice's payment window has closed, so a new payment would not count. A payment \
-         made in time can still be recorded until block {last}."
-    ))
+    if sight.covered || sight.ambiguous {
+        // A payment made in time is in sight; publishing it has no deadline,
+        // so naming a block here would soon name one already passed (review
+        // round 4). The pill and the notes beside it say what was seen.
+        return Some(
+            "This invoice's payment window has closed, so a new payment would not count. A \
+             payment made in time is in sight and still counts."
+                .to_string(),
+        );
+    }
+    // Past `last` with nothing in sight the stage is Lapsed and says so.
+    tip_height.is_some_and(|tip| tip <= last).then(|| {
+        format!(
+            "This invoice's payment window has closed, so a new payment would not count. A \
+             payment made in time can still be recorded until block {last}."
+        )
+    })
 }
 
 #[cfg(test)]
@@ -475,6 +517,14 @@ mod tests {
     const COVERED: PaymentSight = PaymentSight {
         covered: true,
         in_flight: false,
+        ambiguous: false,
+    };
+
+    /// A covering payment that may be a twin's.
+    const AMBIGUOUS: PaymentSight = PaymentSight {
+        covered: false,
+        in_flight: false,
+        ambiguous: true,
     };
 
     fn bridge() -> SigningKey {
@@ -714,8 +764,9 @@ mod tests {
         assert!(!offers_payment_address(&open, Some(window_end)));
         // No tip yet: an open invoice still shows its address.
         assert!(offers_payment_address(&open, None));
-        assert!(closed_window_note(&open, Some(window_end - 1)).is_none());
-        let note = closed_window_note(&open, Some(window_end)).expect("said why");
+        assert!(closed_window_note(&open, Some(window_end - 1), PaymentSight::default()).is_none());
+        let note =
+            closed_window_note(&open, Some(window_end), PaymentSight::default()).expect("said why");
         assert!(note.contains(&format!("block {window_end}")), "{note}");
         // Review round 2: past the window the STAGE can still read as
         // awaiting payment (a payment made in time gathering confirmations),
@@ -796,14 +847,16 @@ mod tests {
             order_stage(&cancelled, Some(last), COVERED),
             OrderStage::Cancelled {
                 settle_until: Some(last),
-                payment_seen: true
+                payment_seen: true,
+                payment_maybe: false
             }
         );
         assert_eq!(
             order_stage(&cancelled, Some(last + 1), PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: None,
-                payment_seen: false
+                payment_seen: false,
+                payment_maybe: false
             }
         );
         // No tip: it still might.
@@ -811,7 +864,8 @@ mod tests {
             order_stage(&cancelled, None, PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: Some(last),
-                payment_seen: false
+                payment_seen: false,
+                payment_maybe: false
             }
         );
         // Review round 2: a covering payment past the cutoff is still seen,
@@ -822,7 +876,8 @@ mod tests {
             stage,
             OrderStage::Cancelled {
                 settle_until: None,
-                payment_seen: true
+                payment_seen: true,
+                payment_maybe: false
             }
         );
         assert!(stage.needs_attention());
@@ -830,6 +885,34 @@ mod tests {
             .describe(Some(last + 1), OrderStatus::Cancelled)
             .expect("said")
             .contains("owes the goods"));
+    }
+
+    /// Review round 4: a covering payment that may be a twin's keeps the
+    /// order from reading lapsed (the seller may yet confirm it) without
+    /// counting as settling it, and a cancelled one says the seller has to
+    /// decide rather than that the goods are owed.
+    #[test]
+    fn a_payment_that_may_be_a_twins_holds_the_order_open_without_settling_it() {
+        let open = order(OrderStatus::AwaitingPayment, 10_000);
+        let last = ANCHOR + PAYMENT_WINDOW_BLOCKS;
+        assert_eq!(
+            order_stage(&open, Some(last + 500), AMBIGUOUS),
+            OrderStage::AwaitingPayment { settle_until: last }
+        );
+        assert!(!AMBIGUOUS.settles());
+        let cancelled = order(OrderStatus::Cancelled, 10_000);
+        let stage = order_stage(&cancelled, Some(last + 500), AMBIGUOUS);
+        assert!(stage.needs_attention());
+        let said = stage
+            .describe(Some(last + 500), OrderStatus::Cancelled)
+            .expect("said");
+        assert!(said.contains("confirm which"), "{said}");
+        assert!(!said.contains("no payment was recorded"), "{said}");
+        // Past the cutoff, the closed-window note never names a block that
+        // has already gone by.
+        let note = closed_window_note(&open, Some(last + 500), AMBIGUOUS).expect("said");
+        assert!(!note.contains("block"), "{note}");
+        assert!(closed_window_note(&open, Some(last + 1), PaymentSight::default()).is_none());
     }
 
     #[test]
@@ -869,6 +952,7 @@ mod tests {
             OrderStage::Cancelled {
                 settle_until: Some(1_144),
                 payment_seen: false,
+                payment_maybe: false,
             },
             OrderStatus::Cancelled,
         )
@@ -880,6 +964,7 @@ mod tests {
             OrderStage::Cancelled {
                 settle_until: Some(1_144),
                 payment_seen: true,
+                payment_maybe: false,
             },
             OrderStatus::Cancelled,
         )
@@ -890,6 +975,7 @@ mod tests {
         let no_tip = OrderStage::Cancelled {
             settle_until: Some(1_144),
             payment_seen: false,
+            payment_maybe: false,
         }
         .describe(None, OrderStatus::Cancelled)
         .expect("cancelled");
@@ -941,7 +1027,8 @@ mod tests {
         for settle_until in [Some(1), None] {
             assert!(OrderStage::Cancelled {
                 settle_until,
-                payment_seen: true
+                payment_seen: true,
+                payment_maybe: false
             }
             .needs_attention());
         }
@@ -951,6 +1038,7 @@ mod tests {
             OrderStage::Cancelled {
                 settle_until: Some(1),
                 payment_seen: false,
+                payment_maybe: false,
             },
             OrderStage::AwaitingDespatch {
                 paid_at: 1,

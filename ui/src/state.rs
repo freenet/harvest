@@ -6644,12 +6644,20 @@ impl AppState {
         let reading =
             crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref());
         let mut sight = reading.sight(&order.order, tip);
-        if sight.covered
-            && !self
-                .orders_whose_window_holds(&order.order.id, &reading.in_window_heights)
-                .is_empty()
+        if !self
+            .orders_whose_window_holds(&order.order.id, &reading.in_window_heights)
+            .is_empty()
         {
+            // The confirmed value in the window may be the twin's, so it
+            // counts for neither "covered" nor as a base for "in flight":
+            // only mempool value that covers the amount on its own does
+            // (review round 4, which found one sat of mempool dust over a
+            // twin's payment refusing the cancel again).
+            sight.ambiguous = sight.covered;
             sight.covered = false;
+            sight.in_flight = crate::fulfilment::accepts_new_payment(&order.order, tip)
+                && reading.unconfirmed_sats >= order.order.amount_sats
+                && reading.unconfirmed_sats > 0;
         }
         sight
     }
@@ -22435,10 +22443,35 @@ mod buy_flow_tests {
 
         let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
         show_a_payment_row(&mut state, &order, order.order.amount_sats);
-        assert!(
-            !state.payment_sight(&order).covered,
-            "the payment may be the twin's"
-        );
+        let sight = state.payment_sight(&order);
+        assert!(!sight.covered, "the payment may be the twin's");
+        // Review round 4: but it is not nothing either. The seller's card
+        // offers "Confirm paid" for it, so the order must not read lapsed
+        // however far the tip has moved.
+        assert!(sight.ambiguous);
+        assert!(!matches!(
+            crate::fulfilment::order_stage(&order, Some(TIP_HEIGHT + 100_000), sight),
+            crate::fulfilment::OrderStage::Lapsed { .. }
+        ));
+        // And one sat of mempool dust over the twin's payment does not bring
+        // back "a payment is on its way".
+        let view_id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("build")
+            .to_vec();
+        state
+            .bitcoin
+            .addresses
+            .get_mut(&view_id)
+            .expect("view")
+            .txs
+            .push(TxRow {
+                txid_display: "dust".into(),
+                value_sats: 1,
+                status: TxRowStatus::Unconfirmed,
+            });
+        assert!(!state.payment_sight(&order).settles());
     }
 
     /// Review round 2: a cancelled twin is named as cancelled in the hold
