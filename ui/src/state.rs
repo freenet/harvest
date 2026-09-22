@@ -161,7 +161,10 @@ pub struct AppState {
     /// update notification, so without this a busy store issues one delegate
     /// request per message per notification. Also what makes a failure
     /// recoverable: an error answer un-asks its keys, so the next mailbox
-    /// update retries them.
+    /// update retries them. A request that could not even be SENT is un-asked
+    /// the same way -- see [`AppState::on_conversation_key_request_failed`]
+    /// (#107, marker sweep: this used to stay claimed forever on that path,
+    /// making the peer's messages permanently unreadable for the session).
     pub pending_conversation_key_requests: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
 
     /// Routing tags the delegate was asked about and declined to answer.
@@ -182,6 +185,14 @@ pub struct AppState {
     /// Store state re-arrives on every update notification, so without this a
     /// buyer browsing a busy store issues one recall per notification.
     pub buyer_conversations_recalled: HashSet<Vec<u8>>,
+
+    /// How many times a `ListBuyerConversations` send has failed for a given
+    /// store, keyed the same way `buyer_conversations_recalled` is. A send
+    /// failure is not a refusal -- nothing was ever asked -- so the claim is
+    /// released for a bounded number of retries rather than left forever
+    /// (#107, marker sweep). See
+    /// [`AppState::on_buyer_conversations_recall_failed`].
+    pub buyer_conversation_recall_failures: HashMap<Vec<u8>, u8>,
 
     /// `ExportBuyerConversation` and `MarkConversationBackedUp` requests in
     /// flight, as request id -> the store AND conversation THIS browser asked
@@ -497,6 +508,14 @@ pub struct AppState {
     /// Codes already sent to be remembered this session. See
     /// [`AppState::remember_loaded_store`].
     pub stores_remembered: HashSet<String>,
+
+    /// How many times a `RememberStore` send has failed for a given store
+    /// code, keyed the same way `stores_remembered` is. A send failure is
+    /// not a refusal -- nothing was ever asked -- so `stores_remembered` is
+    /// released for a bounded number of retries rather than left claimed
+    /// forever (#107, marker sweep). See
+    /// [`AppState::on_store_remember_failed`].
+    pub store_remember_failures: HashMap<String, u8>,
 
     /// Our stores whose address another key holds, already announced, so
     /// the notification is made once rather than on every state arrival.
@@ -2029,6 +2048,194 @@ fn subscribe_to_own_store(contract_id: Vec<u8>) {
     let _ = contract_id;
 }
 
+/// GET-and-subscribe a Bitcoin address contract, shared by a manual watch
+/// (`register_watch_contract`) and an order's payment address
+/// (`watch_purchase_addresses`) -- both claim the same `bitcoin.subscribed`
+/// marker before this send.
+///
+/// The failure arm used to only log (#107, marker sweep): nothing released
+/// `subscribed`, so a transient failure to send meant the address was never
+/// watched again this session -- for a manual watch, the row stays
+/// "watching..." forever; for a purchase, the buyer never sees whether their
+/// payment address has been paid.
+///
+/// Retries itself on a timer rather than only releasing the marker for some
+/// external event to notice, for the same reason `subscribe_to_mailbox`
+/// does: `watch_purchase_addresses` is re-driven by the store's own state
+/// re-arriving, which is not periodic -- a quiet store may never update
+/// again in the session -- and `register_watch_contract`'s re-trigger
+/// (`list_watched`) is sent only at startup and after an unwatch, not on any
+/// cadence either.
+fn subscribe_to_address_contract(id: Vec<u8>) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&id).await {
+            let why = e.to_string();
+            dioxus::logger::tracing::warn!("Failed to subscribe address contract: {why}");
+            use dioxus::prelude::WritableExt;
+            let should_retry = crate::gateway::APP_STATE
+                .write()
+                .on_address_subscribe_failed(&id, &why);
+            if should_retry {
+                gloo_timers::future::TimeoutFuture::new(SUBSCRIBE_RETRY_DELAY_MS).await;
+                subscribe_to_address_contract(id);
+            }
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = id;
+}
+
+/// Send a `DeriveConversationKeys` request, releasing its
+/// `pending_conversation_key_requests` claim on any failure to send. See
+/// [`AppState::on_conversation_key_request_failed`] for why this is
+/// deliberately unbounded rather than following the tip/mailbox subscribes'
+/// capped shape.
+fn send_conversation_key_request(
+    delegate_key: freenet_stdlib::prelude::DelegateKey,
+    request_id: u64,
+    request: harvest_common::HarvestDelegateRequest,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let payload = match harvest_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                let why = e.to_string();
+                dioxus::logger::tracing::warn!(
+                    "Failed to serialize a request to read this store's messages: {why}"
+                );
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_conversation_key_request_failed(request_id, &why);
+                return;
+            }
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                let why = e.to_string();
+                dioxus::logger::tracing::error!("Failed to read this store's messages: {why}");
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_conversation_key_request_failed(request_id, &why);
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (delegate_key, request_id, request);
+}
+
+/// Send a `ListBuyerConversations` request, releasing its
+/// `buyer_conversations_recalled` claim on a failure to send.
+///
+/// Retries itself on a timer, like `subscribe_to_mailbox` /
+/// `subscribe_to_own_store`: the natural external re-trigger (a store's
+/// state re-arriving) can be arbitrarily rare for a store nobody else is
+/// touching, so a session that never sees a further update would otherwise
+/// get exactly one attempt.
+fn send_buyer_conversations_recall(
+    store_contract_id: Vec<u8>,
+    request_id: u64,
+    delegate_key: freenet_stdlib::prelude::DelegateKey,
+    request: harvest_common::HarvestDelegateRequest,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let payload = match harvest_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                let why = e.to_string();
+                dioxus::logger::tracing::warn!(
+                    "Failed to serialize a request to recall this store's conversations: {why}"
+                );
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_buyer_conversations_recall_failed(&store_contract_id, request_id, &why);
+                return;
+            }
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                let why = e.to_string();
+                dioxus::logger::tracing::error!(
+                    "Failed to recall this store's conversations: {why}"
+                );
+                use dioxus::prelude::WritableExt;
+                let should_retry = crate::gateway::APP_STATE
+                    .write()
+                    .on_buyer_conversations_recall_failed(&store_contract_id, request_id, &why);
+                if should_retry {
+                    gloo_timers::future::TimeoutFuture::new(SUBSCRIBE_RETRY_DELAY_MS).await;
+                    send_buyer_conversations_recall(
+                        store_contract_id,
+                        request_id,
+                        delegate_key,
+                        request,
+                    );
+                }
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (store_contract_id, request_id, delegate_key, request);
+}
+
+/// Send a `RememberStore` request, releasing its `stores_remembered` claim
+/// on a failure to send.
+///
+/// `remember_loaded_store` claims `stores_remembered` before this send (and
+/// so does the delegate-registration queue drain in
+/// `sync_remembered_stores`, which shares the same claim), and the failure
+/// arm used to only log: a failed `RememberStore` meant the store silently
+/// never joined the user's durable store list, with this marker as the
+/// retry gate and nothing left to release it (#107, marker sweep).
+///
+/// Retries itself on a timer, like `subscribe_to_mailbox` /
+/// `subscribe_to_own_store`, for the same reason: the natural external
+/// re-trigger (a store's state re-arriving) is not periodic.
+fn send_remember_store_request(
+    code: String,
+    delegate_key: freenet_stdlib::prelude::DelegateKey,
+    request: harvest_common::HarvestDelegateRequest,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let payload = match harvest_common::to_cbor(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                let why = e.to_string();
+                dioxus::logger::tracing::warn!(
+                    "Failed to serialize a request to remember store {code}: {why}"
+                );
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_store_remember_failed(&code, &why);
+                return;
+            }
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+                let why = e.to_string();
+                dioxus::logger::tracing::error!("Failed to remember store {code}: {why}");
+                use dioxus::prelude::WritableExt;
+                let should_retry = crate::gateway::APP_STATE
+                    .write()
+                    .on_store_remember_failed(&code, &why);
+                if should_retry {
+                    gloo_timers::future::TimeoutFuture::new(SUBSCRIBE_RETRY_DELAY_MS).await;
+                    send_remember_store_request(code, delegate_key, request);
+                }
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (code, delegate_key, request);
+}
+
 impl AppState {
     /// Start browsing a store: prepare its state and make it the store the
     /// Browse tab shows. The caller is responsible for the GET/subscribe.
@@ -2087,16 +2294,63 @@ impl AppState {
         if !self.stores_remembered.insert(code.clone()) {
             return false;
         }
+        // A fresh claim gets its own full retry budget, matching
+        // `note_store_subscribed`'s reasoning (#107 re-review): without
+        // this, a store that ever crossed the retry cap once would get
+        // exactly one silent attempt on every later store-state arrival for
+        // the rest of the session.
+        self.store_remember_failures.remove(&code);
         self.remember_store(&code);
+        true
+    }
+
+    /// A `RememberStore` send failed -- from either `remember_store` or the
+    /// delegate-registration queue drain in `sync_remembered_stores`.
+    /// Bounded, and left CLAIMED for every failure below the cap --
+    /// `send_remember_store_request` retries itself directly on a timer,
+    /// never through `remember_loaded_store`, so releasing `stores_remembered`
+    /// on every failure would let a concurrent external call (the next
+    /// store-state arrival) start a second, redundant retry chain racing the
+    /// internal one -- the same race `on_mailbox_subscribe_failed`'s doc
+    /// comment describes. Released only once the cap is reached and this
+    /// function gives up for good, so a LATER external event can start over
+    /// from scratch.
+    pub(crate) fn on_store_remember_failed(&mut self, code: &str, why: &str) -> bool {
+        let failures = self
+            .store_remember_failures
+            .entry(code.to_string())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_STORE_REMEMBER_ATTEMPTS {
+            if *failures == MAX_STORE_REMEMBER_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not save store {code} to your remembered stores: {why}. \
+                     Reload to try again."
+                ));
+            }
+            self.stores_remembered.remove(code);
+            return false;
+        }
         true
     }
 
     /// Remember a store the user opened, so it is still listed after the tab
     /// is gone (harvest#52). See `known_stores` in the harvest delegate.
     pub fn remember_store(&mut self, code: &str) {
-        if let Some(request) = self.remember_store_request(code) {
-            self.send_to_harvest_delegate("remember this store", &request);
-        }
+        let Some(request) = self.remember_store_request(code) else {
+            return;
+        };
+        let Some(delegate_key) = self.harvest_delegate_key.clone() else {
+            // `remember_store_request` only returns `Some` once a delegate
+            // is registered (it queues to `stores_to_remember` otherwise),
+            // so this is unreachable today -- guarded anyway rather than
+            // relied upon, per #107's own "consider" finding about an
+            // unpinned cross-file invariant becoming reachable later without
+            // anyone noticing.
+            self.on_store_remember_failed(code, "Harvest delegate not registered");
+            return;
+        };
+        send_remember_store_request(code.to_string(), delegate_key, request);
     }
 
     /// What to ask the harvest delegate once it is registered: remember
@@ -2115,8 +2369,28 @@ impl AppState {
     }
 
     /// Send [`Self::remembered_store_requests`].
+    ///
+    /// `RememberStore` requests here share `stores_remembered` with
+    /// `remember_loaded_store` (which claimed it before queuing them in
+    /// `stores_to_remember`), so a failure here needs the same release as a
+    /// direct `remember_store` failure (#107, marker sweep) -- this used to
+    /// go through the generic fire-and-forget sender, which never released
+    /// anything on failure.
     pub fn sync_remembered_stores(&mut self) {
+        let delegate_key = self.harvest_delegate_key.clone();
         for request in self.remembered_store_requests() {
+            if let harvest_common::HarvestDelegateRequest::RememberStore { store_code } = &request {
+                match delegate_key.clone() {
+                    Some(key) => send_remember_store_request(store_code.clone(), key, request),
+                    None => {
+                        self.on_store_remember_failed(
+                            store_code,
+                            "Harvest delegate not registered",
+                        );
+                    }
+                }
+                continue;
+            }
             self.send_to_harvest_delegate("list the remembered stores", &request);
         }
     }
@@ -2826,6 +3100,11 @@ impl AppState {
                 &state_bytes,
             ) {
                 Ok(addr_state) => {
+                    // A genuine arrival is success: forget any past send
+                    // failures so a later transient failure gets its own
+                    // full retry budget rather than inheriting a lifetime
+                    // count (#107, marker sweep).
+                    self.bitcoin.address_subscribe_failures.remove(&contract_id);
                     self.apply_address_state(contract_id, network, &addr_state);
                     self.refresh_same_address_orders();
                     // A payment confirming is exactly the moment an order
@@ -3251,6 +3530,34 @@ impl AppState {
         }
     }
 
+    /// A `DeriveConversationKeys` request could not be SENT -- no delegate
+    /// registered, a serialization failure, or the send itself failing, as
+    /// opposed to a request that reached the delegate and got a real answer
+    /// (`on_conversation_keys` handles that). Used to stay claimed forever on
+    /// this path (#107, marker sweep): every later mailbox update saw these
+    /// peer tags as already asked and never asked again, making their
+    /// messages permanently unreadable for the session.
+    ///
+    /// Deliberately unbounded, matching `on_conversation_keys`'s `Err` arm
+    /// rather than the tip/mailbox subscribes' bounded-cap shape:
+    /// `pending_conversation_key_requests` is an ephemeral per-attempt map,
+    /// not a persistent "asked once ever" latch, and this file already
+    /// treats a delegate-returned error the same way -- un-ask
+    /// unconditionally and say so, relying on the next mailbox update (a
+    /// real message, not a timer) as the retry cadence. Capping this path
+    /// while leaving the sibling path uncapped would be an inconsistency,
+    /// not a safety improvement.
+    pub(crate) fn on_conversation_key_request_failed(&mut self, request_id: u64, why: &str) {
+        if self
+            .pending_conversation_key_requests
+            .remove(&request_id)
+            .is_some()
+        {
+            self.notifications
+                .push(format!("Could not read your messages: {why}"));
+        }
+    }
+
     /// Ask the delegate for whatever conversation keys this store's mailbox
     /// still needs, if any.
     ///
@@ -3261,7 +3568,18 @@ impl AppState {
         let Some(request) = self.conversation_keys_to_request(store_contract_id) else {
             return;
         };
-        self.send_to_harvest_delegate("read this store's messages", &request);
+        let request_id = match &request {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id, ..
+            } => *request_id,
+            _ => return,
+        };
+        let Some(delegate_key) = self.harvest_delegate_key.clone() else {
+            warn!("Harvest delegate not registered -- cannot read this store's messages");
+            self.on_conversation_key_request_failed(request_id, "Harvest delegate not registered");
+            return;
+        };
+        send_conversation_key_request(delegate_key, request_id, request);
     }
 
     /// Seal a buyer's request to buy a listing, opening a conversation if
@@ -3437,6 +3755,13 @@ impl AppState {
         {
             return None;
         }
+        // A fresh claim gets its own full retry budget, matching
+        // `note_store_subscribed`'s reasoning (#107 re-review): without
+        // this, a store that ever crossed the retry cap once would get
+        // exactly one silent attempt on every later store-state arrival for
+        // the rest of the session.
+        self.buyer_conversation_recall_failures
+            .remove(store_contract_id);
         let request_id = self.next_messaging_request_id();
         self.pending_conversation_recalls
             .insert(request_id, store_contract_id.to_vec());
@@ -3448,12 +3773,88 @@ impl AppState {
         )
     }
 
+    /// A `ListBuyerConversations` send could not be SENT. Bounded, and left
+    /// CLAIMED for every failure below the cap -- `send_buyer_conversations_recall`
+    /// retries itself directly on a timer, never through
+    /// `buyer_conversations_to_recall`, so releasing `buyer_conversations_recalled`
+    /// on every failure would let a concurrent external call (the next
+    /// store-state arrival) start a second, redundant retry chain racing the
+    /// internal one -- the same race `on_mailbox_subscribe_failed`'s doc
+    /// comment describes. Released only once the cap is reached and this
+    /// function gives up for good, so a LATER external event can start over
+    /// from scratch.
+    ///
+    /// Used to stay claimed forever on any send failure (#107, marker
+    /// sweep): a buyer's kept conversations with a store were never recalled
+    /// again this session, and the reply they hold keys to read sat unread
+    /// with nothing saying why.
+    ///
+    /// The ownership guard mirrors `on_mailbox_subscribe_failed`'s: a stale
+    /// callback for an attempt that is no longer live cannot bump the
+    /// counter or notify for a claim it does not own.
+    pub(crate) fn on_buyer_conversations_recall_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        request_id: u64,
+        why: &str,
+    ) -> bool {
+        if self
+            .pending_conversation_recalls
+            .get(&request_id)
+            .map(Vec::as_slice)
+            != Some(store_contract_id)
+        {
+            return false;
+        }
+        let failures = self
+            .buyer_conversation_recall_failures
+            .entry(store_contract_id.to_vec())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            if *failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not recall your earlier conversations with a store: {why}. \
+                     Reload to try again."
+                ));
+            }
+            self.pending_conversation_recalls.remove(&request_id);
+            self.buyer_conversations_recalled.remove(store_contract_id);
+            return false;
+        }
+        true
+    }
+
     /// [`Self::buyer_conversations_to_recall`], dispatched.
     pub fn recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
         let Some(request) = self.buyer_conversations_to_recall(store_contract_id) else {
             return;
         };
-        self.send_to_harvest_delegate("recall this store's conversations", &request);
+        let request_id = match &request {
+            harvest_common::HarvestDelegateRequest::ListBuyerConversations {
+                request_id, ..
+            } => *request_id,
+            _ => return,
+        };
+        let Some(delegate_key) = self.harvest_delegate_key.clone() else {
+            // `buyer_conversations_to_recall` only claims once a delegate is
+            // registered, so this is unreachable today -- guarded anyway
+            // rather than relied upon, per #107's own "consider" finding
+            // about an unpinned cross-file invariant becoming reachable
+            // later without anyone noticing.
+            self.on_buyer_conversations_recall_failed(
+                store_contract_id,
+                request_id,
+                "Harvest delegate not registered",
+            );
+            return;
+        };
+        send_buyer_conversations_recall(
+            store_contract_id.to_vec(),
+            request_id,
+            delegate_key,
+            request,
+        );
     }
 
     /// Ask for the kept conversations of every store already on screen.
@@ -3500,6 +3901,11 @@ impl AppState {
                  about; filing them under the store that was asked about"
             );
         }
+        // A genuine arrival is success: forget any past send failures so a
+        // later transient failure gets its own full retry budget rather
+        // than inheriting a lifetime count (#107, marker sweep).
+        self.buyer_conversation_recall_failures
+            .remove(&store_contract_id);
         let store_contract_id = store_contract_id.as_slice();
         if conversations.is_empty() {
             return;
@@ -4505,14 +4911,10 @@ impl AppState {
             if !self.bitcoin.subscribed.insert(bytes.clone()) {
                 continue;
             }
-            #[cfg(target_arch = "wasm32")]
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
-                    dioxus::logger::tracing::error!(
-                        "Failed to subscribe an order's address contract: {e}"
-                    );
-                }
-            });
+            // A fresh claim gets its own full retry budget -- see
+            // `register_watch_contract`'s identical reset for why.
+            self.bitcoin.address_subscribe_failures.remove(&bytes);
+            subscribe_to_address_contract(bytes);
         }
     }
 
@@ -6353,6 +6755,13 @@ impl AppState {
             }
 
             HarvestDelegateResponse::RememberedStores { stores } => {
+                // A genuine arrival is success for every code it lists: forget
+                // any past send failures so a later transient failure gets
+                // its own full retry budget rather than inheriting a
+                // lifetime count (#107, marker sweep).
+                for store in &stores {
+                    self.store_remember_failures.remove(&store.store_code);
+                }
                 self.remembered_stores = Some(stores);
             }
 
@@ -7493,12 +7902,13 @@ impl AppState {
             .address_contract_network
             .insert(bytes.clone(), watch.network);
         if self.bitcoin.subscribed.insert(bytes.clone()) {
-            #[cfg(target_arch = "wasm32")]
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = crate::gateway::bitcoin_ops::subscribe_contract(&bytes).await {
-                    dioxus::logger::tracing::error!("Failed to subscribe address contract: {e}");
-                }
-            });
+            // A fresh claim gets its own full retry budget, matching
+            // `note_store_subscribed`'s reasoning (#107 re-review): without
+            // this, an address that ever crossed the retry cap once would
+            // get exactly one silent attempt on every later `WatchList`
+            // answer for the rest of the session.
+            self.bitcoin.address_subscribe_failures.remove(&bytes);
+            subscribe_to_address_contract(bytes);
         }
     }
 
@@ -7605,6 +8015,41 @@ impl AppState {
             return;
         }
         self.bitcoin.subscribed.remove(id);
+    }
+
+    /// An address contract's subscribe (a manual watch or a purchase's
+    /// payment address) could not be SENT. Bounded, and left CLAIMED for
+    /// every failure below the cap -- `subscribe_to_address_contract`
+    /// retries itself directly on a timer, never through
+    /// `register_watch_contract` or `watch_purchase_addresses`, so releasing
+    /// `subscribed` on every failure would let a concurrent external call (a
+    /// fresh `WatchList` answer, or the next store-state arrival) start a
+    /// second, redundant retry chain racing the internal one -- the same
+    /// race `on_mailbox_subscribe_failed`'s doc comment describes for the
+    /// mailbox case. Released only once the cap is reached and this function
+    /// gives up for good, so a LATER external event can start over from
+    /// scratch.
+    ///
+    /// Split out of the spawned subscribe so the state change is testable
+    /// off-target; only the subscribe itself needs a browser.
+    pub(crate) fn on_address_subscribe_failed(&mut self, id: &[u8], why: &str) -> bool {
+        let failures = self
+            .bitcoin
+            .address_subscribe_failures
+            .entry(id.to_vec())
+            .or_insert(0);
+        *failures = failures.saturating_add(1);
+        if *failures >= MAX_ADDRESS_SUBSCRIBE_ATTEMPTS {
+            if *failures == MAX_ADDRESS_SUBSCRIBE_ATTEMPTS {
+                self.notifications.push(format!(
+                    "Harvest could not reach the network to check a Bitcoin address: {why}. \
+                     Reload to try again."
+                ));
+            }
+            self.bitcoin.subscribed.remove(id);
+            return false;
+        }
+        true
     }
 
     /// Track `bridge`'s request inbox at the generation its pointer names. A
@@ -8278,6 +8723,19 @@ pub fn watch_sync_status(watch: &WatchedPayment) -> WatchSyncStatus {
 /// [`AppState::on_tip_subscribe_failed`] stops retrying and says so.
 const MAX_TIP_SUBSCRIBE_ATTEMPTS: u8 = 3;
 
+/// How many times an address contract's subscribe may fail to send before
+/// [`AppState::on_address_subscribe_failed`] stops retrying and says so.
+const MAX_ADDRESS_SUBSCRIBE_ATTEMPTS: u8 = 3;
+
+/// How many times a `ListBuyerConversations` send may fail before
+/// [`AppState::on_buyer_conversations_recall_failed`] stops retrying and
+/// says so.
+const MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS: u8 = 3;
+
+/// How many times a `RememberStore` send may fail before
+/// [`AppState::on_store_remember_failed`] stops retrying and says so.
+const MAX_STORE_REMEMBER_ATTEMPTS: u8 = 3;
+
 /// Bitcoin/Payments state: bridge config, the user's private watch list, and
 /// live on-chain data mirrored from subscribed Bitcoin contracts.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -8344,6 +8802,13 @@ pub struct BitcoinState {
     /// bridge's 10-minute generation refresh is what drives the retry; the
     /// cap stops it retrying past the point of being worth mentioning.
     pub tip_subscribe_failures: HashMap<Vec<u8>, u8>,
+    /// How many times an address contract's subscribe (a manual watch, via
+    /// `register_watch_contract`, or an order's payment address, via
+    /// `watch_purchase_addresses`) has failed to SEND, keyed by contract id.
+    /// Same reasoning as `tip_subscribe_failures` (#107, marker sweep): a
+    /// send failure is not a refusal, so `subscribed` is released for a
+    /// bounded number of retries rather than left set forever.
+    pub address_subscribe_failures: HashMap<Vec<u8>, u8>,
     /// Tip contract id -> network, so an incoming state/update routes to
     /// the right `TipView` without guessing from the bytes.
     pub tip_contract_network: HashMap<Vec<u8>, BitcoinNetwork>,
@@ -12662,6 +13127,63 @@ mod mailbox_read_tests {
         );
     }
 
+    /// A `DeriveConversationKeys` send that never reached the delegate must
+    /// un-ask its peers the same way a delegate `Err` answer already does
+    /// (#107, marker sweep): before this fix,
+    /// `pending_conversation_key_requests` stayed claimed forever on this
+    /// path, so those peers' messages were never asked about again for the
+    /// rest of the session.
+    #[test]
+    fn a_conversation_key_send_failure_un_asks_its_peers() {
+        let conversation = conversation("hello");
+        let mut state = state_with(vec![conversation.message.clone()]);
+        let request = state.conversation_keys_to_request(OURS).expect("asks");
+        let request_id = match request {
+            harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+                request_id, ..
+            } => request_id,
+            other => panic!("expected a DeriveConversationKeys request, got {other:?}"),
+        };
+        assert!(
+            !state.pending_conversation_key_requests.is_empty(),
+            "precondition: the request is claimed"
+        );
+
+        state.on_conversation_key_request_failed(request_id, "no network");
+
+        assert!(
+            state.pending_conversation_key_requests.is_empty(),
+            "the send failure must release the pending entry so the next mailbox update retries"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and say so, matching the delegate-Err path"
+        );
+        // Un-asked, not declined: the peer must be askable again.
+        assert!(
+            state.conversation_keys_to_request(OURS).is_some(),
+            "a released request must be retried, not treated as permanently declined"
+        );
+    }
+
+    /// A failure for a request id nothing is waiting on -- including one
+    /// that already failed to send and was released -- must not notify
+    /// twice.
+    #[test]
+    fn a_conversation_key_send_failure_for_an_unknown_request_is_a_no_op() {
+        let mut state = AppState::default();
+        state.on_conversation_key_request_failed(999, "no network");
+        assert!(
+            state.notifications.is_empty(),
+            "nothing was asked for id 999"
+        );
+    }
+
     /// The certificate verdict and the key the mailbox address is derived
     /// from are formed together, from the same call, when a store's state
     /// arrives -- so a store the buyer is told is unverified can never also
@@ -13851,6 +14373,123 @@ mod buyer_persistence_tests {
         assert!(
             state.buyer_conversations_to_recall(STORE).is_some(),
             "the store was marked as asked while the request could not be sent"
+        );
+    }
+
+    /// A `ListBuyerConversations` send that never reached the delegate must
+    /// not disable recall for the rest of the session (#107, marker sweep):
+    /// `buyer_conversations_recalled` was claimed before the send, and its
+    /// failure arm only logged, so a returning buyer's kept conversations
+    /// were never recalled again -- the reply sitting unread with nothing
+    /// saying why.
+    ///
+    /// Matches what `send_buyer_conversations_recall`'s internal timer retry
+    /// actually does: it never re-registers through
+    /// `buyer_conversations_to_recall` between attempts, so this test
+    /// doesn't either (see `on_mailbox_subscribe_failed`'s doc comment for
+    /// why re-registering between attempts would hide a real bug: the
+    /// mapping would look "stale/foreign" to the ownership check and the
+    /// retry chain would die silently with no notification).
+    #[test]
+    fn a_buyer_conversations_recall_failure_retries_a_bounded_number_of_times() {
+        let mut state = buyer_state();
+        let request_id = match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { request_id, .. }) => request_id,
+            other => panic!("expected a recall, got {other:?}"),
+        };
+
+        for attempt in 1..MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            assert!(
+                state.on_buyer_conversations_recall_failed(STORE, request_id, "no network"),
+                "attempt {attempt} must tell the caller to retry itself"
+            );
+            assert!(
+                state.buyer_conversations_recalled.contains(STORE),
+                "attempt {attempt} must leave the claim in place"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "must not nag on attempt {attempt}"
+            );
+        }
+
+        assert!(
+            !state.on_buyer_conversations_recall_failed(STORE, request_id, "no network"),
+            "past the cap it must tell the caller to stop"
+        );
+        assert!(
+            !state.buyer_conversations_recalled.contains(STORE),
+            "past the cap it releases the claim for a future attempt"
+        );
+        assert!(
+            !state.pending_conversation_recalls.contains_key(&request_id),
+            "past the cap the dead request is also forgotten"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // A later external event re-claims and must get a genuinely fresh
+        // budget (#107 re-review round 3 shape), not one silent attempt.
+        let fresh_request_id = match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { request_id, .. }) => request_id,
+            other => panic!("expected a fresh recall, got {other:?}"),
+        };
+        assert!(
+            state.on_buyer_conversations_recall_failed(STORE, fresh_request_id, "no network"),
+            "a fresh claim must get a fresh budget, not inherit the earlier cap"
+        );
+    }
+
+    /// A failure naming a request id that is not the one currently pending
+    /// for that store must not touch a claim it does not own -- the same
+    /// ownership guard `on_mailbox_subscribe_failed` has.
+    #[test]
+    fn a_stale_buyer_conversations_recall_failure_is_a_no_op() {
+        let mut state = buyer_state();
+        state.buyer_conversations_to_recall(STORE);
+        assert!(
+            !state.on_buyer_conversations_recall_failed(STORE, 999_999, "stale"),
+            "a request id nothing is waiting on must not be treated as a live attempt"
+        );
+        assert!(
+            state.buyer_conversations_recalled.contains(STORE),
+            "a stale failure must not release a claim it does not own"
+        );
+        assert!(
+            state.notifications.is_empty(),
+            "a stale failure must not notify either"
+        );
+    }
+
+    /// A genuine arrival (even an empty list) resets the failure count, for
+    /// the same reason as the mailbox/own-store/tip cases (#107 re-review,
+    /// skeptical lens): otherwise a few transient failures scattered across
+    /// a long session, each followed by a real success, still exhaust the
+    /// retry budget.
+    #[test]
+    fn a_genuine_buyer_conversations_arrival_resets_the_failure_count() {
+        let mut state = buyer_state();
+        let request_id = match state.buyer_conversations_to_recall(STORE) {
+            Some(HarvestDelegateRequest::ListBuyerConversations { request_id, .. }) => request_id,
+            other => panic!("expected a recall, got {other:?}"),
+        };
+        for _ in 1..MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            state.on_buyer_conversations_recall_failed(STORE, request_id, "no network");
+        }
+
+        state.on_buyer_conversations(request_id, STORE, Vec::new());
+
+        assert_eq!(
+            state.buyer_conversation_recall_failures.get(STORE),
+            None,
+            "a genuine arrival must reset the counter, not just leave it below cap"
         );
     }
 
@@ -18975,6 +19614,122 @@ mod buy_flow_tests {
         );
     }
 
+    /// An address contract's subscribe that never reached the network must
+    /// not disable it -- a manual watch or a purchase's payment address --
+    /// for the rest of the session (#107, marker sweep): `bitcoin.subscribed`
+    /// was claimed before the send, shared between `register_watch_contract`
+    /// and `watch_purchase_addresses`, and the failure arm only logged.
+    ///
+    /// Matches what `subscribe_to_address_contract`'s internal timer retry
+    /// actually does: it never re-claims through either caller between
+    /// attempts, so this test doesn't either.
+    #[test]
+    fn an_address_subscribe_failure_retries_a_bounded_number_of_times() {
+        let mut state = AppState::default();
+        state.bitcoin.subscribed.insert(vec![7u8; 32]);
+
+        for attempt in 1..MAX_ADDRESS_SUBSCRIBE_ATTEMPTS {
+            assert!(
+                state.on_address_subscribe_failed(&[7u8; 32], "no network"),
+                "attempt {attempt} must tell the caller to retry itself"
+            );
+            assert!(
+                state.bitcoin.subscribed.contains(&vec![7u8; 32]),
+                "attempt {attempt} must leave the claim in place"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "must not nag on attempt {attempt}"
+            );
+        }
+
+        assert!(
+            !state.on_address_subscribe_failed(&[7u8; 32], "no network"),
+            "past the cap it must tell the caller to stop"
+        );
+        assert!(
+            !state.bitcoin.subscribed.contains(&vec![7u8; 32]),
+            "past the cap it releases the claim for a future attempt"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+    }
+
+    /// A fresh claim -- a new `WatchList` answer for a manual watch --
+    /// resets the failure count, matching `note_store_subscribed`'s
+    /// reasoning (#107 re-review round 3): without this, an address that
+    /// ever crossed the retry cap once would get exactly one silent attempt
+    /// on every later `WatchList` answer for the rest of the session.
+    #[test]
+    fn register_watch_contract_resets_the_failure_count_on_a_fresh_claim() {
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .address_subscribe_failures
+            .insert(vec![7u8; 32], MAX_ADDRESS_SUBSCRIBE_ATTEMPTS);
+
+        let watch = WatchedPayment {
+            network: BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xde, 0xad],
+            address: "tb1qexample".to_string(),
+            label: None,
+            order_id: None,
+            expected_amount_sats: None,
+            contract_id: Some(bs58::encode([7u8; 32]).into_string()),
+            added_at_ms: 1_700_000_000_000,
+            bridge_synced: false,
+            last_error: None,
+        };
+        state.register_watch_contract(&watch);
+
+        assert_eq!(
+            state
+                .bitcoin
+                .address_subscribe_failures
+                .get([7u8; 32].as_slice()),
+            None,
+            "a fresh claim must reset the counter, not inherit an earlier cap"
+        );
+    }
+
+    /// A genuine arrival of an address contract's state resets the
+    /// send-failure count, for the same reason as the tip/mailbox/own-store
+    /// cases (#107 re-review, skeptical lens).
+    #[test]
+    fn a_genuine_address_arrival_resets_the_send_failure_count() {
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .address_contract_network
+            .insert(vec![7u8; 32], BitcoinNetwork::Signet);
+        for _ in 1..MAX_ADDRESS_SUBSCRIBE_ATTEMPTS {
+            state.bitcoin.subscribed.insert(vec![7u8; 32]);
+            state.on_address_subscribe_failed(&[7u8; 32], "no network");
+        }
+
+        state.on_contract_state(
+            vec![7u8; 32],
+            harvest_common::to_cbor(&freenet_bitcoin_common::BitcoinAddressStateV1::default())
+                .expect("address state encodes"),
+        );
+
+        assert_eq!(
+            state
+                .bitcoin
+                .address_subscribe_failures
+                .get([7u8; 32].as_slice()),
+            None,
+            "a genuine arrival must reset the counter, not just leave it below cap"
+        );
+    }
+
     #[test]
     fn the_watch_check_acts_only_with_something_to_watch() {
         let gk = inbox::authority().mint();
@@ -19828,6 +20583,135 @@ mod store_code_tests {
         state.note_store_code(fresh.to_vec(), "2222222222222222".to_string());
         assert!(state.remember_loaded_store(&fresh), "asked once");
         assert!(!state.remember_loaded_store(&fresh), "and not again");
+    }
+
+    /// A `RememberStore` send that never reached the delegate must not
+    /// disable remembering that code for the rest of the session (#107,
+    /// marker sweep): `stores_remembered` was claimed before the send, and
+    /// its failure arm only logged, so the store silently never joined the
+    /// user's durable store list.
+    ///
+    /// Matches what `send_remember_store_request`'s internal timer retry
+    /// actually does: it never re-registers through `remember_loaded_store`
+    /// between attempts, so this test doesn't either.
+    #[test]
+    fn a_store_remember_failure_retries_a_bounded_number_of_times() {
+        let mut state = AppState::default();
+        let code = "3Bn8xWqLd6Tz9Kf2".to_string();
+        state.stores_remembered.insert(code.clone());
+
+        for attempt in 1..MAX_STORE_REMEMBER_ATTEMPTS {
+            assert!(
+                state.on_store_remember_failed(&code, "no network"),
+                "attempt {attempt} must tell the caller to retry itself"
+            );
+            assert!(
+                state.stores_remembered.contains(&code),
+                "attempt {attempt} must leave the claim in place"
+            );
+            assert!(
+                state.notifications.is_empty(),
+                "must not nag on attempt {attempt}"
+            );
+        }
+
+        assert!(
+            !state.on_store_remember_failed(&code, "no network"),
+            "past the cap it must tell the caller to stop"
+        );
+        assert!(
+            !state.stores_remembered.contains(&code),
+            "past the cap it releases the claim for a future attempt"
+        );
+        assert_eq!(
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("no network"))
+                .count(),
+            1,
+            "and says so exactly once"
+        );
+
+        // A later external event re-claims and must get a genuinely fresh
+        // budget, matching `remember_loaded_store`'s reset on a fresh claim.
+        state.note_store_code([8u8; 32].to_vec(), code.clone());
+        assert!(
+            state.remember_loaded_store(&[8u8; 32]),
+            "a fresh claim must be allowed"
+        );
+        assert!(
+            state.on_store_remember_failed(&code, "no network"),
+            "and must get a fresh budget, not inherit the earlier cap"
+        );
+    }
+
+    /// The queued `RememberStore` path (`sync_remembered_stores`, sent once
+    /// the delegate registers) shares `stores_remembered` with the direct
+    /// path and has the identical defect if left unfixed: a queued code
+    /// whose send fails would stay claimed forever with nothing to release
+    /// it. Here every attempt fails identically (no delegate ever
+    /// registers), so repeated calls walk it through the same bounded cap
+    /// as the direct path.
+    #[test]
+    fn a_queued_store_remember_failure_releases_the_claim() {
+        let mut state = AppState::default();
+        // Queue a code the way `remember_loaded_store` does before a
+        // delegate exists.
+        state.note_store_code([9u8; 32].to_vec(), "Qp5vMe7RkT2cHw4n".to_string());
+        assert!(state.remember_loaded_store(&[9u8; 32]));
+        assert!(state.stores_remembered.contains("Qp5vMe7RkT2cHw4n"));
+        assert!(state.harvest_delegate_key.is_none());
+
+        // The delegate never registers in this test, so each call to
+        // `sync_remembered_stores` must treat the still-queued code exactly
+        // like a send failure rather than silently dropping it -- and the
+        // requeue below is what lets a SECOND call see it again, mirroring
+        // `remembered_store_requests` draining `stores_to_remember` and a
+        // later run re-populating it the way a real re-opened link would.
+        for attempt in 1..MAX_STORE_REMEMBER_ATTEMPTS {
+            state.sync_remembered_stores();
+            assert!(
+                state.stores_remembered.contains("Qp5vMe7RkT2cHw4n"),
+                "attempt {attempt} must leave the claim in place"
+            );
+            state
+                .stores_to_remember
+                .push("Qp5vMe7RkT2cHw4n".to_string());
+        }
+        state.sync_remembered_stores();
+
+        assert!(
+            !state.stores_remembered.contains("Qp5vMe7RkT2cHw4n"),
+            "past the cap, with no delegate ever registering, the claim must \
+             finally be released rather than left stuck forever"
+        );
+    }
+
+    /// A `RememberedStores` answer naming a code is a genuine success for
+    /// it: reset that code's failure count, for the same reason as the
+    /// mailbox/own-store/tip cases.
+    #[test]
+    fn a_remembered_stores_answer_resets_the_failure_count_for_the_codes_it_names() {
+        let mut state = AppState::default();
+        let code = "3Bn8xWqLd6Tz9Kf2".to_string();
+        state.stores_remembered.insert(code.clone());
+        for _ in 1..MAX_STORE_REMEMBER_ATTEMPTS {
+            state.on_store_remember_failed(&code, "no network");
+        }
+
+        state.on_delegate_response(harvest_common::HarvestDelegateResponse::RememberedStores {
+            stores: vec![harvest_common::RememberedStore {
+                store_code: code.clone(),
+                archived: false,
+            }],
+        });
+
+        assert_eq!(
+            state.store_remember_failures.get(&code),
+            None,
+            "a genuine arrival must reset the counter, not just leave it below cap"
+        );
     }
 
     #[test]
