@@ -4825,6 +4825,28 @@ impl AppState {
     /// under a mutation that deleted the guard, which is the
     /// reports-success-while-measuring-nothing shape this repository is
     /// built around avoiding.
+    ///
+    /// # What a WITHHELD settlement means on a buyer's tab (harvest#75)
+    ///
+    /// A hold can now fire for a buyer, which it never could before, so two
+    /// things are worth knowing and neither is a leak:
+    ///
+    /// * **It is not confirmable by the buyer.** The "Confirm paid" control
+    ///   lives on the seller's order card, so a buyer's held settlement
+    ///   waits for the seller to publish it. That is exactly what happened
+    ///   before #75 for EVERY buyer settlement rather than just the
+    ///   ambiguous ones, so it is a narrowing of the old dead end and not a
+    ///   new one.
+    /// * **A buyer who also SELLS can be held by their own unloaded
+    ///   stores**, because [`Self::settlement_hold`] asks
+    ///   [`Self::unloaded_stores`], which is about `my_stores`. That is a
+    ///   delay and not a block: [`Self::republish_withheld`] runs when a
+    ///   store list is answered and when a store's state arrives, so the
+    ///   hold clears as soon as their own stores load.
+    ///
+    /// `withheld_settlements` cannot grow without bound either -- this
+    /// method rebuilds the entries for its store on every call, so an entry
+    /// never outlives the proof behind it.
     pub fn publish_settled_orders(
         &mut self,
         store_contract_id: &[u8],
