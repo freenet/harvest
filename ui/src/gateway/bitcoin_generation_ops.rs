@@ -116,12 +116,31 @@ pub fn start() {
                 // unpaid. Deciding here also means the walk happens once
                 // rather than once to ask and once to act.
                 let now = crate::state::now_ms();
-                let (wanted, due) = {
+                // The tip contract is asked about on the same tick and from
+                // the same walk (harvest#74). `wanted` IS the unsettled-order
+                // set, so the tip's bound and the address's bound are one
+                // rule; and the walk is the expensive half, so doing it once
+                // for both is most of why they share a timer.
+                let (wanted, due, tips_wanted, tips_due) = {
                     use dioxus::prelude::ReadableExt;
-                    APP_STATE.peek().due_address_rereads(now)
+                    let state = APP_STATE.peek();
+                    let (wanted, due) = state.due_address_rereads(now);
+                    let (tips_wanted, tips_due) = state.due_tip_rereads(&wanted, now);
+                    (wanted, due, tips_wanted, tips_due)
                 };
-                if !due.is_empty() {
-                    APP_STATE.write().send_address_rereads(&wanted, &due, now);
+                // Either may be due on its own -- a tip whose spacing has
+                // widened past the addresses', or the reverse -- so neither
+                // is allowed to gate the other. Taking the write once when
+                // there is anything at all to send keeps a quiet tick from
+                // repainting the app.
+                if !due.is_empty() || !tips_due.is_empty() {
+                    let mut state = APP_STATE.write();
+                    if !due.is_empty() {
+                        state.send_address_rereads(&wanted, &due, now);
+                    }
+                    if !tips_due.is_empty() {
+                        state.send_tip_rereads(&tips_wanted, &tips_due, now);
+                    }
                 }
             })
         });

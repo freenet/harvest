@@ -37,6 +37,17 @@
 //! which to ask for now. [`AddressRereads`] holds only when each was last
 //! asked for.
 //!
+//! It is keyed by contract id and knows nothing about addresses, so
+//! harvest#74 reuses it unchanged for the same problem one contract over: a
+//! network's CHAIN-TIP contract is also GET-and-subscribed once, and a stale
+//! tip refuses a payment that is deep enough while under-counting every
+//! window measured against it. `AppState::tip_contracts_to_reread` is that
+//! caller, bounded by "some order is unsettled" rather than by one address.
+//! It keeps its own [`AddressRereads`], because the two sets are pruned
+//! against different `wanted` lists and one shared tracker would have each
+//! forget the other's entries. The type keeps its name: renaming it would
+//! churn every call site to say less about where it came from.
+//!
 //! # The spacing, and why it widens
 //!
 //! The first re-ask comes [`FIRST_RETRY_MS`] after the last one, and each

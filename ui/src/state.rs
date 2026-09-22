@@ -4403,6 +4403,13 @@ impl AppState {
     /// sign. The buyer is simply the party who cares soonest, and the same
     /// call serves a seller looking at their own invoices.
     ///
+    /// That was a statement about the CONTRACT before it was a statement
+    /// about this app: [`Self::publish_settled_orders`] sent nothing from a
+    /// buyer's tab until harvest#75, because the key it addressed the store
+    /// with came out of `my_stores`. Both halves are true now -- the network
+    /// accepts it from either party and the app sends it from either party --
+    /// and they are meant to stay that way.
+    ///
     /// # What it will not publish
     ///
     /// An order whose status has already moved, and an order whose evidence
@@ -4472,39 +4479,64 @@ impl AppState {
     /// payments: it records which orders COULD be confused, and
     /// [`Self::settlement_hold`] leaves those to the seller.
     ///
-    /// Own stores only (a stranger copying a script must not stall this
-    /// seller), same network only (signet and testnet4 share script bytes but
-    /// not payments), cancelled orders ignored, and orders with no anchor
-    /// ignored (no window). Stored because the card reads it on every render.
+    /// # Whose orders are compared, and why it is not "own stores only"
+    ///
+    /// **Orders this node is party to** -- ones its own identities issued and
+    /// ones it bought ([`Self::our_orders`]) -- across every store on screen,
+    /// same network only (signet and testnet4 share script bytes but not
+    /// payments), cancelled orders ignored, and orders with no anchor ignored
+    /// (no window). Stored because the card reads it on every render.
+    ///
+    /// It was own stores ONLY until harvest#75, and that was right while only
+    /// a seller's tab could publish `Paid`: the orders a seller might confuse
+    /// a payment between are all in their own stores, and a stranger copying
+    /// a script must not be able to stall them. #75 let a BUYER publish, and
+    /// a buyer's exposure is the mirror image -- two purchases from one
+    /// address-reusing seller sit in that seller's store, which is nobody's
+    /// own store here, so neither was ever a twin of the other and one
+    /// payment would have auto-published `Paid` on both.
+    ///
+    /// Widening to OUR orders rather than to every order keeps the property
+    /// the narrower rule was protecting: an order this node is not party to
+    /// still cannot stall anything, whoever wrote it.
     pub fn refresh_same_address_orders(&mut self) {
         use harvest_common::payment::OrderStatus;
-        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<SameAddressOrder>> = HashMap::new();
+        // Collected owning its own script bytes, so the borrow of
+        // `browsing_stores` ends before the map is stored back.
+        let mut ours: Vec<(BitcoinNetwork, Vec<u8>, SameAddressOrder)> = Vec::new();
         let mut seen = HashSet::new();
-        for registration in self.my_stores.values().flatten() {
-            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
-                continue;
-            };
-            for record in &store.orders {
+        let store_ids: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
+        for store_contract_id in &store_ids {
+            for record in self.our_orders(store_contract_id, |record| {
+                record.status != OrderStatus::Cancelled
+                    && !record.order.payment_script_pubkey.is_empty()
+                    && record.order.payment_window().is_some()
+            }) {
                 let order = &record.order;
                 let Some(window) = order.payment_window() else {
                     continue;
                 };
-                if record.status != OrderStatus::Cancelled
-                    && !order.payment_script_pubkey.is_empty()
-                    && seen.insert(&order.id)
-                {
-                    by_script
-                        .entry((order.network, order.payment_script_pubkey.as_slice()))
-                        .or_default()
-                        .push(SameAddressOrder {
+                if seen.insert(order.id.clone()) {
+                    ours.push((
+                        order.network,
+                        order.payment_script_pubkey.clone(),
+                        SameAddressOrder {
                             id: order.id.clone(),
                             window,
                             amount_sats: order.amount_sats,
                             status: record.status,
                             confirmed_by_you: false,
-                        });
+                        },
+                    ));
                 }
             }
+        }
+        let mut by_script: HashMap<(BitcoinNetwork, &[u8]), Vec<SameAddressOrder>> = HashMap::new();
+        for (network, script, entry) in &ours {
+            by_script
+                .entry((*network, script.as_slice()))
+                .or_default()
+                .push(entry.clone());
         }
         let mut map = HashMap::new();
         for orders in by_script.values().filter(|orders| orders.len() > 1) {
@@ -4670,18 +4702,6 @@ impl AppState {
         }
     }
 
-    /// Whether one of this node's identities owns `store_contract_id`.
-    ///
-    /// The same question `crate::gateway::store_ops::owned_store_key` asks
-    /// before it will sign anything for a store, kept here so a decision that
-    /// depends on it can be made without a browser.
-    pub fn owns_store(&self, store_contract_id: &[u8]) -> bool {
-        self.my_stores
-            .values()
-            .flat_map(|stores| stores.iter())
-            .any(|s| s.store_contract_id == store_contract_id)
-    }
-
     /// [`Self::settled_orders`], published.
     ///
     /// Each order once per tab. Between dispatching the update and the
@@ -4705,30 +4725,22 @@ impl AppState {
         &mut self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
-        // Only a tab that owns the store can publish TODAY, which is not the
-        // same as saying only the seller may.
+        // Whoever holds the claims publishes, and until harvest#75 that was
+        // the seller alone -- not because the network said so but because
+        // this app did. `store_ops::owned_store_key` resolved the contract
+        // key out of `my_stores`, so a buyer's send failed every time and was
+        // then suppressed here to stop a wall of apologies for a payment that
+        // was fine. The cost was that an order reached `Paid` on the network
+        // only when the seller opened the app -- which is precisely the case
+        // the purchase flow exists to survive.
         //
-        // `Paid` is authorized by evidence rather than by a signature, and
-        // the store contract accepts it from anyone holding the claims --
-        // [`Self::settled_orders`] says so, and says the buyer is simply the
-        // party who cares soonest. What stops a buyer is not the contract but
-        // `store_ops::owned_store_key`, which resolves the contract key from
-        // `my_stores`, so a buyer's send has never once succeeded.
-        //
-        // Given that, dispatching from a buyer's tab only produces a failure
-        // and an apology for a payment that was fine. That mattered little
-        // when it happened once per session; `publish_settled_orders` now
-        // runs on every address state arrival, and an unsettled order
-        // produces one every few minutes, so it would have become a growing
-        // wall of apologies on the screen of the buyer whose payment worked.
-        //
-        // The cost of stopping here is real and is not hidden: until a buyer
-        // can publish (freenet/harvest#75), an order reaches `Paid` on the
-        // network only when the seller opens the app. Recorded in
-        // `docs/untested-invariants.md` rather than left to be discovered.
-        if !self.owns_store(store_contract_id) {
-            return Vec::new();
-        }
+        // Nothing in the contract ever required it: `update_state` reads only
+        // the state and the parameters, `OrdersV1::apply_delta` verifies each
+        // record against the owner the current state names, and `Paid` is
+        // authorized by Bitcoin evidence and by no signature at all. So the
+        // key is rebuilt from the store contract id instead
+        // (`store_ops::submit_settled_order_by_id`), and this runs for a
+        // buyer's tab too.
 
         // Anything ambiguous goes to the seller rather than out on its own;
         // see `settlement_hold`. Rebuilt for this store on every call so an
@@ -4786,7 +4798,7 @@ impl AppState {
             let order_id = settled.order.id.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) =
-                    crate::gateway::store_ops::submit_order_by_id(&store_id, settled).await
+                    crate::gateway::store_ops::submit_settled_order_by_id(&store_id, settled).await
                 {
                     dioxus::logger::tracing::error!("Failed to publish a settled order: {e}");
                     crate::gateway::APP_STATE
@@ -4856,6 +4868,36 @@ impl AppState {
         store_contract_id: &[u8],
         keep: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
     ) -> Vec<[u8; 32]> {
+        let mut ids = Vec::new();
+        for order in self.our_orders(store_contract_id, keep) {
+            // `None` for an order naming no contract build: there is nothing
+            // to subscribe to, and guessing would subscribe to some other
+            // contract.
+            let Some(id) = order.order.bitcoin_address_instance_id() else {
+                continue;
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The orders at `store_contract_id` that this node is party to and
+    /// `keep` accepts: ones issued by one of its own identities, and ones it
+    /// bought.
+    ///
+    /// The single definition of "ours" for an order. Two copies could
+    /// disagree about whose payment addresses this node advertises an
+    /// interest in ([`Self::our_order_addresses`]) and about which orders a
+    /// payment could be confused between
+    /// ([`Self::refresh_same_address_orders`]), and those are the two
+    /// questions the scoping exists to answer.
+    fn our_orders(
+        &self,
+        store_contract_id: &[u8],
+        keep: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+    ) -> Vec<&harvest_common::payment::AuthorizedOrder> {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
@@ -4893,24 +4935,15 @@ impl AppState {
             Default::default()
         };
 
-        let mut ids = Vec::new();
+        let mut ours = Vec::new();
         for order in &store.orders {
-            let ours = bought.contains(&order.order.id)
+            let is_ours = bought.contains(&order.order.id)
                 || mine.contains(order.order.seller_fingerprint.as_str());
-            if !ours || !keep(order) {
-                continue;
-            }
-            // `None` for an order naming no contract build: there is nothing
-            // to subscribe to, and guessing would subscribe to some other
-            // contract.
-            let Some(id) = order.order.bitcoin_address_instance_id() else {
-                continue;
-            };
-            if !ids.contains(&id) {
-                ids.push(id);
+            if is_ours && keep(order) {
+                ours.push(order);
             }
         }
-        ids
+        ours
     }
 
     /// [`Self::address_contracts_to_watch`], subscribed.
@@ -5023,6 +5056,140 @@ impl AppState {
                         .write()
                         .bitcoin
                         .address_rereads
+                        .forget(&id, now_ms);
+                }
+            });
+        }
+    }
+
+    /// The chain-tip contracts worth asking about again (harvest#74).
+    ///
+    /// # Why the tip needs this at all
+    ///
+    /// `register_tip_contract_with_id` GETs and subscribes a network's tip
+    /// contract once, behind the insert-only `bitcoin.subscribed` set, and
+    /// nothing ever asks again -- the same shape #67 was about. A stale tip
+    /// is not a cosmetic wrong number: [`Self::settled_orders`] returns
+    /// nothing at all without a `signed_tip`, `assemble_on_chain_proof`
+    /// measures confirmation depth against it and so REFUSES a payment that
+    /// is deep enough, and [`Self::worth_watching_for_payment`] answers
+    /// `true` with no tip, which leaves the address re-reads with no bound.
+    /// So a node serving a stale tip reproduces #67's exact symptom -- a
+    /// confirmed payment reading as awaiting payment -- with the address
+    /// contract perfectly fresh.
+    ///
+    /// # Why it is nonetheless the less exposed of the two
+    ///
+    /// A tip contract gets an update per block, so its own update stream
+    /// heals a missed fan-out in about ten minutes, where an address contract
+    /// may receive exactly one update in its whole life. That argument is
+    /// worth keeping and is also not a guarantee: it assumes the update
+    /// stream is working, which is the assumption that failed in the first
+    /// place.
+    ///
+    /// # The bound
+    ///
+    /// "Some order is unsettled", not one per address: the networks of
+    /// `unsettled`, which the caller takes from
+    /// [`Self::due_address_rereads`]'s own `wanted` list. That is ONE rule
+    /// for when an order has stopped being worth asking about
+    /// ([`Self::address_contracts_to_reread`], which drops a settled order
+    /// and one whose anchor has aged out) rather than a second copy that
+    /// could disagree with it. With nothing unsettled this returns nothing,
+    /// so a tab that is only browsing never asks.
+    ///
+    /// Retired generations need no exclusion HERE, and a filter for them was
+    /// written and then removed rather than kept as insurance: the two sets
+    /// are disjoint by construction, because
+    /// [`Self::register_tip_contract_with_id`] REMOVES a replaced generation
+    /// from `tip_contract_network` on the way to putting it in
+    /// `retired_contracts`. A `retired_contracts` check here therefore could
+    /// not fire, and a guard that cannot fire is one nobody can verify --
+    /// deleting the map entry is what carries the exclusion, and
+    /// `only_a_live_tip_for_a_network_with_an_unsettled_order_is_asked_about`
+    /// is red when that deletion is removed.
+    ///
+    /// Sorted, because the map it walks has no order of its own and the
+    /// caller's spacing should not depend on the hasher.
+    pub fn tip_contracts_to_reread(&self, unsettled: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let mut networks: Vec<BitcoinNetwork> = Vec::new();
+        for id in unsettled {
+            let Some(network) = self.address_network_for(id) else {
+                continue;
+            };
+            if !networks.contains(&network) {
+                networks.push(network);
+            }
+        }
+        let mut ids: Vec<[u8; 32]> = self
+            .bitcoin
+            .tip_contract_network
+            .iter()
+            .filter(|(_, network)| networks.contains(network))
+            .filter_map(|(id, _)| <[u8; 32]>::try_from(id.as_slice()).ok())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Every chain-tip contract worth asking about again, and which of them
+    /// are due now (harvest#74).
+    ///
+    /// Takes `unsettled` from [`Self::due_address_rereads`] rather than
+    /// recomputing it, for the reason that method gives for computing it once
+    /// itself: the walk decrypts conversations and verifies a signature per
+    /// purchase, and it runs on the same tick.
+    ///
+    /// `&self` for the same reason too -- the decision is made under a READ
+    /// so a tick with nothing to send does not repaint the app.
+    pub fn due_tip_rereads(
+        &self,
+        unsettled: &[[u8; 32]],
+        now_ms: u64,
+    ) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        let wanted = self.tip_contracts_to_reread(unsettled);
+        let due = self.bitcoin.tip_rereads.due(&wanted, now_ms);
+        (wanted, due)
+    }
+
+    /// Send the GETs for `due`, recording each as asked for (harvest#74).
+    ///
+    /// No registration to do on the way out, unlike
+    /// [`Self::send_address_rereads`]: a tip contract is only ever reachable
+    /// here because `register_tip_contract_with_id` already put it in
+    /// `tip_contract_network`, which is the map that routes the answer.
+    ///
+    /// `wanted` is what prunes the tracker, so it must be the full set and
+    /// not just `due`.
+    pub fn send_tip_rereads(&mut self, wanted: &[[u8; 32]], due: &[[u8; 32]], now_ms: u64) {
+        self.bitcoin.tip_rereads.retain(wanted);
+        for id in due {
+            // Recorded BEFORE the send, so one tick cannot ask twice, and
+            // withdrawn below if the send turns out not to have happened.
+            self.bitcoin.tip_rereads.note_asked(*id, now_ms);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        for id in due.iter().copied() {
+            wasm_bindgen_futures::spawn_local(async move {
+                use dioxus::prelude::WritableExt;
+
+                let instance = freenet_stdlib::prelude::ContractInstanceId::new(id);
+                // Read WITHOUT subscribing, for the reason
+                // `send_address_rereads` gives: the subscription was made
+                // when the generation resolved, and re-registering this
+                // client's interest every few minutes is documented in core
+                // as non-idempotent. A re-read needs the answer, not another
+                // subscription.
+                if let Err(e) = crate::gateway::get_contract(&instance, false).await {
+                    dioxus::logger::tracing::warn!(
+                        "could not ask again for the Bitcoin chain tip: {e}"
+                    );
+                    crate::gateway::APP_STATE
+                        .write()
+                        .bitcoin
+                        .tip_rereads
                         .forget(&id, now_ms);
                 }
             });
@@ -5628,6 +5795,36 @@ impl AppState {
             return Some(key);
         }
         self.store_owner_fingerprint(store_contract_id)?;
+        let held = self.browsing_stores.get(store_contract_id)?.owner?;
+        ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
+    }
+
+    /// The owner a SETTLEMENT names, for any store -- one of ours or a
+    /// stranger's (harvest#75).
+    ///
+    /// [`Self::delta_owner_key`] answers only for stores this device has a
+    /// registration for, which is exactly the wrong shape for a buyer: the
+    /// store whose invoice they paid is not theirs. So a store that is not
+    /// ours falls through to the owner its LOADED STATE names, which is the
+    /// same key the contract will verify the record against -- `apply_delta`
+    /// checks every incoming order against `owner_key(parent_state)`, the
+    /// owner of the state already held, so naming the one we read is the only
+    /// answer that can be accepted and is a no-op for the owner field itself.
+    ///
+    /// `None` when the store's state has not arrived or names no owner, which
+    /// is the honest answer: a store with no owner can hold no signed record,
+    /// so there is no invoice to settle either.
+    ///
+    /// Only for the settlement, and named so. Anything signed still goes
+    /// through [`Self::store_owner_key`] and is refused for a store this
+    /// device cannot sign for.
+    pub fn settlement_owner_key(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Option<ed25519_dalek::VerifyingKey> {
+        if let Some(key) = self.delta_owner_key(store_contract_id) {
+            return Some(key);
+        }
         let held = self.browsing_stores.get(store_contract_id)?.owner?;
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
     }
@@ -8852,6 +9049,14 @@ pub struct BitcoinState {
     /// nothing tells the app when the node catches up, so an unsettled order
     /// asks again on a widening interval. See `crate::address_reread`.
     pub address_rereads: crate::address_reread::AddressRereads,
+    /// When each network's chain-tip contract was last asked for again
+    /// (harvest#74).
+    ///
+    /// The same tracker type and the same widening spacing as
+    /// `address_rereads`, in its OWN instance: the two sets are pruned
+    /// against different `wanted` lists, so sharing one would have each
+    /// forget the other's entries on every tick.
+    pub tip_rereads: crate::address_reread::AddressRereads,
 }
 
 impl BitcoinState {
@@ -17414,6 +17619,143 @@ mod buy_flow_tests {
         );
     }
 
+    /// What the periodic tick does for the chain tip (harvest#74): the same
+    /// decide-under-a-read, send-only-if-due shape as [`tick_rereads`], fed
+    /// the address tick's own `wanted` list so the two share one rule for
+    /// when an order is still unsettled.
+    fn tick_tip_rereads(state: &mut AppState, now_ms: u64) -> Vec<[u8; 32]> {
+        let (wanted, _) = state.due_address_rereads(now_ms);
+        let (tips_wanted, tips_due) = state.due_tip_rereads(&wanted, now_ms);
+        if !tips_due.is_empty() {
+            state.send_tip_rereads(&tips_wanted, &tips_due, now_ms);
+        }
+        tips_due
+    }
+
+    /// A tip contract id registered for `network`, as the bridge's
+    /// generation refresh would.
+    fn a_tip_contract(state: &mut AppState, network: BitcoinNetwork, id: [u8; 32]) -> [u8; 32] {
+        state.register_tip_contract_with_id(network, &bs58::encode(id).into_string());
+        id
+    }
+
+    /// **An order still awaiting payment asks for the chain tip again
+    /// (harvest#74).**
+    ///
+    /// The tip contract is GET-and-subscribed once, behind the same
+    /// insert-only marker #67 was about, and a stale tip is not a cosmetic
+    /// wrong number: `settled_orders` returns nothing at all without a
+    /// `signed_tip`, and `assemble_on_chain_proof` measures depth against it,
+    /// so a stale one REFUSES a payment that is deep enough. That reproduces
+    /// #67's exact symptom with the address contract perfectly fresh.
+    #[test]
+    fn an_unsettled_order_asks_for_the_chain_tip_again() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+        let tip_id = a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+
+        assert_eq!(
+            tick_tip_rereads(&mut state, 0),
+            vec![tip_id],
+            "an unsettled order is a reason to ask for the tip again"
+        );
+        // The ask is RECORDED, so the next tick a second later does not ask
+        // again. Without that the tip would be fetched once a tick for the
+        // life of the tab, which is the cost the widening spacing exists to
+        // bound.
+        assert!(
+            tick_tip_rereads(&mut state, 1_000).is_empty(),
+            "the tip was asked for again a second later"
+        );
+    }
+
+    /// **A network with nothing unsettled is not asked about, and neither is
+    /// a retired generation (harvest#74).**
+    ///
+    /// Two separate ways the bound can leak, asserted together because both
+    /// are "the set is wider than it should be" and a single wrong set would
+    /// satisfy neither. The order is on signet, so a testnet4 tip has no
+    /// reason to be asked for; and a generation a newer one replaced has its
+    /// arriving state ignored, so asking would spend a GET on an answer
+    /// nothing reads.
+    ///
+    /// The retired half is carried by `register_tip_contract_with_id`
+    /// deleting the replaced id from `tip_contract_network`, NOT by a filter
+    /// in `tip_contracts_to_reread`. A filter there was written first and
+    /// then removed: the two sets are disjoint by construction, so it could
+    /// never fire, and it survived the mutation that deleted it -- which is
+    /// how the dead branch was found. This test is red when the deletion in
+    /// `register_tip_contract_with_id` is removed instead.
+    #[test]
+    fn only_a_live_tip_for_a_network_with_an_unsettled_order_is_asked_about() {
+        let (order, _, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
+
+        let old = a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+        let other_network = a_tip_contract(&mut state, BitcoinNetwork::Testnet4, [8u8; 32]);
+        let live = a_tip_contract(&mut state, BitcoinNetwork::Signet, [9u8; 32]);
+        assert!(
+            state.bitcoin.retired_contracts.contains(old.as_slice()),
+            "the fixture must actually retire the older signet generation"
+        );
+        assert!(
+            !state
+                .bitcoin
+                .tip_contract_network
+                .contains_key(old.as_slice()),
+            "and retiring it must remove it from the map this walks"
+        );
+
+        let asked = tick_tip_rereads(&mut state, 0);
+        assert_eq!(asked, vec![live], "asked for {asked:?}");
+        assert!(!asked.contains(&old), "a retired generation was asked for");
+        assert!(
+            !asked.contains(&other_network),
+            "a network with nothing unsettled was asked about"
+        );
+    }
+
+    /// **A settled order stops the tip being asked about (harvest#74).**
+    ///
+    /// The bound is "some order is unsettled", and it is the address
+    /// re-read's own `wanted` list rather than a second copy of the rule --
+    /// so an order settling has to silence both. A tab that is only browsing
+    /// never asks at all, which is what stops this costing a GET a minute for
+    /// the life of every tab.
+    #[test]
+    fn a_settled_order_stops_the_tip_being_asked_about() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        a_tip_contract(&mut state, BitcoinNetwork::Signet, [7u8; 32]);
+
+        assert!(
+            !tick_tip_rereads(&mut state, 0).is_empty(),
+            "asked while the order is awaiting payment"
+        );
+
+        // Publish the settlement back into the store's state, as the network
+        // would once the update lands.
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        for existing in store.orders.iter_mut() {
+            if existing.order.id == settled.order.id {
+                *existing = settled.clone();
+            }
+        }
+
+        assert!(
+            state.due_tip_rereads(&[], 60_000).0.is_empty(),
+            "with nothing unsettled there is no tip worth asking for"
+        );
+        assert!(
+            tick_tip_rereads(&mut state, 60_000).is_empty(),
+            "a settled order does not keep asking for the tip"
+        );
+    }
+
     /// **An order nobody can pay any more stops being asked about.**
     ///
     /// What bounds a tab left open. The window is the one the watch requests
@@ -18013,34 +18355,148 @@ mod buy_flow_tests {
         );
     }
 
-    /// **A buyer's tab does not try to publish a settlement.**
+    /// **A buyer's tab publishes the settlement (harvest#75).**
     ///
-    /// It cannot succeed: the store contract takes an update signed with the
-    /// store's own key, which only the seller has. Before the re-reads that
-    /// cost one failed send and one apology per session. After them
-    /// `publish_settled_orders` runs on every address state arrival, so an
-    /// unsettled order produces one every few minutes, and the apology --
-    /// "your payment was seen on chain, but the order could not be updated
-    /// to say so" -- would pile up on the screen of the buyer whose payment
-    /// worked perfectly, for as long as the seller took to publish.
+    /// This test asserted the OPPOSITE until #75, and the reason given for it
+    /// was wrong rather than merely out of date: it said the store contract
+    /// "takes an update signed with the store's own key, which only the
+    /// seller has". It does not. `Paid` is authorized by Bitcoin evidence and
+    /// by no signature at all, `update_state` inspects no origin, and
+    /// `OrdersV1::apply_delta` verifies each record against the owner the
+    /// CURRENT STATE names -- so the network always accepted this from the
+    /// buyer. What refused it was `store_ops::owned_store_key`, resolving the
+    /// contract key out of `my_stores`.
+    ///
+    /// The cost of that was the whole of harvest#53's buyer half: an order
+    /// reached `Paid` on the network only when the seller opened the app, so
+    /// in the one case the purchase flow exists to survive -- the seller
+    /// takes the money and vanishes -- the public record stayed
+    /// `AwaitingPayment` forever.
     #[test]
-    fn a_buyers_tab_does_not_try_to_publish() {
+    fn a_buyers_tab_publishes_the_settlement() {
         let (order, claims, tip) = a_paid_order();
         let (mut state, _) = buyer_after_acceptance(&order);
         give_the_node_the_chain(&mut state, &order, claims, tip);
+        assert!(
+            state.my_stores.is_empty(),
+            "the fixture must be a buyer: this store is not one of theirs"
+        );
 
         assert_eq!(
             state.settled_orders(STORE).len(),
             1,
             "the buyer can see the payment settles the order"
         );
+
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(published.len(), 1, "the buyer's tab published nothing");
+        assert_eq!(published[0].order.id, order.order.id);
         assert!(
-            state.publish_settled_orders(STORE).is_empty(),
-            "but does not attempt a publish only the seller can make"
+            state.settlements_submitted.contains(&order.order.id),
+            "and it is recorded as submitted, so one arrival cannot send it twice"
         );
         assert!(
-            state.settlements_submitted.is_empty(),
-            "and nothing is recorded as submitted"
+            state.withheld_settlements.is_empty(),
+            "nothing was ambiguous, so nothing is waiting on a seller"
+        );
+    }
+
+    /// **A settlement for a store that is not ours names the owner that
+    /// store's own state names (harvest#75).**
+    ///
+    /// The other half of the buyer's publish, and the half a native test can
+    /// reach: the delta has to name an owner, and `delta_owner_key` answers
+    /// only for stores this device has a registration for -- which is exactly
+    /// the wrong shape for a buyer. It must fall through to the owner the
+    /// loaded state names, because that is the key `apply_delta` will verify
+    /// the record against.
+    ///
+    /// `None` when the state names no owner is not an oversight: a store with
+    /// no owner can hold no signed record, so there is no invoice to settle.
+    #[test]
+    fn a_settlement_names_the_owner_the_stores_own_state_names() {
+        let (order, _, _) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        let seller = seller_signing_key().verifying_key();
+
+        assert!(
+            state.delta_owner_key(STORE).is_none(),
+            "the store is not one of ours, so the owned path must not answer"
+        );
+        assert!(
+            state.settlement_owner_key(STORE).is_none(),
+            "and with no owner in the loaded state there is nothing to name"
+        );
+
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .owner = Some(seller.to_bytes());
+        assert_eq!(
+            state.settlement_owner_key(STORE),
+            Some(seller),
+            "a buyer's settlement names the owner the store's state names"
+        );
+    }
+
+    /// **One payment does not settle two of a BUYER's orders sharing one
+    /// address (harvest#75, the guard it would otherwise bypass).**
+    ///
+    /// `settlement_hold` withholds a provable payment when another
+    /// uncancelled order on the same address has an overlapping window,
+    /// because nothing on the chain says which order a payment was for. It
+    /// was fed by `refresh_same_address_orders`, which scanned OWN STORES
+    /// ONLY -- correct while only a seller could publish, and blind in
+    /// exactly the wrong direction once a buyer can: a buyer's two purchases
+    /// from one address-reusing seller both sit in that seller's store, which
+    /// is nobody's own store here.
+    ///
+    /// `docs/untested-invariants.md` recorded that as the thing #75 would
+    /// bypass. This is it not bypassed.
+    #[test]
+    fn one_payment_does_not_settle_two_of_a_buyers_orders_on_one_address() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, tag) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        // A second acceptance from the same seller for a second order on the
+        // SAME payment script -- the address-reuse case.
+        let conversation_id = state.browsing_stores[STORE].conversations[0]
+            .conversation_id
+            .clone();
+        let mut twin = order.clone();
+        twin.order.amount_sats += 1;
+        let twin = resigned(twin, &seller_signing_key());
+        assert_eq!(
+            twin.order.payment_script_pubkey, order.order.payment_script_pubkey,
+            "the twin must reuse the address, or this test proves nothing"
+        );
+        let acceptance = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&tag),
+            &tag,
+            &conversation_id,
+            &twin.order.id,
+        )
+        .expect("the seller seals the second acceptance");
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("the store");
+            store.orders.push(twin);
+            store.mailbox_messages.push(acceptance);
+        }
+        state.refresh_same_address_orders();
+
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "a payment that could belong to either order was published anyway"
+        );
+        assert!(matches!(
+            state.settlement_hold(&order.order),
+            Some(SettlementHold::Twins(_))
+        ));
+        assert!(
+            state.withheld_settlements.contains_key(&order.order.id),
+            "and it is held rather than dropped"
         );
     }
 

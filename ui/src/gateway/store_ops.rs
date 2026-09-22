@@ -164,20 +164,36 @@ pub fn store_contract_key(
             .map_err(|e| format!("deserialize stored contract key: {e}"));
     }
 
-    let instance_id: [u8; 32] = registration
-        .store_contract_id
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            format!(
-                "store contract id is {} bytes, not 32",
-                registration.store_contract_id.len()
-            )
-        })?;
-    let code_hash = *ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash();
     Ok((
-        ContractKey::from_id_and_code(ContractInstanceId::new(instance_id), code_hash),
+        reconstruct_store_key(&registration.store_contract_id)?,
         KeyOrigin::Reconstructed,
+    ))
+}
+
+/// A store's `ContractKey` built from its contract id alone.
+///
+/// The reconstruction half of [`store_contract_key`], split out because it
+/// needs nothing but the id: a `ContractKey` is an instance id plus a code
+/// hash, the instance id IS the store contract id, and the code hash is the
+/// hash of the store contract this build bundles. Neither half comes from
+/// `my_stores`, which is what lets a BUYER address a seller's store contract
+/// (harvest#75) -- a store nobody on this device has a registration for.
+///
+/// It carries the same limit [`store_contract_key`] records: a store
+/// published under an OLDER store contract has a different code hash, so the
+/// rebuilt key names a contract that does not exist. That is why every caller
+/// is told its key was reconstructed and says so when a send fails.
+pub fn reconstruct_store_key(store_contract_id: &[u8]) -> Result<ContractKey, String> {
+    let instance_id: [u8; 32] = store_contract_id.try_into().map_err(|_| {
+        format!(
+            "store contract id is {} bytes, not 32",
+            store_contract_id.len()
+        )
+    })?;
+    let code_hash = *ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash();
+    Ok(ContractKey::from_id_and_code(
+        ContractInstanceId::new(instance_id),
+        code_hash,
     ))
 }
 
@@ -451,6 +467,106 @@ fn owned_store_key(
     Ok((key, origin, owner))
 }
 
+/// The contract key of ANY store a settlement may be published to, ours or
+/// not, how it was found, and the owner the delta has to name (harvest#75).
+///
+/// # Why this exists beside `owned_store_key`
+///
+/// `Paid` is authorized by Bitcoin evidence and by no signature at all
+/// (`AuthorizedOrder::fields_used` marks `status_signature` unused for it),
+/// and the store contract adds no origin check: `update_state` reads nothing
+/// but the state and the parameters, and `OrdersV1::apply_delta` verifies each
+/// record against the owner key the CURRENT STATE names. So any peer holding
+/// the claims may publish the transition, and the buyer is the party who
+/// cares soonest.
+///
+/// What stopped them was this module, not the network:
+/// [`owned_store_key`] resolves the key out of `my_stores` and fails with
+/// "this store is not one of yours", so a buyer's settlement had never once
+/// been sent. A `ContractKey` needs no registration -- see
+/// [`reconstruct_store_key`].
+///
+/// # Why it is still not `owned_store_key`'s replacement
+///
+/// Everything else a store publishes -- a listing, its details, an invoice --
+/// is authorized by the OWNER'S SIGNATURE, so resolving a key for one without
+/// a registration would only build an unsignable update. Those keep asking
+/// for ownership. This is for the one transition that needs no signature, and
+/// it is named for that rather than for the key it returns, so a later caller
+/// cannot reach for it by accident.
+///
+/// A store we DO own still prefers its recorded key when it has one: the
+/// reconstruction is right only for a store published under the store
+/// contract this build bundles, and the recorded key is right for any.
+#[cfg(target_arch = "wasm32")]
+fn settlement_store_key(
+    store_contract_id: &[u8],
+) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
+    use dioxus::prelude::ReadableExt;
+
+    let state = super::APP_STATE.read();
+    let owner = state
+        .settlement_owner_key(store_contract_id)
+        .ok_or("this store's owner key is not known here, so a settlement cannot name it")?;
+    match state
+        .my_stores
+        .values()
+        .flat_map(|stores| stores.iter())
+        .find(|s| s.store_contract_id == store_contract_id)
+    {
+        Some(registration) => {
+            let (key, origin) = store_contract_key(registration)?;
+            Ok((key, origin, owner))
+        }
+        None => Ok((
+            reconstruct_store_key(store_contract_id)?,
+            KeyOrigin::Reconstructed,
+            owner,
+        )),
+    }
+}
+
+/// Publish a settled order -- the `Paid` transition -- to its store contract.
+///
+/// Separate from [`submit_order_by_id`] because it resolves the key through
+/// [`settlement_store_key`] rather than through ownership: the record is
+/// authorized by the evidence it carries, so a buyer may send it
+/// (harvest#75). Everything about the send itself is identical.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_settled_order_by_id(
+    store_contract_id: &[u8],
+    order: harvest_common::payment::AuthorizedOrder,
+) -> Result<(), String> {
+    use dioxus::logger::tracing::{info, warn};
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, origin, owner) = settlement_store_key(store_contract_id)?;
+    if origin == KeyOrigin::Reconstructed {
+        warn!("Store contract key rebuilt from the bundled store contract");
+    }
+
+    let id = order.order.id.short();
+    let delta_bytes = orders_delta_bytes(owner, vec![order])?;
+
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await
+    .map_err(|e| match origin {
+        KeyOrigin::Reconstructed => format!(
+            "{e} -- this store's contract key was rebuilt from the store \
+             contract this version of Harvest bundles. If the store was \
+             created with an older version, that key is wrong and the \
+             settlement cannot be published."
+        ),
+        KeyOrigin::Recorded => e,
+    })?;
+
+    info!("Published the settled order {} to its store contract", id);
+    Ok(())
+}
+
 /// Submit a signed listing to a store contract.
 ///
 /// Resolves the store's `ContractKey` (see `store_contract_key`) and sends
@@ -662,6 +778,48 @@ mod tests {
             key.code_hash(),
             ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash(),
             "the code hash must come from the bundled store contract"
+        );
+    }
+
+    /// **A buyer can address a seller's store contract with no registration
+    /// at all (harvest#75).**
+    ///
+    /// This is the whole of #75's key problem. `Paid` needs no signature, so
+    /// a buyer holding the Bitcoin evidence may publish it -- but every path
+    /// to a `ContractKey` went through `my_stores`, and a buyer has no
+    /// registration for the seller's store. Both halves of the key are
+    /// derivable without one: the instance id IS the store contract id, and
+    /// the code hash is the bundled contract's.
+    ///
+    /// Asserted against `store_contract_key`'s reconstructed answer rather
+    /// than against a hand-built key, so the two cannot drift into addressing
+    /// different contracts for one store.
+    #[test]
+    fn a_store_can_be_addressed_without_owning_it() {
+        let rebuilt = reconstruct_store_key(&[3u8; 32]).expect("should rebuild");
+        let (via_registration, origin) =
+            store_contract_key(&registration(None)).expect("should rebuild");
+
+        assert_eq!(origin, KeyOrigin::Reconstructed);
+        assert_eq!(rebuilt.id().as_bytes(), &[3u8; 32]);
+        assert_eq!(rebuilt.id(), via_registration.id());
+        // `ContractKey`'s `PartialEq` ignores the code hash, so comparing the
+        // keys would pass with two different contracts -- the same trap
+        // `the_two_ways_to_address_a_mailbox_agree` records.
+        assert_eq!(
+            rebuilt.code_hash(),
+            via_registration.code_hash(),
+            "the two ways to address one store must name the same contract"
+        );
+        assert_eq!(
+            rebuilt.code_hash(),
+            ContractCode::from(STORE_CONTRACT_WASM.to_vec()).hash(),
+            "the code hash must come from the bundled store contract"
+        );
+
+        assert!(
+            reconstruct_store_key(&[3u8; 31]).is_err(),
+            "an id that is not 32 bytes is refused rather than padded"
         );
     }
 
