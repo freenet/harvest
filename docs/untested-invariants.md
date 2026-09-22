@@ -1120,9 +1120,11 @@ that makes it testable is to split the state change out of the spawned send,
 as `on_subkeys_request_failed`, `on_index_publish_failed`,
 `on_index_watch_failed`, `on_indexed_store_load_failed`,
 `on_certificate_request_failed`, `on_custody_send_failed`,
-`on_tip_subscribe_failed`, `on_mailbox_subscribe_failed` and
-`on_own_store_subscribe_send_failed` all now do -- then the release is
-reachable off-target and can be mutation-checked.
+`on_tip_subscribe_failed`, `on_mailbox_subscribe_failed`,
+`on_own_store_subscribe_send_failed`, `on_address_subscribe_failed`,
+`on_conversation_key_request_failed`, `on_buyer_conversations_recall_failed`
+and `on_store_remember_failed` all now do -- then the release is reachable
+off-target and can be mutation-checked.
 
 **How it was found, which is the part worth copying.** Three instances turned
 up during the #93 phase-1 review, each spotted by a DIFFERENT reviewer, each
@@ -1149,11 +1151,20 @@ no backoff and nothing said. One fix in this round introduced exactly that --
 afterwards. Cap the attempts and surface the failure at the cap:
 `MAX_INDEX_PUBLISH_ATTEMPTS`, `MAX_CUSTODY_SEND_ATTEMPTS`.
 
-**Six remaining instances are tracked in harvest#107.** The three that block
-a purchase -- the Bitcoin tip contract subscribe, the mailbox subscribe, and
-the `store_state_unavailable` inverse described above -- are fixed in the PR
-immediately after the phase-1 stack (`on_tip_subscribe_failed`,
+**All six instances tracked in harvest#107 are now fixed.** The three that
+block a purchase -- the Bitcoin tip contract subscribe, the mailbox
+subscribe, and the `store_state_unavailable` inverse described above -- were
+fixed in the PR immediately after the phase-1 stack (`on_tip_subscribe_failed`,
 `on_mailbox_subscribe_failed`, `on_own_store_subscribe_send_failed`). The
-remaining three (`bitcoin.subscribed`'s watch-contract flavor, conversation
-key requests, buyer conversation recalls / `stores_remembered`) are
-deliberately left for a follow-on PR.
+remaining three -- `bitcoin.subscribed`'s watch-contract flavor
+(`register_watch_contract`, `watch_purchase_addresses`), conversation key
+requests (`ask_for_conversation_keys`), and buyer conversation recalls /
+`stores_remembered` (`recall_buyer_conversations`, `remember_store`, and the
+queued `RememberStore` path in `sync_remembered_stores`) -- were fixed in the
+follow-on PR (`on_address_subscribe_failed`, `on_conversation_key_request_failed`,
+`on_buyer_conversations_recall_failed`, `on_store_remember_failed`).
+`pending_conversation_key_requests` is a deliberate exception to the bounded-cap
+shape: it is released unconditionally on any send failure, mirroring the
+delegate-`Err`-answer path that already existed for the same marker, because it
+is an ephemeral per-attempt map rather than a persistent "asked once ever"
+latch like the other five.

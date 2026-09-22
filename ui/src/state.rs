@@ -2051,7 +2051,14 @@ fn subscribe_to_own_store(contract_id: Vec<u8>) {
 /// GET-and-subscribe a Bitcoin address contract, shared by a manual watch
 /// (`register_watch_contract`) and an order's payment address
 /// (`watch_purchase_addresses`) -- both claim the same `bitcoin.subscribed`
-/// marker before this send.
+/// marker before this send. A tip contract (`register_tip_contract_with_id`)
+/// claims the same set too, through its own separate counter
+/// (`tip_subscribe_failures`) and its own release logic
+/// (`on_tip_subscribe_failed`) -- deliberately NOT this function's shape,
+/// because a tip's re-trigger (the bridge's genuinely periodic 10-minute
+/// generation refresh) is the opposite case from these two callers' (review
+/// finding, skeptical lens: `bitcoin.subscribed` has three claimants total,
+/// not two).
 ///
 /// The failure arm used to only log (#107, marker sweep): nothing released
 /// `subscribed`, so a transient failure to send meant the address was never
@@ -2383,6 +2390,21 @@ impl AppState {
                 match delegate_key.clone() {
                     Some(key) => send_remember_store_request(store_code.clone(), key, request),
                     None => {
+                        // Unreachable today -- the only production call site
+                        // (`components::app`) calls this immediately after
+                        // setting `harvest_delegate_key`, which is never
+                        // reset to `None` outside tests -- guarded anyway
+                        // rather than relied upon, matching `remember_store`'s
+                        // and `recall_buyer_conversations`'s identical
+                        // defensive arms (review finding, skeptical +
+                        // code-first lenses). Unlike its self-retrying
+                        // siblings, this arm has no internal timer: were this
+                        // path ever reached by a future change (a reconnect
+                        // flow resetting the delegate key), a single failure
+                        // here would need `sync_remembered_stores` to be
+                        // called again externally to make further progress,
+                        // same as the pre-fix bug, until such a caller
+                        // exists.
                         self.on_store_remember_failed(
                             store_code,
                             "Harvest delegate not registered",
@@ -20650,9 +20672,16 @@ mod store_code_tests {
     /// the delegate registers) shares `stores_remembered` with the direct
     /// path and has the identical defect if left unfixed: a queued code
     /// whose send fails would stay claimed forever with nothing to release
-    /// it. Here every attempt fails identically (no delegate ever
-    /// registers), so repeated calls walk it through the same bounded cap
-    /// as the direct path.
+    /// it.
+    ///
+    /// The repeated call + requeue below is a stand-in for a HYPOTHETICAL
+    /// future re-drive of this path (review finding, skeptical lens):
+    /// `sync_remembered_stores`'s "no delegate" arm has no self-retry timer
+    /// of its own (see its doc comment), and production calls this function
+    /// exactly once per delegate registration, so nothing today actually
+    /// loops it this way. What this test pins is that IF something does
+    /// call it again, the bounded cap and eventual release still hold --
+    /// not that this calling pattern occurs in the running app.
     #[test]
     fn a_queued_store_remember_failure_releases_the_claim() {
         let mut state = AppState::default();
