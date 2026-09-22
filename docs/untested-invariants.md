@@ -966,6 +966,27 @@ test, original file restored after each), unless the row says otherwise.
 | `gateway/index_ops::index_contract_key` | The index address this build derives is the one the node computes. | **Yes** -- `the_derived_index_key_is_the_one_the_node_computes`. |
 | Decision 6.2 before the backer's index arrives | A reader shows a key's stake as still being checked until it has the key's index. | **No, not built.** It shows the verdict from the stores it has loaded. |
 
+### A listing's certificate: harvest#118 (added 2026-09-22)
+
+Since harvest#93 the store key signs listings, and its answer carries no
+certificate, so the Ghost Key's certificate has to be attached before the
+listing is sent for signing. Until #118 only store creation and the
+store-edit form ever asked the vault for it, so a listing added in any other
+session went out with an empty certificate: buyers were told it was "not this
+seller's" and given no Buy button. Other signed records were checked for the
+same shape and do not have it: store details wait on the certificate
+(`start_store_edit_if_ready`), store creation and its backing statement wait
+on it (`start_store_creation_if_ready`), orders carry no certificate, and
+watch requests are signed by the vault, whose answer brings its own.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `backing_flow.rs::queue_listing_signature` | A listing is never sent for signing without the Ghost Key's certificate; with none cached it waits in `listings_awaiting_certificate`, the vault is asked, and the certificate's arrival releases it carrying the certificate. | **Yes** -- `a_listing_added_without_a_cached_certificate_waits_for_it_and_carries_it`, `every_listing_waiting_on_a_certificate_is_released_by_it_alone`; red with the pre-fix behaviour restored (signed at once, certificate taken from the cache or left empty), and the first also red with the listing no longer counted in `user_signature_under_way`. The `GetCertificate` send is wasm-only. |
+| `drop_vault_signatures`, `on_certificate_request_failed`, `watch_signature_failed` | A listing whose certificate cannot be had is dropped with a notification naming it, and stops holding the vault (`user_signature_under_way`). | **Yes** -- `a_listing_whose_certificate_cannot_be_had_is_dropped_visibly`, `a_named_watch_refusal_drops_a_listing_waiting_on_that_keys_certificate`, `an_empty_certificate_drops_the_listing_rather_than_publishing_it`; red with the drop removed from each of the three in turn, and with an empty certificate accepted on release. |
+| `state.rs::on_signature`, `PendingSignature::Listing` | A signed listing with no certificate is not published, whatever queued it. | **Yes** -- `a_signed_listing_with_no_certificate_is_not_published`; red with the check removed. |
+| A listing waiting on the certificate | Is released or dropped eventually. | **No.** Like `pending_store_edit`, there is no timeout: a vault that never answers `GetCertificate` leaves it waiting, and the vault held, until a reload. |
+| Listings published before #118 with no certificate | Become buyable. | **No.** They stay flagged, and the store's listings are grow-only, so nothing removes them. Adding the listing again publishes a buyable copy under a new id (the id derives from the terms, which include `created_at`); the flagged original stays beside it until #70 can mark it unavailable. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

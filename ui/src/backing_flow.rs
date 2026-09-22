@@ -399,23 +399,138 @@ impl AppState {
 
     /// Queue a listing for the store key's signature, for the store
     /// `store_contract_id`, which must be one of ours with a store key.
+    ///
+    /// The listing has to carry the certificate of the Ghost Key
+    /// `fingerprint`, and the store key's answer brings none (harvest#93), so
+    /// it is attached here, before signing. When this device has not fetched
+    /// that certificate yet -- any session in which the seller neither
+    /// created the store nor edited its details, which is the ordinary one --
+    /// the listing waits in `listings_awaiting_certificate` and the vault is
+    /// asked for it. It is never sent without one: before #118 it went out
+    /// with an empty certificate, and every buyer was told it was not the
+    /// seller's and offered no way to buy it.
     pub(crate) fn queue_listing_signature(
         &mut self,
         store_contract_id: Vec<u8>,
         fingerprint: String,
         listing: Listing,
     ) -> Result<(), String> {
-        let store_key = self
-            .store_owner_key(&store_contract_id)
+        if self.store_owner_key(&store_contract_id).is_none() {
+            return Err(crate::state::NO_STORE_KEY_MESSAGE.to_string());
+        }
+        let mut pending = crate::state::PendingListing {
+            fingerprint,
+            listing,
+            store_contract_id: Some(store_contract_id),
+            certificate_pem: String::new(),
+        };
+        if let Some(pem) = self.certificate_for(&pending.fingerprint) {
+            pending.certificate_pem = pem;
+            return self.request_listing_signature(pending);
+        }
+        // One request per Ghost Key: a second listing added before the
+        // answer rides on the first's.
+        let already_asked = self
+            .listings_awaiting_certificate
+            .iter()
+            .any(|waiting| waiting.fingerprint == pending.fingerprint);
+        let fingerprint = pending.fingerprint.clone();
+        dioxus::logger::tracing::info!(
+            "Listing \"{}\" is waiting on the certificate for {fingerprint}",
+            pending.listing.title
+        );
+        self.listings_awaiting_certificate.push(pending);
+        if !already_asked {
+            #[cfg(target_arch = "wasm32")]
+            crate::state::request_certificate(fingerprint);
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = fingerprint;
+        }
+        Ok(())
+    }
+
+    /// The certificate this device holds for the Ghost Key `fingerprint`, if
+    /// it holds a usable one.
+    fn certificate_for(&self, fingerprint: &str) -> Option<String> {
+        self.certificates
+            .get(fingerprint)
+            .filter(|pem| !pem.trim().is_empty())
+            .cloned()
+    }
+
+    /// Send a listing that already carries its certificate for the store
+    /// key's signature.
+    fn request_listing_signature(
+        &mut self,
+        pending: crate::state::PendingListing,
+    ) -> Result<(), String> {
+        debug_assert!(!pending.certificate_pem.trim().is_empty());
+        let store_key = pending
+            .store_contract_id
+            .as_deref()
+            .and_then(|id| self.store_owner_key(id))
             .ok_or(crate::state::NO_STORE_KEY_MESSAGE)?;
-        self.request_store_key_signature(
-            PendingSignature::Listing(crate::state::PendingListing {
-                fingerprint,
-                listing,
-                store_contract_id: Some(store_contract_id),
-            }),
-            store_key.to_bytes(),
-        )
+        self.request_store_key_signature(PendingSignature::Listing(pending), store_key.to_bytes())
+    }
+
+    /// A certificate response for `fingerprint` has arrived: send the
+    /// listings waiting on it for signing, or, if the vault answered with no
+    /// certificate at all, drop them and say so rather than wait forever.
+    pub(crate) fn release_listings_awaiting_certificate(&mut self, fingerprint: &str) {
+        let (ready, waiting): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.listings_awaiting_certificate)
+                .into_iter()
+                .partition(|pending| pending.fingerprint == fingerprint);
+        self.listings_awaiting_certificate = waiting;
+        if ready.is_empty() {
+            return;
+        }
+        let Some(pem) = self.certificate_for(fingerprint) else {
+            self.drop_listings(
+                ready,
+                "the vault returned no certificate for your Ghost Key",
+            );
+            return;
+        };
+        for mut pending in ready {
+            pending.certificate_pem = pem.clone();
+            let title = pending.listing.title.clone();
+            if let Err(e) = self.request_listing_signature(pending) {
+                self.notifications
+                    .push(format!("Your listing \"{title}\" was not published: {e}"));
+            }
+        }
+    }
+
+    /// Give up on the listings waiting on a certificate -- those for
+    /// `fingerprint`, or all of them for `None` -- because it is not coming.
+    ///
+    /// Each is named in a notification, so the seller knows to add it again.
+    /// A parked listing also counts as vault work under way
+    /// (`user_signature_under_way`), which holds back custody and watch
+    /// requests, so leaving one parked after its answer failed would stall
+    /// those for the rest of the session.
+    pub(crate) fn drop_listings_awaiting_certificate(
+        &mut self,
+        fingerprint: Option<&str>,
+        why: &str,
+    ) {
+        let (dropped, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.listings_awaiting_certificate)
+                .into_iter()
+                .partition(|pending| fingerprint.is_none_or(|fp| pending.fingerprint == fp));
+        self.listings_awaiting_certificate = kept;
+        self.drop_listings(dropped, why);
+    }
+
+    fn drop_listings(&mut self, dropped: Vec<crate::state::PendingListing>, why: &str) {
+        for pending in dropped {
+            self.notifications.push(format!(
+                "Your listing \"{}\" was not published: this device could not get your Ghost \
+                 Key's certificate ({why}). Add it again to retry.",
+                pending.listing.title
+            ));
+        }
     }
 
     /// The store a new listing from the Ghost Key `fingerprint` goes to: the
