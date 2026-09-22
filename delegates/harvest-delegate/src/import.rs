@@ -55,6 +55,31 @@ use harvest_common::{from_cbor, to_cbor};
 /// module docs for why reproducing it is sound).
 const PRED_WIP_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-wip:";
 
+/// The TRAVELLING record that a predecessor's secrets were folded into this
+/// generation: `harvest:folded:` and the predecessor's key in hex.
+///
+/// The completion marker above is per-successor and must not travel -- it
+/// says THIS delegate imported that predecessor. This one says something that
+/// stays true for whoever imports this delegate's export in full: everything
+/// the predecessor held, bar what this generation since deleted, is in what
+/// you just imported. So it sits under `harvest:`, is exported, and a later
+/// generation that finds it treats that predecessor as done
+/// ([`get_marker`]). Without it every delegate re-key would walk every
+/// generation back to V5 again and bring back what a newer one deleted -- a
+/// forgotten conversation, an unwatched address -- because each generation's
+/// seals stay behind with it.
+///
+/// Hex, never raw bytes: a key run through a lossy UTF-8 conversion aliases.
+pub(crate) fn folded_key(predecessor: &[u8; 32]) -> Vec<u8> {
+    let mut key = b"harvest:folded:".to_vec();
+    key.extend_from_slice(hex_lower(predecessor).as_bytes());
+    key
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn done_key(predecessor: &[u8; 32]) -> Vec<u8> {
     [PRED_DONE_MARKER_KEY_PREFIX, predecessor.as_slice()].concat()
 }
@@ -79,6 +104,11 @@ pub(crate) fn get_marker<S: SecretStore>(
         Some(PredecessorMarkerState::Done {
             had_data: flag(&value),
         })
+    } else if store.has_secret(&folded_key(&predecessor)) {
+        // Folded into a generation this delegate has imported: its data came
+        // in with that one. Data-bearing, so the walk treats it as a snapshot
+        // it already has rather than as an empty generation.
+        Some(PredecessorMarkerState::Done { had_data: true })
     } else {
         store
             .get_secret(&wip_key(&predecessor))
@@ -107,10 +137,18 @@ pub(crate) fn record_marker<S: SecretStore>(
     } else {
         PRED_DONE_MARKER_VALUE_EMPTY
     };
+    let mut recorded = store.set_secret(&key, value);
+    if recorded && matches!(marker, PredecessorMarkerState::Done { .. }) {
+        // And the travelling record, so the NEXT generation does not walk
+        // this predecessor again. Reported with the marker: a `Done` whose
+        // travelling half did not land would let the next re-key bring back
+        // what this generation deleted.
+        recorded = store.set_secret(&folded_key(&predecessor), b"1");
+    }
     HarvestDelegateResponse::PredecessorMarkerRecorded {
         predecessor,
         marker,
-        recorded: store.set_secret(&key, value),
+        recorded,
     }
 }
 
@@ -129,28 +167,77 @@ pub(crate) fn import<S: SecretStore>(
     }
 }
 
+/// Which import rule a secret key falls under.
+///
+/// An explicit enum rather than a chain of prefix tests, so that every key
+/// shape this delegate writes is decided on purpose: `every_key_shape_has_a_family`
+/// fails for a new shape until somebody says which rule it needs. The shape
+/// that falls through silently is the ghostkeys/Delta failure -- a list
+/// imported as a standalone value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Family {
+    /// Not a Harvest secret, or a store key (recovered through custody).
+    Refused,
+    /// A Ghost Key's store registrations: merged by store contract id.
+    StoreRegistry,
+    /// The transaction index: merged as a set of ids.
+    TransactionIndex,
+    /// The Bitcoin watch list: merged by (network, script).
+    Watches,
+    /// Half of a Ghost Key's RSA reputation keypair: only ever imported so
+    /// that the two halves held afterwards are a pair.
+    RsaHalf,
+    /// The payment key and its derivation counter: the counter is raised to
+    /// the higher of the two when both sides hold the same key.
+    PaymentXpub,
+    /// A buyer's kept conversation: capped.
+    BuyerConversation,
+    /// A remembered store: capped.
+    KnownStore,
+    /// Everything else: written only if absent.
+    Standalone,
+}
+
+/// The rule for `key`.
+pub(crate) fn family(key: &[u8]) -> Family {
+    use harvest_common::migration::SECRET_KEY_PREFIX;
+    if !key.starts_with(SECRET_KEY_PREFIX)
+        || key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
+    {
+        // An export covers `harvest:` only, so a foreign key is not something
+        // any predecessor sends, and it could name anything in this
+        // delegate's namespace, the migration markers above included. A store
+        // key is never exported (`migration::WithoutStoreKeys`); custody
+        // recovers it.
+        Family::Refused
+    } else if key.starts_with(b"harvest:stores:") {
+        Family::StoreRegistry
+    } else if key == crate::handlers::TX_INDEX_KEY {
+        Family::TransactionIndex
+    } else if key == crate::bitcoin::BITCOIN_WATCHES_KEY {
+        Family::Watches
+    } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY {
+        Family::PaymentXpub
+    } else if key.starts_with(b"harvest:rsa_sk:") || key.starts_with(b"harvest:rsa_pk:") {
+        Family::RsaHalf
+    } else if key.starts_with(crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes()) {
+        Family::BuyerConversation
+    } else if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
+        Family::KnownStore
+    } else {
+        Family::Standalone
+    }
+}
+
 /// Import one secret by the rules of its family. See the module docs.
 pub(crate) fn import_secret<S: SecretStore>(
     store: &mut S,
     key: &[u8],
     value: &[u8],
 ) -> SecretImport {
-    use harvest_common::migration::SECRET_KEY_PREFIX;
-
-    if !key.starts_with(SECRET_KEY_PREFIX) {
-        // An export covers `harvest:` only, so this is not something any
-        // predecessor sends. Refused rather than written: it could name
-        // anything in this delegate's namespace, including the migration
-        // markers above.
-        return SecretImport::Permanent("not a Harvest secret".into());
-    }
-    if key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes()) {
-        // Never exported (`migration::WithoutStoreKeys`); a store key comes
-        // back through custody instead. Refused in case one ever arrives.
-        return SecretImport::Permanent("store keys are recovered through custody".into());
-    }
-    if key.starts_with(b"harvest:stores:") {
-        return merge_list(
+    match family(key) {
+        Family::Refused => SecretImport::Permanent("not an importable Harvest secret".into()),
+        Family::StoreRegistry => merge_list(
             store,
             key,
             value,
@@ -177,21 +264,19 @@ pub(crate) fn import_secret<S: SecretStore>(
                 }
                 added
             },
-        );
-    }
-    if key == crate::handlers::TX_INDEX_KEY {
-        return merge_list(store, key, value, |held: &mut Vec<String>, incoming| {
-            let before = held.len();
-            for id in incoming {
-                if !held.contains(&id) {
-                    held.push(id);
+        ),
+        Family::TransactionIndex => {
+            merge_list(store, key, value, |held: &mut Vec<String>, incoming| {
+                let before = held.len();
+                for id in incoming {
+                    if !held.contains(&id) {
+                        held.push(id);
+                    }
                 }
-            }
-            held.len() != before
-        });
-    }
-    if key == crate::bitcoin::BITCOIN_WATCHES_KEY {
-        return merge_list(
+                held.len() != before
+            })
+        }
+        Family::Watches => merge_list(
             store,
             key,
             value,
@@ -208,27 +293,119 @@ pub(crate) fn import_secret<S: SecretStore>(
                 }
                 held.len() != before
             },
-        );
-    }
-    if key.starts_with(crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes()) {
-        return copy_within_cap(
+        ),
+        Family::RsaHalf => import_rsa_half(store, key, value),
+        Family::PaymentXpub => import_payment_xpub(store, key, value),
+        Family::BuyerConversation => copy_within_cap(
             store,
             key,
             value,
             crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
             crate::messaging::MAX_BUYER_CONVERSATIONS,
-        );
+        ),
+        Family::KnownStore => crate::known_stores::import(store, key, value),
+        Family::Standalone => copy_if_absent(store, key, value),
     }
-    if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
-        return copy_within_cap(
-            store,
-            key,
-            value,
-            crate::known_stores::KNOWN_STORE_PREFIX.as_bytes(),
-            crate::known_stores::MAX_KNOWN_STORES,
-        );
+}
+
+/// The public half a PKCS#1 private key implies, as `handle_init_reputation_keys`
+/// stores it.
+fn rsa_public_of(sk_der: &[u8]) -> Option<Vec<u8>> {
+    use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
+    let sk = rsa::RsaPrivateKey::from_pkcs1_der(sk_der).ok()?;
+    sk.to_public_key()
+        .to_pkcs1_der()
+        .ok()
+        .map(|d| d.as_bytes().to_vec())
+}
+
+/// Import one half of a Ghost Key's RSA reputation keypair so that whatever
+/// this delegate holds afterwards is a PAIR.
+///
+/// The two halves are separate secrets (`handle_init_reputation_keys` writes
+/// them one after the other), and importing each never-clobber on its own can
+/// leave a private key from one generation beside a public key from another:
+/// `GetRsaPublicKey` then advertises a key the blind signatures do not use.
+/// So a half is written only if this delegate holds the matching half or
+/// neither; a half that contradicts the one held is refused `Permanent` --
+/// the held key is authoritative, and the contradiction is a property of the
+/// bytes, stable over time.
+fn import_rsa_half<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) -> SecretImport {
+    if store.has_secret(key) {
+        return SecretImport::AlreadyAuthoritative;
     }
-    copy_if_absent(store, key, value)
+    let is_private = key.starts_with(b"harvest:rsa_sk:");
+    let fingerprint = &key[b"harvest:rsa_sk:".len()..];
+    let other_key = [
+        if is_private {
+            &b"harvest:rsa_pk:"[..]
+        } else {
+            &b"harvest:rsa_sk:"[..]
+        },
+        fingerprint,
+    ]
+    .concat();
+    if let Some(other) = store.get_secret(&other_key) {
+        let pair = if is_private {
+            rsa_public_of(value).is_some_and(|public| public == other)
+        } else {
+            rsa_public_of(&other).is_some_and(|public| public == value)
+        };
+        if !pair {
+            return SecretImport::Permanent(
+                "this delegate holds the other half of a different RSA keypair for this identity"
+                    .into(),
+            );
+        }
+    }
+    written(store.set_secret(key, value))
+}
+
+/// Import the payment key and its derivation counter.
+///
+/// Never-clobber would be wrong in one case that matters: the seller entered
+/// the SAME account key on the new generation before the walk ran, so the new
+/// record restarted the counter (or recovered only the highest PUBLISHED
+/// index), while the predecessor's counter also covers addresses handed out
+/// and not yet published. Then the higher counter is taken; a lower one is
+/// never written back, and a different key on either side leaves this
+/// delegate's own record alone.
+fn import_payment_xpub<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) -> SecretImport {
+    use harvest_common::bitcoin_delegate::PaymentXpubStatus;
+    let Ok(incoming) = from_cbor::<Option<PaymentXpubStatus>>(value) else {
+        return SecretImport::Permanent("the predecessor's payment key did not decode".into());
+    };
+    let Some(incoming) = incoming else {
+        return SecretImport::AlreadyAuthoritative;
+    };
+    let held = match store.get_secret(key) {
+        None => None,
+        Some(bytes) => match from_cbor::<Option<PaymentXpubStatus>>(&bytes) {
+            Ok(held) => held,
+            Err(_) => {
+                return SecretImport::Retryable(
+                    "this delegate's own payment key did not decode".into(),
+                )
+            }
+        },
+    };
+    let merged = match held {
+        None => incoming,
+        Some(mut held) => {
+            if held.xpub != incoming.xpub
+                || held.network != incoming.network
+                || held.next_index >= incoming.next_index
+            {
+                return SecretImport::AlreadyAuthoritative;
+            }
+            held.next_index = incoming.next_index;
+            held
+        }
+    };
+    match to_cbor(&Some(merged)) {
+        Ok(bytes) => written(store.set_secret(key, &bytes)),
+        Err(_) => SecretImport::Retryable("could not encode the payment key".into()),
+    }
 }
 
 /// A standalone secret: written only if this delegate holds nothing under the
@@ -335,17 +512,23 @@ mod tests {
     #[test]
     fn a_held_secret_is_never_overwritten() {
         let mut store = MemSecrets::default();
-        store.set_secret(b"harvest:rsa_sk:fp1", b"newer");
+        store.set_secret(b"harvest:x25519_sk:fp1", b"newer");
         assert_eq!(
-            import_secret(&mut store, b"harvest:rsa_sk:fp1", b"older"),
+            import_secret(&mut store, b"harvest:x25519_sk:fp1", b"older"),
             SecretImport::AlreadyAuthoritative
         );
-        assert_eq!(store.get_secret(b"harvest:rsa_sk:fp1").unwrap(), b"newer");
         assert_eq!(
-            import_secret(&mut store, b"harvest:rsa_pk:fp1", b"pk"),
+            store.get_secret(b"harvest:x25519_sk:fp1").unwrap(),
+            b"newer"
+        );
+        assert_eq!(
+            import_secret(&mut store, b"harvest:x25519_sk:fp2", b"other"),
             SecretImport::Written
         );
-        assert_eq!(store.get_secret(b"harvest:rsa_pk:fp1").unwrap(), b"pk");
+        assert_eq!(
+            store.get_secret(b"harvest:x25519_sk:fp2").unwrap(),
+            b"other"
+        );
     }
 
     /// A store registry is merged, not skipped and not replaced: a store the
@@ -432,8 +615,8 @@ mod tests {
     #[test]
     fn a_full_family_is_retryable_and_not_overfilled() {
         let mut store = MemSecrets::default();
-        let prefix = crate::known_stores::KNOWN_STORE_PREFIX;
-        for i in 0..crate::known_stores::MAX_KNOWN_STORES {
+        let prefix = crate::messaging::BUYER_CONVERSATION_PREFIX_STR;
+        for i in 0..crate::messaging::MAX_BUYER_CONVERSATIONS {
             store.set_secret(format!("{prefix}{i:016}").as_bytes(), b"x");
         }
         let key = format!("{prefix}ZZZZZZZZZZZZZZZZ");
@@ -443,7 +626,7 @@ mod tests {
         ));
         assert_eq!(
             store.list_secrets(prefix.as_bytes()).len(),
-            crate::known_stores::MAX_KNOWN_STORES
+            crate::messaging::MAX_BUYER_CONVERSATIONS
         );
     }
 
@@ -453,7 +636,7 @@ mod tests {
     fn a_refused_write_is_retryable() {
         let mut store = MemSecrets::refusing_writes();
         assert!(matches!(
-            import_secret(&mut store, b"harvest:rsa_sk:fp1", b"sk"),
+            import_secret(&mut store, b"harvest:x25519_sk:fp1", b"sk"),
             SecretImport::Retryable(_)
         ));
         assert!(matches!(
@@ -558,5 +741,269 @@ mod tests {
             "{response:?}"
         );
         assert!(store.is_empty());
+    }
+
+    /// A real RSA keypair, minted the way the delegate mints one.
+    fn rsa_pair(fp: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut scratch = MemSecrets::default();
+        crate::handlers::handle(
+            &mut scratch,
+            Some(&crate::origin::test_origins::harvest()),
+            HarvestDelegateRequest::InitReputationKeys {
+                ghostkey_fingerprint: fp.into(),
+            },
+        );
+        (
+            scratch
+                .get_secret(format!("harvest:rsa_sk:{fp}").as_bytes())
+                .expect("sk"),
+            scratch
+                .get_secret(format!("harvest:rsa_pk:{fp}").as_bytes())
+                .expect("pk"),
+        )
+    }
+
+    /// Both halves of a predecessor's keypair arrive when this delegate holds
+    /// neither, in either order.
+    #[test]
+    fn an_rsa_pair_is_imported_whole() {
+        let (sk, pk) = rsa_pair("fp1");
+        let mut store = MemSecrets::default();
+        assert_eq!(
+            import_secret(&mut store, b"harvest:rsa_pk:fp1", &pk),
+            SecretImport::Written
+        );
+        assert_eq!(
+            import_secret(&mut store, b"harvest:rsa_sk:fp1", &sk),
+            SecretImport::Written
+        );
+        let mut store = MemSecrets::default();
+        assert_eq!(
+            import_secret(&mut store, b"harvest:rsa_sk:fp1", &sk),
+            SecretImport::Written
+        );
+        assert_eq!(
+            import_secret(&mut store, b"harvest:rsa_pk:fp1", &pk),
+            SecretImport::Written
+        );
+    }
+
+    /// **The half that would make a mismatched pair is refused.** A delegate
+    /// holding one half of ITS keypair must not gain the other half of a
+    /// predecessor's: `GetRsaPublicKey` would advertise one key while blind
+    /// signatures used another. Mutated red by dropping the pair check.
+    #[test]
+    fn a_half_from_another_keypair_is_refused() {
+        let (sk_old, pk_old) = rsa_pair("old");
+        let (sk_new, pk_new) = rsa_pair("new");
+        let mut store = MemSecrets::default();
+        store.set_secret(b"harvest:rsa_sk:fp1", &sk_new);
+        assert!(matches!(
+            import_secret(&mut store, b"harvest:rsa_pk:fp1", &pk_old),
+            SecretImport::Permanent(_)
+        ));
+        assert!(!store.has_secret(b"harvest:rsa_pk:fp1"));
+        assert_eq!(
+            import_secret(&mut store, b"harvest:rsa_pk:fp1", &pk_new),
+            SecretImport::Written,
+            "the matching half is accepted"
+        );
+        let mut store = MemSecrets::default();
+        store.set_secret(b"harvest:rsa_pk:fp1", &pk_new);
+        assert!(matches!(
+            import_secret(&mut store, b"harvest:rsa_sk:fp1", &sk_old),
+            SecretImport::Permanent(_)
+        ));
+        assert!(!store.has_secret(b"harvest:rsa_sk:fp1"));
+    }
+
+    fn xpub(key: &str, next_index: u32) -> Vec<u8> {
+        cbor(&Some(harvest_common::bitcoin_delegate::PaymentXpubStatus {
+            xpub: key.into(),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            next_index,
+        }))
+    }
+
+    fn held_index(store: &MemSecrets) -> u32 {
+        from_cbor::<Option<harvest_common::bitcoin_delegate::PaymentXpubStatus>>(
+            &store
+                .get_secret(crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY)
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+        .next_index
+    }
+
+    /// The same payment key on both sides keeps the HIGHER counter, so an
+    /// address the predecessor handed out is not handed out again. A
+    /// different key, or a lower counter, leaves this delegate's record
+    /// alone. Mutated red by never-clobbering, and by taking the lower.
+    #[test]
+    fn the_payment_counter_is_raised_never_lowered() {
+        let key = crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY;
+        let mut store = MemSecrets::default();
+        store.set_secret(key, &xpub("vpubA", 2));
+        assert_eq!(
+            import_secret(&mut store, key, &xpub("vpubA", 7)),
+            SecretImport::Written
+        );
+        assert_eq!(held_index(&store), 7);
+        assert_eq!(
+            import_secret(&mut store, key, &xpub("vpubA", 3)),
+            SecretImport::AlreadyAuthoritative
+        );
+        assert_eq!(held_index(&store), 7);
+        assert_eq!(
+            import_secret(&mut store, key, &xpub("vpubB", 50)),
+            SecretImport::AlreadyAuthoritative
+        );
+        assert_eq!(
+            held_index(&store),
+            7,
+            "another key's counter says nothing about this one"
+        );
+        let mut empty = MemSecrets::default();
+        assert_eq!(
+            import_secret(&mut empty, key, &xpub("vpubA", 4)),
+            SecretImport::Written
+        );
+    }
+
+    /// Every key shape this delegate writes has a family decided on purpose.
+    /// A new shape fails here until somebody says which rule it needs.
+    #[test]
+    fn every_key_shape_has_a_family() {
+        let expected = [
+            Family::RsaHalf,
+            Family::RsaHalf,
+            Family::Standalone, // tx record
+            Family::StoreRegistry,
+            Family::Standalone, // x25519 secret
+            Family::TransactionIndex,
+            Family::Watches,
+            Family::Standalone, // bridge config
+            Family::PaymentXpub,
+            Family::Standalone, // migration and notice markers
+            Family::BuyerConversation,
+            Family::KnownStore,
+            Family::Refused,    // store key
+            Family::Standalone, // unfinished store creation
+            Family::Standalone, // travelling "folded into" record
+        ];
+        let shapes = crate::handlers::all_secret_key_shapes("fp1", "tx1");
+        assert_eq!(
+            shapes.len(),
+            expected.len(),
+            "a key shape was added or removed: decide its import family here"
+        );
+        for (shape, want) in shapes.iter().zip(expected) {
+            assert_eq!(family(shape), want, "{}", String::from_utf8_lossy(shape));
+        }
+    }
+
+    /// A predecessor list that does not decode is refused; this delegate's
+    /// own list that does not decode is left alone and retried, never
+    /// replaced.
+    #[test]
+    fn an_undecodable_list_is_never_merged_over() {
+        let key = b"harvest:stores:fp1";
+        let mut store = MemSecrets::default();
+        assert!(matches!(
+            import_secret(&mut store, key, b"not cbor"),
+            SecretImport::Permanent(_)
+        ));
+        store.set_secret(key, b"corrupt");
+        assert!(matches!(
+            import_secret(&mut store, key, &cbor(&vec![registration(1, None)])),
+            SecretImport::Retryable(_)
+        ));
+        assert_eq!(store.get_secret(key).unwrap(), b"corrupt");
+    }
+
+    /// A refused marker write is reported, so the UI does not seal a
+    /// predecessor whose `Done` never landed.
+    #[test]
+    fn a_refused_marker_write_is_reported() {
+        let mut store = MemSecrets::refusing_writes();
+        match record_marker(
+            &mut store,
+            PRED,
+            PredecessorMarkerState::Done { had_data: true },
+        ) {
+            HarvestDelegateResponse::PredecessorMarkerRecorded { recorded, .. } => {
+                assert!(!recorded)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **Deletions stay deleted across the next re-key.** Sealing a
+    /// predecessor `Done` also writes a record that travels in this
+    /// delegate's export, and a later generation that imports it treats that
+    /// predecessor as done instead of walking it again (which would bring
+    /// back a conversation forgotten here). Mutated red by not writing the
+    /// travelling record, and by not reading it in `get_marker`.
+    #[test]
+    fn a_folded_predecessor_is_done_for_the_next_generation() {
+        let mut this = MemSecrets::default();
+        record_marker(
+            &mut this,
+            PRED,
+            PredecessorMarkerState::Done { had_data: true },
+        );
+        let travelling = folded_key(&PRED);
+        assert!(travelling.starts_with(harvest_common::migration::SECRET_KEY_PREFIX));
+        let value = this.get_secret(&travelling).expect("the travelling record");
+
+        // The next generation imports this one's export, travelling record
+        // included, and then asks about the same predecessor.
+        let mut next = MemSecrets::default();
+        assert_eq!(
+            import_secret(&mut next, &travelling, &value),
+            SecretImport::Written
+        );
+        match get_marker(&next, PRED) {
+            HarvestDelegateResponse::PredecessorMarker { marker, .. } => {
+                assert_eq!(
+                    marker,
+                    Some(PredecessorMarkerState::Done { had_data: true })
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        // An in-progress marker does not travel.
+        let mut other = MemSecrets::default();
+        record_marker(
+            &mut other,
+            [9; 32],
+            PredecessorMarkerState::InProgress { saw_data: true },
+        );
+        assert!(!other.has_secret(&folded_key(&[9; 32])));
+    }
+
+    /// A remembered store archived on the predecessor stays archived even
+    /// when the connect path already remembered it here, unarchived. Mutated
+    /// red by never-clobbering the record.
+    #[test]
+    fn an_archived_store_stays_archived() {
+        let code = "3Bn8xWqLd6Tz9Kf2";
+        let key = crate::known_stores::known_store_key(code);
+        let mut store = MemSecrets::default();
+        crate::known_stores::remember(&mut store, code);
+        let mut predecessor = MemSecrets::default();
+        crate::known_stores::set_archived(&mut predecessor, code, true);
+        let archived = predecessor.get_secret(&key).unwrap();
+        assert_eq!(
+            import_secret(&mut store, &key, &archived),
+            SecretImport::Written
+        );
+        assert_eq!(store.get_secret(&key).unwrap(), archived);
+        assert_eq!(
+            import_secret(&mut store, &key, &archived),
+            SecretImport::AlreadyAuthoritative,
+            "a repeat changes nothing"
+        );
     }
 }

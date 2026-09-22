@@ -40,9 +40,9 @@
 //!
 //! # What losing this delegate's secrets costs, until then
 //!
-//! A delegate re-key moves this secret out of reach unless the export
-//! handshake carries it forward (see `crate::migration`), and nothing drives
-//! that handshake yet. A store whose key is lost can no longer be signed for:
+//! A delegate re-key moves this secret out of reach: the export handshake
+//! (`crate::migration`, driven since harvest#123) deliberately does NOT carry
+//! store keys. A store whose key is lost can no longer be signed for:
 //! its listings, details and orders stay readable, but nothing new can be
 //! published to it. Phase 1b's custody is what makes the key recoverable from
 //! any backing Ghost Key; this is recorded in `docs/untested-invariants.md`.

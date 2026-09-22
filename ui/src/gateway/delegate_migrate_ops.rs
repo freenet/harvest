@@ -19,7 +19,11 @@
 //!
 //! A predecessor's message that arrives after its call timed out finds no
 //! waiter and goes on to the response handler, which drops messages from a
-//! delegate this app did not register; it never reaches `AppState`.
+//! delegate this app did not register; it never reaches `AppState`. A late
+//! answer from the CURRENT delegate to one of the migration requests does
+//! reach `AppState::on_delegate_response`, and is absorbed there by its
+//! catch-all arm; nothing in `AppState` acts on those variants, and nothing
+//! should.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -31,16 +35,18 @@ use freenet_stdlib::prelude::DelegateKey;
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 
-use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply};
+use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, SettleGate};
 
-/// How long one delegate message may take. A delegate call is node-local and
-/// answers in milliseconds; this is for the ones that never answer at all (an
-/// execution error names no delegate, so it can only time out).
-const CALL_TIMEOUT_MS: u32 = 5_000;
-
-/// How long work that must follow the migration waits for it before going
-/// ahead anyway. See [`after_delegate_migration`].
-const SETTLE_DEADLINE_MS: u32 = 30_000;
+/// How long one delegate message may take.
+///
+/// A delegate call is node-local and usually answers in milliseconds, but an
+/// export is the predecessor's whole secret store and the first call to a
+/// generation may compile its module, and a timeout STOPS the walk for this
+/// load ([`delegate_migrate::Walk`]). So this is generous: it costs time only
+/// for a generation that never answers at all (an execution error names no
+/// delegate, so it can only time out), and those are few since V1-V4 are not
+/// asked and unregistered ones answer `Missing` at once.
+const CALL_TIMEOUT_MS: u32 = 20_000;
 
 struct Waiter {
     delegate: DelegateKey,
@@ -52,14 +58,12 @@ thread_local! {
     /// The one call in flight, if any.
     static WAITER: RefCell<Option<Waiter>> = const { RefCell::new(None) };
 
-    /// Whether the walk has finished (or given up) in this session.
-    static SETTLED: Cell<bool> = const { Cell::new(false) };
-
     /// Whether the walk has been started in this session.
     static STARTED: Cell<bool> = const { Cell::new(false) };
 
-    /// Work that must not run until the walk has settled.
-    static AFTER: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::new(Vec::new());
+    /// Work that must not run until the walk has reached a verdict. See
+    /// [`SettleGate`].
+    static AFTER: RefCell<SettleGate<Box<dyn FnOnce()>>> = RefCell::new(SettleGate::default());
 }
 
 /// The browser's [`DelegateCalls`]: a handle to the thread-local slot.
@@ -116,17 +120,9 @@ impl DelegateCalls for Browser {
 pub fn offer_payload(delegate: &DelegateKey, payload: &[u8]) -> bool {
     WAITER.with(|w| {
         let mut slot = w.borrow_mut();
-        let Some(waiter) = slot.as_ref() else {
-            return false;
-        };
-        if &waiter.delegate != delegate {
-            return false;
-        }
-        let taken = match &waiter.expect {
-            Expect::AnyFrom => true,
-            expect => harvest_common::from_cbor::<harvest_common::HarvestDelegateResponse>(payload)
-                .is_ok_and(|response| expect.matches(&response)),
-        };
+        let taken = slot.as_ref().is_some_and(|waiter| {
+            &waiter.delegate == delegate && waiter.expect.accepts_payload(payload)
+        });
         if !taken {
             return false;
         }
@@ -158,30 +154,23 @@ pub fn offer_error(error: &freenet_stdlib::client_api::ClientError) -> bool {
     })
 }
 
-/// Run `work` once the delegate migration has settled in this session, or
-/// after [`SETTLE_DEADLINE_MS`], whichever is first.
-///
-/// For work that WRITES a secret the migration may be about to import. The
-/// case today is `InitEncryptionKey`, sent for every Ghost Key on connect: it
-/// mints a key if the delegate holds none, and on a freshly re-keyed delegate
-/// it holds none until the import lands. Minted first, it would stand (the
-/// import never overwrites) and the store info's published encryption key --
-/// the old one -- would stop matching the secret, so buyers' messages would
-/// be unreadable. The deadline is a bound, not a design: work that has waited
-/// that long goes ahead and the import keeps whatever it then finds.
+/// Run `work` once the delegate migration has reached a verdict on every
+/// registered predecessor; drop it for this load if the walk did not. See
+/// [`SettleGate`] for why there is no "go ahead anyway".
 pub fn after_delegate_migration(work: impl FnOnce() + 'static) {
-    if SETTLED.with(Cell::get) {
+    if let Some(work) = AFTER.with(|a| a.borrow_mut().defer(Box::new(work))) {
         work();
-        return;
     }
-    AFTER.with(|a| a.borrow_mut().push(Box::new(work)));
 }
 
-fn settle() {
-    if SETTLED.with(|s| s.replace(true)) {
-        return;
+fn settle(complete: bool) {
+    let work = AFTER.with(|a| a.borrow_mut().settle(complete));
+    if !complete {
+        warn!(
+            "delegate migration: did not reach every generation; work that could pre-empt an \
+             import (minting an encryption key) is left for the next load"
+        );
     }
-    let work = AFTER.with(|a| std::mem::take(&mut *a.borrow_mut()));
     for job in work {
         job();
     }
@@ -198,26 +187,25 @@ pub fn start() {
         warn!(
             "delegate migration: the harvest delegate is not registered; nothing to migrate into"
         );
-        settle();
+        // Nothing could be imported, so nothing can be pre-empted either.
+        settle(true);
         return;
     };
-    gloo_timers::callback::Timeout::new(SETTLE_DEADLINE_MS, || {
-        if !SETTLED.with(Cell::get) {
-            warn!("delegate migration: still running after the deadline; letting waiting work go ahead");
-            settle();
-        }
-    })
-    .forget();
     wasm_bindgen_futures::spawn_local(async move {
-        let report = delegate_migrate::migrate(Browser, current).await;
+        let outcome = delegate_migrate::migrate(Browser, current).await;
         info!(
-            "delegate migration: {}",
-            delegate_migrate::summarize(&report)
+            "delegate migration: {}{}",
+            delegate_migrate::summarize(&outcome.report),
+            if outcome.walk.halted {
+                " (stopped: a generation did not answer)"
+            } else {
+                ""
+            }
         );
-        let imported = delegate_migrate::imported_anything(&report);
-        settle();
+        let imported = delegate_migrate::imported_anything(&outcome.report);
+        settle(outcome.complete());
         if imported {
-            refresh_from_delegate().await;
+            refresh_from_delegate(outcome.imported_rsa_fingerprints()).await;
         }
     });
 }
@@ -230,7 +218,7 @@ pub fn start() {
 /// conversations". These answers are additive in `AppState`
 /// (`merge_store_registrations`, the conversation recall), so asking again
 /// only fills in.
-async fn refresh_from_delegate() {
+async fn refresh_from_delegate(rsa_fingerprints: Vec<String>) {
     info!("delegate migration: secrets were imported; asking the delegate again");
     let fingerprints: Vec<String> = super::APP_STATE
         .read()
@@ -241,6 +229,24 @@ async fn refresh_from_delegate() {
     for fingerprint in fingerprints {
         if let Err(e) = super::store_ops::list_stores(fingerprint.clone()).await {
             warn!("delegate migration: could not list stores for {fingerprint}: {e}");
+        }
+    }
+    // The imported RSA public keys, by name: the answer is what starts the
+    // reputation migration for that identity. Only imported ones -- see the
+    // "Ordering" section of `delegate_migrate`.
+    for fingerprint in rsa_fingerprints {
+        let request = harvest_common::HarvestDelegateRequest::GetRsaPublicKey {
+            ghostkey_fingerprint: fingerprint.clone(),
+        };
+        let sent = match (
+            harvest_common::to_cbor(&request),
+            super::APP_STATE.read().harvest_delegate_key.clone(),
+        ) {
+            (Ok(payload), Some(key)) => super::send_delegate_message(&key, payload).await,
+            _ => Err("could not build the request".to_string()),
+        };
+        if let Err(e) = sent {
+            warn!("delegate migration: could not ask for the RSA key of {fingerprint}: {e}");
         }
     }
     if let Err(e) = super::bitcoin_ops::get_bridge().await {

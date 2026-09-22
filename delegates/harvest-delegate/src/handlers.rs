@@ -56,6 +56,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
             &ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key(),
         ),
         crate::store_keys::creation_secret(fp),
+        crate::import::folded_key(&[7u8; 32]),
     ]
 }
 

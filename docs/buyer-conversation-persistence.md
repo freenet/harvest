@@ -459,7 +459,10 @@ every conversation. The prefix made them exportable; `ui/src/delegate_migrate.rs
 is what now exports them, on the first load after a delegate re-key, from any
 earlier generation from V5 on that the buyer's node still has registered. It
 cannot reach a conversation kept only under V1 to V4, or under a generation
-this node never ran.)
+this node never ran. And a conversation is keyed by the store's CONTRACT id:
+it is carried whatever that id is, but it is only shown while the store still
+lives at that id, so one kept under a store generation that has since re-keyed
+is carried and not shown -- the store re-key's gap, not this one's.)
 
 ## The shape of the change, as built
 

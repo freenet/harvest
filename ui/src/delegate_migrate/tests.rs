@@ -30,6 +30,15 @@ struct Node {
     markers: HashMap<[u8; 32], PredecessorMarkerState>,
     /// Every delegate key a message was sent to, in order.
     asked: Vec<[u8; 32]>,
+    /// The current delegate refuses every marker write.
+    refuse_markers: bool,
+    /// The current delegate answers every import with something else.
+    garbled_imports: bool,
+}
+
+fn folded(predecessor: &[u8; 32]) -> Vec<u8> {
+    let hex: String = predecessor.iter().map(|b| format!("{b:02x}")).collect();
+    format!("harvest:folded:{hex}").into_bytes()
 }
 
 #[derive(Clone, Default)]
@@ -59,21 +68,42 @@ impl DelegateCalls for Fake {
             let request: HarvestDelegateRequest =
                 harvest_common::from_cbor(&payload).expect("a harvest request");
             let response = match request {
+                // As the real delegate: a travelling "folded" record counts as
+                // done, and sealing writes one.
                 HarvestDelegateRequest::GetPredecessorMarker { predecessor } => {
+                    let marker = node.markers.get(&predecessor).copied().or_else(|| {
+                        node.secrets
+                            .contains_key(&folded(&predecessor))
+                            .then_some(PredecessorMarkerState::Done { had_data: true })
+                    });
                     HarvestDelegateResponse::PredecessorMarker {
                         predecessor,
-                        marker: node.markers.get(&predecessor).copied(),
+                        marker,
                     }
                 }
                 HarvestDelegateRequest::RecordPredecessorMarker {
                     predecessor,
                     marker,
                 } => {
-                    node.markers.insert(predecessor, marker);
+                    let recorded = !node.refuse_markers;
+                    if recorded {
+                        node.markers.insert(predecessor, marker);
+                        if matches!(marker, PredecessorMarkerState::Done { .. }) {
+                            node.secrets.insert(folded(&predecessor), b"1".to_vec());
+                        }
+                    }
                     HarvestDelegateResponse::PredecessorMarkerRecorded {
                         predecessor,
                         marker,
-                        recorded: true,
+                        recorded,
+                    }
+                }
+                HarvestDelegateRequest::ImportMigratedSecret { predecessor, .. }
+                    if node.garbled_imports =>
+                {
+                    HarvestDelegateResponse::PredecessorMarker {
+                        predecessor,
+                        marker: None,
                     }
                 }
                 HarvestDelegateRequest::ImportMigratedSecret {
@@ -135,6 +165,10 @@ fn generation(n: u32) -> [u8; 32] {
 }
 
 fn run(fake: &Fake) -> DelegateMigrationReport {
+    outcome(fake).report
+}
+
+fn outcome(fake: &Fake) -> Outcome {
     futures::executor::block_on(migrate(fake.clone(), key(CURRENT)))
 }
 
@@ -350,4 +384,205 @@ fn a_refusal_is_never_reported_as_authoritative() {
             ..
         }
     ));
+}
+
+/// **A newer generation that is registered but silent stops the walk**, so
+/// an older generation cannot land its values first and then stand for good
+/// (the import never overwrites). When the newer one answers on a later load,
+/// ITS value wins. Mutated red by not halting on a silent export, and by
+/// halting on `Missing` too (which `a_skipped_generation_does_not_hide_an_older_one`
+/// catches).
+#[test]
+fn a_silent_newer_generation_stops_the_walk_until_it_answers() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.old.insert(generation(18), Old::SilentOnExport);
+        node.old.insert(
+            generation(12),
+            Old::Holds(vec![(b"harvest:x25519_sk:fp1".to_vec(), b"older".to_vec())]),
+        );
+    }
+    let first = outcome(&fake);
+    assert!(first.walk.halted);
+    assert!(!first.complete());
+    assert_eq!(
+        secret(&fake, "harvest:x25519_sk:fp1"),
+        None,
+        "nothing older lands first"
+    );
+    assert!(!fake.0.borrow().markers.contains_key(&generation(12)));
+
+    fake.0.borrow_mut().old.insert(
+        generation(18),
+        Old::Holds(vec![(b"harvest:x25519_sk:fp1".to_vec(), b"newer".to_vec())]),
+    );
+    let second = outcome(&fake);
+    assert!(second.complete(), "{}", summarize(&second.report));
+    assert_eq!(
+        secret(&fake, "harvest:x25519_sk:fp1").as_deref(),
+        Some(&b"newer"[..])
+    );
+}
+
+/// **A deletion made on the new generation survives the NEXT re-key.** V17
+/// sealed V16 and travels a record of it; a later walk that imports V17 then
+/// treats V16 as done instead of re-importing what V17 no longer holds.
+/// Mutated red by not honouring the travelling record in the marker lookup.
+#[test]
+fn a_generation_folded_into_a_newer_one_is_not_walked_again() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        // V17 had already folded V16 in, and the buyer then forgot the
+        // conversation V16 still holds.
+        node.old.insert(
+            generation(17),
+            Old::Holds(vec![
+                (b"harvest:rsa_pk:fp1".to_vec(), b"pk".to_vec()),
+                (folded(&generation(16)), b"1".to_vec()),
+            ]),
+        );
+        node.old.insert(
+            generation(16),
+            Old::Holds(vec![(
+                b"harvest:buyer_conv:s:forgotten".to_vec(),
+                b"conv".to_vec(),
+            )]),
+        );
+    }
+    run(&fake);
+    assert_eq!(
+        secret(&fake, "harvest:rsa_pk:fp1").as_deref(),
+        Some(&b"pk"[..])
+    );
+    assert_eq!(
+        secret(&fake, "harvest:buyer_conv:s:forgotten"),
+        None,
+        "the conversation forgotten on V17 stays forgotten"
+    );
+}
+
+/// A marker write the current delegate refuses leaves the predecessor
+/// unsealed, and the walk incomplete. Mutated red by returning `Ok(())` from
+/// `record_marker` whatever the answer.
+#[test]
+fn a_refused_marker_leaves_the_predecessor_unsealed() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.refuse_markers = true;
+        node.old.insert(
+            generation(18),
+            Old::Holds(vec![(b"harvest:rsa_pk:fp1".to_vec(), b"pk".to_vec())]),
+        );
+    }
+    let out = outcome(&fake);
+    assert!(!fake.0.borrow().markers.contains_key(&generation(18)));
+    assert!(!out.complete(), "{}", summarize(&out.report));
+}
+
+/// An import answered with something else is a retry, never a success the
+/// crate would seal on.
+#[test]
+fn an_unexpected_import_answer_is_never_success() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.garbled_imports = true;
+        node.old.insert(
+            generation(18),
+            Old::Holds(vec![(b"harvest:rsa_pk:fp1".to_vec(), b"pk".to_vec())]),
+        );
+    }
+    let out = outcome(&fake);
+    assert!(!matches!(
+        fake.0.borrow().markers.get(&generation(18)),
+        Some(PredecessorMarkerState::Done { .. })
+    ));
+    assert!(!out.complete());
+}
+
+/// The recorded-marker answer is matched on its predecessor, and the export
+/// expectation takes only an export.
+#[test]
+fn the_other_expectations_match_only_their_own_answer() {
+    let recorded = |p: [u8; 32]| HarvestDelegateResponse::PredecessorMarkerRecorded {
+        predecessor: p,
+        marker: PredecessorMarkerState::Done { had_data: true },
+        recorded: true,
+    };
+    assert!(Expect::PredecessorMarkerRecorded([1; 32]).matches(&recorded([1; 32])));
+    assert!(!Expect::PredecessorMarkerRecorded([1; 32]).matches(&recorded([2; 32])));
+    assert!(!Expect::PredecessorMarkerRecorded([1; 32]).matches(
+        &HarvestDelegateResponse::PredecessorMarker {
+            predecessor: [1; 32],
+            marker: None,
+        }
+    ));
+    let export = freenet_migrate::ExportedSecrets {
+        source_generation: 5,
+        secrets: vec![],
+    }
+    .to_bytes()
+    .unwrap();
+    assert!(Expect::Export.accepts_payload(&export));
+    assert!(
+        !Expect::Export.accepts_payload(&cbor(&HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: String::new(),
+            stores: Vec::new(),
+        }))
+    );
+}
+
+/// Imported RSA public keys are named by fingerprint, so the app asks for
+/// exactly those and no others.
+#[test]
+fn only_imported_rsa_keys_are_asked_for() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.secrets
+            .insert(b"harvest:rsa_pk:held".to_vec(), b"pk".to_vec());
+        node.old.insert(
+            generation(18),
+            Old::Holds(vec![
+                (b"harvest:rsa_pk:held".to_vec(), b"old".to_vec()),
+                (b"harvest:rsa_pk:new".to_vec(), b"pk".to_vec()),
+                (b"harvest:rsa_sk:new".to_vec(), b"sk".to_vec()),
+            ]),
+        );
+    }
+    assert_eq!(
+        outcome(&fake).imported_rsa_fingerprints(),
+        vec!["new".to_string()]
+    );
+}
+
+/// The gate runs deferred work only after a walk that reached every
+/// generation, and drops it for this load otherwise; there is no "go ahead
+/// anyway". Mutated red by releasing on an incomplete walk.
+#[test]
+fn deferred_work_waits_for_a_complete_walk() {
+    let mut gate = SettleGate::default();
+    assert_eq!(gate.defer(1), None, "queued while the walk runs");
+    assert_eq!(gate.settle(true), vec![1]);
+    assert_eq!(gate.defer(2), Some(2), "runs at once after a complete walk");
+    assert!(
+        gate.settle(false).is_empty(),
+        "a second settle changes nothing"
+    );
+    assert_eq!(gate.defer(3), Some(3));
+
+    let mut gate = SettleGate::default();
+    assert_eq!(gate.defer(1), None);
+    assert!(
+        gate.settle(false).is_empty(),
+        "an incomplete walk releases nothing"
+    );
+    assert_eq!(
+        gate.defer(2),
+        None,
+        "and later work is dropped for this load"
+    );
 }

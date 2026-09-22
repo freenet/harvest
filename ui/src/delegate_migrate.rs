@@ -44,36 +44,56 @@
 //!
 //! * **The newest value must win a shared key.** Predecessors are offered
 //!   newest first, and that only means anything if the writer declines a key
-//!   it already holds. The delegate's import never overwrites.
-//! * **It resurrects what a newer generation deleted by absence.** Harvest's
-//!   delegate deletes one kind of secret, a buyer conversation the buyer chose
-//!   to forget (`ForgetBuyerConversation`). Forgotten on the NEW generation it
-//!   stays forgotten, because the predecessor it came from is already sealed
-//!   `Done` and never walked again. Forgotten on an OLD generation, it comes
-//!   back if an even older one still holds it. That needs a buyer to have
-//!   forgotten a conversation, then upgraded twice with the node skipping the
-//!   middle release; the cost is a conversation the buyer can forget again.
+//!   it already holds -- the delegate's import never overwrites -- AND if no
+//!   newer generation that holds data was skipped. A generation registered
+//!   here that does not answer therefore stops the walk ([`Walk`]); only one
+//!   the node never ran (`Missing`) is walked past.
+//! * **It resurrects what a newer generation deleted by absence** -- a
+//!   conversation the buyer forgot, an address unwatched, a conversation
+//!   evicted at the cap. Each generation's completion markers stay behind
+//!   with it, so without more, every re-key would walk back to V5 and bring
+//!   those back. Sealing a predecessor therefore also writes a record that
+//!   TRAVELS (`harvest:folded:<key>`, `delegates/.../import.rs`), and a later
+//!   generation that imports it treats that predecessor as done. What is left:
+//!   this first walk has no such records to find, so something deleted on one
+//!   generation from V5 to V17 can come back from an older one, once.
 //!
 //! # What cannot be recovered
 //!
-//! V1 to V4 have no export handler and are not walked at all (they would
-//! answer every export with an error, which is a timeout here). A generation
-//! the node never registered answers `Missing`, is recorded `Unresponsive`,
-//! and is asked again on the next load at the cost of two node-local round
-//! trips. Store keys are never exported; custody recovers them.
+//! * V1 to V4 have no export handler and are not walked at all (they would
+//!   answer every export with an error, which is a timeout here).
+//! * A generation the node never registered answers `Missing`, is recorded
+//!   `Unresponsive`, and is asked again on the next load at the cost of two
+//!   node-local round trips.
+//! * Store keys are never exported; custody recovers them.
+//! * A write made by a stale tab of an OLD UI, to its old delegate, after
+//!   that generation was sealed here, is not carried: re-walking a sealed
+//!   generation would undo deletions instead.
+//! * A buyer conversation is kept under the store's CONTRACT id. It is
+//!   imported whatever that id is, but the app recalls conversations by the
+//!   store's current id, so one kept under a store generation that has since
+//!   re-keyed is carried and not shown. That is the store re-key's gap, not
+//!   this migration's.
+//! * A family at its cap answers `Retryable`, so its predecessor is not
+//!   sealed and is walked again each load until there is room.
 //!
 //! # Ordering against the contract migration
 //!
 //! The migration doctrine says to migrate delegate secrets before any contract
 //! whose parameters are derived from one. Harvest has one such parameter, the
-//! reputation contract's RSA key, and `migrate_ops::start_reputation_migration`
-//! already waits for the delegate to report it. This walk starts once the
-//! current delegate is registered, and when it imports anything the app asks
-//! the delegate again ([`crate::gateway::delegate_migrate_ops`]), which is what
-//! lets the reputation walk start from the recovered key.
+//! reputation contract's RSA key: `migrate_ops::start_reputation_migration`
+//! waits until the delegate has reported it, and nothing on connect asks. So
+//! when this walk imports an RSA public key, the app asks for it by
+//! fingerprint ([`Outcome::imported_rsa_fingerprints`],
+//! `crate::gateway::delegate_migrate_ops`), and the answer is what starts the
+//! reputation walk. Asking for a key the delegate does not hold would answer
+//! an `Error` that `AppState` reads as the failure of a store creation in
+//! flight, which is why only imported fingerprints are asked about.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 
 use freenet_migrate::{
     DelegateLineageEntry, DelegateMigrationReport, ItemWrite, MarkerQuery, MigrationAuthorization,
@@ -141,9 +161,16 @@ impl core::fmt::Display for CallError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expect {
     AnyFrom,
+    /// Only a payload that decodes as `freenet_migrate::ExportedSecrets`:
+    /// the answer to `ExportSecrets`. Anything else a predecessor sends is
+    /// left alone rather than taken as the export.
+    Export,
     PredecessorMarker([u8; 32]),
     PredecessorMarkerRecorded([u8; 32]),
-    SecretImported { predecessor: [u8; 32], key: Vec<u8> },
+    SecretImported {
+        predecessor: [u8; 32],
+        key: Vec<u8>,
+    },
 }
 
 impl Expect {
@@ -152,6 +179,8 @@ impl Expect {
     pub fn matches(&self, response: &HarvestDelegateResponse) -> bool {
         match (self, response) {
             (Expect::AnyFrom, _) => true,
+            // Never a Harvest response; see `accepts_payload`.
+            (Expect::Export, _) => false,
             (
                 Expect::PredecessorMarker(want),
                 HarvestDelegateResponse::PredecessorMarker { predecessor, .. },
@@ -172,6 +201,47 @@ impl Expect {
             _ => false,
         }
     }
+}
+
+impl Expect {
+    /// Whether a raw application-message payload from the delegate being
+    /// waited on is this call's answer. The one decision the transport makes.
+    pub fn accepts_payload(&self, payload: &[u8]) -> bool {
+        match self {
+            Expect::AnyFrom => true,
+            Expect::Export => freenet_migrate::ExportedSecrets::from_bytes(payload).is_ok(),
+            expect => harvest_common::from_cbor::<HarvestDelegateResponse>(payload)
+                .is_ok_and(|response| expect.matches(&response)),
+        }
+    }
+}
+
+/// What one walk learned, shared by both adapters.
+///
+/// # Why a predecessor that does not answer stops the walk
+///
+/// Union walks every generation, and the newest generation's value wins a
+/// shared key only because it is offered first and the import never
+/// overwrites. That holds only if every newer generation that holds data
+/// answers in the same run as the older ones, or before them. One that is
+/// registered here but silent -- a timeout, a garbled answer -- would let an
+/// older generation's RSA key, encryption key or payment counter land first,
+/// and it would then stand for good. So after the first such silence the
+/// walk stops ([`Successor::migration_marker`] refuses the next predecessor,
+/// which the crate reads as `WriterUnavailable`) and tries again next load.
+///
+/// `Missing` does not stop it: that is the node saying it never ran the
+/// generation, so there is nothing there to be shadowed. Stopping on it would
+/// mean one skipped release hid every older one, which is the reason for
+/// Union in the first place.
+#[derive(Default, Debug)]
+pub struct Walk {
+    /// A registered predecessor failed to answer. Nothing older is imported
+    /// in this run.
+    pub halted: bool,
+    /// Keys the current delegate reported `Written`, so the app knows what to
+    /// ask for again. Key names only, never values.
+    pub written: Vec<Vec<u8>>,
 }
 
 /// Send one message to one delegate and wait for its answer.
@@ -196,17 +266,23 @@ fn encode<T: serde::Serialize>(message: &T) -> Result<Vec<u8>, String> {
 pub struct Predecessors<T> {
     calls: T,
     generations: HashMap<[u8; 32], u32>,
+    walk: Rc<RefCell<Walk>>,
 }
 
 impl<T> Predecessors<T> {
-    pub fn new(calls: T, lineage: &[DelegateLineageEntry]) -> Self {
+    pub fn new(calls: T, lineage: &[DelegateLineageEntry], walk: Rc<RefCell<Walk>>) -> Self {
         Self {
             calls,
             generations: lineage
                 .iter()
                 .map(|e| (e.delegate_key, e.generation))
                 .collect(),
+            walk,
         }
+    }
+
+    fn halt(&self) {
+        self.walk.borrow_mut().halted = true;
     }
 }
 
@@ -217,15 +293,23 @@ impl<T: DelegateCalls> PredecessorSecretsIo for Predecessors<T> {
     ///
     /// `Missing` is the node saying it never registered this generation;
     /// silence is the crate's "no reply within the bound". Both are
-    /// `Ok(false)`, which the crate records `Unresponsive` and never seals.
+    /// `Ok(false)`, which the crate records `Unresponsive` and never seals --
+    /// but only silence halts the walk (see [`Walk`]).
     async fn probe_executable(&mut self, predecessor: &DelegateKey) -> Result<bool, String> {
         let payload = encode(&HarvestDelegateRequest::ListStores {
             ghostkey_fingerprint: String::new(),
         })?;
         match self.calls.call(predecessor, payload, Expect::AnyFrom).await {
             Ok(Reply::Payloads(_)) => Ok(true),
-            Ok(Reply::Missing) | Err(CallError::Timeout) => Ok(false),
-            Err(CallError::Send(e)) => Err(e),
+            Ok(Reply::Missing) => Ok(false),
+            Err(CallError::Timeout) => {
+                self.halt();
+                Ok(false)
+            }
+            Err(CallError::Send(e)) => {
+                self.halt();
+                Err(e)
+            }
         }
     }
 
@@ -246,12 +330,16 @@ impl<T: DelegateCalls> PredecessorSecretsIo for Predecessors<T> {
         let payload = encode(&HarvestMigrationRequest::ExportSecrets {
             source_generation: generation,
         })?;
-        let reply = self
-            .calls
-            .call(predecessor, payload, Expect::AnyFrom)
-            .await
-            .map_err(|e| format!("export not answered: {e}"))?;
-        interpret_export(reply, generation)
+        let answer = match self.calls.call(predecessor, payload, Expect::Export).await {
+            Ok(reply) => interpret_export(reply, generation),
+            Err(e) => Err(format!("export not answered: {e}")),
+        };
+        if answer.is_err() {
+            // It answered the probe, so it runs and may hold data: nothing
+            // older may be imported ahead of it in this run.
+            self.halt();
+        }
+        answer
     }
 }
 
@@ -282,11 +370,16 @@ pub fn interpret_export(
 pub struct Successor<T> {
     calls: T,
     current: DelegateKey,
+    walk: Rc<RefCell<Walk>>,
 }
 
 impl<T> Successor<T> {
-    pub fn new(calls: T, current: DelegateKey) -> Self {
-        Self { calls, current }
+    pub fn new(calls: T, current: DelegateKey, walk: Rc<RefCell<Walk>>) -> Self {
+        Self {
+            calls,
+            current,
+            walk,
+        }
     }
 }
 
@@ -322,6 +415,12 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
         &mut self,
         query: &MarkerQuery<'_>,
     ) -> Result<Option<MigrationMarker>, String> {
+        if self.walk.borrow().halted {
+            return Err(
+                "a newer generation did not answer; stopping so an older one cannot shadow it"
+                    .into(),
+            );
+        }
         let predecessor = key_bytes(query.predecessor)?;
         match self
             .ask(
@@ -374,6 +473,9 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
         };
         match self.ask(&request, expect).await {
             Ok(HarvestDelegateResponse::MigratedSecretImported { outcome, .. }) => {
+                if outcome == SecretImport::Written {
+                    self.walk.borrow_mut().written.push(item.key.to_vec());
+                }
                 to_item_write(outcome)
             }
             Ok(_) => ItemWrite::retryable("unexpected answer".into()),
@@ -414,15 +516,48 @@ pub fn to_item_write(outcome: SecretImport) -> ItemWrite<String> {
     }
 }
 
+/// What a walk ended with.
+pub struct Outcome {
+    pub report: DelegateMigrationReport,
+    pub walk: Walk,
+}
+
+impl Outcome {
+    /// Every registered predecessor reached a verdict: nothing was silent,
+    /// nothing is half-imported, the current delegate answered throughout.
+    /// Only then may work that could pre-empt an import go ahead
+    /// ([`SettleGate`]).
+    pub fn complete(&self) -> bool {
+        !self.walk.halted
+            && !self.report.predecessors.iter().any(|p| {
+                matches!(
+                    p,
+                    PredecessorMigration::Incomplete { .. }
+                        | PredecessorMigration::WriterUnavailable { .. }
+                )
+            })
+    }
+
+    /// The Ghost Key fingerprints whose RSA public key was imported, so the
+    /// app can ask for it: nothing else does, and the reputation migration
+    /// waits on it.
+    pub fn imported_rsa_fingerprints(&self) -> Vec<String> {
+        self.walk
+            .written
+            .iter()
+            .filter_map(|k| k.strip_prefix(b"harvest:rsa_pk:"))
+            .filter_map(|fp| String::from_utf8(fp.to_vec()).ok())
+            .collect()
+    }
+}
+
 /// Run the walk. See the module docs for the policy.
-pub async fn migrate<T: DelegateCalls + Clone>(
-    calls: T,
-    current: DelegateKey,
-) -> DelegateMigrationReport {
+pub async fn migrate<T: DelegateCalls + Clone>(calls: T, current: DelegateKey) -> Outcome {
     let lineage = exporting_predecessors();
-    let mut successor = Successor::new(calls.clone(), current);
-    let mut predecessors = Predecessors::new(calls, &lineage);
-    freenet_migrate::migrate_delegate_secrets(
+    let walk = Rc::new(RefCell::new(Walk::default()));
+    let mut successor = Successor::new(calls.clone(), current, walk.clone());
+    let mut predecessors = Predecessors::new(calls, &lineage, walk.clone());
+    let report = freenet_migrate::migrate_delegate_secrets(
         &mut successor,
         &mut predecessors,
         &lineage,
@@ -431,7 +566,70 @@ pub async fn migrate<T: DelegateCalls + Clone>(
             UnionAck::i_understand_union_resurrects_deleted_by_absence_secrets(),
         ),
     )
-    .await
+    .await;
+    drop((successor, predecessors));
+    let walk = Rc::try_unwrap(walk)
+        .map(RefCell::into_inner)
+        .unwrap_or_else(|shared| std::mem::take(&mut *shared.borrow_mut()));
+    Outcome { report, walk }
+}
+
+/// Work that must wait for the delegate migration, and what becomes of it.
+///
+/// The one user today is `InitEncryptionKey`, sent for every Ghost Key on
+/// connect: it MINTS a key if the delegate holds none, and a freshly re-keyed
+/// delegate holds none until the import lands. Minted first, the new key
+/// would stand -- the import never overwrites -- while the store info still
+/// publishes the old one, and buyers' messages would be unreadable for good.
+///
+/// So the work runs only once a walk has reached a verdict on every
+/// registered predecessor ([`Outcome::complete`]). A walk that did not --
+/// a silent generation, a half-imported one -- DROPS the work for this load,
+/// and the next load tries again: an encryption key missing for one load
+/// costs a retry, one minted ahead of the import costs the conversations.
+/// There is no deadline that lets the work go ahead anyway, for the same
+/// reason; every call the walk makes has its own timeout, so it always ends.
+pub enum SettleGate<W> {
+    Waiting(Vec<W>),
+    Released,
+    Withheld,
+}
+
+impl<W> Default for SettleGate<W> {
+    fn default() -> Self {
+        SettleGate::Waiting(Vec::new())
+    }
+}
+
+impl<W> SettleGate<W> {
+    /// Offer work. Returns it back if it may run now; keeps it if the walk
+    /// is still running; drops it if this load's walk did not complete.
+    pub fn defer(&mut self, work: W) -> Option<W> {
+        match self {
+            SettleGate::Waiting(queue) => {
+                queue.push(work);
+                None
+            }
+            SettleGate::Released => Some(work),
+            SettleGate::Withheld => None,
+        }
+    }
+
+    /// The walk ended. Returns the work that may now run: all of it if the
+    /// walk completed, none if it did not. A second call changes nothing.
+    pub fn settle(&mut self, complete: bool) -> Vec<W> {
+        match std::mem::replace(self, SettleGate::Withheld) {
+            SettleGate::Waiting(queue) if complete => {
+                *self = SettleGate::Released;
+                queue
+            }
+            SettleGate::Waiting(_) => Vec::new(),
+            already => {
+                *self = already;
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Whether a report carried anything in, so the app should ask the delegate

@@ -56,11 +56,10 @@ impl SecretStore for CtxStore<'_> {
     }
 
     fn set_secret(&mut self, _key: &[u8], _value: &[u8]) -> bool {
-        // Export is read-only. A successor imports through this delegate's own
-        // request handlers, not by having its bytes written in behind them --
-        // those handlers derive fingerprints, maintain the transaction index,
-        // and check what they are given, none of which a raw key/value copy
-        // would do.
+        // Export is read-only. A successor imports through its own per-family
+        // rules (`crate::import`), not by having these bytes written in
+        // behind them: a list must be merged, a keypair kept a pair, a cap
+        // respected, none of which a raw key/value copy would do.
         false
     }
 }

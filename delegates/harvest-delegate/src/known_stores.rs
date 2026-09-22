@@ -67,6 +67,49 @@ struct Record {
     archived: bool,
 }
 
+/// Import a remembered store from a predecessor delegate (harvest#123).
+///
+/// Absent: kept, within [`MAX_KNOWN_STORES`]. Present: the archived flag is
+/// the OR of the two, because archiving is a choice the buyer made and a
+/// visit is not a reversal of it -- which is exactly what the connect path's
+/// `RememberStore` may already have written here, with `archived: false`,
+/// before the import ran. A held record that does not decode is left alone.
+pub(crate) fn import(
+    store: &mut impl SecretStore,
+    key: &[u8],
+    value: &[u8],
+) -> harvest_common::delegate::SecretImport {
+    use harvest_common::delegate::SecretImport;
+    let Ok(incoming) = from_cbor::<Record>(value) else {
+        return SecretImport::Permanent("the predecessor's store record did not decode".into());
+    };
+    let merged = match store.get_secret(key) {
+        None => {
+            if store.list_secrets(KNOWN_STORE_PREFIX.as_bytes()).len() >= MAX_KNOWN_STORES {
+                return SecretImport::Retryable(format!(
+                    "this node already remembers {MAX_KNOWN_STORES} stores, the most it keeps"
+                ));
+            }
+            incoming
+        }
+        Some(bytes) => match from_cbor::<Record>(&bytes) {
+            Ok(held) if held.archived || !incoming.archived => {
+                return SecretImport::AlreadyAuthoritative
+            }
+            Ok(_) => Record { archived: true },
+            Err(_) => {
+                return SecretImport::Retryable(
+                    "this delegate's own store record did not decode".into(),
+                )
+            }
+        },
+    };
+    match to_cbor(&merged) {
+        Ok(bytes) if store.set_secret(key, &bytes) => SecretImport::Written,
+        _ => SecretImport::Retryable("the node refused to save the store record".into()),
+    }
+}
+
 fn refuse(message: impl Into<String>) -> HarvestDelegateResponse {
     HarvestDelegateResponse::Error {
         message: message.into(),

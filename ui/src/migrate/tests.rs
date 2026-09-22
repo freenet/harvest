@@ -490,8 +490,8 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the `harvest:store_sk:` secret family.
             "4d36b2a41c7f77d99ea39d0b5bbf565d8b62b22552aeda6249d6626b70392dea".to_string(),
             // V18, from `git show 4dec675:ui/public/contracts/harvest_delegate.wasm`.
-            // Superseded by harvest#123: the successor side of the export
-            // handshake (predecessor markers and `ImportMigratedSecret`).
+            // Superseded by harvest#123, whose successor (not V18) gained the
+            // import side of the export handshake; V18 only answers exports.
             "09507e3f4f1432dd746cf4644aaa81678e25314798dc6069ce38409d1499fddd".to_string(),
         ],
     );
