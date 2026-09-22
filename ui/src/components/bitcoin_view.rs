@@ -566,10 +566,10 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     };
     // Where the order stands after the payment question (harvest#53):
     // reader-side windows against this reader's own tip.
-    let stage = crate::fulfilment::order_stage(&order, tip_height);
-    let stage_note = stage.describe(tip_height);
+    let stage = crate::fulfilment::order_stage(&order, tip_height, reading.payment_seen());
+    let stage_note = stage.describe(tip_height, order.status);
     let offers_address = crate::fulfilment::offers_payment_address(&order, stage);
-    let (status_class, status_text) = status_pill(order.status, &reading, hold.is_some());
+    let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
 
     rsx! {
@@ -675,6 +675,21 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 },
             }
         }
+    }
+}
+
+/// The pill an order card shows, once the order's stage is known: a lapsed
+/// invoice's pill says so, rather than "Awaiting payment" above a line saying
+/// it can no longer be paid (harvest#53 review).
+pub(crate) fn card_pill(
+    status: OrderStatus,
+    reading: &AddressReading,
+    awaiting_confirmation: bool,
+    stage: crate::fulfilment::OrderStage,
+) -> (&'static str, &'static str) {
+    match stage {
+        crate::fulfilment::OrderStage::Lapsed { .. } => ("btc-pill cancelled", "Lapsed"),
+        _ => status_pill(status, reading, awaiting_confirmation),
     }
 }
 
@@ -798,6 +813,12 @@ impl AddressReading {
             }
         }
         reading
+    }
+
+    /// Whether this reading shows a payment that may yet be this order's:
+    /// value confirmed inside its window, or value not yet confirmed.
+    pub(crate) fn payment_seen(&self) -> bool {
+        self.in_window_sats > 0 || self.pending_sats > 0
     }
 
     /// What to tell the seller when the address holds confirmed value that is
@@ -1588,6 +1609,36 @@ mod address_reading_tests {
         assert_ne!(
             super::status_pill(OrderStatus::AwaitingPayment, &full, true).0,
             "btc-pill paid"
+        );
+    }
+
+    /// harvest#53 review: a lapsed invoice's pill does not say "Awaiting
+    /// payment" above a line saying it can no longer be paid.
+    #[test]
+    fn a_lapsed_invoice_pills_as_lapsed() {
+        use crate::fulfilment::OrderStage;
+        use harvest_common::payment::OrderStatus;
+        let order = order_anchored_at(150);
+        let nothing = AddressReading::of(&order, None);
+        assert_eq!(
+            super::card_pill(
+                OrderStatus::AwaitingPayment,
+                &nothing,
+                false,
+                OrderStage::Lapsed { closed_at: 2_214 }
+            ),
+            ("btc-pill cancelled", "Lapsed")
+        );
+        assert_eq!(
+            super::card_pill(
+                OrderStatus::AwaitingPayment,
+                &nothing,
+                false,
+                OrderStage::AwaitingPayment {
+                    settle_until: 2_214
+                }
+            ),
+            ("btc-pill waiting", "Awaiting payment")
         );
     }
 

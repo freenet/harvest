@@ -276,21 +276,14 @@ fn SettledPurchase(
         .tips
         .get(&order.order.network)
         .and_then(|tip| tip.tip_height);
-    let stage = crate::fulfilment::order_stage(&order, tip_height);
+    let live = super::bitcoin_view::live_address_for_order(&bitcoin, &order.order);
+    let seen = super::bitcoin_view::AddressReading::of(&order.order, live.as_ref()).payment_seen();
+    let stage = crate::fulfilment::order_stage(&order, tip_height, seen);
+    // Every status that reaches here is past AwaitingPayment, and `describe`
+    // has a sentence for each of those; the fallback is for safety only.
     let note = stage
-        .describe(tip_height)
-        .unwrap_or_else(|| match order.status {
-            // `Unknown` for a paid order: the chain tip has not loaded, or the
-            // record's evidence cannot be dated. Say what is certain.
-            harvest_common::payment::OrderStatus::Paid => {
-                "Paid. Your node cannot yet place the order against the chain, so the \
-             despatch deadline is not shown; look again in a moment."
-                    .to_string()
-            }
-            // `describe` covers every other status, so this is only reached
-            // for a stage that has nothing to say.
-            _ => "This order is no longer awaiting payment.".to_string(),
-        });
+        .describe(tip_height, order.status)
+        .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
     let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
     rsx! {
         p { class: if stage.needs_attention() { "text-warning" } else { "" },

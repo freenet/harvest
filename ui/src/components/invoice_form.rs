@@ -173,12 +173,25 @@ fn CancelInvoice(
 ) -> Element {
     let mut confirming = use_signal(|| false);
     let mut problem = use_signal(|| Option::<String>::None);
-    let pending = APP_STATE.read().cancellation_pending(&order_id);
+    let (pending, sent) = {
+        let state = APP_STATE.read();
+        (
+            state.cancellation_pending(&order_id),
+            state.cancellations_sent.contains(&order_id),
+        )
+    };
     let short = order_id.short();
 
     if pending {
         return rsx! {
             p { class: "text-muted", "Cancelling invoice {short}\u{2026}" }
+        };
+    }
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Cancellation of invoice {short} sent. It shows here once the store has it."
+            }
         };
     }
     rsx! {

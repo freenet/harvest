@@ -357,6 +357,11 @@ pub struct AppState {
     /// them, in order.
     pub stores_from_my_indexes: Vec<Vec<u8>>,
 
+    /// Cancellations signed, checked and sent, by order id, so the seller's
+    /// control does not reappear on an invoice whose cancellation is on its
+    /// way to the store. Session-only: a reload shows the store's own answer.
+    pub cancellations_sent: HashSet<harvest_common::payment::OrderId>,
+
     /// Off-target only: cancelled invoices recorded instead of published, so
     /// the cancel flow can be followed in a test (harvest#53).
     #[cfg(not(target_arch = "wasm32"))]
@@ -4566,7 +4571,8 @@ impl AppState {
         // construction. See that function for why the implication was true
         // and still not good enough.
         for order in self.orders_we_may_settle(store_contract_id, |order| {
-            order.status == OrderStatus::AwaitingPayment && Self::confusable_with_a_payment(order)
+            crate::fulfilment::payment_could_still_settle(order.status)
+                && Self::confusable_with_a_payment(order)
         }) {
             let Some(view) = order
                 .order
@@ -4592,6 +4598,12 @@ impl AppState {
             let mut paid = order.clone();
             paid.status = OrderStatus::Paid;
             paid.payment_proof = Some(proof);
+            // A cancelled order being settled carries the seller's status
+            // signature, which `Paid` does not use -- and a record carrying a
+            // field its status does not use is one every peer refuses
+            // (`AuthorizedOrder::verify_unused_fields_absent`).
+            paid.status_scoped_payload = None;
+            paid.status_signature = None;
             settled.push(paid);
         }
         settled
@@ -5083,7 +5095,8 @@ impl AppState {
     pub fn address_contracts_to_reread(&self, store_contract_id: &[u8]) -> Vec<[u8; 32]> {
         use harvest_common::payment::OrderStatus;
         self.our_order_addresses(store_contract_id, |order| {
-            order.status == OrderStatus::AwaitingPayment && self.worth_watching_for_payment(order)
+            crate::fulfilment::payment_could_still_settle(order.status)
+                && self.worth_watching_for_payment(order)
         })
     }
 
@@ -5182,13 +5195,15 @@ impl AppState {
     /// change fail loudly or not at all. Raised by the authorization lens
     /// reviewing harvest#75.
     ///
-    /// A cancelled order is out (`Paid` outranks `Cancelled`, so it is not a
-    /// competitor). An order with no script names no address, and one with
-    /// no window has no span a payment could fall in.
+    /// A cancelled order is IN, and this is the case that used to be got
+    /// backwards (harvest#53 review). `Paid` outranks `Cancelled`, so a buyer
+    /// who pays a cancelled invoice settles it -- which makes a cancelled
+    /// order exactly a competitor for a payment at its address, not the
+    /// opposite. It stopped being harmless the moment the app could produce
+    /// a `Cancelled` record. An order with no script names no address, and
+    /// one with no window has no span a payment could fall in.
     fn confusable_with_a_payment(record: &harvest_common::payment::AuthorizedOrder) -> bool {
-        record.status != harvest_common::payment::OrderStatus::Cancelled
-            && !record.order.payment_script_pubkey.is_empty()
-            && record.order.payment_window().is_some()
+        !record.order.payment_script_pubkey.is_empty() && record.order.payment_window().is_some()
     }
 
     fn orders_we_may_settle(
@@ -6558,7 +6573,23 @@ impl AppState {
                 "only an unpaid invoice can be cancelled, and this one is {settled}"
             ));
         }
-        if self.cancellation_pending(order_id) {
+        // A payment already on its way is not stopped by a cancellation --
+        // `Paid` outranks `Cancelled` -- so cancelling now would only put a
+        // record in public that says the opposite of what is about to happen
+        // (harvest#53 review).
+        let live =
+            crate::components::bitcoin_view::live_address_for_order(&self.bitcoin, &order.order);
+        if crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref())
+            .payment_seen()
+        {
+            return Err(
+                "a payment has already been seen at this invoice's address, and \
+                        cancelling would not stop it counting. Check your wallet: if it \
+                        confirms in time, the order is paid and the goods are owed."
+                    .to_string(),
+            );
+        }
+        if self.cancellation_pending(order_id) || self.cancellations_sent.contains(order_id) {
             return Err("this invoice is already being cancelled".to_string());
         }
         info!("Cancelling invoice {}", order_id.short());
@@ -6602,19 +6633,22 @@ impl AppState {
                 .push(format!("Could not cancel invoice {short}: {why}"));
             return;
         }
+        // Held until the store shows the cancellation or the send fails, so
+        // the control does not come back on an invoice whose cancellation is
+        // on its way.
+        self.cancellations_sent.insert(cancelled.order.id.clone());
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
+            let id = cancelled.order.id.clone();
             if let Err(e) =
                 crate::gateway::store_ops::submit_order_by_id(&store_contract_id, cancelled).await
             {
                 dioxus::logger::tracing::error!("Failed to publish the cancellation: {}", e);
-                crate::gateway::APP_STATE
-                    .write()
+                let mut state = crate::gateway::APP_STATE.write();
+                state.cancellations_sent.remove(&id);
+                state
                     .notifications
-                    .push(format!(
-                        "Invoice {short} was cancelled but the cancellation could not be \
-                         published: {e}"
-                    ));
+                    .push(format!("Could not cancel invoice {short}: {e}"));
             }
         });
         #[cfg(not(target_arch = "wasm32"))]
@@ -8928,7 +8962,7 @@ impl AppState {
                     .orders
                     .iter()
                     .filter(|o| {
-                        o.status == OrderStatus::AwaitingPayment
+                        crate::fulfilment::payment_could_still_settle(o.status)
                             && o.order.seller_fingerprint == *fingerprint
                             && !o.order.payment_script_pubkey.is_empty()
                             && o.order.trusted_bridges.contains(&bridge)
@@ -13148,9 +13182,15 @@ mod invoice_tests {
         let mut paid = late.clone();
         paid.status = OrderStatus::Paid;
         assert_eq!(twins_of(&a, paid, false), twins, "a paid twin counts");
+        // A cancelled twin counts: a payment at the address may be its
+        // buyer's, since `Paid` outranks `Cancelled` (harvest#53 review).
         let mut cancelled = late.clone();
         cancelled.status = OrderStatus::Cancelled;
-        assert_eq!(twins_of(&a, cancelled, false), None, "a cancelled twin");
+        assert_eq!(
+            twins_of(&a, cancelled, false),
+            twins,
+            "a cancelled twin counts"
+        );
         let mut other_net = late.clone();
         other_net.order.network = BitcoinNetwork::Testnet4;
         other_net.order = other_net.order.with_derived_id();
@@ -17961,7 +18001,7 @@ mod buy_flow_tests {
     /// proving this order, and an abandoned one awaiting payment forever --
     /// means nothing is auto-published. The seller's "Confirm paid" then
     /// publishes exactly the proof that was assembled, and it verifies, so no
-    /// case is left stuck. A cancelled twin does not count.
+    /// case is left stuck. A cancelled twin counts as well (harvest#53).
     #[test]
     fn a_twin_withholds_the_settlement_and_the_seller_can_confirm_it() {
         for twin in [OrderStatus::Paid, OrderStatus::AwaitingPayment] {
@@ -17992,11 +18032,12 @@ mod buy_flow_tests {
                 .expect("the confirmed record verifies as Paid");
         }
 
+        // A cancelled twin withholds too: its buyer may be the one who paid
+        // (harvest#53 review, which found this pinned the other way round).
         let (mut state, _) = seller_holding_a_paid_order(Some(OrderStatus::Cancelled));
-        assert_eq!(
-            state.publish_settled_orders(STORE).len(),
-            1,
-            "a cancelled twin counted"
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "a cancelled twin must withhold the settlement"
         );
     }
 
@@ -20791,6 +20832,33 @@ mod buy_flow_tests {
         );
     }
 
+    /// A CANCELLED invoice is still watched while its window holds: a buyer
+    /// who pays it anyway settles it (`Paid` outranks `Cancelled`), and a
+    /// payment the bridge is not watching for is never observed at all
+    /// (harvest#53 review). A paid one is not.
+    #[test]
+    fn a_cancelled_invoice_is_still_watched_and_a_paid_one_is_not() {
+        let gk = inbox::authority().mint();
+        let mut order = an_order_naming_the_test_bridge(3);
+        order.status = OrderStatus::Cancelled;
+        let mut state = a_seller_selling(vec![order.clone()], gk.id().0);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        let queued = queued_watch_requests(&state);
+        assert_eq!(queued.len(), 1, "the cancelled invoice is still watched");
+        assert_eq!(
+            queued[0].scripts,
+            vec![order.order.payment_script_pubkey.clone()]
+        );
+
+        order.status = OrderStatus::Paid;
+        let mut state = a_seller_selling(vec![order], gk.id().0);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        assert!(
+            queued_watch_requests(&state).is_empty(),
+            "a paid one is not"
+        );
+    }
+
     /// **A signature by any key but the store's seller key is not sent.** The
     /// request is bound to the seller key, so the inbox would admit it and
     /// the bridge could never open it.
@@ -22066,6 +22134,11 @@ mod buy_flow_tests {
         answer_the_store_key_request(&mut state, &seller_signing_key());
 
         assert!(!state.cancellation_pending(&order.order.id));
+        assert!(
+            state.cancellations_sent.contains(&order.order.id),
+            "the control stays down until the store shows the cancellation"
+        );
+        assert!(state.cancel_invoice(STORE, &order.order.id).is_err());
         assert_eq!(state.published_cancellations.len(), 1);
         let cancelled = &state.published_cancellations[0];
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -22153,6 +22226,78 @@ mod buy_flow_tests {
             .expect("a withdrawn cancellation can be asked for again");
     }
 
+    /// **The blocking bug the harvest#53 review found.** `Paid` outranks
+    /// `Cancelled`, so a buyer who pays a cancelled invoice settles it -- but
+    /// only if some tab PUBLISHES the `Paid`, and `settled_orders` used to
+    /// consider `AwaitingPayment` orders only. The buyer paid, both cards said
+    /// nothing was owed, and nothing would ever change that.
+    #[test]
+    fn a_payment_on_a_cancelled_invoice_still_settles_it() {
+        let (order, claims, tip) = a_paid_order();
+        let mut cancelled = order.clone();
+        cancel(&mut cancelled, &seller_signing_key());
+        let (mut state, _) = buyer_after_acceptance(&cancelled);
+        give_the_node_the_chain(&mut state, &cancelled, claims, tip);
+
+        let settled = state.settled_orders(STORE);
+        assert_eq!(settled.len(), 1, "the buyer's tab publishes the Paid");
+        let paid = &settled[0];
+        assert_eq!(paid.status, OrderStatus::Paid);
+        assert_eq!(
+            (&paid.status_scoped_payload, &paid.status_signature),
+            (&None, &None),
+            "a Paid record carrying the cancel's signature is one every peer refuses"
+        );
+        paid.verify(&seller_signing_key().verifying_key())
+            .expect("the settlement of a cancelled order verifies as Paid");
+        // And it is watched and re-read while its window holds, so the
+        // payment is noticed at all.
+        assert!(!state.address_contracts_to_reread(STORE).is_empty());
+    }
+
+    /// Cancelling while a payment is visibly on its way would publish a
+    /// record saying the opposite of what is about to happen.
+    #[test]
+    fn a_seller_cannot_cancel_an_invoice_whose_payment_is_already_seen() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        // The rows the card reads, as `apply_address_state` builds them from
+        // the claims (the chain fixture leaves them empty).
+        let view_id = order
+            .order
+            .bitcoin_address_instance_id()
+            .expect("the fixture names a build")
+            .to_vec();
+        state
+            .bitcoin
+            .addresses
+            .get_mut(&view_id)
+            .expect("the view")
+            .txs = vec![TxRow {
+            txid_display: "t".into(),
+            value_sats: order.order.amount_sats,
+            status: TxRowStatus::Confirmed {
+                anchor_height: TIP_HEIGHT - 1,
+            },
+        }];
+        let refused = state
+            .cancel_invoice(STORE, &order.order.id)
+            .expect_err("a seen payment refuses the cancel");
+        assert!(refused.contains("already been seen"), "{refused}");
+        assert!(state.pending_signatures.is_empty());
+    }
+
     /// The buyer's card for an order past payment shows where it stands --
     /// and only for the buyer's OWN order.
     #[test]
@@ -22171,7 +22316,7 @@ mod buy_flow_tests {
         );
         assert_eq!(purchase.settled(), Some(&paid));
         assert!(matches!(
-            crate::fulfilment::order_stage(&paid, Some(TIP_HEIGHT)),
+            crate::fulfilment::order_stage(&paid, Some(TIP_HEIGHT), false),
             crate::fulfilment::OrderStage::AwaitingDespatch { .. }
         ));
     }
