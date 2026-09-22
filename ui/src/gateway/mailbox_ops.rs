@@ -145,9 +145,12 @@ pub enum DeliveryStep {
     SendAgain,
     /// Missing after every automatic attempt: say so, and offer to resend.
     TellTheBuyer,
-    /// Still unable to tell after every automatic attempt. Stop, and claim
-    /// nothing: the message stays "not yet visible", which is true.
-    StopWithoutClaiming,
+    /// Still unable to tell after every automatic attempt. Claim nothing
+    /// about the seller, but say Harvest could not check, and offer the
+    /// resend: #119's own condition (a GET that never answers) lands here,
+    /// and a buyer left with no button would retype the message, which is a
+    /// fresh seal and a possible duplicate.
+    CouldNotCheck,
 }
 
 /// `sends` is how many times these bytes have been handed to the node so far.
@@ -156,7 +159,7 @@ pub fn after_delivery_check(check: Check, sends: u8) -> DeliveryStep {
         Check::Landed => DeliveryStep::Landed,
         _ if sends <= AUTOMATIC_RESENDS => DeliveryStep::SendAgain,
         Check::Missing => DeliveryStep::TellTheBuyer,
-        Check::CannotTell => DeliveryStep::StopWithoutClaiming,
+        Check::CannotTell => DeliveryStep::CouldNotCheck,
     }
 }
 
@@ -201,10 +204,14 @@ pub(crate) trait Delivery {
 ///
 /// A GET answer carries no request id, so "fresh" means "the node answered
 /// a GET for this mailbox after the re-read was registered", which an older
-/// GET still in flight could satisfy with a pre-write state. That errs only
-/// towards an extra (harmless) resend or a "not received" card, and the
-/// card clears by itself as soon as any later read shows the message:
-/// `AppState::unconfirmed_sent` filters on what is in the mailbox.
+/// GET still in flight could satisfy with a pre-write state. The first
+/// check's verdict only ever triggers the resend, so one such stale answer
+/// on the SECOND check is enough for a false "not received" card. It errs
+/// only that way, and the card clears by itself once a later read of the
+/// sending store's mailbox shows the message (`AppState::unconfirmed_sent`
+/// filters on what is in it) -- except for a second store under the same
+/// Ghost Key, whose mailbox state this tab files under the first store
+/// (freenet/harvest#130).
 pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage) {
     use crate::state::NotArrived;
 
@@ -213,12 +220,24 @@ pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage) {
     loop {
         sends = sends.saturating_add(1);
         if let Err(e) = io.write(&message).await {
-            io.not_arrived(&digest, NotArrived::NeverReachedNode, Some(e));
+            // Only the FIRST write failing means nothing was ever sent. A
+            // resend failing says nothing about the copy that did reach the
+            // node, which may well have landed.
+            let why = if sends == 1 {
+                NotArrived::NeverReachedNode
+            } else {
+                NotArrived::Unconfirmed
+            };
+            io.not_arrived(&digest, why, Some(e));
             return;
         }
         let fresh = io.wait_and_reread().await;
         match after_delivery_check(Check::from_read(io.landed(&digest), fresh), sends) {
-            DeliveryStep::Landed | DeliveryStep::StopWithoutClaiming => return,
+            DeliveryStep::Landed => return,
+            DeliveryStep::CouldNotCheck => {
+                io.not_arrived(&digest, NotArrived::Unconfirmed, None);
+                return;
+            }
             DeliveryStep::SendAgain => continue,
             DeliveryStep::TellTheBuyer => {
                 io.not_arrived(&digest, NotArrived::NotInMailbox, None);
@@ -544,16 +563,20 @@ mod tests {
     /// The resend still happens: identical bytes cannot land twice.
     #[test]
     fn an_unanswered_reread_never_reports_the_message_missing() {
+        let message = a_message();
+        let digest = harvest_common::mailbox::entry_digest(&message);
         let mut mailbox = FakeMailbox::new(None);
         mailbox.answers = false;
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, message));
         assert_eq!(
             mailbox.writes.borrow().len(),
             1 + AUTOMATIC_RESENDS as usize
         );
-        assert!(
-            mailbox.not_arrived.borrow().is_empty(),
-            "told the buyer the seller lacks it without a fresh read"
+        assert_eq!(
+            *mailbox.not_arrived.borrow(),
+            vec![(digest, NotArrived::Unconfirmed, None)],
+            "told the buyer the seller lacks it without a fresh read, or left them with \
+             nothing to act on"
         );
     }
 
@@ -563,7 +586,46 @@ mod tests {
         let mut mailbox = FakeMailbox::new(None);
         mailbox.routed = false;
         futures::executor::block_on(deliver(&mailbox, a_message()));
-        assert!(mailbox.not_arrived.borrow().is_empty());
+        let reported = mailbox.not_arrived.borrow();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].1, NotArrived::Unconfirmed);
+    }
+
+    /// **A resend that cannot reach the node is not "never sent"** (round 2
+    /// of the harvest#126 review). The first copy did reach it and may have
+    /// landed; the socket dropping during the wait says nothing about that.
+    #[test]
+    fn a_resend_that_cannot_reach_the_node_claims_nothing_about_the_first_copy() {
+        struct DropsAfterFirst(FakeMailbox);
+        impl Delivery for DropsAfterFirst {
+            async fn write(&self, message: &EncryptedMessage) -> Result<(), String> {
+                let first = self.0.writes.borrow().is_empty();
+                self.0
+                    .writes
+                    .borrow_mut()
+                    .push(harvest_common::mailbox::entry_digest(message));
+                if first {
+                    Ok(())
+                } else {
+                    Err("not connected to gateway".into())
+                }
+            }
+            async fn wait_and_reread(&self) -> bool {
+                false
+            }
+            fn landed(&self, digest: &[u8; 32]) -> Option<bool> {
+                self.0.landed(digest)
+            }
+            fn not_arrived(&self, digest: &[u8; 32], why: NotArrived, error: Option<String>) {
+                self.0.not_arrived(digest, why, error)
+            }
+        }
+        let mailbox = DropsAfterFirst(FakeMailbox::new(None));
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(mailbox.0.writes.borrow().len(), 2);
+        let reported = mailbox.0.not_arrived.borrow();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].1, NotArrived::Unconfirmed);
     }
 
     /// A message seen in the mailbox has landed even when the read that

@@ -495,11 +495,20 @@ fn Thread(
                                  once and it is still not in their mailbox. Sending it again \
                                  cannot deliver it twice."
                             }
+                            crate::state::NotArrived::Unconfirmed => {
+                                "Harvest could not check whether this reached the seller's \
+                                 mailbox: your Freenet node did not answer. It may have \
+                                 arrived. Sending it again cannot deliver it twice."
+                            }
+                        };
+                        let label = match why {
+                            crate::state::NotArrived::Unconfirmed => "You — not confirmed",
+                            _ => "You — not received",
                         };
                         rsx! {
                             div { class: "card",
                                 style: "margin-top: 0.5rem;",
-                                p { class: "text-muted", style: "font-size: 0.8rem;", "You — not received" }
+                                p { class: "text-muted", style: "font-size: 0.8rem;", "{label}" }
                                 p { style: "white-space: pre-wrap;", "{message.text}" }
                                 p { class: "text-warning",
                                     style: "font-size: 0.8rem;",
@@ -704,10 +713,36 @@ fn resend(store_contract_id: &[u8], digest: &[u8; 32]) -> Result<(), String> {
         // Already being sent again (a second click before the re-render).
         return Ok(());
     };
-    let mailbox = crate::gateway::mailbox_ops::mailbox_contract_key(&seller)?;
-    APP_STATE
-        .write()
-        .register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
+    // Cannot fail here: the same derivation succeeded for this key on the
+    // first send. If it ever did, the message is re-marked rather than left
+    // with no mark and no delivery.
+    let mailbox = match crate::gateway::mailbox_ops::mailbox_contract_key(&seller) {
+        Ok(mailbox) => mailbox,
+        Err(e) => {
+            APP_STATE.write().mark_not_arrived(
+                store_contract_id,
+                digest,
+                crate::state::NotArrived::Unconfirmed,
+            );
+            return Err(e);
+        }
+    };
+    {
+        let mut app = APP_STATE.write();
+        // Only when this store records no mailbox, or records this one (a
+        // subscribe that gave up drops the routing but keeps the record, and
+        // this re-asks for it). A store re-backed since records a different
+        // one, and repointing it here would file two mailboxes' states into
+        // one store.
+        let same_or_none = app
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.mailbox_contract_id.as_deref())
+            .is_none_or(|recorded| recorded == mailbox.id().as_bytes());
+        if same_or_none {
+            app.register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
+        }
+    }
     dispatch(store_contract_id.to_vec(), seller, sealed);
     Ok(())
 }

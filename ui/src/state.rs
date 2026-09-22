@@ -1950,6 +1950,10 @@ pub enum NotArrived {
     /// The node took it, and fresh reads of the mailbox still do not show
     /// it after an automatic resend.
     NotInMailbox,
+    /// Harvest could not check: the node did not answer the re-reads, or a
+    /// resend could not reach it after the first send had. Nothing is
+    /// claimed either way; the buyer can send it again.
+    Unconfirmed,
 }
 
 /// Enough of a conversation's routing tag to tell two apart on screen.
