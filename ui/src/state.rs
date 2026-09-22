@@ -811,6 +811,13 @@ pub(crate) fn test_store_key() -> [u8; 32] {
         .to_bytes()
 }
 
+/// Why a seller's cancel is refused while a payment that would settle the
+/// invoice is in sight (harvest#53).
+pub(crate) const PAYMENT_ON_ITS_WAY: &str =
+    "a payment for this invoice has been seen at its address, and cancelling would not stop it \
+     counting. Check your wallet: if it settles the invoice, the order is paid and the goods \
+     are owed.";
+
 /// What a seller is told when they try to publish to a store this device has
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
@@ -1393,7 +1400,8 @@ pub enum SettlementHold {
     StoresNotLoaded(Vec<String>),
 }
 
-/// Another own, uncancelled order on the same address and network.
+/// Another own order on the same address and network that a payment could
+/// still settle, or already did (a cancelled one counts: harvest#53).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SameAddressOrder {
     pub id: harvest_common::payment::OrderId,
@@ -1428,7 +1436,16 @@ impl SettlementHold {
                             _ if twin.confirmed_by_you => "confirmed by you, publishing",
                             harvest_common::payment::OrderStatus::Paid => "ALREADY PAID",
                             harvest_common::payment::OrderStatus::PaymentReversed => "reversed",
-                            _ => "awaiting payment",
+                            // A payment in time still settles a cancelled
+                            // invoice, so it is a twin like any other
+                            // (harvest#53); saying "awaiting payment" of it
+                            // would describe an invoice the seller withdrew.
+                            harvest_common::payment::OrderStatus::Cancelled => {
+                                "cancelled, but a payment in time still counts"
+                            }
+                            harvest_common::payment::OrderStatus::AwaitingPayment => {
+                                "awaiting payment"
+                            }
                         }
                     ))
                     .collect::<Vec<_>>()
@@ -4712,10 +4729,10 @@ impl AppState {
             // NOT a cheap test, and saying so because the next reader will
             // want to know: for a store that is not ours this calls
             // `our_orders`, whose own early-out is satisfied by any single
-            // uncancelled windowed order -- which nearly every live store
-            // has -- so `buyer_purchases` then decrypts every conversation
-            // in it. What this skips is a store whose orders are ALL
-            // cancelled or windowless, not a busy one. The per-store sweep
+            // windowed order -- which nearly every live store has -- so
+            // `buyer_purchases` then decrypts every conversation in it. What
+            // this skips is a store whose orders are ALL windowless, not a
+            // busy one. The per-store sweep
             // is real and is tracked in harvest#116, whose answer (key the
             // twin check off the address contract) removes it rather than
             // trims it.
@@ -4772,7 +4789,7 @@ impl AppState {
         self.same_address_orders = map;
     }
 
-    /// The other own, uncancelled orders on the same address and network
+    /// The other own orders on the same address and network
     /// whose payment window contains any of `heights`: for a Paid order's
     /// in-window payment heights, the invoices whose payment it may have
     /// been; for a late payment's height, whose it may be instead.
@@ -4838,7 +4855,7 @@ impl AppState {
     /// Why a provable payment for `order` should not be published as Paid
     /// without the seller confirming it, if it should not.
     ///
-    /// Only when nothing is ambiguous: no other own, uncancelled order on the
+    /// Only when nothing is ambiguous: no other own order (cancelled included) on the
     /// same address and network with an overlapping window (a Paid one
     /// counts: its payment may be the very one proving this order), and
     /// everything owned loaded (a twin could be in what has not). Everything
@@ -6577,17 +6594,8 @@ impl AppState {
         // `Paid` outranks `Cancelled` -- so cancelling now would only put a
         // record in public that says the opposite of what is about to happen
         // (harvest#53 review).
-        let live =
-            crate::components::bitcoin_view::live_address_for_order(&self.bitcoin, &order.order);
-        if crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref())
-            .payment_seen()
-        {
-            return Err(
-                "a payment has already been seen at this invoice's address, and \
-                        cancelling would not stop it counting. Check your wallet: if it \
-                        confirms in time, the order is paid and the goods are owed."
-                    .to_string(),
-            );
+        if self.payment_on_its_way(&order) {
+            return Err(PAYMENT_ON_ITS_WAY.to_string());
         }
         if self.cancellation_pending(order_id) || self.cancellations_sent.contains(order_id) {
             return Err("this invoice is already being cancelled".to_string());
@@ -6600,6 +6608,25 @@ impl AppState {
             })),
             store_key.to_bytes(),
         )
+    }
+
+    /// Whether this node can see a payment at `order`'s address that would
+    /// settle it: the full amount confirmed inside its window, or in flight
+    /// while the window is still open. A partial payment or dust does not
+    /// count -- neither settles anything, and letting dust refuse a cancel
+    /// would hand anyone who can read the public address a way to make any
+    /// invoice uncancellable (harvest#53 review round 2).
+    fn payment_on_its_way(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|tip| tip.tip_height);
+        let live =
+            crate::components::bitcoin_view::live_address_for_order(&self.bitcoin, &order.order);
+        crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref())
+            .sight(&order.order, tip)
+            .settles()
     }
 
     /// Whether a cancellation of `order_id` is waiting on its signature.
@@ -6623,6 +6650,14 @@ impl AppState {
     ) {
         let store_contract_id = pending.store_contract_id.clone();
         let short = pending.order.order.id.short();
+        // Asked again now the seller has signed: a payment can have come into
+        // sight while the signature was being given.
+        if self.payment_on_its_way(&pending.order) {
+            self.notifications.push(format!(
+                "Did not cancel invoice {short}: {PAYMENT_ON_ITS_WAY}"
+            ));
+            return;
+        }
         let cancelled = pending.cancelled(scoped_payload, signature);
         let verdict = self
             .store_owner_key(&store_contract_id)
@@ -13121,7 +13156,7 @@ mod invoice_tests {
         );
     }
 
-    /// **Which orders are ambiguous.** Any other own, uncancelled order on the
+    /// **Which orders are ambiguous.** Any other own order (cancelled included, harvest#53) on the
     /// same address and network whose window overlaps, whatever its status.
     /// Windows overlap exactly when the later anchor is less than a window
     /// after the earlier; a partial overlap counts. A stranger's store flags
@@ -19735,7 +19770,7 @@ mod buy_flow_tests {
     /// address (harvest#75, the guard it would otherwise bypass).**
     ///
     /// `settlement_hold` withholds a provable payment when another
-    /// uncancelled order on the same address has an overlapping window,
+    /// order on the same address has an overlapping window,
     /// because nothing on the chain says which order a payment was for. It
     /// was fed by `refresh_same_address_orders`, which scanned OWN STORES
     /// ONLY -- correct while only a seller could publish, and blind in
@@ -22272,8 +22307,18 @@ mod buy_flow_tests {
             }],
         );
         give_the_node_the_chain(&mut state, &order, claims, tip);
-        // The rows the card reads, as `apply_address_state` builds them from
-        // the claims (the chain fixture leaves them empty).
+        show_a_payment_row(&mut state, &order, order.order.amount_sats);
+        let refused = state
+            .cancel_invoice(STORE, &order.order.id)
+            .expect_err("a seen payment refuses the cancel");
+        assert!(refused.contains("has been seen"), "{refused}");
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// A confirmed in-window row at `order`'s address, as
+    /// `apply_address_state` builds them (the chain fixture leaves the rows
+    /// empty).
+    fn show_a_payment_row(state: &mut AppState, order: &AuthorizedOrder, value_sats: u64) {
         let view_id = order
             .order
             .bitcoin_address_instance_id()
@@ -22286,16 +22331,87 @@ mod buy_flow_tests {
             .expect("the view")
             .txs = vec![TxRow {
             txid_display: "t".into(),
-            value_sats: order.order.amount_sats,
+            value_sats,
             status: TxRowStatus::Confirmed {
                 anchor_height: TIP_HEIGHT - 1,
             },
         }];
-        let refused = state
+    }
+
+    /// Review round 2: dust at the public address must not make an invoice
+    /// uncancellable -- anyone can send it.
+    #[test]
+    fn dust_at_the_address_does_not_stop_a_cancel() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        show_a_payment_row(&mut state, &order, 546);
+        state
             .cancel_invoice(STORE, &order.order.id)
-            .expect_err("a seen payment refuses the cancel");
-        assert!(refused.contains("already been seen"), "{refused}");
-        assert!(state.pending_signatures.is_empty());
+            .expect("dust does not refuse a cancel");
+    }
+
+    /// Review round 2: a payment that comes into sight while the seller is
+    /// signing stops the cancellation before it is published.
+    #[test]
+    fn a_payment_seen_while_the_cancel_is_signing_stops_it() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        state
+            .cancel_invoice(STORE, &order.order.id)
+            .expect("queued");
+        show_a_payment_row(&mut state, &order, order.order.amount_sats);
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.published_cancellations.is_empty());
+        assert!(!state.cancellations_sent.contains(&order.order.id));
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.starts_with("Did not cancel invoice")),
+            "{:?}",
+            state.notifications
+        );
+    }
+
+    /// Review round 2: a cancelled twin is named as cancelled in the hold
+    /// the seller reads above "Confirm paid", not as "awaiting payment".
+    #[test]
+    fn a_cancelled_twin_is_named_as_cancelled() {
+        let hold = SettlementHold::Twins(vec![SameAddressOrder {
+            id: harvest_common::payment::OrderId([3u8; 32]),
+            window: 1..=2,
+            amount_sats: 5,
+            status: OrderStatus::Cancelled,
+            confirmed_by_you: false,
+        }]);
+        let said = hold.explain(5, 5);
+        assert!(
+            said.contains("cancelled, but a payment in time still counts"),
+            "{said}"
+        );
+        assert!(!said.contains("awaiting payment"), "{said}");
     }
 
     /// The buyer's card for an order past payment shows where it stands --
@@ -22316,7 +22432,7 @@ mod buy_flow_tests {
         );
         assert_eq!(purchase.settled(), Some(&paid));
         assert!(matches!(
-            crate::fulfilment::order_stage(&paid, Some(TIP_HEIGHT), false),
+            crate::fulfilment::order_stage(&paid, Some(TIP_HEIGHT), Default::default()),
             crate::fulfilment::OrderStage::AwaitingDespatch { .. }
         ));
     }

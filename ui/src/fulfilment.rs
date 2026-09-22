@@ -57,6 +57,33 @@ pub fn payment_could_still_settle(status: OrderStatus) -> bool {
     }
 }
 
+/// What this reader can see at an order's address that bears on whether it
+/// will be paid (harvest#53 review round 2).
+///
+/// Only payments that would SETTLE the order count. A partial payment or dust
+/// settles nothing, and anyone who can read the public address can send
+/// dust, so letting either hold an order open would let a stranger keep any
+/// invoice from ever lapsing and any cancel from ever being allowed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaymentSight {
+    /// Value confirmed inside the order's payment window covers the amount:
+    /// the order will settle once that payment is deep enough and somebody
+    /// publishes it. There is no deadline on publishing, so this holds after
+    /// the window closes too.
+    pub covered: bool,
+    /// Unconfirmed value that, with what is already confirmed in the window,
+    /// would cover the amount -- while the window is still open for it to
+    /// confirm in.
+    pub in_flight: bool,
+}
+
+impl PaymentSight {
+    /// Whether what is in sight would settle the order.
+    pub fn settles(self) -> bool {
+        self.covered || self.in_flight
+    }
+}
+
 /// Where one order stands, as this reader judges it against their own view
 /// of the chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +96,8 @@ pub enum OrderStage {
     Lapsed { closed_at: u32 },
     /// Cancelled by the seller. `settle_until` is `Some` while a payment made
     /// in time could still settle it anyway -- `Paid` outranks `Cancelled` --
-    /// and `payment_seen` says this reader can see one at the address.
+    /// and `payment_seen` says this reader can see one that would, at the
+    /// address ([`PaymentSight::settles`]).
     Cancelled {
         settle_until: Option<u32>,
         payment_seen: bool,
@@ -191,16 +219,16 @@ fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
 /// open: a window cannot be said to be open by a reader who cannot see the
 /// chain.
 ///
-/// `payment_seen` is whether this reader's own view of the order's address
-/// shows value confirmed inside its window, or unconfirmed value (see
-/// `components::bitcoin_view::AddressReading`). While it does, an unpaid
-/// order is not called lapsed: a payment the chain holds but nobody has
-/// published yet is still a payment, and saying "no payment" over it would
-/// contradict the address reading on the same card.
+/// `sight` is what this reader's own view of the order's address shows (see
+/// `components::bitcoin_view::AddressReading::sight`). While it shows a
+/// payment covering the order inside its window, an unpaid order is not
+/// called lapsed: a payment the chain holds but nobody has published yet is
+/// still a payment, and saying "no payment" over it would contradict the
+/// address reading on the same card.
 pub fn order_stage(
     order: &AuthorizedOrder,
     tip_height: Option<u32>,
-    payment_seen: bool,
+    sight: PaymentSight,
 ) -> OrderStage {
     match order.status {
         OrderStatus::PaymentReversed => OrderStage::Reversed,
@@ -215,14 +243,14 @@ pub fn order_stage(
             };
             OrderStage::Cancelled {
                 settle_until,
-                payment_seen,
+                payment_seen: sight.settles(),
             }
         }
         OrderStatus::AwaitingPayment => {
             let (Some(last), Some(tip)) = (last_settling_block(order), tip_height) else {
                 return OrderStage::Unknown;
             };
-            if tip > last && !payment_seen {
+            if tip > last && !sight.covered {
                 OrderStage::Lapsed { closed_at: last }
             } else {
                 OrderStage::AwaitingPayment { settle_until: last }
@@ -290,7 +318,13 @@ impl OrderStage {
     /// seller who shipped on day one reads exactly the same, and styling it
     /// as a warning would accuse every honest seller after a week.
     pub fn describe(self, tip_height: Option<u32>, status: OrderStatus) -> Option<String> {
-        let left = |until: u32| approx_duration(until.saturating_sub(tip_height.unwrap_or(until)));
+        // " (about 3 days)", or nothing when this reader has no tip to count
+        // from: a duration made up without one is a made-up number.
+        let left = |until: u32| {
+            tip_height
+                .map(|tip| format!(" ({})", approx_duration(until.saturating_sub(tip))))
+                .unwrap_or_default()
+        };
         match self {
             // The payment pill and the notes beside it already cover an open
             // invoice.
@@ -305,17 +339,20 @@ impl OrderStage {
                  block {closed_at}, so it can no longer be paid."
             )),
             OrderStage::Cancelled {
+                payment_seen: true, ..
+            } => Some(
+                "The seller cancelled this invoice, but a payment that settles it has been seen \
+                 at its address. A cancellation does not undo a payment: once it is recorded the \
+                 order is paid, and the seller owes the goods."
+                    .to_string(),
+            ),
+            OrderStage::Cancelled {
                 settle_until: Some(until),
-                payment_seen,
+                payment_seen: false,
             } => Some(format!(
                 "The seller cancelled this invoice. A payment made in time still counts until \
-                 block {until} ({}), and the seller would then owe the goods.{}",
+                 block {until}{}, and the seller would then owe the goods.",
                 left(until),
-                if payment_seen {
-                    " A payment has been seen at this invoice's address."
-                } else {
-                    ""
-                }
             )),
             OrderStage::Cancelled {
                 settle_until: None, ..
@@ -328,7 +365,7 @@ impl OrderStage {
                 despatch_by,
             } => Some(format!(
                 "Paid, counting from block {paid_at}. The seller is expected to despatch by \
-                 block {despatch_by} ({}).",
+                 block {despatch_by}{}.",
                 left(despatch_by)
             )),
             OrderStage::DespatchWindowClosed {
@@ -336,7 +373,7 @@ impl OrderStage {
                 complaint_until,
             } => Some(format!(
                 "Paid. The despatch window closed at block {despatch_by}, and this order counts \
-                 as complete from block {complaint_until} ({}).",
+                 as complete from block {complaint_until}{}.",
                 left(complaint_until)
             )),
             OrderStage::Closed { closed_at } => Some(format!(
@@ -359,8 +396,8 @@ impl OrderStage {
             self,
             OrderStage::Reversed
                 | OrderStage::Cancelled {
-                    settle_until: Some(_),
                     payment_seen: true,
+                    ..
                 }
         )
     }
@@ -368,19 +405,31 @@ impl OrderStage {
 
 /// Whether anybody should be shown `order`'s payment address.
 ///
-/// Only while a payment could still settle it and nobody has withdrawn it.
-/// Showing the address of a cancelled, lapsed or already-paid order invites a
-/// payment the order will either never recognise or does not need. (A
-/// cancelled invoice paid anyway does still settle, but it is not one to
-/// invite payment to.)
+/// Only an unpaid invoice, and only while a payment sent now could still
+/// confirm inside its payment window. Showing the address of a cancelled or
+/// already-paid order invites a payment it will either never recognise or
+/// does not need. (A cancelled invoice paid anyway does still settle, but it
+/// is not one to invite payment to.)
 ///
-/// Decided on the STATUS first and the stage second, so that a reader who
-/// cannot yet see the chain ([`OrderStage::Unknown`]) still sees an open
-/// invoice's address as before: withholding it on "unknown" would blank every
-/// seller's panel while the tip loads. The buyer's own purchase card refuses
-/// to show payment details without a tip anyway (`PaymentBlocker::ChainUnknown`).
-pub fn offers_payment_address(order: &AuthorizedOrder, stage: OrderStage) -> bool {
-    order.status == OrderStatus::AwaitingPayment && !matches!(stage, OrderStage::Lapsed { .. })
+/// Judged against the window's last block, NOT against the order's stage
+/// (harvest#53 review round 2). The stage stays "awaiting payment" past the
+/// window while a payment made in time is still gathering confirmations or
+/// waiting to be published, and a second payment sent in that time can only
+/// confirm outside the window and never settle anything.
+///
+/// A reader with no tip still sees an open invoice's address as before:
+/// withholding it on "unknown" would blank every seller's panel while the
+/// chain loads. The buyer's own purchase card refuses to show payment details
+/// without a tip anyway (`PaymentBlocker::ChainUnknown`). An order with no
+/// anchor keeps the address and its existing note saying it can never settle.
+pub fn offers_payment_address(order: &AuthorizedOrder, tip_height: Option<u32>) -> bool {
+    if order.status != OrderStatus::AwaitingPayment {
+        return false;
+    }
+    match (order.order.payment_window(), tip_height) {
+        (Some(window), Some(tip)) => tip <= *window.end(),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +444,12 @@ mod tests {
     use harvest_common::payment::{Order, OrderId, PAYMENT_WINDOW_BLOCKS};
 
     const ANCHOR: u32 = 800_000;
+
+    /// A payment covering the order, confirmed inside its window.
+    const COVERED: PaymentSight = PaymentSight {
+        covered: true,
+        in_flight: false,
+    };
 
     fn bridge() -> SigningKey {
         SigningKey::from_bytes(&[61u8; 32])
@@ -541,7 +596,7 @@ mod tests {
         let complaint_until = despatch_by + COMPLAINT_WINDOW_BLOCKS;
 
         assert_eq!(
-            order_stage(&paid, Some(paid_at + 6), false),
+            order_stage(&paid, Some(paid_at + 6), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by
@@ -549,28 +604,28 @@ mod tests {
         );
         // The deadline block itself is still inside the window.
         assert_eq!(
-            order_stage(&paid, Some(despatch_by), false),
+            order_stage(&paid, Some(despatch_by), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(despatch_by + 1), false),
+            order_stage(&paid, Some(despatch_by + 1), PaymentSight::default()),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(complaint_until), false),
+            order_stage(&paid, Some(complaint_until), PaymentSight::default()),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(complaint_until + 1), false),
+            order_stage(&paid, Some(complaint_until + 1), PaymentSight::default()),
             OrderStage::Closed {
                 closed_at: complaint_until
             }
@@ -582,11 +637,11 @@ mod tests {
         let open = order(OrderStatus::AwaitingPayment, 10_000);
         let settle_until = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         assert_eq!(
-            order_stage(&open, Some(settle_until), false),
+            order_stage(&open, Some(settle_until), PaymentSight::default()),
             OrderStage::AwaitingPayment { settle_until }
         );
         assert_eq!(
-            order_stage(&open, Some(settle_until + 1), false),
+            order_stage(&open, Some(settle_until + 1), PaymentSight::default()),
             OrderStage::Lapsed {
                 closed_at: settle_until
             }
@@ -596,43 +651,52 @@ mod tests {
     #[test]
     fn no_window_is_judged_without_a_tip_or_a_paid_height() {
         let open = order(OrderStatus::AwaitingPayment, 10_000);
-        assert_eq!(order_stage(&open, None, false), OrderStage::Unknown);
+        assert_eq!(
+            order_stage(&open, None, PaymentSight::default()),
+            OrderStage::Unknown
+        );
 
         let paid = paid_with(|o| vec![confirmed(o, 10_000, ANCHOR + 3, 1)]);
-        assert_eq!(order_stage(&paid, None, false), OrderStage::Unknown);
+        assert_eq!(
+            order_stage(&paid, None, PaymentSight::default()),
+            OrderStage::Unknown
+        );
 
         // Paid, but the evidence does not show it covered: unknown, NOT an
         // open despatch window measured from some default.
         let short = paid_with(|o| vec![confirmed(o, 9_999, ANCHOR + 3, 1)]);
         assert_eq!(
-            order_stage(&short, Some(ANCHOR + 10), false),
+            order_stage(&short, Some(ANCHOR + 10), PaymentSight::default()),
             OrderStage::Unknown
         );
 
         let mut unanchored = order(OrderStatus::AwaitingPayment, 10_000);
         unanchored.order.anchor = None;
         assert_eq!(
-            order_stage(&unanchored, Some(ANCHOR), false),
+            order_stage(&unanchored, Some(ANCHOR), PaymentSight::default()),
             OrderStage::Unknown
         );
     }
 
     #[test]
-    fn only_an_open_invoice_offers_its_address() {
-        let settle_until = ANCHOR + PAYMENT_WINDOW_BLOCKS;
-        let open = order(OrderStatus::AwaitingPayment, 10_000);
-        assert!(offers_payment_address(
-            &open,
-            OrderStage::AwaitingPayment { settle_until }
-        ));
+    fn only_an_open_invoice_offers_its_address_and_only_inside_its_window() {
+        let window_end = ANCHOR + PAYMENT_WINDOW_BLOCKS;
+        let mut open = order(OrderStatus::AwaitingPayment, 10_000);
+        assert!(offers_payment_address(&open, Some(window_end)));
         // No tip yet: an open invoice still shows its address.
-        assert!(offers_payment_address(&open, OrderStage::Unknown));
-        assert!(!offers_payment_address(
-            &open,
-            OrderStage::Lapsed {
-                closed_at: settle_until
+        assert!(offers_payment_address(&open, None));
+        assert!(!offers_payment_address(&open, Some(window_end + 1)));
+        // Review round 2: past the window the STAGE can still read as
+        // awaiting payment (a payment made in time gathering confirmations),
+        // and the address must not come back with it.
+        open.order.required_confirmations = 6;
+        assert_eq!(
+            order_stage(&open, Some(window_end + 3), COVERED),
+            OrderStage::AwaitingPayment {
+                settle_until: window_end + 5
             }
-        ));
+        );
+        assert!(!offers_payment_address(&open, Some(window_end + 3)));
         for status in [
             OrderStatus::Cancelled,
             OrderStatus::Paid,
@@ -640,7 +704,7 @@ mod tests {
         ] {
             let settled = order(status, 10_000);
             assert!(
-                !offers_payment_address(&settled, OrderStage::Unknown),
+                !offers_payment_address(&settled, Some(ANCHOR + 1)),
                 "{status:?} must not show an address"
             );
         }
@@ -656,7 +720,7 @@ mod tests {
         assert_eq!(paid_height(&paid), Some(ANCHOR + 3 + 1_499));
         let paid_at = ANCHOR + 3 + 1_499;
         assert_eq!(
-            order_stage(&paid, Some(paid_at), false),
+            order_stage(&paid, Some(paid_at), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by: paid_at + DESPATCH_WINDOW_BLOCKS
@@ -673,17 +737,23 @@ mod tests {
         open.order.required_confirmations = 6;
         let last = ANCHOR + PAYMENT_WINDOW_BLOCKS + 5;
         assert_eq!(
-            order_stage(&open, Some(last), false),
+            order_stage(&open, Some(last), PaymentSight::default()),
             OrderStage::AwaitingPayment { settle_until: last }
         );
         assert_eq!(
-            order_stage(&open, Some(last + 1), false),
+            order_stage(&open, Some(last + 1), PaymentSight::default()),
             OrderStage::Lapsed { closed_at: last }
         );
-        // A payment this reader can see is never called lapsed.
+        // A covering payment this reader can see is never called lapsed.
         assert_eq!(
-            order_stage(&open, Some(last + 1), true),
+            order_stage(&open, Some(last + 1), COVERED),
             OrderStage::AwaitingPayment { settle_until: last }
+        );
+        // But a partial payment, dust, or something still in flight after
+        // the window is not a payment that settles it (review round 2).
+        assert_eq!(
+            order_stage(&open, Some(last + 1), PaymentSight::default()),
+            OrderStage::Lapsed { closed_at: last }
         );
     }
 
@@ -692,14 +762,14 @@ mod tests {
         let cancelled = order(OrderStatus::Cancelled, 10_000);
         let last = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         assert_eq!(
-            order_stage(&cancelled, Some(last), true),
+            order_stage(&cancelled, Some(last), COVERED),
             OrderStage::Cancelled {
                 settle_until: Some(last),
                 payment_seen: true
             }
         );
         assert_eq!(
-            order_stage(&cancelled, Some(last + 1), false),
+            order_stage(&cancelled, Some(last + 1), PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: None,
                 payment_seen: false
@@ -707,12 +777,28 @@ mod tests {
         );
         // No tip: it still might.
         assert_eq!(
-            order_stage(&cancelled, None, false),
+            order_stage(&cancelled, None, PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: Some(last),
                 payment_seen: false
             }
         );
+        // Review round 2: a covering payment past the cutoff is still seen,
+        // and still reads as a warning, because publishing it has no
+        // deadline and it will turn the order Paid.
+        let stage = order_stage(&cancelled, Some(last + 1), COVERED);
+        assert_eq!(
+            stage,
+            OrderStage::Cancelled {
+                settle_until: None,
+                payment_seen: true
+            }
+        );
+        assert!(stage.needs_attention());
+        assert!(stage
+            .describe(Some(last + 1), OrderStatus::Cancelled)
+            .expect("said")
+            .contains("owes the goods"));
     }
 
     #[test]
@@ -767,7 +853,20 @@ mod tests {
             OrderStatus::Cancelled,
         )
         .expect("cancelled");
-        assert!(seen.contains("payment has been seen"), "{seen}");
+        assert!(seen.contains("has been seen"), "{seen}");
+        // No tip: the block, but no duration counted from nowhere (codex,
+        // review round 2).
+        let no_tip = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: false,
+        }
+        .describe(None, OrderStatus::Cancelled)
+        .expect("cancelled");
+        assert!(no_tip.contains("block 1144"), "{no_tip}");
+        assert!(
+            !no_tip.contains("about") && !no_tip.contains("under"),
+            "{no_tip}"
+        );
         let despatch = say(
             OrderStage::AwaitingDespatch {
                 paid_at: 990,
@@ -808,21 +907,19 @@ mod tests {
     #[test]
     fn only_a_reversal_or_a_payment_on_a_cancelled_invoice_is_a_warning() {
         assert!(OrderStage::Reversed.needs_attention());
-        assert!(OrderStage::Cancelled {
-            settle_until: Some(1),
-            payment_seen: true
+        for settle_until in [Some(1), None] {
+            assert!(OrderStage::Cancelled {
+                settle_until,
+                payment_seen: true
+            }
+            .needs_attention());
         }
-        .needs_attention());
         for calm in [
             OrderStage::AwaitingPayment { settle_until: 1 },
             OrderStage::Lapsed { closed_at: 1 },
             OrderStage::Cancelled {
                 settle_until: Some(1),
                 payment_seen: false,
-            },
-            OrderStage::Cancelled {
-                settle_until: None,
-                payment_seen: true,
             },
             OrderStage::AwaitingDespatch {
                 paid_at: 1,

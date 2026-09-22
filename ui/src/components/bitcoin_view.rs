@@ -566,9 +566,9 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     };
     // Where the order stands after the payment question (harvest#53):
     // reader-side windows against this reader's own tip.
-    let stage = crate::fulfilment::order_stage(&order, tip_height, reading.payment_seen());
+    let stage = crate::fulfilment::order_stage(&order, tip_height, reading.sight(o, tip_height));
     let stage_note = stage.describe(tip_height, order.status);
-    let offers_address = crate::fulfilment::offers_payment_address(&order, stage);
+    let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
     let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
 
@@ -815,10 +815,29 @@ impl AddressReading {
         reading
     }
 
-    /// Whether this reading shows a payment that may yet be this order's:
-    /// value confirmed inside its window, or value not yet confirmed.
-    pub(crate) fn payment_seen(&self) -> bool {
-        self.in_window_sats > 0 || self.pending_sats > 0
+    /// What this reading shows that would settle `order`: the full amount
+    /// confirmed inside its window, or unconfirmed value making up the
+    /// amount while the window is still open for it to confirm in. Partial
+    /// value and dust are nothing here -- see
+    /// [`crate::fulfilment::PaymentSight`].
+    ///
+    /// `pending_sats` is not window-checked (an unconfirmed transaction has
+    /// no height), which is why it only counts while the window is open.
+    pub(crate) fn sight(
+        &self,
+        order: &harvest_common::payment::Order,
+        tip_height: Option<u32>,
+    ) -> crate::fulfilment::PaymentSight {
+        let covered = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
+        let window_open = match (order.payment_window(), tip_height) {
+            (Some(window), Some(tip)) => tip <= *window.end(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let in_flight = window_open
+            && self.pending_sats > 0
+            && self.in_window_sats.saturating_add(self.pending_sats) >= self.amount_sats;
+        crate::fulfilment::PaymentSight { covered, in_flight }
     }
 
     /// What to tell the seller when the address holds confirmed value that is
@@ -1610,6 +1629,34 @@ mod address_reading_tests {
             super::status_pill(OrderStatus::AwaitingPayment, &full, true).0,
             "btc-pill paid"
         );
+    }
+
+    /// harvest#53 review round 2: only a payment that would SETTLE the order
+    /// is in sight. Dust and part-payments are not -- anyone can send dust to
+    /// a public address -- and unconfirmed value counts only while the window
+    /// is still open for it to confirm in.
+    #[test]
+    fn only_a_settling_payment_is_in_sight() {
+        let order = order_anchored_at(150);
+        let window_end = order.payment_window().expect("anchored").end().to_owned();
+        let dust = AddressReading::of(&order, Some(&address_with(&[(151, 546)])));
+        assert!(!dust.sight(&order, Some(160)).settles());
+        let full = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
+        assert!(full.sight(&order, Some(window_end + 50)).covered);
+        let mut pending_view = address_with(&[(151, 4_000)]);
+        pending_view.pending_sats = 6_000;
+        let pending = AddressReading::of(&order, Some(&pending_view));
+        assert!(pending.sight(&order, Some(160)).in_flight);
+        assert!(pending.sight(&order, None).in_flight);
+        assert!(
+            !pending.sight(&order, Some(window_end + 1)).settles(),
+            "value still in flight after the window can never settle it"
+        );
+        let mut short_pending = address_with(&[(151, 4_000)]);
+        short_pending.pending_sats = 5_999;
+        assert!(!AddressReading::of(&order, Some(&short_pending))
+            .sight(&order, Some(160))
+            .settles());
     }
 
     /// harvest#53 review: a lapsed invoice's pill does not say "Awaiting
