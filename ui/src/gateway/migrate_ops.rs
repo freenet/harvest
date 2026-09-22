@@ -58,7 +58,7 @@ use harvest_common::store::StoreStateV1;
 
 use crate::migrate::{self, Artifact, MailboxOps, ProbeSession, ReputationOps, Seal, StoreOps};
 
-use super::migrate_gate::{self, Admission, SessionWalks};
+use super::migrate_gate::{self, Admission, NoticeLedger, SessionWalks};
 use super::migrate_seal::{self, Disposition, ForwardPut, SuccessorReference};
 use super::store_ops::{
     INDEX_CONTRACT_WASM, MAILBOX_CONTRACT_WASM, REPUTATION_CONTRACT_WASM, STORE_CONTRACT_WASM,
@@ -81,6 +81,17 @@ struct Probe {
     probed: Vec<ContractInstanceId>,
     params: Parameters<'static>,
     session: Session,
+    /// What THIS walk's folds could not carry, taken from
+    /// `migrate::take_uncarried` after every step of this walk.
+    ///
+    /// The collector is shared by every walk in the tab, and several walks
+    /// interleave (a Ghost Key's store, mailbox and index, and each store
+    /// key's store). Draining it in `finish`, as this used to, handed a loss
+    /// to whichever walk happened to finish next -- harmless while a notice
+    /// was just a string, wrong once a notice's durable id names its lineage
+    /// (`migrate::notice_marker`). A fold only runs inside a step of its own
+    /// walk, synchronously, so draining after each step attributes exactly.
+    uncarried: Vec<String>,
 }
 
 /// The three probe types behind one handle.
@@ -452,6 +463,7 @@ fn start<F>(
         probed: Vec::new(),
         params: params.clone(),
         session: build(&params),
+        uncarried: Vec::new(),
     };
     PENDING.with(|p| p.borrow_mut().insert(marker.clone(), probe));
 
@@ -548,11 +560,18 @@ pub fn deliver_delegate_response(response: &super::response_handler::DelegateRes
     };
     match harvest {
         HarvestDelegateResponse::MigrationMarker { marker, present } => {
-            match migrate::probe_gate(if *present {
+            let lookup = if *present {
                 migrate::MarkerLookup::Present
             } else {
                 migrate::MarkerLookup::Absent
-            }) {
+            };
+            // A notice's answer, including a late one for a notice already
+            // settled, never reaches the probe gate: it names no lineage.
+            if marker.starts_with(migrate::NOTICE_MARKER_PREFIX) {
+                settle_notice(marker, lookup);
+                return true;
+            }
+            match migrate::probe_gate(lookup) {
                 migrate::Gate::Skip => drop_pending(marker),
                 migrate::Gate::Run => {
                     release_pending(marker);
@@ -562,10 +581,17 @@ pub fn deliver_delegate_response(response: &super::response_handler::DelegateRes
         }
         HarvestDelegateResponse::MigrationMarkerRecorded { marker, recorded } => {
             if !*recorded {
-                warn!(
-                    "migration: the delegate did not record marker {marker}; \
-                     this lineage will be probed again on the next load"
-                );
+                if marker.starts_with(migrate::NOTICE_MARKER_PREFIX) {
+                    warn!(
+                        "migration: the delegate did not record notice {marker} as shown; \
+                         it will be shown again on the next load"
+                    );
+                } else {
+                    warn!(
+                        "migration: the delegate did not record marker {marker}; \
+                         this lineage will be probed again on the next load"
+                    );
+                }
             }
             true
         }
@@ -586,6 +612,10 @@ fn pump(mut probe: Probe) {
         Session::Mailbox(s) => s.next_get(),
         Session::Index(s) => s.next_get(),
     };
+    // Every fold of this walk has run by now: the step that brought us here
+    // (`on_state` and friends, called just before) and `next_get`, which
+    // folds in the local snapshot when the walk ends. See `Probe::uncarried`.
+    probe.uncarried.extend(migrate::take_uncarried());
 
     let Some(candidate) = next else {
         finish(probe);
@@ -838,9 +868,9 @@ fn finish(mut probe: Probe) {
     // precisely the case this reports -- draining after it would mean the one
     // message that matters is the one never sent.
     //
-    // The migration seals after this, so there is no second attempt and no
-    // later screen where it turns up again. See `migrate::take_uncarried`.
-    report_uncarried();
+    // The walk repeats on every load and will find the same loss again, so
+    // each notice is shown once across loads (`notify_once`, harvest#121).
+    report_uncarried(&probe.marker, std::mem::take(&mut probe.uncarried));
 
     let Some(forward) = forward else {
         // Nothing to carry forward, so there is nothing that could have
@@ -1037,21 +1067,16 @@ fn settle_forward(successor: ContractInstanceId, how: Confirmation) {
     }
 }
 
-/// Push everything the migration could not carry into the notifications the
-/// seller actually sees.
+/// Tell the seller what this walk could not carry, each notice at most once.
 ///
-/// A `probe_warn` is a browser console line. The loss is permanent -- the
-/// migration seals -- and a decision the person affected is not told about is
-/// indistinguishable from a bug, so this is the half that reaches them.
-fn report_uncarried() {
-    let lost = crate::migrate::take_uncarried();
-    if lost.is_empty() {
-        return;
-    }
-    let mut state = super::APP_STATE.write();
+/// A `probe_warn` is a browser console line. The loss is permanent, and a
+/// decision the person affected is not told about is indistinguishable from a
+/// bug, so this is the half that reaches them. Once, because the walk repeats
+/// on every load and finds the same loss every time (harvest#121).
+fn report_uncarried(lineage: &str, lost: Vec<String>) {
     for what in lost {
         warn!("migration: {what}");
-        state.notifications.push(what);
+        notify_once(lineage, what);
     }
 }
 
@@ -1066,10 +1091,14 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
         forwarded.artifact.as_str()
     );
     adopt_recovered(&forwarded.probed, successor);
-    super::APP_STATE.write().notifications.push(format!(
-        "Recovered your {} from an earlier version of Harvest.",
-        forwarded.artifact.as_str()
-    ));
+    // Once, not on every load: the walk repeats and re-adopts each time.
+    notify_once(
+        &forwarded.marker,
+        format!(
+            "Recovered your {} from an earlier version of Harvest.",
+            forwarded.artifact.as_str()
+        ),
+    );
 }
 
 /// Whether every durable pointer a later load follows already names the
@@ -1108,11 +1137,36 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 /// `Err`. Reading a successful in-session adoption as durability is how a
 /// migration would start sealing again over exactly the state that reverts.
 ///
-/// Closing this needs a delegate request that replaces a `StoreRegistration`
-/// -- `common/src/delegate.rs` plus the delegate's own handler, with the
-/// duplicate handling that `RegisterStore`'s append semantics currently dodge.
-/// When it exists, this function sends it, awaits its acknowledgement, and
-/// returns `Ok` on that acknowledgement alone.
+/// # Adding the missing request would not be enough (harvest#121)
+///
+/// A request that repoints the registry was built and reviewed on the first
+/// round of harvest#121, together with a read-back that closes condition 1,
+/// and withdrawn: the review established that condition 2 is not the only
+/// thing standing between this code and a safe seal. **Harvest's predecessor
+/// contracts are not frozen after a re-key**, which is the precondition the
+/// migration doctrine puts on any durable marker:
+///
+/// * a mailbox is open-write, and a buyer's tab that has not reloaded derives
+///   the mailbox address from the WASM it was served, so first-contact
+///   messages keep landing in the predecessor;
+/// * a settlement lands on whichever store generation the buyer's copy names,
+///   and a seller's own stale tab edits the predecessor store;
+/// * `seal_decision` accepts `Recovered` when other candidates answered
+///   `NotFound`, which is unauthenticated, so a present-but-unfindable
+///   generation would be skipped for good;
+/// * a fold that refuses a predecessor wholesale still reports `Recovered`,
+///   and `docs/design/migratability.md`'s owner-assisted re-issue needs that
+///   lineage left open;
+/// * the store info's signed `reputation_contract_id`, and the custody path
+///   that re-registers from it, would put a predecessor id back after any
+///   repoint.
+///
+/// Every one of those is harmless while nothing seals, because the next load
+/// walks again and folds in whatever arrived. So the seal stays off by
+/// decision: the walk repeats on every load, re-PUTs a state the contracts
+/// merge idempotently, and its notices are shown once (`notify_once`). Turning
+/// sealing on means answering each point above first, not implementing this
+/// function.
 ///
 /// # Making this return `Ok` arms three things at once
 ///
@@ -1144,7 +1198,8 @@ fn successor_reference_is_durable(_artifact: Artifact) -> Result<(), String> {
     )
 }
 
-/// Ask the delegate to record a completed migration.
+/// Ask the delegate to record a marker: a completed migration, or a notice
+/// that has been shown.
 ///
 /// Fire-and-forget, and that is sound here in a way it was not for the forward
 /// PUT: this is the LAST step, and the direction it fails in is safe. A write
@@ -1160,6 +1215,91 @@ fn record_marker(marker: &str, note: &str) {
             warn!("migration: could not record marker {marker}: {e}");
         }
     });
+}
+
+thread_local! {
+    /// Notices waiting on the delegate's answer about whether an earlier load
+    /// showed them, and those this session has settled. See [`notify_once`].
+    static NOTICES: RefCell<NoticeLedger> = RefCell::new(NoticeLedger::default());
+
+    /// [`generation_tag`], computed once: it hashes every bundled contract.
+    static GENERATION_TAG: std::cell::OnceCell<[u8; 32]> = const { std::cell::OnceCell::new() };
+}
+
+/// A tag for this build's contract generations: every bundled contract's code
+/// hash, hashed together. A notice id folds it in (`migrate::notice_marker`),
+/// so a notice shown under one generation set is news again after the next
+/// re-key.
+fn generation_tag() -> [u8; 32] {
+    GENERATION_TAG.with(|tag| {
+        *tag.get_or_init(|| {
+            let mut hasher = blake3::Hasher::new();
+            for wasm in [
+                STORE_CONTRACT_WASM,
+                MAILBOX_CONTRACT_WASM,
+                REPUTATION_CONTRACT_WASM,
+                INDEX_CONTRACT_WASM,
+            ] {
+                hasher.update(&code_hash(wasm));
+            }
+            *hasher.finalize().as_bytes()
+        })
+    })
+}
+
+/// Show a migration notice about `lineage` unless an earlier load already did
+/// (harvest#121).
+///
+/// The notice's id goes to the delegate as a migration marker query, and the
+/// answer decides through `migrate::notice_gate`: `present` suppresses it,
+/// `absent` shows it and records it, and no answer within
+/// [`MARKER_QUERY_TIMEOUT_MS`] shows it -- a loss notice is the one thing the
+/// person affected hears, so silence is never read as "already told". Within
+/// a session the ledger stops a repeat whatever the delegate says.
+fn notify_once(lineage: &str, text: String) {
+    let marker = migrate::notice_marker(&generation_tag(), lineage, &text);
+    if !NOTICES.with(|n| n.borrow_mut().offer(&marker, text)) {
+        return;
+    }
+
+    {
+        let marker = marker.clone();
+        gloo_timers::callback::Timeout::new(MARKER_QUERY_TIMEOUT_MS, move || {
+            settle_notice(&marker, migrate::MarkerLookup::Unavailable);
+        })
+        .forget();
+    }
+
+    let query = migrate::marker_query(&marker);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = send_harvest_request(&query).await {
+            warn!("migration: could not ask the delegate about notice {marker}: {e}");
+            settle_notice(&marker, migrate::MarkerLookup::Unavailable);
+        }
+    });
+}
+
+/// Show or drop a waiting notice.
+///
+/// Idempotent: [`NoticeLedger::settle`] takes the entry, so of the delegate's
+/// answer, an expired deadline and a failed send exactly one acts. Called
+/// outside any `APP_STATE` guard (from a timer, a spawned task, or
+/// `deliver_delegate_response`, which runs before the response handler takes
+/// its write guard), so the write below cannot double-borrow.
+fn settle_notice(marker: &str, lookup: migrate::MarkerLookup) {
+    let Some(show) = NOTICES.with(|n| n.borrow_mut().settle(marker, lookup)) else {
+        return;
+    };
+    match show {
+        None => info!("migration: notice {marker} was shown on an earlier load; not repeating it"),
+        Some(text) => {
+            super::APP_STATE.write().notifications.push(text);
+            // Recorded after it is shown, and best effort: an unrecorded
+            // notice is shown once more on a later load, which is the safe
+            // direction for a message about lost data.
+            record_marker(marker, "notice shown");
+        }
+    }
 }
 
 fn encode_forward<T: serde::Serialize>(state: &T, wasm: &'static [u8]) -> Option<Forward> {

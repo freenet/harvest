@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use freenet_stdlib::prelude::ContractInstanceId;
 
+use crate::migrate::{notice_gate, MarkerLookup, NoticeGate};
+
 /// Whether a lineage may be walked now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Admission {
@@ -153,6 +155,55 @@ pub fn superseded_ids(
     out
 }
 
+/// Which migration notices are waiting on the delegate, and which this
+/// session has already settled (harvest#121).
+///
+/// A migration that has not sealed walks again on the next load and finds the
+/// same things again, so its notices would be shown on every visit. Each
+/// notice has a durable id (`migrate::notice_marker`), and the delegate is
+/// asked whether it was shown on an earlier load before it goes up. This is
+/// the bookkeeping around that question, split out of the wasm-only
+/// `migrate_ops` so the property that matters -- a second walk over the same
+/// lineage puts up no second notice -- can be tested on the host.
+///
+/// Bounded like [`SessionWalks`]: entries are keyed by notices this app wrote
+/// from its own migrations, a handful per identity, and nothing the network
+/// says can add one.
+#[derive(Default)]
+pub struct NoticeLedger {
+    waiting: HashMap<String, String>,
+    settled: std::collections::HashSet<String>,
+}
+
+impl NoticeLedger {
+    /// Offer a notice. Returns `true` if the caller should ask the delegate
+    /// about it now; `false` if the same notice is already waiting on an
+    /// answer or was settled earlier in this session.
+    pub fn offer(&mut self, marker: &str, text: String) -> bool {
+        if self.settled.contains(marker) || self.waiting.contains_key(marker) {
+            return false;
+        }
+        self.waiting.insert(marker.to_string(), text);
+        true
+    }
+
+    /// The delegate answered, or failed to, about `marker`.
+    ///
+    /// `None` if `marker` is not a waiting notice -- it may be a lineage's
+    /// marker, or a late answer for a notice already settled -- so the caller
+    /// can route the answer elsewhere. Otherwise `Some` of the text to show,
+    /// or `Some(None)` when the delegate says it was shown before. Settles the
+    /// notice either way, so a later answer or a second walk finds nothing.
+    pub fn settle(&mut self, marker: &str, lookup: MarkerLookup) -> Option<Option<String>> {
+        let text = self.waiting.remove(marker)?;
+        self.settled.insert(marker.to_string());
+        Some(match notice_gate(lookup) {
+            NoticeGate::Show => Some(text),
+            NoticeGate::Suppress => None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +317,73 @@ mod tests {
     #[test]
     fn probing_nothing_supersedes_nothing() {
         assert!(superseded_ids(&[], id(9)).is_empty());
+    }
+    const NOTICE: &str = "v1.notice.00112233445566778899aabbccddeeff";
+
+    /// **The harvest#121 regression.** The walk repeats on every load until it
+    /// seals, and it used to put its notices up every time. A notice the
+    /// delegate says was shown before stays down. Mutated red by showing on
+    /// `Present`.
+    #[test]
+    fn a_notice_shown_on_an_earlier_load_is_not_shown_again() {
+        let mut ledger = NoticeLedger::default();
+        assert!(ledger.offer(NOTICE, "Recovered your store".into()));
+        assert_eq!(ledger.settle(NOTICE, MarkerLookup::Present), Some(None));
+    }
+
+    /// The first time, it is shown.
+    #[test]
+    fn a_new_notice_is_shown() {
+        let mut ledger = NoticeLedger::default();
+        assert!(ledger.offer(NOTICE, "Recovered your store".into()));
+        assert_eq!(
+            ledger.settle(NOTICE, MarkerLookup::Absent),
+            Some(Some("Recovered your store".into()))
+        );
+    }
+
+    /// A delegate that cannot answer is never "already told": a loss notice
+    /// is the only thing the person affected hears. Mutated red by
+    /// suppressing on `Unavailable`.
+    #[test]
+    fn silence_from_the_delegate_shows_the_notice() {
+        let mut ledger = NoticeLedger::default();
+        assert!(ledger.offer(NOTICE, "lost".into()));
+        assert_eq!(
+            ledger.settle(NOTICE, MarkerLookup::Unavailable),
+            Some(Some("lost".into()))
+        );
+    }
+
+    /// A second walk in the same session -- or two walks finding the same
+    /// thing -- asks nothing and shows nothing, whatever the delegate would
+    /// have said. Mutated red by not recording the settled id, and by not
+    /// checking the waiting set.
+    #[test]
+    fn a_second_walk_in_the_same_session_puts_up_no_second_notice() {
+        let mut ledger = NoticeLedger::default();
+        assert!(ledger.offer(NOTICE, "Recovered your store".into()));
+        assert!(
+            !ledger.offer(NOTICE, "Recovered your store".into()),
+            "still waiting"
+        );
+        assert!(ledger.settle(NOTICE, MarkerLookup::Absent).is_some());
+        assert!(
+            !ledger.offer(NOTICE, "Recovered your store".into()),
+            "already shown"
+        );
+        assert_eq!(
+            ledger.settle(NOTICE, MarkerLookup::Absent),
+            None,
+            "a late answer"
+        );
+    }
+
+    /// An answer about something that is not a waiting notice -- a lineage's
+    /// own marker -- is not taken, so the probe still gets it.
+    #[test]
+    fn a_lineage_marker_answer_is_left_for_the_probe() {
+        let mut ledger = NoticeLedger::default();
+        assert_eq!(ledger.settle(A, MarkerLookup::Absent), None);
     }
 }

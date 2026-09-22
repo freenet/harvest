@@ -90,6 +90,14 @@
 //! is the one *positive* result: the data was found and the search is known to
 //! have been complete.
 //!
+//! **Harvest does not seal at all today, and that is a decision, not a gap**
+//! (harvest#121): its predecessor contracts are not frozen after a re-key --
+//! anyone can write to a mailbox, a buyer's stale tab still addresses the old
+//! generation, and a settlement lands on whichever store generation the
+//! buyer's copy names -- so a marker would strand whatever arrives after it.
+//! See `gateway::migrate_ops::successor_reference_is_durable`. The rules here
+//! are what a seal would have to satisfy if that ever changes.
+//!
 //! Never `SeedLocal`, however conclusive it looks. Absence on Freenet is
 //! unauthenticated: with the placement migration disabled (freenet-core#4440),
 //! present-but-unfindable dead-ends were measured at ~99.6% of all
@@ -632,11 +640,11 @@ impl ProbeStateOps for StoreOps {
 /// partially-applied state is worse than an unapplied one. What must never
 /// happen is that it does so in SILENCE: a migration that found a populated
 /// predecessor and carried none of it is otherwise indistinguishable, in the
-/// log and on screen, from one that found nothing. **And this migration
-/// SEALS** -- `seal_decision` writes a durable marker on a clean `Recovered`,
-/// which gates future walks, so a generation dropped quietly on the sealing
-/// run is never looked at again. Nothing is destroyed (predecessors stay on
-/// the network and the merge only ever adds), but the app stops asking.
+/// log and on screen, from one that found nothing. The refusal is also
+/// deterministic: the same bytes are refused on every walk, so repeating the
+/// walk never brings the generation across. Nothing is destroyed
+/// (predecessors stay on the network and the merge only ever adds), but
+/// nothing recovers it either, so the person affected has to be told.
 ///
 /// # Why this is a function rather than three `probe_warn` calls
 ///
@@ -666,8 +674,7 @@ fn fold_or_keep_primary<S: Clone>(
                 "migration fold: the predecessor {artifact} generation was REFUSED in full \
                  and none of it was carried into the new generation -- keeping the newer \
                  generation unchanged. This is how a recoverable generation goes missing \
-                 silently, and this migration seals, so it will not be looked at again. \
-                 reason: {e}"
+                 silently, and the same bytes are refused on every walk. reason: {e}"
             ));
             FoldOutcome {
                 state: snapshot,
@@ -776,11 +783,23 @@ pub(crate) fn merge_store_reporting_discard(
 ///
 /// # Why this is a whole function
 ///
-/// It is the only thing the person affected ever sees about it. The migration
-/// SEALS after a fold, so there is no second attempt and no later screen where
-/// this turns up again -- one message, once, and then the data is gone for
-/// good. That is also why it names the store rather than an artifact: a seller
-/// with several stores needs to know which one.
+/// It is the only thing the person affected ever sees about it: one message,
+/// shown once (`migrate_ops` dedupes it durably, harvest#121), and then the
+/// data is gone for good. That is also why it names the store rather than an
+/// artifact: a seller with several stores needs to know which one.
+///
+/// # Why it must not say "nothing was recovered"
+///
+/// A fold walks every generation, so a refused copy almost always sits beside
+/// one that WAS carried: the refusal keeps the newer side and drops only the
+/// older one. This used to say "Nothing was recovered and it will not be
+/// retried", which appeared in the same session as "Recovered your store from
+/// an earlier version of Harvest" -- two notices contradicting each other on
+/// every load (harvest#121). So it talks about the one COPY it refused, and
+/// it says what the seller can rely on: retrying does not help, because the
+/// refusal is a property of the bytes and the same bytes are refused every
+/// time. Whether the walk is ever repeated is a separate matter this message
+/// does not depend on.
 ///
 /// # Why it says the loss was EXPECTED
 ///
@@ -792,50 +811,53 @@ pub(crate) fn merge_store_reporting_discard(
 /// made" and "a thing that happened to you" is carried entirely by this
 /// sentence, so it is asserted rather than left to whoever edits the copy
 /// next.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
     let name = lost.info.info.store_name.trim();
     let which = if name.is_empty() {
-        "One of your stores".to_string()
+        "one of your stores".to_string()
     } else {
-        format!("Your store \"{name}\"")
+        format!("your store \"{name}\"")
     };
     let listings = lost.listings.listings.len();
     let orders = lost.orders.orders.len();
 
-    let mut said = match side {
+    let mut held = "its name, description and seller certificate".to_string();
+    match (listings, orders) {
+        (0, 0) => {}
+        (l, 0) => held.push_str(&format!(" and {l} listing(s)")),
+        (0, o) => held.push_str(&format!(" and {o} order(s)")),
+        (l, o) => held.push_str(&format!(", {l} listing(s) and {o} order(s)")),
+    }
+
+    match side {
         DiscardedSide::Predecessor => format!(
-            "{which} was not carried over when Harvest upgraded. This is expected -- an \
-             upgrade moves your store to a new address and this one could not be brought \
-             across -- but it does mean the following is gone: its name, description and \
-             seller certificate"
+            "An older copy of {which}, from an earlier version of Harvest, could not be \
+             carried over. This is expected: an upgrade moves a store to a new address, and \
+             this copy could not be brought across. It held {held}. Whatever of that your \
+             store does not already have is gone, and trying again will not bring it back. \
+             If anything is missing, publish your store details and listings again to carry \
+             on selling."
         ),
         // Deliberately different: this store is at the new address and is not
         // going anywhere. What failed is the merge, not the store, so
         // "republish it" would send the seller re-publishing data that is
         // fine.
         DiscardedSide::LocalSnapshot => format!(
-            "{which} could not be merged with what was recovered from an earlier version of \
+            "{} could not be merged with what was recovered from an earlier version of \
              Harvest. Your store here is intact; what could not be brought in alongside it \
-             is: its name, description and seller certificate"
+             is {held}. Trying again will not change that, and your current store is \
+             unaffected.",
+            capitalise(&which)
         ),
-    };
-    if listings > 0 {
-        said.push_str(&format!(", {listings} listing(s)"));
     }
-    if orders > 0 {
-        said.push_str(&format!(", {orders} order(s)"));
-    }
-    said.push_str(match side {
-        DiscardedSide::Predecessor => {
-            ". Nothing was recovered and it will not be retried. Publish your store details \
-             and listings again to carry on selling."
-        }
-        DiscardedSide::LocalSnapshot => {
-            ". Nothing from the earlier version was recovered and it will not be retried. \
-             Your current store is unaffected."
-        }
-    });
-    said
 }
 
 /// Merge rules for a reputation contract's state.
@@ -1466,6 +1488,80 @@ pub fn marker_write(marker: &str, note: &str) -> harvest_common::HarvestDelegate
     harvest_common::HarvestDelegateRequest::SetMigrationMarker {
         marker: marker.to_string(),
         note: note.to_string(),
+    }
+}
+
+// --- telling the seller, once -------------------------------------------
+
+/// The durable id under which a migration notice is recorded as shown.
+///
+/// # Why notices need one (harvest#121)
+///
+/// Harvest's migration never seals (see this module's docs), so it walks
+/// again on every load and finds the same things again. It used to announce
+/// them again too, so a seller saw the same "recovered" and "not carried
+/// over" notices on every visit, forever -- which is how a notice teaches a
+/// person to ignore it, and how a loss that happened once reads as a loss
+/// happening again each time.
+///
+/// # What makes two notices "the same"
+///
+/// The same text, about the same lineage, under the same contract
+/// generations:
+///
+/// * `lineage` is the walk's own marker (`marker_key`: artifact, current
+///   instance, current code hash), so a second store or a second Ghost Key
+///   gets its own notice even when the words are identical -- "Recovered
+///   your store" says nothing about WHICH store.
+/// * `text` names the store and counts what was lost, so a different loss in
+///   the same lineage is still told.
+/// * `generation` folds in every bundled contract's code hash, so the next
+///   re-key's news is news again.
+///
+/// The id is hex and ASCII by construction, which the delegate requires of a
+/// marker id (`markers::is_valid_marker`), and it shares the migration
+/// markers' `v1.` format prefix and namespace without colliding with them:
+/// those are `v1.<artifact>.`, and no artifact is called `notice`.
+pub fn notice_marker(generation: &[u8; 32], lineage: &str, text: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"harvest-migration-notice-v1");
+    hasher.update(generation);
+    // Length-prefixed, so no (lineage, text) pair can be re-split into
+    // another with the same bytes.
+    hasher.update(&(lineage.len() as u64).to_le_bytes());
+    hasher.update(lineage.as_bytes());
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{NOTICE_MARKER_PREFIX}{}",
+        hex::encode(&digest.as_bytes()[..16])
+    )
+}
+
+/// The prefix every notice id starts with, so a delegate answer about one can
+/// be told apart from an answer about a lineage.
+pub const NOTICE_MARKER_PREFIX: &str = "v1.notice.";
+
+/// Whether to show a migration notice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoticeGate {
+    Show,
+    Suppress,
+}
+
+/// The notice gate: **only a definite `Present` suppresses.**
+///
+/// The same direction as [`probe_gate`], for a sharper reason. A notice about
+/// what a migration could not carry is the only thing the person affected
+/// ever learns about it, so a delegate that cannot answer must not be read as
+/// "already told" -- the cost of that mistake is a loss nobody hears about,
+/// while the cost of the other is one repeated notice.
+pub fn notice_gate(lookup: MarkerLookup) -> NoticeGate {
+    match lookup {
+        MarkerLookup::Present => NoticeGate::Suppress,
+        MarkerLookup::Absent => NoticeGate::Show,
+        // Never `Suppress`. See this function's docs.
+        MarkerLookup::Unavailable => NoticeGate::Show,
     }
 }
 
@@ -2132,5 +2228,38 @@ mod uncarried_tests {
         record_uncarried("something".to_string());
         assert_eq!(take_uncarried().len(), 1);
         assert!(take_uncarried().is_empty());
+    }
+    /// **harvest#121: the loss notice must not contradict the recovery
+    /// notice.** A fold refuses one COPY and keeps the newer side, so a loss
+    /// notice nearly always appears beside "Recovered your store from an
+    /// earlier version of Harvest". It used to say "Nothing was recovered and
+    /// it will not be retried" -- false beside that notice, and false about
+    /// retrying, since the walk did retry. Mutated red by restoring the old
+    /// tail sentence.
+    #[test]
+    fn a_loss_notice_cannot_contradict_a_recovery_notice() {
+        let mut lost = StoreStateV1::default();
+        lost.info.info.store_name = "E2E TEST STORE".to_string();
+        for side in [DiscardedSide::Predecessor, DiscardedSide::LocalSnapshot] {
+            let said = describe_lost_store(&lost, side);
+            let lower = said.to_lowercase();
+            assert!(
+                !lower.contains("nothing was recovered"),
+                "{side:?} must not deny a recovery that happened beside it: {said}"
+            );
+            assert!(
+                !lower.contains("will not be retried"),
+                "{side:?} must not promise something about the walk: {said}"
+            );
+            assert!(
+                lower.contains("trying again"),
+                "{side:?} still tells the seller retrying does not help: {said}"
+            );
+        }
+        let predecessor = describe_lost_store(&lost, DiscardedSide::Predecessor);
+        assert!(
+            predecessor.contains("An older copy of your store \"E2E TEST STORE\""),
+            "it names the COPY that was refused, not the store as a whole: {predecessor}"
+        );
     }
 }

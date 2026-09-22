@@ -2621,3 +2621,61 @@ fn folding_an_identical_generation_changes_nothing() {
     assert_eq!(folded.messages.len(), 2);
     folded.verify().expect("valid");
 }
+
+// --- harvest#121: telling the seller once --------------------------------
+
+/// A notice's id is a valid delegate marker id, stable for the same notice
+/// about the same lineage under the same generations, and different when any
+/// of the three changes -- so a repeated walk re-finds the same id, while a
+/// second store's identical "Recovered your store" and the next re-key's news
+/// are still shown. Mutated red by leaving the text, the lineage and the
+/// generation out of the hash in turn.
+#[test]
+fn a_notice_id_is_stable_for_the_same_notice_and_new_for_a_different_one() {
+    let generation = [3u8; 32];
+    let lineage = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([1u8; 32]),
+        &[2u8; 32],
+    );
+    let other_lineage = marker_key(
+        Artifact::Store,
+        &ContractInstanceId::new([9u8; 32]),
+        &[2u8; 32],
+    );
+    let text = "Recovered your store from an earlier version of Harvest.";
+    let id = notice_marker(&generation, &lineage, text);
+    assert_eq!(id, notice_marker(&generation, &lineage, text));
+    assert!(id.starts_with(NOTICE_MARKER_PREFIX), "{id}");
+    assert!(
+        id.is_ascii() && !id.is_empty(),
+        "the delegate refuses non-ASCII ids: {id}"
+    );
+    assert_ne!(
+        id,
+        notice_marker(
+            &generation,
+            &lineage,
+            "Recovered your mailbox from an earlier version of Harvest."
+        )
+    );
+    assert_ne!(
+        id,
+        notice_marker(&generation, &other_lineage, text),
+        "a second store's identical words are a different notice"
+    );
+    assert_ne!(id, notice_marker(&[4u8; 32], &lineage, text));
+    assert!(
+        !lineage.starts_with(NOTICE_MARKER_PREFIX),
+        "a lineage marker and a notice id must never collide: {lineage}"
+    );
+}
+
+/// Only a definite `Present` suppresses a notice. Mutated red by suppressing
+/// on `Unavailable`.
+#[test]
+fn only_a_definite_present_suppresses_a_notice() {
+    assert_eq!(notice_gate(MarkerLookup::Present), NoticeGate::Suppress);
+    assert_eq!(notice_gate(MarkerLookup::Absent), NoticeGate::Show);
+    assert_eq!(notice_gate(MarkerLookup::Unavailable), NoticeGate::Show);
+}

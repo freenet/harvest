@@ -1032,6 +1032,18 @@ to "round 4").
 | The windows themselves | 1008 and 2016 blocks are the right numbers. | **No, by design** (#53 decision 4): a starting point, reader-side, changeable without a re-key. |
 | A buyer's cancel | Symmetric with the seller's before payment. | **No, not built in Phase A.** It needs a key the store contract recognises for the buyer (`buyer_receipt_key`), which is Phase B's store re-key. Until then a buyer who changes their mind does not pay and the order lapses by reading. |
 
+### Migration notices: harvest#121 (added 2026-09-22)
+
+Harvest's contract migration never seals, by decision rather than for want of a capability: the predecessor contracts are not frozen after a re-key (an open-write mailbox, buyers' stale tabs, settlements against the generation a buyer's copy names), so a marker would strand what arrives after it. The walk therefore repeats on every load, and it used to re-announce what it found every time, including a loss notice that said "Nothing was recovered and it will not be retried" beside "Recovered your store". The first round of review on #128 withdrew a sealing design for the reasons listed at `migrate_ops::successor_reference_is_durable`.
+
+| Where | Invariant | Pinned? |
+|---|---|---|
+| `ui/src/gateway/migrate_gate.rs::NoticeLedger`; `migrate::notice_gate` | A migration notice is shown at most once: a second walk in the same session asks nothing and shows nothing, a notice the delegate says an earlier load showed stays down, and a delegate that cannot answer shows it rather than hiding a loss. | **Yes** -- `a_second_walk_in_the_same_session_puts_up_no_second_notice`, `a_notice_shown_on_an_earlier_load_is_not_shown_again`, `silence_from_the_delegate_shows_the_notice`, `only_a_definite_present_suppresses_a_notice`. |
+| `migrate::notice_marker` | The same notice about the same lineage under the same contract generations gets the same id; different text, a different lineage (a second store saying the same words) or the next re-key gets a new one. | **Yes** -- `a_notice_id_is_stable_for_the_same_notice_and_new_for_a_different_one`, red with each of the three inputs dropped from the hash. |
+| `migrate::describe_lost_store` | The loss notice names the refused COPY and never denies the recovery beside it or promises anything about retries. | **Yes** -- `a_loss_notice_cannot_contradict_a_recovery_notice`. |
+| `migrate_ops::Probe::uncarried` | A loss is attributed to the walk whose fold refused it, not to whichever walk finishes next. | **No, compile-checked only** (wasm-gated). The drain runs in `pump` after every step; walks interleave only between steps, and a fold runs synchronously inside one. |
+| `migrate_ops::notify_once`, `settle_notice` | The ledger's answers reach the screen once and the shown-marker is written after showing. | **No, compile-checked only** (wasm-gated); the decisions they route are the ledger's, tested above. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the
