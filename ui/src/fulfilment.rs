@@ -423,13 +423,39 @@ impl OrderStage {
 /// without a tip anyway (`PaymentBlocker::ChainUnknown`). An order with no
 /// anchor keeps the address and its existing note saying it can never settle.
 pub fn offers_payment_address(order: &AuthorizedOrder, tip_height: Option<u32>) -> bool {
-    if order.status != OrderStatus::AwaitingPayment {
-        return false;
-    }
-    match (order.order.payment_window(), tip_height) {
-        (Some(window), Some(tip)) => tip <= *window.end(),
+    order.status == OrderStatus::AwaitingPayment && accepts_new_payment(&order.order, tip_height)
+}
+
+/// Whether a payment sent NOW could still confirm inside `order`'s payment
+/// window: the tip is strictly below the window's last block, since a
+/// transaction confirms in the next block at the earliest (review round 3).
+/// With no tip, or no window, the answer is yes -- see
+/// [`offers_payment_address`] for why "unknown" does not withhold.
+pub fn accepts_new_payment(
+    order: &harvest_common::payment::Order,
+    tip_height: Option<u32>,
+) -> bool {
+    match (order.payment_window(), tip_height) {
+        (Some(window), Some(tip)) => tip < *window.end(),
         _ => true,
     }
+}
+
+/// What an unpaid invoice's card says once its window has closed to new
+/// payments but a payment made in time could still be recorded -- the
+/// stretch where the address is withdrawn and the order has not lapsed. The
+/// card would otherwise hide the address with no reason given (review
+/// round 3).
+pub fn closed_window_note(order: &AuthorizedOrder, tip_height: Option<u32>) -> Option<String> {
+    if order.status != OrderStatus::AwaitingPayment || accepts_new_payment(&order.order, tip_height)
+    {
+        return None;
+    }
+    let last = last_settling_block(order)?;
+    Some(format!(
+        "This invoice's payment window has closed, so a new payment would not count. A payment \
+         made in time can still be recorded until block {last}."
+    ))
 }
 
 #[cfg(test)]
@@ -682,10 +708,15 @@ mod tests {
     fn only_an_open_invoice_offers_its_address_and_only_inside_its_window() {
         let window_end = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         let mut open = order(OrderStatus::AwaitingPayment, 10_000);
-        assert!(offers_payment_address(&open, Some(window_end)));
+        assert!(offers_payment_address(&open, Some(window_end - 1)));
+        // At the window's last block a payment sent now confirms in the next
+        // block at the earliest, outside the window (review round 3).
+        assert!(!offers_payment_address(&open, Some(window_end)));
         // No tip yet: an open invoice still shows its address.
         assert!(offers_payment_address(&open, None));
-        assert!(!offers_payment_address(&open, Some(window_end + 1)));
+        assert!(closed_window_note(&open, Some(window_end - 1)).is_none());
+        let note = closed_window_note(&open, Some(window_end)).expect("said why");
+        assert!(note.contains(&format!("block {window_end}")), "{note}");
         // Review round 2: past the window the STAGE can still read as
         // awaiting payment (a payment made in time gathering confirmations),
         // and the address must not come back with it.

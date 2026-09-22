@@ -6617,6 +6617,23 @@ impl AppState {
     /// would hand anyone who can read the public address a way to make any
     /// invoice uncancellable (harvest#53 review round 2).
     fn payment_on_its_way(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        self.payment_sight(order).settles()
+    }
+
+    /// What this node can see at `order`'s address that would settle it
+    /// (`fulfilment::PaymentSight`), for every card and for the cancel check
+    /// alike, so they cannot disagree.
+    ///
+    /// A covering payment that also falls inside another of this address's
+    /// orders' windows is NOT counted as this order's (review round 3). It
+    /// may be the twin's, `settlement_hold` withholds it for the seller to
+    /// decide, and counting it here would keep this order from ever lapsing,
+    /// refuse its cancel with a sentence that may be false, and tell a buyer
+    /// who never paid that the goods are owed.
+    pub fn payment_sight(
+        &self,
+        order: &harvest_common::payment::AuthorizedOrder,
+    ) -> crate::fulfilment::PaymentSight {
         let tip = self
             .bitcoin
             .tips
@@ -6624,9 +6641,17 @@ impl AppState {
             .and_then(|tip| tip.tip_height);
         let live =
             crate::components::bitcoin_view::live_address_for_order(&self.bitcoin, &order.order);
-        crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref())
-            .sight(&order.order, tip)
-            .settles()
+        let reading =
+            crate::components::bitcoin_view::AddressReading::of(&order.order, live.as_ref());
+        let mut sight = reading.sight(&order.order, tip);
+        if sight.covered
+            && !self
+                .orders_whose_window_holds(&order.order.id, &reading.in_window_heights)
+                .is_empty()
+        {
+            sight.covered = false;
+        }
+        sight
     }
 
     /// Whether a cancellation of `order_id` is waiting on its signature.
@@ -22354,7 +22379,10 @@ mod buy_flow_tests {
                 store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
             }],
         );
-        give_the_node_the_chain(&mut state, &order, claims, tip);
+        // No claims at all, so nothing about the fixture proves a payment:
+        // the dust row is the only thing at the address.
+        let _ = claims;
+        give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
         show_a_payment_row(&mut state, &order, 546);
         state
             .cancel_invoice(STORE, &order.order.id)
@@ -22392,6 +22420,24 @@ mod buy_flow_tests {
                 .any(|n| n.starts_with("Did not cancel invoice")),
             "{:?}",
             state.notifications
+        );
+    }
+
+    /// Review round 3: a covering payment that also falls in a twin's
+    /// window may be the twin's, so it is not this order's in sight -- it
+    /// must not keep the order from lapsing, refuse its cancel, or tell its
+    /// buyer the goods are owed. Without a twin it is.
+    #[test]
+    fn a_payment_that_may_be_a_twins_is_not_this_orders_in_sight() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        show_a_payment_row(&mut state, &order, order.order.amount_sats);
+        assert!(state.payment_sight(&order).covered);
+
+        let (mut state, order) = seller_holding_a_paid_order(Some(OrderStatus::AwaitingPayment));
+        show_a_payment_row(&mut state, &order, order.order.amount_sats);
+        assert!(
+            !state.payment_sight(&order).covered,
+            "the payment may be the twin's"
         );
     }
 

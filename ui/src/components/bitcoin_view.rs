@@ -566,8 +566,11 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     };
     // Where the order stands after the payment question (harvest#53):
     // reader-side windows against this reader's own tip.
-    let stage = crate::fulfilment::order_stage(&order, tip_height, reading.sight(o, tip_height));
-    let stage_note = stage.describe(tip_height, order.status);
+    let sight = APP_STATE.read().payment_sight(&order);
+    let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
+    let stage_note = stage
+        .describe(tip_height, order.status)
+        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height));
     let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
     let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();
@@ -761,6 +764,9 @@ pub(crate) struct AddressReading {
     /// Unconfirmed value. Not window-checked, because an unconfirmed
     /// transaction has no height yet; the pill says only "unconfirmed".
     pub pending_sats: u64,
+    /// Value in mempool rows only. Unlike `pending_sats`, never overlaps
+    /// `in_window_sats`; see [`Self::sight`].
+    pub unconfirmed_sats: u64,
     /// Highest confirmation height of value that confirmed at or before the
     /// anchor, if any.
     pub before_order: Option<u32>,
@@ -788,6 +794,10 @@ impl AddressReading {
         // so no confirmed value is counted as its payment.
         for tx in &live.txs {
             let TxRowStatus::Confirmed { anchor_height } = tx.status else {
+                if tx.status == TxRowStatus::Unconfirmed {
+                    reading.unconfirmed_sats =
+                        reading.unconfirmed_sats.saturating_add(tx.value_sats);
+                }
                 continue;
             };
             match &window {
@@ -821,22 +831,23 @@ impl AddressReading {
     /// value and dust are nothing here -- see
     /// [`crate::fulfilment::PaymentSight`].
     ///
-    /// `pending_sats` is not window-checked (an unconfirmed transaction has
-    /// no height), which is why it only counts while the window is open.
+    /// Unconfirmed value is not window-checked (an unconfirmed transaction
+    /// has no height), which is why it only counts while a payment sent now
+    /// could still confirm in the window.
     pub(crate) fn sight(
         &self,
         order: &harvest_common::payment::Order,
         tip_height: Option<u32>,
     ) -> crate::fulfilment::PaymentSight {
         let covered = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
-        let window_open = match (order.payment_window(), tip_height) {
-            (Some(window), Some(tip)) => tip <= *window.end(),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        let in_flight = window_open
-            && self.pending_sats > 0
-            && self.in_window_sats.saturating_add(self.pending_sats) >= self.amount_sats;
+        // Mempool rows only, NOT `pending_sats`: that figure also counts a
+        // confirmed output this reader's tip has not yet reached, which is
+        // already in `in_window_sats`, so adding the two counted one payment
+        // twice (review round 3).
+        let in_flight = order.payment_window().is_some()
+            && crate::fulfilment::accepts_new_payment(order, tip_height)
+            && self.unconfirmed_sats > 0
+            && self.in_window_sats.saturating_add(self.unconfirmed_sats) >= self.amount_sats;
         crate::fulfilment::PaymentSight { covered, in_flight }
     }
 
@@ -1643,18 +1654,36 @@ mod address_reading_tests {
         assert!(!dust.sight(&order, Some(160)).settles());
         let full = AddressReading::of(&order, Some(&address_with(&[(151, 10_000)])));
         assert!(full.sight(&order, Some(window_end + 50)).covered);
-        let mut pending_view = address_with(&[(151, 4_000)]);
-        pending_view.pending_sats = 6_000;
-        let pending = AddressReading::of(&order, Some(&pending_view));
+        let with_mempool = |confirmed: u64, unconfirmed: u64| {
+            let mut view = address_with(&[(151, confirmed)]);
+            view.txs.push(TxRow {
+                txid_display: "mempool".into(),
+                value_sats: unconfirmed,
+                status: TxRowStatus::Unconfirmed,
+            });
+            view.pending_sats = unconfirmed;
+            view
+        };
+        let pending = AddressReading::of(&order, Some(&with_mempool(4_000, 6_000)));
         assert!(pending.sight(&order, Some(160)).in_flight);
         assert!(pending.sight(&order, None).in_flight);
         assert!(
-            !pending.sight(&order, Some(window_end + 1)).settles(),
-            "value still in flight after the window can never settle it"
+            !pending.sight(&order, Some(window_end)).settles(),
+            "value still in flight at the window's end can never settle it"
         );
-        let mut short_pending = address_with(&[(151, 4_000)]);
-        short_pending.pending_sats = 5_999;
-        assert!(!AddressReading::of(&order, Some(&short_pending))
+        assert!(
+            !AddressReading::of(&order, Some(&with_mempool(4_000, 5_999)))
+                .sight(&order, Some(160))
+                .settles()
+        );
+        // Review round 3: `pending_sats` also counts a CONFIRMED output the
+        // reader's tip has not reached (the address state arriving before
+        // the tip reads every confirmation as zero deep). That output is
+        // already in the window total; counting it again read a 6k
+        // underpayment of a 10k invoice as 12k.
+        let mut before_tip = address_with(&[(151, 6_000)]);
+        before_tip.pending_sats = 6_000;
+        assert!(!AddressReading::of(&order, Some(&before_tip))
             .sight(&order, Some(160))
             .settles());
     }

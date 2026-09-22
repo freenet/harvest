@@ -276,9 +276,7 @@ fn SettledPurchase(
         .tips
         .get(&order.order.network)
         .and_then(|tip| tip.tip_height);
-    let live = super::bitcoin_view::live_address_for_order(&bitcoin, &order.order);
-    let sight = super::bitcoin_view::AddressReading::of(&order.order, live.as_ref())
-        .sight(&order.order, tip_height);
+    let sight = APP_STATE.read().payment_sight(&order);
     let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
     // Every status that reaches here is past AwaitingPayment, and `describe`
     // has a sentence for each of those; the fallback is for safety only.
