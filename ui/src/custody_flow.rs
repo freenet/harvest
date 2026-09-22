@@ -1130,6 +1130,53 @@ mod tests {
         );
     }
 
+    /// A listing waiting on its certificate holds custody back, and the
+    /// certificate's arrival starts it again: nothing else necessarily
+    /// would, and backup or recovery would then wait for a reload (#118
+    /// review).
+    ///
+    /// Mutated red by removing `start_custody_where_needed` from the
+    /// `Certificate` arm.
+    #[test]
+    fn a_certificate_arriving_starts_custody_deferred_behind_a_listing() {
+        let mut state = backed_store();
+        register(&mut state);
+        state
+            .listings_awaiting_certificate
+            .push(crate::state::ListingAwaitingCertificate {
+                since_ms: crate::state::now_ms(),
+                pending: crate::state::PendingListing {
+                    fingerprint: FINGERPRINT.to_string(),
+                    listing: harvest_common::listing::Listing {
+                        id: harvest_common::listing::ListingId([0; 32]),
+                        title: "Beans".to_string(),
+                        description: String::new(),
+                        kind: harvest_common::listing::ListingKind::Sale,
+                        price: None,
+                        created_at: chrono::Utc::now(),
+                    }
+                    .with_derived_id(),
+                    store_contract_id: Some(vec![ID; 32]),
+                    certificate_pem: String::new(),
+                },
+            });
+        state.start_custody_where_needed();
+        assert!(
+            state.pending_custody.is_empty(),
+            "deferred behind the listing"
+        );
+
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Certificate {
+            fingerprint: FINGERPRINT.to_string(),
+            certificate_pem: "CERT".to_string(),
+        });
+        assert!(state.listings_awaiting_certificate.is_empty());
+        assert!(
+            !state.pending_custody.is_empty(),
+            "started once the vault is free"
+        );
+    }
+
     /// Custody is decided again when the Ghost Keys connected to the tab
     /// arrive, not only when store state does (#99 review). Mutated red by
     /// removing the call from the `GhostKeyList` arm.

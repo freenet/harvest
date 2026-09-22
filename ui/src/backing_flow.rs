@@ -402,13 +402,12 @@ impl AppState {
     ///
     /// The listing has to carry the certificate of the Ghost Key
     /// `fingerprint`, and the store key's answer brings none (harvest#93), so
-    /// it is attached here, before signing. When this device has not fetched
-    /// that certificate yet -- any session in which the seller neither
-    /// created the store nor edited its details, which is the ordinary one --
-    /// the listing waits in `listings_awaiting_certificate` and the vault is
-    /// asked for it. It is never sent without one: before #118 it went out
-    /// with an empty certificate, and every buyer was told it was not the
-    /// seller's and offered no way to buy it.
+    /// it is attached here, before signing (`certificate_for`). When this
+    /// device has no copy yet, the listing waits in
+    /// `listings_awaiting_certificate` and the vault is asked for it. It is
+    /// never sent without one: before #118 it went out with an empty
+    /// certificate, and every buyer was told it was not the seller's and
+    /// offered no way to buy it.
     pub(crate) fn queue_listing_signature(
         &mut self,
         store_contract_id: Vec<u8>,
@@ -424,37 +423,67 @@ impl AppState {
             store_contract_id: Some(store_contract_id),
             certificate_pem: String::new(),
         };
-        if let Some(pem) = self.certificate_for(&pending.fingerprint) {
+        if let Some(pem) = self.certificate_for(&pending) {
             pending.certificate_pem = pem;
             return self.request_listing_signature(pending);
         }
-        // One request per Ghost Key: a second listing added before the
-        // answer rides on the first's.
-        let already_asked = self
-            .listings_awaiting_certificate
-            .iter()
-            .any(|waiting| waiting.fingerprint == pending.fingerprint);
+        // Asked for every listing that waits, not once per Ghost Key: a
+        // duplicate `GetCertificate` costs nothing, since any answer releases
+        // every listing waiting on that key, and it makes adding a listing
+        // again a real retry if an earlier request was lost.
         let fingerprint = pending.fingerprint.clone();
         dioxus::logger::tracing::info!(
             "Listing \"{}\" is waiting on the certificate for {fingerprint}",
             pending.listing.title
         );
-        self.listings_awaiting_certificate.push(pending);
-        if !already_asked {
-            #[cfg(target_arch = "wasm32")]
+        self.listings_awaiting_certificate
+            .push(crate::state::ListingAwaitingCertificate {
+                since_ms: crate::state::now_ms(),
+                pending,
+            });
+        #[cfg(target_arch = "wasm32")]
+        {
             crate::state::request_certificate(fingerprint);
-            #[cfg(not(target_arch = "wasm32"))]
-            let _ = fingerprint;
+            spawn_listing_certificate_timeout();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = fingerprint;
         Ok(())
     }
 
-    /// The certificate this device holds for the Ghost Key `fingerprint`, if
-    /// it holds a usable one.
-    fn certificate_for(&self, fingerprint: &str) -> Option<String> {
-        self.certificates
-            .get(fingerprint)
-            .filter(|pem| !pem.trim().is_empty())
+    /// The certificate a listing for `pending`'s store, signed for the Ghost
+    /// Key `pending.fingerprint`, should carry, if this device has it.
+    ///
+    /// The vault's answer, if this session has had one; otherwise the
+    /// certificate inside that Ghost Key's own backing of the store, as last
+    /// loaded. The second is the one a buyer already checks the store
+    /// against, it certifies the same key, and it needs no round trip to the
+    /// vault, so the ordinary case -- the seller's store is loaded -- signs
+    /// at once.
+    fn certificate_for(&self, pending: &crate::state::PendingListing) -> Option<String> {
+        let usable = |pem: &String| !pem.trim().is_empty();
+        if let Some(pem) = self
+            .certificates
+            .get(&pending.fingerprint)
+            .filter(|p| usable(p))
+        {
+            return Some(pem.clone());
+        }
+        let backer = self
+            .ghostkeys
+            .iter()
+            .find(|key| key.fingerprint == pending.fingerprint)?
+            .verifying_key_bytes
+            .as_deref()?;
+        let backer: [u8; 32] = backer.try_into().ok()?;
+        self.browsing_stores
+            .get(pending.store_contract_id.as_deref()?)?
+            .backing_state
+            .backings
+            .records
+            .get(&harvest_common::store::Bytes32(backer))
+            .map(|backing| &backing.statement.certificate_pem)
+            .filter(|pem| usable(pem))
             .cloned()
     }
 
@@ -474,30 +503,26 @@ impl AppState {
     }
 
     /// A certificate response for `fingerprint` has arrived: send the
-    /// listings waiting on it for signing, or, if the vault answered with no
-    /// certificate at all, drop them and say so rather than wait forever.
+    /// listings waiting on it for signing, or, if there is still no
+    /// certificate to attach, drop them and say so rather than wait forever.
     pub(crate) fn release_listings_awaiting_certificate(&mut self, fingerprint: &str) {
         let (ready, waiting): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.listings_awaiting_certificate)
                 .into_iter()
-                .partition(|pending| pending.fingerprint == fingerprint);
+                .partition(|waiting| waiting.pending.fingerprint == fingerprint);
         self.listings_awaiting_certificate = waiting;
-        if ready.is_empty() {
-            return;
-        }
-        let Some(pem) = self.certificate_for(fingerprint) else {
-            self.drop_listings(
-                ready,
-                "the vault returned no certificate for your Ghost Key",
-            );
-            return;
-        };
-        for mut pending in ready {
-            pending.certificate_pem = pem.clone();
+        for crate::state::ListingAwaitingCertificate { mut pending, .. } in ready {
             let title = pending.listing.title.clone();
+            let Some(pem) = self.certificate_for(&pending) else {
+                self.notifications.push(listing_not_published(
+                    &title,
+                    "the Ghost Key vault returned no certificate for your Ghost Key",
+                ));
+                continue;
+            };
+            pending.certificate_pem = pem;
             if let Err(e) = self.request_listing_signature(pending) {
-                self.notifications
-                    .push(format!("Your listing \"{title}\" was not published: {e}"));
+                self.notifications.push(listing_not_published(&title, &e));
             }
         }
     }
@@ -518,19 +543,43 @@ impl AppState {
         let (dropped, kept): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.listings_awaiting_certificate)
                 .into_iter()
-                .partition(|pending| fingerprint.is_none_or(|fp| pending.fingerprint == fp));
+                .partition(|waiting| {
+                    fingerprint.is_none_or(|fp| waiting.pending.fingerprint == fp)
+                });
         self.listings_awaiting_certificate = kept;
-        self.drop_listings(dropped, why);
+        for waiting in dropped {
+            self.notifications
+                .push(listing_not_published(&waiting.pending.listing.title, why));
+        }
     }
 
-    fn drop_listings(&mut self, dropped: Vec<crate::state::PendingListing>, why: &str) {
-        for pending in dropped {
-            self.notifications.push(format!(
-                "Your listing \"{}\" was not published: this device could not get your Ghost \
-                 Key's certificate ({why}). Add it again to retry.",
-                pending.listing.title
+    /// Give up on the listings that have waited on a certificate for
+    /// [`crate::state::LISTING_CERTIFICATE_TIMEOUT_MS`] or longer.
+    ///
+    /// A request the vault never answers -- a lost message, a prompt left
+    /// unanswered -- would otherwise hold the listing, and the vault with it,
+    /// until a reload, and the seller would never learn it was not published.
+    pub(crate) fn expire_listings_awaiting_certificate(&mut self, now_ms: u64) {
+        let (expired, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.listings_awaiting_certificate)
+                .into_iter()
+                .partition(|waiting| {
+                    now_ms.saturating_sub(waiting.since_ms)
+                        >= crate::state::LISTING_CERTIFICATE_TIMEOUT_MS
+                });
+        self.listings_awaiting_certificate = kept;
+        if expired.is_empty() {
+            return;
+        }
+        for waiting in expired {
+            self.notifications.push(listing_not_published(
+                &waiting.pending.listing.title,
+                "the Ghost Key vault did not send your Ghost Key's certificate in time",
             ));
         }
+        // The vault may be free now for a custody request that was deferred
+        // while the listing waited.
+        self.start_custody_where_needed();
     }
 
     /// The store a new listing from the Ghost Key `fingerprint` goes to: the
@@ -658,6 +707,40 @@ impl AppState {
 
 /// Ask the vault to sign a backing statement. Same discipline as every other
 /// signature: queued before this runs, withdrawn if the send fails.
+/// What a seller is told about a listing that was not published because its
+/// certificate could not be had (#118).
+fn listing_not_published(title: &str, why: &str) -> String {
+    format!("Your listing \"{title}\" was not published ({why}). Add it again to retry.")
+}
+
+/// Expire listings still waiting on their certificate once they are due.
+///
+/// Re-checked rather than fired once, like custody's timer: a one-shot timer
+/// that goes off a millisecond early would leave the listing waiting for the
+/// session. Stops as soon as nothing waits.
+#[cfg(target_arch = "wasm32")]
+fn spawn_listing_certificate_timeout() {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::{ReadableExt, WritableExt};
+        for _ in 0..4 {
+            gloo_timers::future::TimeoutFuture::new(
+                (crate::state::LISTING_CERTIFICATE_TIMEOUT_MS / 2).max(1) as u32,
+            )
+            .await;
+            crate::gateway::APP_STATE
+                .write()
+                .expire_listings_awaiting_certificate(crate::state::now_ms());
+            if crate::gateway::APP_STATE
+                .read()
+                .listings_awaiting_certificate
+                .is_empty()
+            {
+                return;
+            }
+        }
+    });
+}
+
 #[cfg(target_arch = "wasm32")]
 fn spawn_backing_statement_signature(pending: PendingBacking) {
     wasm_bindgen_futures::spawn_local(async move {
@@ -1452,6 +1535,91 @@ pub(crate) mod tests {
             .or_default()
             .backing_state = backing_state;
         state.refresh_backing_verdicts();
+    }
+
+    /// The ordinary case of #118: the seller's store is loaded, so the
+    /// certificate a listing needs is already here, inside the Ghost Key's
+    /// own backing of that store -- the certificate buyers check the store
+    /// against. The listing is signed at once, carrying it, with no vault
+    /// round trip. A connected Ghost Key that is NOT the backer does not get
+    /// the backer's certificate: its listing waits for its own.
+    ///
+    /// Mutated red by removing the backing lookup from `certificate_for`, and
+    /// by matching any backing rather than the Ghost Key's own.
+    #[test]
+    fn a_listing_takes_its_certificate_from_the_ghost_keys_own_backing() {
+        const STORE: u8 = 0x71;
+        const BACKER: u8 = 0x41;
+        let listing = |title: &str| {
+            harvest_common::listing::Listing {
+                id: harvest_common::listing::ListingId([0; 32]),
+                title: title.to_string(),
+                description: String::new(),
+                kind: harvest_common::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id()
+        };
+        let seller = |fingerprint: &str, key: u8| {
+            let mut state = AppState::default();
+            load_backed(
+                &mut state,
+                5,
+                STORE,
+                vec![signed_backing(STORE, BACKER, 10)],
+            );
+            state.my_stores.insert(
+                fingerprint.to_string(),
+                vec![harvest_common::StoreRegistration {
+                    store_contract_id: vec![5; 32],
+                    reputation_contract_id: vec![6; 32],
+                    mailbox_contract_id: vec![7; 32],
+                    store_contract_key: None,
+                    store_verifying_key: Some(store_key_of(STORE)),
+                }],
+            );
+            state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+                fingerprint: fingerprint.to_string(),
+                label: None,
+                notary_info: String::new(),
+                verifying_key_bytes: Some(
+                    SigningKey::from_bytes(&[key; 32])
+                        .verifying_key()
+                        .to_bytes()
+                        .to_vec(),
+                ),
+                backed_up: false,
+            });
+            state
+        };
+
+        let mut state = seller(FINGERPRINT, BACKER);
+        assert!(state.certificates.is_empty(), "nothing from the vault");
+        state
+            .queue_listing_signature(vec![5; 32], FINGERPRINT.to_string(), listing("Beans"))
+            .expect("accepted");
+        assert!(state.listings_awaiting_certificate.is_empty(), "no wait");
+        let certificates: Vec<_> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|p| match p {
+                PendingSignature::Listing(l) => Some(l.certificate_pem.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(certificates, vec![format!("CERT-{BACKER}")]);
+
+        let mut stranger = seller("fp-stranger", 0x42);
+        stranger
+            .queue_listing_signature(vec![5; 32], "fp-stranger".to_string(), listing("Rice"))
+            .expect("accepted");
+        assert_eq!(
+            stranger.listings_awaiting_certificate.len(),
+            1,
+            "another key's backing is not this key's certificate"
+        );
+        assert!(stranger.pending_signatures.is_empty());
     }
 
     fn store_key_of(seed: u8) -> [u8; 32] {

@@ -1154,7 +1154,7 @@ fn sign_and_submit_listing(fingerprint: String, listing: Listing) {
     };
     let title = listing.title.clone();
     match state.queue_listing_signature(store_contract_id, fingerprint, listing) {
-        Ok(()) => dioxus::logger::tracing::info!("Sent listing for signing: {title}"),
+        Ok(()) => dioxus::logger::tracing::info!("Queued listing for signing: {title}"),
         Err(e) => state
             .notifications
             .push(format!("Cannot add the listing: {e}")),
