@@ -4457,8 +4457,12 @@ impl AppState {
         // when the question is "whose ORDER", and address reuse is exactly
         // where the two part company (external review of harvest#75).
         let mut settled = Vec::new();
+        // `confusable_with_a_payment` is ANDed in rather than left implied:
+        // it is what makes every publishable order also a compared one, by
+        // construction. See that function for why the implication was true
+        // and still not good enough.
         for order in self.orders_we_may_settle(store_contract_id, |order| {
-            order.status == OrderStatus::AwaitingPayment
+            order.status == OrderStatus::AwaitingPayment && Self::confusable_with_a_payment(order)
         }) {
             let Some(view) = order
                 .order
@@ -4533,26 +4537,25 @@ impl AppState {
     /// Identified by the authorization lens reviewing harvest#75, after a
     /// first fix that made the two sets equal and left this half open.
     ///
-    /// # Whose orders are compared, and why it is not "own stores only"
+    /// # What it compares, and how the rule got here
     ///
-    /// **Orders this node is party to** -- ones its own identities issued and
-    /// ones it bought ([`Self::our_orders`]) -- across every store on screen,
-    /// same network only (signet and testnet4 share script bytes but not
-    /// payments), cancelled orders ignored, and orders with no anchor ignored
-    /// (no window). Stored because the card reads it on every render.
+    /// Same network only (signet and testnet4 share script bytes but not
+    /// payments), and [`Self::confusable_with_a_payment`] decides the rest.
+    /// Stored because the card reads it on every render.
     ///
-    /// It was own stores ONLY until harvest#75, and that was right while only
-    /// a seller's tab could publish `Paid`: the orders a seller might confuse
-    /// a payment between are all in their own stores, and a stranger copying
-    /// a script must not be able to stall them. #75 let a BUYER publish, and
-    /// a buyer's exposure is the mirror image -- two purchases from one
-    /// address-reusing seller sit in that seller's store, which is nobody's
-    /// own store here, so neither was ever a twin of the other and one
-    /// payment would have auto-published `Paid` on both.
+    /// It was **own stores only** until harvest#75, and that was right while
+    /// only a seller's tab could publish `Paid`: the orders a seller might
+    /// confuse a payment between are all in their own stores, and a stranger
+    /// copying a script must not be able to stall them. #75 let a BUYER
+    /// publish, and two purchases from one address-reusing seller sit in
+    /// that seller's store, which is nobody's own store here -- so neither
+    /// was ever a twin of the other and one payment would have
+    /// auto-published `Paid` on both.
     ///
-    /// Widening to OUR orders rather than to every order keeps the property
-    /// the narrower rule was protecting: an order this node is not party to
-    /// still cannot stall anything, whoever wrote it.
+    /// The first fix widened it to OUR orders, which closed that and left
+    /// the mirror above open. The rule is now the one stated at the top,
+    /// and "our orders" is NOT it: a store where we hold something
+    /// settleable contributes its whole book.
     ///
     /// # The residual, and why it is not closed here (harvest#116)
     ///
@@ -4585,16 +4588,21 @@ impl AppState {
         let mut ours: Vec<(BitcoinNetwork, Vec<u8>, SameAddressOrder)> = Vec::new();
         let mut seen = HashSet::new();
         let store_ids: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
-        let confusable = |record: &harvest_common::payment::AuthorizedOrder| {
-            record.status != OrderStatus::Cancelled
-                && !record.order.payment_script_pubkey.is_empty()
-                && record.order.payment_window().is_some()
-        };
+        let confusable = Self::confusable_with_a_payment;
         for store_contract_id in &store_ids {
             // A store where we hold nothing we could settle can contribute
-            // no twin of anything, so it costs nothing -- and this is the
-            // cheap test that keeps a buyer browsing many stores from paying
-            // a decryption sweep for each of them.
+            // no twin of anything, so it is skipped.
+            //
+            // NOT a cheap test, and saying so because the next reader will
+            // want to know: for a store that is not ours this calls
+            // `our_orders`, whose own early-out is satisfied by any single
+            // uncancelled windowed order -- which nearly every live store
+            // has -- so `buyer_purchases` then decrypts every conversation
+            // in it. What this skips is a store whose orders are ALL
+            // cancelled or windowless, not a busy one. The per-store sweep
+            // is real and is tracked in harvest#116, whose answer (key the
+            // twin check off the address contract) removes it rather than
+            // trims it.
             if self
                 .orders_we_may_settle(store_contract_id, confusable)
                 .is_empty()
@@ -5027,6 +5035,36 @@ impl AppState {
     /// cheap filter still runs BEFORE `our_orders` decides anything about
     /// ownership -- that early-out is what keeps a buyer's tab from
     /// decrypting every conversation in every store on every notification.
+    /// Whether a payment at this order's address could be taken for this
+    /// order's -- the ONE definition, so the publish set cannot drift out of
+    /// the twin set.
+    ///
+    /// [`Self::settled_orders`] ands this into its own filter and
+    /// [`Self::refresh_same_address_orders`] uses it alone, which makes
+    /// "everything publishable is also compared" true by CONSTRUCTION rather
+    /// than by an argument about which conjuncts happen to follow from
+    /// `AwaitingPayment`. That argument did hold -- a publishable order must
+    /// have an anchor, because `verify_on_chain_proof` refuses one without
+    /// (`NoAnchor`) -- but it held for `payment_script_pubkey` only by being
+    /// contrived to reach, and it lived in nobody's code.
+    ///
+    /// The hazard is not today's conjuncts. It is the fourth one somebody
+    /// adds here later: with two copies of the filter that would silently
+    /// narrow the twin set below the publish set and reopen the original
+    /// bug, with no test able to see it. Same reasoning as
+    /// `AuthorizedOrder::fields_used` staying exhaustive -- make the next
+    /// change fail loudly or not at all. Raised by the authorization lens
+    /// reviewing harvest#75.
+    ///
+    /// A cancelled order is out (`Paid` outranks `Cancelled`, so it is not a
+    /// competitor). An order with no script names no address, and one with
+    /// no window has no span a payment could fall in.
+    fn confusable_with_a_payment(record: &harvest_common::payment::AuthorizedOrder) -> bool {
+        record.status != harvest_common::payment::OrderStatus::Cancelled
+            && !record.order.payment_script_pubkey.is_empty()
+            && record.order.payment_window().is_some()
+    }
+
     fn orders_we_may_settle(
         &self,
         store_contract_id: &[u8],
