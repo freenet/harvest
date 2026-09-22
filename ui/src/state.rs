@@ -9060,11 +9060,11 @@ impl AppState {
         for fingerprint in refused {
             self.stop_watch_requests_for(&fingerprint, reason);
         }
-        // What was refused may have been all that held a custody request
-        // back (#122 review); nothing else would start it before the next
-        // store update. A custody request already tried is not raised again
-        // (`custody_attempted`).
-        self.start_custody_where_needed();
+        // Custody is deliberately NOT restarted here, though what was refused
+        // may have been all that held it back: a refusal naming this key can
+        // mean its grant is gone, and a custody wrap for the same key would put
+        // a second prompt in front of the seller moments after they said no.
+        // The next store update starts it, as before (#122 review round 3).
     }
 
     /// Stop asking `fingerprint` to sign watch requests for the rest of the
