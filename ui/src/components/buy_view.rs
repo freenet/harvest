@@ -288,8 +288,8 @@ fn SettledPurchase(
                     .to_string()
             }
             // `describe` covers every other status, so this is only reached
-        // for a stage that has nothing to say.
-        _ => "This order is no longer awaiting payment.".to_string(),
+            // for a stage that has nothing to say.
+            _ => "This order is no longer awaiting payment.".to_string(),
         });
     let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
     rsx! {
