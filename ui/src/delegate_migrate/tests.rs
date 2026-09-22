@@ -19,6 +19,8 @@ enum Old {
     Holds(Vec<(Vec<u8>, Vec<u8>)>),
     /// Registered, answers the cheap read, never answers the export.
     SilentOnExport,
+    /// Registered, answers nothing at all.
+    Silent,
 }
 
 #[derive(Default)]
@@ -131,11 +133,14 @@ impl DelegateCalls for Fake {
         let Some(old) = node.old.get(&target).cloned() else {
             return Ok(Reply::Missing);
         };
+        if matches!(old, Old::Silent) {
+            return Err(CallError::Timeout);
+        }
         if let Ok(HarvestMigrationRequest::ExportSecrets { source_generation }) =
             harvest_common::from_cbor::<HarvestMigrationRequest>(&payload)
         {
             return match old {
-                Old::SilentOnExport => Err(CallError::Timeout),
+                Old::SilentOnExport | Old::Silent => Err(CallError::Timeout),
                 Old::Holds(secrets) => {
                     Ok(Reply::Payloads(vec![freenet_migrate::ExportedSecrets {
                         source_generation,
@@ -585,4 +590,23 @@ fn deferred_work_waits_for_a_complete_walk() {
         None,
         "and later work is dropped for this load"
     );
+}
+
+/// The same, when the newer generation does not even answer the probe: a
+/// timeout is not `Missing`, so it halts too. Mutated red by not halting on
+/// a probe timeout.
+#[test]
+fn a_newer_generation_silent_to_the_probe_stops_the_walk() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.old.insert(generation(18), Old::Silent);
+        node.old.insert(
+            generation(12),
+            Old::Holds(vec![(b"harvest:x25519_sk:fp1".to_vec(), b"older".to_vec())]),
+        );
+    }
+    let out = outcome(&fake);
+    assert!(out.walk.halted);
+    assert_eq!(secret(&fake, "harvest:x25519_sk:fp1"), None);
 }
