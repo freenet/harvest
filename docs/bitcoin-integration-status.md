@@ -147,33 +147,34 @@ rather than waiting forever. The inbox route above could carry these too.
 Whether it should is a privacy question: an order's address is public anyway,
 and a private watch list's is not.
 
-### 3. Buyer-seller messaging is not implemented
+### 3. Buyer-seller messaging — RESOLVED
 
-`messaging::encrypt_message`/`decrypt_message` have no callers outside their
-own tests, and nothing sends anything to a mailbox contract. The missing piece
-is the seller's X25519 public key: `StoreInfoV1` publishes a certificate and a
-reputation contract id and no encryption key, so a buyer has nothing to derive
-a conversation key against.
+This section used to say messaging was not implemented. It is: a buyer asks to
+buy through the seller's mailbox contract, the seller accepts by issuing an
+invoice against the request, and the buyer's software checks the published
+commitment before offering to pay (`AppState::payment_blockers`). See
+`docs/buyer-conversation-persistence.md` and the messaging sections of
+`docs/untested-invariants.md`.
 
-`MessageView` used to claim "Messages are end-to-end encrypted" while
-discarding whatever was typed; it now says messaging is unavailable. The
-mailbox contract itself is real and stores messages — nothing in this app can
-put one there or read one back.
+### 4. Migration registry — RESOLVED
 
-### 4. No migration registry — this change re-keys the store contract
+This section used to say Harvest had no `legacy/*.toml` registry. It has one
+per contract and for the delegate (`legacy/README.md`), and CI refuses a build
+whose current hash turns up in one (`scripts/check-code-hashes.sh`).
 
-Adding `OrdersV1` to `StoreStateV1` changes the store contract's WASM, which
-changes its code hash, which changes every store's contract key. Harvest has
-**no `legacy_*.toml` registry** and has not adopted `freenet-migrate`. The only
-migration mechanism that exists is `LEGACY_HARVEST_WEBAPP_CONTRACT_IDS`, which
-covers the *webapp container* id and nothing else.
+### 5. After Paid (harvest#53)
 
-So any store published under the previous contract WASM is orphaned by this
-change. Harvest's README describes the project as early scaffolding, so the
-practical blast radius is probably zero today — but the gap should be closed
-**before** anyone publishes stores they care about, because the fix is
-mechanical beforehand and a data-loss incident afterwards. See the
-`freenet-app-migration` skill.
+A purchase used to stop at `Paid`: no cancel, no despatch, no complaint.
+Since #53 Phase 0 a buyer can publish `Paid` themselves, and since Phase A a
+seller can cancel an unpaid invoice and every order card says where the order
+stands against reader-side windows in blocks (`ui/src/fulfilment.rs`): lapsed
+once its payment window closes unpaid, then despatch due, then the complaint
+window, then complete by silence. No contract reads a clock, so none of those
+windows is enforced by a contract and nothing is written when one passes.
+
+Still to come: a buyer-signed cancel and a recorded despatch (Phase B, a store
+and delegate re-key), and the receipted complaint (Phase C, a reputation
+re-key). `PaymentReversed` still has no producer anywhere.
 
 ## Smaller things found and fixed along the way
 
