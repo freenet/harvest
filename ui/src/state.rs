@@ -9060,6 +9060,11 @@ impl AppState {
         for fingerprint in refused {
             self.stop_watch_requests_for(&fingerprint, reason);
         }
+        // What was refused may have been all that held a custody request
+        // back (#122 review); nothing else would start it before the next
+        // store update. A custody request already tried is not raised again
+        // (`custody_attempted`).
+        self.start_custody_where_needed();
     }
 
     /// Stop asking `fingerprint` to sign watch requests for the rest of the

@@ -427,10 +427,15 @@ impl AppState {
             pending.certificate_pem = pem;
             return self.request_listing_signature(pending);
         }
-        // Asked for every listing that waits, not once per Ghost Key: a
-        // duplicate `GetCertificate` costs nothing, since any answer releases
-        // every listing waiting on that key, and it makes adding a listing
-        // again a real retry if an earlier request was lost.
+        // Asked for every listing that waits, not once per Ghost Key, so
+        // adding a listing again is a real retry if an earlier request was
+        // lost. A duplicate answer costs nothing -- any `Certificate`
+        // releases every listing waiting on that key -- but a duplicate
+        // REFUSAL is not free: a refusal names no request, so a second one
+        // landing after the first has cleared the vault can be taken for
+        // whatever was asked next. Rare, since the backing's certificate
+        // spares the vault in the ordinary case, and bounded to one wrong
+        // attribution.
         let fingerprint = pending.fingerprint.clone();
         dioxus::logger::tracing::info!(
             "Listing \"{}\" is waiting on the certificate for {fingerprint}",
@@ -522,7 +527,9 @@ impl AppState {
             };
             pending.certificate_pem = pem;
             if let Err(e) = self.request_listing_signature(pending) {
-                self.notifications.push(listing_not_published(&title, &e));
+                // Not "add it again": the store itself cannot be signed for.
+                self.notifications
+                    .push(format!("Your listing \"{title}\" was not published: {e}"));
             }
         }
     }
@@ -705,8 +712,6 @@ impl AppState {
     }
 }
 
-/// Ask the vault to sign a backing statement. Same discipline as every other
-/// signature: queued before this runs, withdrawn if the send fails.
 /// What a seller is told about a listing that was not published because its
 /// certificate could not be had (#118).
 fn listing_not_published(title: &str, why: &str) -> String {
@@ -741,6 +746,8 @@ fn spawn_listing_certificate_timeout() {
     });
 }
 
+/// Ask the vault to sign a backing statement. Same discipline as every other
+/// signature: queued before this runs, withdrawn if the send fails.
 #[cfg(target_arch = "wasm32")]
 fn spawn_backing_statement_signature(pending: PendingBacking) {
     wasm_bindgen_futures::spawn_local(async move {
