@@ -481,13 +481,22 @@ pub fn closed_window_note(
         return None;
     }
     let last = last_settling_block(order)?;
-    if sight.covered || sight.ambiguous {
-        // A payment made in time is in sight; publishing it has no deadline,
-        // so naming a block here would soon name one already passed (review
-        // round 4). The pill and the notes beside it say what was seen.
+    // A payment made in time is in sight; publishing it has no deadline, so
+    // naming a block here would soon name one already passed (review round
+    // 4). The pill and the notes beside it say what was seen.
+    if sight.covered {
         return Some(
             "This invoice's payment window has closed, so a new payment would not count. A \
              payment made in time is in sight and still counts."
+                .to_string(),
+        );
+    }
+    if sight.ambiguous {
+        // Not "still counts": it may be another invoice's (review round 5).
+        return Some(
+            "This invoice's payment window has closed, so a new payment would not count. A \
+             payment made in time is in sight, but it may be for another invoice on this \
+             address."
                 .to_string(),
         );
     }
@@ -912,6 +921,11 @@ mod tests {
         // has already gone by.
         let note = closed_window_note(&open, Some(last + 500), AMBIGUOUS).expect("said");
         assert!(!note.contains("block"), "{note}");
+        assert!(!note.contains("still counts"), "{note}");
+        assert!(note.contains("may be for another invoice"), "{note}");
+        let covered = closed_window_note(&open, Some(last + 500), COVERED).expect("said");
+        assert!(covered.contains("still counts"), "{covered}");
+        assert!(!covered.contains("block"), "{covered}");
         assert!(closed_window_note(&open, Some(last + 1), PaymentSight::default()).is_none());
     }
 
