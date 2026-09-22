@@ -562,7 +562,10 @@ pub struct PendingStoreCreation {
     /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
     /// `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
-    /// Filled by the harvest delegate's `EncryptionKeyReady` response.
+    /// Filled from the store key's inbox key (`custody_flow`'s
+    /// `fill_creation_from_subkeys`, harvest#93 phase 1b); the per-Ghost-Key
+    /// key `EncryptionKeyReady` answers is only for stores made before store
+    /// keys.
     ///
     /// **Not** part of the readiness gate, unlike the two above. Creation
     /// waits on the certificate and the RSA key because a store without
@@ -572,9 +575,6 @@ pub struct PendingStoreCreation {
     /// thing to wait on would add a third way for a creation to hang
     /// forever, and this one has a recovery path that those do not.
     ///
-    /// It is present once the connect path's recall (or, for a Ghost Key with
-    /// no key yet, the mint that follows the delegate migration) has been
-    /// answered. Nothing here relies on that having happened.
     pub encryption_public_key: Option<[u8; 32]>,
     /// The new store's own key (harvest#93), filled by the harvest delegate's
     /// `StoreKeyCreated`. `None` until it arrives; creation waits on it,

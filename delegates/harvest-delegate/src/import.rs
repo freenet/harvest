@@ -800,7 +800,7 @@ mod tests {
     /// further successor.
     #[test]
     fn markers_are_outside_the_export_prefix() {
-        for key in [done_key(&PRED), wip_key(&PRED)] {
+        for key in [done_key(&PRED), wip_key(&PRED), staged_prefix(&PRED)] {
             assert!(!key.starts_with(harvest_common::migration::SECRET_KEY_PREFIX));
         }
     }

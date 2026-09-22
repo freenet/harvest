@@ -47,7 +47,9 @@
 //!   it already holds -- the delegate's import never overwrites -- AND if no
 //!   newer generation that holds data was skipped. A generation registered
 //!   here that does not answer therefore stops the walk ([`Walk`]); only one
-//!   the node never ran (`Missing`) is walked past.
+//!   the node never ran (`Missing`) is walked past. So does a generation that
+//!   carried travelling records and did not finish for a reason a retry fixes
+//!   ([`Carrier`]).
 //! * **It resurrects what a newer generation deleted by absence** -- a
 //!   conversation the buyer forgot, an address unwatched, a conversation
 //!   evicted at the cap. Each generation's completion markers stay behind
@@ -270,9 +272,60 @@ pub struct Walk {
     /// A registered predecessor failed to answer. Nothing older is imported
     /// in this run.
     pub halted: bool,
+    /// The predecessor whose items are being written, and what happened to
+    /// them. See [`Carrier`].
+    pub carrier: Option<Carrier>,
     /// Keys the current delegate reported `Written`, so the app knows what to
     /// ask for again. Key names only, never values.
     pub written: Vec<Vec<u8>>,
+}
+
+/// What happened to the items of the predecessor most recently written.
+///
+/// # Why this can halt the walk too
+///
+/// A predecessor can carry travelling records ("generation Q was folded into
+/// me"). The current delegate stages them and puts them into effect only when
+/// that predecessor is sealed, so an unfinished carrier cannot make it skip Q.
+/// That is right when the carrier failed PERMANENTLY -- an item it will never
+/// accept -- because then Q's own copy of that item is worth offering. It is
+/// wrong when the carrier failed for a reason a retry fixes: Q would be walked
+/// in this run, and whatever the carrier had deleted since Q (a conversation
+/// forgotten, an address unwatched) would come back for good. The carrier's
+/// failed item is retried next load anyway. So a carrier that staged records,
+/// was not sealed, and failed retryably stops the walk, as a silent generation
+/// does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carrier {
+    pub predecessor: [u8; 32],
+    /// It carried at least one travelling record.
+    pub staged: bool,
+    /// At least one of its items failed for a reason a retry may fix, or its
+    /// seal failed.
+    pub retryable: bool,
+    /// Its `Done` landed.
+    pub sealed: bool,
+}
+
+impl Walk {
+    fn carrier_for(&mut self, predecessor: [u8; 32]) -> &mut Carrier {
+        if self.carrier.as_ref().map(|c| c.predecessor) != Some(predecessor) {
+            self.carrier = Some(Carrier {
+                predecessor,
+                staged: false,
+                retryable: false,
+                sealed: false,
+            });
+        }
+        self.carrier.as_mut().expect("just set")
+    }
+
+    /// Whether the predecessor just written leaves the walk unsafe to go on.
+    fn carrier_blocks(&self) -> bool {
+        self.carrier
+            .as_ref()
+            .is_some_and(|c| c.staged && !c.sealed && c.retryable)
+    }
 }
 
 /// Send one message to one delegate and wait for its answer.
@@ -464,9 +517,15 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
         &mut self,
         query: &MarkerQuery<'_>,
     ) -> Result<Option<MigrationMarker>, String> {
+        if self.walk.borrow().carrier_blocks() {
+            // See `Carrier`: going on would walk a generation the newer one
+            // folded in, and bring back what it deleted.
+            self.walk.borrow_mut().halted = true;
+        }
         if self.walk.borrow().halted {
             return Err(
-                "a newer generation did not answer; stopping so an older one cannot shadow it"
+                "a newer generation did not answer, or did not finish for a reason a retry \
+                 fixes; stopping so an older one cannot shadow it"
                     .into(),
             );
         }
@@ -489,7 +548,8 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
         marker: MigrationMarker,
     ) -> Result<(), String> {
         let predecessor = key_bytes(predecessor)?;
-        match self
+        let done = matches!(marker, MigrationMarker::Done { .. });
+        let answer = match self
             .ask(
                 &HarvestDelegateRequest::RecordPredecessorMarker {
                     predecessor,
@@ -497,11 +557,22 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
                 },
                 Expect::PredecessorMarkerRecorded(predecessor),
             )
-            .await?
+            .await
         {
-            HarvestDelegateResponse::PredecessorMarkerRecorded { recorded: true, .. } => Ok(()),
-            _ => Err("the current delegate did not record the marker".into()),
+            Ok(HarvestDelegateResponse::PredecessorMarkerRecorded { recorded: true, .. }) => Ok(()),
+            Ok(_) => Err("the current delegate did not record the marker".to_string()),
+            Err(e) => Err(e),
+        };
+        if done {
+            let mut walk = self.walk.borrow_mut();
+            let carrier = walk.carrier_for(predecessor);
+            match answer {
+                Ok(()) => carrier.sealed = true,
+                // A seal that did not land is retried next load.
+                Err(_) => carrier.retryable = true,
+            }
         }
+        answer
     }
 
     /// Silence is `retryable`, never `already_authoritative`: the latter is a
@@ -520,16 +591,25 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
             predecessor,
             key: item.key.to_vec(),
         };
-        match self.ask(&request, expect).await {
-            Ok(HarvestDelegateResponse::MigratedSecretImported { outcome, .. }) => {
-                if outcome == SecretImport::Written {
-                    self.walk.borrow_mut().written.push(item.key.to_vec());
-                }
-                to_item_write(outcome)
+        let outcome = match self.ask(&request, expect).await {
+            Ok(HarvestDelegateResponse::MigratedSecretImported { outcome, .. }) => outcome,
+            Ok(_) => SecretImport::Retryable("unexpected answer".into()),
+            Err(e) => SecretImport::Retryable(e),
+        };
+        {
+            let mut walk = self.walk.borrow_mut();
+            if outcome == SecretImport::Written {
+                walk.written.push(item.key.to_vec());
             }
-            Ok(_) => ItemWrite::retryable("unexpected answer".into()),
-            Err(e) => ItemWrite::retryable(e),
+            let carrier = walk.carrier_for(predecessor);
+            if item.key.starts_with(b"harvest:folded:") && outcome == SecretImport::Written {
+                carrier.staged = true;
+            }
+            if matches!(outcome, SecretImport::Retryable(_)) {
+                carrier.retryable = true;
+            }
         }
+        to_item_write(outcome)
     }
 }
 

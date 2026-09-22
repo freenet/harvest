@@ -509,13 +509,13 @@ pub enum HarvestDelegateResponse {
         rsa_public_key_der: Vec<u8>,
     },
 
-    /// This identity's long-term X25519 public key, minted or recalled.
     /// Answer to a recall-only `InitEncryptionKey`: this delegate holds no
     /// key for the identity, and none was minted.
     EncryptionKeyAbsent {
         ghostkey_fingerprint: String,
     },
 
+    /// This identity's long-term X25519 public key, minted or recalled.
     EncryptionKeyReady {
         ghostkey_fingerprint: String,
         /// Raw 32 bytes. A `Vec` rather than `[u8; 32]` because every other

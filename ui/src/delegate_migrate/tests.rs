@@ -41,6 +41,8 @@ struct Node {
     staged: HashMap<[u8; 32], Vec<Vec<u8>>>,
     /// A key the current delegate refuses, permanently.
     reject_key: Option<Vec<u8>>,
+    /// A key the current delegate refuses for now (a retry may take it).
+    retry_key: Option<Vec<u8>>,
 }
 
 fn folded(predecessor: &[u8; 32]) -> Vec<u8> {
@@ -125,6 +127,15 @@ impl DelegateCalls for Fake {
                         predecessor,
                         key,
                         outcome: SecretImport::Written,
+                    }
+                }
+                HarvestDelegateRequest::ImportMigratedSecret {
+                    predecessor, key, ..
+                } if node.retry_key.as_ref() == Some(&key) => {
+                    HarvestDelegateResponse::MigratedSecretImported {
+                        predecessor,
+                        key,
+                        outcome: SecretImport::Retryable("full".into()),
                     }
                 }
                 HarvestDelegateRequest::ImportMigratedSecret {
@@ -690,5 +701,41 @@ fn a_record_carried_by_an_unfinished_generation_is_not_in_effect() {
         secret(&fake, "harvest:x25519_sk:fp1").as_deref(),
         Some(&b"v16"[..]),
         "V16 was still walked"
+    );
+}
+
+/// **A carrier that did not finish for a reason a retry fixes stops the
+/// walk**, rather than letting the generation it folded in be walked in the
+/// same run -- which would bring back whatever the carrier had deleted since,
+/// for good. (A carrier that failed only permanently lets the walk go on:
+/// `a_record_carried_by_an_unfinished_generation_is_not_in_effect`.) Mutated
+/// red by not halting on a blocked carrier.
+#[test]
+fn a_retryably_unfinished_carrier_stops_the_walk() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.retry_key = Some(b"harvest:busy".to_vec());
+        node.old.insert(
+            generation(17),
+            Old::Holds(vec![
+                (folded(&generation(16)), b"1".to_vec()),
+                (b"harvest:busy".to_vec(), b"x".to_vec()),
+            ]),
+        );
+        node.old.insert(
+            generation(16),
+            Old::Holds(vec![(
+                b"harvest:buyer_conv:s:forgotten".to_vec(),
+                b"conv".to_vec(),
+            )]),
+        );
+    }
+    let out = outcome(&fake);
+    assert!(out.walk.halted, "{}", summarize(&out.report));
+    assert_eq!(
+        secret(&fake, "harvest:buyer_conv:s:forgotten"),
+        None,
+        "V16, folded into V17, is not walked while V17 is only waiting on a retry"
     );
 }

@@ -260,6 +260,21 @@ async fn refresh_from_delegate(rsa_fingerprints: Vec<String>) {
             warn!("delegate migration: could not ask for the RSA key of {fingerprint}: {e}");
         }
     }
+    // And recall each Ghost Key's encryption key the app does not hold yet:
+    // the connect path's recall ran before the import and found nothing, and
+    // the mint that would have followed may have been dropped by an
+    // incomplete walk. A recall never mints.
+    let missing: Vec<String> = {
+        let app = super::APP_STATE.read();
+        app.ghostkeys
+            .iter()
+            .map(|k| k.fingerprint.clone())
+            .filter(|fp| !app.encryption_public_keys.contains_key(fp))
+            .collect()
+    };
+    for fingerprint in missing {
+        crate::components::ensure_encryption_key(fingerprint);
+    }
     if let Err(e) = super::bitcoin_ops::get_bridge().await {
         warn!("delegate migration: could not fetch bridge config: {e}");
     }
