@@ -481,10 +481,21 @@ fn Thread(
             // Once the delivery check has given up (harvest#119) it says the
             // seller does not have it, and offers the one thing that helps.
             for message in unconfirmed.iter() {
-                if message.not_arrived {
+                if let Some(why) = message.not_arrived {
                     {
                         let store_contract_id = store_contract_id.clone();
                         let digest = message.digest;
+                        let explanation = match why {
+                            crate::state::NotArrived::NeverReachedNode => {
+                                "The seller has not received this. It never reached your Freenet \
+                                 node, so nothing was sent."
+                            }
+                            crate::state::NotArrived::NotInMailbox => {
+                                "The seller has not received this yet. Harvest sent it more than \
+                                 once and it is still not in their mailbox. Sending it again \
+                                 cannot deliver it twice."
+                            }
+                        };
                         rsx! {
                             div { class: "card",
                                 style: "margin-top: 0.5rem;",
@@ -492,9 +503,7 @@ fn Thread(
                                 p { style: "white-space: pre-wrap;", "{message.text}" }
                                 p { class: "text-warning",
                                     style: "font-size: 0.8rem;",
-                                    "The seller has not received this yet. Harvest sent it more than "
-                                    "once and it is still not in their mailbox. Sending it again "
-                                    "cannot deliver it twice."
+                                    "{explanation}"
                                 }
                                 button {
                                     class: "btn btn-sm",
@@ -650,7 +659,7 @@ pub(crate) fn deliver_to_seller(
 
     APP_STATE
         .write()
-        .record_sent_message(store_contract_id, record_as, &sealed);
+        .record_sent_to_seller(store_contract_id, record_as, &sealed, &seller);
     Ok(())
 }
 
@@ -683,10 +692,22 @@ fn dispatch(
 
 /// Send a message the seller has not received again: the identical sealed
 /// bytes, never a fresh seal, so it cannot arrive twice (harvest#119).
+///
+/// Re-registers the mailbox as the first send does, so a subscription that
+/// gave up in the meantime is asked for again and the re-read has somewhere
+/// to land.
 fn resend(store_contract_id: &[u8], digest: &[u8; 32]) -> Result<(), String> {
-    let (seller, sealed) = APP_STATE
+    let Some((seller, sealed)) = APP_STATE
         .write()
-        .take_for_resend(store_contract_id, digest)?;
+        .take_for_resend(store_contract_id, digest)?
+    else {
+        // Already being sent again (a second click before the re-render).
+        return Ok(());
+    };
+    let mailbox = crate::gateway::mailbox_ops::mailbox_contract_key(&seller)?;
+    APP_STATE
+        .write()
+        .register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
     dispatch(store_contract_id.to_vec(), seller, sealed);
     Ok(())
 }

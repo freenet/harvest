@@ -1931,10 +1931,25 @@ pub struct SentMessage {
     /// fresh nonce, which the mailbox would keep as a second message.
     /// Ciphertext only; nothing here reads it.
     pub sealed: harvest_common::mailbox::EncryptedMessage,
-    /// The delivery check gave up on it: re-sent automatically and still not
-    /// in the mailbox. The buyer is told, and offered a resend. See
-    /// `gateway::mailbox_ops::deliver`.
-    pub not_arrived: bool,
+    /// Set when the delivery check gave up on it, saying why. The buyer is
+    /// told, and offered a resend. See `gateway::mailbox_ops::deliver`.
+    pub not_arrived: Option<NotArrived>,
+    /// The seller verifying key this message was sealed and addressed to --
+    /// the key its mailbox is derived from. Set only for a buyer's own
+    /// messages, which are the only ones that can be resent: a resend goes
+    /// where the first send went, not to whatever key the store names by
+    /// then.
+    pub sent_to: Option<[u8; 32]>,
+}
+
+/// Why a buyer's message is marked as not received.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotArrived {
+    /// It never reached this browser's Freenet node at all.
+    NeverReachedNode,
+    /// The node took it, and fresh reads of the mailbox still do not show
+    /// it after an automatic resend.
+    NotInMailbox,
 }
 
 /// Enough of a conversation's routing tag to tell two apart on screen.
@@ -6016,22 +6031,58 @@ impl AppState {
                 sent_at: chrono::Utc::now(),
                 digest: harvest_common::mailbox::entry_digest(sealed),
                 sealed: sealed.clone(),
-                not_arrived: false,
+                not_arrived: None,
+                sent_to: None,
             });
     }
 
-    /// Whether the message this browser sent with `digest` is in the store's
-    /// mailbox as last read. A digest this browser never sent counts as
-    /// landed: there is nothing to deliver.
-    pub fn sent_message_landed(&self, store_contract_id: &[u8], digest: &[u8; 32]) -> bool {
-        !self
-            .unconfirmed_sent(store_contract_id)
-            .iter()
-            .any(|sent| sent.digest == *digest)
+    /// [`Self::record_sent_message`] for a buyer's message to a seller,
+    /// remembering which seller key it went to so it can be resent there.
+    pub fn record_sent_to_seller(
+        &mut self,
+        store_contract_id: &[u8],
+        text: String,
+        sealed: &harvest_common::mailbox::EncryptedMessage,
+        seller: &ed25519_dalek::VerifyingKey,
+    ) {
+        self.record_sent_message(store_contract_id, text, sealed);
+        if let Some(sent) = self
+            .browsing_stores
+            .get_mut(store_contract_id)
+            .and_then(|store| store.sent_messages.last_mut())
+        {
+            sent.sent_to = Some(seller.to_bytes());
+        }
     }
 
-    /// The delivery check gave up on a message: say so on screen.
-    pub fn mark_not_arrived(&mut self, store_contract_id: &[u8], digest: &[u8; 32]) {
+    /// Whether the mailbox `mailbox_contract_id`, as last read, holds the
+    /// entry with `digest`. `None` when this tab cannot tell.
+    ///
+    /// Looked up by MAILBOX, not by the store the message was sent from: a
+    /// mailbox is derived from the seller's Ghost Key, so two stores under
+    /// one key share it, and its state is filed under whichever store
+    /// registered it first (`register_store_mailbox`). Asking the sending
+    /// store would never see the message land. A mailbox with no mapping at
+    /// all (its subscribe gave up) has its state dropped on arrival, so the
+    /// answer is `None`, never a "no" nothing could have contradicted.
+    pub fn mailbox_holds(&self, mailbox_contract_id: &[u8], digest: &[u8; 32]) -> Option<bool> {
+        let store = self.mailbox_to_store.get(mailbox_contract_id)?;
+        let store = self.browsing_stores.get(store)?;
+        Some(
+            store
+                .mailbox_messages
+                .iter()
+                .any(|entry| harvest_common::mailbox::entry_digest(entry) == *digest),
+        )
+    }
+
+    /// The delivery check gave up on a message: say so on screen, and why.
+    pub fn mark_not_arrived(
+        &mut self,
+        store_contract_id: &[u8],
+        digest: &[u8; 32],
+        why: NotArrived,
+    ) {
         if let Some(sent) = self
             .browsing_stores
             .get_mut(store_contract_id)
@@ -6042,43 +6093,47 @@ impl AppState {
                     .find(|sent| sent.digest == *digest)
             })
         {
-            sent.not_arrived = true;
+            sent.not_arrived = Some(why);
         }
     }
 
     /// What a resend of a message the seller has not received needs: the
-    /// seller whose mailbox it goes to, and the IDENTICAL sealed bytes.
+    /// seller key it was first sent to, and the IDENTICAL sealed bytes.
     ///
-    /// Clears the "not arrived" mark, since a new delivery check starts. The
-    /// mailbox is addressed from the store's verified seller key, exactly as
-    /// the first send was (`components::message_view::deliver_to_seller`).
+    /// `Ok(None)` when the message is not marked as not received -- a resend
+    /// already under way, say, from a second click before the page
+    /// re-rendered -- so one click starts one delivery check. Clears the
+    /// mark otherwise, since a new check starts.
     pub fn take_for_resend(
         &mut self,
         store_contract_id: &[u8],
         digest: &[u8; 32],
     ) -> Result<
-        (
+        Option<(
             ed25519_dalek::VerifyingKey,
             harvest_common::mailbox::EncryptedMessage,
-        ),
+        )>,
         String,
     > {
-        let store = self
+        let sent = self
             .browsing_stores
             .get_mut(store_contract_id)
-            .ok_or("this store is no longer loaded")?;
-        let seller = store
-            .seller_verifying_key
-            .ok_or("this store's identity can no longer be confirmed, so its mailbox is unknown")?;
-        let seller = ed25519_dalek::VerifyingKey::from_bytes(&seller)
-            .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
-        let sent = store
-            .sent_messages
-            .iter_mut()
-            .find(|sent| sent.digest == *digest)
+            .and_then(|store| {
+                store
+                    .sent_messages
+                    .iter_mut()
+                    .find(|sent| sent.digest == *digest)
+            })
             .ok_or("that message is not one this tab sent")?;
-        sent.not_arrived = false;
-        Ok((seller, sent.sealed.clone()))
+        let to = sent
+            .sent_to
+            .ok_or("only a message you sent to a seller can be sent again")?;
+        let seller = ed25519_dalek::VerifyingKey::from_bytes(&to)
+            .map_err(|e| format!("the seller key this went to is unusable: {e}"))?;
+        if sent.not_arrived.take().is_none() {
+            return Ok(None);
+        }
+        Ok(Some((seller, sent.sealed.clone())))
     }
 
     /// One store's mailbox, read with whatever keys are on hand.
@@ -16339,37 +16394,127 @@ mod nonce_collision_tests {
     }
 
     /// **A resend hands the node the SAME bytes, never a fresh seal**
-    /// (harvest#119). A fresh seal is a fresh nonce, which the mailbox keeps
-    /// as a second message: the seller would see the request twice.
+    /// (harvest#119), addressed to the seller it first went to. A fresh seal
+    /// is a fresh nonce, which the mailbox keeps as a second message: the
+    /// seller would see the request twice.
     #[test]
-    fn a_resend_is_the_identical_sealed_message() {
+    fn a_resend_is_the_identical_sealed_message_to_the_same_seller() {
         let mut buyer = buyer_state();
         let seller = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "is this still for sale?".into())
+            .expect("compose");
+        buyer.record_sent_to_seller(STORE, "is this still for sale?".into(), &mine, &seller);
+        let digest = harvest_common::mailbox::entry_digest(&mine);
+
+        // The store has since been re-backed by another key. The resend must
+        // still go where the message was sealed and first sent.
         buyer
             .browsing_stores
             .get_mut(STORE)
             .expect("store")
-            .seller_verifying_key = Some(seller.to_bytes());
-        let mine = buyer
-            .compose_to_seller(STORE, &seller_public(), "is this still for sale?".into())
-            .expect("compose");
-        buyer.record_sent_message(STORE, "is this still for sale?".into(), &mine);
-        let digest = harvest_common::mailbox::entry_digest(&mine);
+            .seller_verifying_key = Some([0x77; 32]);
 
-        buyer.mark_not_arrived(STORE, &digest);
-        assert!(
+        assert_eq!(
+            buyer.take_for_resend(STORE, &digest),
+            Ok(None),
+            "a message not marked as lost must not start a second delivery"
+        );
+
+        buyer.mark_not_arrived(STORE, &digest, NotArrived::NotInMailbox);
+        assert_eq!(
             buyer.unconfirmed_sent(STORE)[0].not_arrived,
+            Some(NotArrived::NotInMailbox),
             "the buyer is not told the seller lacks it"
         );
 
-        let (to, again) = buyer.take_for_resend(STORE, &digest).expect("resend");
+        let (to, again) = buyer
+            .take_for_resend(STORE, &digest)
+            .expect("resend")
+            .expect("marked, so resendable");
         assert_eq!(to, seller, "addressed to a different seller's mailbox");
         assert_eq!(again, mine, "a resend must be the identical message");
-        assert!(
-            !buyer.unconfirmed_sent(STORE)[0].not_arrived,
+        assert_eq!(
+            buyer.unconfirmed_sent(STORE)[0].not_arrived,
+            None,
             "a resend starts a new check, so the warning must clear"
         );
+        assert_eq!(
+            buyer.take_for_resend(STORE, &digest),
+            Ok(None),
+            "a second click started a second delivery"
+        );
         assert!(buyer.take_for_resend(STORE, &[0u8; 32]).is_err());
+    }
+
+    /// With two stores open, a resend on one returns that store's message and
+    /// seller, never the other's (review of harvest#126, testing lens).
+    #[test]
+    fn a_resend_takes_the_message_from_the_store_it_was_sent_from() {
+        const OTHER: &[u8] = b"another store contract id, 32 b";
+        let mut buyer = buyer_state();
+        buyer.browsing_stores.entry(OTHER.to_vec()).or_default();
+        let first = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let second = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]).verifying_key();
+        let to_first = buyer
+            .compose_to_seller(STORE, &seller_public(), "to the first".into())
+            .expect("compose");
+        let to_second = buyer
+            .compose_to_seller(STORE, &seller_public(), "to the second".into())
+            .expect("compose");
+        buyer.record_sent_to_seller(STORE, "to the first".into(), &to_first, &first);
+        buyer.record_sent_to_seller(OTHER, "to the second".into(), &to_second, &second);
+        let digest = harvest_common::mailbox::entry_digest(&to_second);
+
+        buyer.mark_not_arrived(OTHER, &digest, NotArrived::NotInMailbox);
+        assert!(
+            buyer.take_for_resend(STORE, &digest).is_err(),
+            "found another store's message"
+        );
+        let (to, again) = buyer
+            .take_for_resend(OTHER, &digest)
+            .expect("resend")
+            .expect("marked");
+        assert_eq!((to, again), (second, to_second));
+    }
+
+    /// **Landing is read from the mailbox, not from the sending store**
+    /// (review of harvest#126). A mailbox is derived from the seller's Ghost
+    /// Key, so two stores under one key share it, and its state is filed
+    /// under whichever store registered it first. Asking the second store
+    /// would never see the message land, and the buyer would be told,
+    /// wrongly, that the seller does not have it.
+    #[test]
+    fn landing_is_read_from_the_mailbox_whichever_store_holds_its_state() {
+        const SECOND: &[u8] = b"a second store under the same k";
+        const MAILBOX: [u8; 32] = [0x5A; 32];
+        let mut buyer = buyer_state();
+        buyer.browsing_stores.entry(SECOND.to_vec()).or_default();
+        buyer
+            .mailbox_to_store
+            .insert(MAILBOX.to_vec(), STORE.to_vec());
+        let mine = buyer
+            .compose_to_seller(STORE, &seller_public(), "hello".into())
+            .expect("compose");
+        buyer.record_sent_message(SECOND, "hello".into(), &mine);
+        let digest = harvest_common::mailbox::entry_digest(&mine);
+
+        assert_eq!(buyer.mailbox_holds(&MAILBOX, &digest), Some(false));
+        buyer
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages = mailbox_after(vec![mine]);
+        assert_eq!(
+            buyer.mailbox_holds(&MAILBOX, &digest),
+            Some(true),
+            "the message is in the mailbox and was not seen"
+        );
+        assert_eq!(
+            buyer.mailbox_holds(&[0x5B; 32], &digest),
+            None,
+            "a mailbox this tab does not route cannot be read as a no"
+        );
     }
 
     /// A message marked as not received that then lands (late) stops being
@@ -16382,15 +16527,14 @@ mod nonce_collision_tests {
             .expect("compose");
         buyer.record_sent_message(STORE, "hello".into(), &mine);
         let digest = harvest_common::mailbox::entry_digest(&mine);
-        buyer.mark_not_arrived(STORE, &digest);
-        assert!(!buyer.sent_message_landed(STORE, &digest));
+        buyer.mark_not_arrived(STORE, &digest, NotArrived::NotInMailbox);
+        assert_eq!(buyer.unconfirmed_sent(STORE).len(), 1);
 
         buyer
             .browsing_stores
             .get_mut(STORE)
             .expect("store")
             .mailbox_messages = mailbox_after(vec![mine]);
-        assert!(buyer.sent_message_landed(STORE, &digest));
         assert!(buyer.unconfirmed_sent(STORE).is_empty());
     }
 

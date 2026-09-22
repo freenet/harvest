@@ -92,31 +92,71 @@ pub fn mailbox_delta_bytes(messages: Vec<EncryptedMessage>) -> Result<Vec<u8>, S
 /// applied locally before it is forwarded), short enough that a buyer who is
 /// still looking at the page learns about a lost message while they can do
 /// something about it.
+///
+/// The WORST case to a "not received" card is longer than this suggests:
+/// the first write may wait up to `prime::PRIME_TIMEOUT_MS` for its priming
+/// answer, and each check is this wait plus a re-read that may itself wait
+/// up to `PRIME_TIMEOUT_MS`, twice over -- roughly 30 + 2 x (20 + 30)
+/// seconds. The card says "not yet visible" throughout.
 pub const DELIVERY_CHECK_AFTER_MS: u32 = 20_000;
 
 /// How many times the IDENTICAL sealed bytes are handed to the node again,
 /// automatically, before the buyer is told the seller does not have them.
 pub const AUTOMATIC_RESENDS: u8 = 1;
 
+/// What one delivery check established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// The message is in the mailbox.
+    Landed,
+    /// The node answered a fresh read of the mailbox, and the message is not
+    /// in it.
+    Missing,
+    /// No fresh answer (the re-read timed out or could not be sent), or this
+    /// tab does not route that mailbox's state anywhere it can look. Nothing
+    /// was learned, so nothing may be claimed.
+    CannotTell,
+}
+
+impl Check {
+    /// `landed` is what the mailbox as last read says; `fresh` is whether
+    /// the node answered the re-read that preceded it.
+    ///
+    /// A message seen in the mailbox has landed whether or not the read was
+    /// fresh. Its ABSENCE counts only from a fresh read: a stale copy
+    /// predates the write, so it says nothing about it.
+    pub fn from_read(landed: Option<bool>, fresh: bool) -> Self {
+        match (landed, fresh) {
+            (Some(true), _) => Check::Landed,
+            (Some(false), true) => Check::Missing,
+            _ => Check::CannotTell,
+        }
+    }
+}
+
 /// What to do after a delivery check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryStep {
     /// The message is in the mailbox. Nothing more to do.
     Landed,
-    /// Not there yet: hand the same bytes to the node again.
+    /// Not seen yet: hand the same bytes to the node again. Harmless even
+    /// when the check could not tell, since identical bytes cannot land
+    /// twice.
     SendAgain,
-    /// Not there after every automatic attempt: say so, and offer to resend.
+    /// Missing after every automatic attempt: say so, and offer to resend.
     TellTheBuyer,
+    /// Still unable to tell after every automatic attempt. Stop, and claim
+    /// nothing: the message stays "not yet visible", which is true.
+    StopWithoutClaiming,
 }
 
 /// `sends` is how many times these bytes have been handed to the node so far.
-pub fn after_delivery_check(landed: bool, sends: u8) -> DeliveryStep {
-    if landed {
-        DeliveryStep::Landed
-    } else if sends <= AUTOMATIC_RESENDS {
-        DeliveryStep::SendAgain
-    } else {
-        DeliveryStep::TellTheBuyer
+pub fn after_delivery_check(check: Check, sends: u8) -> DeliveryStep {
+    match check {
+        Check::Landed => DeliveryStep::Landed,
+        _ if sends <= AUTOMATIC_RESENDS => DeliveryStep::SendAgain,
+        Check::Missing => DeliveryStep::TellTheBuyer,
+        Check::CannotTell => DeliveryStep::StopWithoutClaiming,
     }
 }
 
@@ -126,13 +166,14 @@ pub(crate) trait Delivery {
     /// Hand `message` to the node.
     async fn write(&self, message: &EncryptedMessage) -> Result<(), String>;
     /// Wait [`DELIVERY_CHECK_AFTER_MS`], then re-read the mailbox from the
-    /// node.
-    async fn wait_and_reread(&self);
-    /// Whether the message with this digest is in the mailbox as last read.
-    fn landed(&self, digest: &[u8; 32]) -> bool;
+    /// node. `true` only when the node actually answered the re-read.
+    async fn wait_and_reread(&self) -> bool;
+    /// Whether the message with this digest is in the mailbox as last read;
+    /// `None` when this tab cannot tell.
+    fn landed(&self, digest: &[u8; 32]) -> Option<bool>;
     /// The message did not arrive: record it so the buyer is told and can
-    /// resend. `why` is set when the node could not even be reached.
-    fn not_arrived(&self, digest: &[u8; 32], why: Option<String>);
+    /// resend. `error` is the node's failure when it could not be reached.
+    fn not_arrived(&self, digest: &[u8; 32], why: crate::state::NotArrived, error: Option<String>);
 }
 
 /// Hand a sealed message to the node, check that it reached the mailbox,
@@ -151,24 +192,36 @@ pub(crate) trait Delivery {
 ///
 /// That the message is in the buyer's own node's copy of the mailbox, read
 /// back after waiting. An update is applied by the local node before it is
-/// forwarded, so a message missing from that copy was not applied at all --
-/// which is what harvest#119 looked like from the outside. Whether the
-/// network then carries it to the seller's node is not observable from here.
+/// forwarded, so a message missing from a FRESH read of that copy was not
+/// applied at all -- which is what harvest#119 looked like from the outside.
+/// Whether the network then carries it to the seller's node is not
+/// observable from here.
+///
+/// # What it cannot rule out
+///
+/// A GET answer carries no request id, so "fresh" means "the node answered
+/// a GET for this mailbox after the re-read was registered", which an older
+/// GET still in flight could satisfy with a pre-write state. That errs only
+/// towards an extra (harmless) resend or a "not received" card, and the
+/// card clears by itself as soon as any later read shows the message:
+/// `AppState::unconfirmed_sent` filters on what is in the mailbox.
 pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage) {
+    use crate::state::NotArrived;
+
     let digest = harvest_common::mailbox::entry_digest(&message);
     let mut sends: u8 = 0;
     loop {
         sends = sends.saturating_add(1);
         if let Err(e) = io.write(&message).await {
-            io.not_arrived(&digest, Some(e));
+            io.not_arrived(&digest, NotArrived::NeverReachedNode, Some(e));
             return;
         }
-        io.wait_and_reread().await;
-        match after_delivery_check(io.landed(&digest), sends) {
-            DeliveryStep::Landed => return,
+        let fresh = io.wait_and_reread().await;
+        match after_delivery_check(Check::from_read(io.landed(&digest), fresh), sends) {
+            DeliveryStep::Landed | DeliveryStep::StopWithoutClaiming => return,
             DeliveryStep::SendAgain => continue,
             DeliveryStep::TellTheBuyer => {
-                io.not_arrived(&digest, None);
+                io.not_arrived(&digest, NotArrived::NotInMailbox, None);
                 return;
             }
         }
@@ -229,21 +282,21 @@ impl Delivery for NodeDelivery {
     async fn write(&self, message: &EncryptedMessage) -> Result<(), String> {
         write_to_mailbox(&self.key, message.clone()).await
     }
-    async fn wait_and_reread(&self) {
+    async fn wait_and_reread(&self) -> bool {
         gloo_timers::future::TimeoutFuture::new(DELIVERY_CHECK_AFTER_MS).await;
-        super::prime::reread(*self.key.id()).await;
+        super::prime::reread(*self.key.id()).await == super::prime::Primed::Held
     }
-    fn landed(&self, digest: &[u8; 32]) -> bool {
+    fn landed(&self, digest: &[u8; 32]) -> Option<bool> {
         use dioxus::prelude::ReadableExt;
         super::APP_STATE
             .read()
-            .sent_message_landed(&self.store_contract_id, digest)
+            .mailbox_holds(self.key.id().as_bytes(), digest)
     }
-    fn not_arrived(&self, digest: &[u8; 32], why: Option<String>) {
+    fn not_arrived(&self, digest: &[u8; 32], why: crate::state::NotArrived, error: Option<String>) {
         use dioxus::prelude::WritableExt;
         let mut app = super::APP_STATE.write();
-        app.mark_not_arrived(&self.store_contract_id, digest);
-        if let Some(e) = why {
+        app.mark_not_arrived(&self.store_contract_id, digest, why);
+        if let Some(e) = error {
             dioxus::logger::tracing::error!("Failed to send message: {e}");
             app.notifications
                 .push(format!("Your message could not be sent: {e}"));
@@ -362,7 +415,13 @@ mod tests {
         assert_ne!(one, two);
     }
 
-    /// A mailbox that takes (or refuses) writes as the test says.
+    use crate::state::NotArrived;
+
+    /// One `not_arrived` report: digest, reason, node error.
+    type Report = ([u8; 32], NotArrived, Option<String>);
+
+    /// A mailbox that takes (or refuses) writes, and answers re-reads, as
+    /// the test says.
     struct FakeMailbox {
         /// Digest of every message handed to the node, in order.
         writes: std::cell::RefCell<Vec<[u8; 32]>>,
@@ -370,7 +429,11 @@ mod tests {
         /// any.
         lands_after: Option<usize>,
         write_fails: bool,
-        not_arrived: std::cell::RefCell<Vec<([u8; 32], Option<String>)>>,
+        /// Whether the node answers re-reads.
+        answers: bool,
+        /// Whether this tab can see the mailbox's state at all.
+        routed: bool,
+        not_arrived: std::cell::RefCell<Vec<Report>>,
     }
 
     impl FakeMailbox {
@@ -379,6 +442,8 @@ mod tests {
                 writes: Default::default(),
                 lands_after,
                 write_fails: false,
+                answers: true,
+                routed: true,
                 not_arrived: Default::default(),
             }
         }
@@ -395,13 +460,17 @@ mod tests {
                 Ok(())
             }
         }
-        async fn wait_and_reread(&self) {}
-        fn landed(&self, _digest: &[u8; 32]) -> bool {
-            self.lands_after
-                .is_some_and(|n| self.writes.borrow().len() >= n)
+        async fn wait_and_reread(&self) -> bool {
+            self.answers
         }
-        fn not_arrived(&self, digest: &[u8; 32], why: Option<String>) {
-            self.not_arrived.borrow_mut().push((*digest, why));
+        fn landed(&self, _digest: &[u8; 32]) -> Option<bool> {
+            self.routed.then(|| {
+                self.lands_after
+                    .is_some_and(|n| self.writes.borrow().len() >= n)
+            })
+        }
+        fn not_arrived(&self, digest: &[u8; 32], why: NotArrived, error: Option<String>) {
+            self.not_arrived.borrow_mut().push((*digest, why, error));
         }
     }
 
@@ -431,7 +500,10 @@ mod tests {
             vec![digest; 1 + AUTOMATIC_RESENDS as usize],
             "every attempt must hand the node the SAME bytes, and stop"
         );
-        assert_eq!(*mailbox.not_arrived.borrow(), vec![(digest, None)]);
+        assert_eq!(
+            *mailbox.not_arrived.borrow(),
+            vec![(digest, NotArrived::NotInMailbox, None)]
+        );
     }
 
     /// The resend is what rescues a first write the node bounced.
@@ -452,17 +524,57 @@ mod tests {
         assert!(mailbox.not_arrived.borrow().is_empty());
     }
 
-    /// A node that cannot be reached is reported at once, with the reason,
-    /// and not retried into the same failure.
+    /// A node that cannot be reached is reported at once, AS unreachable and
+    /// with the reason, and not retried into the same failure.
     #[test]
-    fn a_write_that_cannot_reach_the_node_is_reported_with_its_reason() {
+    fn a_write_that_cannot_reach_the_node_is_reported_as_such() {
         let mut mailbox = FakeMailbox::new(None);
         mailbox.write_fails = true;
         futures::executor::block_on(deliver(&mailbox, a_message()));
         assert_eq!(mailbox.writes.borrow().len(), 1);
         let reported = mailbox.not_arrived.borrow();
         assert_eq!(reported.len(), 1);
-        assert_eq!(reported[0].1.as_deref(), Some("not connected to gateway"));
+        assert_eq!(reported[0].1, NotArrived::NeverReachedNode);
+        assert_eq!(reported[0].2.as_deref(), Some("not connected to gateway"));
+    }
+
+    /// **A read the node never answered is not evidence** (review of
+    /// harvest#126, Codex). A stale copy predates the write, so the buyer
+    /// must not be told the seller lacks the message on the strength of it.
+    /// The resend still happens: identical bytes cannot land twice.
+    #[test]
+    fn an_unanswered_reread_never_reports_the_message_missing() {
+        let mut mailbox = FakeMailbox::new(None);
+        mailbox.answers = false;
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(
+            mailbox.writes.borrow().len(),
+            1 + AUTOMATIC_RESENDS as usize
+        );
+        assert!(
+            mailbox.not_arrived.borrow().is_empty(),
+            "told the buyer the seller lacks it without a fresh read"
+        );
+    }
+
+    /// Nor is a mailbox whose state this tab does not route anywhere.
+    #[test]
+    fn a_mailbox_this_tab_cannot_see_never_reports_the_message_missing() {
+        let mut mailbox = FakeMailbox::new(None);
+        mailbox.routed = false;
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert!(mailbox.not_arrived.borrow().is_empty());
+    }
+
+    /// A message seen in the mailbox has landed even when the read that
+    /// showed it was not fresh.
+    #[test]
+    fn a_message_seen_in_a_stale_read_has_still_landed() {
+        let mut mailbox = FakeMailbox::new(Some(1));
+        mailbox.answers = false;
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(mailbox.writes.borrow().len(), 1);
+        assert!(mailbox.not_arrived.borrow().is_empty());
     }
 
     /// The delta a buyer sends has to be the shape the mailbox contract

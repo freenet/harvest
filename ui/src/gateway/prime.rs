@@ -102,11 +102,15 @@ impl PrimeWaiters {
     /// its own store before `send` has even returned is not missed.
     pub fn register(&mut self, id: ContractInstanceId) -> oneshot::Receiver<Primed> {
         let (tx, rx) = oneshot::channel();
-        let waiting = self.waiting.entry(id).or_default();
-        // A waiter whose deadline already fired has dropped its receiver.
-        // Pruned here so a contract that never answers does not accumulate.
-        waiting.retain(|tx| !tx.is_canceled());
-        waiting.push(tx);
+        // A waiter whose deadline fired, or whose GET could not be sent, has
+        // dropped its receiver. Pruned across EVERY contract here, so one
+        // that never answers and is never written to again does not keep an
+        // entry for the life of the tab.
+        self.waiting.retain(|_, waiting| {
+            waiting.retain(|tx| !tx.is_canceled());
+            !waiting.is_empty()
+        });
+        self.waiting.entry(id).or_default().push(tx);
         rx
     }
 
@@ -123,6 +127,10 @@ impl PrimeWaiters {
     }
 }
 
+// One registry per thread, which in the browser is the only thread. Under
+// `cargo test` the threads are reused across tests, so a test using the real
+// registry must resolve every waiter it registers, with ids no other test
+// uses (see `response_handler`'s test).
 thread_local! {
     static WAITERS: RefCell<PrimeWaiters> = RefCell::default();
 }
@@ -408,8 +416,14 @@ mod tests {
         let id = ContractInstanceId::new([1u8; 32]);
         let abandoned = waiters.register(id);
         drop(abandoned);
+        let elsewhere = ContractInstanceId::new([2u8; 32]);
+        drop(waiters.register(elsewhere));
         let _a = waiters.register(id);
         let _b = waiters.register(id);
+        assert!(
+            !waiters.waiting.contains_key(&elsewhere),
+            "an abandoned waiter on another contract was kept"
+        );
         assert_eq!(
             waiters.waiting[&id].len(),
             2,
