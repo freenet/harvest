@@ -75,7 +75,9 @@ terms. The consequence, unnoticed until it was probed:
 4. So `fold_or_keep_primary` discards the predecessor **in full** — listings,
    orders, and the store's own name, description and certificate with them.
 5. It was reported by a `probe_warn`: a browser console line.
-6. The migration then **seals**. There is no second attempt.
+6. The migration then **sealed** (at the time). There was no second attempt.
+   It no longer seals (harvest#121), but the refusal is deterministic, so a
+   second attempt refuses the same bytes.
 
 A seller upgrading lost their entire shop, and the only trace was a log nobody
 reads. It passed `cargo fmt`, `cargo clippy` on both targets, the full test
@@ -133,9 +135,10 @@ re-signing itself:
 * the UI layer takes that list, asks the delegate to sign each, and publishes
   the re-issued generation.
 
-It also has to survive the seal: today a fold that refuses everything still
-seals, so a re-issue that failed part way would need to leave the migration
-unsealed rather than half-carried.
+It also has to survive a seal, if one is ever turned on: Harvest's contract
+migration does not seal today (harvest#121, `migrate_ops::successor_reference_is_durable`),
+and a fold that refuses everything still reports `Recovered`, so any future
+seal must leave a lineage with a refused generation unsealed for the re-issue.
 
 ### Two complications worth knowing before starting
 

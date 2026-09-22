@@ -1104,8 +1104,10 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 /// Whether every durable pointer a later load follows already names the
 /// successor -- condition 2 of the sealing rule in [`finish`].
 ///
-/// **It never does, today, and this returns `Err` for every artifact.** That
-/// is a statement about a missing capability, not a placeholder:
+/// **It never does, today, and this returns `Err` for every artifact.** Two
+/// reasons, and the second is the one that decides it (see "Adding the
+/// missing request would not be enough" below). The first is a missing
+/// capability:
 ///
 /// * All three successor ids live in one `harvest_common::StoreRegistration`
 ///   in the harvest delegate, which is what `ListStores` restores into
@@ -1192,8 +1194,8 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 /// function returns `Ok`.
 fn successor_reference_is_durable(_artifact: Artifact) -> Result<(), String> {
     Err(
-        "the harvest delegate has no request that can replace a StoreRegistration, so the \
-         registry a later load reads still names the predecessor"
+        "Harvest does not seal contract migrations: predecessor contracts are not frozen \
+         after a re-key (see migrate_ops::successor_reference_is_durable)"
             .to_string(),
     )
 }
@@ -1221,30 +1223,6 @@ thread_local! {
     /// Notices waiting on the delegate's answer about whether an earlier load
     /// showed them, and those this session has settled. See [`notify_once`].
     static NOTICES: RefCell<NoticeLedger> = RefCell::new(NoticeLedger::default());
-
-    /// [`generation_tag`], computed once: it hashes every bundled contract.
-    static GENERATION_TAG: std::cell::OnceCell<[u8; 32]> = const { std::cell::OnceCell::new() };
-}
-
-/// A tag for this build's contract generations: every bundled contract's code
-/// hash, hashed together. A notice id folds it in (`migrate::notice_marker`),
-/// so a notice shown under one generation set is news again after the next
-/// re-key.
-fn generation_tag() -> [u8; 32] {
-    GENERATION_TAG.with(|tag| {
-        *tag.get_or_init(|| {
-            let mut hasher = blake3::Hasher::new();
-            for wasm in [
-                STORE_CONTRACT_WASM,
-                MAILBOX_CONTRACT_WASM,
-                REPUTATION_CONTRACT_WASM,
-                INDEX_CONTRACT_WASM,
-            ] {
-                hasher.update(&code_hash(wasm));
-            }
-            *hasher.finalize().as_bytes()
-        })
-    })
 }
 
 /// Show a migration notice about `lineage` unless an earlier load already did
@@ -1256,8 +1234,16 @@ fn generation_tag() -> [u8; 32] {
 /// [`MARKER_QUERY_TIMEOUT_MS`] shows it -- a loss notice is the one thing the
 /// person affected hears, so silence is never read as "already told". Within
 /// a session the ledger stops a repeat whatever the delegate says.
+///
+/// # One accepted residual: shown is not seen
+///
+/// The notice is recorded as shown when it is put on screen, not when a
+/// person reads it -- Harvest's notifications cannot be dismissed, so there
+/// is no later moment to hook. A seller who loads Harvest in a background tab
+/// and closes it before looking loses the notice. Recording only while the
+/// page is visible would narrow that window, not close it.
 fn notify_once(lineage: &str, text: String) {
-    let marker = migrate::notice_marker(&generation_tag(), lineage, &text);
+    let marker = migrate::notice_marker(lineage, &text);
     if !NOTICES.with(|n| n.borrow_mut().offer(&marker, text)) {
         return;
     }

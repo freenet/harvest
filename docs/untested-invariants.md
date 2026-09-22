@@ -562,8 +562,9 @@ Three things make it worse than the loss:
 
 * it is reported by `probe_warn`, a browser console line, not something a user
   sees;
-* the fold's own message says the migration then **seals**, so the generation
-  is never looked at again;
+* the fold's own message said the migration then **sealed**, so the generation
+  would never be looked at again (it does not seal today, harvest#121; the
+  refusal repeats on every walk instead);
 * every other test in this repository builds its fixtures with the NEW
   derivation, so not one of them could see it. It passed all four gates.
 

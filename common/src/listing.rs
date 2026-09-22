@@ -792,8 +792,8 @@ mod listing_identity_tests {
     /// is not the one its terms give, and `ListingsV1::apply_delta` returns
     /// on the first refusal -- so the migration's fold discards the ENTIRE
     /// predecessor generation: the listings, the orders, and the store's own
-    /// name, description and certificate with them. The migration then
-    /// SEALS, so there is no second attempt.
+    /// name, description and certificate with them. Retrying cannot help:
+    /// the same bytes are refused on every walk.
     ///
     /// That happened on this branch. It passed every gate and survived a
     /// review round, because every other fixture in this repository builds

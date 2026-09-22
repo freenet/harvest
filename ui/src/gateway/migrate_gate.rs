@@ -208,8 +208,8 @@ impl NoticeLedger {
 mod tests {
     use super::*;
 
-    const A: &str = "harvest:migrate:store:aaaa";
-    const B: &str = "harvest:migrate:mailbox:bbbb";
+    const A: &str = "v1.store.aaaa.bbbb";
+    const B: &str = "v1.mailbox.aaaa.bbbb";
 
     /// The concurrent-duplicate case the module has always guarded: the vault
     /// sends a `GhostKeyList` per connect, and two can overlap.
@@ -320,8 +320,8 @@ mod tests {
     }
     const NOTICE: &str = "v1.notice.00112233445566778899aabbccddeeff";
 
-    /// **The harvest#121 regression.** The walk repeats on every load until it
-    /// seals, and it used to put its notices up every time. A notice the
+    /// **The harvest#121 regression.** The walk repeats on every load, by
+    /// design, and it used to put its notices up every time. A notice the
     /// delegate says was shown before stays down. Mutated red by showing on
     /// `Present`.
     #[test]

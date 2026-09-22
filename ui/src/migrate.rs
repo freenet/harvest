@@ -811,14 +811,6 @@ pub(crate) fn merge_store_reporting_discard(
 /// made" and "a thing that happened to you" is carried entirely by this
 /// sentence, so it is asserted rather than left to whoever edits the copy
 /// next.
-fn capitalise(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
 fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
     let name = lost.info.info.store_name.trim();
     let which = if name.is_empty() {
@@ -829,13 +821,26 @@ fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
     let listings = lost.listings.listings.len();
     let orders = lost.orders.orders.len();
 
-    let mut held = "its name, description and seller certificate".to_string();
-    match (listings, orders) {
-        (0, 0) => {}
-        (l, 0) => held.push_str(&format!(" and {l} listing(s)")),
-        (0, o) => held.push_str(&format!(" and {o} order(s)")),
-        (l, o) => held.push_str(&format!(", {l} listing(s) and {o} order(s)")),
+    // Only what the copy actually held: version 0 means no details were ever
+    // published, so there is no name, description or certificate to lose.
+    let mut parts = Vec::new();
+    if lost.info.info.version > 0 {
+        parts.push("its name, description and seller certificate".to_string());
     }
+    if listings > 0 {
+        parts.push(format!("{listings} listing(s)"));
+    }
+    if orders > 0 {
+        parts.push(format!("{orders} order(s)"));
+    }
+    let held = match parts.len() {
+        0 => "nothing it had published".to_string(),
+        1 => parts.remove(0),
+        _ => {
+            let last = parts.pop().unwrap_or_default();
+            format!("{} and {last}", parts.join(", "))
+        }
+    };
 
     match side {
         DiscardedSide::Predecessor => format!(
@@ -857,6 +862,16 @@ fn describe_lost_store(lost: &StoreStateV1, side: DiscardedSide) -> String {
              unaffected.",
             capitalise(&which)
         ),
+    }
+}
+
+/// `text` with its first letter upper-cased, for a phrase that starts a
+/// sentence.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -1506,26 +1521,37 @@ pub fn marker_write(marker: &str, note: &str) -> harvest_common::HarvestDelegate
 ///
 /// # What makes two notices "the same"
 ///
-/// The same text, about the same lineage, under the same contract
-/// generations:
+/// The same text about the same lineage:
 ///
 /// * `lineage` is the walk's own marker (`marker_key`: artifact, current
-///   instance, current code hash), so a second store or a second Ghost Key
-///   gets its own notice even when the words are identical -- "Recovered
-///   your store" says nothing about WHICH store.
-/// * `text` names the store and counts what was lost, so a different loss in
-///   the same lineage is still told.
-/// * `generation` folds in every bundled contract's code hash, so the next
-///   re-key's news is news again.
+///   instance, and that artifact's current code hash). So a second store or a
+///   second Ghost Key gets its own notice even when the words are identical --
+///   "Recovered your store" says nothing about WHICH store -- and when THIS
+///   artifact re-keys its news is news again. A re-key of another artifact
+///   changes nothing here.
+/// * `text` names the store and counts what was lost, so a loss whose
+///   description differs is still told. Two losses with identical
+///   descriptions in one lineage are one notice.
+///
+/// One consequence to know: a refused copy that is still refused after the
+/// artifact's next re-key is announced once more then, because the lineage
+/// is new. That is once per re-key, and it is still true.
+///
+/// # Growth
+///
+/// Ids are never removed. They are bounded by the notices a seller's own
+/// migrations produce -- a handful per lineage per re-key -- and they sit
+/// under `harvest:migrate:`, so they count toward a delegate export's
+/// 4096-key enumeration budget alongside everything else; they are nowhere
+/// near it.
 ///
 /// The id is hex and ASCII by construction, which the delegate requires of a
 /// marker id (`markers::is_valid_marker`), and it shares the migration
 /// markers' `v1.` format prefix and namespace without colliding with them:
 /// those are `v1.<artifact>.`, and no artifact is called `notice`.
-pub fn notice_marker(generation: &[u8; 32], lineage: &str, text: &str) -> String {
+pub fn notice_marker(lineage: &str, text: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"harvest-migration-notice-v1");
-    hasher.update(generation);
     // Length-prefixed, so no (lineage, text) pair can be re-split into
     // another with the same bytes.
     hasher.update(&(lineage.len() as u64).to_le_bytes());
@@ -1779,8 +1805,9 @@ mod predecessor_generation_tests {
     ///
     /// * it is reported by `probe_warn`, which is a browser console line and
     ///   not something a user sees;
-    /// * the fold's own message says the migration then SEALS, so the
-    ///   generation is never looked at again;
+    /// * the fold's own message said the migration then sealed, so the
+    ///   generation would never be looked at again (it does not seal now,
+    ///   harvest#121, but the refusal repeats on every walk);
     /// * every other test in this repository builds its fixtures with the
     ///   NEW derivation, so none of them can see it.
     ///
@@ -1961,8 +1988,8 @@ mod uncarried_tests {
     /// **What it does not do is prevent the loss.** It cannot: the id is
     /// inside what the seller signed, so no fold can re-stamp a record
     /// without invalidating it. What it prevents is the loss being a
-    /// surprise -- which, given the migration seals and there is no second
-    /// attempt, is the whole of the available protection.
+    /// surprise -- which, given the same bytes are refused on every walk, is
+    /// the whole of the available protection.
     #[test]
     fn a_derivation_change_fails_here_before_it_reaches_a_seller() {
         let key = SigningKey::from_bytes(&[53u8; 32]);
@@ -2261,5 +2288,19 @@ mod uncarried_tests {
             predecessor.contains("An older copy of your store \"E2E TEST STORE\""),
             "it names the COPY that was refused, not the store as a whole: {predecessor}"
         );
+    }
+
+    /// A copy that never published details is not said to have lost its name,
+    /// description and certificate. Mutated red by listing the details
+    /// unconditionally.
+    #[test]
+    fn a_loss_notice_lists_only_what_the_copy_held() {
+        let mut lost = StoreStateV1::default();
+        let said = describe_lost_store(&lost, DiscardedSide::Predecessor);
+        assert!(!said.contains("seller certificate"), "{said}");
+        lost.info.info.version = 1;
+        lost.info.info.store_name = "Named".into();
+        let said = describe_lost_store(&lost, DiscardedSide::Predecessor);
+        assert!(said.contains("seller certificate"), "{said}");
     }
 }

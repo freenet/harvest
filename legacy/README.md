@@ -57,8 +57,8 @@ the split in `ui/src/migrate.rs` is still yours to write.
   user data.** Appending a row here is not enough on its own: if the change
   also alters how a record's identity or signature preimage is derived, the
   predecessor's records stop verifying and the fold discards that generation
-  **in full** -- listings, orders and the store's own details together -- on a
-  migration that then seals -- and it spends the property that **any UI can
+  **in full** -- listings, orders and the store's own details together, and
+  refuses it again on every walk -- and it spends the property that **any UI can
   migrate a contract**, which holds only while new versions accept old state.
   See [`docs/design/migratability.md`](../docs/design/migratability.md) for the
   requirement, what one such change cost, and why the owner-assisted re-issue
