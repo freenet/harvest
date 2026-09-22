@@ -252,7 +252,7 @@ pub(crate) const MAX_BUYER_CONVERSATIONS: usize = 256;
 /// A contract instance id, which is what a store is named by.
 const STORE_CONTRACT_ID_BYTES: usize = 32;
 
-const BUYER_CONVERSATION_PREFIX_STR: &str = "harvest:buyer_conv:";
+pub(crate) const BUYER_CONVERSATION_PREFIX_STR: &str = "harvest:buyer_conv:";
 
 /// Every buyer conversation this delegate holds, whichever store it is with.
 ///

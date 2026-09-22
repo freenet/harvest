@@ -175,6 +175,12 @@ pub fn App() -> Element {
                 // registration would time every first attempt out unanswered.
                 crate::gateway::bitcoin_generation_ops::start();
 
+                // Carry the harvest delegate's secrets over from its earlier
+                // generations (harvest#123). Started here for the same reason
+                // as the line above: every call has a deadline, and the loop
+                // below is what reads the answers.
+                crate::gateway::delegate_migrate_ops::start();
+
                 dioxus::logger::tracing::info!("Starting response loop");
                 while let Some(response) = rx.next().await {
                     crate::gateway::response_handler::handle_response(response);

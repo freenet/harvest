@@ -35,8 +35,8 @@ pub use bitcoin_delegate::{
 };
 pub use delegate::{
     BackupString, ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
-    HarvestDelegateResponse, ImportedConversation, RecalledConversation, RememberedStore,
-    StoreRegistration, TransactionRecord,
+    HarvestDelegateResponse, ImportedConversation, MigratedSecretValue, PredecessorMarkerState,
+    RecalledConversation, RememberedStore, SecretImport, StoreRegistration, TransactionRecord,
 };
 pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};

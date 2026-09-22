@@ -3,6 +3,7 @@
 mod bip32;
 mod bitcoin;
 mod handlers;
+mod import;
 mod known_stores;
 mod markers;
 mod messaging;

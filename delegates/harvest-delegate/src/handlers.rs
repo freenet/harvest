@@ -24,7 +24,7 @@ fn tx_key(tx_id: &str) -> Vec<u8> {
 fn stores_key(fp: &str) -> Vec<u8> {
     format!("harvest:stores:{fp}").into_bytes()
 }
-const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
+pub(crate) const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 
 /// Every shape of secret key this delegate writes, for a sample fingerprint
 /// and transaction id.
@@ -304,6 +304,24 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::SetMigrationMarker { marker, note } => {
             crate::markers::set_marker(store, &marker, &note)
         }
+
+        // Importing a predecessor delegate's secrets (harvest#123). Gated like
+        // everything else, and it matters most here: an import writes
+        // secrets, private keys included. `import` owns the per-family rules.
+        HarvestDelegateRequest::GetPredecessorMarker { predecessor } => {
+            crate::import::get_marker(store, predecessor)
+        }
+
+        HarvestDelegateRequest::RecordPredecessorMarker {
+            predecessor,
+            marker,
+        } => crate::import::record_marker(store, predecessor, marker),
+
+        HarvestDelegateRequest::ImportMigratedSecret {
+            predecessor,
+            key,
+            value,
+        } => crate::import::import(store, predecessor, key, &value.0),
 
         // The stores this node has visited. Gated like everything else: the
         // list is a record of which sellers this user has dealt with, which

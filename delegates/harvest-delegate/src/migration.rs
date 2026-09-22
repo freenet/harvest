@@ -10,7 +10,8 @@
 //! to recover from. Only the OLD delegate can hand them over, and only if it
 //! shipped with the code to do so.
 //!
-//! So this handler does nothing for anyone today. Generations V1 to V4 in
+//! Since harvest#123 a successor asks (`ui/src/delegate_migrate.rs`), and
+//! [`crate::import`] is the half that takes what this answers. Generations V1 to V4 in
 //! `legacy/harvest_delegate.toml` do not have it, and no change made now can
 //! give it to them: their WASM is already deployed and its `handle_request`
 //! rejects anything that is neither a `HarvestDelegateRequest` nor a

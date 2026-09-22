@@ -30,12 +30,15 @@
 # early: it cannot be added to a generation retroactively, so every release
 # without it adds another permanently unrecoverable one. Keep it that way.
 #
-# Be precise about what that buys today, because it is easy to read as more.
-# The handler answers an export request; NOTHING ASKS. `delegate_lineage()` in
-# `ui/src/migrate.rs` has no caller outside tests, so no re-key has actually
-# carried a secret forward yet -- V5 to V6 and V6 to V7 both lost everything,
-# exactly as V1-V4 did. The rows say a successor COULD recover from these
-# generations, not that one has.
+# Until harvest#123 the handler answered an export request and NOTHING ASKED:
+# `delegate_lineage()` had no caller outside tests, so V5 to V6 and V6 to V7
+# lost everything, exactly as V1-V4 did, and every description below that says
+# "nothing drives the export handshake yet" was true when written. From the
+# generation after V18, `ui/src/delegate_migrate.rs` asks: on every load it
+# walks V5 and newer, newest first, and imports from each one this node still
+# has registered. So the older descriptions' "does not survive the re-key" now
+# means "did not survive THAT re-key"; a node that still holds one of those
+# generations recovers its secrets on the next load.
 #
 # From V7 the cost of that gap includes the Bitcoin derivation counter, and
 # that one is worse than the others: the RSA keypair and the watch list are
@@ -165,3 +168,10 @@ description = "Superseded by harvest#93 phase 1a. This delegate gained the store
 date = "2026-09-19"
 code_hash = "4d36b2a41c7f77d99ea39d0b5bbf565d8b62b22552aeda6249d6626b70392dea"
 delegate_key = "9a6f7b44e106e696a2c37251a5c6d97fbbee656c0f4a1758335a11e785118ee9"
+
+[[entry]]
+version = "V18"
+description = "Superseded by harvest#123, the first generation whose successor actually ASKS for its secrets. This delegate gained the successor side of the export handshake: `GetPredecessorMarker` / `RecordPredecessorMarker` (answered with `PredecessorMarker` / `PredecessorMarkerRecorded`), which keep `freenet-migrate`'s per-predecessor markers in the crate's reserved namespace outside `harvest:`, so no export carries them onward; and `ImportMigratedSecret` (answered with `MigratedSecretImported`), which applies each recovered secret by its family's rules -- a Ghost Key's store registrations, the transaction index and the Bitcoin watch list merged by the identity their own handlers use, buyer conversations and remembered stores kept within their caps, everything else written only if absent, store keys and anything outside `harvest:` refused. The UI drives it (`ui/src/delegate_migrate.rs`). The generation it supersedes was built at `4dec675` (#101, harvest#93 phase 1c), where `harvest-common` gained the Ghost Key index; nothing the delegate itself does changed there. The parameters are unchanged (empty). THIS generation's secrets are the first a successor will carry forward: V18 answers the export request like every generation from V5, and from its successor on, something asks."
+date = "2026-09-20"
+code_hash = "09507e3f4f1432dd746cf4644aaa81678e25314798dc6069ce38409d1499fddd"
+delegate_key = "d1babbaced3c2f86c565ddb78db0ef2e8ba75b2e2bf02b797d5448bac1be230f"

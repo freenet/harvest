@@ -70,6 +70,15 @@ pub async fn connect(
         websocket,
         // Result callback -- routes host responses to our channel
         move |result: Result<HostResponse, ClientError>| {
+            // The one error the delegate migration needs typed: the node
+            // saying a predecessor delegate is not registered. Offered before
+            // it is flattened to a string; taken only if the migration was
+            // waiting on exactly that delegate.
+            if let Err(e) = &result {
+                if super::delegate_migrate_ops::offer_error(e) {
+                    return;
+                }
+            }
             let mapped = result.map_err(|e| e.to_string());
             let tx = response_tx_clone.clone();
             spawn_local(async move {

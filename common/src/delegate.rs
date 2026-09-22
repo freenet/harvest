@@ -309,6 +309,35 @@ pub enum HarvestDelegateRequest {
     /// the key is load-bearing.
     SetMigrationMarker { marker: String, note: String },
 
+    // === Delegate secret migration, successor side (harvest#123) ===
+    /// What this delegate has recorded about importing from the predecessor
+    /// delegate `predecessor` (its 32-byte key). Answered with
+    /// [`HarvestDelegateResponse::PredecessorMarker`].
+    ///
+    /// The markers live outside the `harvest:` prefix, in `freenet-migrate`'s
+    /// reserved namespace, so an export never carries them to a further
+    /// successor: they say "THIS delegate imported that one", which is not
+    /// true of the next.
+    GetPredecessorMarker { predecessor: [u8; 32] },
+
+    /// Record progress importing from `predecessor`. Answered with
+    /// [`HarvestDelegateResponse::PredecessorMarkerRecorded`].
+    RecordPredecessorMarker {
+        predecessor: [u8; 32],
+        marker: PredecessorMarkerState,
+    },
+
+    /// Import one secret a predecessor delegate exported, through this
+    /// delegate's own rules for that kind of secret: a list is merged into
+    /// the one held here, a capped family respects its cap, and nothing this
+    /// delegate already holds is overwritten. Answered with
+    /// [`HarvestDelegateResponse::MigratedSecretImported`].
+    ImportMigratedSecret {
+        predecessor: [u8; 32],
+        key: Vec<u8>,
+        value: MigratedSecretValue,
+    },
+
     // === Stores this node has visited (harvest#52) ===
     /// Remember a store whose link was followed, so it is still listed after
     /// the tab is gone.
@@ -680,6 +709,28 @@ pub enum HarvestDelegateResponse {
         recorded: bool,
     },
 
+    /// Answer to `GetPredecessorMarker`. `None` means nothing is recorded.
+    PredecessorMarker {
+        predecessor: [u8; 32],
+        marker: Option<PredecessorMarkerState>,
+    },
+
+    /// Answer to `RecordPredecessorMarker`. `recorded: false` means the host
+    /// refused the write.
+    PredecessorMarkerRecorded {
+        predecessor: [u8; 32],
+        marker: PredecessorMarkerState,
+        recorded: bool,
+    },
+
+    /// Answer to `ImportMigratedSecret`, naming the secret's key (never its
+    /// value) so the answer can be matched to the request.
+    MigratedSecretImported {
+        predecessor: [u8; 32],
+        key: Vec<u8>,
+        outcome: SecretImport,
+    },
+
     Error {
         message: String,
     },
@@ -894,6 +945,52 @@ pub struct BackupString(pub String);
 impl core::fmt::Debug for BackupString {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("BackupString(redacted)")
+    }
+}
+
+/// Where an import from one predecessor delegate has got to (harvest#123).
+///
+/// Mirrors `freenet_migrate::MigrationMarker`, which is the type the UI's
+/// adapter hands back to the crate. A separate wire type because the crate's
+/// is not serializable and is not this protocol's to version.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PredecessorMarkerState {
+    /// An import started and did not finish; `saw_data` is sticky across
+    /// retries.
+    InProgress { saw_data: bool },
+    /// The import finished; `had_data` says whether it carried anything.
+    Done { had_data: bool },
+}
+
+/// What importing one migrated secret did (harvest#123).
+///
+/// Mirrors `freenet_migrate::ItemWrite`. `AlreadyAuthoritative` is a
+/// SUCCESS -- this delegate's own value stands -- and must never be used for
+/// a write that failed: the crate seals a predecessor whose items all came
+/// back written or authoritative, and never walks it again.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum SecretImport {
+    Written,
+    AlreadyAuthoritative,
+    /// A retry may succeed (the host refused a write, a family is full).
+    Retryable(String),
+    /// This delegate refuses the item and always will.
+    Permanent(String),
+}
+
+/// A migrated secret's value, in transit from the UI to the successor
+/// delegate.
+///
+/// Every secret this delegate holds can pass through here, private keys
+/// included, so `Debug` prints `MigratedSecretValue(redacted)` (harvest#94).
+/// `#[serde(transparent)]`: on the wire it is exactly the bytes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct MigratedSecretValue(pub Vec<u8>);
+
+impl core::fmt::Debug for MigratedSecretValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MigratedSecretValue(redacted)")
     }
 }
 
@@ -1186,9 +1283,12 @@ mod tests {
             R::StoreKeyRecovered { .. } => (26, false),
             // The derived keys' PUBLIC halves.
             R::StoreSubkeys { .. } => (27, false),
+            R::PredecessorMarker { .. } => (28, false),
+            R::PredecessorMarkerRecorded { .. } => (29, false),
+            R::MigratedSecretImported { .. } => (30, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 28;
+    const RESPONSE_VARIANTS: usize = 31;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1226,9 +1326,13 @@ mod tests {
             Q::WrapStoreKeyFor { .. } => (24, true),
             Q::UnwrapStoreKey { .. } => (25, true),
             Q::GetStoreSubkeys { .. } => (26, false),
+            Q::GetPredecessorMarker { .. } => (27, false),
+            Q::RecordPredecessorMarker { .. } => (28, false),
+            // Any secret this delegate holds, private keys included.
+            Q::ImportMigratedSecret { .. } => (29, true),
         }
     }
-    const REQUEST_VARIANTS: usize = 27;
+    const REQUEST_VARIANTS: usize = 30;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1382,6 +1486,20 @@ mod tests {
             R::MigrationMarkerRecorded {
                 marker: "marker-one".into(),
                 recorded: true,
+            },
+            R::PredecessorMarker {
+                predecessor: [20u8; 32],
+                marker: Some(PredecessorMarkerState::Done { had_data: true }),
+            },
+            R::PredecessorMarkerRecorded {
+                predecessor: [20u8; 32],
+                marker: PredecessorMarkerState::InProgress { saw_data: false },
+                recorded: true,
+            },
+            R::MigratedSecretImported {
+                predecessor: [20u8; 32],
+                key: b"harvest:rsa_pk:fp-one".to_vec(),
+                outcome: SecretImport::Written,
             },
             R::Error {
                 message: "refused".into(),
@@ -1545,6 +1663,18 @@ mod tests {
             Q::SetMigrationMarker {
                 marker: "marker-one".into(),
                 note: "done".into(),
+            },
+            Q::GetPredecessorMarker {
+                predecessor: [20u8; 32],
+            },
+            Q::RecordPredecessorMarker {
+                predecessor: [20u8; 32],
+                marker: PredecessorMarkerState::Done { had_data: false },
+            },
+            Q::ImportMigratedSecret {
+                predecessor: [20u8; 32],
+                key: b"harvest:rsa_sk:fp-one".to_vec(),
+                value: MigratedSecretValue(SECRET.to_vec()),
             },
             Q::RememberStore {
                 store_code: "abcdefghijkl".into(),

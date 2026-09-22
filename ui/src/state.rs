@@ -4058,6 +4058,14 @@ impl AppState {
     /// The other half of the ordering above: a store whose state arrived
     /// before the delegate was registered was deliberately not asked about,
     /// so it is asked here, once the delegate exists.
+    /// Forget which stores' conversations were already asked for, so the next
+    /// recall asks again. Used once the delegate migration has imported a
+    /// predecessor's secrets (harvest#123): the first answer came from a
+    /// delegate that did not hold them yet.
+    pub fn forget_recalled_conversations(&mut self) {
+        self.buyer_conversations_recalled.clear();
+    }
+
     pub fn recall_conversations_for_known_stores(&mut self) {
         for store_contract_id in self.browsing_stores.keys().cloned().collect::<Vec<_>>() {
             self.recall_buyer_conversations(&store_contract_id);
@@ -8221,8 +8229,14 @@ impl AppState {
                         crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
                     }
 
+                    // Not before the delegate migration has run: on a freshly
+                    // re-keyed delegate this would mint a NEW encryption key
+                    // ahead of the import of the old one, and the import never
+                    // overwrites (see `after_delegate_migration`).
                     for fingerprint in needs_encryption_key {
-                        crate::components::ensure_encryption_key(fingerprint);
+                        crate::gateway::delegate_migrate_ops::after_delegate_migration(move || {
+                            crate::components::ensure_encryption_key(fingerprint)
+                        });
                     }
                 });
 

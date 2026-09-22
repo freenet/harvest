@@ -43,11 +43,11 @@
 //! about contracts that no delegate re-key changes. Carrying it forward is
 //! therefore accurate, and costs nothing extra to arrange.
 //!
-//! Until a successor actually imports (no generation before V5 can even answer
-//! an export request, see `legacy/harvest_delegate.toml`), a delegate re-key
-//! still drops every marker and every contract re-probes once. That is safe:
-//! the fold only ever adds, and a delegate re-key is the moment the RSA
-//! secrets moved too, so re-probing is the honest thing to do.
+//! Since harvest#123 the successor does import (`ui/src/delegate_migrate.rs`,
+//! with the successor side in [`crate::import`]), so markers now actually
+//! travel. A marker that does not -- from V1-V4, which cannot export, or from a
+//! generation the node never ran -- costs one extra probe of that contract.
+//! That is safe: the fold only ever adds.
 
 use freenet_migrate::SecretStore;
 use harvest_common::HarvestDelegateResponse;

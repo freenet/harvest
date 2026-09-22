@@ -172,10 +172,10 @@ pub fn index_lineage() -> &'static [ContractLineageEntry] {
 
 /// Superseded generations of the harvest delegate, oldest first.
 ///
-/// Recorded and exercised by tests, but nothing recovers from them yet: the
-/// export handshake needs the PREDECESSOR delegate to answer an export
-/// request, and no generation before the current one has an export handler.
-/// See `legacy/harvest_delegate.toml`.
+/// Walked on every load by `crate::delegate_migrate` (harvest#123), from V5 on:
+/// the export handshake needs the PREDECESSOR delegate to answer an export
+/// request, and V1 to V4 have no export handler. See
+/// `legacy/harvest_delegate.toml`.
 pub fn delegate_lineage() -> &'static [DelegateLineageEntry] {
     delegate_gen::LEGACY_HARVEST_DELEGATE
 }

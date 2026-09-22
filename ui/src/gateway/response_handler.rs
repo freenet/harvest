@@ -508,6 +508,14 @@ fn handle_delegate_response(
     for value in values {
         match value {
             freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
+                // The delegate migration's one call in flight, if this is its
+                // answer: a predecessor's export (whose payload is not a
+                // Harvest response at all), or the current delegate's answer
+                // to an import. Offered first so neither reaches `AppState`.
+                #[cfg(target_arch = "wasm32")]
+                if super::delegate_migrate_ops::offer_payload(&key, &msg.payload) {
+                    continue;
+                }
                 match decode_delegate_message(sender, &msg.payload) {
                     Ok(response) => {
                         // Offer it to the migration gate FIRST, and outside

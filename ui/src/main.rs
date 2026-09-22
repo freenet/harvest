@@ -8,6 +8,7 @@ mod bitcoin_generation;
 mod bitcoin_inbox;
 mod components;
 mod custody_flow;
+mod delegate_migrate;
 mod document_title;
 mod fulfilment;
 mod gateway;
