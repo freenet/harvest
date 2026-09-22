@@ -4447,21 +4447,19 @@ impl AppState {
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
         use harvest_common::payment::{assemble_on_chain_proof, OrderStatus};
 
-        let Some(store) = self.browsing_stores.get(store_contract_id) else {
-            return Vec::new();
-        };
-        // Not scoped to orders this node is party to, and it does not need to
-        // be: `Paid` is evidence-backed, so publishing a stranger's settled
-        // order would be correct if it happened. It cannot, because
-        // `bitcoin.addresses` only ever holds the addresses
-        // `address_contracts_to_watch` subscribed to, which ARE this node's
-        // own. The scoping is the subscription's, and saying so here is
-        // cheaper than a second copy of the rule that could disagree with it.
+        // Scoped to the orders this node may settle, which is the SAME set
+        // the twin guard compares against -- see `orders_we_may_settle` for
+        // why those two must not be allowed to differ.
+        //
+        // This used to walk every order in the store, on the argument that
+        // `bitcoin.addresses` holds only our own addresses so a stranger's
+        // order could never assemble. That argument answers "whose ADDRESS"
+        // when the question is "whose ORDER", and address reuse is exactly
+        // where the two part company (external review of harvest#75).
         let mut settled = Vec::new();
-        for order in &store.orders {
-            if order.status != OrderStatus::AwaitingPayment {
-                continue;
-            }
+        for order in self.orders_we_may_settle(store_contract_id, |order| {
+            order.status == OrderStatus::AwaitingPayment
+        }) {
             let Some(view) = order
                 .order
                 .bitcoin_address_instance_id()
@@ -4552,7 +4550,7 @@ impl AppState {
         let mut seen = HashSet::new();
         let store_ids: Vec<Vec<u8>> = self.browsing_stores.keys().cloned().collect();
         for store_contract_id in &store_ids {
-            for record in self.our_orders(store_contract_id, |record| {
+            for record in self.orders_we_may_settle(store_contract_id, |record| {
                 record.status != OrderStatus::Cancelled
                     && !record.order.payment_script_pubkey.is_empty()
                     && record.order.payment_window().is_some()
@@ -4926,6 +4924,73 @@ impl AppState {
             }
         }
         ids
+    }
+
+    /// The orders at `store_contract_id` whose settlement this node may
+    /// publish -- which is, and must stay, the SAME question as which orders
+    /// a payment at one address could be confused between.
+    ///
+    /// # Why one function serves both (external review of harvest#75)
+    ///
+    /// [`Self::settled_orders`] decides what gets published;
+    /// [`Self::refresh_same_address_orders`] decides what
+    /// [`Self::settlement_hold`] will withhold it against. If the first set
+    /// is WIDER than the second, an order can be published that the guard
+    /// never knew to compare, and `Paid` is monotone under `merge_order` --
+    /// only `PaymentReversed`, which needs a bridge-signed retraction, ranks
+    /// above it. There is no taking it back.
+    ///
+    /// Those two sets used to coincide by accident rather than by rule. The
+    /// only party who could publish was the store's owner, and a store
+    /// owner's own orders ARE every order in their store, so "every order in
+    /// the store" and "the orders we could confuse" were the same list.
+    /// harvest#75 made a buyer a publisher, and a buyer's share of a seller's
+    /// order book is one or two records -- so the accident stopped holding,
+    /// in the direction that publishes.
+    ///
+    /// What that cost, concretely: a seller reuses one address for buyer B's
+    /// order and buyer C's order, of equal price and overlapping windows. B
+    /// pays once. B's node holds that address view because of B's own order,
+    /// and `assemble_on_chain_proof` ties a payment to an order only by
+    /// script, amount, window and depth -- nothing in it distinguishes C's
+    /// order. So B's tab published `Paid` for an order B is not party to and
+    /// nobody paid, the seller's own tab then skipped it (it is no longer
+    /// `AwaitingPayment`), and the seller ships against money that never
+    /// arrived.
+    ///
+    /// # The rule
+    ///
+    /// A store this device has a registration for: every order in it. That
+    /// is the seller's whole book, exactly as before, and deliberately NOT
+    /// filtered by `seller_fingerprint` -- an order carrying a fingerprint
+    /// the registration no longer files the store under (a re-backed store,
+    /// say) must still be settleable by its own seller, and must still count
+    /// as a twin.
+    ///
+    /// Any other store: the orders this node is party to
+    /// ([`Self::our_orders`]).
+    ///
+    /// `keep` is taken rather than applied by the caller so each caller's own
+    /// cheap filter still runs BEFORE `our_orders` decides anything about
+    /// ownership -- that early-out is what keeps a buyer's tab from
+    /// decrypting every conversation in every store on every notification.
+    fn orders_we_may_settle(
+        &self,
+        store_contract_id: &[u8],
+        keep: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+    ) -> Vec<&harvest_common::payment::AuthorizedOrder> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        if self
+            .my_stores
+            .values()
+            .flat_map(|stores| stores.iter())
+            .any(|s| s.store_contract_id == store_contract_id)
+        {
+            return store.orders.iter().filter(|order| keep(order)).collect();
+        }
+        self.our_orders(store_contract_id, keep)
     }
 
     /// The orders at `store_contract_id` that this node is party to and
@@ -5850,11 +5915,28 @@ impl AppState {
     /// [`Self::delta_owner_key`] answers only for stores this device has a
     /// registration for, which is exactly the wrong shape for a buyer: the
     /// store whose invoice they paid is not theirs. So a store that is not
-    /// ours falls through to the owner its LOADED STATE names, which is the
-    /// same key the contract will verify the record against -- `apply_delta`
-    /// checks every incoming order against `owner_key(parent_state)`, the
-    /// owner of the state already held, so naming the one we read is the only
-    /// answer that can be accepted and is a no-op for the owner field itself.
+    /// ours falls through to the owner its LOADED STATE names.
+    ///
+    /// # Why naming an owner here cannot take a store over
+    ///
+    /// Stated carefully, because the obvious reason is the wrong one. It is
+    /// NOT that the held owner is the only name the contract accepts:
+    /// `StoreStateV1::apply_delta` has a branch that WIPES the store and
+    /// rebuilds it from the delta alone, when the named owner outranks the
+    /// held one under the "smaller key wins the address" total order.
+    ///
+    /// What actually closes it is that `apply_parts` hands the delta to
+    /// `OrdersV1::apply_delta`, which verifies every order in it against the
+    /// NAMED owner -- and order terms carry the seller's signature. So a
+    /// record naming key K is refused unless K signed it, which a buyer
+    /// cannot fabricate; the wipe branch is unreachable without a signature
+    /// the attacker does not have, and `holds_signed_content` cannot be
+    /// satisfied by an unsigned order either. `StoreParameters::admits` is a
+    /// second, weaker bar (~2^95 for a chosen store) on top of that.
+    ///
+    /// Identified by the authorization lens reviewing harvest#75, which found
+    /// the original wording here would not have survived a change to either
+    /// half.
     ///
     /// `None` when the store's state has not arrived or names no owner, which
     /// is the honest answer: a store with no owner can hold no signed record,
@@ -17821,6 +17903,127 @@ mod buy_flow_tests {
         );
     }
 
+    /// **A seller can still settle an order in their own store whose
+    /// `seller_fingerprint` the registration no longer matches (harvest#75,
+    /// authorization lens).**
+    ///
+    /// `orders_we_may_settle` gives a store this device has a registration
+    /// for its WHOLE order book, deliberately not filtered by
+    /// `seller_fingerprint`. This pins why that branch exists, because
+    /// without it the ordinary seller tests still pass: their fixtures are
+    /// buyer AND seller of the same order, so `our_orders` picks it up
+    /// through the purchase path and the branch never has to do anything.
+    /// That is a guard nobody could verify, which is the shape this
+    /// repository keeps finding.
+    ///
+    /// A store re-backed onto a different Ghost Key is the obvious way to
+    /// reach this: orders issued before it carry the old fingerprint. Their
+    /// seller must still be able to settle them, and they must still count
+    /// as twins of each other.
+    #[test]
+    fn a_seller_settles_their_own_order_whose_fingerprint_has_since_moved() {
+        let (mut state, order) = seller_holding_a_paid_order(None);
+        // Take away the purchase path: this node is the SELLER here, not the
+        // buyer, so nothing should depend on it also holding an acceptance.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .clear();
+        // And move the registration onto a different Ghost Key, as re-backing
+        // a store does, leaving the order carrying the old fingerprint.
+        let registrations = state
+            .my_stores
+            .remove("seller-fp")
+            .expect("the registration");
+        state
+            .my_stores
+            .insert("a-newer-ghost-key".to_string(), registrations);
+        assert_ne!(
+            order.order.seller_fingerprint, "a-newer-ghost-key",
+            "the fixture must actually leave the fingerprints disagreeing"
+        );
+
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(
+            published.len(),
+            1,
+            "the seller could not settle an order in their own store"
+        );
+        assert_eq!(published[0].order.id, order.order.id);
+    }
+
+    /// **One payment does not settle a STRANGER's order on the same address
+    /// (harvest#75, authorization lens — this was a blocking bug).**
+    ///
+    /// The sibling test above covers two of the buyer's OWN orders. This is
+    /// the case that regressed, and it is worse, because the order that gets
+    /// wrongly marked paid belongs to someone this node has nothing to do
+    /// with and nobody paid for it.
+    ///
+    /// `settled_orders` used to walk every order in the store, on the
+    /// argument that `bitcoin.addresses` holds only our own addresses so a
+    /// stranger's order could never assemble a proof. That answers "whose
+    /// ADDRESS" when the question is "whose ORDER", and address reuse is
+    /// exactly where they part company. Meanwhile the twin guard's input was
+    /// narrowed to our orders — so the publisher's set became WIDER than the
+    /// guard's, and `Paid` is monotone: only `PaymentReversed`, which needs a
+    /// bridge-signed retraction, outranks it. The seller's own tab could not
+    /// repair it either, since `settled_orders` skips anything no longer
+    /// `AwaitingPayment`.
+    ///
+    /// Both sets now come from `orders_we_may_settle`, so they cannot drift
+    /// apart again.
+    #[test]
+    fn one_payment_does_not_settle_a_strangers_order_on_the_same_address() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+
+        // A different buyer's order at the same store, same price, same
+        // reused payment address, overlapping window. This node is not party
+        // to it: no acceptance for it ever reaches this mailbox.
+        let mut strangers = order.clone();
+        strangers.order.buyer_fingerprint = "a-different-buyer".to_string();
+        let strangers = resigned(strangers, &seller_signing_key());
+        assert_ne!(strangers.order.id, order.order.id, "it must be a real twin");
+        assert_eq!(
+            strangers.order.payment_script_pubkey, order.order.payment_script_pubkey,
+            "the twin must reuse the address, or this test proves nothing"
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders
+            .push(strangers.clone());
+        state.refresh_same_address_orders();
+
+        // Our own order settles: one payment, one order, nothing ambiguous
+        // about it from here.
+        let published = state.publish_settled_orders(STORE);
+        assert_eq!(
+            published.len(),
+            1,
+            "the buyer's own order should still settle"
+        );
+        assert_eq!(published[0].order.id, order.order.id);
+
+        // The stranger's does not, and is not even a candidate.
+        assert!(
+            state
+                .settled_orders(STORE)
+                .iter()
+                .all(|r| r.order.id != strangers.order.id),
+            "one payment was used to mark a stranger's order paid"
+        );
+        assert!(
+            !state.settlements_submitted.contains(&strangers.order.id),
+            "a stranger's order was published as Paid off somebody else's payment"
+        );
+    }
+
     /// **A fresher tip settles the order it unblocks (harvest#74, external
     /// review P2).**
     ///
@@ -18272,6 +18475,55 @@ mod buy_flow_tests {
             state.notifications.len(),
             1,
             "the seller was told once, not once per retry at the re-read cadence"
+        );
+    }
+
+    /// **The same, from a BUYER's tab (harvest#75, testing lens).**
+    ///
+    /// The retry path does not branch on who owns the store, so this is the
+    /// same mechanism -- but it is the one path whose CONTEXT changed with no
+    /// coverage in the new context, and the failure it guards is now reachable
+    /// for a buyer in a way it was not before. A buyer's key is rebuilt from
+    /// the store contract id, so a store published under an OLDER store
+    /// contract resolves to a contract that does not exist and the send fails
+    /// identically every time.
+    ///
+    /// The thing that must not happen is the wall of apologies harvest#73
+    /// removed: `publish_settled_orders` runs on every address arrival, so an
+    /// apology per retry would land on the screen of the buyer whose payment
+    /// worked, every few minutes, for as long as the seller stayed away.
+    #[test]
+    fn a_buyers_failed_settlement_retries_and_apologises_once() {
+        let (order, claims, tip) = a_paid_order();
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        assert!(state.my_stores.is_empty(), "the fixture must be a buyer");
+
+        assert_eq!(
+            state.publish_settled_orders(STORE).len(),
+            1,
+            "published once"
+        );
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "and not again while that send is in flight"
+        );
+
+        for _ in 0..6 {
+            state.settlement_publish_failed(
+                &order.order.id,
+                "this store's contract key was rebuilt from the bundled store contract",
+            );
+            assert_eq!(
+                state.publish_settled_orders(STORE).len(),
+                1,
+                "a buyer's failed settlement must keep being retried"
+            );
+        }
+        assert_eq!(
+            state.notifications.len(),
+            1,
+            "a buyer got one apology per retry -- the harvest#73 wall, rebuilt"
         );
     }
 

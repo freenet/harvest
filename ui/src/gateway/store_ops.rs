@@ -540,6 +540,25 @@ pub async fn submit_settled_order_by_id(
     use dioxus::logger::tracing::{info, warn};
     use freenet_stdlib::prelude::*;
 
+    // The keyless path is justified by "the record is authorized by the
+    // evidence it carries", and that is true of `Paid` SPECIFICALLY. Making
+    // it structural rather than a property of the one current call site is
+    // the same argument `AuthorizedOrder::fields_used` makes for staying
+    // exhaustive: nothing here should depend on a caller remembering.
+    //
+    // Nothing else could reach this usefully today -- `Cancelled` needs the
+    // seller's status signature, `PaymentReversed` needs retraction
+    // evidence, and `AwaitingPayment` loses every merge at rank 0 -- so this
+    // guards the next caller, not this one. Raised by the authorization lens
+    // reviewing harvest#75.
+    if order.status != harvest_common::payment::OrderStatus::Paid {
+        return Err(format!(
+            "only a Paid settlement may be published without the store's key; \
+             this record is {:?}",
+            order.status
+        ));
+    }
+
     let (contract_key, origin, owner) = settlement_store_key(store_contract_id)?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");

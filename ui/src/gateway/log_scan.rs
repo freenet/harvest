@@ -130,6 +130,13 @@ const VETTED: &[Vetted] = &[
         why: "a fieldless enum",
     },
     Vetted {
+        file: "gateway/store_ops.rs",
+        expr: "order.status",
+        ty: "harvest_common::payment::OrderStatus",
+        why: "a fieldless enum, and a PUBLIC one -- it is the status the \
+              store contract publishes for everyone to read (harvest#75)",
+    },
+    Vetted {
         file: "state.rs",
         expr: "network",
         ty: "freenet_bitcoin_common::BitcoinNetwork",
