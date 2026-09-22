@@ -950,14 +950,15 @@ fn send_store_creation_requests(fingerprint: String, store_key_request: u64) {
     });
 }
 
-/// Ask the harvest delegate to mint (or recall) this identity's long-term
-/// X25519 key, so the seller has one to publish.
+/// Ask the harvest delegate for this identity's long-term X25519 key, so the
+/// seller has one to publish: recall it, or with `recall_only: false` mint it
+/// if there is none.
 ///
-/// Idempotent at the delegate, which is what lets this be called both at
-/// store creation and whenever a ghostkey is connected without either caller
-/// having to know about the other.
+/// A Ghost Key connecting RECALLS (`ensure_encryption_key`); only a recall
+/// that finds nothing leads to a mint, and that waits for the delegate secret
+/// migration (`mint_encryption_key`, harvest#123).
 #[cfg(target_arch = "wasm32")]
-async fn request_encryption_key(fingerprint: String) {
+async fn request_encryption_key(fingerprint: String, recall_only: bool) {
     let Some(delegate_key) = APP_STATE.read().harvest_delegate_key.clone() else {
         dioxus::logger::tracing::error!(
             "Harvest delegate not registered -- cannot mint an encryption key"
@@ -966,6 +967,7 @@ async fn request_encryption_key(fingerprint: String) {
     };
     let request = harvest_common::HarvestDelegateRequest::InitEncryptionKey {
         ghostkey_fingerprint: fingerprint.clone(),
+        recall_only,
     };
     let payload = match harvest_common::to_cbor(&request) {
         Ok(payload) => payload,
@@ -979,16 +981,33 @@ async fn request_encryption_key(fingerprint: String) {
     }
 }
 
-/// The same request, spawned, for callers that are not already async.
+/// Recall this identity's key, spawned, for callers that are not already
+/// async. Never mints; safe before the delegate migration has run.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn ensure_encryption_key(fingerprint: String) {
     wasm_bindgen_futures::spawn_local(async move {
-        request_encryption_key(fingerprint).await;
+        request_encryption_key(fingerprint, true).await;
     });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn ensure_encryption_key(_fingerprint: String) {}
+
+/// Mint this identity's key if the delegate holds none, once the delegate
+/// secret migration has reached every generation (so a key an earlier
+/// generation held is imported, not replaced). Spawned; see
+/// `gateway::delegate_migrate_ops::after_delegate_migration`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn mint_encryption_key(fingerprint: String) {
+    crate::gateway::delegate_migrate_ops::after_delegate_migration(move || {
+        wasm_bindgen_futures::spawn_local(async move {
+            request_encryption_key(fingerprint, false).await;
+        });
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn mint_encryption_key(_fingerprint: String) {}
 
 /// Render a ghostkey's notary attestation as something a person can read.
 ///

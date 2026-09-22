@@ -76,6 +76,29 @@
 //!   this migration's.
 //! * A family at its cap answers `Retryable`, so its predecessor is not
 //!   sealed and is walked again each load until there is room.
+//! * A generation that is registered here but NEVER answers -- a module the
+//!   node can no longer run, an export over the host's 4096-key enumeration
+//!   cap -- stops every walk at that point, so nothing older is carried
+//!   either. That is the price of never letting an older value shadow a newer
+//!   one, and it is said in the console on every load
+//!   ("stopped: a generation did not answer"). It costs no messaging: the
+//!   encryption key is recalled on connect whatever the walk does, and only
+//!   MINTING a new one waits for a complete walk.
+//!
+//! # The travelling record, and the doctrine it seems to break
+//!
+//! The migration doctrine says a marker naming a predecessor DELEGATE must
+//! not travel with an export: copied forward, it would claim the next
+//! generation imported that predecessor, which it did not. The
+//! `harvest:folded:<key>` record does travel, and it claims something else:
+//! "everything that predecessor held, bar what was deleted since, is in the
+//! export you are importing". That stays true at every hop because (a) it is
+//! written only when every item of the predecessor landed (the crate asks for
+//! `Done` only on a clean tally), (b) the data itself is copied forward at
+//! each hop, not referenced, and (c) a successor puts a carried record into
+//! effect only when the generation carrying it is itself sealed -- until then
+//! it is staged (`delegates/harvest-delegate/src/import.rs`). Copy the
+//! reasoning, not the choice.
 //!
 //! # Ordering against the contract migration
 //!
@@ -204,6 +227,14 @@ impl Expect {
 }
 
 impl Expect {
+    /// Whether this call goes to a PREDECESSOR (true) or to the current
+    /// delegate. A predecessor may be compiling its module or exporting its
+    /// whole store, and silence from it stops the walk, so the transport gives
+    /// it longer; the current delegate answers in milliseconds.
+    pub fn is_predecessor_call(&self) -> bool {
+        matches!(self, Expect::AnyFrom | Expect::Export)
+    }
+
     /// Whether a raw application-message payload from the delegate being
     /// waited on is this call's answer. The one decision the transport makes.
     pub fn accepts_payload(&self, payload: &[u8]) -> bool {
@@ -296,9 +327,17 @@ impl<T: DelegateCalls> PredecessorSecretsIo for Predecessors<T> {
     /// `Ok(false)`, which the crate records `Unresponsive` and never seals --
     /// but only silence halts the walk (see [`Walk`]).
     async fn probe_executable(&mut self, predecessor: &DelegateKey) -> Result<bool, String> {
-        let payload = encode(&HarvestDelegateRequest::ListStores {
+        let payload = match encode(&HarvestDelegateRequest::ListStores {
             ghostkey_fingerprint: String::new(),
-        })?;
+        }) {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Unreachable, and it would say nothing about the predecessor;
+                // halting keeps "we did not ask" from reading as "it is empty".
+                self.halt();
+                return Err(e);
+            }
+        };
         match self.calls.call(predecessor, payload, Expect::AnyFrom).await {
             Ok(Reply::Payloads(_)) => Ok(true),
             Ok(Reply::Missing) => Ok(false),
@@ -323,6 +362,22 @@ impl<T: DelegateCalls> PredecessorSecretsIo for Predecessors<T> {
         &mut self,
         predecessor: &DelegateKey,
     ) -> Result<Vec<freenet_migrate::SecretPair>, String> {
+        let answer = self.export(predecessor).await;
+        if answer.is_err() {
+            // It answered the probe, so it runs and may hold data: nothing
+            // older may be imported ahead of it in this run. Every error path
+            // lands here, the unreachable ones included.
+            self.halt();
+        }
+        answer
+    }
+}
+
+impl<T: DelegateCalls> Predecessors<T> {
+    async fn export(
+        &mut self,
+        predecessor: &DelegateKey,
+    ) -> Result<Vec<freenet_migrate::SecretPair>, String> {
         let generation = *self
             .generations
             .get(&key_bytes(predecessor)?)
@@ -330,16 +385,10 @@ impl<T: DelegateCalls> PredecessorSecretsIo for Predecessors<T> {
         let payload = encode(&HarvestMigrationRequest::ExportSecrets {
             source_generation: generation,
         })?;
-        let answer = match self.calls.call(predecessor, payload, Expect::Export).await {
+        match self.calls.call(predecessor, payload, Expect::Export).await {
             Ok(reply) => interpret_export(reply, generation),
             Err(e) => Err(format!("export not answered: {e}")),
-        };
-        if answer.is_err() {
-            // It answered the probe, so it runs and may hold data: nothing
-            // older may be imported ahead of it in this run.
-            self.halt();
         }
-        answer
     }
 }
 
@@ -576,9 +625,10 @@ pub async fn migrate<T: DelegateCalls + Clone>(calls: T, current: DelegateKey) -
 
 /// Work that must wait for the delegate migration, and what becomes of it.
 ///
-/// The one user today is `InitEncryptionKey`, sent for every Ghost Key on
-/// connect: it MINTS a key if the delegate holds none, and a freshly re-keyed
-/// delegate holds none until the import lands. Minted first, the new key
+/// The one user today is a MINTING `InitEncryptionKey`. On connect the app
+/// only RECALLS each Ghost Key's encryption key (`recall_only`), which is
+/// always safe; a mint is sent only when that recall finds nothing, and a
+/// freshly re-keyed delegate holds nothing until the import lands. Minted first, the new key
 /// would stand -- the import never overwrites -- while the store info still
 /// publishes the old one, and buyers' messages would be unreadable for good.
 ///

@@ -37,7 +37,7 @@ use futures::future::{select, Either};
 
 use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, SettleGate};
 
-/// How long one delegate message may take.
+/// How long a call to a PREDECESSOR delegate may take.
 ///
 /// A delegate call is node-local and usually answers in milliseconds, but an
 /// export is the predecessor's whole secret store and the first call to a
@@ -46,7 +46,13 @@ use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, Set
 /// for a generation that never answers at all (an execution error names no
 /// delegate, so it can only time out), and those are few since V1-V4 are not
 /// asked and unregistered ones answer `Missing` at once.
-const CALL_TIMEOUT_MS: u32 = 20_000;
+const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
+
+/// How long a call to the CURRENT delegate may take: node-local, loaded,
+/// answering in milliseconds. An import that times out is retried next load
+/// and does not stop the walk, so a long deadline here would only make a
+/// load's walk slower.
+const CURRENT_TIMEOUT_MS: u32 = 5_000;
 
 struct Waiter {
     delegate: DelegateKey,
@@ -78,6 +84,7 @@ impl DelegateCalls for Browser {
         expect: Expect,
     ) -> Result<Reply, CallError> {
         let (tx, rx) = oneshot::channel();
+        let predecessor_call = expect.is_predecessor_call();
         let busy = WAITER.with(|w| {
             let mut w = w.borrow_mut();
             if w.is_some() {
@@ -103,7 +110,11 @@ impl DelegateCalls for Browser {
             WAITER.with(|w| w.borrow_mut().take());
             return Err(CallError::Send(e));
         }
-        let timeout = gloo_timers::future::TimeoutFuture::new(CALL_TIMEOUT_MS);
+        let timeout = gloo_timers::future::TimeoutFuture::new(if predecessor_call {
+            PREDECESSOR_TIMEOUT_MS
+        } else {
+            CURRENT_TIMEOUT_MS
+        });
         match select(rx, timeout).await {
             Either::Left((Ok(reply), _)) => Ok(reply),
             Either::Left((Err(_), _)) => Err(CallError::Timeout),
@@ -238,10 +249,10 @@ async fn refresh_from_delegate(rsa_fingerprints: Vec<String>) {
         let request = harvest_common::HarvestDelegateRequest::GetRsaPublicKey {
             ghostkey_fingerprint: fingerprint.clone(),
         };
-        let sent = match (
-            harvest_common::to_cbor(&request),
-            super::APP_STATE.read().harvest_delegate_key.clone(),
-        ) {
+        // Bound first: a read guard held across the `.await` below is the
+        // leaked-guard shape `state.rs` warns about.
+        let delegate_key = super::APP_STATE.read().harvest_delegate_key.clone();
+        let sent = match (harvest_common::to_cbor(&request), delegate_key) {
             (Ok(payload), Some(key)) => super::send_delegate_message(&key, payload).await,
             _ => Err("could not build the request".to_string()),
         };

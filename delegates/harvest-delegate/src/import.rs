@@ -51,6 +51,8 @@ use harvest_common::delegate::{
 };
 use harvest_common::{from_cbor, to_cbor};
 
+use crate::secrets::RemovableSecrets;
+
 /// `freenet-migrate`'s in-progress marker prefix (crate-private there; see the
 /// module docs for why reproducing it is sound).
 const PRED_WIP_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-wip:";
@@ -104,11 +106,12 @@ pub(crate) fn get_marker<S: SecretStore>(
         Some(PredecessorMarkerState::Done {
             had_data: flag(&value),
         })
-    } else if store.has_secret(&folded_key(&predecessor)) {
+    } else if let Some(value) = store.get_secret(&folded_key(&predecessor)) {
         // Folded into a generation this delegate has imported: its data came
-        // in with that one. Data-bearing, so the walk treats it as a snapshot
-        // it already has rather than as an empty generation.
-        Some(PredecessorMarkerState::Done { had_data: true })
+        // in with that one.
+        Some(PredecessorMarkerState::Done {
+            had_data: flag(&value),
+        })
     } else {
         store
             .get_secret(&wip_key(&predecessor))
@@ -123,33 +126,82 @@ pub(crate) fn get_marker<S: SecretStore>(
 }
 
 /// Answer `RecordPredecessorMarker`, reporting a refused write.
-pub(crate) fn record_marker<S: SecretStore>(
+///
+/// # A `Done` is written LAST
+///
+/// Sealing a predecessor is three writes: the travelling records it carried
+/// (staged by [`import`] until now), its own travelling record, and the
+/// completion marker. The completion marker goes last, because once it is
+/// down `get_marker` answers `Done` and this predecessor is never offered
+/// again -- so a travelling record that failed after it would be missing for
+/// good, and the next re-key would walk this predecessor again and bring back
+/// what was deleted since. Written last, any failure leaves the marker absent,
+/// the crate retries the whole seal next load, and every write here is
+/// idempotent. A travelling record that landed without its marker already
+/// reads as done ([`get_marker`]), which is true: it is written only once
+/// every item of this predecessor landed.
+pub(crate) fn record_marker<S: SecretStore + RemovableSecrets>(
     store: &mut S,
     predecessor: [u8; 32],
     marker: PredecessorMarkerState,
 ) -> HarvestDelegateResponse {
-    let (key, data) = match marker {
-        PredecessorMarkerState::InProgress { saw_data } => (wip_key(&predecessor), saw_data),
-        PredecessorMarkerState::Done { had_data } => (done_key(&predecessor), had_data),
+    let recorded = match marker {
+        PredecessorMarkerState::InProgress { saw_data } => {
+            store.set_secret(&wip_key(&predecessor), data_value(saw_data))
+        }
+        PredecessorMarkerState::Done { had_data } => {
+            promote_staged(store, &predecessor)
+                && store.set_secret(&folded_key(&predecessor), data_value(had_data))
+                && store.set_secret(&done_key(&predecessor), data_value(had_data))
+        }
     };
-    let value = if data {
-        PRED_DONE_MARKER_VALUE_DATA
-    } else {
-        PRED_DONE_MARKER_VALUE_EMPTY
-    };
-    let mut recorded = store.set_secret(&key, value);
-    if recorded && matches!(marker, PredecessorMarkerState::Done { .. }) {
-        // And the travelling record, so the NEXT generation does not walk
-        // this predecessor again. Reported with the marker: a `Done` whose
-        // travelling half did not land would let the next re-key bring back
-        // what this generation deleted.
-        recorded = store.set_secret(&folded_key(&predecessor), b"1");
-    }
     HarvestDelegateResponse::PredecessorMarkerRecorded {
         predecessor,
         marker,
         recorded,
     }
+}
+
+fn data_value(data: bool) -> &'static [u8] {
+    if data {
+        PRED_DONE_MARKER_VALUE_DATA
+    } else {
+        PRED_DONE_MARKER_VALUE_EMPTY
+    }
+}
+
+/// Where a travelling record imported from `predecessor` waits until that
+/// predecessor is sealed. Outside `harvest:`, so it is never exported while
+/// staged.
+fn staged_prefix(predecessor: &[u8; 32]) -> Vec<u8> {
+    let mut key = b"\0harvest/folded-staged/".to_vec();
+    key.extend_from_slice(hex_lower(predecessor).as_bytes());
+    key.push(b'/');
+    key
+}
+
+/// Turn the travelling records staged from `predecessor` into real ones.
+/// Answers whether every one landed; the staged copies are then removed,
+/// best effort (one left behind is re-promoted, harmlessly, next time).
+fn promote_staged<S: SecretStore + RemovableSecrets>(
+    store: &mut S,
+    predecessor: &[u8; 32],
+) -> bool {
+    let prefix = staged_prefix(predecessor);
+    let staged = store.list_secrets(&prefix);
+    for key in &staged {
+        let Some(value) = store.get_secret(key) else {
+            return false;
+        };
+        let real = [b"harvest:folded:".as_slice(), &key[prefix.len()..]].concat();
+        if !store.set_secret(&real, &value) {
+            return false;
+        }
+    }
+    for key in &staged {
+        store.remove_secret(key);
+    }
+    true
 }
 
 /// Answer `ImportMigratedSecret`.
@@ -159,7 +211,11 @@ pub(crate) fn import<S: SecretStore>(
     key: Vec<u8>,
     value: &[u8],
 ) -> HarvestDelegateResponse {
-    let outcome = import_secret(store, &key, value);
+    let outcome = if family(&key) == Family::Folded {
+        stage_folded(store, &predecessor, &key, value)
+    } else {
+        import_secret(store, &key, value)
+    };
     HarvestDelegateResponse::MigratedSecretImported {
         predecessor,
         key,
@@ -194,6 +250,9 @@ pub(crate) enum Family {
     BuyerConversation,
     /// A remembered store: capped.
     KnownStore,
+    /// A travelling "folded into" record: staged until the predecessor
+    /// carrying it is sealed.
+    Folded,
     /// Everything else: written only if absent.
     Standalone,
 }
@@ -224,9 +283,30 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::BuyerConversation
     } else if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
         Family::KnownStore
+    } else if key.starts_with(b"harvest:folded:") {
+        Family::Folded
     } else {
         Family::Standalone
     }
+}
+
+/// Stage a travelling record carried by `predecessor` until that predecessor
+/// is sealed ([`record_marker`]).
+///
+/// Written straight through, it would take effect in the same walk, before
+/// the predecessor carrying it is known to be complete: if that predecessor
+/// then ended `Incomplete` (an item refused), the record would still make
+/// this delegate skip the generation it names -- whose own copy of the
+/// refused item the crate deliberately offers next.
+fn stage_folded<S: SecretStore>(
+    store: &mut S,
+    predecessor: &[u8; 32],
+    key: &[u8],
+    value: &[u8],
+) -> SecretImport {
+    let named = &key[b"harvest:folded:".len()..];
+    let staged = [staged_prefix(predecessor).as_slice(), named].concat();
+    written(store.set_secret(&staged, value))
 }
 
 /// Import one secret by the rules of its family. See the module docs.
@@ -304,6 +384,9 @@ pub(crate) fn import_secret<S: SecretStore>(
             crate::messaging::MAX_BUYER_CONVERSATIONS,
         ),
         Family::KnownStore => crate::known_stores::import(store, key, value),
+        // Only reached if a caller bypasses `import`; staging needs the
+        // predecessor, so a direct copy is the one wrong answer.
+        Family::Folded => SecretImport::Permanent("a travelling record needs its carrier".into()),
         Family::Standalone => copy_if_absent(store, key, value),
     }
 }
@@ -890,7 +973,7 @@ mod tests {
             Family::KnownStore,
             Family::Refused,    // store key
             Family::Standalone, // unfinished store creation
-            Family::Standalone, // travelling "folded into" record
+            Family::Folded,     // travelling "folded into" record
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1", "tx1");
         assert_eq!(
@@ -947,6 +1030,7 @@ mod tests {
     /// travelling record, and by not reading it in `get_marker`.
     #[test]
     fn a_folded_predecessor_is_done_for_the_next_generation() {
+        const CARRIER: [u8; 32] = [0xC1; 32];
         let mut this = MemSecrets::default();
         record_marker(
             &mut this,
@@ -957,23 +1041,35 @@ mod tests {
         assert!(travelling.starts_with(harvest_common::migration::SECRET_KEY_PREFIX));
         let value = this.get_secret(&travelling).expect("the travelling record");
 
-        // The next generation imports this one's export, travelling record
-        // included, and then asks about the same predecessor.
+        // The next generation imports this one's export (this generation is
+        // CARRIER to it), travelling record included.
         let mut next = MemSecrets::default();
-        assert_eq!(
-            import_secret(&mut next, &travelling, &value),
-            SecretImport::Written
-        );
-        match get_marker(&next, PRED) {
-            HarvestDelegateResponse::PredecessorMarker { marker, .. } => {
-                assert_eq!(
-                    marker,
-                    Some(PredecessorMarkerState::Done { had_data: true })
-                )
+        match import(&mut next, CARRIER, travelling.clone(), &value) {
+            HarvestDelegateResponse::MigratedSecretImported { outcome, .. } => {
+                assert_eq!(outcome, SecretImport::Written)
             }
             other => panic!("{other:?}"),
         }
-        // An in-progress marker does not travel.
+        let marker = |store: &MemSecrets| match get_marker(store, PRED) {
+            HarvestDelegateResponse::PredecessorMarker { marker, .. } => marker,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            marker(&next),
+            None,
+            "staged, not in effect, while its carrier is not sealed"
+        );
+        record_marker(
+            &mut next,
+            CARRIER,
+            PredecessorMarkerState::Done { had_data: true },
+        );
+        assert_eq!(
+            marker(&next),
+            Some(PredecessorMarkerState::Done { had_data: true })
+        );
+
+        // An in-progress marker writes no travelling record.
         let mut other = MemSecrets::default();
         record_marker(
             &mut other,
@@ -981,6 +1077,83 @@ mod tests {
             PredecessorMarkerState::InProgress { saw_data: true },
         );
         assert!(!other.has_secret(&folded_key(&[9; 32])));
+    }
+
+    /// A store that refuses writes to keys with one prefix.
+    #[derive(Default)]
+    struct RefusingPrefix {
+        inner: MemSecrets,
+        prefix: Vec<u8>,
+    }
+
+    impl SecretStore for RefusingPrefix {
+        fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.inner.list_secrets(prefix)
+        }
+        fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.get_secret(key)
+        }
+        fn has_secret(&self, key: &[u8]) -> bool {
+            self.inner.has_secret(key)
+        }
+        fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+            !key.starts_with(&self.prefix) && self.inner.set_secret(key, value)
+        }
+    }
+
+    impl RemovableSecrets for RefusingPrefix {
+        fn remove_secret(&mut self, key: &[u8]) -> bool {
+            self.inner.remove_secret(key)
+        }
+    }
+
+    /// **A `Done` whose travelling record did not land is not written.**
+    /// Otherwise the predecessor reads as done forever and its travelling
+    /// record is never retried, so the next re-key walks it again. Mutated
+    /// red by writing the completion marker first.
+    #[test]
+    fn a_failed_travelling_write_leaves_the_predecessor_unsealed() {
+        let mut store = RefusingPrefix {
+            prefix: b"harvest:folded:".to_vec(),
+            ..Default::default()
+        };
+        match record_marker(
+            &mut store,
+            PRED,
+            PredecessorMarkerState::Done { had_data: true },
+        ) {
+            HarvestDelegateResponse::PredecessorMarkerRecorded { recorded, .. } => {
+                assert!(!recorded)
+            }
+            other => panic!("{other:?}"),
+        }
+        match get_marker(&store, PRED) {
+            HarvestDelegateResponse::PredecessorMarker { marker, .. } => {
+                assert_eq!(marker, None, "not sealed, so the next load seals it again")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A predecessor sealed as empty travels as empty.
+    #[test]
+    fn a_travelling_record_keeps_the_data_flag() {
+        let mut store = MemSecrets::default();
+        record_marker(
+            &mut store,
+            PRED,
+            PredecessorMarkerState::Done { had_data: false },
+        );
+        store.remove_secret(&done_key(&PRED));
+        match get_marker(&store, PRED) {
+            HarvestDelegateResponse::PredecessorMarker { marker, .. } => {
+                assert_eq!(
+                    marker,
+                    Some(PredecessorMarkerState::Done { had_data: false })
+                )
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A remembered store archived on the predecessor stays archived even

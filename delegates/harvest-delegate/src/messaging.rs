@@ -78,11 +78,19 @@ pub(crate) fn x25519_sk_key(fp: &str) -> Vec<u8> {
 pub(crate) fn init_encryption_key<S: SecretStore>(
     store: &mut S,
     ghostkey_fingerprint: &str,
+    recall_only: bool,
 ) -> HarvestDelegateResponse {
     let key = x25519_sk_key(ghostkey_fingerprint);
 
     let secret = match store.get_secret(&key).and_then(seed_from_stored) {
         Some(existing) => existing,
+        // A recall that finds nothing mints nothing: the UI asks this way
+        // before the delegate secret migration has run (harvest#123).
+        None if recall_only => {
+            return HarvestDelegateResponse::EncryptionKeyAbsent {
+                ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
+            }
+        }
         None => {
             let mut seed = [0u8; 32];
             // The delegate host's own RNG, via this crate's registered
@@ -1016,15 +1024,38 @@ mod tests {
     /// one undecryptable, with nothing anywhere reporting a problem. The UI
     /// calls this on every connect, so "idempotent" is the normal path rather
     /// than an edge case.
+    /// A recall-only request never mints: the UI asks this way before the
+    /// delegate secret migration has run, so a key minted here cannot stand
+    /// in front of the one being imported (harvest#123). Once a key exists,
+    /// a recall answers it. Mutated red by minting on a recall.
+    #[test]
+    fn a_recall_never_mints_and_answers_an_existing_key() {
+        let mut store = MemSecrets::default();
+        match init_encryption_key(&mut store, FP, true) {
+            HarvestDelegateResponse::EncryptionKeyAbsent {
+                ghostkey_fingerprint,
+            } => {
+                assert_eq!(ghostkey_fingerprint, FP)
+            }
+            other => panic!("expected EncryptionKeyAbsent, got {other:?}"),
+        }
+        assert!(store.is_empty(), "a recall wrote a key");
+        let minted = public_key(&init_encryption_key(&mut store, FP, false));
+        assert_eq!(
+            public_key(&init_encryption_key(&mut store, FP, true)),
+            minted
+        );
+    }
+
     #[test]
     fn the_encryption_key_is_minted_once_and_then_recalled() {
         let mut store = MemSecrets::default();
 
-        let first = public_key(&init_encryption_key(&mut store, FP));
+        let first = public_key(&init_encryption_key(&mut store, FP, false));
         assert_eq!(first.len(), 32, "an X25519 public key is 32 bytes");
         assert_ne!(first, vec![0u8; 32], "the key must not be all zeros");
 
-        let second = public_key(&init_encryption_key(&mut store, FP));
+        let second = public_key(&init_encryption_key(&mut store, FP, false));
         assert_eq!(first, second, "a second call minted a different key");
     }
 
@@ -1033,8 +1064,8 @@ mod tests {
     #[test]
     fn two_identities_get_different_keys() {
         let mut store = MemSecrets::default();
-        let one = public_key(&init_encryption_key(&mut store, "fp1"));
-        let two = public_key(&init_encryption_key(&mut store, "fp2"));
+        let one = public_key(&init_encryption_key(&mut store, "fp1", false));
+        let two = public_key(&init_encryption_key(&mut store, "fp2", false));
         assert_ne!(one, two);
     }
 
@@ -1052,7 +1083,7 @@ mod tests {
         let mut store = MemSecrets::default();
         store.writes_fail = true;
 
-        let message = error_message(&init_encryption_key(&mut store, FP));
+        let message = error_message(&init_encryption_key(&mut store, FP, false));
         assert!(
             message.contains("could not"),
             "the refusal must say the key was not stored: {message}"
@@ -1073,7 +1104,7 @@ mod tests {
     #[test]
     fn the_seller_derives_the_key_the_buyer_derived() {
         let mut store = MemSecrets::default();
-        let seller_public_bytes = public_key(&init_encryption_key(&mut store, FP));
+        let seller_public_bytes = public_key(&init_encryption_key(&mut store, FP, false));
         let seller_public: [u8; 32] = seller_public_bytes.clone().try_into().expect("32 bytes");
 
         // The buyer's side, computed the way `harvest-ui`'s
@@ -1124,7 +1155,7 @@ mod tests {
     #[test]
     fn a_store_key_reads_with_the_inbox_key_it_derives() {
         let mut store = MemSecrets::default();
-        let device_public = public_key(&init_encryption_key(&mut store, FP));
+        let device_public = public_key(&init_encryption_key(&mut store, FP, false));
         let store_sk = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
         assert!(crate::store_keys::keep(&mut store, &store_sk));
         let inbox = PublicKey::from(&harvest_common::custody::inbox_secret(&store_sk));
@@ -1166,7 +1197,7 @@ mod tests {
     #[test]
     fn a_malformed_peer_key_does_not_shift_the_others() {
         let mut store = MemSecrets::default();
-        init_encryption_key(&mut store, FP);
+        init_encryption_key(&mut store, FP, false);
 
         let a = PublicKey::from(&StaticSecret::from([1u8; 32]));
         let b = PublicKey::from(&StaticSecret::from([2u8; 32]));
@@ -1221,7 +1252,7 @@ mod tests {
     #[test]
     fn a_low_order_peer_key_is_refused() {
         let mut store = MemSecrets::default();
-        init_encryption_key(&mut store, FP);
+        init_encryption_key(&mut store, FP, false);
 
         let good = PublicKey::from(&StaticSecret::from([3u8; 32]));
         let derived = keys(&derive_conversation_keys(
@@ -1256,7 +1287,7 @@ mod tests {
     #[test]
     fn everything_this_module_writes_is_under_the_exported_prefix() {
         let mut store = MemSecrets::default();
-        init_encryption_key(&mut store, FP);
+        init_encryption_key(&mut store, FP, false);
 
         let everything = store.list_secrets(b"");
         assert!(

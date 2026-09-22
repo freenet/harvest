@@ -156,7 +156,7 @@ async fn read_back(node: &mut Node, key: &DelegateKey) -> Seeded {
     // Mints if absent -- which is exactly the check: after a migration it
     // must answer the PREDECESSOR's key, not a new one.
     let x25519 = match node
-        .harvest(key, HarvestDelegateRequest::InitEncryptionKey { ghostkey_fingerprint: FP.into() })
+        .harvest(key, HarvestDelegateRequest::InitEncryptionKey { ghostkey_fingerprint: FP.into(), recall_only: false })
         .await
     {
         HarvestDelegateResponse::EncryptionKeyReady { x25519_public_key, .. } => x25519_public_key,

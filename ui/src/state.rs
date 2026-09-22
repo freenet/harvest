@@ -572,9 +572,9 @@ pub struct PendingStoreCreation {
     /// thing to wait on would add a third way for a creation to hang
     /// forever, and this one has a recovery path that those do not.
     ///
-    /// In practice it is nearly always present: `InitEncryptionKey` goes out
-    /// alongside `InitReputationKeys`, and generating a 2048-bit RSA key
-    /// takes far longer than 32 random bytes. Nothing here relies on that.
+    /// It is present once the connect path's recall (or, for a Ghost Key with
+    /// no key yet, the mint that follows the delegate migration) has been
+    /// answered. Nothing here relies on that having happened.
     pub encryption_public_key: Option<[u8; 32]>,
     /// The new store's own key (harvest#93), filled by the harvest delegate's
     /// `StoreKeyCreated`. `None` until it arrives; creation waits on it,
@@ -7518,6 +7518,17 @@ impl AppState {
                 self.start_reputation_migration(&ghostkey_fingerprint);
             }
 
+            // The connect path's recall found no key. Mint one, but only once
+            // the delegate migration has had its chance to import the key an
+            // earlier generation held (harvest#123). `mint_encryption_key`
+            // only defers and spawns, so nothing here re-enters `APP_STATE`.
+            HarvestDelegateResponse::EncryptionKeyAbsent {
+                ghostkey_fingerprint,
+            } => {
+                info!("No encryption key yet for {ghostkey_fingerprint}; minting after the delegate migration");
+                crate::components::mint_encryption_key(ghostkey_fingerprint);
+            }
+
             HarvestDelegateResponse::EncryptionKeyReady {
                 ghostkey_fingerprint,
                 x25519_public_key,
@@ -8239,14 +8250,12 @@ impl AppState {
                         crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
                     }
 
-                    // Not before the delegate migration has run: on a freshly
-                    // re-keyed delegate this would mint a NEW encryption key
-                    // ahead of the import of the old one, and the import never
-                    // overwrites (see `after_delegate_migration`).
+                    // A RECALL, which never mints: safe before the delegate
+                    // migration has run. A recall that finds nothing answers
+                    // `EncryptionKeyAbsent`, and only then is a mint sent,
+                    // after the migration (harvest#123).
                     for fingerprint in needs_encryption_key {
-                        crate::gateway::delegate_migrate_ops::after_delegate_migration(move || {
-                            crate::components::ensure_encryption_key(fingerprint)
-                        });
+                        crate::components::ensure_encryption_key(fingerprint);
                     }
                 });
 

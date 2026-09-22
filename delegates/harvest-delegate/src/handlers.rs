@@ -174,7 +174,8 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         // another web app.
         HarvestDelegateRequest::InitEncryptionKey {
             ghostkey_fingerprint,
-        } => crate::messaging::init_encryption_key(store, &ghostkey_fingerprint),
+            recall_only,
+        } => crate::messaging::init_encryption_key(store, &ghostkey_fingerprint, recall_only),
 
         HarvestDelegateRequest::DeriveConversationKeys {
             request_id,
@@ -1016,6 +1017,7 @@ mod origin_gating_tests {
             Some(&a_different_web_app()),
             HarvestDelegateRequest::InitEncryptionKey {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
+                recall_only: false,
             },
         );
         assert!(
@@ -1031,6 +1033,7 @@ mod origin_gating_tests {
             Some(&harvest()),
             HarvestDelegateRequest::InitEncryptionKey {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
+                recall_only: false,
             },
         ) {
             HarvestDelegateResponse::EncryptionKeyReady {

@@ -36,6 +36,11 @@ struct Node {
     refuse_markers: bool,
     /// The current delegate answers every import with something else.
     garbled_imports: bool,
+    /// Travelling records carried by each predecessor, staged until it is
+    /// sealed.
+    staged: HashMap<[u8; 32], Vec<Vec<u8>>>,
+    /// A key the current delegate refuses, permanently.
+    reject_key: Option<Vec<u8>>,
 }
 
 fn folded(predecessor: &[u8; 32]) -> Vec<u8> {
@@ -91,6 +96,13 @@ impl DelegateCalls for Fake {
                     if recorded {
                         node.markers.insert(predecessor, marker);
                         if matches!(marker, PredecessorMarkerState::Done { .. }) {
+                            // Promote what this predecessor carried, then
+                            // write its own travelling record.
+                            let carried: Vec<Vec<u8>> =
+                                node.staged.remove(&predecessor).unwrap_or_default();
+                            for key in carried {
+                                node.secrets.insert(key, b"1".to_vec());
+                            }
                             node.secrets.insert(folded(&predecessor), b"1".to_vec());
                         }
                     }
@@ -98,6 +110,30 @@ impl DelegateCalls for Fake {
                         predecessor,
                         marker,
                         recorded,
+                    }
+                }
+                // A carried travelling record is staged until its carrier is
+                // sealed, as the real delegate does.
+                HarvestDelegateRequest::ImportMigratedSecret {
+                    predecessor, key, ..
+                } if key.starts_with(b"harvest:folded:") && !node.garbled_imports => {
+                    node.staged
+                        .entry(predecessor)
+                        .or_default()
+                        .push(key.clone());
+                    HarvestDelegateResponse::MigratedSecretImported {
+                        predecessor,
+                        key,
+                        outcome: SecretImport::Written,
+                    }
+                }
+                HarvestDelegateRequest::ImportMigratedSecret {
+                    predecessor, key, ..
+                } if node.reject_key.as_ref() == Some(&key) => {
+                    HarvestDelegateResponse::MigratedSecretImported {
+                        predecessor,
+                        key,
+                        outcome: SecretImport::Permanent("refused".into()),
                     }
                 }
                 HarvestDelegateRequest::ImportMigratedSecret { predecessor, .. }
@@ -609,4 +645,50 @@ fn a_newer_generation_silent_to_the_probe_stops_the_walk() {
     let out = outcome(&fake);
     assert!(out.walk.halted);
     assert_eq!(secret(&fake, "harvest:x25519_sk:fp1"), None);
+}
+
+/// Halting alone makes a walk incomplete, even when no later predecessor is
+/// left to fail: here the silent generation is the oldest one walked.
+/// Mutated red by dropping `!halted` from `Outcome::complete`.
+#[test]
+fn a_halt_on_the_last_generation_still_leaves_the_walk_incomplete() {
+    let fake = Fake::default();
+    fake.0
+        .borrow_mut()
+        .old
+        .insert(generation(FIRST_EXPORTING_GENERATION), Old::Silent);
+    let out = outcome(&fake);
+    assert!(out.walk.halted);
+    assert!(!out.complete(), "{}", summarize(&out.report));
+}
+
+/// A travelling record carried by a predecessor that did NOT finish is not
+/// in effect: the generation it names is still walked. Mutated red by
+/// honouring staged records.
+#[test]
+fn a_record_carried_by_an_unfinished_generation_is_not_in_effect() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        // V17 carries "V16 folded", but one of its items is refused, so V17
+        // is not sealed.
+        node.reject_key = Some(b"harvest:broken".to_vec());
+        node.old.insert(
+            generation(17),
+            Old::Holds(vec![
+                (folded(&generation(16)), b"1".to_vec()),
+                (b"harvest:broken".to_vec(), b"x".to_vec()),
+            ]),
+        );
+        node.old.insert(
+            generation(16),
+            Old::Holds(vec![(b"harvest:x25519_sk:fp1".to_vec(), b"v16".to_vec())]),
+        );
+    }
+    run(&fake);
+    assert_eq!(
+        secret(&fake, "harvest:x25519_sk:fp1").as_deref(),
+        Some(&b"v16"[..]),
+        "V16 was still walked"
+    );
 }

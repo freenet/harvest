@@ -52,6 +52,12 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
             ghostkey_fingerprint,
             ..
         } => ("EncryptionKeyReady", Some(ghostkey_fingerprint.clone())),
+        R::EncryptionKeyAbsent {
+            ghostkey_fingerprint,
+        } => ("EncryptionKeyAbsent", Some(ghostkey_fingerprint.clone())),
+        R::PredecessorMarker { .. } => ("PredecessorMarker", None),
+        R::PredecessorMarkerRecorded { .. } => ("PredecessorMarkerRecorded", None),
+        R::MigratedSecretImported { .. } => ("MigratedSecretImported", None),
         R::BuyerConversationStored { request_id, .. } => {
             ("BuyerConversationStored", request(request_id))
         }

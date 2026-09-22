@@ -384,6 +384,7 @@ mod tests {
         // reach the code that exports this delegate's private keys.
         let init_encryption_key = to_cbor(&HarvestDelegateRequest::InitEncryptionKey {
             ghostkey_fingerprint: "fp".into(),
+            recall_only: false,
         })
         .expect("cbor");
         let derive_keys = to_cbor(&HarvestDelegateRequest::DeriveConversationKeys {

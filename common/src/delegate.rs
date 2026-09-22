@@ -46,7 +46,21 @@ pub enum HarvestDelegateRequest {
     /// buyer has something to encrypt to. Idempotent: a second call returns
     /// the key the first one minted, because re-minting would strand every
     /// message already in flight to the old one.
-    InitEncryptionKey { ghostkey_fingerprint: String },
+    InitEncryptionKey {
+        ghostkey_fingerprint: String,
+        /// Answer the key only if this delegate already holds it; never mint
+        /// one (harvest#123). Answered with
+        /// [`HarvestDelegateResponse::EncryptionKeyAbsent`] when it does not.
+        ///
+        /// A recall is always safe. A MINT is safe only once the delegate
+        /// secret migration has had its chance to import the key a previous
+        /// generation held: minted first, the new key would stand (the import
+        /// never overwrites) while the store info still publishes the old one.
+        /// So the UI recalls on connect and mints only after the migration.
+        /// `#[serde(default)]`: a request without it mints, as before.
+        #[serde(default)]
+        recall_only: bool,
+    },
 
     /// Derive the conversation keys for a batch of buyer ephemeral public
     /// keys, so the UI can decrypt what is sitting in the mailbox.
@@ -496,6 +510,12 @@ pub enum HarvestDelegateResponse {
     },
 
     /// This identity's long-term X25519 public key, minted or recalled.
+    /// Answer to a recall-only `InitEncryptionKey`: this delegate holds no
+    /// key for the identity, and none was minted.
+    EncryptionKeyAbsent {
+        ghostkey_fingerprint: String,
+    },
+
     EncryptionKeyReady {
         ghostkey_fingerprint: String,
         /// Raw 32 bytes. A `Vec` rather than `[u8; 32]` because every other
@@ -1286,9 +1306,10 @@ mod tests {
             R::PredecessorMarker { .. } => (28, false),
             R::PredecessorMarkerRecorded { .. } => (29, false),
             R::MigratedSecretImported { .. } => (30, false),
+            R::EncryptionKeyAbsent { .. } => (31, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 31;
+    const RESPONSE_VARIANTS: usize = 32;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1501,6 +1522,9 @@ mod tests {
                 key: b"harvest:rsa_pk:fp-one".to_vec(),
                 outcome: SecretImport::Written,
             },
+            R::EncryptionKeyAbsent {
+                ghostkey_fingerprint: fp(),
+            },
             R::Error {
                 message: "refused".into(),
             },
@@ -1581,6 +1605,7 @@ mod tests {
             },
             Q::InitEncryptionKey {
                 ghostkey_fingerprint: fp(),
+                recall_only: true,
             },
             Q::DeriveConversationKeys {
                 request_id: 42,
