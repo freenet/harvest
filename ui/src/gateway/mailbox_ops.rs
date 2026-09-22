@@ -212,25 +212,30 @@ pub(crate) trait Delivery {
 /// filters on what is in it) -- except for a second store under the same
 /// Ghost Key, whose mailbox state this tab files under the first store
 /// (freenet/harvest#130).
-pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage) {
+///
+/// `handed_over` says a copy of these bytes already reached the node in an
+/// earlier delivery (a manual "Send again").
+pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage, handed_over: bool) {
     use crate::state::NotArrived;
 
     let digest = harvest_common::mailbox::entry_digest(&message);
+    let mut handed_over = handed_over;
     let mut sends: u8 = 0;
     loop {
         sends = sends.saturating_add(1);
         if let Err(e) = io.write(&message).await {
-            // Only the FIRST write failing means nothing was ever sent. A
-            // resend failing says nothing about the copy that did reach the
-            // node, which may well have landed.
-            let why = if sends == 1 {
-                NotArrived::NeverReachedNode
-            } else {
+            // Only a failure before ANY copy reached the node means nothing
+            // was sent. Otherwise it says nothing about the copy that did,
+            // which may well have landed.
+            let why = if handed_over {
                 NotArrived::Unconfirmed
+            } else {
+                NotArrived::NeverReachedNode
             };
             io.not_arrived(&digest, why, Some(e));
             return;
         }
+        handed_over = true;
         let fresh = io.wait_and_reread().await;
         match after_delivery_check(Check::from_read(io.landed(&digest), fresh), sends) {
             DeliveryStep::Landed => return,
@@ -276,6 +281,7 @@ pub async fn send_message(
     store_contract_id: Vec<u8>,
     owner_verifying_key: &ed25519_dalek::VerifyingKey,
     message: EncryptedMessage,
+    handed_over: bool,
 ) -> Result<(), String> {
     let key = mailbox_contract_key(owner_verifying_key)?;
     deliver(
@@ -284,6 +290,7 @@ pub async fn send_message(
             key,
         },
         message,
+        handed_over,
     )
     .await;
     Ok(())
@@ -317,8 +324,14 @@ impl Delivery for NodeDelivery {
         app.mark_not_arrived(&self.store_contract_id, digest, why);
         if let Some(e) = error {
             dioxus::logger::tracing::error!("Failed to send message: {e}");
-            app.notifications
-                .push(format!("Your message could not be sent: {e}"));
+            // Worded by what is known: a resend failing does not undo the
+            // copy that already reached the node.
+            app.notifications.push(match why {
+                crate::state::NotArrived::NeverReachedNode => {
+                    format!("Your message could not be sent: {e}")
+                }
+                _ => format!("Your message could not be sent again: {e}"),
+            });
         }
     }
 }
@@ -512,7 +525,7 @@ mod tests {
         let message = a_message();
         let digest = harvest_common::mailbox::entry_digest(&message);
         let mailbox = FakeMailbox::new(None);
-        futures::executor::block_on(deliver(&mailbox, message));
+        futures::executor::block_on(deliver(&mailbox, message, false));
 
         assert_eq!(
             *mailbox.writes.borrow(),
@@ -529,7 +542,7 @@ mod tests {
     #[test]
     fn a_message_that_lands_on_the_resend_is_not_reported() {
         let mailbox = FakeMailbox::new(Some(2));
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         assert_eq!(mailbox.writes.borrow().len(), 2);
         assert!(mailbox.not_arrived.borrow().is_empty());
     }
@@ -538,7 +551,7 @@ mod tests {
     #[test]
     fn a_message_that_lands_first_time_is_sent_once() {
         let mailbox = FakeMailbox::new(Some(1));
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         assert_eq!(mailbox.writes.borrow().len(), 1);
         assert!(mailbox.not_arrived.borrow().is_empty());
     }
@@ -549,7 +562,7 @@ mod tests {
     fn a_write_that_cannot_reach_the_node_is_reported_as_such() {
         let mut mailbox = FakeMailbox::new(None);
         mailbox.write_fails = true;
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         assert_eq!(mailbox.writes.borrow().len(), 1);
         let reported = mailbox.not_arrived.borrow();
         assert_eq!(reported.len(), 1);
@@ -567,7 +580,7 @@ mod tests {
         let digest = harvest_common::mailbox::entry_digest(&message);
         let mut mailbox = FakeMailbox::new(None);
         mailbox.answers = false;
-        futures::executor::block_on(deliver(&mailbox, message));
+        futures::executor::block_on(deliver(&mailbox, message, false));
         assert_eq!(
             mailbox.writes.borrow().len(),
             1 + AUTOMATIC_RESENDS as usize
@@ -585,7 +598,7 @@ mod tests {
     fn a_mailbox_this_tab_cannot_see_never_reports_the_message_missing() {
         let mut mailbox = FakeMailbox::new(None);
         mailbox.routed = false;
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         let reported = mailbox.not_arrived.borrow();
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].1, NotArrived::Unconfirmed);
@@ -621,9 +634,23 @@ mod tests {
             }
         }
         let mailbox = DropsAfterFirst(FakeMailbox::new(None));
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         assert_eq!(mailbox.0.writes.borrow().len(), 2);
         let reported = mailbox.0.not_arrived.borrow();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].1, NotArrived::Unconfirmed);
+    }
+
+    /// **A manual resend whose write fails is not "never sent" either**
+    /// (round 3 of the harvest#126 review): the earlier delivery's copy
+    /// reached the node. Without the flag, the fresh `deliver` would count
+    /// this as its first write.
+    #[test]
+    fn a_manual_resend_that_cannot_reach_the_node_claims_nothing() {
+        let mut mailbox = FakeMailbox::new(None);
+        mailbox.write_fails = true;
+        futures::executor::block_on(deliver(&mailbox, a_message(), true));
+        let reported = mailbox.not_arrived.borrow();
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].1, NotArrived::Unconfirmed);
     }
@@ -634,7 +661,7 @@ mod tests {
     fn a_message_seen_in_a_stale_read_has_still_landed() {
         let mut mailbox = FakeMailbox::new(Some(1));
         mailbox.answers = false;
-        futures::executor::block_on(deliver(&mailbox, a_message()));
+        futures::executor::block_on(deliver(&mailbox, a_message(), false));
         assert_eq!(mailbox.writes.borrow().len(), 1);
         assert!(mailbox.not_arrived.borrow().is_empty());
     }

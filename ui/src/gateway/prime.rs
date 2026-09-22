@@ -34,7 +34,13 @@
 //!
 //! The GET does NOT subscribe. Priming is not interest: a subscription is a
 //! standing signal to the network, and each caller that wants one already
-//! asks for it separately.
+//! asks for it separately. Its answer is still an ordinary `GetResponse`,
+//! though, and goes through `on_contract_state` like any other: for a store
+//! that re-runs the follow-ups a store state triggers (the reputation link,
+//! purchase address watches, settlements, watch requests). Each of those is
+//! already deduplicated (`settlements_submitted`, `custody_attempted`, the
+//! watch request's landing grace), which is why a pre-write state coming
+//! back cannot start a write loop.
 //!
 //! # Why this is at the choke point rather than at each caller
 //!

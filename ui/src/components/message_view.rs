@@ -36,13 +36,15 @@ use crate::messaging::{MailboxEntry, MessageContent};
 ///   send rather than discovered when they need the answer. See
 ///   `docs/buyer-conversation-persistence.md`.
 /// * **Handed over, not delivered.** `update_contract` resolves when the
-///   local node accepts the send. Nothing confirms the contract took it or
-///   that the seller ever looks. The button is an action label and says
-///   "Send"; what must not claim delivery is the CONFIRMATION, and the list
-///   of what was written says "handed to your Freenet node" instead. A
-///   message that is still not in the mailbox after the delivery check's
-///   automatic resend says the seller has not received it, with a "Send
-///   again" (harvest#119).
+///   local node has taken the send (after it answered for the mailbox; see
+///   `gateway::prime`). Nothing confirms the contract took it or that the
+///   seller ever looks. The button is an action label and says "Send";
+///   what must not claim delivery is the CONFIRMATION, and the list of what
+///   was written says "handed to your Freenet node" instead. Once the
+///   delivery check gives up (harvest#119) the card says which of three
+///   things is true -- it never reached the node, fresh reads show it is not
+///   in the mailbox, or Harvest could not confirm either way -- each with a
+///   "Send again".
 ///
 /// # Why a store can still be unmessageable
 ///
@@ -496,14 +498,15 @@ fn Thread(
                                  cannot deliver it twice."
                             }
                             crate::state::NotArrived::Unconfirmed => {
-                                "Harvest could not check whether this reached the seller's \
-                                 mailbox: your Freenet node did not answer. It may have \
-                                 arrived. Sending it again cannot deliver it twice."
+                                "Harvest could not confirm that this reached the seller's \
+                                 mailbox. It may have arrived. Sending it again cannot deliver \
+                                 it twice."
                             }
                         };
                         let label = match why {
                             crate::state::NotArrived::Unconfirmed => "You — not confirmed",
-                            _ => "You — not received",
+                            crate::state::NotArrived::NeverReachedNode
+                            | crate::state::NotArrived::NotInMailbox => "You — not received",
                         };
                         rsx! {
                             div { class: "card",
@@ -664,7 +667,7 @@ pub(crate) fn deliver_to_seller(
         .write()
         .register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
 
-    dispatch(store_contract_id.to_vec(), seller, sealed.clone());
+    dispatch(store_contract_id.to_vec(), seller, sealed.clone(), false);
 
     APP_STATE
         .write()
@@ -680,15 +683,24 @@ pub(crate) fn deliver_to_seller(
 /// marked as not received (with a resend) when it does not. A failure to
 /// even reach the node is also a notification, which is the only channel
 /// left once the compose box has been told the send was dispatched.
+///
+/// `_handed_over` is whether a copy of these bytes already reached the node
+/// (a resend), so a failure now is not reported as "nothing was sent".
 fn dispatch(
     _store_contract_id: Vec<u8>,
     _seller: ed25519_dalek::VerifyingKey,
     _sealed: harvest_common::mailbox::EncryptedMessage,
+    _handed_over: bool,
 ) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) =
-            crate::gateway::mailbox_ops::send_message(_store_contract_id, &_seller, _sealed).await
+        if let Err(e) = crate::gateway::mailbox_ops::send_message(
+            _store_contract_id,
+            &_seller,
+            _sealed,
+            _handed_over,
+        )
+        .await
         {
             dioxus::logger::tracing::error!("Failed to send message: {e}");
             APP_STATE
@@ -706,7 +718,7 @@ fn dispatch(
 /// gave up in the meantime is asked for again and the re-read has somewhere
 /// to land.
 fn resend(store_contract_id: &[u8], digest: &[u8; 32]) -> Result<(), String> {
-    let Some((seller, sealed)) = APP_STATE
+    let Some((seller, sealed, handed_over)) = APP_STATE
         .write()
         .take_for_resend(store_contract_id, digest)?
     else {
@@ -743,7 +755,7 @@ fn resend(store_contract_id: &[u8], digest: &[u8; 32]) -> Result<(), String> {
             app.register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
         }
     }
-    dispatch(store_contract_id.to_vec(), seller, sealed);
+    dispatch(store_contract_id.to_vec(), seller, sealed, handed_over);
     Ok(())
 }
 

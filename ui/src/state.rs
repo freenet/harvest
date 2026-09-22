@@ -6102,7 +6102,9 @@ impl AppState {
     }
 
     /// What a resend of a message the seller has not received needs: the
-    /// seller key it was first sent to, and the IDENTICAL sealed bytes.
+    /// seller key it was first sent to, the IDENTICAL sealed bytes, and
+    /// whether a copy already reached the node (everything but
+    /// [`NotArrived::NeverReachedNode`]).
     ///
     /// `Ok(None)` when the message is not marked as not received -- a resend
     /// already under way, say, from a second click before the page
@@ -6116,6 +6118,7 @@ impl AppState {
         Option<(
             ed25519_dalek::VerifyingKey,
             harvest_common::mailbox::EncryptedMessage,
+            bool,
         )>,
         String,
     > {
@@ -6134,10 +6137,11 @@ impl AppState {
             .ok_or("only a message you sent to a seller can be sent again")?;
         let seller = ed25519_dalek::VerifyingKey::from_bytes(&to)
             .map_err(|e| format!("the seller key this went to is unusable: {e}"))?;
-        if sent.not_arrived.take().is_none() {
+        let Some(why) = sent.not_arrived.take() else {
             return Ok(None);
-        }
-        Ok(Some((seller, sent.sealed.clone())))
+        };
+        let handed_over = why != NotArrived::NeverReachedNode;
+        Ok(Some((seller, sent.sealed.clone(), handed_over)))
     }
 
     /// One store's mailbox, read with whatever keys are on hand.
@@ -16432,10 +16436,14 @@ mod nonce_collision_tests {
             "the buyer is not told the seller lacks it"
         );
 
-        let (to, again) = buyer
+        let (to, again, handed_over) = buyer
             .take_for_resend(STORE, &digest)
             .expect("resend")
             .expect("marked, so resendable");
+        assert!(
+            handed_over,
+            "a copy reached the node, so a failed resend must not say otherwise"
+        );
         assert_eq!(to, seller, "addressed to a different seller's mailbox");
         assert_eq!(again, mine, "a resend must be the identical message");
         assert_eq!(
@@ -16475,11 +16483,19 @@ mod nonce_collision_tests {
             buyer.take_for_resend(STORE, &digest).is_err(),
             "found another store's message"
         );
-        let (to, again) = buyer
+        let (to, again, _) = buyer
             .take_for_resend(OTHER, &digest)
             .expect("resend")
             .expect("marked");
         assert_eq!((to, again), (second, to_second));
+
+        // A message that never reached the node is resent as never handed over.
+        buyer.mark_not_arrived(OTHER, &digest, NotArrived::NeverReachedNode);
+        let (_, _, handed_over) = buyer
+            .take_for_resend(OTHER, &digest)
+            .expect("resend")
+            .expect("marked");
+        assert!(!handed_over);
     }
 
     /// **Landing is read from the mailbox, not from the sending store**
