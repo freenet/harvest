@@ -51,6 +51,14 @@ fn handle_contract_response(response: ContractResponse) {
 
             info!("GET response for contract ({} bytes)", state_bytes.len());
 
+            // Any answer with state proves the node now holds this contract,
+            // which is what a write waiting to be sent needs to know
+            // (harvest#119). First, before the early returns below: which
+            // request asked is irrelevant to that. The woken writers run
+            // after this handler returns, so the state below is applied
+            // before any of them looks.
+            super::prime::deliver_answer(key.id(), super::prime::Primed::Held);
+
             // Offer it to the migration probe FIRST. A probe GETs a SUPERSEDED
             // generation's instance, whose state is perfectly decodable
             // store/reputation/mailbox state -- so letting it fall through to
@@ -110,6 +118,8 @@ fn handle_contract_response(response: ContractResponse) {
         // not seal -- see `migrate::seal_decision`.
         ContractResponse::NotFound { instance_id } => {
             info!("NotFound for contract {instance_id}");
+            // An answer, so a write waiting on it stops waiting (harvest#119).
+            super::prime::deliver_answer(&instance_id, super::prime::Primed::Absent);
             // Offered to the migration probe, which is the only thing that
             // acts on it. `deliver_absent` is the ONE path a `NotFound` may
             // take into a probe: every other way a GET fails to produce state
@@ -260,6 +270,43 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// **The handler is what releases a waiting write** (harvest#119). A
+    /// `NotFound` and a `GetResponse` are both answers; a write waiting on
+    /// one that the handler did not pass on would sit out the whole deadline
+    /// and then be bounced by the node, which is the bug.
+    #[test]
+    fn a_get_answer_releases_a_write_waiting_on_that_contract() {
+        use super::super::prime::{register_answer_waiter, Primed};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, WrappedState};
+
+        let absent = ContractInstanceId::new([21u8; 32]);
+        let mut waiting = register_answer_waiter(absent);
+        handle_response(Ok(HostResponse::ContractResponse(
+            ContractResponse::NotFound {
+                instance_id: absent,
+            },
+        )));
+        assert_eq!(waiting.try_recv(), Ok(Some(Primed::Absent)));
+
+        // A `GetResponse` goes on to write `APP_STATE`, which on the host
+        // panics for want of a Dioxus runtime. The answer is delivered FIRST,
+        // before that and before the migration and pointer early returns, so
+        // the waiter is released even though the rest of the arm cannot run
+        // here -- and that ordering is exactly the claim this half checks.
+        let held = ContractInstanceId::new([22u8; 32]);
+        let mut waiting = register_answer_waiter(held);
+        let _ = std::panic::catch_unwind(|| {
+            handle_response(Ok(HostResponse::ContractResponse(
+                ContractResponse::GetResponse {
+                    key: ContractKey::from_id_and_code(held, CodeHash::new([23u8; 32])),
+                    contract: None,
+                    state: WrappedState::new(vec![0xF6]),
+                },
+            )))
+        });
+        assert_eq!(waiting.try_recv(), Ok(Some(Primed::Held)));
     }
 
     /// An unsigned version-0 reputation id is not followed; a signed one is

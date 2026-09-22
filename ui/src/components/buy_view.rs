@@ -70,6 +70,8 @@ pub fn BuyForm(
         return rsx! {
             p { class: "text-muted",
                 "Your request for {listing_title} has been handed to your Freenet node. "
+                "Harvest checks that it reaches the seller's mailbox, and says so under "
+                "\"Your conversation\" if it does not. "
                 "The seller has to publish the order publicly before you can pay for it, and "
                 "it will appear under \"Your purchases\" below when they do."
             }

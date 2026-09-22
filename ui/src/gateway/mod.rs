@@ -31,14 +31,16 @@ pub mod migrate_ops;
 // which nothing inside `migrate_ops` is.
 pub mod migrate_gate;
 pub mod migrate_seal;
+// Every contract write waits for the node to hold the contract (harvest#119).
+pub mod prime;
 pub mod response_handler;
 pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
     get_contract, get_contract_by_id, put_contract, register_delegate, send_delegate_message,
-    update_contract,
 };
+pub use prime::update_contract;
 
 use dioxus::prelude::*;
 

@@ -84,8 +84,13 @@ pub async fn get_contract_by_id(contract_id: &[u8]) -> Result<(), String> {
     get_contract(&ContractInstanceId::new(id_bytes), true).await
 }
 
-/// Send a contract update (delta or full state).
-pub async fn update_contract(
+/// Put a contract update on the wire, with nothing in front of it.
+///
+/// Not for direct use: a node that does not yet hold the contract bounces
+/// this with a retry request nothing can correlate (harvest#119). Every
+/// caller goes through [`super::update_contract`], which waits for the node
+/// to answer a GET for the contract first.
+pub(super) async fn send_update(
     contract_key: &ContractKey,
     data: UpdateData<'static>,
 ) -> Result<(), String> {

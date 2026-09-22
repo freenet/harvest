@@ -39,7 +39,10 @@ use crate::messaging::{MailboxEntry, MessageContent};
 ///   local node accepts the send. Nothing confirms the contract took it or
 ///   that the seller ever looks. The button is an action label and says
 ///   "Send"; what must not claim delivery is the CONFIRMATION, and the list
-///   of what was written says "handed to your Freenet node" instead.
+///   of what was written says "handed to your Freenet node" instead. A
+///   message that is still not in the mailbox after the delivery check's
+///   automatic resend says the seller has not received it, with a "Send
+///   again" (harvest#119).
 ///
 /// # Why a store can still be unmessageable
 ///
@@ -169,6 +172,7 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
 
             if !thread.is_empty() || !unconfirmed.is_empty() {
                 Thread {
+                    store_contract_id: store_contract_id.clone(),
                     thread: thread,
                     unconfirmed: unconfirmed,
                     authored_here: authored_here,
@@ -423,6 +427,7 @@ fn Restore() -> Element {
 /// and what has not been seen landing yet.
 #[component]
 fn Thread(
+    store_contract_id: Vec<u8>,
     thread: Vec<crate::messaging::ConversationMessage>,
     unconfirmed: Vec<crate::state::SentMessage>,
     /// Entry digests this browser wrote. The ONLY authorship anything here
@@ -472,15 +477,50 @@ fn Thread(
             // separate from the thread above rather than shown as sent,
             // because "the node accepted it" and "it is in the mailbox" are
             // different claims and only the second is evidence.
+            //
+            // Once the delivery check has given up (harvest#119) it says the
+            // seller does not have it, and offers the one thing that helps.
             for message in unconfirmed.iter() {
-                div { class: "card",
-                    style: "margin-top: 0.5rem;",
-                    p { class: "text-muted", style: "font-size: 0.8rem;", "You — not yet visible" }
-                    p { style: "white-space: pre-wrap;", "{message.text}" }
-                    p { class: "text-warning",
-                        style: "font-size: 0.8rem;",
-                        "Handed to your Freenet node. It has not appeared in the seller's "
-                        "mailbox yet, so Harvest cannot say it arrived."
+                if message.not_arrived {
+                    {
+                        let store_contract_id = store_contract_id.clone();
+                        let digest = message.digest;
+                        rsx! {
+                            div { class: "card",
+                                style: "margin-top: 0.5rem;",
+                                p { class: "text-muted", style: "font-size: 0.8rem;", "You — not received" }
+                                p { style: "white-space: pre-wrap;", "{message.text}" }
+                                p { class: "text-warning",
+                                    style: "font-size: 0.8rem;",
+                                    "The seller has not received this yet. Harvest sent it more than "
+                                    "once and it is still not in their mailbox. Sending it again "
+                                    "cannot deliver it twice."
+                                }
+                                button {
+                                    class: "btn btn-sm",
+                                    onclick: move |_| {
+                                        if let Err(e) = resend(&store_contract_id, &digest) {
+                                            APP_STATE
+                                                .write()
+                                                .notifications
+                                                .push(format!("Your message could not be sent again: {e}"));
+                                        }
+                                    },
+                                    "Send again"
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    div { class: "card",
+                        style: "margin-top: 0.5rem;",
+                        p { class: "text-muted", style: "font-size: 0.8rem;", "You — not yet visible" }
+                        p { style: "white-space: pre-wrap;", "{message.text}" }
+                        p { class: "text-warning",
+                            style: "font-size: 0.8rem;",
+                            "Handed to your Freenet node. It has not appeared in the seller's "
+                            "mailbox yet, so Harvest cannot say it arrived."
+                        }
                     }
                 }
             }
@@ -606,7 +646,7 @@ pub(crate) fn deliver_to_seller(
         .write()
         .register_store_mailbox(store_contract_id, mailbox.id().as_bytes());
 
-    dispatch(seller, sealed.clone());
+    dispatch(store_contract_id.to_vec(), seller, sealed.clone());
 
     APP_STATE
         .write()
@@ -614,19 +654,24 @@ pub(crate) fn deliver_to_seller(
     Ok(())
 }
 
-/// Hand a sealed message to the local node.
+/// Hand a sealed message to the local node, and check that it arrives.
 ///
-/// Fire-and-forget, and the caller must not read it as delivery: see
-/// `gateway::mailbox_ops::send_message`. A failure to even reach the node is
-/// reported as a notification, which is the only channel left once the
-/// compose box has been told the send was dispatched.
+/// The caller must not read this as delivery: see
+/// `gateway::mailbox_ops::send_message`. What the buyer learns comes later,
+/// from the mailbox: the message moves into the thread when it lands, or is
+/// marked as not received (with a resend) when it does not. A failure to
+/// even reach the node is also a notification, which is the only channel
+/// left once the compose box has been told the send was dispatched.
 fn dispatch(
+    _store_contract_id: Vec<u8>,
     _seller: ed25519_dalek::VerifyingKey,
     _sealed: harvest_common::mailbox::EncryptedMessage,
 ) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::mailbox_ops::send_message(&_seller, _sealed).await {
+        if let Err(e) =
+            crate::gateway::mailbox_ops::send_message(_store_contract_id, &_seller, _sealed).await
+        {
             dioxus::logger::tracing::error!("Failed to send message: {e}");
             APP_STATE
                 .write()
@@ -634,6 +679,16 @@ fn dispatch(
                 .push(format!("Your message could not be sent: {e}"));
         }
     });
+}
+
+/// Send a message the seller has not received again: the identical sealed
+/// bytes, never a fresh seal, so it cannot arrive twice (harvest#119).
+fn resend(store_contract_id: &[u8], digest: &[u8; 32]) -> Result<(), String> {
+    let (seller, sealed) = APP_STATE
+        .write()
+        .take_for_resend(store_contract_id, digest)?;
+    dispatch(store_contract_id.to_vec(), seller, sealed);
+    Ok(())
 }
 
 /// Why this store cannot be messaged, said plainly and with the compose box

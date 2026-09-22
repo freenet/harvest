@@ -85,86 +85,179 @@ pub fn mailbox_delta_bytes(messages: Vec<EncryptedMessage>) -> Result<Vec<u8>, S
     harvest_common::to_cbor(&messages).map_err(|e| format!("serialize mailbox delta: {e}"))
 }
 
-/// Write one encrypted message into a seller's mailbox.
+/// How long after handing a message to the node the buyer's copy of the
+/// mailbox is re-read to see whether the message is in it.
+///
+/// Long enough for an update the node applied to be in its own copy (it is
+/// applied locally before it is forwarded), short enough that a buyer who is
+/// still looking at the page learns about a lost message while they can do
+/// something about it.
+pub const DELIVERY_CHECK_AFTER_MS: u32 = 20_000;
+
+/// How many times the IDENTICAL sealed bytes are handed to the node again,
+/// automatically, before the buyer is told the seller does not have them.
+pub const AUTOMATIC_RESENDS: u8 = 1;
+
+/// What to do after a delivery check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryStep {
+    /// The message is in the mailbox. Nothing more to do.
+    Landed,
+    /// Not there yet: hand the same bytes to the node again.
+    SendAgain,
+    /// Not there after every automatic attempt: say so, and offer to resend.
+    TellTheBuyer,
+}
+
+/// `sends` is how many times these bytes have been handed to the node so far.
+pub fn after_delivery_check(landed: bool, sends: u8) -> DeliveryStep {
+    if landed {
+        DeliveryStep::Landed
+    } else if sends <= AUTOMATIC_RESENDS {
+        DeliveryStep::SendAgain
+    } else {
+        DeliveryStep::TellTheBuyer
+    }
+}
+
+/// What delivering one message needs from the world. A trait so the retry
+/// behaviour runs on the host; see `NodeDelivery` for the real one.
+pub(crate) trait Delivery {
+    /// Hand `message` to the node.
+    async fn write(&self, message: &EncryptedMessage) -> Result<(), String>;
+    /// Wait [`DELIVERY_CHECK_AFTER_MS`], then re-read the mailbox from the
+    /// node.
+    async fn wait_and_reread(&self);
+    /// Whether the message with this digest is in the mailbox as last read.
+    fn landed(&self, digest: &[u8; 32]) -> bool;
+    /// The message did not arrive: record it so the buyer is told and can
+    /// resend. `why` is set when the node could not even be reached.
+    fn not_arrived(&self, digest: &[u8; 32], why: Option<String>);
+}
+
+/// Hand a sealed message to the node, check that it reached the mailbox,
+/// re-send the identical bytes if it did not, and say so if it still has
+/// not.
+///
+/// # Why a re-send is safe here, and a re-seal would not be
+///
+/// Every attempt hands the node the SAME `EncryptedMessage`. The mailbox
+/// keys entries by `entry_digest`, so a second copy of bytes that did land is
+/// merged away rather than shown twice. Sealing again would produce a fresh
+/// nonce and a second, distinct message. Nothing here holds a key it could
+/// seal with, which is the point.
+///
+/// # What "landed" means
+///
+/// That the message is in the buyer's own node's copy of the mailbox, read
+/// back after waiting. An update is applied by the local node before it is
+/// forwarded, so a message missing from that copy was not applied at all --
+/// which is what harvest#119 looked like from the outside. Whether the
+/// network then carries it to the seller's node is not observable from here.
+pub(crate) async fn deliver(io: &impl Delivery, message: EncryptedMessage) {
+    let digest = harvest_common::mailbox::entry_digest(&message);
+    let mut sends: u8 = 0;
+    loop {
+        sends = sends.saturating_add(1);
+        if let Err(e) = io.write(&message).await {
+            io.not_arrived(&digest, Some(e));
+            return;
+        }
+        io.wait_and_reread().await;
+        match after_delivery_check(io.landed(&digest), sends) {
+            DeliveryStep::Landed => return,
+            DeliveryStep::SendAgain => continue,
+            DeliveryStep::TellTheBuyer => {
+                io.not_arrived(&digest, None);
+                return;
+            }
+        }
+    }
+}
+
+/// Write one encrypted message into a seller's mailbox, and see that it
+/// arrives.
 ///
 /// # What "sent" means here, and what it does not
 ///
-/// `update_contract` resolves when the WebSocket SEND to the local node
-/// succeeds. It does not mean the update reached the contract, that the
-/// contract accepted it, or that the seller will ever see it -- the node
-/// answers an `UpdateResponse` with no correlation id, so there is nothing to
-/// match a confirmation against even if one arrived. Callers must not report
-/// delivery; see `components::message_view` for the wording that does not.
+/// A write resolves when the WebSocket SEND to the local node succeeds. The
+/// node answers an `UpdateResponse` with no correlation id, so nothing here
+/// can match a confirmation or a rejection to this send. The only delivery
+/// signal Harvest has is the message turning up in the mailbox, which
+/// [`deliver`] checks for; callers must not report delivery before that. See
+/// `components::message_view` for the wording.
 ///
-/// # The GET first: what is known, what is not, and how it fails
+/// # A buyer's node usually does not hold the seller's mailbox
 ///
-/// **What is known.** A buyer has never touched this contract, so their node
-/// very likely does not hold it -- and an update has to be applied by the
-/// contract's own WASM, which the node must have. A client GET primes the
-/// local store, so issuing one first is the cheapest way to give the node the
-/// contract it is about to be asked to update.
+/// A node cannot apply an update to a contract it does not hold; it bounces
+/// it and asks the client to retry, uncorrelated (harvest#119). Every write
+/// therefore waits for the node to answer a GET for the mailbox first --
+/// `gateway::prime`, which all contract writes go through -- and [`deliver`]
+/// covers what priming cannot: a GET that never answers, after which the
+/// write goes out anyway and may be bounced.
 ///
-/// **What is NOT known, and cannot be established from this repository.**
-/// Whether the update succeeds when the node does not yet hold the contract.
-/// It might fetch the contract itself; it might refuse. Nothing here can
-/// answer that, because answering it needs a running node, and the only
-/// harness that talks to one is `tests/rehearsal/`, which is compile-checked
-/// in CI and never executed there. **This path has not been run against a
-/// live node.**
-///
-/// **The ordering is not guaranteed.** Both `get_contract` and
-/// `update_contract` resolve when the WebSocket SEND succeeds, not when the
-/// node has done anything, so the update can be dispatched while the fetch is
-/// still in flight. There is nothing to await: a GET that dead-ends produces
-/// no response at all -- which is why `state::subscribe_to_own_store` needs a
-/// deadline before it can conclude anything -- so "wait for the GET" means
-/// "block the buyer's message behind a timeout that usually fires for a
-/// reason unrelated to them".
-///
-/// **What it looks like when the race is lost.** The node rejects or drops
-/// the update. `update_contract` has already returned `Ok` (the send
-/// succeeded), so the UI shows the message as handed over. It never appears
-/// in the mailbox, so it stays in the "not yet visible" list
-/// (`state::AppState::unconfirmed_sent`) indefinitely, and the seller never
-/// receives it. The buyer is not told it failed, because nothing told this
-/// code it failed -- an `UpdateResponse` carries no correlation id, so even a
-/// rejection that did come back could not be matched to this send.
-///
-/// **What must NOT be done about it here.** Not a sleep, and not a retry
-/// loop: both would paper over a question that has an answer, and a retry
-/// that re-sends a message the node actually did apply would deposit it
-/// twice (deduped by nonce, but only because the nonce is reused -- a fresh
-/// seal would not be). Characterising this needs the rehearsal harness and a
-/// node; until then it is a stated residual, recorded in
-/// `docs/untested-invariants.md`.
-///
-/// The GET does NOT subscribe. Subscription is a separate decision made once,
-/// on the buyer's first message, by `components::message_view` -- a reader
-/// who never writes advertises no interest in anybody's mailbox.
+/// Subscription is a separate decision made once, on the buyer's first
+/// message, by `components::message_view` -- a reader who never writes
+/// advertises no interest in anybody's mailbox.
 #[cfg(target_arch = "wasm32")]
 pub async fn send_message(
+    store_contract_id: Vec<u8>,
     owner_verifying_key: &ed25519_dalek::VerifyingKey,
     message: EncryptedMessage,
 ) -> Result<(), String> {
     let key = mailbox_contract_key(owner_verifying_key)?;
+    deliver(
+        &NodeDelivery {
+            store_contract_id,
+            key,
+        },
+        message,
+    )
+    .await;
+    Ok(())
+}
 
-    // Failure here is logged rather than returned: the update below is worth
-    // attempting either way, and a buyer told "could not send" because a
-    // priming fetch failed would be told something misleading.
-    if let Err(e) = super::get_contract(key.id(), false).await {
-        dioxus::logger::tracing::warn!(
-            "Could not prime the seller's mailbox contract before writing to it: {e}"
-        );
+/// The real [`Delivery`]: this node, and `APP_STATE` for what it holds.
+#[cfg(target_arch = "wasm32")]
+struct NodeDelivery {
+    store_contract_id: Vec<u8>,
+    key: ContractKey,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Delivery for NodeDelivery {
+    async fn write(&self, message: &EncryptedMessage) -> Result<(), String> {
+        write_to_mailbox(&self.key, message.clone()).await
     }
-
-    write_to_mailbox(&key, message).await
+    async fn wait_and_reread(&self) {
+        gloo_timers::future::TimeoutFuture::new(DELIVERY_CHECK_AFTER_MS).await;
+        super::prime::reread(*self.key.id()).await;
+    }
+    fn landed(&self, digest: &[u8; 32]) -> bool {
+        use dioxus::prelude::ReadableExt;
+        super::APP_STATE
+            .read()
+            .sent_message_landed(&self.store_contract_id, digest)
+    }
+    fn not_arrived(&self, digest: &[u8; 32], why: Option<String>) {
+        use dioxus::prelude::WritableExt;
+        let mut app = super::APP_STATE.write();
+        app.mark_not_arrived(&self.store_contract_id, digest);
+        if let Some(e) = why {
+            dioxus::logger::tracing::error!("Failed to send message: {e}");
+            app.notifications
+                .push(format!("Your message could not be sent: {e}"));
+        }
+    }
 }
 
 /// Write into a mailbox whose key is already known.
 ///
-/// The seller's own replies take this path: they are already subscribed to
-/// their mailbox, so there is nothing to prime, and the id comes from their
-/// delegate's registration rather than from a derivation.
+/// The seller's own replies take this path: the id comes from their
+/// delegate's registration rather than from a derivation. They are
+/// subscribed to their own mailbox, so the priming every write does is
+/// answered from their node's own store. No delivery check: the seller's
+/// Inbox shows what is in the mailbox, their own replies included.
 #[cfg(target_arch = "wasm32")]
 pub async fn reply_to_mailbox(
     mailbox_instance_id: &[u8],
@@ -267,6 +360,109 @@ mod tests {
         let two = mailbox_contract_key(&SigningKey::from_bytes(&[10u8; 32]).verifying_key())
             .expect("derive");
         assert_ne!(one, two);
+    }
+
+    /// A mailbox that takes (or refuses) writes as the test says.
+    struct FakeMailbox {
+        /// Digest of every message handed to the node, in order.
+        writes: std::cell::RefCell<Vec<[u8; 32]>>,
+        /// The write (1-based) after which the message is in the mailbox, if
+        /// any.
+        lands_after: Option<usize>,
+        write_fails: bool,
+        not_arrived: std::cell::RefCell<Vec<([u8; 32], Option<String>)>>,
+    }
+
+    impl FakeMailbox {
+        fn new(lands_after: Option<usize>) -> Self {
+            Self {
+                writes: Default::default(),
+                lands_after,
+                write_fails: false,
+                not_arrived: Default::default(),
+            }
+        }
+    }
+
+    impl Delivery for FakeMailbox {
+        async fn write(&self, message: &EncryptedMessage) -> Result<(), String> {
+            self.writes
+                .borrow_mut()
+                .push(harvest_common::mailbox::entry_digest(message));
+            if self.write_fails {
+                Err("not connected to gateway".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn wait_and_reread(&self) {}
+        fn landed(&self, _digest: &[u8; 32]) -> bool {
+            self.lands_after
+                .is_some_and(|n| self.writes.borrow().len() >= n)
+        }
+        fn not_arrived(&self, digest: &[u8; 32], why: Option<String>) {
+            self.not_arrived.borrow_mut().push((*digest, why));
+        }
+    }
+
+    fn a_message() -> EncryptedMessage {
+        EncryptedMessage {
+            conversation_id: harvest_common::mailbox::ConversationId([4u8; 32]),
+            sender_public_key: vec![5u8; 32],
+            ciphertext: vec![6u8; 48],
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            nonce: [7u8; 24],
+        }
+    }
+
+    /// **harvest#119, the part priming cannot cover.** A write the node
+    /// bounced is re-sent -- the identical bytes, once, automatically -- and
+    /// if the message is still missing the buyer is told rather than left
+    /// believing it arrived.
+    #[test]
+    fn a_message_that_never_lands_is_resent_once_then_reported() {
+        let message = a_message();
+        let digest = harvest_common::mailbox::entry_digest(&message);
+        let mailbox = FakeMailbox::new(None);
+        futures::executor::block_on(deliver(&mailbox, message));
+
+        assert_eq!(
+            *mailbox.writes.borrow(),
+            vec![digest; 1 + AUTOMATIC_RESENDS as usize],
+            "every attempt must hand the node the SAME bytes, and stop"
+        );
+        assert_eq!(*mailbox.not_arrived.borrow(), vec![(digest, None)]);
+    }
+
+    /// The resend is what rescues a first write the node bounced.
+    #[test]
+    fn a_message_that_lands_on_the_resend_is_not_reported() {
+        let mailbox = FakeMailbox::new(Some(2));
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(mailbox.writes.borrow().len(), 2);
+        assert!(mailbox.not_arrived.borrow().is_empty());
+    }
+
+    /// A message that landed is not sent again.
+    #[test]
+    fn a_message_that_lands_first_time_is_sent_once() {
+        let mailbox = FakeMailbox::new(Some(1));
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(mailbox.writes.borrow().len(), 1);
+        assert!(mailbox.not_arrived.borrow().is_empty());
+    }
+
+    /// A node that cannot be reached is reported at once, with the reason,
+    /// and not retried into the same failure.
+    #[test]
+    fn a_write_that_cannot_reach_the_node_is_reported_with_its_reason() {
+        let mut mailbox = FakeMailbox::new(None);
+        mailbox.write_fails = true;
+        futures::executor::block_on(deliver(&mailbox, a_message()));
+        assert_eq!(mailbox.writes.borrow().len(), 1);
+        let reported = mailbox.not_arrived.borrow();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].1.as_deref(), Some("not connected to gateway"));
     }
 
     /// The delta a buyer sends has to be the shape the mailbox contract
