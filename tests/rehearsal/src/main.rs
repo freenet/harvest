@@ -1034,6 +1034,7 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
             );
             assert_eq!(titles(&s), vec!["newest-listing".to_string()]);
             assert_eq!(s.info.info.store_name, "Newest Generation Store");
+            assert!(s.listing_statuses.is_empty(), "none was planted, none appears");
             for l in &s.listings.listings {
                 l.verify(&vk).expect("a carried listing still verifies");
             }

@@ -27892,6 +27892,11 @@ mod buy_flow_tests {
         assert!(card.paid.is_some(), "the card offers the complaint");
         assert_eq!(
             paid_state.complaint_refusal(STORE, &card),
+            None,
+            "open on the card"
+        );
+        assert_eq!(
+            paid_state.complaint_refusal(STORE, &card),
             paid_state.kept_complaint_refusal(&owner, &unpaid_order.order.id),
             "with the same answer as the kept row"
         );

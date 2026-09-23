@@ -284,7 +284,7 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
     // the request at all and the node reports it as an error; it then holds
     // no RSA key, and the RSA check compares two absences (said in `check`).
     // The RSA import is still exercised by any scenario seeding V21 or older.
-    match node
+    let rsa_minted = match node
         .ask_shape(&key, harvest_common::to_cbor(&LegacyRequest::InitReputationKeys { ghostkey_fingerprint: FP.into() }).unwrap())
         .await
     {
@@ -292,12 +292,14 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
             if let Ok(HarvestDelegateResponse::Error { message }) = harvest_common::from_cbor::<HarvestDelegateResponse>(&answer) {
                 panic!("the seeded generation refused InitReputationKeys: {message}");
             }
+            true
         }
         Err(e) if e.contains("InitReputationKeys") => {
             println!("the seeded generation cannot mint an RSA key (harvest#53 Phase C); none seeded");
+            false
         }
         Err(e) => panic!("InitReputationKeys: {e}"),
-    }
+    };
     node.harvest(
         &key,
         HarvestDelegateRequest::RegisterStore {
@@ -341,6 +343,9 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
     }
     let seeded = read_back(&mut node, &key).await;
     assert!(!seeded.stores.is_empty() && !seeded.xpub.is_empty());
+    // A generation that minted must hold the key it minted, so the RSA check
+    // in `check` compares two absences only for one that could not.
+    assert_eq!(!seeded.rsa_public_key_der.is_empty(), rsa_minted, "the seeded RSA key");
     std::fs::write(out, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
     println!("seeded {key}: {seeded:#?}");
 }
