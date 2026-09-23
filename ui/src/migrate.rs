@@ -384,6 +384,32 @@ pub fn store_candidate_ids(
     Ok(by_generation.into_iter().map(|(_, id)| id).collect())
 }
 
+/// The store's instance ids at every superseded generation addressed by the
+/// store CODE (V17 on), newest first, for `params` (harvest#138).
+///
+/// A buyer's conversation is kept under the id the store had when the buyer
+/// opened it, so after the store contract re-keys it sits under one of these,
+/// and the app recalls it from them as well as from the current id. Only the
+/// code-addressed generations can be derived from what a buyer holds (the
+/// store's code). The whole-key generations (V1 to V16) were addressed by the
+/// seller's key and predate every conversation a buyer can have kept, since
+/// no store but test ones existed before the code; they are not recalled.
+pub fn earlier_code_store_ids(params: &StoreParameters) -> Result<Vec<ContractInstanceId>, String> {
+    let bytes = encode_params(params)?;
+    let mut by_generation: Vec<(u32, ContractInstanceId)> = store_lineage()
+        .iter()
+        .filter(|e| store_param_shape(e.generation) == StoreParamShape::Code)
+        .map(|e| {
+            (
+                e.generation,
+                contract_id_from_code_hash(&e.code_hash, &bytes),
+            )
+        })
+        .collect();
+    by_generation.sort_by_key(|(generation, _)| core::cmp::Reverse(*generation));
+    Ok(by_generation.into_iter().map(|(_, id)| id).collect())
+}
+
 /// [`store_candidate_ids`] as the ordering-proof type `ProbeSession` wants.
 ///
 /// `assume_ordered` is safe here for the reason it asks for: the list is sorted

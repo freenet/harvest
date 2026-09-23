@@ -305,6 +305,16 @@ pub struct BuyerConversation {
     /// only place the derivation exists. See that function for the hole it
     /// closes.
     order_binding: [u8; 32],
+    /// The store contract id the delegate keeps this conversation under,
+    /// when it is not the id of the store it is shown with (harvest#138).
+    ///
+    /// A conversation is kept under the id the store had when it was
+    /// opened. After the store's contract re-keys it is recalled from that
+    /// earlier id and shown with the store's current one, and a request
+    /// about it (back up, mark saved, forget) must name the id it is kept
+    /// under, or the delegate answers that it holds no such conversation.
+    /// `None` for one kept under the store's current id.
+    pub kept_under: Option<Vec<u8>>,
 }
 
 impl BuyerConversation {
@@ -347,6 +357,7 @@ impl BuyerConversation {
             // Nothing has been asked yet, let alone answered.
             kept: false,
             order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
+            kept_under: None,
         })
     }
 
@@ -377,6 +388,7 @@ impl BuyerConversation {
             // is free to sign all-zeros and would then match every
             // conversation in that state. See `usable_order_binding`.
             order_binding: recalled.order_binding,
+            kept_under: None,
         }
     }
 
