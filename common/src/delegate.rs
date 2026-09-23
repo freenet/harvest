@@ -363,6 +363,36 @@ pub enum HarvestDelegateRequest {
     /// with none): the records are keyed by store code alone.
     ListRememberedStores,
 
+    // === The buyer's own copy of a paid order (harvest#53 Phase C) ===
+    /// Keep this buyer's copy of one of their PAID orders, so a complaint
+    /// about it never depends on the seller keeping the order in the store
+    /// (review round 1 of #143, P1-2).
+    ///
+    /// # Why the buyer needs a copy
+    ///
+    /// The complaint carries the paid order as its own evidence, and the
+    /// buyer reads the order out of the store's state. The seller controls
+    /// what that state keeps: `store::enforce_order_cap` drops the oldest
+    /// orders past `MAX_ORDERS`, so 4,096 newer unpaid orders -- free to
+    /// issue -- push a paid one out, and with it the buyer's evidence. A
+    /// copy kept here, once seen, survives that.
+    ///
+    /// # What is refused
+    ///
+    /// Anything that is not a `Paid` order verifying under `store_key`
+    /// (terms, and payment evidence against the bridges the seller signed
+    /// in), or whose encoding exceeds `MAX_PAID_PURCHASE_BYTES`; and a new
+    /// order once `MAX_PAID_PURCHASES` are kept. Idempotent: a copy already
+    /// held for that order id is kept as it is.
+    ///
+    /// Answered with [`HarvestDelegateResponse::PaidPurchases`], the whole
+    /// list.
+    RememberPaidPurchase { purchase: PaidPurchase },
+
+    /// Every paid order this node keeps a copy of. Answered with
+    /// [`HarvestDelegateResponse::PaidPurchases`].
+    ListPaidPurchases,
+
     // === Store keys (harvest#93, revision 2) ===
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
     /// this delegate on this device. Answered with
@@ -458,6 +488,32 @@ pub enum HarvestDelegateRequest {
         store_verifying_key: [u8; 32],
     },
 }
+
+/// A buyer's own copy of one of their paid orders (harvest#53 Phase C). See
+/// [`HarvestDelegateRequest::RememberPaidPurchase`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PaidPurchase {
+    /// The store key the order's terms are signed by: the store's identity,
+    /// which outlives any one store contract generation (a re-key moves the
+    /// contract id, never this), and the key the store's reputation record
+    /// is addressed by.
+    pub store_key: [u8; 32],
+    /// The buyer conversation the order was issued to (its routing tag),
+    /// whose receipt key the order names.
+    pub conversation: [u8; 32],
+    /// The order at `Paid`, with its evidence.
+    pub order: crate::payment::AuthorizedOrder,
+}
+
+/// How many paid orders one node keeps a copy of. Past it a new one is
+/// refused out loud, not an old one dropped. A complaint is only offered
+/// within weeks of payment, so this is years of purchases.
+pub const MAX_PAID_PURCHASES: usize = 1024;
+
+/// The largest paid order kept, in bytes of its CBOR encoding. A genuine
+/// order with its on-chain evidence is a few kilobytes; the bound is what
+/// makes [`MAX_PAID_PURCHASES`] a bound on bytes.
+pub const MAX_PAID_PURCHASE_BYTES: usize = 64 * 1024;
 
 /// A store this node remembers visiting.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -668,6 +724,13 @@ pub enum HarvestDelegateResponse {
     /// it believes it asked for.
     RememberedStores {
         stores: Vec<RememberedStore>,
+    },
+
+    /// Every paid order this node keeps a copy of, after whichever
+    /// `RememberPaidPurchase` or `ListPaidPurchases` asked. The whole list,
+    /// for the reason [`Self::RememberedStores`] gives.
+    PaidPurchases {
+        purchases: Vec<PaidPurchase>,
     },
 
     /// Whether the migration named by `marker` is already recorded as done.
@@ -1265,9 +1328,11 @@ mod tests {
             R::PredecessorMarkerRecorded { .. } => (24, false),
             R::MigratedSecretImported { .. } => (25, false),
             R::EncryptionKeyAbsent { .. } => (26, false),
+            // Public orders the buyer already read out of store state.
+            R::PaidPurchases { .. } => (27, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 27;
+    const RESPONSE_VARIANTS: usize = 28;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1303,9 +1368,11 @@ mod tests {
             Q::RecordPredecessorMarker { .. } => (23, false),
             // Any secret this delegate holds, private keys included.
             Q::ImportMigratedSecret { .. } => (24, true),
+            Q::RememberPaidPurchase { .. } => (25, false),
+            Q::ListPaidPurchases => (26, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 25;
+    const REQUEST_VARIANTS: usize = 27;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1500,7 +1567,18 @@ mod tests {
                     record_public_key: vec![21u8; 8],
                 }),
             },
+            R::PaidPurchases {
+                purchases: vec![paid_purchase()],
+            },
         ]
+    }
+
+    fn paid_purchase() -> PaidPurchase {
+        PaidPurchase {
+            store_key: [17u8; 32],
+            conversation: [1u8; 32],
+            order: crate::test_orders::paid(1),
+        }
     }
 
     fn request_samples() -> Vec<HarvestDelegateRequest> {
@@ -1634,6 +1712,10 @@ mod tests {
                 request_id: 47,
                 store_verifying_key: [17u8; 32],
             },
+            Q::RememberPaidPurchase {
+                purchase: paid_purchase(),
+            },
+            Q::ListPaidPurchases,
         ]
     }
 
