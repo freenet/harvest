@@ -391,8 +391,8 @@ next load of Harvest.
   complaints until its subscription catches up. The buyer's re-assert (3.4) pushes its
   complaint back into the network on every load.
 - **Another device.** A conversation restored from a backup string on another device does not
-  carry the kept purchase. There, the complaint rests on the store's copy, which is auto-kept
-  once seen paid (3.3), until the store drops it.
+  carry the kept purchase. There, the complaint rests on the store's copy (the fallback in 3.3)
+  until the buyer files, which keeps it, or the store drops it.
 - **A buyer who never returns after a re-key.** Their complaint stays on the old record, and
   readers look at the new one. A reader-driven legacy walk (#145) would close this.
 - **Kept-purchase list size.** 1,024 records at the derived bound would be about 290 MiB. That
