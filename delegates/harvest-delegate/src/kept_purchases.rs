@@ -603,6 +603,27 @@ mod tests {
         );
     }
 
+    /// **A paid copy is kept only with the proof a complaint can carry**: the
+    /// canonical minimal one. A kept paid copy is never replaced, so a padded
+    /// one kept here would block the complaint for good. Red if `check`
+    /// stops requiring `verify_minimal_proof`.
+    #[test]
+    fn a_paid_copy_with_padded_evidence_is_refused() {
+        use harvest_common::payment::OrderPaymentProof;
+        let mut secrets = holding(1);
+        let mut padded = to_keep(1, 1, OrderStatus::Paid, 1);
+        let Some(OrderPaymentProof::OnChain(proof)) = padded.order.payment_proof.as_mut() else {
+            panic!("on chain");
+        };
+        proof.claims.push(proof.claims[0].clone());
+        padded
+            .order
+            .verify(&store_signing_key().verifying_key())
+            .expect("precondition: the padded copy verifies");
+        let (_, reason) = refusal(keep(&mut secrets, padded));
+        assert!(reason.contains("not the one a complaint carries"), "{reason}");
+    }
+
     /// No complaint is kept about an unpaid order.
     #[test]
     fn a_complaint_about_an_unpaid_order_is_refused() {

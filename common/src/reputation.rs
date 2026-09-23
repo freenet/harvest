@@ -838,10 +838,13 @@ mod tests {
         unconfirmed.required_confirmations = 0;
         let mut distant = order(1);
         distant.required_confirmations = crate::payment::MAX_REQUIRED_CONFIRMATIONS + 1;
+        let mut lightning = order(1);
+        lightning.payment_hash = Some([5u8; 32]);
         for (what, o, needle) in [
             ("a zero amount", free, "for nothing"),
             ("zero confirmations", unconfirmed, "before any confirmation"),
             ("too many confirmations", distant, "more than the"),
+            ("a Lightning order", lightning, "not an on-chain order"),
         ] {
             let o = o.with_derived_id();
             let c = complaint_by(
