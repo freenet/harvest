@@ -1902,19 +1902,20 @@ pub fn minimal_on_chain_proof(
     // it and whether it is already as deep as the order asks.
     let mut qualifying: Vec<(bool, u64, OutPoint, &SignedClaim)> = Vec::new();
     for (outpoint, group) in &by_outpoint {
-        let Some(status @ OutpointStatus::Confirmed {
-            value_sats, anchor, ..
-        }) = fold_outpoint_status(group.iter().map(|(_, body)| body))
+        let Some(
+            status @ OutpointStatus::Confirmed {
+                value_sats, anchor, ..
+            },
+        ) = fold_outpoint_status(group.iter().map(|(_, body)| body))
         else {
             continue;
         };
         if !window.contains(&anchor.height) {
             continue;
         }
-        let Some((decider, _)) = group
-            .iter()
-            .find(|(_, body)| fold_outpoint_status(std::iter::once(body)).as_ref() == Some(&status))
-        else {
+        let Some((decider, _)) = group.iter().find(|(_, body)| {
+            fold_outpoint_status(std::iter::once(body)).as_ref() == Some(&status)
+        }) else {
             continue;
         };
         let deep_enough = status.confirmations_at(tip_height) >= order.required_confirmations;

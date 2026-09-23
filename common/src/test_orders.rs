@@ -213,9 +213,7 @@ pub fn compact_envelope(envelope: &[u8]) -> Vec<u8> {
             };
             let bytes: Vec<u8> = items
                 .iter()
-                .map(|item| {
-                    u8::try_from(item.as_integer().expect("a byte")).expect("a byte")
-                })
+                .map(|item| u8::try_from(item.as_integer().expect("a byte")).expect("a byte"))
                 .collect();
             *field = Value::Bytes(bytes);
             rewrote = true;

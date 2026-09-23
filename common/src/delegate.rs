@@ -1875,15 +1875,24 @@ mod tests {
         // own framing around them once compacted.
         let mut terms = order(1);
         terms.seller_fingerprint = String::new();
-        let base = crate::to_cbor(&terms.clone().with_derived_id()).expect("encodes").len();
+        let base = crate::to_cbor(&terms.clone().with_derived_id())
+            .expect("encodes")
+            .len();
         terms.seller_fingerprint = "s".repeat(MAX_ORDER_ENVELOPE_BYTES - base - 128);
         let terms = terms.with_derived_id();
         let terms_len = crate::to_cbor(&terms).expect("encodes").len();
-        assert!(terms_len > MAX_ORDER_ENVELOPE_BYTES - 256 && terms_len <= MAX_ORDER_ENVELOPE_BYTES);
+        assert!(
+            terms_len > MAX_ORDER_ENVELOPE_BYTES - 256 && terms_len <= MAX_ORDER_ENVELOPE_BYTES
+        );
 
-        let mut paid = crate::test_orders::authorized(&store_key(), terms.clone(), OrderStatus::Paid);
+        let mut paid =
+            crate::test_orders::authorized(&store_key(), terms.clone(), OrderStatus::Paid);
         let mut envelope = compact_envelope(&paid.scoped_payload);
-        assert!(envelope.len() <= MAX_ORDER_ENVELOPE_BYTES, "{}", envelope.len());
+        assert!(
+            envelope.len() <= MAX_ORDER_ENVELOPE_BYTES,
+            "{}",
+            envelope.len()
+        );
         envelope.resize(MAX_ORDER_ENVELOPE_BYTES, 0);
         paid.signature = store_key().sign(&envelope).to_bytes().to_vec();
         paid.scoped_payload = envelope;

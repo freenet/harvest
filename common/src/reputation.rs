@@ -414,8 +414,7 @@ impl ReputationStateV1 {
 mod tests {
     use super::*;
     use crate::test_orders::{
-        authorized, buyer_key, complaint, complaint_by, order, paid, proof, sign_scoped,
-        store_key,
+        authorized, buyer_key, complaint, complaint_by, order, paid, proof, sign_scoped, store_key,
     };
     use ed25519_dalek::SigningKey;
 
@@ -746,11 +745,7 @@ mod tests {
         unconfirmed.required_confirmations = 0;
         for (what, o, needle) in [
             ("a zero amount", free, "for nothing"),
-            (
-                "zero confirmations",
-                unconfirmed,
-                "before any confirmation",
-            ),
+            ("zero confirmations", unconfirmed, "before any confirmation"),
         ] {
             let o = o.with_derived_id();
             let c = complaint_by(
