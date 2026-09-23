@@ -2301,10 +2301,8 @@ fn dummy_complaint() -> Complaint {
             status_signature: None,
         },
         category: harvest_common::feedback::FeedbackCategory::NonDelivery,
-        block_ref: freenet_bitcoin_common::BlockAnchor {
-            height: 100,
-            hash: freenet_bitcoin_common::BlockHash([4u8; 32]),
-        },
+        block_height: 100,
+        paid_height: 90,
         scoped_payload: vec![0u8; 8],
         buyer_signature: vec![0u8; 64],
     }

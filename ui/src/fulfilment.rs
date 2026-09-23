@@ -176,42 +176,11 @@ pub enum OrderStage {
 /// claim again on each render would cost an Ed25519 check and an SPV proof
 /// per claim, per card, per frame.
 pub fn paid_height(order: &AuthorizedOrder) -> Option<u32> {
-    if order.status != OrderStatus::Paid {
-        return None;
-    }
-    let OrderPaymentProof::OnChain(proof) = order.payment_proof.as_ref()? else {
-        // A Lightning payment has no confirmation height at all. No
-        // Lightning order is issued by this build.
-        return None;
-    };
-    let window = order.order.payment_window()?;
-    let bodies: Vec<freenet_bitcoin_common::ClaimBody> = proof
-        .claims
-        .iter()
-        .filter_map(|claim| claim.body().ok())
-        .collect();
-    // The same fold the verifier runs, so the height read here is the one the
-    // winning confirmation of each outpoint names.
-    let mut confirmed: Vec<(u32, u64)> = freenet_bitcoin_common::fold_claims_by_outpoint(&bodies)
-        .into_values()
-        .filter_map(|status| match status {
-            freenet_bitcoin_common::OutpointStatus::Confirmed {
-                value_sats,
-                anchor,
-                attested_depth: _,
-            } if window.contains(&anchor.height) => Some((anchor.height, value_sats)),
-            _ => None,
-        })
-        .collect();
-    confirmed.sort_unstable();
-    let mut total: u64 = 0;
-    for (height, value) in confirmed {
-        total = total.saturating_add(value);
-        if total >= order.order.amount_sats {
-            return Some(height.saturating_add(extra_confirmations(order)));
-        }
-    }
-    None
+    // One function, in `harvest-common`, because the reputation contract
+    // checks a complaint's signed paid height against it
+    // (`docs/complaint-threat-model.md` section 5.2): a reader measuring
+    // from any other height would disagree with what the buyer signed.
+    harvest_common::payment::paid_height(order)
 }
 
 /// Confirmations the order needs beyond the one that puts the payment in a
@@ -396,20 +365,31 @@ pub fn complaint_window_end(
     order: &AuthorizedOrder,
     despatch: Option<&AuthorizedDespatch>,
 ) -> Option<u32> {
-    let paid_at = paid_height(order)?;
-    let despatch_by = paid_at.saturating_add(DESPATCH_WINDOW_BLOCKS);
-    let despatched_at = despatch
-        .filter(|d| d.despatch.order_id == order.order.id)
-        .map(|d| d.despatch.anchor.height)
-        .unwrap_or(0);
-    Some(
-        despatch_by
-            .max(despatched_at)
-            .saturating_add(COMPLAINT_WINDOW_BLOCKS),
-    )
+    Some(window_end_from(
+        paid_height(order)?,
+        &order.order.id,
+        despatch,
+    ))
 }
 
-/// How a reader counts `complaint` (harvest#53 Phase C).
+/// [`complaint_window_end`] for an order paid at `paid_at`.
+fn window_end_from(
+    paid_at: u32,
+    order_id: &harvest_common::payment::OrderId,
+    despatch: Option<&AuthorizedDespatch>,
+) -> u32 {
+    let despatch_by = paid_at.saturating_add(DESPATCH_WINDOW_BLOCKS);
+    let despatched_at = despatch
+        .filter(|d| &d.despatch.order_id == order_id)
+        .map(|d| d.despatch.anchor.height)
+        .unwrap_or(0);
+    despatch_by
+        .max(despatched_at)
+        .saturating_add(COMPLAINT_WINDOW_BLOCKS)
+}
+
+/// How a reader counts `complaint` (harvest#53 Phase C,
+/// `docs/complaint-threat-model.md` section 6).
 ///
 /// `store_order` is the store's current record of the complained-about
 /// order, if the reader has the store loaded and it still holds the order
@@ -417,32 +397,92 @@ pub fn complaint_window_end(
 /// of it, if any. Neither is needed: the complaint carries its own paid
 /// order, which the contract verified.
 ///
-/// # What the block reference can and cannot show
+/// # The window is the complaint's own
 ///
-/// It is a lower bound, like a despatch's anchor: every past block hash is
-/// public, so a buyer can backdate a complaint to any block inside the
-/// window, and a window's close is not enforceable against a buyer who does.
-/// What it does show is a complaint honestly signed late, which is not
-/// counted.
+/// It counts from the complaint's SIGNED `paid_height`, which the contract
+/// checked against the complaint's own proof, so nothing the store holds can
+/// move its start. A despatch can only extend it (`max`).
+///
+/// # What the block height can and cannot show
+///
+/// It is the buyer's statement, a lower bound at best: a buyer can name any
+/// in-window height after the window closed, so a window's close is not
+/// enforceable against a buyer who does. What it does show is a complaint
+/// honestly signed late, which is not counted.
+///
+/// # A reversal counts only on the union of the evidence
+///
+/// A store `PaymentReversed` record is built from claims its submitter chose,
+/// and a submitter can build a genuine one by withholding the later
+/// re-confirmation of a reorged payment. So the reversal discounts the
+/// complaint only if the reversal's claims TOGETHER WITH the complaint's
+/// still fold to `Reversed` ([`reversal_stands`]).
+///
+/// # Nothing about the store's status
+///
+/// Closure, retirement and backing are never read. A seller can backdate a
+/// closure anchor, so no rule of the form "discount complaints after
+/// closure" is safe; complaints are counted on the store key's record
+/// whatever the store's status.
 pub fn complaint_standing(
     complaint: &harvest_common::reputation::Complaint,
     store_order: Option<&AuthorizedOrder>,
     despatch: Option<&AuthorizedDespatch>,
 ) -> ComplaintStanding {
-    let reversed = store_order.is_some_and(|held| {
+    let reversal = store_order.filter(|held| {
         held.order.id == complaint.order.order.id && held.status == OrderStatus::PaymentReversed
     });
-    if reversed {
+    if reversal.is_some_and(|reversal| reversal_stands(complaint, reversal)) {
         return ComplaintStanding::PaymentReversed;
     }
-    match complaint_window_end(&complaint.order, despatch) {
-        Some(closed_at) if complaint.block_ref.height > closed_at => {
-            ComplaintStanding::Late { closed_at }
-        }
-        // Inside the window, or a window this reader cannot place: the
-        // payment is verified either way, so the complaint counts.
-        _ => ComplaintStanding::Counts,
+    let closed_at = window_end_from(complaint.paid_height, complaint.order_id(), despatch);
+    if complaint.block_height > closed_at {
+        ComplaintStanding::Late { closed_at }
+    } else {
+        ComplaintStanding::Counts
     }
+}
+
+/// Whether a store's `PaymentReversed` record of the complained-about order
+/// still shows the payment reversed once the complaint's own evidence is
+/// added to it (`docs/complaint-threat-model.md` section 6).
+///
+/// The union of both claim sets, deduplicated by digest, with whichever of
+/// the two tips is higher, verified against the complaint's order: a
+/// reversal counts only if that verification answers
+/// [`harvest_common::payment::ProofError::Reversed`] itself. Anything else
+/// -- the union shows the payment confirmed again, or the evidence cannot be
+/// read -- leaves the complaint standing, since the complaint is what the
+/// contract verified.
+pub fn reversal_stands(
+    complaint: &harvest_common::reputation::Complaint,
+    reversal: &AuthorizedOrder,
+) -> bool {
+    use harvest_common::payment::{verify_payment_proof, ProofError};
+    let (Some(OrderPaymentProof::OnChain(theirs)), Some(OrderPaymentProof::OnChain(ours))) = (
+        reversal.payment_proof.as_ref(),
+        complaint.order.payment_proof.as_ref(),
+    ) else {
+        return false;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let claims: Vec<freenet_bitcoin_common::SignedClaim> = theirs
+        .claims
+        .iter()
+        .chain(ours.claims.iter())
+        .filter(|claim| seen.insert(claim.digest()))
+        .cloned()
+        .collect();
+    let height = |tip: &freenet_bitcoin_common::SignedTipEntry| {
+        tip.body().map(|body| body.anchor.height).unwrap_or(0)
+    };
+    let tip = if height(&theirs.tip) >= height(&ours.tip) {
+        theirs.tip.clone()
+    } else {
+        ours.tip.clone()
+    };
+    let union = OrderPaymentProof::on_chain(claims, tip);
+    verify_payment_proof(&complaint.order.order, &union) == Err(ProofError::Reversed)
 }
 
 /// "about 3 days" for a span of blocks, at Bitcoin's ten-minute target.
@@ -1402,10 +1442,69 @@ mod tests {
         harvest_common::reputation::Complaint {
             order: order.clone(),
             category: harvest_common::feedback::FeedbackCategory::NonDelivery,
-            block_ref: anchor(block),
+            block_height: block,
+            paid_height: paid_height(order).expect("a paid order"),
             scoped_payload: Vec::new(),
             buyer_signature: Vec::new(),
         }
+    }
+
+    /// [`confirmed`], with the bridge's `as_of` of the caller's choosing, so
+    /// a test can order a confirmation against a retraction.
+    fn confirmed_as_of(
+        order: &AuthorizedOrder,
+        value_sats: u64,
+        height: u32,
+        seed: u8,
+        as_of: u32,
+    ) -> SignedClaim {
+        let (spv, txid, block_hash) = payment_proof(
+            &order.order.payment_script_pubkey,
+            value_sats,
+            1,
+            [seed; 32],
+        );
+        SignedClaim::sign(
+            &bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: anchor(as_of),
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats,
+                    anchor: BlockAnchor {
+                        height,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign the claim")
+    }
+
+    /// The bridge's retraction, as of `as_of`, of the outpoint
+    /// [`confirmed`] makes for `value_sats` and `seed`.
+    fn retracted(order: &AuthorizedOrder, value_sats: u64, seed: u8, as_of: u32) -> SignedClaim {
+        let (_, txid, _) = payment_proof(
+            &order.order.payment_script_pubkey,
+            value_sats,
+            1,
+            [seed; 32],
+        );
+        SignedClaim::sign(
+            &bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: anchor(as_of),
+                claim: Claim::Retracted {
+                    outpoint: OutPoint { txid, vout: 0 },
+                },
+            },
+        )
+        .expect("sign the retraction")
     }
 
     /// harvest#53 Phase C: a complaint counts when it was made inside the
@@ -1471,8 +1570,25 @@ mod tests {
         let paid_at = ANCHOR + 3;
         let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
         let complaint = complaint_at(&paid, paid_at + 10);
+        // A genuine reversal: the payment the complaint shows, retracted
+        // later, and nothing since.
         let mut reversed = paid.clone();
         reversed.status = OrderStatus::PaymentReversed;
+        reversed.payment_proof = Some(OrderPaymentProof::on_chain(
+            vec![
+                confirmed(&paid, 10_000, paid_at, 1),
+                retracted(&paid, 10_000, 1, paid_at + 15),
+            ],
+            tip(),
+        ));
+        assert_eq!(
+            harvest_common::payment::verify_payment_proof(
+                &paid.order,
+                reversed.payment_proof.as_ref().unwrap()
+            ),
+            Err(harvest_common::payment::ProofError::Reversed),
+            "precondition: the reversal's own evidence shows it reversed"
+        );
 
         let standing = complaint_standing(&complaint, Some(&reversed), None);
         assert_eq!(standing, ComplaintStanding::PaymentReversed);
@@ -1489,6 +1605,66 @@ mod tests {
         assert_ne!(other.order.id, paid.order.id);
         assert_eq!(
             complaint_standing(&complaint, Some(&other), None),
+            ComplaintStanding::Counts
+        );
+    }
+
+    /// **A reversal built by withholding a re-confirmation does not erase
+    /// the complaint** (`docs/complaint-threat-model.md` section 6). The
+    /// buyer's payment was reorged out and confirmed again; the seller
+    /// publishes `PaymentReversed` from the genuine confirmation and
+    /// retraction, leaving out the later re-confirmation the complaint
+    /// carries. On the union of both, the payment stands. Red if
+    /// `complaint_standing` goes back to trusting the store's status alone.
+    #[test]
+    fn a_reversal_withholding_a_reconfirmation_does_not_erase_the_complaint() {
+        let paid_at = ANCHOR + 3;
+        let order_paid =
+            paid_with(|o| vec![confirmed_as_of(o, 10_000, paid_at + 1, 1, paid_at + 18)]);
+        let complaint = complaint_at(&order_paid, paid_at + 20);
+
+        let mut reversed = order_paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        reversed.payment_proof = Some(OrderPaymentProof::on_chain(
+            vec![
+                confirmed(&order_paid, 10_000, paid_at, 1),
+                retracted(&order_paid, 10_000, 1, paid_at + 15),
+            ],
+            tip(),
+        ));
+        assert_eq!(
+            harvest_common::payment::verify_payment_proof(
+                &order_paid.order,
+                reversed.payment_proof.as_ref().unwrap()
+            ),
+            Err(harvest_common::payment::ProofError::Reversed),
+            "precondition: on its own, the reversal's evidence verifies as a reversal"
+        );
+        assert!(!reversal_stands(&complaint, &reversed));
+        assert_eq!(
+            complaint_standing(&complaint, Some(&reversed), None),
+            ComplaintStanding::Counts
+        );
+    }
+
+    /// **The window counts from the complaint's signed paid height** (model
+    /// section 6): the contract checked it against the complaint's own
+    /// proof, so it is what every reader measures from. Red if the standing
+    /// re-reads the height from anything else.
+    #[test]
+    fn the_window_counts_from_the_complaints_own_paid_height() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let end = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        let mut complaint = complaint_at(&paid, end + 1);
+        assert_eq!(
+            complaint_standing(&complaint, None, None),
+            ComplaintStanding::Late { closed_at: end }
+        );
+        // The signed paid height, not a height re-read from anything else.
+        complaint.paid_height = paid_at + 1;
+        assert_eq!(
+            complaint_standing(&complaint, None, None),
             ComplaintStanding::Counts
         );
     }
