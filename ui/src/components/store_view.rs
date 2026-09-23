@@ -186,20 +186,10 @@ fn StoreList() -> Element {
 #[component]
 fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
     let info = store.info.as_ref().unwrap();
-    // Counted the way the Reputation page counts them (`complaint_standing`),
-    // so the badge and the record agree.
-    let counted_complaints = store
-        .complaints
-        .iter()
-        .filter(|c| {
-            crate::fulfilment::complaint_standing(
-                c,
-                store.orders.iter().find(|o| o.order.id == *c.order_id()),
-                store.despatches.get(c.order_id()),
-            )
-            .counts()
-        })
-        .count();
+    // Counted the way the Reputation page counts them
+    // (`BrowsingStore::complaint_standings`), so the badge and the record
+    // agree, and neither reads the store's status.
+    let counted_complaints = store.counted_complaints();
     let (record_class, record_text) = store.record.badge(counted_complaints);
     let mut show_messages = use_signal(|| false);
     // Read once, here, rather than inside the per-listing helper: this

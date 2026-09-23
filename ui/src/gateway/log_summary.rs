@@ -88,7 +88,8 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
             ..
         } => ("StoreList", Some(ghostkey_fingerprint.clone())),
         R::RememberedStores { .. } => ("RememberedStores", None),
-        R::PaidPurchases { .. } => ("PaidPurchases", None),
+        R::KeptPurchases { .. } => ("KeptPurchases", None),
+        R::KeepPurchaseRefused { order_id, .. } => ("KeepPurchaseRefused", Some(order_id.short())),
         R::MigrationMarker { .. } => ("MigrationMarker", None),
         R::MigrationMarkerRecorded { .. } => ("MigrationMarkerRecorded", None),
         R::Error { .. } => ("Error", None),

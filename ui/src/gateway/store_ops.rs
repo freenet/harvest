@@ -858,10 +858,15 @@ pub(crate) fn complaint_state_bytes(
 /// may not exist yet. A PUT creates it if absent and is merged by the
 /// contract if present, which keeps the complaint independent of anything
 /// the seller does, the receipted design's point.
+///
+/// `follow` subscribes to the record afterwards, for a store this tab shows.
+/// The re-assert sweep (`AppState::reassert_kept_complaints`) passes `false`:
+/// a record for a store not shown has nowhere to be shown.
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_complaint(
     store_key: ed25519_dalek::VerifyingKey,
     complaint: harvest_common::reputation::Complaint,
+    follow: bool,
 ) -> Result<(), String> {
     use dioxus::logger::tracing::info;
     use freenet_stdlib::prelude::*;
@@ -879,6 +884,9 @@ pub async fn submit_complaint(
     )
     .await?;
     info!("Published a complaint about order {id} to the store's reputation record");
+    if !follow {
+        return Ok(());
+    }
     // Follow the record, so the complaint shows here once the network has it
     // -- the store page's own subscription may have found nothing, if this
     // PUT is what created the record.

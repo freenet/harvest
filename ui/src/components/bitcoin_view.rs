@@ -411,8 +411,35 @@ pub(crate) fn unrecognised_bridges(order: &harvest_common::payment::Order) -> Ve
         .trusted_bridges
         .iter()
         .map(|b| b.to_bs58())
-        .filter(|id| id != bitcoin_config::TRUSTED_BRIDGE_ID_BS58)
+        .filter(|id| id != bitcoin_config::TRUSTED_BRIDGE_ID_BS58 && !recognised_for_test(id))
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bridges a test recognises on its own thread, in addition to the
+    /// build's. A test cannot sign a claim as the build's bridge (nobody
+    /// here has its key), so a test of a rule that needs a RECOGNISED bridge
+    /// to have signed the evidence recognises the one its fixture signs
+    /// with. Per thread, so no other test sees it.
+    static RECOGNISED_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Treat bridge `id` as recognised for the rest of this test's thread.
+#[cfg(test)]
+pub(crate) fn recognise_for_test(id: freenet_bitcoin_common::BridgeId) {
+    RECOGNISED_FOR_TEST.with(|ids| ids.borrow_mut().push(id.to_bs58()));
+}
+
+#[cfg(test)]
+fn recognised_for_test(id: &str) -> bool {
+    RECOGNISED_FOR_TEST.with(|ids| ids.borrow().iter().any(|held| held == id))
+}
+
+#[cfg(not(test))]
+fn recognised_for_test(_id: &str) -> bool {
+    false
 }
 
 /// Short, quotable form of a bridge id, for a line that has to fit on a card.

@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use harvest_common::feedback::FeedbackCategory;
 use harvest_common::reputation::Complaint;
 
-use crate::fulfilment::{complaint_standing, ComplaintStanding};
+use crate::fulfilment::ComplaintStanding;
 use crate::gateway::APP_STATE;
 
 /// One complaint as a reader sees it: what it says, and how it counts.
@@ -22,15 +22,13 @@ pub fn ReputationView() -> Element {
             .values()
             .flat_map(|store| {
                 let store_name = store.info.as_ref().map(|i| i.store_name.clone());
-                store.complaints.iter().map(move |c| ComplaintRow {
-                    standing: complaint_standing(
-                        c,
-                        store.orders.iter().find(|o| o.order.id == *c.order_id()),
-                        store.despatches.get(c.order_id()),
-                    ),
-                    complaint: c.clone(),
-                    store_name: store_name.clone(),
-                })
+                store
+                    .complaint_standings()
+                    .map(move |(complaint, standing)| ComplaintRow {
+                        standing,
+                        complaint: complaint.clone(),
+                        store_name: store_name.clone(),
+                    })
             })
             .collect()
     };
@@ -79,7 +77,7 @@ fn ComplaintCard(row: ComplaintRow) -> Element {
         store_name,
     } = row;
     let short = complaint.order_id().short();
-    let block = complaint.block_ref.height;
+    let block = complaint.block_height;
     let note = match standing {
         ComplaintStanding::Counts => None,
         ComplaintStanding::Late { closed_at } => Some(format!(
