@@ -657,7 +657,18 @@ impl Order {
     /// A default hash would name some other contract, and a buyer would be
     /// shown its balance under their own order.
     pub fn bitcoin_address_instance_id(&self) -> Option<[u8; 32]> {
-        let code_hash = self.bitcoin_address_code_hash?;
+        Some(self.bitcoin_address_instance_id_under(self.bitcoin_address_code_hash?))
+    }
+
+    /// The instance of the `BitcoinAddressContract` build `code_hash` that
+    /// observes this order's payment address.
+    ///
+    /// A buyer watches the build the recognised bridges' signed generation
+    /// pointer names as well as the one the order names, because the order's
+    /// hash is the seller's choice and is fixed at issue, while the bridges
+    /// write to their current build (`docs/complaint-threat-model.md`
+    /// section 3.2).
+    pub fn bitcoin_address_instance_id_under(&self, code_hash: [u8; 32]) -> [u8; 32] {
         // Infallible: `BitcoinAddressParameters` is plain data with a derived
         // `Serialize`.
         let params = crate::to_cbor(&self.bitcoin_params())
@@ -665,7 +676,7 @@ impl Order {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&code_hash);
         hasher.update(&params);
-        Some(*hasher.finalize().as_bytes())
+        *hasher.finalize().as_bytes()
     }
 
     /// Parameters of the `BitcoinAddressContract` that observes this order's
