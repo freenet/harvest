@@ -554,6 +554,14 @@ mod tests {
         );
         let err = c.verify(&owner()).expect_err("no buyer key");
         assert!(err.contains("names no buyer key"), "{err}");
+        // The shared predicate itself refuses it (review round 4, P3): the
+        // later check in `verify` has the same words, so the assertion above
+        // alone passed with the precondition deleted.
+        assert!(
+            crate::payment::complaint_preconditions(&c.order)
+                .expect_err("the precondition refuses it")
+                .contains("names no buyer key"),
+        );
 
         let mut identity = [0u8; 32];
         identity[0] = 1;
@@ -710,8 +718,11 @@ mod tests {
         fresher
             .verify(&owner())
             .expect("a later rung of the same payment");
+        // Its proof shows the paid height the buyer signed (review round 4,
+        // P3: comparing the cloned field compared a value with itself).
         assert_eq!(
-            fresher.paid_height, genuine.paid_height,
+            crate::payment::paid_height(&fresher.order),
+            Some(genuine.paid_height),
             "the same statement"
         );
         for (first, second) in [(&genuine, &fresher), (&fresher, &genuine)] {
