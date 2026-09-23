@@ -602,8 +602,11 @@ impl KeptComplaint {
 
 /// How many purchases one node keeps. Past it a new one is refused out
 /// loud, and the buyer is not shown payment details: refusing to pay is the
-/// safe failure. Only the buyer's own press to pay takes a slot, so this is
-/// years of purchases.
+/// safe failure. Only the buyer's own press takes a slot (*Pay this order*,
+/// or *File a complaint* about a paid copy never kept), so nothing a seller
+/// mints, fabricates or pays for can fill it (`docs/complaint-threat-model.md`
+/// section 5.1). A press never paid holds its slot: bounded by the buyer's
+/// own presses.
 pub const MAX_KEPT_PURCHASES: usize = 1024;
 
 /// The largest kept purchase, in bytes of its CBOR encoding.

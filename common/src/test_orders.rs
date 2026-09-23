@@ -108,6 +108,12 @@ pub fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
 /// [`proof`], for a payment confirmed at `confirmed_at`, with a tip deep
 /// enough for the order.
 pub fn proof_at(order: &Order, seed: u8, confirmed_at: u32) -> OrderPaymentProof {
+    proof_as_of(order, seed, confirmed_at, confirmed_at)
+}
+
+/// [`proof_at`], with the bridge having signed the claim at `as_of`: a later
+/// rung of the same payment when `as_of > confirmed_at`.
+pub fn proof_as_of(order: &Order, seed: u8, confirmed_at: u32, as_of: u32) -> OrderPaymentProof {
     let bridge = bridge_key();
     let (spv, txid, block_hash) = payment_proof(
         &order.payment_script_pubkey,
@@ -124,7 +130,14 @@ pub fn proof_at(order: &Order, seed: u8, confirmed_at: u32) -> OrderPaymentProof
         &ClaimBody {
             script_id: order.bitcoin_params().script_id(),
             network: order.network,
-            as_of: anchor,
+            as_of: BlockAnchor {
+                height: as_of,
+                hash: if as_of == confirmed_at {
+                    anchor.hash
+                } else {
+                    BlockHash([0x77; 32])
+                },
+            },
             claim: Claim::ConfirmedOutput {
                 outpoint: OutPoint { txid, vout: 0 },
                 value_sats: order.amount_sats,

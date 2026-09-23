@@ -1832,6 +1832,31 @@ pub fn paid_height(order: &AuthorizedOrder) -> Option<u32> {
     None
 }
 
+/// How fresh `order`'s payment evidence is: the highest `as_of` height any
+/// of its claims was signed at, or 0 for an order carrying none.
+///
+/// A reorg that retracts and re-confirms a payment adds claims at a later
+/// `as_of`, so fresher evidence is what a reader needs to see through a
+/// reversal built from the stale claims (`docs/complaint-threat-model.md`
+/// section 3.2). Two uses: the buyer's delegate replaces a kept paid copy
+/// that has no complaint yet with a strictly fresher one, and the
+/// reputation record keeps the freshest of several evidence copies for one
+/// buyer statement ([`crate::reputation::Complaint`]'s tie-break).
+///
+/// Reads claim bodies without checking signatures; callers verify the order.
+pub fn evidence_freshness(order: &AuthorizedOrder) -> u32 {
+    let Some(OrderPaymentProof::OnChain(proof)) = order.payment_proof.as_ref() else {
+        return 0;
+    };
+    proof
+        .claims
+        .iter()
+        .filter_map(|claim| claim.body().ok())
+        .map(|body| body.as_of.height)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The largest signed order a complaint may carry, in bytes: both the signed
 /// envelope as the seller wrote it and the order's own canonical encoding.
 ///
@@ -1882,6 +1907,18 @@ pub const MAX_REQUIRED_CONFIRMATIONS: u32 = 144;
 pub fn complaint_preconditions(order: &AuthorizedOrder) -> Result<(), String> {
     if order.order.amount_sats == 0 {
         return Err("the order is for nothing, so paying it proves nothing".into());
+    }
+    // Defence in depth (review round 3): the buyer's blockers refuse all
+    // three before payment, and the delegate must not keep an order no
+    // complaint could ever be filed about.
+    if order.order.anchor.is_none() {
+        return Err("the order names no block it was made at, so no payment can be dated".into());
+    }
+    if order.order.trusted_bridges.is_empty() {
+        return Err("the order names no bridge, so no payment to it can be proven".into());
+    }
+    if order.order.buyer_receipt_key.is_none() {
+        return Err("the order names no buyer key, so nobody can complain about it".into());
     }
     // On-chain only: the window a complaint is judged by counts from a
     // confirmation height (`paid_height`), which a Lightning payment does not

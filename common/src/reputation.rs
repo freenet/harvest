@@ -277,10 +277,15 @@ impl Complaint {
     /// statements (review round 1, P2-9: ranking on the whole encoding let
     /// the seller's re-signed terms decide which of the buyer's complaints
     /// survived).
-    fn canonical_rank(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn canonical_rank(&self) -> (Vec<u8>, Vec<u8>, std::cmp::Reverse<u32>, Vec<u8>) {
         (
             crate::to_cbor(&self.terms()).expect("complaint terms always serialize"),
             self.buyer_signature.clone(),
+            // Among copies of ONE buyer statement, the freshest evidence
+            // (review round 3): an older ladder rung of the same payment
+            // verifies too, and a reader judging a reversal needs the
+            // freshest claim, not whichever copy encodes smallest.
+            std::cmp::Reverse(crate::payment::evidence_freshness(&self.order)),
             crate::to_cbor(self).expect("a complaint always serializes"),
         )
     }
@@ -442,8 +447,8 @@ impl ReputationStateV1 {
 mod tests {
     use super::*;
     use crate::test_orders::{
-        authorized, buyer_key, complaint, complaint_by, order, paid, proof, proof_at, sign_scoped,
-        store_key,
+        authorized, buyer_key, complaint, complaint_by, order, paid, proof, proof_as_of, proof_at,
+        sign_scoped, store_key,
     };
     use ed25519_dalek::SigningKey;
 
@@ -692,6 +697,68 @@ mod tests {
         }
     }
 
+    /// **Among copies of one buyer statement, the record keeps the freshest
+    /// evidence** (review round 3). An older rung of the same payment
+    /// verifies too, and may encode smaller; a reader judging a reversal
+    /// needs the freshest claim. Either arrival order keeps the fresher
+    /// copy. Red if the tie-break goes back to the encoding alone.
+    #[test]
+    fn the_record_keeps_the_freshest_evidence_for_one_statement() {
+        let genuine = complaint(1);
+        let mut fresher = genuine.clone();
+        fresher.order.payment_proof = Some(proof_as_of(&order(1), 1, 100, 140));
+        fresher
+            .verify(&owner())
+            .expect("a later rung of the same payment");
+        assert_eq!(
+            fresher.paid_height, genuine.paid_height,
+            "the same statement"
+        );
+        for (first, second) in [(&genuine, &fresher), (&fresher, &genuine)] {
+            let mut state = ReputationStateV1::default();
+            state
+                .apply_delta(&params(), &Some(vec![first.clone()]))
+                .expect("applies");
+            state
+                .apply_delta(&params(), &Some(vec![second.clone()]))
+                .expect("applies");
+            assert_eq!(state.complaints, vec![fresher.clone()]);
+        }
+    }
+
+    /// **A complaint made by the first build that accepts complaints still
+    /// verifies** (`docs/complaint-threat-model.md` section 8: the complaint
+    /// format is append-only). The fixture is the frozen bytes of a record
+    /// holding one genuine complaint, written once by this test with
+    /// `HARVEST_WRITE_COMPLAINT_FIXTURE=1` and never regenerated. A later
+    /// change that stops these bytes decoding, re-encoding identically, or
+    /// verifying would erase every existing complaint at the next re-key,
+    /// and the merge-law corpora would not notice, because they are
+    /// regenerated. If this goes red, the change is what is wrong.
+    #[test]
+    fn a_complaint_from_the_first_build_still_verifies() {
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/reputation-state-complaint-v1.cbor"
+        );
+        if std::env::var_os("HARVEST_WRITE_COMPLAINT_FIXTURE").is_some() {
+            let state = ReputationStateV1 {
+                owner_certificate_pem: String::new(),
+                complaints: vec![complaint(1)],
+            };
+            std::fs::write(FIXTURE, crate::to_cbor(&state).expect("encodes")).expect("writes");
+        }
+        let bytes = std::fs::read(FIXTURE).expect("the frozen fixture is committed");
+        let state: ReputationStateV1 = crate::from_cbor(&bytes).expect("still decodes");
+        assert_eq!(
+            crate::to_cbor(&state).expect("encodes"),
+            bytes,
+            "still re-encodes to the same bytes"
+        );
+        state.verify(&params()).expect("still verifies");
+        assert_eq!(state.complaints.len(), 1);
+    }
+
     #[test]
     fn a_cancel_signature_is_not_a_complaint() {
         let genuine = complaint(1);
@@ -840,11 +907,17 @@ mod tests {
         distant.required_confirmations = crate::payment::MAX_REQUIRED_CONFIRMATIONS + 1;
         let mut lightning = order(1);
         lightning.payment_hash = Some([5u8; 32]);
+        let mut undated = order(1);
+        undated.anchor = None;
+        let mut unbridged = order(1);
+        unbridged.trusted_bridges.clear();
         for (what, o, needle) in [
             ("a zero amount", free, "for nothing"),
             ("zero confirmations", unconfirmed, "before any confirmation"),
             ("too many confirmations", distant, "more than the"),
             ("a Lightning order", lightning, "not an on-chain order"),
+            ("no anchor", undated, "names no block"),
+            ("no bridge", unbridged, "names no bridge"),
         ] {
             let o = o.with_derived_id();
             let c = complaint_by(

@@ -15,6 +15,16 @@ dependency instead of guarding each route to it.
 under-specified on how the evidence is OBTAINED. Its findings are labelled TM-A to TM-H in
 section 10.
 
+**Revision 3** takes in review round 3 of the code built to revision 2 (labelled R3-*). Its
+P1s were again in NEW mechanisms, so revision 3 removes one mechanism rather than guarding it:
+
+- **Auto-keep is gone.** A slot is taken only by a buyer's own press: *Pay this order*, or
+  *File a complaint* about a paid copy the node has not kept.
+- **No screen shows a buyer a payment address except the purchase card**, once the copy is kept.
+- **A kept paid copy tracks the freshest evidence until a complaint is filed**, so a reorg
+  before the complaint cannot strand it.
+- **The seller's power to reuse one address across many orders** is named in section 2.
+
 ## 1. The invariant
 
 > **Once a buyer has paid a genuine order, they can file exactly one complaint about it that
@@ -59,7 +69,9 @@ The seller can do any of these, at any time, including after payment:
 | Mint any number of orders into a conversation carrying the buyer's binding, receipt key and listing tag (it copies all three from the request) | any cap filled by orders the buyer did not choose (R2-3) |
 | Publish fabricated `Paid` orders naming the buyer's receipt key, backed by its own bridge or by paying itself | anything that treats "a Paid order naming my key" as "my purchase" (R2-3) |
 | Pad the order's signed envelope, list one recognised bridge thousands of times, or submit non-minimal proofs | any size cap: the buyer's copy, the complaint, the record (R2-4, TM-E) |
-| Pay its own order address: early (to move the paid height), or repeatedly with large transactions (a flood that makes the address contract prune) | the window's start (TM-D); the buyer's claims (TM-B) |
+| Pay its own order address: early or late (to move the paid height), or repeatedly with large transactions (a flood that makes the address contract prune) | the window's start (TM-D); the buyer's claims (TM-B) |
+| Reuse one payment address across many orders, so one payment settles all of them (their windows overlap) | any rule that equates one paid order with one payment (R3: cap filling, record growth) |
+| Show the buyer a payment address anywhere else: the store's invoice list, the Payments tab (matched on the seller-written `buyer_fingerprint`), a message | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
 | Publish a backdated despatch | the complaint window (P2-10) |
 | Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (section 6) |
 | Submit the buyer's own complaint to the record with a different copy of the order or proof | the record's tie-break |
@@ -126,41 +138,63 @@ against, and every later seller act on the store is irrelevant to them.
 
 ### 3.2 Watching and upgrading
 
-For every kept order, the UI watches the address contract under the order's code hash **and**
-under the current generation pointer's hash. The pointer follows the bridges' redeploys; the
-order's hash is fixed at issue.
+For every kept order that can still be settled, the UI watches the address contract under the
+order's code hash **and** under the current generation pointer's hash. The pointer follows the
+bridges' redeploys; the order's hash is fixed at issue. Watching stops once the order's last
+settling block has passed unpaid.
 
 Once the claims it holds prove the order paid, the UI builds the **minimal covering proof**
-(section 5.2) and sends the `Paid` copy. It uses the same proof builder over a store copy's
-claims when the store has published `Paid`. Delegate rules:
+(section 5.2) over the **union** of every claim it holds for the order: the watched address
+contracts' claims and any store copy's. It then sends the `Paid` copy. The union matters,
+because a store copy carries only the claims the seller chose (R3). Delegate rules:
 
 - a kept `AwaitingPayment` copy is replaced by a verifying `Paid` copy of the same id;
-- a kept `Paid` copy is never replaced, except when the held record does not decode or verify;
-- a record without a complaint gains one exactly once, and it must verify.
+- **a kept `Paid` copy with no complaint yet is replaced by a verifying `Paid` copy whose
+  evidence is strictly fresher** (a higher highest `as_of`). This way, a reorg that retracts
+  and re-confirms the payment before the complaint is filed leaves the kept copy on the
+  re-confirmation, not the stale claim a reversal would be built from (R3).
+- once a complaint is kept, the copy is frozen: the complaint signs its paid height;
+- a record without a complaint gains one exactly once, and it must verify;
+- a held record that no longer decodes or verifies is overwritten.
 
-### 3.3 Auto-keep of a paid order naming my key (TM-F)
+### 3.3 A paid order this node never kept (TM-F; auto-keep removed in revision 3)
 
-A store `Paid` copy that names this conversation's receipt key, verifies under the store's
-owner key, names only recognised bridges and meets the preconditions is kept too, even when
-the buyer never pressed *Pay*. This covers a buyer who paid outside the app's flow, for
-example to an address a message carried.
+Revision 2 auto-kept any store `Paid` copy naming this conversation's receipt key. Round 3
+showed that a seller can then fill every slot on the node with one payment. It mints orders
+on one reused address, pays it once, and publishes them `Paid`. The node can then never buy
+again. So nothing is kept without a press.
 
-It takes a normal slot. That is safe because filling the cap this way needs the seller to
-publish, and actually pay, one order per slot, and each such order is a genuine complaint
-against that seller that the buyer's node now keeps.
+A store `Paid` copy that the node never kept is still shown as this buyer's paid purchase if
+it passes all of the fallback checks:
+
+- it names this conversation's receipt key;
+- it verifies under the store's owner key;
+- it names only recognised bridges;
+- it meets the preconditions.
+
+Such a copy comes from a payment made on another device, before this build, or outside the
+app's flow. **Filing a complaint about it is the press that keeps it.** The complaint action
+sends the paid copy (minimal proof) together with the complaint, in one `KeepPurchase`. Until
+then, the copy is only as durable as the store's.
 
 ### 3.4 Complain, then re-assert
 
-The complaint is built from the kept `Paid` copy and signed with the kept `receipt_seed`. It is
-PUT to the record addressed by `store_key`, then kept in the record.
+The complaint is built from the kept `Paid` copy (or, for 3.3, the fallback copy) and signed with
+the kept receipt seed (or the conversation's). **It is kept first, then PUT.** The complaint
+goes to the delegate in a `KeepPurchase`, and the PUT is sent once the delegate's list holds
+it. So a lost PUT, or a tab closed mid-PUT, is covered by the re-assert. A complaint cannot be
+on the record without being kept.
 
 While a kept copy is still `AwaitingPayment`, and its upgrade is on its way, the complaint
 waits. Built from a paid copy computed on the fly, it could name a different paid height from
 the upgrade the delegate keeps. The delegate would then refuse to keep the complaint, and the
 re-assert would never cover it.
 
-**On every load**, once per session, the UI PUTs every kept complaint again, whether or not the
-store is being viewed (TM-H). A PUT to an existing record is merged by the contract's
+**On every load**, the UI PUTs every kept complaint again, once per complaint per session,
+whether or not the store is being viewed (TM-H). This runs on every arrival of the kept list,
+not only the first: the first list of a session can arrive from a freshly re-keyed delegate
+before the migration has imported the predecessor's records (R3). A failed PUT is tried again
+on the next arrival. A PUT to an existing record is merged by the contract's
 `update_state`, which keeps one complaint per order under a total order, so the re-PUT is
 idempotent. The buyer's node is the durable copy, and the public record is a replica of it.
 This covers:
@@ -217,8 +251,12 @@ claims were read from, only that they verify.
 ### 5.1 The delegate
 
 - `MAX_KEPT_PURCHASES` = 1024 per node.
-- A slot is consumed only by the buyer's own *Pay* press, or by a paid order naming its key
-  (3.3). A seller's minted or fabricated unpaid orders never take one.
+- A slot is consumed only by the buyer's own press: *Pay this order*, or *File a complaint*
+  about a paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
+  for ever takes one.
+- A slot taken by a *Pay* press that was never paid is held for the node's lifetime. That is
+  bounded by the buyer's own presses, 1,024 of them. Releasing a lapsed unpaid keep, against a
+  recognised bridge's signed tip, is a follow-up.
 - At the cap the delegate answers with a typed `KeepPurchaseRefused { order_id, reason }`. The
   UI releases its marker, keeps the payment details hidden and shows why. Refusing to pay is
   the safe failure.
@@ -266,7 +304,13 @@ substitute must show the same paid height.
 ### 5.3 The record
 
 - No count cap, so nothing can be displaced.
-- freenet-core's state size limit (50 MiB) bounds it. With minimal proofs, filling it takes
+- freenet-core's state size limit (50 MiB) bounds it. **With a reused address (section 2), one
+  payment can back many complaints**, so the seller and sockpuppets complaining about their own
+  orders can make the record costly to host, or too big to load: about 700 complaints with a
+  64 KB transaction, or about 200 at 256 KiB each. That record then reads "record unavailable",
+  never "clean record". It is a residual (7.2): the seller spends it to make its own record
+  unreadable, which is itself a warning to a reader. The original sentence for scale: without
+  reuse, filling it takes
   thousands of paid orders, each one a complaint the seller made against itself.
 - A record that does not load reads "record not loaded", never "clean record" (`RecordLoad`).
 
@@ -323,16 +367,26 @@ next load of Harvest.
 
 - **Buyer-stated `block_height`.** It is not a clock. A buyer can state an in-window height after
   the window, so the window binds only the honest (P2-10, unchanged).
-- **Buyer-chosen paid height.** Among its genuine in-window payments. Bounded by the payment
-  window.
+- **The paid height a buyer's proof shows.** It is the latest in-window payment the node has
+  seen when the copy is kept or refreshed. A seller who pays its own address after the buyer,
+  before a complaint is filed, moves it later. That delays when the complaint can be filed
+  (the `AwaitingDespatch` stage), by at most the payment window, and costs the buyer no time,
+  because every window moves with it.
+- **A reorg after a complaint is filed**, deeper than the complaint's age: the complaint's
+  frozen copy may show only the pre-reorg claim, and a reversal built from it discounts the
+  complaint. Complaints are filed days after payment, so this needs a reorg days deep.
+- **Record growth through a reused address** (5.3).
+- **An address-contract generation missed** when the bridges redeploy twice while the buyer is
+  away. Only the order's and the current generation are watched.
 - **Address reuse** lets someone complain on another's payment to a reused address (round 1,
   #15).
 - **Channels in seller-signed or payer-chosen bytes:**
   - the seller's order text on the seller's own record (#144);
   - `OP_RETURN` and witness bytes in SPV transactions;
   - the certificate's ground `verifying_key` (R2-8).
-- **A payment made outside the app's flow** is kept only once the buyer's node sees it paid
-  (3.3). Before that, the seller can evict the order from the store.
+- **A payment made outside the app's flow** (an address from a message) is never kept until
+  the buyer files a complaint about it (3.3). Until then it lasts only as long as the store
+  keeps it. The app itself shows no address outside the purchase card.
 - **A stale record.** A reader served a stale copy by hosts the seller runs sees fewer
   complaints until its subscription catches up. The buyer's re-assert (3.4) pushes its
   complaint back into the network on every load.
@@ -342,9 +396,10 @@ next load of Harvest.
 - **A buyer who never returns after a re-key.** Their complaint stays on the old record, and
   readers look at the new one. A reader-driven legacy walk (#145) would close this.
 - **Kept-purchase list size.** 1,024 records at the derived bound would be about 290 MiB. That
-  is reachable only by the buyer's own 1,024 payments, each carrying about 256 KiB of genuine
-  claims. A minimal proof for an ordinary payment is a few kilobytes, so the list stays one
-  response, and it is not paged (TM P3).
+  is reachable only by the buyer's own 1,024 presses, each on an order whose genuine claims
+  are about 256 KiB. With auto-keep removed, nothing else can add a record. A minimal proof for
+  an ordinary payment is a few kilobytes, so the list stays one response, and it is not paged
+  (TM P3).
 
 ## 8. Compatibility requirements this creates (TM-H)
 
@@ -358,6 +413,20 @@ next load of Harvest.
   with the seed it carries, so it does not wait for its conversation.
 - **The merge semantics of a PUT to an existing record** are the contract's own `update_state`
   (a merge). The re-assert relies on that, and the E2E walk-through checks it.
+- **Everything `Complaint::verify` and the delegate's `check` depend on must never tighten**
+  for records already made (R3). A later build that refuses an old complaint erases it at the
+  next re-key: the re-assert is refused, and the kept purchase fails to import. That covers:
+  - freenet-bitcoin's `ClaimBody` and SPV encoding, `fold_outpoint_status`, and its proof-of-work
+    floor. The revision is pinned in `Cargo.lock`, and bumping it is a change to review under
+    this rule;
+  - `paid_height`'s definition;
+  - every `MAX_*` bound;
+  - `LEGACY_HARVEST_WEBAPP_CONTRACT_IDS` (append-only);
+  - the `ScopedPayload` format.
+
+  A frozen-bytes complaint fixture (`tests/fixtures/reputation-state-complaint-v1.cbor`),
+  decoded, re-encoded and verified by `Complaint::verify` in every build, pins it
+  (`a_complaint_from_the_first_build_still_verifies`).
 
 ## 9. For Ian (does not block this PR; the code works for either answer)
 

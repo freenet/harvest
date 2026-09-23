@@ -40,7 +40,7 @@ use harvest_common::delegate::{
     MAX_KEPT_PURCHASE_BYTES,
 };
 use harvest_common::payment::{
-    complaint_preconditions, verify_minimal_proof, OrderId, OrderStatus,
+    complaint_preconditions, evidence_freshness, verify_minimal_proof, OrderId, OrderStatus,
 };
 use harvest_common::{from_cbor, to_cbor};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -212,8 +212,21 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
                     ..held
                 }
             }
+            // A paid copy with no complaint yet follows strictly fresher
+            // evidence (`docs/complaint-threat-model.md` section 3.2): after a
+            // reorg re-confirms the payment, the kept copy must show the
+            // re-confirmation, not the stale claim a reversal is built from.
+            // Frozen once a complaint is kept, since the complaint signs its
+            // paid height.
+            (OrderStatus::Paid, OrderStatus::Paid)
+                if held.complaint.is_none()
+                    && offered.complaint.is_none()
+                    && evidence_freshness(&offered.order) > evidence_freshness(&held.order) =>
+            {
+                offered
+            }
             // Anything else keeps what is held: a second unpaid copy, an
-            // unpaid copy of a paid order, a second paid copy, a second
+            // unpaid copy of a paid order, a paid copy no fresher, a second
             // complaint.
             _ => return list(store),
         },
@@ -256,8 +269,28 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
         Ok(bytes) => bytes,
         Err(message) => return SecretImport::Permanent(message),
     };
-    if held(store, key).is_some() {
-        return SecretImport::AlreadyAuthoritative;
+    // Merged as a fresh keep would be, not "whoever is here first" (review
+    // round 3): the successor may already hold an unpaid copy, or a paid
+    // one without the complaint, while the predecessor holds the paid copy
+    // and the complaint. Both records passed `check`, so the more complete
+    // one wins: a complaint first (and a held complaint is never swapped
+    // for another), then paid over unpaid, then fresher evidence.
+    if let Some(held) = held(store, key) {
+        let completeness = |record: &KeptPurchase| {
+            (
+                record.complaint.is_some(),
+                record.order.status == OrderStatus::Paid,
+                evidence_freshness(&record.order),
+            )
+        };
+        if held.complaint.is_some() || completeness(&incoming) <= completeness(&held) {
+            return SecretImport::AlreadyAuthoritative;
+        }
+        return if store.set_secret(key, &bytes) {
+            SecretImport::Written
+        } else {
+            SecretImport::Retryable("the node refused to save the purchase".into())
+        };
     }
     if !store.has_secret(key)
         && store.list_secrets(KEPT_PURCHASE_PREFIX.as_bytes()).len() >= MAX_KEPT_PURCHASES
@@ -434,6 +467,38 @@ pub(crate) mod fixtures {
         )
         .expect("sign tip");
         OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// A genuine confirmation of `order`'s payment at height 100, signed by
+    /// the bridge at `as_of`: a later rung of the same payment.
+    pub(crate) fn claim_as_of(order: &Order, as_of: u32) -> SignedClaim {
+        let (spv, txid, block_hash) = payment_proof(
+            &order.payment_script_pubkey,
+            order.amount_sats,
+            1,
+            [1u8; 32],
+        );
+        SignedClaim::sign(
+            &bridge_key(),
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: BlockAnchor {
+                    height: as_of,
+                    hash: BlockHash([0x55; 32]),
+                },
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor: BlockAnchor {
+                        height: 100,
+                        hash: block_hash,
+                    },
+                    spv,
+                },
+            },
+        )
+        .expect("sign claim")
     }
 
     /// `order` at `status`, terms signed by `seller`, with real payment
@@ -625,6 +690,93 @@ mod tests {
             reason.contains("not the one a complaint carries"),
             "{reason}"
         );
+    }
+
+    /// A paid copy following a reorg: `n`'s payment, confirmed at 100, with a
+    /// claim signed at `as_of`.
+    fn paid_as_of(n: u16, c: u8, as_of: u32) -> PurchaseToKeep {
+        use harvest_common::payment::OrderPaymentProof;
+        let mut keep = to_keep(n, c, OrderStatus::Paid, 1);
+        let Some(OrderPaymentProof::OnChain(proof)) = keep.order.payment_proof.as_mut() else {
+            panic!("on chain");
+        };
+        proof.claims = vec![fixtures::claim_as_of(&keep.order.order, as_of)];
+        keep
+    }
+
+    /// **A kept paid copy with no complaint follows strictly fresher
+    /// evidence, and is frozen once a complaint is kept** (model 3.2, review
+    /// round 3). After a reorg re-confirms the payment, the kept copy must
+    /// show the re-confirmation, not the stale claim a reversal is built
+    /// from. Red if the fresher copy is refused, or if a copy that is not
+    /// fresher, or one with a complaint, is replaced.
+    #[test]
+    fn a_paid_copy_follows_fresher_evidence_until_a_complaint() {
+        use harvest_common::payment::evidence_freshness;
+        let mut secrets = holding(1);
+        keep(&mut secrets, paid_as_of(1, 1, 100));
+        let fresher = purchases(keep(&mut secrets, paid_as_of(1, 1, 105))).remove(0);
+        assert_eq!(evidence_freshness(&fresher.order), 105, "fresher replaces");
+        let same = purchases(keep(&mut secrets, paid_as_of(1, 1, 103))).remove(0);
+        assert_eq!(evidence_freshness(&same.order), 105, "older does not");
+
+        let complaint = complaint_about(&fresher.order, &seed(1), FeedbackCategory::NonDelivery);
+        keep(
+            &mut secrets,
+            PurchaseToKeep {
+                complaint: Some(complaint),
+                ..paid_as_of(1, 1, 105)
+            },
+        );
+        let frozen = purchases(keep(&mut secrets, paid_as_of(1, 1, 110))).remove(0);
+        assert_eq!(
+            evidence_freshness(&frozen.order),
+            105,
+            "frozen by the complaint"
+        );
+        assert!(frozen.complaint.is_some());
+    }
+
+    /// **Migration merges as a keep would** (review round 3): the successor
+    /// holding only the unpaid copy takes the predecessor's paid copy and
+    /// complaint; a successor already holding a complaint keeps it. Red if
+    /// import keeps whatever the successor holds.
+    #[test]
+    fn import_takes_the_more_complete_record() {
+        let mut predecessor = holding(1);
+        let paid = purchases(keep(&mut predecessor, to_keep(1, 1, OrderStatus::Paid, 1)))
+            .remove(0)
+            .order;
+        keep(
+            &mut predecessor,
+            PurchaseToKeep {
+                complaint: Some(complaint_about(
+                    &paid,
+                    &seed(1),
+                    FeedbackCategory::NonDelivery,
+                )),
+                ..to_keep(1, 1, OrderStatus::Paid, 1)
+            },
+        );
+        let key = kept_purchase_key(&order(1, 1).id.0);
+        let value = predecessor.get_secret(&key).expect("kept");
+
+        let mut successor = holding(1);
+        keep(
+            &mut successor,
+            to_keep(1, 1, OrderStatus::AwaitingPayment, 1),
+        );
+        assert!(matches!(
+            import(&mut successor, &key, &value),
+            SecretImport::Written
+        ));
+        let merged = purchases(list(&successor)).remove(0);
+        assert_eq!(merged.order.status, OrderStatus::Paid);
+        assert!(merged.complaint.is_some());
+        assert!(matches!(
+            import(&mut successor, &key, &value),
+            SecretImport::AlreadyAuthoritative
+        ));
     }
 
     /// No complaint is kept about an unpaid order.
