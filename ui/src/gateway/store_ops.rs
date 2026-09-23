@@ -735,6 +735,33 @@ pub async fn submit_listing_by_id(
     Ok(())
 }
 
+/// Publish a listing's availability, already signed by the store key, to one
+/// of our stores (harvest#70).
+///
+/// A delta carrying only `listing_statuses`, under the same shape rule as
+/// `listings_delta_bytes`.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_listing_status_by_id(
+    store_contract_id: &[u8],
+    status: harvest_common::listing::AuthorizedListingStatus,
+) -> Result<(), String> {
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, _origin, owner) =
+        owned_store_key(store_contract_id, "nothing to update a listing in")?;
+    let delta_bytes = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
+        listing_statuses: Some(vec![status]),
+        ..Default::default()
+    })
+    .map_err(|e| format!("serialize listing status delta: {e}"))?;
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await
+}
+
 /// Publish a store's signed details to its contract.
 ///
 /// Separate from creation because it cannot happen during it: the details

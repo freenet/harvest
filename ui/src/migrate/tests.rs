@@ -322,6 +322,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#53 Phase C; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "9e0561ce17ef6e62dae5b3a75f70c9e00d742aa6afb5b813d369208f75efc16d",
+                // V21, from `git show 52afb47:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#70: the state gained listing statuses.
+                "4aa47d75444431b8dcecd731aef0e88dd484be0805b2b7fb74798d003a23cca8",
             ],
         ),
         (
@@ -380,6 +383,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // and the record addressed by the store key. The last
                 // generation addressed by an RSA key and the Ghost Key.
                 "78ae80d2bcb3e80299a977da3a437a44cced8b74367f53d24e407c2b171d362e",
+                // V16, from `git show 52afb47:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#70; this
+                // artifact moves only because `harvest-common` is compiled
+                // into it. The first generation addressed by the store key.
+                "68543c8c1e29a968046ffe3392fb767576aa6a950c6a835d6eb97e8d989e0230",
             ],
         ),
         (
@@ -445,6 +453,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#53 Phase C; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "88fe938bc67b794a497a1e9c657d527c9d857cc394259c02bb7e594000729a29",
+                // V3, from `git show 52afb47:ui/public/contracts/index_contract.wasm`.
+                // Superseded by harvest#70; this artifact moves only because
+                // `harvest-common` is compiled into it.
+                "0a21fecfdd702dea40d5ccd51d6b7ecc095e101d1c8a8801a5594c4368d60361",
             ],
         ),
     ];
@@ -549,6 +561,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#53 Phase C: the blind-signature and
             // transaction requests are gone, and nothing mints an RSA key.
             "0ab16ff67f87e11da81e179ab75481791b165d631af0a86966e2421255da3b62".to_string(),
+            // V22, from `git show 52afb47:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#70: the store key also signs a listing
+            // status.
+            "225214b7d88fcc8e769f50f51279703f11fd5aef13f64657b4646c2af978ef19".to_string(),
         ],
     );
 }
@@ -748,6 +764,20 @@ fn rsa_generation_id(code_hash: &[u8; 32], der: &[u8]) -> ContractInstanceId {
     current_id(code_hash, &params)
 }
 
+/// The superseded store-key generations (V16 on), newest first, each at the
+/// address it was published at for `store_vk()`.
+fn store_key_generation_ids() -> Vec<ContractInstanceId> {
+    let params = encode_params(&reputation_params(&store_vk())).unwrap();
+    let mut rows: Vec<_> = reputation_lineage()
+        .iter()
+        .filter(|e| e.generation > LAST_RSA_REPUTATION_PARAM_GENERATION)
+        .collect();
+    rows.sort_by_key(|e| core::cmp::Reverse(e.generation));
+    rows.iter()
+        .map(|e| current_id(&e.code_hash, &params))
+        .collect()
+}
+
 /// **Every RSA generation is probed at the address it was published at,
 /// for every RSA key known, and at no store-key address.** Deriving them from
 /// today's parameters would probe addresses that never existed and report a
@@ -785,22 +815,30 @@ fn rsa_generations_are_probed_under_their_own_encoding() {
             row.generation
         );
     }
-    // The newest RSA generation first: `NewestFirst` asks for it.
+    // Newest first, as `NewestFirst` asks: the store-key generations, then
+    // the newest RSA generation.
+    let store_key_ids = store_key_generation_ids();
+    assert_eq!(ids[..store_key_ids.len()], store_key_ids[..]);
     let newest = rsa_rows.iter().max_by_key(|e| e.generation).unwrap();
-    assert_eq!(ids[0], rsa_generation_id(&newest.code_hash, &record));
+    assert_eq!(
+        ids[store_key_ids.len()],
+        rsa_generation_id(&newest.code_hash, &record)
+    );
 }
 
-/// With no RSA key known, the RSA generations contribute nothing, and the
-/// registered id -- the exact record this seller made -- is still tried,
-/// once, and last.
+/// With no RSA key known, the RSA generations contribute nothing (the
+/// store-key generations still do, derived from the store key alone), and
+/// the registered id -- the exact record this seller made -- is still
+/// tried, once, and last.
 #[test]
 fn the_registered_reputation_id_is_tried_once_and_last() {
     let registered = ContractInstanceId::new([77u8; 32]);
     let ids = reputation_candidate_ids(&locators(Vec::new(), Some(registered))).expect("derive");
+    let mut expected = store_key_generation_ids();
+    expected.push(registered);
     assert_eq!(
-        ids,
-        vec![registered],
-        "no RSA key, so only the registered id"
+        ids, expected,
+        "no RSA key, so only the store-key generations and the registered id"
     );
 
     let der = vec![3u8; 40];
@@ -1040,6 +1078,9 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // V20: harvest#53 Phase B (`3f3ef7b`). Still the store key's code,
         // 29B.
         (20, Code),
+        // V21: harvest#53 Phase C (`52afb47`). Still the store key's code,
+        // 29B.
+        (21, Code),
     ]
 };
 

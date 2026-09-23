@@ -4,8 +4,10 @@ pub(crate) mod buy_view;
 mod invoice_form;
 mod listing_form;
 pub(crate) mod message_view;
-mod my_store;
+pub(crate) mod my_store;
+mod purchases_view;
 mod reputation_view;
+mod seller_listings;
 mod store_view;
 
 pub use app::App;

@@ -196,3 +196,10 @@ description = "Superseded by harvest#53 Phase C (the receipted complaint), which
 date = "2026-09-23"
 code_hash = "0ab16ff67f87e11da81e179ab75481791b165d631af0a86966e2421255da3b62"
 delegate_key = "0557c435c3bcb2701fc9848875d6f52d3ce311c2fff16ba77aae86617ebf2aea"
+
+[[entry]]
+version = "V22"
+description = "Superseded by harvest#70 (listing availability): `StoreStateV1` gained `listing_statuses`, one store-key-signed `ListingStatus` per listing id (`{listing, revision, availability: Available { quantity } | SoldOut | Withdrawn}`), merged per listing by the HIGHEST revision and then the smaller encoding (`SignedRecord::rank`, which every other signed record leaves at zero, so their merge is unchanged), and `classify_store_key_message` gained `ListingStatus`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This delegate's did: `SignStoreUpdate` now also signs a `ListingStatus` with the store key, through `classify_store_key_message`, which the delegate consults before signing anything with a store key. No secret family, request or response shape changed, so the export/import handshake and every import family are unchanged. The generation harvest#53 Phase C shipped (`52afb47`, #143). The parameters are unchanged (empty)."
+date = "2026-09-23"
+code_hash = "225214b7d88fcc8e769f50f51279703f11fd5aef13f64657b4646c2af978ef19"
+delegate_key = "9feb07695981fe08488fae1d32d5c6ba92b5988c187c76bfa8ba79ad9a572dc6"

@@ -245,6 +245,63 @@ pub fn open_store(params: StoreParameters) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_store(_params: StoreParameters) {}
 
+/// Load a remembered store in the background without opening it (harvest#93
+/// phase 2): My purchases lists a store only once its state has arrived,
+/// because that is what recalls this device's conversations with it.
+///
+/// A store already in `browsing_stores` (loaded, or its GET already out) is
+/// left alone. The placeholder entry this adds is what says a GET is out, and
+/// it is taken back out if the GET fails to send, so a later visit retries. A
+/// GET that goes out and is never answered leaves the placeholder for the
+/// session, which only means the store is not asked about again until reload.
+#[cfg(target_arch = "wasm32")]
+pub fn load_remembered_store(code: &str) {
+    use dioxus::prelude::WritableExt;
+
+    let Some(params) = StoreParameters::from_code(code) else {
+        return;
+    };
+    let Ok(store_id) = crate::gateway::store_ops::store_instance_id(&params) else {
+        return;
+    };
+    let contract_id = store_id.as_bytes().to_vec();
+    // Checked under a READ first: My purchases calls this from an effect
+    // that reads the app state, and a write, even one that changes nothing,
+    // would re-run that effect for ever.
+    {
+        use dioxus::prelude::ReadableExt;
+        if crate::gateway::APP_STATE
+            .read()
+            .browsing_stores
+            .contains_key(&contract_id)
+        {
+            return;
+        }
+    }
+    if !crate::gateway::APP_STATE
+        .write()
+        .begin_background_load(contract_id.clone(), code.to_string())
+    {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
+            dioxus::logger::tracing::warn!("Could not load a remembered store: {e}");
+            crate::gateway::APP_STATE
+                .write()
+                .end_background_load_failed(&contract_id);
+            return;
+        }
+        gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .end_background_load_timed_out(&contract_id);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_remembered_store(_code: &str) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

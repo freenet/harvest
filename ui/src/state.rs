@@ -647,6 +647,32 @@ pub struct AppState {
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
 
+    /// Listing statuses the store key has signed, with the store each is for.
+    /// Filled only off wasm, where nothing publishes them, so a test can see
+    /// what would have been sent (harvest#70).
+    /// Remembered stores My purchases is loading in the background: GET out,
+    /// state not yet arrived. See `store_link::load_remembered_store`.
+    pub background_loads: HashSet<Vec<u8>>,
+
+    pub signed_statuses_ready: Vec<(Vec<u8>, harvest_common::listing::AuthorizedListingStatus)>,
+
+    /// Listing statuses this session has signed and sent, per (store,
+    /// listing): the revision floor for the next one, and whether the row is
+    /// still waiting for the store's state to show it. See
+    /// `crate::listing_status_flow::SentStatus`.
+    pub listing_statuses_sent: HashMap<
+        (Vec<u8>, harvest_common::listing::ListingId),
+        crate::listing_status_flow::SentStatus,
+    >,
+
+    /// An edited listing's predecessor, to take down once the replacement
+    /// has published, keyed by the replacement's id (harvest#70). See
+    /// `AppState::on_listing_published`.
+    pub withdraw_after_publish: HashMap<
+        harvest_common::listing::ListingId,
+        (Vec<u8>, harvest_common::listing::ListingId, i64),
+    >,
+
     /// Pending messages/events for the UI to display.
     pub notifications: Vec<String>,
 
@@ -979,7 +1005,7 @@ pub(crate) const PAYMENT_ON_ITS_WAY_BUYER: &str =
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
     "this store has no store key on this device. A store made before stores had their own \
-     keys has to be moved to one first (My Store offers it); for a store created on another \
+     keys has to be moved to one first (My store offers it); for a store created on another \
      device, open its link here with the Ghost Key that backs it connected, and Harvest \
      recovers the key from the store.";
 
@@ -1196,7 +1222,7 @@ fn unverified_listings(
 
 impl BrowsingStore {
     /// How a reader counts each complaint on this store's record, beside the
-    /// complaint: the ONE place both the store badge and the Reputation page
+    /// complaint: the ONE place both the store badge and the store's record (`StoreRecord`)
     /// read it from, so they cannot disagree.
     ///
     /// Reads the complaint, the store's record of that one order and its
@@ -1234,6 +1260,18 @@ impl BrowsingStore {
         self.complaint_standings()
             .filter(|(_, standing)| standing.counts())
             .count()
+    }
+
+    /// A listing's availability: the status the store holds for it, or on
+    /// sale and uncounted when it holds none (harvest#70).
+    pub fn availability(
+        &self,
+        listing: &harvest_common::listing::ListingId,
+    ) -> harvest_common::listing::ListingAvailability {
+        self.listing_statuses
+            .get(listing)
+            .map(|status| status.availability.clone())
+            .unwrap_or_default()
     }
 
     /// Whether anything on this store may be offered to a buyer as payable
@@ -1333,6 +1371,8 @@ pub enum PendingSignature {
     /// The store key's acceptance of that statement, from the Harvest
     /// delegate.
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
+    /// A listing's availability, for the store key (harvest#70).
+    ListingStatus(Box<crate::listing_status_flow::PendingListingStatus>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1351,6 +1391,7 @@ impl PendingSignature {
     pub(crate) fn signed_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
+            PendingSignature::ListingStatus(pending) => harvest_common::to_cbor(&pending.status),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
@@ -1378,6 +1419,7 @@ impl PendingSignature {
     pub(crate) fn signer(&self) -> Signer {
         match self {
             PendingSignature::Listing(_)
+            | PendingSignature::ListingStatus(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
@@ -2526,6 +2568,11 @@ pub fn foreign_owner_message(code: &str, held: &[u8; 32]) -> String {
 pub struct BrowsingStore {
     pub info: Option<StoreInfoV1>,
     pub listings: Vec<AuthorizedListing>,
+    /// Each listing's availability, as the store key last signed it
+    /// (harvest#70). A listing with no entry is on sale and uncounted; see
+    /// [`Self::availability`].
+    pub listing_statuses:
+        HashMap<harvest_common::listing::ListingId, harvest_common::listing::ListingStatus>,
     /// Whether the store's published ghostkey certificate actually holds up.
     ///
     /// Reached once, in `on_contract_state`, rather than being recomputed
@@ -3086,6 +3133,44 @@ impl AppState {
     /// `store_link::is_old_format_link`.
     pub fn note_old_format_link(&mut self) {
         self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
+    }
+
+    /// Mark a remembered store as being loaded in the background, unless it is
+    /// already loaded or loading. `true` when the caller should send the GET.
+    /// See `store_link::load_remembered_store`.
+    pub fn begin_background_load(&mut self, store_contract_id: Vec<u8>, code: String) -> bool {
+        if self.browsing_stores.contains_key(&store_contract_id) {
+            return false;
+        }
+        self.browsing_stores
+            .insert(store_contract_id.clone(), BrowsingStore::default());
+        self.background_loads.insert(store_contract_id.clone());
+        self.note_store_code(store_contract_id, code);
+        true
+    }
+
+    /// A background load's GET did not go out: take its placeholder back out,
+    /// so a later visit retries. Only a placeholder this load made and nothing
+    /// has written into since (another flow may have registered the store's
+    /// mailbox or recalled a conversation into the same entry).
+    pub fn end_background_load_failed(&mut self, store_contract_id: &[u8]) {
+        if !self.background_loads.remove(store_contract_id) {
+            return;
+        }
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| *store == BrowsingStore::default())
+        {
+            self.browsing_stores.remove(store_contract_id);
+        }
+    }
+
+    /// A background load has waited long enough: stop saying it is loading.
+    /// The placeholder stays, so the store is not asked about again this
+    /// session; its state is still taken if it arrives.
+    pub fn end_background_load_timed_out(&mut self, store_contract_id: &[u8]) {
+        self.background_loads.remove(store_contract_id);
     }
 
     /// Record the code a store was opened under. See [`Self::store_codes`].
@@ -3948,6 +4033,10 @@ impl AppState {
 
     /// Handle full contract state received from a GET response.
     pub fn on_contract_state(&mut self, contract_id: Vec<u8>, state_bytes: Vec<u8>) {
+        // Any answer for a store My purchases is loading ends the wait for
+        // it, whatever it turns out to hold (see `store_link::
+        // load_remembered_store`).
+        let background = self.background_loads.remove(&contract_id);
         // Before anything else, and before the empty check: an empty state is
         // itself an answer to a reuse check (nothing registered there). An id
         // that is ALSO a watched address goes on to the ordinary path below,
@@ -4137,7 +4226,10 @@ impl AppState {
                     // A store the seller just created, or one they own, arrives
                     // without anyone having followed a link. Show it, unless a link
                     // has already named the store this tab is for.
-                    if self.active_store_id.is_none() {
+                    // A store loaded in the background for My purchases is
+                    // not one the user opened, so it does not become the
+                    // store the Stores page shows.
+                    if self.active_store_id.is_none() && !background {
                         self.active_store_id = Some(contract_id.clone());
                     }
 
@@ -4197,6 +4289,12 @@ impl AppState {
                     // At version 0 this is the default (reset above), so a
                     // buyer finds no name, no key and no reputation link in it.
                     store.info = Some(store_state.info.info);
+                    store.listing_statuses = store_state
+                        .listing_statuses
+                        .records
+                        .values()
+                        .map(|record| (record.status.listing.clone(), record.status.clone()))
+                        .collect();
                     store.listings = store_state.listings.listings;
                     store.orders = store_state.orders.orders.into_values().collect();
                     store.despatches = store_state
@@ -9610,6 +9708,7 @@ impl AppState {
             .and_then(|at| self.pending_signatures.remove(at));
         let what = match &withdrawn {
             Some(PendingSignature::Listing(_)) => "your listing",
+            Some(PendingSignature::ListingStatus(_)) => "the change to your listing",
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
@@ -9618,6 +9717,9 @@ impl AppState {
             _ => "your store",
         };
         warn!("store key did not sign {what}: {reason}");
+        if let Some(PendingSignature::Listing(listing)) = &withdrawn {
+            self.on_listing_published(&listing.listing.id, false);
+        }
         if matches!(withdrawn, Some(PendingSignature::BackingAcceptance(_))) {
             self.store_creation_failed(&format!(
                 "the store's key did not accept the backing: {reason}"
@@ -9687,6 +9789,20 @@ impl AppState {
                 "this store belongs to {owner}, so only that identity can issue invoices \
                  on it"
             ));
+        }
+        // A listing its seller took down is not one to start a fresh sale of
+        // (harvest#70). An invoice answering a buyer's request is allowed
+        // whatever the listing's state now: the buyer asked while it was on
+        // sale, and an edit replaces a listing's id under them. A sold-out
+        // listing may be invoiced again, for an invoice that expired unpaid.
+        if invoice.reply_to.is_none()
+            && self.listing_availability(&invoice.store_contract_id, &invoice.listing_id)
+                == harvest_common::listing::ListingAvailability::Withdrawn
+        {
+            return Err(
+                "that listing is taken down. Put it back on sale first if you mean to sell it"
+                    .to_string(),
+            );
         }
         if self.bitcoin.payment_xpub.is_none() {
             return Err(
@@ -10642,11 +10758,14 @@ impl AppState {
                 // (#118).
                 if pending.certificate_pem.trim().is_empty() {
                     warn!("a signed listing has no certificate -- not publishing it");
-                    self.notifications.push(format!(
-                        "Your listing \"{}\" was not published: it has no Ghost Key \
-                         certificate, so buyers could not buy it. Add it again.",
-                        pending.listing.title
-                    ));
+                    self.listing_dropped(
+                        &pending.listing.id,
+                        format!(
+                            "Your listing \"{}\" was not published: it has no Ghost Key \
+                             certificate, so buyers could not buy it. Add it again.",
+                            pending.listing.title
+                        ),
+                    );
                     return;
                 }
                 let authorized = AuthorizedListing {
@@ -10665,20 +10784,29 @@ impl AppState {
                 if let Some(store_id) = pending.store_contract_id {
                     let listing = authorized.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) =
+                        let id = listing.listing.id.clone();
+                        let outcome =
                             crate::gateway::store_ops::submit_listing_by_id(&store_id, listing)
-                                .await
-                        {
+                                .await;
+                        if let Err(e) = &outcome {
                             dioxus::logger::tracing::error!("Failed to submit listing: {}", e);
                             crate::gateway::APP_STATE
                                 .write()
                                 .notifications
                                 .push(format!("Failed to submit listing: {e}"));
                         }
+                        // An edit's predecessor comes down only once its
+                        // replacement is up (harvest#70).
+                        crate::gateway::APP_STATE
+                            .write()
+                            .on_listing_published(&id, outcome.is_ok());
                     });
                 }
 
                 self.signed_listings_ready.push(authorized);
+            }
+            Some(PendingSignature::ListingStatus(pending)) => {
+                self.on_listing_status_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
                 let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
@@ -13994,6 +14122,7 @@ mod tests {
             .find_map(|pending| match pending {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
                 PendingSignature::Listing(_)
+                | PendingSignature::ListingStatus(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -14723,6 +14852,7 @@ mod tests {
             .filter_map(|pending| match pending {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
                 PendingSignature::Listing(_)
+                | PendingSignature::ListingStatus(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -16845,6 +16975,52 @@ mod invoice_tests {
         let err = state.issue_invoice(invoice()).expect_err("must refuse");
         assert!(err.contains("payment key"), "unhelpful error: {err}");
         assert!(state.pending_invoices.is_empty());
+    }
+
+    /// A fresh invoice for a listing its seller took down is refused; one
+    /// answering a buyer's request, or for a sold-out listing, is not
+    /// (harvest#70). Mutated red by dropping the check, and by dropping its
+    /// `reply_to` condition.
+    #[test]
+    fn a_taken_down_listing_cannot_be_invoiced_afresh() {
+        use harvest_common::listing::{ListingAvailability, ListingStatus};
+        let with = |availability: ListingAvailability| {
+            let mut state = seller_with_a_store();
+            state
+                .browsing_stores
+                .entry(STORE_ID.to_vec())
+                .or_default()
+                .listing_statuses
+                .insert(
+                    listing_id(),
+                    ListingStatus {
+                        listing: listing_id(),
+                        revision: 1,
+                        availability,
+                    },
+                );
+            state
+        };
+        let mut state = with(ListingAvailability::Withdrawn);
+        let err = state.issue_invoice(invoice()).expect_err("must refuse");
+        assert!(err.contains("taken down"), "{err}");
+        assert!(state.pending_invoices.is_empty());
+
+        let mut state = with(ListingAvailability::Withdrawn);
+        let mut answering = invoice();
+        answering.reply_to = Some([3u8; 32]);
+        // It goes on to the next check (this fixture holds no conversation
+        // key), rather than being refused as taken down.
+        let answered = state.issue_invoice(answering);
+        assert!(
+            answered.as_ref().is_ok() || !answered.as_ref().unwrap_err().contains("taken down"),
+            "a buyer's request is still answered: {answered:?}"
+        );
+
+        let mut state = with(ListingAvailability::SoldOut);
+        state
+            .issue_invoice(invoice())
+            .expect("a sold-out listing can be invoiced again");
     }
 
     #[test]
@@ -28474,7 +28650,7 @@ mod buy_flow_tests {
     }
 
     /// **Counting never consults closure, retirement or backing** (model
-    /// section 6): the badge's count, and the Reputation page's, are the
+    /// section 6): the badge's count, and the store record's, are the
     /// same whatever the store's status. Red if anything discounts
     /// complaints by it.
     #[test]

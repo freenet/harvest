@@ -1589,6 +1589,133 @@ fn main() {
     if want("fulfilment") {
         gen_fulfilment(&root);
     }
+    if want("status") {
+        gen_status(&root);
+    }
+}
+
+use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+
+/// Listing availability (harvest#70): a store-key-signed status per listing,
+/// the highest revision kept, then the smaller encoding. Revisions racing in
+/// both orders, equal revisions with different content, a status arriving
+/// before its listing, and statuses beside the closed flag; then states the
+/// contract must refuse.
+fn gen_status(root: &Path) {
+    use ListingAvailability::{Available, SoldOut, Withdrawn};
+    let bx = BackingFx::new();
+    let params = cbor(&bx.fx.params);
+    let p = &bx.fx.params;
+    let stranger = SigningKey::from_bytes(&[0xDA; 32]);
+    let l1 = bx.fx.listing(1);
+    let l2 = bx.fx.listing(2);
+    let s1_r1_three = bx.status(&l1, 1, Available { quantity: Some(3) });
+    let s1_r2_one = bx.status(&l1, 2, Available { quantity: Some(1) });
+    let s1_r3_sold = bx.status(&l1, 3, SoldOut);
+    let s1_r3_down = bx.status(&l1, 3, Withdrawn); // same revision, other content
+    let s1_r4_back = bx.status(&l1, 4, Available { quantity: None });
+    let s2_r1_down = bx.status(&l2, 1, Withdrawn);
+    let s2_big = bx.status(&l2, u64::MAX, SoldOut);
+    let closed = bx.closure_by(&bx.store);
+    // Statuses beside backings and a retirement, so the store-wide
+    // `normalize_backings` pass runs over a state holding statuses.
+    let g1 = SigningKey::from_bytes(&[0xD1; 32]);
+    let mixed = {
+        let mut s = StoreStateV1::default();
+        s.apply_delta(
+            &StoreStateV1::default(),
+            p,
+            &Some(StoreStateV1Delta {
+                owner: Some(bx.store.verifying_key()),
+                listings: Some(vec![l1.clone()]),
+                backings: Some(vec![bx.backing(&g1, 100)]),
+                retirements: Some(vec![bx.retirement_by(&bx.store, &g1)]),
+                listing_statuses: Some(vec![s1_r3_down.clone()]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        bx.fx.check(&s);
+        s
+    };
+
+    let states: Vec<(&str, StoreStateV1)> = vec![
+        ("default", StoreStateV1::default()),
+        ("mixed_backing_r3down", mixed),
+        ("L1", bx.build_s(vec![l1.clone()], vec![], vec![])),
+        ("L1_r1", bx.build_s(vec![l1.clone()], vec![s1_r1_three.clone()], vec![])),
+        ("L1_r2", bx.build_s(vec![l1.clone()], vec![s1_r2_one.clone()], vec![])),
+        ("L1_r3sold", bx.build_s(vec![l1.clone()], vec![s1_r3_sold.clone()], vec![])),
+        ("L1_r3down", bx.build_s(vec![l1.clone()], vec![s1_r3_down.clone()], vec![])),
+        ("L1_r4back", bx.build_s(vec![l1.clone()], vec![s1_r4_back.clone()], vec![])),
+        ("L12_r2_s2", bx.build_s(vec![l1.clone(), l2.clone()], vec![s1_r2_one.clone(), s2_r1_down.clone()], vec![])),
+        // A status arriving before the listing it describes.
+        ("r3sold_only", bx.build_s(vec![], vec![s1_r3_sold.clone()], vec![])),
+        ("s2_only", bx.build_s(vec![], vec![s2_r1_down.clone()], vec![])),
+        ("s2_max", bx.build_s(vec![], vec![s2_big.clone()], vec![])),
+        ("L2_closed_r1", bx.build_s(vec![l2.clone()], vec![s1_r1_three.clone()], vec![closed.clone()])),
+    ];
+    native_laws_total("status", p, &states);
+
+    let pairs = [
+        ("L1_r1", "L1_r2"), ("L1_r2", "L1_r1"),
+        ("L1_r3sold", "L1_r3down"), ("L1_r3down", "L1_r3sold"),
+        ("L1_r2", "L1_r4back"), ("L1_r4back", "L1_r3sold"),
+        ("r3sold_only", "L1"), ("L1", "r3sold_only"),
+        ("r3sold_only", "L1_r2"), ("L1_r2", "r3sold_only"),
+        ("L12_r2_s2", "s2_max"), ("s2_max", "L12_r2_s2"),
+        ("default", "L12_r2_s2"), ("L2_closed_r1", "L1_r4back"),
+        ("s2_only", "L1_r3down"),
+        ("mixed_backing_r3down", "L1_r3sold"), ("L1_r4back", "mixed_backing_r3down"),
+    ];
+    let mut c = Corpus::new(root, "store-status", &params);
+    let mut all = states.clone();
+    let find = |all: &Vec<(&str, StoreStateV1)>, n: &str| all.iter().find(|(m, _)| *m == n).unwrap().1.clone();
+    let mut extra = vec![];
+    for (a, b) in pairs {
+        let r = bx.fx.merged(&find(&all, a), &find(&all, b));
+        let name: &'static str = Box::leak(format!("m_{a}__{b}").into_boxed_str());
+        extra.push((a, name, r));
+    }
+    for (_, n, s) in &extra { all.push((n, s.clone())); }
+    let later = find(&all, "m_L1_r2__L1_r1");
+    println!(
+        "status: r1 into r2 keeps r2? {}",
+        later.listing_availability(&l1.listing.id) == Available { quantity: Some(1) }
+    );
+    for (n, s) in &all { c.state(n, &cbor(s)); }
+    for (a, n, _) in &extra { c.transition(a, n); }
+    for (a, b) in pairs {
+        let base = find(&all, a);
+        let tgt = find(&all, b);
+        let summ = base.summarize(&base, p);
+        let Some(d) = tgt.delta(&tgt, p, &summ) else { continue };
+        let mut r = base.clone();
+        r.apply_delta(&base.clone(), p, &Some(d.clone())).expect("a status delta applies");
+        bx.fx.check(&r);
+        c.delta_step(&cbor(&base), &cbor(&summ), &cbor(&d), &cbor(&r));
+    }
+    c.finish();
+
+    // States the contract must refuse: a status signed by someone else, and
+    // one filed under another listing's slot.
+    let base = bx.build_s(vec![l1.clone()], vec![], vec![]);
+    let raw = |slot: [u8; 32], record: AuthorizedListingStatus| {
+        let mut s = base.clone();
+        s.listing_statuses.records.insert(harvest_common::store::Bytes32(slot), record);
+        assert!(s.verify(&s, p).is_err(), "an invalid fixture must be one the contract refuses");
+        s
+    };
+    let bad: Vec<(&str, StoreStateV1)> = vec![
+        ("default", StoreStateV1::default()),
+        ("L1", base.clone()),
+        ("L1_r2", find(&all, "L1_r2")),
+        ("bad_status_by_stranger", raw(l1.listing.id.0, bx.status_by(&stranger, &l1, 9, Withdrawn))),
+        ("bad_status_wrong_slot", raw(l2.listing.id.0, bx.status(&l1, 9, Withdrawn))),
+    ];
+    let mut c = Corpus::new(root, "store-status-bad", &params);
+    for (n, s) in &bad { c.state(n, &cbor(s)); }
+    c.finish();
 }
 
 use harvest_common::fulfilment::{AuthorizedDespatch, Despatch};
@@ -2403,6 +2530,53 @@ impl BackingFx {
             closed: (!closed.is_empty()).then_some(closed),
             copies: (!copies.is_empty()).then_some(copies),
             fulfilment: None,
+            listing_statuses: None,
+        };
+        s.apply_delta(&StoreStateV1::default(), &self.fx.params, &Some(delta))
+            .unwrap();
+        self.fx.check(&s);
+        s
+    }
+
+    fn status_by(
+        &self,
+        signer: &SigningKey,
+        listing: &AuthorizedListing,
+        revision: u64,
+        availability: ListingAvailability,
+    ) -> AuthorizedListingStatus {
+        let status = ListingStatus {
+            listing: listing.listing.id.clone(),
+            revision,
+            availability,
+        };
+        let (scoped_payload, signature) = sign_scoped(signer, &status);
+        AuthorizedListingStatus { status, scoped_payload, signature }
+    }
+
+    fn status(
+        &self,
+        listing: &AuthorizedListing,
+        revision: u64,
+        availability: ListingAvailability,
+    ) -> AuthorizedListingStatus {
+        self.status_by(&self.store, listing, revision, availability)
+    }
+
+    /// A store holding `listings`, `statuses` and optionally the closed flag.
+    fn build_s(
+        &self,
+        listings: Vec<AuthorizedListing>,
+        statuses: Vec<AuthorizedListingStatus>,
+        closed: Vec<AuthorizedClosure>,
+    ) -> StoreStateV1 {
+        let mut s = StoreStateV1::default();
+        let delta = StoreStateV1Delta {
+            owner: Some(self.store.verifying_key()),
+            listings: (!listings.is_empty()).then_some(listings),
+            closed: (!closed.is_empty()).then_some(closed),
+            listing_statuses: (!statuses.is_empty()).then_some(statuses),
+            ..Default::default()
         };
         s.apply_delta(&StoreStateV1::default(), &self.fx.params, &Some(delta))
             .unwrap();
@@ -2808,6 +2982,7 @@ fn gen_retire98(root: &Path) {
         closed: (!cl.is_empty()).then_some(cl),
         copies: None,
         fulfilment: None,
+        listing_statuses: None,
     };
     let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
         ("ret1", d(vec![], vec![r1.clone()], vec![], true)),

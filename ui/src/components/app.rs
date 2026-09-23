@@ -2,22 +2,43 @@ use dioxus::prelude::*;
 
 use super::bitcoin_view::BitcoinView;
 use super::my_store::MyStore;
-use super::reputation_view::ReputationView;
+use super::purchases_view::MyPurchases;
 use super::store_view::StoreView;
 use crate::gateway::{ConnectionStatus, CONNECTION_STATUS};
 
-#[derive(Clone, PartialEq)]
-enum Route {
-    Browse,
+/// The top-level pages (harvest#93 phase 2: Stores / My purchases / My
+/// store). The Bitcoin diagnostics that used to be the "Payments" tab are
+/// reached from the footer: a seller's orders live in My store and a buyer's
+/// in My purchases, so what remains there is for someone checking the bridge.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Route {
+    Stores,
+    Purchases,
     MyStore,
-    Reputation,
-    Payments,
+    Diagnostics,
+}
+
+/// The page on screen, global so that a control on one page can send the
+/// seller to another ("See your store as buyers do", "Open store").
+pub(crate) static ROUTE: GlobalSignal<Route> = GlobalSignal::new(|| Route::Stores);
+
+/// Show a store's own page, as a buyer sees it.
+pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
+    crate::gateway::APP_STATE.write().active_store_id = Some(store_contract_id);
+    *ROUTE.write() = Route::Stores;
 }
 
 #[component]
 pub fn App() -> Element {
-    let mut current_route = use_signal(|| Route::Browse);
+    let current_route = ROUTE();
     let connection_status = CONNECTION_STATUS.read().clone();
+    // A buyer's request arriving is the one thing a seller must not miss, so
+    // its count rides on the navigation, visible from every page.
+    let waiting = super::my_store::requests_needing_seller(&crate::gateway::APP_STATE.read());
+    let my_store_label = match waiting {
+        0 => "My store".to_string(),
+        n => format!("My store ({n})"),
+    };
 
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
     {
@@ -210,8 +231,8 @@ pub fn App() -> Element {
             .and_then(|(_, store)| store.info.as_ref())
             .map(|info| info.store_name.as_str());
 
-        match (&current_route(), store_name) {
-            (Route::Browse, Some(name)) => crate::document_title::set_store_title(name),
+        match (&current_route, store_name) {
+            (Route::Stores, Some(name)) => crate::document_title::set_store_title(name),
             _ => crate::document_title::set_default_title(),
         }
     }
@@ -234,43 +255,40 @@ pub fn App() -> Element {
                     }
                     h1 { class: "harvest-title", "Harvest" }
                 }
-                nav { class: "harvest-nav",
-                    span { class: "{status_class}", "{connection_status}" }
+                span { class: "{status_class}", "{connection_status}" }
+            }
+            nav { class: "harvest-nav", aria_label: "Main",
+                for (route , label) in [
+                    (Route::Stores, "Stores".to_string()),
+                    (Route::Purchases, "My purchases".to_string()),
+                    (Route::MyStore, my_store_label.clone()),
+                ]
+                {
                     button {
-                        class: if current_route() == Route::Browse { "nav-btn active" } else { "nav-btn" },
-                        onclick: move |_| current_route.set(Route::Browse),
-                        "Browse"
-                    }
-                    button {
-                        class: if current_route() == Route::MyStore { "nav-btn active" } else { "nav-btn" },
-                        onclick: move |_| current_route.set(Route::MyStore),
-                        "My Store"
-                    }
-                    button {
-                        class: if current_route() == Route::Reputation { "nav-btn active" } else { "nav-btn" },
-                        onclick: move |_| current_route.set(Route::Reputation),
-                        "Reputation"
-                    }
-                    button {
-                        class: if current_route() == Route::Payments { "nav-btn active" } else { "nav-btn" },
-                        onclick: move |_| current_route.set(Route::Payments),
-                        "Payments"
+                        class: if current_route == route { "nav-btn active" } else { "nav-btn" },
+                        aria_current: if current_route == route { "page" } else { "false" },
+                        onclick: move |_| *ROUTE.write() = route,
+                        "{label}"
                     }
                 }
             }
 
             {notification_bar()}
 
-            match current_route() {
-                Route::Browse => rsx! { StoreView {} },
+            match current_route {
+                Route::Stores => rsx! { StoreView {} },
+                Route::Purchases => rsx! { MyPurchases {} },
                 Route::MyStore => rsx! { MyStore {} },
-                Route::Reputation => rsx! { ReputationView {} },
-                Route::Payments => rsx! { BitcoinView {} },
+                Route::Diagnostics => rsx! { BitcoinView {} },
             }
 
-            // Footer with build timestamp
             footer { class: "harvest-footer",
                 span { "Built: {format_build_time()}" }
+                button {
+                    class: "link-btn",
+                    onclick: move |_| *ROUTE.write() = Route::Diagnostics,
+                    "Bitcoin bridge status"
+                }
             }
         }
     }

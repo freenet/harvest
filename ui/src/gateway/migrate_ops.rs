@@ -251,8 +251,7 @@ pub fn start_identity_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
     }
 
     // The Ghost Key's index (harvest#93 phase 1c), addressed by the key
-    // alone. Its lineage is empty until a generation is superseded; wired now
-    // so that re-key only has to record a row.
+    // alone. Its first generation was superseded by harvest#70.
     let index_params = migrate::index_params(&vk);
     match migrate::encode_params(&index_params) {
         Ok(params) => start(

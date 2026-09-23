@@ -28,3 +28,9 @@ version = "V2"
 description = "Superseded by harvest#53 Phase C (the receipted complaint), which changed `harvest-common`: `reputation.rs` replaced `FeedbackEntry` with `Complaint` (a buyer-signed complaint about one PAID order of the store) and `ReputationParameters` lost its RSA key, `FeedbackCategory` lost `Other`, and `delegate.rs` lost the blind-signature and transaction requests (`InitReputationKeys`, `BlindSignFeedbackToken`, `BeginTransaction`, `RecordBlindSignature`, `ListTransactions`, `TransactionRecord`). `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not, and `IndexParameters` is unchanged."
 date = "2026-09-23"
 code_hash = "88fe938bc67b794a497a1e9c657d527c9d857cc394259c02bb7e594000729a29"
+
+[[entry]]
+version = "V3"
+description = "Superseded by harvest#70 (listing availability): `StoreStateV1` gained `listing_statuses`, one store-key-signed `ListingStatus` per listing id (`{listing, revision, availability: Available { quantity } | SoldOut | Withdrawn}`), merged per listing by the HIGHEST revision and then the smaller encoding (`SignedRecord::rank`, which every other signed record leaves at zero, so their merge is unchanged), and `classify_store_key_message` gained `ListingStatus`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not, and `IndexParameters` is unchanged. The generation harvest#53 Phase C shipped (`52afb47`, #143)."
+date = "2026-09-23"
+code_hash = "0a21fecfdd702dea40d5ccd51d6b7ecc095e101d1c8a8801a5594c4368d60361"

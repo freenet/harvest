@@ -1196,6 +1196,31 @@ Two gaps harvest#123 left, found by reading #136 and then (F1) reproduced on an 
 | Review round 1 (harvest#138) | A recovery is matched to the registration by key; a late recovery answer still marks the key held; a recovered registered store's buyers' messages are asked about again; a store whose key cannot be recovered is said once; a restored backup kept under an earlier id is filed with its store whichever came first; a re-ask leaves recalls in flight alone; one notice per store for a failed recall; a wrong link code falls back to the owner's. | **Yes** -- `a_registration_moved_to_a_new_contract_id_is_still_kept`, `a_late_recovery_answer_still_marks_the_key_held`, `recovering_a_registered_stores_key_asks_for_its_conversation_keys_again`, `an_unrecoverable_store_key_is_said_once`, `a_store_list_records_each_keys_held_state_on_its_own`, `a_recovered_store_key_is_listed_as_held` (delegate, real handlers both ends), `a_backup_restored_before_its_store_opened_is_shown_with_the_store`, `a_backup_restored_after_its_store_opened_is_shown_with_the_store`, `a_re_ask_leaves_recalls_in_flight_alone`, `a_failed_recall_is_said_once_per_store`, `a_wrong_link_code_falls_back_to_the_owner`. |
 | Residuals | A store key with no custody copy (a store no device ever wrapped, or its backer never connected) is not recoverable after a re-key by this app, though its seed still sits in the predecessor delegate on that node. A conversation kept under a whole-key store generation (V1-V16) is not recalled. Every browsed store costs one recall per earlier code-addressed generation per load (node-local). | **Documented** here and in `delegate_migrate`'s module docs. |
 
+
+### Listing availability: harvest#70 (added 2026-09-22)
+
+A store-key-signed status beside each listing (on sale with an optional
+count, sold out, taken down), the highest revision kept. The listing's own
+terms, and so its id, never change. Mutation results below were each observed
+red with the named guard removed or inverted, original file restored after
+each.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `common/src/store.rs` `SignedRecord::rank` for `AuthorizedListingStatus` | A later revision supersedes an earlier one whichever arrives first, and a stale one arriving later does not displace it. | **Yes** -- `the_highest_revision_wins_in_either_order`; red with `rank` returning 0. |
+| `common/src/backing.rs::keeps_held` | Rank first, then the smaller encoding: a total order, so the per-slot merge is idempotent, commutative and associative. Every other record ranks 0, so their merge is unchanged. | **Yes** -- `merge_is_commutative_associative_and_idempotent` (clashing revisions and equal-revision clashes, 300 cases) and `equal_revisions_resolve_to_the_smaller_encoding`; the existing backing, retirement, closure and copy law tests are unchanged and pass. `fdev verify-merge` on `store-status` and `store-status-bad`: results recorded on PR #125. |
+| `common/src/listing.rs::AuthorizedListingStatus::verify` | Only the store key can set a listing's status; a refused delta leaves the whole state as it was; a status filed under another listing's slot does not verify. | **Yes** -- `a_status_not_signed_by_the_store_key_is_refused`, `a_status_under_the_wrong_slot_does_not_verify`; red with `verify` returning `Ok`. |
+| `common/src/backing.rs::classify_store_key_message` | The delegate signs a listing status with the store key, and a listing is still classified as a listing. | **Yes** -- `the_store_key_signs_a_listing_status`. |
+| `StoreStateV1` serialization | A state, summary or delta holding no statuses encodes exactly as before they existed, so every earlier state re-encodes to its own bytes. | **Yes** -- `no_statuses_encode_as_before_they_existed`. |
+| A status for a listing the store does not hold | Kept, because it may arrive first; readers ignore it. | **By design, not a gap.** Unbounded like the listings themselves, and only the store key can add one. |
+| The revision the UI picks | `max(held + 1, now in ms)`, so a later change wins across devices whose clocks agree. | **Partly.** Two devices with skewed clocks can each think they wrote last; the one with the larger revision wins everywhere, which is convergent but may not be the seller's latest intent. |
+| `ui/src/listing_status_flow.rs::queue_listing_status_at` | The next revision is above what the store holds, what is waiting for the store key, AND what this session already signed and sent, so a second change before the store's state catches up never reuses a revision. A held revision of `u64::MAX` is refused rather than tied with. | **Yes** -- `a_second_change_before_the_first_is_signed_gets_a_higher_revision`, `a_sent_status_holds_its_row_until_the_state_shows_it`, `a_new_revision_is_above_what_is_held_and_no_older_than_now`; red with the pending term and with the sent floor dropped. |
+| `listing_status_pending_at` ("Saving") | A row waits while the store key signs and then until the store's state shows the revision, the publish fails, or `SAVING_WINDOW_MS` passes, so no local marker can hold it for good. | **Partly.** The sent half is tested (`a_sent_status_holds_its_row_until_the_state_shows_it`, red with the sent entry dropped). The signing half has no timeout: a store-key signature the delegate never answers holds its row until reload, as it holds every store-key request today. |
+| `replace_listing` / `on_listing_published` | An edit of a listing's terms publishes the replacement with the old one's availability (a sold-out listing stays sold out unless restocked), and takes the old one down only once the replacement's publish succeeded; a failed publish leaves the original up. | **Yes** -- `an_edit_replaces_the_listing_and_a_count_change_does_not`, `an_edit_of_a_sold_out_listing_stays_sold_out`, `an_edit_keeps_sold_out_unless_restocked`. The publish call itself is wasm-only. |
+| `issue_invoice`, the invoice picker, the store page | A fresh invoice (no buyer's request) for a listing taken down is refused; one answering a request is allowed whatever the listing's state now, since the buyer asked while it was on sale and an edit replaces the id under them; a sold-out listing can be invoiced again (for an invoice that expired unpaid) and is marked so in the picker. Buyers get no Buy on a sold-out listing and never see a taken-down one. | **Yes** -- `a_taken_down_listing_cannot_be_invoiced_afresh` (red with the check dropped and with its `reply_to` condition dropped), `taken_down_listings_cannot_be_invoiced_from_the_picker`, `only_a_listing_on_sale_offers_buy`, `taken_down_listings_are_hidden_and_sold_out_ones_shown`. The inbox note beside Accept is render-only. |
+| A cancelled invoice (#53 Phase A) and its request | A cancelled order still answers the buyer's request it was issued for (the match is on binding and listing tag, whatever the status), so the request leaves the inbox's Accept list and the Orders count. A seller who cancels and wants to invoice that buyer again uses the picker, which sends no `reply_to`. | **By decision, not tested.** Not nagging about a request the seller deliberately closed is intended; cancel-and-reissue through Accept is not a supported flow. |
+| An edit in flight | The original shows "Saving" until its replacement lands or is dropped (a certificate failure, #118, a store-key refusal, or an empty certificate), so a second edit cannot publish a second replacement; every drop path forgets the pending withdrawal. | **Yes** -- `an_edit_in_flight_holds_the_original_until_it_lands_or_is_dropped`; red with the replacing term dropped and with the drop path's call removed. A replacement's own status is published independently, so a replacement that is dropped leaves a status for an id never published: harmless, readers ignore it. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the
@@ -1315,6 +1340,11 @@ a mechanism that never existed — until it was corrected on 2026-09-05. Someone
 reading that line would have concluded a removal path already existed and that
 `FoldAll` was already unsound. The two claims contradicted each other across
 files for as long as both existed, and nothing brought them together.
+
+**harvest#70 kept it sound.** Taking a listing down is a store-key-signed
+status with a higher revision, not a deletion: the listing stays in
+`ListingsV1`, and the fold is a merge that keeps the highest revision, so
+folding an older generation cannot bring a taken-down listing back.
 
 ### Not in the four, and why
 
