@@ -205,6 +205,91 @@ impl AuthorizedListing {
     }
 }
 
+/// Whether a listing can still be bought, as its seller last said
+/// (harvest#70).
+///
+/// A listing's own terms never change, because its id is a hash of them
+/// ([`ListingId::from_terms`]), and the listings set is grow-only with no
+/// removal path (see `store::ListingsV1`). So what changes about a listing
+/// after it is published (how many are left, whether it sold out, whether the
+/// seller took it down) lives beside it, in a [`ListingStatus`] the store key
+/// signs, and a reader holding no status for a listing reads it as
+/// `Available { quantity: None }`: on sale, uncounted, which is what every
+/// listing published before statuses existed was.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum ListingAvailability {
+    /// On sale. `quantity` is how many are left, when the seller counts them;
+    /// `None` means the seller does not say.
+    Available { quantity: Option<u32> },
+    /// Sold out. Still shown, so a buyer following an old link sees what
+    /// happened to it rather than a gap.
+    SoldOut,
+    /// Taken down by the seller. Readers do not show it to buyers.
+    Withdrawn,
+}
+
+impl ListingAvailability {
+    /// Whether a buyer may start a purchase of a listing in this state.
+    pub fn is_buyable(&self) -> bool {
+        match self {
+            Self::Available { quantity } => *quantity != Some(0),
+            Self::SoldOut | Self::Withdrawn => false,
+        }
+    }
+}
+
+impl Default for ListingAvailability {
+    /// What a listing with no status reads as.
+    fn default() -> Self {
+        Self::Available { quantity: None }
+    }
+}
+
+/// The seller's current word on one listing: signed by the store key, and
+/// superseded by a later one for the same listing (harvest#70).
+///
+/// # Why a revision, and why it is safe to let the seller choose it
+///
+/// A store holds one status per listing, and the one with the HIGHEST
+/// `revision` wins; two with one revision fall back to the smaller encoding,
+/// as every other signed record in a store does (`backing::SignedSetV1`).
+/// The seller picks the number, and the only party who can sign a status is
+/// the store key's holder, so what choosing it buys them is their own
+/// listing's state, which is theirs to set. A store whose key is in the wrong
+/// hands is closed instead (entity model, section 6.4).
+///
+/// The UI uses `max(held + 1, now in milliseconds)`, so a later change wins
+/// both on the device that made the earlier one and, clocks permitting, on
+/// another device that never saw it.
+///
+/// # Why a status may name a listing the store does not hold
+///
+/// It may arrive first. A rule keyed on what else happened to arrive would
+/// depend on arrival order, which is the defect the #98 merge-law re-check
+/// found in retirements. A reader ignores a status for a listing it cannot
+/// find.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ListingStatus {
+    pub listing: ListingId,
+    pub revision: u64,
+    pub availability: ListingAvailability,
+}
+
+/// A [`ListingStatus`] signed by the store key.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AuthorizedListingStatus {
+    pub status: ListingStatus,
+    pub scoped_payload: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl AuthorizedListingStatus {
+    pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
+        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.status)
+            .map_err(|e| format!("listing status is not signed by the store key: {e}"))
+    }
+}
+
 /// Verify a ghostkey delegate signature (ScopedPayload format).
 ///
 /// 1. Parse the 64-byte Ed25519 signature.

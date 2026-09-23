@@ -371,6 +371,9 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
 /// absence is never a deletion. Adding a removal path here without a
 /// tombstone would make folding an older generation silently reinstate every
 /// listing the seller had removed.
+///
+/// So a seller takes a listing down, or marks it sold out, with a status in
+/// [`StoreStateV1::listing_statuses`] (harvest#70), never by removing it here.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct ListingsV1 {
     pub listings: Vec<AuthorizedListing>,
@@ -493,6 +496,34 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         self.normalize();
         Ok(())
     }
+}
+
+/// Every listing's current status, one per listing id, signed by the store key
+/// (harvest#70). See [`crate::listing::ListingStatus`].
+///
+/// A [`crate::backing::SignedSetV1`] like the backings, with one difference:
+/// two statuses for one listing resolve to the higher `revision` before the
+/// smaller encoding, so a later status supersedes an earlier one. Nothing
+/// removes a status, and a status for a listing the store does not hold is
+/// kept, since it may arrive first.
+///
+/// Unbounded, as the listings are. Only the store key's holder can add one,
+/// and one is kept per listing id, but a status need not name a listing the
+/// store holds, so the holder can add as many as they sign. That is their own
+/// store's state to grow, the same exposure the listings already carry.
+pub type ListingStatusesV1 = crate::backing::SignedSetV1<crate::listing::AuthorizedListingStatus>;
+
+impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
+    fn slot(&self) -> Bytes32 {
+        Bytes32(self.status.listing.0)
+    }
+    fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
+        self.verify(owner)
+    }
+    fn rank(&self) -> u64 {
+        self.status.revision
+    }
+    const WHAT: &'static str = "listing status";
 }
 
 /// How many orders one store contract will hold.
@@ -1057,6 +1088,11 @@ pub struct StoreStateV1 {
         skip_serializing_if = "SignedSetV1::<crate::fulfilment::AuthorizedDespatch>::is_empty"
     )]
     pub fulfilment: crate::fulfilment::FulfilmentV1,
+    /// Each listing's availability, as the store key last signed it
+    /// (harvest#70). Serialized like the backings, for the same reason: a
+    /// state holding none encodes exactly as it did before they existed.
+    #[serde(default, skip_serializing_if = "ListingStatusesV1::is_empty")]
+    pub listing_statuses: ListingStatusesV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -1081,6 +1117,8 @@ pub struct StoreStateV1Summary {
     pub copies: <crate::custody::CopiesV1 as ComposableState>::Summary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fulfilment: <crate::fulfilment::FulfilmentV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_statuses: <ListingStatusesV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -1112,6 +1150,8 @@ pub struct StoreStateV1Delta {
     pub copies: Option<<crate::custody::CopiesV1 as ComposableState>::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulfilment: Option<<crate::fulfilment::FulfilmentV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_statuses: Option<<ListingStatusesV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -1128,6 +1168,21 @@ impl StoreStateV1 {
             || !self.closed.is_empty()
             || !self.copies.is_empty()
             || !self.fulfilment.is_empty()
+            || !self.listing_statuses.is_empty()
+    }
+
+    /// What a reader should take a listing's availability to be: the status
+    /// the store holds for it, or on sale and uncounted when it holds none
+    /// (harvest#70).
+    pub fn listing_availability(
+        &self,
+        listing: &crate::listing::ListingId,
+    ) -> crate::listing::ListingAvailability {
+        self.listing_statuses
+            .records
+            .get(&Bytes32(listing.0))
+            .map(|status| status.status.availability.clone())
+            .unwrap_or_default()
     }
 
     /// Apply the store-wide bound on backings and retirements (harvest#93
@@ -1325,6 +1380,8 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.copies)?;
         next.fulfilment
             .apply_delta(&parent, parameters, &delta.fulfilment)?;
+        next.listing_statuses
+            .apply_delta(&parent, parameters, &delta.listing_statuses)?;
         next.normalize_backings();
         next.normalize_fulfilment();
         *self = next;
@@ -1405,6 +1462,7 @@ impl ComposableState for StoreStateV1 {
             }
         }
         self.copies.verify(&parent, parameters)?;
+        self.listing_statuses.verify(&parent, parameters)?;
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
         self.closed.verify(&parent, parameters)?;
@@ -1440,6 +1498,7 @@ impl ComposableState for StoreStateV1 {
             closed: self.closed.summarize(&parent, parameters),
             copies: self.copies.summarize(&parent, parameters),
             fulfilment: self.fulfilment.summarize(&parent, parameters),
+            listing_statuses: self.listing_statuses.summarize(&parent, parameters),
         }
     }
 
@@ -1482,6 +1541,11 @@ impl ComposableState for StoreStateV1 {
             closed: self.closed.delta(&parent, parameters, &base.closed),
             copies: self.copies.delta(&parent, parameters, &base.copies),
             fulfilment: self.fulfilment.delta(&parent, parameters, &base.fulfilment),
+            listing_statuses: self.listing_statuses.delta(
+                &parent,
+                parameters,
+                &base.listing_statuses,
+            ),
         };
         if delta.info.is_none()
             && delta.listings.is_none()
@@ -1491,6 +1555,7 @@ impl ComposableState for StoreStateV1 {
             && delta.closed.is_none()
             && delta.copies.is_none()
             && delta.fulfilment.is_none()
+            && delta.listing_statuses.is_none()
         {
             None
         } else {
@@ -5252,5 +5317,312 @@ mod wire_compat_tests {
             state.info.info.store_name, "V1 store",
             "the rest of the record must survive alongside the missing field"
         );
+    }
+}
+
+#[cfg(test)]
+mod listing_status_tests {
+    //! harvest#70: a listing's availability, signed by the store key, the
+    //! highest revision kept.
+    use super::*;
+    use crate::backing::sign_with_store_key;
+    use crate::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    use crate::merge_laws::{assert_laws, Rng};
+    use ed25519_dalek::SigningKey;
+
+    fn store_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x61; 32])
+    }
+
+    fn params() -> StoreParameters {
+        StoreParameters::new(store_key().verifying_key())
+    }
+
+    fn status(
+        key: &SigningKey,
+        listing: u8,
+        revision: u64,
+        availability: ListingAvailability,
+    ) -> AuthorizedListingStatus {
+        let status = ListingStatus {
+            listing: ListingId([listing; 32]),
+            revision,
+            availability,
+        };
+        let (scoped_payload, signature) =
+            sign_with_store_key(key, crate::to_cbor(&status).unwrap()).expect("a store record");
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    }
+
+    fn state_with(statuses: Vec<AuthorizedListingStatus>) -> StoreStateV1 {
+        let mut state = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(store_key().verifying_key()),
+                    listing_statuses: Some(statuses),
+                    ..Default::default()
+                }),
+            )
+            .expect("statuses signed by the owner apply");
+        state
+    }
+
+    fn merged(a: &StoreStateV1, b: &StoreStateV1) -> StoreStateV1 {
+        let mut out = a.clone();
+        out.merge(&a.clone(), &params(), b).expect("merge");
+        out
+    }
+
+    fn bytes(state: &StoreStateV1) -> Vec<u8> {
+        crate::to_cbor(state).expect("encode")
+    }
+
+    /// A later status supersedes an earlier one, whichever arrives first.
+    /// Mutated red by making `rank` return 0 (the smaller encoding then
+    /// decides, and `SoldOut` is smaller than `Available`).
+    #[test]
+    fn the_highest_revision_wins_in_either_order() {
+        let early = status(&store_key(), 1, 5, ListingAvailability::SoldOut);
+        let late = status(
+            &store_key(),
+            1,
+            9,
+            ListingAvailability::Available { quantity: Some(3) },
+        );
+        let a = state_with(vec![early.clone()]);
+        let b = state_with(vec![late.clone()]);
+        for out in [merged(&a, &b), merged(&b, &a)] {
+            assert_eq!(
+                out.listing_availability(&ListingId([1; 32])),
+                ListingAvailability::Available { quantity: Some(3) },
+            );
+        }
+        // And a stale status arriving later does not displace the newer one.
+        let mut held = b.clone();
+        held.apply_delta(
+            &StoreStateV1::default(),
+            &params(),
+            &Some(StoreStateV1Delta {
+                owner: None,
+                listing_statuses: Some(vec![early]),
+                ..Default::default()
+            }),
+        )
+        .expect("a stale status is valid, and loses");
+        assert_eq!(bytes(&held), bytes(&b));
+    }
+
+    /// Two statuses at one revision resolve the way every other signed
+    /// record does: the smaller encoding, the same on every replica.
+    #[test]
+    fn equal_revisions_resolve_to_the_smaller_encoding() {
+        let sold = status(&store_key(), 2, 7, ListingAvailability::SoldOut);
+        let down = status(&store_key(), 2, 7, ListingAvailability::Withdrawn);
+        let smaller = if crate::to_cbor(&sold).unwrap() <= crate::to_cbor(&down).unwrap() {
+            ListingAvailability::SoldOut
+        } else {
+            ListingAvailability::Withdrawn
+        };
+        let a = state_with(vec![sold]);
+        let b = state_with(vec![down]);
+        assert_eq!(bytes(&merged(&a, &b)), bytes(&merged(&b, &a)));
+        assert_eq!(
+            merged(&a, &b).listing_availability(&ListingId([2; 32])),
+            smaller
+        );
+    }
+
+    /// No status reads as on sale, uncounted: every listing published before
+    /// statuses existed.
+    #[test]
+    fn a_listing_with_no_status_is_available_and_uncounted() {
+        let state = state_with(vec![status(
+            &store_key(),
+            3,
+            1,
+            ListingAvailability::Withdrawn,
+        )]);
+        assert_eq!(
+            state.listing_availability(&ListingId([4; 32])),
+            ListingAvailability::Available { quantity: None }
+        );
+        assert!(ListingAvailability::default().is_buyable());
+        assert!(!ListingAvailability::Available { quantity: Some(0) }.is_buyable());
+        assert!(!ListingAvailability::SoldOut.is_buyable());
+        assert!(!ListingAvailability::Withdrawn.is_buyable());
+    }
+
+    /// Only the store key can say a listing sold out or was taken down.
+    /// Anybody else's status is refused, and the refused delta leaves the
+    /// state exactly as it was, other parts included. Mutated red by making
+    /// `AuthorizedListingStatus::verify` return `Ok(())`.
+    #[test]
+    fn a_status_not_signed_by_the_store_key_is_refused() {
+        let stranger = SigningKey::from_bytes(&[0x62; 32]);
+        let held = state_with(vec![status(
+            &store_key(),
+            5,
+            1,
+            ListingAvailability::Available { quantity: Some(1) },
+        )]);
+        let mut attempt = held.clone();
+        let refused = attempt.apply_delta(
+            &StoreStateV1::default(),
+            &params(),
+            &Some(StoreStateV1Delta {
+                owner: None,
+                listing_statuses: Some(vec![status(
+                    &stranger,
+                    5,
+                    99,
+                    ListingAvailability::Withdrawn,
+                )]),
+                ..Default::default()
+            }),
+        );
+        assert!(refused.is_err(), "a stranger's status must not apply");
+        assert_eq!(bytes(&attempt), bytes(&held));
+
+        // And a whole state carrying one does not verify.
+        let mut forged = held.clone();
+        let bad = status(&stranger, 6, 1, ListingAvailability::SoldOut);
+        forged
+            .listing_statuses
+            .records
+            .insert(Bytes32([6; 32]), bad);
+        assert!(forged.verify(&StoreStateV1::default(), &params()).is_err());
+    }
+
+    /// A status filed under another listing's slot does not verify, so a
+    /// valid signature over listing A cannot be made to speak for listing B.
+    #[test]
+    fn a_status_under_the_wrong_slot_does_not_verify() {
+        let mut state = state_with(vec![]);
+        state.listing_statuses.records.insert(
+            Bytes32([8; 32]),
+            status(&store_key(), 7, 1, ListingAvailability::Withdrawn),
+        );
+        assert!(state.verify(&StoreStateV1::default(), &params()).is_err());
+    }
+
+    /// A status alone is signed content: a store holding only statuses names
+    /// its owner validly, and one with no owner cannot hold them.
+    #[test]
+    fn a_status_counts_as_signed_content() {
+        let state = state_with(vec![status(
+            &store_key(),
+            9,
+            1,
+            ListingAvailability::SoldOut,
+        )]);
+        assert!(state.holds_signed_content());
+        assert!(state.verify(&StoreStateV1::default(), &params()).is_ok());
+        let mut unowned = state.clone();
+        unowned.owner = None;
+        assert!(unowned.verify(&StoreStateV1::default(), &params()).is_err());
+    }
+
+    /// A state holding no statuses encodes exactly as it did before they
+    /// existed, so `validate_state`'s re-encoding check accepts every earlier
+    /// state, and a summary or delta with none is byte-for-byte the old one.
+    #[test]
+    fn no_statuses_encode_as_before_they_existed() {
+        let state = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        let encoded = bytes(&state);
+        let as_value: ciborium::Value = crate::from_cbor(&encoded).unwrap();
+        let keys: Vec<String> = as_value
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_string))
+            .collect();
+        assert!(!keys.iter().any(|k| k == "listing_statuses"), "{keys:?}");
+        let summary = state.summarize(&state, &params());
+        let summary_bytes = crate::to_cbor(&summary).unwrap();
+        let summary_value: ciborium::Value = crate::from_cbor(&summary_bytes).unwrap();
+        assert!(!summary_value
+            .as_map()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k.as_text() == Some("listing_statuses")));
+        let delta = crate::to_cbor(&StoreStateV1Delta::default()).unwrap();
+        let delta_value: ciborium::Value = crate::from_cbor(&delta).unwrap();
+        assert!(!delta_value
+            .as_map()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k.as_text() == Some("listing_statuses")));
+    }
+
+    /// The store key signs a listing status, and nothing mistakes one for
+    /// another kind of store record.
+    #[test]
+    fn the_store_key_signs_a_listing_status() {
+        let status = ListingStatus {
+            listing: ListingId([1; 32]),
+            revision: 3,
+            availability: ListingAvailability::Available { quantity: Some(2) },
+        };
+        let payload = crate::to_cbor(&status).unwrap();
+        assert_eq!(
+            crate::backing::classify_store_key_message(&payload),
+            Some(crate::backing::StoreKeyMessage::ListingStatus)
+        );
+        let listing = crate::listing::Listing {
+            id: ListingId([0; 32]),
+            title: "t".into(),
+            description: String::new(),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        assert_eq!(
+            crate::backing::classify_store_key_message(&crate::to_cbor(&listing).unwrap()),
+            Some(crate::backing::StoreKeyMessage::Listing),
+            "and a listing is still a listing"
+        );
+    }
+
+    /// Seeded merge laws, on bytes, over states holding clashing statuses:
+    /// several revisions of one listing, equal revisions with different
+    /// content, and statuses for listings nobody holds.
+    #[test]
+    fn merge_is_commutative_associative_and_idempotent() {
+        let key = store_key();
+        let mut pool = Vec::new();
+        for listing in 0..3u8 {
+            for revision in [1u64, 2, 2, 5] {
+                for availability in [
+                    ListingAvailability::Available { quantity: None },
+                    ListingAvailability::Available {
+                        quantity: Some(revision as u32),
+                    },
+                    ListingAvailability::SoldOut,
+                    ListingAvailability::Withdrawn,
+                ] {
+                    pool.push(status(&key, listing, revision, availability));
+                }
+            }
+        }
+        let mut rng = Rng::new(0x70_70);
+        let mut states = vec![state_with(vec![])];
+        for _ in 0..24 {
+            let picked = rng.subset(&pool, 6);
+            states.push(state_with(picked));
+        }
+        assert_laws(&states, 300, &mut rng, merged, bytes);
     }
 }
