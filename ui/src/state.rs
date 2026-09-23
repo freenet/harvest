@@ -12021,10 +12021,14 @@ impl AppState {
             }
         }
         // Newest first across every store of the key, not only within one,
-        // and no more than the bridge will hold for the key with room for the
-        // ones just dropped: see [`WATCHES_PER_GHOSTKEY`].
+        // each script once (a reused address is one watch at the bridge, so
+        // it must not spend two places of the budget), and no more than the
+        // bridge will hold for the key with room for the ones just dropped:
+        // see [`WATCHES_PER_GHOSTKEY`].
         for (_, _, wanted) in &mut groups {
             wanted.sort_by_key(|w| std::cmp::Reverse(w.anchor_height));
+            let mut seen = std::collections::HashSet::new();
+            wanted.retain(|w| seen.insert((w.network, w.script.clone())));
             wanted.truncate(WATCHES_PER_GHOSTKEY);
         }
         groups
@@ -24521,18 +24525,33 @@ mod buy_flow_tests {
     /// across every store of the key (#154 review round 1). A bridge refuses a
     /// new script past its cap while renewals keep their places, so without
     /// the budget a seller with a fortnight of unpaid invoices would have the
-    /// fresh one refused. Red with the truncation removed, and with the
-    /// cross-store sort removed (the second store's newest would be cut).
+    /// fresh one refused. Red with the truncation removed, with the
+    /// cross-store sort removed (the second store's newest would be cut), and
+    /// with the de-duplication removed (a reused address spends two places).
     #[test]
     fn past_the_per_key_budget_the_newest_orders_are_watched() {
         use crate::state::WATCHES_PER_GHOSTKEY;
         let gk = inbox::authority().mint();
         // One more than the budget, oldest first so the store's own order is
         // not what puts the newest in front.
-        let orders: Vec<AuthorizedOrder> = (0..=WATCHES_PER_GHOSTKEY as u32)
+        // Each on its own address, so the budget counts scripts, as the
+        // bridge does (the fixture's orders otherwise share one).
+        let on_its_own_address = |age: u32| {
+            let mut order = an_order_naming_the_test_bridge(age);
+            let mut script = vec![0x00, 0x14];
+            script.extend_from_slice(&[0u8; 16]);
+            script.extend_from_slice(&age.to_be_bytes());
+            order.order.payment_script_pubkey = script;
+            resigned(order, &seller_signing_key())
+        };
+        let mut orders: Vec<AuthorizedOrder> = (0..=WATCHES_PER_GHOSTKEY as u32)
             .rev()
-            .map(|age| an_order_naming_the_test_bridge(age + 10))
+            .map(|age| on_its_own_address(age + 10))
             .collect();
+        // And one address reused by a second order: one place, not two.
+        let mut reused = on_its_own_address(11);
+        reused.order.anchor = Some(anchor(TIP_HEIGHT - 12));
+        orders.push(resigned(reused, &seller_signing_key()));
         let mut state = a_seller_selling(orders, gk.id().0);
         // A second store of the same key, holding the newest order of all.
         let second: Vec<u8> = vec![0x5e; 32];
@@ -24548,7 +24567,7 @@ mod buy_flow_tests {
                 store_verifying_key: Some(crate::state::test_store_key()),
             });
         state.begin_browsing(second.clone());
-        let newest = an_order_naming_the_test_bridge(1);
+        let newest = on_its_own_address(1);
         {
             let store = state.browsing_stores.get_mut(&second).expect("the store");
             store.seller_verifying_key = Some(gk.id().0);
@@ -24564,6 +24583,13 @@ mod buy_flow_tests {
             heights[0],
             Some(TIP_HEIGHT - 1),
             "the other store's newest order comes first"
+        );
+        let scripts: std::collections::HashSet<&Vec<u8>> =
+            wanted[0].2.iter().map(|w| &w.script).collect();
+        assert_eq!(
+            scripts.len(),
+            WATCHES_PER_GHOSTKEY,
+            "every place is a distinct script: the reused address took one"
         );
         assert!(
             !heights.contains(&Some(TIP_HEIGHT - (WATCHES_PER_GHOSTKEY as u32 + 10))),

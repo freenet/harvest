@@ -110,28 +110,39 @@ pub const FORWARD_SLOW_NOTICE_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEO
 ///
 /// # Why only the mailbox waits longer
 ///
-/// Adopting a mailbox changes only where this session READS: buyers write to
-/// the current generation's mailbox whether or not our forward landed, and
-/// the seller never writes to their own. Adopting it late loses nothing.
+/// Both kinds of adopt can land mid-session once the wait is long, and both
+/// move something the seller writes. They differ in what that costs:
 ///
-/// Adopting a store, reputation or index contract changes where the seller's
-/// own WRITES go, and it happens mid-session: `adopt_migrated_contract_id`
-/// repoints `my_stores`, and an invoice accepted into the predecessor store
-/// while the forward was outstanding is then outside everything that watches,
-/// re-reads and settles this seller's orders for the rest of the session, and
-/// a write waiting on a signature fails with "not one of yours" (#154 review
-/// round 1). A 12 s window exposes a seller who acts in the first seconds; a
-/// ten-minute one exposes the seller at work. So those keep the probe's
-/// deadline: a slow load stays on the predecessor throughout, consistently,
-/// and the next load's walk folds in whatever it wrote.
+/// * **A store, reputation or index adopt** repoints `my_stores`. An invoice
+///   accepted into the predecessor store while the forward was outstanding is
+///   then outside everything that watches, re-reads and settles this seller's
+///   orders for the rest of the session, and a write waiting on a signature
+///   fails with "not one of yours" (#154 review round 1). A payment to that
+///   invoice can be missed for good. So these keep the probe's deadline: a
+///   slow load stays on the predecessor throughout, consistently, and the
+///   next load's walk folds in whatever it wrote.
+/// * **A mailbox adopt** moves where the seller's replies and invoice accepts
+///   are sent (`browsing_stores[..].mailbox_contract_id`). One sent to the
+///   predecessor before a late adopt is not seen by a buyer on the current
+///   build, and drops out of the seller's own inbox when the successor's
+///   state replaces it, until the next load's walk carries the predecessor's
+///   messages forward (#154 review round 2). That is a delay, not a loss.
+///   Against it: without the wait, a slow load routes only the predecessor
+///   mailbox for the WHOLE load, so every buyer request written to the
+///   successor meanwhile goes unseen, which is harvest#152 itself. The wait
+///   is the better side of that trade.
 ///
 /// The longer wait also widens the window in which a `PutResponse` for the
 /// same instance from some OTHER put of this tab is taken as ours (see
-/// [`put_response_evidence`]). For the mailbox nothing else in a seller's tab
-/// PUTs to their own current mailbox; for the index, `index_flow` publishes
-/// the seller's entry to the current index on every load that finds it
-/// unlisted, which is the normal state after an index re-key. Another reason
-/// the rule is per artifact.
+/// [`put_response_evidence`]). For the mailbox that is
+/// `store_ops::create_store_contracts`, which PUTs a default state to the
+/// mailbox derived from the seller's key, so a seller who creates a store
+/// during the wait can have the successor adopted with our forward
+/// unconfirmed: the successor is the right place to point anyway, and
+/// nothing seals, so the next load walks again. For the index,
+/// `index_flow` publishes the seller's entry to the current index on every
+/// load that finds it unlisted, which is the normal state after an index
+/// re-key: another reason the rule is per artifact.
 pub fn forward_give_up_ms(artifact: Artifact) -> u32 {
     match artifact {
         Artifact::Mailbox => MAILBOX_FORWARD_GIVE_UP_MS,

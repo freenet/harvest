@@ -88,7 +88,7 @@ anyway (#29).
   unpaid, anchored orders that name the bridge, until the tip is
   `WATCH_PAST_ANCHOR_BLOCKS` (2208) past the anchor: the whole payment window
   plus the deepest confirmation count an order may ask for (harvest#146), and
-  no more than the newest 500 per Ghost Key (`WATCHES_PER_GHOSTKEY`: the bridge
+  no more than the newest 500 distinct scripts per Ghost Key (`WATCHES_PER_GHOSTKEY`: the bridge
   refuses new scripts past 1000 per key while renewals keep their places). Only
   under a Ghost Key the vault has listed for this app.
   `bitcoin_inbox::InboxTracker::plan` batches them. Each request is sealed to
