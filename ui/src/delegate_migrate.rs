@@ -65,9 +65,10 @@
 //!
 //! * V1 to V4 have no export handler and are not walked at all (they would
 //!   answer every export with an error, which is a timeout here).
-//! * A generation the node never registered answers `Missing`, is recorded
-//!   `Unresponsive`, and is asked again on the next load at the cost of two
-//!   node-local round trips.
+//! * A generation the node never registered answers `Missing` (an error
+//!   from `freenet local`, an EMPTY answer from `freenet network`: see
+//!   [`Expect::reply_to_empty_answer`]), is recorded `Unresponsive`, and is
+//!   asked again on the next load at the cost of one node-local round trip.
 //! * Store keys are never exported; custody recovers them. The store
 //!   REGISTRATIONS are carried, so a device comes out of a re-key registered
 //!   for a store it holds no key for; the delegate's `StoreList` answer says
@@ -164,8 +165,10 @@ pub fn exporting_predecessors() -> Vec<DelegateLineageEntry> {
 pub enum Reply {
     /// The delegate answered with these application-message payloads.
     Payloads(Vec<Vec<u8>>),
-    /// The node answered that no delegate is registered under the key
-    /// (`DelegateError::Missing`): a generation this node never ran.
+    /// The node answered that no delegate is registered under the key: a
+    /// generation this node never ran. `freenet local` says so with
+    /// `DelegateError::Missing`, `freenet network` with an empty answer to a
+    /// predecessor call ([`Expect::reply_to_empty_answer`]).
     Missing,
 }
 
@@ -246,8 +249,29 @@ impl Expect {
         matches!(self, Expect::AnyFrom | Expect::Export)
     }
 
+    /// What an answer with NO messages in it, from the delegate being waited
+    /// on, means: `Missing` for a predecessor, nothing for the current
+    /// delegate.
+    ///
+    /// A `freenet network` node answers a message to a delegate it never
+    /// registered with an empty `DelegateResponse` rather than
+    /// `DelegateError::Missing`, which only `freenet local` sends (freenet-core
+    /// `contract.rs`, "Delegate not found in store (expected for migration
+    /// probes)"). Waiting for the error alone cost every real walk a timeout
+    /// at the first generation its node never ran, and a timeout stops the
+    /// walk ([`Walk`]): nothing older was imported and the walk never
+    /// completed (harvest#150). Every generation from V5 answers both
+    /// predecessor calls with a message, so an empty answer is the node's.
+    ///
+    /// The current delegate is registered by this app and always answers with
+    /// a message, so nothing is read into an empty answer from it; its call
+    /// times out and is retried as before.
+    pub fn reply_to_empty_answer(&self) -> Option<Reply> {
+        self.is_predecessor_call().then_some(Reply::Missing)
+    }
+
     /// Whether a raw application-message payload from the delegate being
-    /// waited on is this call's answer. The one decision the transport makes.
+    /// waited on is this call's answer.
     pub fn accepts_payload(&self, payload: &[u8]) -> bool {
         match self {
             Expect::AnyFrom => true,

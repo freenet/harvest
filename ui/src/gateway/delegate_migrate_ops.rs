@@ -12,10 +12,16 @@
 //!   spoken to by nothing else, so anything it sends is the answer. The
 //!   current delegate answers the whole app, so its messages are offered by
 //!   variant ([`Expect::matches`]) and everything else falls through.
-//! * The node's `DelegateError::Missing` for the key being waited on, which
-//!   the connection layer passes on typed rather than as a string
-//!   ([`offer_error`]): a generation this node never ran answers at once
-//!   instead of costing a timeout.
+//! * The node saying the key being waited on is not registered: a
+//!   generation this node never ran answers at once instead of costing a
+//!   timeout. It says so in one of two shapes, and both are taken. A
+//!   `freenet local` node sends `DelegateError::Missing`, which the
+//!   connection layer passes on typed rather than as a string
+//!   ([`offer_error`]). A `freenet network` node -- every user's -- answers
+//!   with a `DelegateResponse` holding no messages ([`offer_empty`],
+//!   [`Expect::reply_to_empty_answer`]). Only the first was handled until
+//!   harvest#150, so every real walk timed out at the first generation its
+//!   node never ran, and stopped there.
 //!
 //! A predecessor's message that arrives after its call timed out finds no
 //! waiter and goes on to the response handler, which drops messages from a
@@ -45,7 +51,8 @@ use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, Set
 /// load ([`delegate_migrate::Walk`]). So this is generous: it costs time only
 /// for a generation that never answers at all (an execution error names no
 /// delegate, so it can only time out), and those are few since V1-V4 are not
-/// asked and unregistered ones answer `Missing` at once.
+/// asked and unregistered ones answer at once ([`offer_error`],
+/// [`offer_empty`]).
 const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
 
 /// How long a call to the CURRENT delegate may take: node-local, loaded,
@@ -160,6 +167,27 @@ pub fn offer_error(error: &freenet_stdlib::client_api::ClientError) -> bool {
         }
         if let Some(waiter) = slot.take() {
             let _ = waiter.reply.send(Reply::Missing);
+        }
+        true
+    })
+}
+
+/// Offer an answer that held NO messages, from `delegate`. Taken, as
+/// [`Reply::Missing`], only when the call in flight is to that delegate and
+/// is a predecessor call; see [`Expect::reply_to_empty_answer`]. Returns
+/// `true` if it was taken.
+pub fn offer_empty(delegate: &DelegateKey) -> bool {
+    WAITER.with(|w| {
+        let mut slot = w.borrow_mut();
+        let Some(reply) = slot
+            .as_ref()
+            .filter(|waiter| &waiter.delegate == delegate)
+            .and_then(|waiter| waiter.expect.reply_to_empty_answer())
+        else {
+            return false;
+        };
+        if let Some(waiter) = slot.take() {
+            let _ = waiter.reply.send(reply);
         }
         true
     })

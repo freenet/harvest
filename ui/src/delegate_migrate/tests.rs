@@ -43,6 +43,12 @@ struct Node {
     reject_key: Option<Vec<u8>>,
     /// A key the current delegate refuses for now (a retry may take it).
     retry_key: Option<Vec<u8>>,
+    /// Answer an unregistered delegate as `freenet network` does -- with no
+    /// messages -- rather than with `DelegateError::Missing`, as
+    /// `freenet local` does. What the transport makes of that is exactly
+    /// `Expect::reply_to_empty_answer`; nothing is ever an answer otherwise,
+    /// so the call times out.
+    network_node: bool,
 }
 
 fn folded(predecessor: &[u8; 32]) -> Vec<u8> {
@@ -68,7 +74,7 @@ impl DelegateCalls for Fake {
         &mut self,
         delegate: &DelegateKey,
         payload: Vec<u8>,
-        _expect: Expect,
+        expect: Expect,
     ) -> Result<Reply, CallError> {
         let mut node = self.0.borrow_mut();
         let target: [u8; 32] = delegate.bytes().try_into().expect("32-byte key");
@@ -181,6 +187,9 @@ impl DelegateCalls for Fake {
             return Ok(Reply::Payloads(vec![cbor(&response)]));
         }
         let Some(old) = node.old.get(&target).cloned() else {
+            if node.network_node {
+                return expect.reply_to_empty_answer().ok_or(CallError::Timeout);
+            }
             return Ok(Reply::Missing);
         };
         if matches!(old, Old::Silent) {
@@ -288,6 +297,61 @@ fn a_skipped_generation_does_not_hide_an_older_one() {
         secret(&fake, "harvest:rsa_pk:fp1").as_deref(),
         Some(&b"pk"[..])
     );
+}
+
+/// The same skipped release on a `freenet network` node, which is every
+/// user's: the node answers a never-registered generation with NO messages,
+/// not `DelegateError::Missing`. Taken as a timeout, as it was until
+/// harvest#150, it stopped the walk at the first such generation, so the
+/// older one's secrets (a seller's payment key, among them) never arrived and
+/// the walk never completed. Mutated red by making
+/// `Expect::reply_to_empty_answer` answer `None`, and live by
+/// `tests/rehearsal/delegate-rehearsal.sh` (scenario "skipped").
+#[test]
+fn a_network_nodes_empty_answer_for_a_skipped_generation_is_walked_past() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.network_node = true;
+        node.old.insert(
+            generation(16),
+            Old::Holds(vec![(
+                b"harvest:bitcoin:payment-xpub:v1".to_vec(),
+                b"vpub".to_vec(),
+            )]),
+        );
+    }
+    let out = outcome(&fake);
+    assert_eq!(
+        secret(&fake, "harvest:bitcoin:payment-xpub:v1").as_deref(),
+        Some(&b"vpub"[..]),
+        "{}",
+        summarize(&out.report)
+    );
+    assert!(
+        out.complete(),
+        "the walk must reach every generation: {}",
+        summarize(&out.report)
+    );
+}
+
+/// An empty answer means "not registered" only from a predecessor. The
+/// current delegate is registered by the app, so an empty answer from it is
+/// read as nothing and its call times out and is retried, as before.
+#[test]
+fn only_a_predecessor_call_reads_an_empty_answer_as_missing() {
+    assert_eq!(Expect::AnyFrom.reply_to_empty_answer(), Some(Reply::Missing));
+    assert_eq!(Expect::Export.reply_to_empty_answer(), Some(Reply::Missing));
+    for current in [
+        Expect::PredecessorMarker([1; 32]),
+        Expect::PredecessorMarkerRecorded([1; 32]),
+        Expect::SecretImported {
+            predecessor: [1; 32],
+            key: b"k".to_vec(),
+        },
+    ] {
+        assert_eq!(current.reply_to_empty_answer(), None, "{current:?}");
+    }
 }
 
 /// The newest generation's value wins a key two generations share, because

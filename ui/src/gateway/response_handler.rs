@@ -513,6 +513,15 @@ fn handle_delegate_response(
 ) {
     // Read the registered keys and drop the guard before any write below --
     // APP_STATE is a RefCell underneath and holding both at once panics.
+    // An answer with no messages at all is how a `freenet network` node says
+    // the delegate is not registered (harvest#150). If the migration walk is
+    // waiting on that delegate, it is the walk's answer; otherwise there is
+    // nothing in it to act on anyway.
+    #[cfg(target_arch = "wasm32")]
+    if values.is_empty() && super::delegate_migrate_ops::offer_empty(&key) {
+        return;
+    }
+
     let sender = {
         let app = APP_STATE.read();
         delegate_sender(
