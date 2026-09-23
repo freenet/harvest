@@ -19535,6 +19535,18 @@ mod buy_flow_tests {
         state.buyer_purchases(STORE)
     }
 
+    /// `blockers` without `UnfitForComplaint`, for a test about another
+    /// blocker on an order the complaint preconditions also refuse (they
+    /// require an anchor, a bridge and a buyer key since round 3); the
+    /// preconditions have their own test.
+    fn without_unfit(blockers: &[PaymentBlocker]) -> Vec<PaymentBlocker> {
+        blockers
+            .iter()
+            .filter(|b| !matches!(b, PaymentBlocker::UnfitForComplaint(_)))
+            .cloned()
+            .collect()
+    }
+
     /// The seller's half: a store they own, a buyer's request already in
     /// their mailbox, and the conversation key their delegate answered.
     fn seller_holding_a_request() -> (AppState, [u8; 32], EncryptedMessage) {
@@ -20109,8 +20121,12 @@ mod buy_flow_tests {
         let order = resigned(order, &seller_signing_key());
         let (state, _) = buyer_after_acceptance(&order);
 
+        // The complaint preconditions refuse it too (round 3, defence in
+        // depth), with their own words.
+        let blockers = purchases(&state)[0].blockers.clone();
+        assert!(blockers.iter().any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
-            purchases(&state)[0].blockers,
+            without_unfit(&blockers),
             vec![
                 PaymentBlocker::NoTrustedBridge,
                 PaymentBlocker::PurchaseNotKept
@@ -23022,8 +23038,10 @@ mod buy_flow_tests {
         let order = commitment(&seller_signing_key(), None, OrderStatus::AwaitingPayment);
         let (state, _) = buyer_after_acceptance(&order);
 
+        let blockers = purchases(&state)[0].blockers.clone();
+        assert!(blockers.iter().any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
-            purchases(&state)[0].blockers,
+            without_unfit(&blockers),
             vec![
                 PaymentBlocker::AnchorMissing,
                 PaymentBlocker::PurchaseNotKept
@@ -25187,7 +25205,7 @@ mod buy_flow_tests {
             let (state, _) = buyer_after_acceptance(&published);
             let purchase = purchases(&state).pop().expect("one purchase");
             assert_eq!(
-                purchase.blockers,
+                without_unfit(&purchase.blockers),
                 vec![
                     PaymentBlocker::CommitmentLacksBuyerKey,
                     PaymentBlocker::PurchaseNotKept
@@ -25281,7 +25299,7 @@ mod buy_flow_tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].conversation, real);
         assert_eq!(
-            held[0].blockers,
+            without_unfit(&held[0].blockers),
             vec![
                 PaymentBlocker::CommitmentLacksBuyerKey,
                 PaymentBlocker::PurchaseNotKept
