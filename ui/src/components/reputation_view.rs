@@ -42,10 +42,16 @@ pub fn ReputationView() -> Element {
 
             div { class: "info-box",
                 p {
-                    "A seller's record holds complaints only. Each one names an order the buyer "
-                    "actually paid for, and only that order's buyer can make it, so a complaint "
-                    "costs a real purchase and cannot be faked by either side. A clean record "
-                    "with an old, high-tier ghostkey is the best possible reputation."
+                    "A seller's record holds complaints only, as categories, with no free text. "
+                    "Each one names an order that the order's own Bitcoin bridges say was paid, "
+                    "and only that order's buyer can make it, so a stranger cannot make one up "
+                    "and the seller cannot take one down."
+                }
+                p {
+                    "What it cannot tell you: the seller chooses which bridges their orders "
+                    "trust, so a seller who pays themselves through a bridge they run can put "
+                    "orders, and complaints, on their own record. And a record with no "
+                    "complaints says nothing about the orders nobody complained about."
                 }
             }
 

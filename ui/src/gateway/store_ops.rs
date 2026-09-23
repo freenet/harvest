@@ -882,7 +882,18 @@ pub async fn submit_complaint(
     // Follow the record, so the complaint shows here once the network has it
     // -- the store page's own subscription may have found nothing, if this
     // PUT is what created the record.
-    super::get_contract(&instance_id, true).await
+    //
+    // The complaint is published once the PUT succeeded, so a failure here
+    // is not the complaint's: reporting it as one released the sent marker
+    // and invited a second complaint about an order already complained
+    // about (review round 1 of #143, P2-8). Logged, and the store page's own
+    // subscription still brings the record in.
+    if let Err(e) = super::get_contract(&instance_id, true).await {
+        dioxus::logger::tracing::warn!(
+            "The complaint about order {id} was published, but following the record failed: {e}"
+        );
+    }
+    Ok(())
 }
 
 /// Publish a seller-signed invoice to their store contract.

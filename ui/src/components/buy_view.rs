@@ -232,14 +232,19 @@ fn PurchaseCard(
                     purchase: purchase.clone(),
                 }
             }
-            if let Some(settled) = purchase.settled() {
-                SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
-                if settled.status == harvest_common::payment::OrderStatus::Paid {
-                    FileComplaint {
-                        store_contract_id: store_contract_id.clone(),
-                        purchase: purchase.clone(),
-                    }
+            // A paid order of this buyer's is shown as paid, and offered the
+            // complaint, whatever the payment checks now say: those are about
+            // whether to PAY, and the seller can trip them after payment by
+            // closing the store or retiring its backing (review round 1 of
+            // #143, P1-1).
+            if let Some(paid) = purchase.paid.as_ref() {
+                SettledPurchase { order: paid.clone(), bitcoin: bitcoin.clone() }
+                FileComplaint {
+                    store_contract_id: store_contract_id.clone(),
+                    purchase: purchase.clone(),
                 }
+            } else if let Some(settled) = purchase.settled() {
+                SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
             } else {
             match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
                 // Everything checks out, so the payment details are shown --

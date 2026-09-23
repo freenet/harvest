@@ -427,6 +427,25 @@ pub struct AppState {
     #[cfg(not(target_arch = "wasm32"))]
     pub published_complaints: Vec<(ed25519_dalek::VerifyingKey, Complaint)>,
 
+    /// The buyer's own copies of their paid orders, as the Harvest delegate
+    /// holds them (harvest#53 Phase C, review round 1 of #143, P1-2).
+    ///
+    /// What a complaint falls back to when the store no longer holds the
+    /// order: the seller controls which orders the store keeps
+    /// (`store::enforce_order_cap` drops the oldest past `MAX_ORDERS`), and
+    /// which acceptance messages the mailbox keeps, so neither may be what
+    /// the buyer's recourse depends on. See [`Self::buyer_purchases`].
+    pub paid_purchases: Vec<harvest_common::delegate::PaidPurchase>,
+
+    /// Paid orders whose copy was sent to the delegate this session, so each
+    /// is sent once. Released if the send fails, so the next arrival retries.
+    pub paid_purchases_sent: HashSet<harvest_common::payment::OrderId>,
+
+    /// Off-target only: paid-order copies that would have been sent to the
+    /// delegate.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub paid_purchase_requests: Vec<harvest_common::delegate::PaidPurchase>,
+
     /// Off-target only: despatches recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]
     pub published_despatches: Vec<(
@@ -1996,6 +2015,20 @@ pub struct BuyerPurchase {
     pub commitment: Option<harvest_common::payment::AuthorizedOrder>,
     /// Empty when there is nothing standing between the buyer and paying.
     pub blockers: Vec<PaymentBlocker>,
+    /// The order, when it is PAID and genuinely this buyer's, judged only on
+    /// what the seller cannot change after payment (review round 1 of #143,
+    /// P1-1): `Paid` with evidence, terms signed by the store's own key (the
+    /// key the store contract authenticates and the reputation record is
+    /// addressed by), naming this conversation's receipt key. See
+    /// [`AppState::paid_order`].
+    ///
+    /// NOT derived from [`Self::blockers`]. Those are about whether to PAY,
+    /// and several are the seller's to cause at will -- closing the store
+    /// (`StoreClosed`), or retiring the backing so no key reads as the
+    /// seller's (`SellerIdentityUnknown`) -- and every one of them returns
+    /// before the status is looked at. Deciding the complaint from them let
+    /// a seller who had been paid take the buyer's complaint away.
+    pub paid: Option<harvest_common::payment::AuthorizedOrder>,
 }
 
 impl BuyerPurchase {
@@ -2563,6 +2596,44 @@ fn send_buyer_conversations_recall(
 /// Retries itself on a timer, like `subscribe_to_mailbox` /
 /// `subscribe_to_own_store`, for the same reason: the natural external
 /// re-trigger (a store's state re-arriving) is not periodic.
+/// Send a paid-order request to the Harvest delegate (P1-2). On failure a
+/// `RememberPaidPurchase` releases its session marker, so the next arrival
+/// of the store's state sends it again.
+#[cfg(target_arch = "wasm32")]
+fn send_paid_purchase_request(
+    delegate_key: Option<freenet_stdlib::prelude::DelegateKey>,
+    request: harvest_common::HarvestDelegateRequest,
+    remembering: Option<harvest_common::payment::OrderId>,
+) {
+    use dioxus::prelude::WritableExt;
+    let fail = move |why: String| {
+        dioxus::logger::tracing::warn!("A paid-order request to the delegate failed: {why}");
+        if let Some(id) = remembering.as_ref() {
+            crate::gateway::APP_STATE
+                .write()
+                .on_paid_purchase_send_failed(id);
+        }
+    };
+    let Some(delegate_key) = delegate_key else {
+        // Not registered yet: `components::app` lists them once it is, and
+        // the store's next arrival sends the copy.
+        wasm_bindgen_futures::spawn_local(async move { fail("delegate not registered".into()) });
+        return;
+    };
+    let payload = match harvest_common::to_cbor(&request) {
+        Ok(payload) => payload,
+        Err(e) => {
+            wasm_bindgen_futures::spawn_local(async move { fail(e) });
+            return;
+        }
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
+            fail(e.to_string());
+        }
+    });
+}
+
 fn send_remember_store_request(
     code: String,
     delegate_key: freenet_stdlib::prelude::DelegateKey,
@@ -3709,6 +3780,9 @@ impl AppState {
                     self.refresh_same_address_orders();
                     self.publish_settled_orders(&contract_id);
                     self.republish_withheld();
+                    // And keep this buyer's own copy of any order of theirs
+                    // now paid, before the seller can push it out (P1-2).
+                    self.remember_paid_purchases(&contract_id);
 
                     // And ask the bridge to watch the payment address of any
                     // new order this seller issued. Nothing else tells the
@@ -3771,6 +3845,8 @@ impl AppState {
                         // every update is cheap: `conversation_keys_to_request`
                         // answers `None` once everything is held or in flight.
                         self.ask_for_conversation_keys(&store_id);
+                        // An acceptance can make a paid order this buyer's.
+                        self.remember_paid_purchases(&store_id);
                     }
                     None => warn!(
                         "Mailbox {:?} maps to a store we have no state for -- dropping messages",
@@ -4923,13 +4999,19 @@ impl AppState {
                 if message.addressing != Addressing::ToBuyer {
                     continue;
                 }
+                // The store's copy, or this buyer's own copy of the paid
+                // order when the store no longer holds it (P1-2).
                 let commitment = store
                     .orders
                     .iter()
                     .find(|order| order.order.id == order_id)
-                    .cloned();
+                    .cloned()
+                    .or_else(|| self.kept_paid_order(store, conversation, &order_id));
                 let candidate = BuyerPurchase {
                     blockers: self.payment_blockers(store, conversation, commitment.as_ref()),
+                    paid: commitment
+                        .as_ref()
+                        .and_then(|order| Self::paid_order(store, conversation, order)),
                     order_id,
                     conversation: conversation.buyer_public_key,
                     commitment,
@@ -4956,7 +5038,156 @@ impl AppState {
                 }
             }
         }
+        // A paid order this buyer kept a copy of, whose acceptance message
+        // the mailbox no longer holds: still their purchase (P1-2). The
+        // mailbox is bounded and anyone may write to it, so the message that
+        // named the order is not something the complaint may depend on.
+        for kept in &self.paid_purchases {
+            if purchases.iter().any(|p| p.order_id == kept.order.order.id) {
+                continue;
+            }
+            if store.owner != Some(kept.store_key) {
+                continue;
+            }
+            let Some(conversation) = store
+                .conversations
+                .iter()
+                .find(|c| c.buyer_public_key == kept.conversation)
+            else {
+                continue;
+            };
+            let Some(paid) = Self::paid_order(store, conversation, &kept.order) else {
+                continue;
+            };
+            purchases.push(BuyerPurchase {
+                order_id: kept.order.order.id.clone(),
+                conversation: kept.conversation,
+                blockers: self.payment_blockers(store, conversation, Some(&kept.order)),
+                commitment: Some(kept.order.clone()),
+                paid: Some(paid),
+            });
+        }
         purchases
+    }
+
+    /// This buyer's own copy of paid order `order_id` at `store`, filed under
+    /// `conversation` (P1-2), if the delegate keeps one.
+    fn kept_paid_order(
+        &self,
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<harvest_common::payment::AuthorizedOrder> {
+        let owner = store.owner?;
+        self.paid_purchases
+            .iter()
+            .find(|kept| {
+                kept.store_key == owner
+                    && kept.conversation == conversation.buyer_public_key
+                    && &kept.order.order.id == order_id
+            })
+            .map(|kept| kept.order.clone())
+    }
+
+    /// `order`, when it is PAID and genuinely this buyer's at `store`
+    /// (P1-1; see [`BuyerPurchase::paid`]): status `Paid`, and the whole
+    /// record -- terms and payment evidence -- verifies under the store's
+    /// OWNER key, and it names `conversation`'s receipt key.
+    ///
+    /// The owner key is `StoreStateV1::owner`: the key the store contract
+    /// verified every record against, and the one the reputation record is
+    /// addressed by. It is NOT `store_verifying_key`, which is `None` unless
+    /// a live backing vouches for the store, and a seller can end that by
+    /// retiring their backing.
+    pub(crate) fn paid_order(
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        order: &harvest_common::payment::AuthorizedOrder,
+    ) -> Option<harvest_common::payment::AuthorizedOrder> {
+        use harvest_common::payment::OrderStatus;
+        if order.status != OrderStatus::Paid {
+            return None;
+        }
+        let owner = ed25519_dalek::VerifyingKey::from_bytes(&store.owner?).ok()?;
+        order.verify(&owner).ok()?;
+        let receipt = conversation.buyer_receipt_key()?;
+        (order.order.buyer_receipt_key == Some(receipt)).then(|| order.clone())
+    }
+
+    /// Send the delegate a copy of every paid order of this buyer's at this
+    /// store that it does not hold yet (P1-2). Called whenever what
+    /// [`Self::buyer_purchases`] reads changes: the store's state, the
+    /// mailbox, the recalled conversations.
+    pub fn remember_paid_purchases(&mut self, store_contract_id: &[u8]) {
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+        else {
+            return;
+        };
+        let due: Vec<harvest_common::delegate::PaidPurchase> = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .filter_map(|purchase| {
+                let order = purchase.paid?;
+                let held = self
+                    .paid_purchases
+                    .iter()
+                    .any(|kept| kept.order.order.id == order.order.id);
+                (!held && !self.paid_purchases_sent.contains(&order.order.id)).then(|| {
+                    harvest_common::delegate::PaidPurchase {
+                        store_key: owner,
+                        conversation: purchase.conversation,
+                        order,
+                    }
+                })
+            })
+            .collect();
+        for purchase in due {
+            self.paid_purchases_sent
+                .insert(purchase.order.order.id.clone());
+            #[cfg(target_arch = "wasm32")]
+            send_paid_purchase_request(
+                self.harvest_delegate_key.clone(),
+                harvest_common::HarvestDelegateRequest::RememberPaidPurchase {
+                    purchase: purchase.clone(),
+                },
+                Some(purchase.order.order.id.clone()),
+            );
+            #[cfg(not(target_arch = "wasm32"))]
+            self.paid_purchase_requests.push(purchase);
+        }
+    }
+
+    /// Ask the delegate for every paid order it keeps a copy of (P1-2).
+    pub fn sync_paid_purchases(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        send_paid_purchase_request(
+            self.harvest_delegate_key.clone(),
+            harvest_common::HarvestDelegateRequest::ListPaidPurchases,
+            None,
+        );
+    }
+
+    /// The delegate's list of kept paid orders arrived.
+    pub(crate) fn on_paid_purchases(
+        &mut self,
+        purchases: Vec<harvest_common::delegate::PaidPurchase>,
+    ) {
+        for kept in &purchases {
+            self.paid_purchases_sent.remove(&kept.order.order.id);
+        }
+        self.paid_purchases = purchases;
+    }
+
+    /// A copy never reached the delegate: release its marker so the next
+    /// arrival sends it again.
+    pub(crate) fn on_paid_purchase_send_failed(
+        &mut self,
+        order_id: &harvest_common::payment::OrderId,
+    ) {
+        self.paid_purchases_sent.remove(order_id);
     }
 
     /// Every listing this conversation has asked about.
@@ -7688,13 +7919,13 @@ impl AppState {
         ),
         String,
     > {
-        use harvest_common::payment::OrderStatus;
         let order_id = &purchase.order_id;
+        // `purchase.paid`, never `settled()` or the payment blockers: those
+        // are the seller's to change after payment (P1-1).
         let order = purchase
-            .settled()
-            .filter(|o| o.status == OrderStatus::Paid)
-            .cloned()
-            .ok_or("only a paid order can be complained about")?;
+            .paid
+            .clone()
+            .ok_or("only a paid order of yours can be complained about")?;
         let store = self
             .browsing_stores
             .get(store_contract_id)
@@ -7712,8 +7943,12 @@ impl AppState {
             .and_then(|c| c.receipt_signing_key())
             .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
             .ok_or("this node does not hold the key this order names for its buyer")?;
+        // The store's OWNER key: what the order verified under in
+        // `paid_order`, and what the record is addressed by. Not
+        // `store_verifying_key`, which the seller can make `None` by
+        // retiring their backing (P1-1).
         let store_key = store
-            .store_verifying_key
+            .owner
             .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
             .ok_or("this store's key is not known here")?;
         let tip = self.bitcoin.tips.get(&order.order.network);
@@ -8659,7 +8894,15 @@ impl AppState {
                 request_id,
                 store_contract_id,
                 conversations,
-            } => self.on_buyer_conversations(request_id, &store_contract_id, conversations),
+            } => {
+                self.on_buyer_conversations(request_id, &store_contract_id, conversations);
+                // A recalled conversation can make a paid order this buyer's.
+                self.remember_paid_purchases(&store_contract_id);
+            }
+
+            HarvestDelegateResponse::PaidPurchases { purchases } => {
+                self.on_paid_purchases(purchases)
+            }
 
             // A conversation the delegate did not keep dies with the tab, and
             // the buyer has already been told their message was sent -- so
@@ -18416,6 +18659,8 @@ mod buy_flow_tests {
             .expect("begin_browsing creates it");
         store.seller_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
         store.store_verifying_key = Some(seller_signing_key().verifying_key().to_bytes());
+        // The store contract's owner: the store key, which signs the orders.
+        store.owner = Some(seller_signing_key().verifying_key().to_bytes());
         store.orders = vec![published.clone()];
         store.conversations = vec![conversation];
         store.mailbox_messages = vec![acceptance];
@@ -24297,6 +24542,7 @@ mod buy_flow_tests {
                 conversation: [0u8; 32],
                 commitment: Some(commitment),
                 blockers: Vec::new(),
+                paid: None,
             };
             assert!(!purchase.cancellable(), "{status:?}");
         }
@@ -24869,6 +25115,183 @@ mod buy_flow_tests {
             "{refused}"
         );
         assert!(state.complaint_on_record(STORE, &order.order.id).is_some());
+    }
+
+    /// **A seller who has been paid cannot take the complaint away** (review
+    /// round 1 of #143, P1-1): closing the store, or retiring its backing so
+    /// no key reads as the seller's, trips the PAYMENT checks, and the
+    /// complaint used to be decided through them. Red if eligibility goes
+    /// back to `settled()` / `store_verifying_key`.
+    #[test]
+    fn a_seller_cannot_take_the_complaint_away_after_payment() {
+        use harvest_common::feedback::FeedbackCategory;
+        type Seller = fn(&mut BrowsingStore);
+        let moves: [(&str, Seller); 3] = [
+            ("closes the store", |store| store.closed = true),
+            ("retires the backing", |store| {
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+            ("does both", |store| {
+                store.closed = true;
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+        ];
+        for (what, seller) in moves {
+            let (mut state, order) = a_paid_purchase();
+            despatched(&mut state, &order);
+            seller(state.browsing_stores.get_mut(STORE).unwrap());
+            let purchase = purchases(&state).remove(0);
+            assert!(purchase.settled().is_none(), "{what}: precondition, the pay checks trip");
+            assert_eq!(purchase.paid.as_ref(), Some(&order), "{what}: still paid, still theirs");
+            assert_eq!(state.complaint_refusal(STORE, &purchase), None, "{what}");
+            state
+                .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let (key, complaint) = state.published_complaints.pop().expect("published");
+            assert_eq!(key, seller_signing_key().verifying_key(), "{what}: the owner's record");
+            complaint.verify(&key).expect("the record accepts it");
+        }
+    }
+
+    /// **A paid order the seller pushes out of the store, and an acceptance
+    /// pushed out of the mailbox, still take the complaint** (review round
+    /// 1 of #143, P1-2): the buyer's delegate keeps its own copy once the
+    /// order is seen paid, and the purchase falls back to it. Red if
+    /// `buyer_purchases` stops consulting `paid_purchases`, or if
+    /// `remember_paid_purchases` stops sending the copy.
+    #[test]
+    fn a_paid_order_the_seller_evicted_is_still_complained_about() {
+        use crate::fulfilment::DESPATCH_WINDOW_BLOCKS;
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        state.remember_paid_purchases(STORE);
+        let sent = std::mem::take(&mut state.paid_purchase_requests);
+        assert_eq!(sent.len(), 1, "the paid order's copy goes to the delegate");
+        assert_eq!(sent[0].order, order);
+        assert_eq!(sent[0].store_key, seller_signing_key().verifying_key().to_bytes());
+        state.remember_paid_purchases(STORE);
+        assert!(state.paid_purchase_requests.is_empty(), "once per session");
+        // The delegate answers with what it keeps.
+        state.on_paid_purchases(sent);
+
+        // The seller floods the store past MAX_ORDERS: the paid order and
+        // its despatch go, the acceptance is still in the mailbox.
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders.clear();
+        store.despatches.clear();
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&order), "the kept copy stands in");
+        // And floods the mailbox: the acceptance goes too.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .clear();
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&order), "still their purchase");
+
+        // With no despatch left to read, the complaint opens at the deadline.
+        move_tip_to(&mut state, TIP_HEIGHT - 1 + DESPATCH_WINDOW_BLOCKS + 1);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("the complaint is still fileable");
+        let (key, complaint) = state.published_complaints.pop().expect("published");
+        complaint.verify(&key).expect("the record accepts it");
+    }
+
+    /// `paid_order` takes a PAID record verifying under the store's owner
+    /// key and nothing else. Red if either check is dropped.
+    #[test]
+    fn paid_order_requires_paid_and_the_owner_key() {
+        let (state, order) = a_paid_purchase();
+        let store = state.browsing_stores[STORE].clone();
+        let conversation = store.conversations[0].clone();
+        assert_eq!(
+            AppState::paid_order(&store, &conversation, &order),
+            Some(order.clone())
+        );
+        let mut unpaid = order.clone();
+        unpaid.status = OrderStatus::AwaitingPayment;
+        unpaid.payment_proof = None;
+        assert_eq!(AppState::paid_order(&store, &conversation, &unpaid), None);
+        let mut elsewhere = store.clone();
+        elsewhere.owner = Some(SigningKey::from_bytes(&[0x57; 32]).verifying_key().to_bytes());
+        assert_eq!(
+            AppState::paid_order(&elsewhere, &conversation, &order),
+            None,
+            "an order that does not verify under this store's owner is not theirs here"
+        );
+    }
+
+    /// A kept copy counts only for the store whose key signed it and the
+    /// conversation it was issued to, and only while it verifies there.
+    #[test]
+    fn a_kept_copy_is_used_only_for_its_own_store_and_conversation() {
+        let (mut state, order) = a_paid_purchase();
+        let genuine = harvest_common::delegate::PaidPurchase {
+            store_key: seller_signing_key().verifying_key().to_bytes(),
+            conversation: purchases(&state)[0].conversation,
+            order: order.clone(),
+        };
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders.clear();
+        store.mailbox_messages.clear();
+        for (what, kept) in [
+            (
+                "another store's key",
+                harvest_common::delegate::PaidPurchase {
+                    store_key: [0x55; 32],
+                    ..genuine.clone()
+                },
+            ),
+            (
+                "another conversation",
+                harvest_common::delegate::PaidPurchase {
+                    conversation: [0x56; 32],
+                    ..genuine.clone()
+                },
+            ),
+        ] {
+            state.paid_purchases = vec![kept];
+            assert!(purchases(&state).is_empty(), "{what}");
+        }
+        state.paid_purchases = vec![genuine];
+        assert_eq!(purchases(&state).len(), 1, "the genuine copy is used");
+    }
+
+    /// **A complaint that never reached the node gives the control back**
+    /// (review round 1 of #143, testing #3). Red if the marker is kept.
+    #[test]
+    fn a_failed_complaint_send_releases_the_sent_marker() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        despatched(&mut state, &order);
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("filed");
+        let purchase = purchases(&state).remove(0);
+        assert!(state.complaint_refusal(STORE, &purchase).is_some(), "on its way");
+        state.on_complaint_send_failed(STORE, &order.order.id, "no node");
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None, "offered again");
+        assert!(state.notifications.iter().any(|n| n.contains("no node")));
+    }
+
+    /// A copy that never reached the delegate is sent again on the next
+    /// arrival.
+    #[test]
+    fn a_failed_paid_order_copy_is_sent_again() {
+        let (mut state, order) = a_paid_purchase();
+        state.remember_paid_purchases(STORE);
+        assert_eq!(state.paid_purchase_requests.len(), 1);
+        state.on_paid_purchase_send_failed(&order.order.id);
+        state.remember_paid_purchases(STORE);
+        assert_eq!(state.paid_purchase_requests.len(), 2, "sent again");
     }
 
     /// The complaint is offered only between "the seller has despatched or
