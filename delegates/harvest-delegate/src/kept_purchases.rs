@@ -216,7 +216,7 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
             // unpaid copy of a paid order, another paid copy (a kept paid
             // copy is never replaced: revision 4 of
             // `docs/complaint-threat-model.md` removed the fresher-evidence
-            // rule, section 7.1), a second complaint.
+            // rule, section 7.2), a second complaint.
             _ => return list(store),
         },
     };

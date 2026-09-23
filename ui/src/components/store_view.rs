@@ -304,12 +304,19 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             // nothing. No payment address on a store nobody should pay:
             // closed, or backed by nothing a reader can believe in (Must
             // Fix 2).
-            if !owned || store.payable() {
-                StoreInvoices { orders: APP_STATE.read().invoices_shown(&contract_id) }
-            } else if !store.orders.is_empty() {
+            StoreInvoices {
+                orders: APP_STATE.read().invoices_shown(&contract_id),
+                owned,
+            }
+            if owned && !store.payable()
+                && store
+                    .orders
+                    .iter()
+                    .any(|o| o.status == harvest_common::payment::OrderStatus::AwaitingPayment)
+            {
                 p { class: "text-muted",
-                    "This store's invoices are not shown: it has closed, or nothing vouches \
-                     for the key that signs them, so none of them should be paid."
+                    "This store's unpaid invoices are not shown: it has closed, or nothing \
+                     vouches for the key that signs them, so none of them should be paid."
                 }
             }
         }
@@ -333,7 +340,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 /// whose "Paid" verdict would rest on a stranger's signature has to say so
 /// before the buyer sends anything.
 #[component]
-fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Element {
+fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>, owned: bool) -> Element {
     if orders.is_empty() {
         return rsx! {};
     }
@@ -344,12 +351,21 @@ fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>) -> Eleme
     rsx! {
         div { style: "margin-top: 24px;",
             h4 { "Invoices" }
-            p { class: "text-muted",
-                "Pay the address shown on an invoice for the exact amount. Anyone can "
-                "check the evidence that settles it, so neither you nor the seller has to "
-                "be taken at their word about the payment."
+            // The paying instructions only where an invoice can carry an
+            // address: on the viewer's own store. Anyone else's list holds
+            // settled invoices only (review round 5, P3).
+            if owned {
+                p { class: "text-muted",
+                    "Pay the address shown on an invoice for the exact amount. Anyone can "
+                    "check the evidence that settles it, so neither you nor the seller has to "
+                    "be taken at their word about the payment."
+                }
+                super::invoice_form::PaymentWatchNote {}
+            } else {
+                p { class: "text-muted",
+                    "Settled invoices. Anyone can check the evidence that settled each one."
+                }
             }
-            super::invoice_form::PaymentWatchNote {}
             for order in sorted.iter() {
                 super::bitcoin_view::OrderCard {
                     key: "{order.order.id}",

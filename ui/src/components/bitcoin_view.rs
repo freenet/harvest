@@ -97,36 +97,26 @@ fn active_network(bitcoin: &BitcoinState) -> BitcoinNetwork {
 /// node's own store registrations, not by the order's `seller_fingerprint`,
 /// which is seller-written too.
 ///
+/// A buyer's own purchases, paid or not, are on the store page's purchase
+/// card, which checks the order is really theirs (`AppState::paid_copy`);
+/// this tab lists nothing it cannot check that way. Round 4 briefly listed
+/// a buyer's settled orders here by `buyer_fingerprint`, and round 5 took it
+/// out again: a seller can mint a `Paid` order naming any fingerprint, and
+/// the tab would have shown it as this buyer's (model 3.3).
+///
 /// An order still awaiting payment is left out when its store is not
 /// `payable` -- closed, or unbacked (harvest#93 review, Must Fix 2): its card
 /// would show a payment address nobody should use. Settled orders stay, as
 /// history.
-///
-/// And, from anyone else's store, a buyer's history: orders naming one of
-/// this node's Ghost Keys as buyer that are past `AwaitingPayment` (review
-/// round 4, P3). Their cards offer no address
-/// (`fulfilment::offers_payment_address`), so the seller-written fingerprint
-/// can put nothing payable here.
 pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
-    let my_fingerprints: std::collections::HashSet<&str> = app_state
-        .ghostkeys
-        .iter()
-        .map(|k| k.fingerprint.as_str())
-        .collect();
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
         .iter()
-        .flat_map(|(id, s)| {
-            let owned = app_state.store_owner_fingerprint(id).is_some();
-            let fingerprints = &my_fingerprints;
-            s.orders.iter().filter(move |o| {
-                if owned {
-                    s.payable() || o.status != OrderStatus::AwaitingPayment
-                } else {
-                    o.status != OrderStatus::AwaitingPayment
-                        && fingerprints.contains(o.order.buyer_fingerprint.as_str())
-                }
-            })
+        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
+        .flat_map(|(_, s)| {
+            s.orders
+                .iter()
+                .filter(move |o| s.payable() || o.status != OrderStatus::AwaitingPayment)
         })
         .cloned()
         .collect();

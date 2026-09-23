@@ -445,7 +445,10 @@ pub struct AppState {
     pub keeps_sent: HashMap<(harvest_common::payment::OrderId, KeepStep), KeepInFlight>,
 
     /// Steps the delegate refused this session, with the digest of the copy
-    /// that was offered ([`keep_digest`]). The same copy is not offered
+    /// that was offered ([`order_digest`]). A `Paid` copy is rebuilt against
+    /// each new tip, so a refused upgrade is offered again once a block:
+    /// that is the retry for a refusal that clears on its own (review round
+    /// 5), and [`Self::refusals_notified`] keeps it from being said again. The same copy is not offered
     /// again by an automatic trigger, so a refusal is not re-sent, and
     /// re-notified, on every arrival (review round 3, P3); a different copy,
     /// or the buyer's own press, is.
@@ -456,6 +459,10 @@ pub struct AppState {
     /// been.
     pub keep_refusals: HashMap<harvest_common::payment::OrderId, String>,
 
+    /// Refusals already notified this session, by order id and reason, so
+    /// an upgrade retried once a block is not re-announced each time.
+    pub refusals_notified: HashSet<(harvest_common::payment::OrderId, String)>,
+
     /// The kept complaints put back on their records this session, by order
     /// id (model section 3.4). Per complaint rather than once per session,
     /// because the first list of a session can come from a freshly re-keyed
@@ -463,6 +470,13 @@ pub struct AppState {
     /// (review round 3). Released when a PUT fails, so the next list
     /// arrival tries it again. See [`complaints_to_reassert`].
     pub complaints_reasserted: HashSet<harvest_common::payment::OrderId>,
+
+    /// Kept complaints whose PUT failed this session: how many times, and
+    /// the earliest ms at which it is tried again (review round 5, P2). The
+    /// wait doubles from a minute up to an hour, so a record that keeps
+    /// refusing (one the seller has bloated past the size limit, say) is not
+    /// sent a PUT every minute for as long as the tab is open.
+    pub reassert_backoff: HashMap<harvest_common::payment::OrderId, (u32, u64)>,
 
     /// `Complaint::verify` answers for the complaint control, by order id and
     /// [`order_digest`] of the copy, so a card does not run a full proof
@@ -2359,7 +2373,7 @@ impl KeepStep {
 /// One `KeepPurchase` on its way to the delegate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepInFlight {
-    /// [`keep_digest`] of the copy offered, so a refusal can be tied to it.
+    /// [`order_digest`] of the copy offered, so a refusal can be tied to it.
     pub digest: u64,
     /// When it was sent, in ms since the epoch.
     pub since_ms: u64,
@@ -2379,26 +2393,6 @@ pub(crate) fn order_digest(order: &AuthorizedOrder) -> u64 {
     harvest_common::to_cbor(order)
         .unwrap_or_default()
         .hash(&mut hasher);
-    hasher.finish()
-}
-
-/// [`order_digest`] of `order` with its proof's tip left out: what ties a
-/// delegate's refusal to the copy it refused (review round 4, P3). A
-/// `Paid` copy is rebuilt against the newest tip on every trigger, so a
-/// digest over the tip would call every block's copy a new one, and a
-/// refused upgrade would be sent, and its refusal notified, once a block.
-pub(crate) fn keep_digest(order: &AuthorizedOrder) -> u64 {
-    use harvest_common::payment::OrderPaymentProof;
-    use std::hash::{Hash, Hasher};
-    let mut bare = order.clone();
-    let evidence = match bare.payment_proof.take() {
-        Some(OrderPaymentProof::OnChain(proof)) => harvest_common::to_cbor(&proof.claims),
-        other => harvest_common::to_cbor(&other),
-    }
-    .unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    order_digest(&bare).hash(&mut hasher);
-    evidence.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -5673,7 +5667,7 @@ impl AppState {
     /// (`docs/complaint-threat-model.md` section 3.2): the upgrade of every
     /// kept unpaid copy that claims now show paid, whether or not the store
     /// is loaded or still holds the order. A kept `Paid` copy is never
-    /// replaced (revision 4 removed the fresher-evidence rule; model 7.1).
+    /// replaced (revision 4 removed the fresher-evidence rule; model 7.2).
     ///
     /// Nothing that was never kept is kept here (revision 3, 3.3): a seller
     /// could otherwise fill every slot on the node with one payment to a
@@ -5788,7 +5782,7 @@ impl AppState {
         {
             return;
         }
-        let digest = keep_digest(&keep.order);
+        let digest = order_digest(&keep.order);
         if self.keeps_refused.get(&(id.clone(), step)) == Some(&digest) {
             return;
         }
@@ -5883,7 +5877,11 @@ impl AppState {
             self.keeps_sent.remove(&key);
             self.keeps_refused.insert(key, digest);
         }
-        if !pressed {
+        if !pressed
+            && self
+                .refusals_notified
+                .insert((order_id.clone(), reason.clone()))
+        {
             self.notifications.push(format!(
                 "Your node would not keep its copy of order {}: {reason}",
                 order_id.short()
@@ -5906,7 +5904,11 @@ impl AppState {
     /// session (`docs/complaint-threat-model.md` section 3.4). See
     /// [`complaints_to_reassert`], which decides the set.
     pub(crate) fn reassert_kept_complaints(&mut self) {
-        let due = complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted);
+        let now = now_ms();
+        let due: Vec<_> = complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
+            .into_iter()
+            .filter(|(_, complaint)| self.reassert_ready(complaint.order_id(), now))
+            .collect();
         for (store_key, complaint) in due {
             self.complaints_reasserted
                 .insert(complaint.order_id().clone());
@@ -5937,24 +5939,38 @@ impl AppState {
     /// arrival of the kept list, which may not come this session: a
     /// complaint that never reaches the record counts for no reader.
     pub fn reasserts_due(&self) -> bool {
+        let now = now_ms();
         self.kept_purchases_loaded
-            && !complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted).is_empty()
+            && complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
+                .iter()
+                .any(|(_, complaint)| self.reassert_ready(complaint.order_id(), now))
     }
 
-    /// Whether a `KeepPurchase` marker has outlived [`KEEP_TIMEOUT_MS`] at
-    /// `now_ms` and is still held: the card still reads it as on its way
-    /// until something repaints (review round 4, P3).
+    /// Whether the kept complaint about `order_id` may be PUT at `now_ms`:
+    /// never failed this session, or its backoff has run out.
+    fn reassert_ready(&self, order_id: &harvest_common::payment::OrderId, now_ms: u64) -> bool {
+        self.reassert_backoff
+            .get(order_id)
+            .is_none_or(|(_, not_before)| now_ms >= *not_before)
+    }
+
+    /// Whether a buyer's press to pay has outlived [`KEEP_TIMEOUT_MS`] at
+    /// `now_ms` and its marker is still held: the card still reads it as on
+    /// its way until something repaints (review round 4, P3). Only the
+    /// press: it is the one marker a card reads, and the others are kept so a
+    /// late answer is still tied to what was sent (review round 5, P3).
     pub fn keeps_timed_out(&self, now_ms: u64) -> bool {
-        self.keeps_sent
-            .values()
-            .any(|sent| now_ms.saturating_sub(sent.since_ms) >= KEEP_TIMEOUT_MS)
+        self.keeps_sent.iter().any(|((_, step), sent)| {
+            *step == KeepStep::Keep && now_ms.saturating_sub(sent.since_ms) >= KEEP_TIMEOUT_MS
+        })
     }
 
     /// Let go of every marker [`Self::keeps_timed_out`] finds, which is also
     /// what repaints the card.
     pub fn drop_timed_out_keeps(&mut self, now_ms: u64) {
-        self.keeps_sent
-            .retain(|_, sent| now_ms.saturating_sub(sent.since_ms) < KEEP_TIMEOUT_MS);
+        self.keeps_sent.retain(|(_, step), sent| {
+            *step != KeepStep::Keep || now_ms.saturating_sub(sent.since_ms) < KEEP_TIMEOUT_MS
+        });
     }
 
     /// Putting the kept complaint about `order_id` on its record failed:
@@ -5962,6 +5978,14 @@ impl AppState {
     /// kept list, tries again.
     pub(crate) fn on_reassert_failed(&mut self, order_id: &harvest_common::payment::OrderId) {
         self.complaints_reasserted.remove(order_id);
+        let failures = self
+            .reassert_backoff
+            .get(order_id)
+            .map_or(0, |(failures, _)| *failures)
+            .saturating_add(1);
+        let wait = (60_000u64 << failures.min(6)).min(60 * 60_000);
+        self.reassert_backoff
+            .insert(order_id.clone(), (failures, now_ms().saturating_add(wait)));
     }
 
     /// Every listing this conversation has asked about.
@@ -6569,6 +6593,7 @@ impl AppState {
         for kept in self.kept_purchases.iter().filter(|kept| {
             kept.store_key == owner
                 && kept.order.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                && self.kept_order_could_still_count(kept)
         }) {
             for id in self.kept_order_address_instances(&kept.order.order) {
                 if !ids.contains(&id) {
@@ -6612,12 +6637,12 @@ impl AppState {
         // stale address view is not evidence of non-payment, and a keep
         // judged lapsed on one was never watched again, so a buyer who paid
         // and came back after the last settling block lost the purchase.
-        // Bounded by the buyer's own presses (model 5.1).
-        for kept in self
-            .kept_purchases
-            .iter()
-            .filter(|kept| kept.order.status == OrderStatus::AwaitingPayment)
-        {
+        // Bounded by the buyer's own presses (model 5.1), and in time by the
+        // tip alone ([`Self::kept_order_could_still_count`]).
+        for kept in self.kept_purchases.iter().filter(|kept| {
+            kept.order.status == OrderStatus::AwaitingPayment
+                && self.kept_order_could_still_count(kept)
+        }) {
             for id in self.kept_order_address_instances(&kept.order.order) {
                 if !ids.iter().any(|(held, _)| *held == id) {
                     ids.push((id, kept.order.order.network));
@@ -7407,6 +7432,31 @@ impl AppState {
         blockers
     }
 
+    /// Whether a complaint about `kept` could still count if it turned out
+    /// to be paid: false only once the chain tip is past the latest block any
+    /// complaint window for it could reach (review round 5, P2). A complaint
+    /// counts up to `paid_height + DESPATCH_WINDOW_BLOCKS +
+    /// COMPLAINT_WINDOW_BLOCKS` (model 6), and `paid_height` is at most the
+    /// order's last settling block. Decided from the bridge-signed tip and
+    /// the order's own terms only, never from the address view, so it cannot
+    /// repeat round 4's P1: past this block nothing is lost by not watching.
+    /// True while the tip, or the order's window, is unknown.
+    fn kept_order_could_still_count(&self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&kept.order.order.network)
+            .and_then(|tip| tip.tip_height);
+        match (tip, crate::fulfilment::last_settling_block(&kept.order)) {
+            (Some(tip), Some(last)) => {
+                tip <= last
+                    .saturating_add(crate::fulfilment::DESPATCH_WINDOW_BLOCKS)
+                    .saturating_add(crate::fulfilment::COMPLAINT_WINDOW_BLOCKS)
+            }
+            _ => true,
+        }
+    }
+
     /// Whether this node's delegate keeps a copy of order `order_id` of
     /// `store`, filed under `conversation`.
     fn holds_kept_copy(
@@ -7991,7 +8041,14 @@ impl AppState {
         if store.payable() {
             store.orders.clone()
         } else {
-            Vec::new()
+            // A closed or unbacked store of the viewer's own: its settled
+            // history, as everyone else sees it (review round 5, P3).
+            store
+                .orders
+                .iter()
+                .filter(|order| order.status != OrderStatus::AwaitingPayment)
+                .cloned()
+                .collect()
         }
     }
 
@@ -26606,10 +26663,14 @@ mod buy_flow_tests {
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "Payments tab"
         );
-        // A settled order of the same store is listed in both, as history:
-        // its card offers no address (review round 4, P3).
-        let mut settled = unpaid.clone();
+        // Another settled order of the same store is on its public list,
+        // with no address (review round 4, P3), and NOT on the Payments tab,
+        // which lists nothing it cannot check is this buyer's (round 5).
+        let mut other = unpaid.clone();
+        other.order.amount_sats += 1;
+        let mut settled = resigned(other, &seller_signing_key());
         settled.status = OrderStatus::Cancelled;
+        assert_ne!(settled.order.id, unpaid.order.id);
         assert!(!crate::fulfilment::offers_payment_address(
             &settled,
             Some(TIP_HEIGHT)
@@ -26621,9 +26682,9 @@ mod buy_flow_tests {
             .orders
             .push(settled.clone());
         assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
-        assert_eq!(
-            crate::components::bitcoin_view::my_orders(&state),
-            vec![settled.clone()]
+        assert!(
+            crate::components::bitcoin_view::my_orders(&state).is_empty(),
+            "Payments tab"
         );
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 
@@ -27029,7 +27090,21 @@ mod buy_flow_tests {
         // the watch timer's question says so, and its answer puts it back
         // (review round 4, P2-6). Red if only a list arrival retries.
         state.on_reassert_failed(&order.order.id);
-        assert!(state.reasserts_due(), "a failed PUT is due again");
+        assert!(!state.reasserts_due(), "not at once: it backs off");
+        state.reassert_kept_complaints();
+        assert_eq!(
+            state.reasserted_complaints.len(),
+            1,
+            "not while backing off"
+        );
+        // The wait doubles with each failure (review round 5, P2).
+        let first = state.reassert_backoff[&order.order.id].1;
+        state.on_reassert_failed(&order.order.id);
+        let (failures, second) = state.reassert_backoff[&order.order.id];
+        assert_eq!(failures, 2);
+        assert!(second > first, "a longer wait");
+        state.reassert_backoff.get_mut(&order.order.id).unwrap().1 = 0;
+        assert!(state.reasserts_due(), "due once the wait has run out");
         state.reassert_kept_complaints();
         assert_eq!(state.reasserted_complaints.len(), 2, "put back");
         assert!(!state.reasserts_due());
@@ -27074,8 +27149,19 @@ mod buy_flow_tests {
         // The watch timer sees it and lets it go, which repaints the card
         // (review round 4, P3).
         assert!(state.keeps_timed_out(now_ms()));
+        // Only the press is let go: another step's marker stays, so a late
+        // answer is still tied to what was sent (review round 5, P3).
+        let upgrade = (unpaid.order.id.clone(), KeepStep::Paid);
+        state.keeps_sent.insert(
+            upgrade.clone(),
+            KeepInFlight {
+                digest: 7,
+                since_ms: 0,
+            },
+        );
         state.drop_timed_out_keeps(now_ms());
-        assert!(state.keeps_sent.is_empty());
+        assert!(!state.keeps_sent.contains_key(&key));
+        assert!(state.keeps_sent.contains_key(&upgrade));
         state
             .keep_purchase(STORE, &unpaid.order.id)
             .expect("pressed");
@@ -27083,8 +27169,10 @@ mod buy_flow_tests {
     }
 
     /// **A refused upgrade is not re-sent on every trigger** (review round 3,
-    /// P3): the same copy is skipped for the session, and notified once; a
-    /// different copy is offered. Red if a refusal is re-sent unchanged.
+    /// P3): the same copy is skipped, and notified once; a new block's copy
+    /// is offered again, since a refusal can clear on its own, without a
+    /// second notification (review round 5, P2). Red if a refusal is re-sent
+    /// unchanged, never retried, or re-notified.
     #[test]
     fn a_refused_upgrade_is_not_resent_until_its_copy_changes() {
         let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
@@ -27096,12 +27184,12 @@ mod buy_flow_tests {
             state.upgrade_kept_purchases();
         }
         assert_eq!(state.keep_requests.len(), 1, "not re-sent");
-        // A new block rebuilds the copy against the new tip: the same copy
-        // for this purpose (review round 4, P3). Red if the digest covers
-        // the tip, which re-sent and re-notified a refusal every block.
+        // A new block rebuilds the copy against the new tip: offered again,
+        // and a second identical refusal is not announced again.
         state.apply_tip_state(BitcoinNetwork::Signet, &a_tip_state(TIP_HEIGHT + 1));
         state.upgrade_kept_purchases();
-        assert_eq!(state.keep_requests.len(), 1, "not re-sent for a new tip");
+        assert_eq!(state.keep_requests.len(), 2, "retried once a block");
+        state.on_keep_refused(&unpaid.order.id, "the node refused to save".into());
         assert_eq!(
             state
                 .notifications
@@ -27121,11 +27209,11 @@ mod buy_flow_tests {
             .claims
             .extend(extra);
         state.upgrade_kept_purchases();
-        assert_eq!(state.keep_requests.len(), 2, "a different copy is offered");
+        assert_eq!(state.keep_requests.len(), 3, "a different copy is offered");
     }
 
     /// **A kept `Paid` copy is never replaced** (revision 4 removed the
-    /// fresher-evidence rule; model 3.2, 7.1): later claims for the same
+    /// fresher-evidence rule; model 3.2, 7.2): later claims for the same
     /// payment, a later tip, or a store copy do not send a second copy.
     /// Red if anything but the unpaid-to-paid upgrade is offered.
     #[test]
@@ -27143,6 +27231,9 @@ mod buy_flow_tests {
             .claims
             .push(reconfirmed(&unpaid, TIP_HEIGHT + 3));
         move_tip_to(&mut state, TIP_HEIGHT + 3);
+        // Nothing is even due (review round 5: `send_keep` would drop a step
+        // already done, so the send alone could not show this).
+        assert!(state.upgrades_due().is_empty());
         state.upgrade_kept_purchases();
         assert!(state.keep_requests.is_empty(), "{:?}", state.keep_requests);
         assert!(
@@ -27274,6 +27365,34 @@ mod buy_flow_tests {
             .expect("the complaint is fileable");
         let (key, complaint) = filed(&mut state);
         complaint.verify(&key).expect("the record accepts it");
+    }
+
+    /// **A never-paid keep stops being watched once no complaint about it
+    /// could count** (review round 5, P2), and not before: at the last block
+    /// a complaint window could reach it is still watched and re-read, one
+    /// block later it is not. Decided from the tip alone. Red if the bound
+    /// is removed (watched forever) or reads the address view.
+    #[test]
+    fn a_never_paid_keep_is_watched_until_no_complaint_could_count() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        let own = unpaid.order.bitcoin_address_instance_id().unwrap();
+        let last = crate::fulfilment::last_settling_block(&unpaid).expect("anchored");
+        let end = last
+            + crate::fulfilment::DESPATCH_WINDOW_BLOCKS
+            + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS;
+        move_tip_to(&mut state, end);
+        assert!(
+            state.due_address_rereads(0).0.contains(&own),
+            "still watched"
+        );
+        assert!(!state.kept_address_contracts_to_watch().is_empty());
+        move_tip_to(&mut state, end + 1);
+        assert!(
+            !state.due_address_rereads(0).0.contains(&own),
+            "not re-read"
+        );
+        assert!(state.kept_address_contracts_to_watch().is_empty());
+        assert_eq!(purchases(&state).len(), 1, "still listed");
     }
 
     /// **A tip alone upgrades a kept copy** (codex round 4, P1): the claims
@@ -27559,8 +27678,16 @@ mod buy_flow_tests {
         state.on_kept_purchases(list.clone());
         assert_eq!(state.reasserted_complaints.len(), 2, "once per session");
 
-        // A failed PUT is tried again on the next arrival.
+        // A failed PUT is tried again on the next arrival once its backoff
+        // has run out (review round 5, P2), and not before.
         state.on_reassert_failed(complaint.order_id());
+        state.on_kept_purchases(list.clone());
+        assert_eq!(state.reasserted_complaints.len(), 2, "backing off");
+        state
+            .reassert_backoff
+            .get_mut(complaint.order_id())
+            .unwrap()
+            .1 = 0;
         state.on_kept_purchases(list);
         assert_eq!(state.reasserted_complaints.len(), 3, "retried");
         assert_eq!(state.reasserted_complaints[2].1, complaint);
