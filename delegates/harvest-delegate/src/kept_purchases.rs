@@ -40,7 +40,7 @@ use harvest_common::delegate::{
     MAX_KEPT_PURCHASE_BYTES,
 };
 use harvest_common::payment::{
-    complaint_preconditions, evidence_freshness, verify_minimal_proof, OrderId, OrderStatus,
+    complaint_preconditions, verify_minimal_proof, OrderId, OrderStatus,
 };
 use harvest_common::{from_cbor, to_cbor};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -212,22 +212,11 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
                     ..held
                 }
             }
-            // A paid copy with no complaint yet follows strictly fresher
-            // evidence (`docs/complaint-threat-model.md` section 3.2): after a
-            // reorg re-confirms the payment, the kept copy must show the
-            // re-confirmation, not the stale claim a reversal is built from.
-            // Frozen once a complaint is kept, since the complaint signs its
-            // paid height.
-            (OrderStatus::Paid, OrderStatus::Paid)
-                if held.complaint.is_none()
-                    && offered.complaint.is_none()
-                    && evidence_freshness(&offered.order) > evidence_freshness(&held.order) =>
-            {
-                offered
-            }
             // Anything else keeps what is held: a second unpaid copy, an
-            // unpaid copy of a paid order, a paid copy no fresher, a second
-            // complaint.
+            // unpaid copy of a paid order, another paid copy (a kept paid
+            // copy is never replaced: revision 4 of
+            // `docs/complaint-threat-model.md` removed the fresher-evidence
+            // rule, section 7.1), a second complaint.
             _ => return list(store),
         },
     };
@@ -274,13 +263,12 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
     // one without the complaint, while the predecessor holds the paid copy
     // and the complaint. Both records passed `check`, so the more complete
     // one wins: a complaint first (and a held complaint is never swapped
-    // for another), then paid over unpaid, then fresher evidence.
+    // for another), then paid over unpaid. On a tie what is held stays.
     if let Some(held) = held(store, key) {
         let completeness = |record: &KeptPurchase| {
             (
                 record.complaint.is_some(),
                 record.order.status == OrderStatus::Paid,
-                evidence_freshness(&record.order),
             )
         };
         if held.complaint.is_some() || completeness(&incoming) <= completeness(&held) {
@@ -704,37 +692,28 @@ mod tests {
         keep
     }
 
-    /// **A kept paid copy with no complaint follows strictly fresher
-    /// evidence, and is frozen once a complaint is kept** (model 3.2, review
-    /// round 3). After a reorg re-confirms the payment, the kept copy must
-    /// show the re-confirmation, not the stale claim a reversal is built
-    /// from. Red if the fresher copy is refused, or if a copy that is not
-    /// fresher, or one with a complaint, is replaced.
+    /// **A kept paid copy is never replaced, and still gains its
+    /// complaint** (model 3.2, revision 4 removed the fresher-evidence rule).
+    /// Red if a later paid copy replaces the held one.
     #[test]
-    fn a_paid_copy_follows_fresher_evidence_until_a_complaint() {
+    fn a_kept_paid_copy_is_never_replaced() {
         use harvest_common::payment::evidence_freshness;
         let mut secrets = holding(1);
         keep(&mut secrets, paid_as_of(1, 1, 100));
-        let fresher = purchases(keep(&mut secrets, paid_as_of(1, 1, 105))).remove(0);
-        assert_eq!(evidence_freshness(&fresher.order), 105, "fresher replaces");
-        let same = purchases(keep(&mut secrets, paid_as_of(1, 1, 103))).remove(0);
-        assert_eq!(evidence_freshness(&same.order), 105, "older does not");
+        let held = purchases(keep(&mut secrets, paid_as_of(1, 1, 105))).remove(0);
+        assert_eq!(evidence_freshness(&held.order), 100, "not replaced");
 
-        let complaint = complaint_about(&fresher.order, &seed(1), FeedbackCategory::NonDelivery);
-        keep(
+        let complaint = complaint_about(&held.order, &seed(1), FeedbackCategory::NonDelivery);
+        let kept = purchases(keep(
             &mut secrets,
             PurchaseToKeep {
                 complaint: Some(complaint),
-                ..paid_as_of(1, 1, 105)
+                ..paid_as_of(1, 1, 100)
             },
-        );
-        let frozen = purchases(keep(&mut secrets, paid_as_of(1, 1, 110))).remove(0);
-        assert_eq!(
-            evidence_freshness(&frozen.order),
-            105,
-            "frozen by the complaint"
-        );
-        assert!(frozen.complaint.is_some());
+        ))
+        .remove(0);
+        assert!(kept.complaint.is_some(), "the complaint is kept");
+        assert_eq!(evidence_freshness(&kept.order), 100);
     }
 
     /// **Migration merges as a keep would** (review round 3): the successor
@@ -777,6 +756,51 @@ mod tests {
             import(&mut successor, &key, &value),
             SecretImport::AlreadyAuthoritative
         ));
+
+        // A held complaint is never swapped for another.
+        let mut other = holding(1);
+        let later = purchases(keep(&mut other, paid_as_of(1, 1, 105)))
+            .remove(0)
+            .order;
+        keep(
+            &mut other,
+            PurchaseToKeep {
+                complaint: Some(complaint_about(
+                    &later,
+                    &seed(1),
+                    FeedbackCategory::Misrepresented,
+                )),
+                ..paid_as_of(1, 1, 105)
+            },
+        );
+        let held_before = other.get_secret(&key);
+        assert!(matches!(
+            import(&mut other, &key, &value),
+            SecretImport::AlreadyAuthoritative
+        ));
+        assert_eq!(other.get_secret(&key), held_before, "complaint vs complaint");
+
+        // A held paid copy is not replaced by an incoming unpaid one, nor by
+        // an incoming paid one that differs only in its evidence.
+        let mut unpaid_source = holding(1);
+        keep(
+            &mut unpaid_source,
+            to_keep(1, 1, OrderStatus::AwaitingPayment, 1),
+        );
+        let unpaid_value = unpaid_source.get_secret(&key).expect("kept");
+        let mut fresher_source = holding(1);
+        keep(&mut fresher_source, paid_as_of(1, 1, 110));
+        let fresher_value = fresher_source.get_secret(&key).expect("kept");
+        let mut paid_holder = holding(1);
+        keep(&mut paid_holder, paid_as_of(1, 1, 100));
+        let held_before = paid_holder.get_secret(&key);
+        for incoming in [unpaid_value, fresher_value] {
+            assert!(matches!(
+                import(&mut paid_holder, &key, &incoming),
+                SecretImport::AlreadyAuthoritative
+            ));
+            assert_eq!(paid_holder.get_secret(&key), held_before);
+        }
     }
 
     /// No complaint is kept about an unpaid order.
