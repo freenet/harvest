@@ -916,7 +916,7 @@ mod tests {
             ("zero confirmations", unconfirmed, "before any confirmation"),
             ("too many confirmations", distant, "more than the"),
             ("a Lightning order", lightning, "not an on-chain order"),
-            ("no anchor", undated, "names no block"),
+            ("no anchor", undated, "anchored to no block"),
             ("no bridge", unbridged, "names no bridge"),
         ] {
             let o = o.with_derived_id();

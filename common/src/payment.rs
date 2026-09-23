@@ -1912,7 +1912,9 @@ pub fn complaint_preconditions(order: &AuthorizedOrder) -> Result<(), String> {
     // three before payment, and the delegate must not keep an order no
     // complaint could ever be filed about.
     if order.order.anchor.is_none() {
-        return Err("the order names no block it was made at, so no payment can be dated".into());
+        return Err(
+            "the order is anchored to no block, so a complaint about it could not be dated".into(),
+        );
     }
     if order.order.trusted_bridges.is_empty() {
         return Err("the order names no bridge, so no payment to it can be proven".into());
