@@ -621,7 +621,10 @@ mod tests {
             .verify(&store_signing_key().verifying_key())
             .expect("precondition: the padded copy verifies");
         let (_, reason) = refusal(keep(&mut secrets, padded));
-        assert!(reason.contains("not the one a complaint carries"), "{reason}");
+        assert!(
+            reason.contains("not the one a complaint carries"),
+            "{reason}"
+        );
     }
 
     /// No complaint is kept about an unpaid order.
