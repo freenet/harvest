@@ -26608,12 +26608,19 @@ mod buy_flow_tests {
             "still no payment details"
         );
         assert!(state.notifications.is_empty(), "the card says it");
-        // A refused upgrade has no card to say it on, so it is notified.
-        state.on_keep_refused(&unpaid.order.id, "the node refused to save".into());
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n.contains("the node refused to save")));
+        // "Try again": the buyer's own press asks again, though the copy is
+        // the one refused (review round 3, P3).
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("pressed again");
+        assert_eq!(state.keep_requests.len(), 2, "asked again");
+        assert_eq!(
+            state.keep_refusal(&unpaid.order.id),
+            None,
+            "the reason clears"
+        );
+        // A refused upgrade, which has no card to say it on, is notified:
+        // `a_refused_upgrade_is_not_resent_until_its_copy_changes`.
     }
 
     /// Only an order ready to pay is kept by the press: any other blocker
