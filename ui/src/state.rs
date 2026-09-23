@@ -1691,6 +1691,8 @@ pub fn order_for_invoice(
          data to load and issue it again.",
     )?;
     Ok(Order {
+        request_id: None,
+        derivation: None,
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
@@ -13451,6 +13453,8 @@ mod tests {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
             listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: harvest_common::listing::ListingId([1u8; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
@@ -13647,6 +13651,8 @@ mod tests {
 
     fn new_listing(title: &str) -> harvest_common::listing::Listing {
         harvest_common::listing::Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: harvest_common::listing::ListingId([0u8; 32]),
             title: title.to_string(),
             description: String::new(),
@@ -14515,6 +14521,8 @@ mod tests {
     fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: harvest_common::listing::ListingId([id; 32]),
                 title: "Beans".to_string(),
                 description: String::new(),
@@ -16077,6 +16085,8 @@ mod invoice_tests {
     /// A published order paying `script`, as a store holds it.
     fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
         let order = harvest_common::payment::Order {
+            request_id: None,
+            derivation: None,
             id: harvest_common::payment::OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: SELLER.to_string(),
@@ -17016,6 +17026,8 @@ mod invoice_tests {
             .push_back(PendingSignature::Listing(PendingListing {
                 fingerprint: SELLER.to_string(),
                 listing: harvest_common::listing::Listing {
+                    checkout: None,
+                    choices: Vec::new(),
                     id: listing_id(),
                     title: "Other".to_string(),
                     description: String::new(),
@@ -17336,6 +17348,8 @@ mod authorized_order_tests {
     fn order() -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -20322,6 +20336,8 @@ mod buy_flow_tests {
         let created_at =
             chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).expect("timestamp");
         let order = Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
@@ -25046,6 +25062,8 @@ mod buy_flow_tests {
                 pending: PendingListing {
                     fingerprint: "seller-fp".into(),
                     listing: harvest_common::listing::Listing {
+                        checkout: None,
+                        choices: Vec::new(),
                         id: harvest_common::listing::ListingId([0u8; 32]),
                         title: "Beans".to_string(),
                         description: String::new(),

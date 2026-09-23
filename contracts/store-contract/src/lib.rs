@@ -259,6 +259,8 @@ mod tests {
     ) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer-fp".into(),
             seller_fingerprint: "seller-fp".into(),
@@ -493,6 +495,8 @@ mod tests {
         let seller = seller_key();
         let make = |title: &str| {
             let listing = Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([0u8; 32]),
                 title: title.to_string(),
                 description: String::new(),
@@ -703,6 +707,8 @@ mod tests {
         };
         for title in titles {
             let listing = Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([0u8; 32]),
                 title: title.to_string(),
                 description: String::new(),

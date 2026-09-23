@@ -49,6 +49,8 @@ fn signed_listing(title: &str) -> AuthorizedListing {
     // would make every fixture here unmergeable. Distinct titles still give
     // distinct listings, which is all these tests identify them by.
     let listing = Listing {
+        checkout: None,
+        choices: Vec::new(),
         id: ListingId([0u8; 32]),
         title: title.to_string(),
         description: String::new(),
@@ -1421,6 +1423,8 @@ fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     };
     foreign.listings.listings = vec![{
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Not the seller's".to_string(),
             description: String::new(),
@@ -2327,6 +2331,8 @@ fn dummy_complaint() -> Complaint {
     Complaint {
         order: AuthorizedOrder {
             order: Order {
+                request_id: None,
+                derivation: None,
                 id: OrderId([4u8; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: String::new(),

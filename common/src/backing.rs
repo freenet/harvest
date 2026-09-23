@@ -1456,6 +1456,8 @@ mod tests {
         let closure = closure_by(&store_key(), &store_key());
         let listing = {
             let listing = crate::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: crate::listing::ListingId([0; 32]),
                 title: "Beans".into(),
                 description: String::new(),

@@ -36,6 +36,8 @@ pub const CONFIRM_HEIGHT: u32 = 100;
 /// Order `n`, naming `buyer_key(n)` as its buyer.
 pub fn order(n: u8) -> Order {
     Order {
+        request_id: None,
+        derivation: None,
         id: OrderId([0u8; 32]),
         buyer_fingerprint: format!("buyer-{n}"),
         seller_fingerprint: "seller-fingerprint".into(),

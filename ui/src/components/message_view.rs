@@ -1389,6 +1389,8 @@ mod inbox_tests {
     fn listing(id: ListingId, title: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id,
                 title: title.to_string(),
                 description: String::new(),
@@ -1443,6 +1445,8 @@ mod inbox_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
+                request_id: None,
+                derivation: None,
                 id: harvest_common::payment::OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
