@@ -454,11 +454,31 @@ pub fn complaint_standing(
 /// -- the union shows the payment confirmed again, or the evidence cannot be
 /// read -- leaves the complaint standing, since the complaint is what the
 /// contract verified.
+///
+/// # Only when every bridge the order names is recognised
+///
+/// A retraction is the one claim SPV cannot check, so it is trusted from the
+/// bridge that signed it. An order naming a bridge the SELLER runs can
+/// therefore be "reversed" at will: the seller's bridge signs a retraction of
+/// its own confirmation. Honoured, that let a seller fill its record, up to
+/// the cap, with sockpuppet complaints dated at their paid height (nearest of
+/// all, so kept first) that no reader counted, pushing every honest
+/// complaint out (review round 6 of #143). A buyer pays only orders whose
+/// bridges are all recognised (`PaymentBlocker::BridgeNotRecognised`), so an
+/// honest buyer's complaint loses nothing here: only a reversal a recognised
+/// bridge attested discounts it. A bridge recognised once and dropped later
+/// makes its reversals count for nothing, which errs toward the buyer.
 pub fn reversal_stands(
     complaint: &harvest_common::reputation::Complaint,
     reversal: &AuthorizedOrder,
 ) -> bool {
     use harvest_common::payment::{verify_payment_proof, ProofError};
+    let bridges = &complaint.order.order.trusted_bridges;
+    if bridges.is_empty()
+        || !crate::components::bitcoin_view::unrecognised_bridges(&complaint.order.order).is_empty()
+    {
+        return false;
+    }
     let (Some(OrderPaymentProof::OnChain(theirs)), Some(OrderPaymentProof::OnChain(ours))) = (
         reversal.payment_proof.as_ref(),
         complaint.order.payment_proof.as_ref(),
@@ -744,6 +764,51 @@ mod tests {
 
     fn bridge() -> SigningKey {
         SigningKey::from_bytes(&[61u8; 32])
+    }
+
+    /// The fixture's bridge, recognised on this thread while the guard lives.
+    fn recognise_fixture_bridge() -> crate::components::bitcoin_view::RecognisedForTest {
+        crate::components::bitcoin_view::recognise_for_test(freenet_bitcoin_common::BridgeId(
+            bridge().verifying_key().to_bytes(),
+        ))
+    }
+
+    /// **A reversal counts only when every bridge the order names is
+    /// recognised** (review round 6 of #143). A seller names its own bridge in
+    /// a sockpuppet order, pays it, complains about it at its paid height, and
+    /// has its bridge retract the payment: with the bridge unrecognised the
+    /// reversal discounts nothing, so the complaint counts against the seller,
+    /// and a full record of them cannot push out honest complaints for free.
+    /// The same evidence under a recognised bridge still discounts it. Red if
+    /// `reversal_stands` stops checking the bridges.
+    #[test]
+    fn a_reversal_by_a_bridge_nobody_recognises_discounts_nothing() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let complaint = complaint_at(&paid, paid_at);
+        let mut reversed = paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        reversed.payment_proof = Some(OrderPaymentProof::on_chain(
+            vec![
+                confirmed(&paid, 10_000, paid_at, 1),
+                retracted(&paid, 10_000, 1, paid_at + 15),
+            ],
+            tip(),
+        ));
+        assert!(
+            !crate::components::bitcoin_view::unrecognised_bridges(&paid.order).is_empty(),
+            "precondition: the fixture's bridge is not the build's"
+        );
+        assert_eq!(
+            complaint_standing(&complaint, Some(&reversed), None),
+            ComplaintStanding::Counts
+        );
+        let _recognised = recognise_fixture_bridge();
+        assert_eq!(
+            complaint_standing(&complaint, Some(&reversed), None),
+            ComplaintStanding::PaymentReversed,
+            "the same reversal from a recognised bridge still discounts it"
+        );
     }
 
     fn anchor(height: u32) -> BlockAnchor {
@@ -1567,6 +1632,7 @@ mod tests {
     /// to.
     #[test]
     fn a_complaint_against_a_reversed_payment_does_not_count() {
+        let _recognised = recognise_fixture_bridge();
         let paid_at = ANCHOR + 3;
         let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
         let complaint = complaint_at(&paid, paid_at + 10);
@@ -1618,6 +1684,7 @@ mod tests {
     /// `complaint_standing` goes back to trusting the store's status alone.
     #[test]
     fn a_reversal_withholding_a_reconfirmation_does_not_erase_the_complaint() {
+        let _recognised = recognise_fixture_bridge();
         let paid_at = ANCHOR + 3;
         let order_paid =
             paid_with(|o| vec![confirmed_as_of(o, 10_000, paid_at + 1, 1, paid_at + 18)]);

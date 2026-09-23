@@ -1215,6 +1215,16 @@ impl BrowsingStore {
         })
     }
 
+    /// Whether this store's record, read, holds as many complaints as a
+    /// record can (`reputation::MAX_COMPLAINTS`, review round 6 of #143):
+    /// from then on a new complaint is kept only in place of one dated
+    /// farther from its payment, so the count shown is a floor, not the
+    /// store's whole history. Readers are told.
+    pub fn record_full(&self) -> bool {
+        self.record == RecordLoad::Loaded
+            && self.complaints.len() >= harvest_common::reputation::MAX_COMPLAINTS
+    }
+
     /// How many complaints on this store's record count against it.
     pub fn counted_complaints(&self) -> usize {
         self.complaint_standings()
@@ -9010,11 +9020,23 @@ impl AppState {
             .into());
         }
         if kept.complaint.is_some() {
-            return Err(
+            // A full record drops a complaint dated farther from its payment
+            // than all it holds, and the re-assert is then dropped each time
+            // too; say so rather than imply it is on the record (round 6).
+            let full_without_it = self
+                .browsing_stores
+                .values()
+                .filter(|store| store.owner.as_ref() == Some(&kept.store_key))
+                .any(BrowsingStore::record_full);
+            return Err(if full_without_it {
+                "your complaint about this order is kept on this node, but the seller's record \
+                 is full and holds complaints dated nearer their payments, so it does not show \
+                 yours; your node offers it again each time Harvest opens"
+            } else {
                 "your complaint about this order is kept on this node, which puts it on the \
                  seller's record each time Harvest opens"
-                    .into(),
-            );
+            }
+            .into());
         }
         if self.complaint_sent(order_id) {
             return Err("your complaint about this order is on its way".into());
@@ -9096,7 +9118,7 @@ impl AppState {
             }
             _ => return Err("this order cannot be complained about".into()),
         }
-        let block_height = tip_height.ok_or(
+        let tip_height = tip_height.ok_or(
             "your node has not seen a recent Bitcoin block yet, and a complaint has to say when \
              it was made",
         )?;
@@ -9104,6 +9126,14 @@ impl AppState {
         // the contract checks the signed value against (model 5.2).
         let paid_height = harvest_common::payment::paid_height(&order)
             .ok_or("your node cannot read when this order was paid")?;
+        // Dated no later than the base window's close (review round 6): a
+        // complaint made in a window a despatch extended would otherwise be
+        // farther from its payment than a late complaint, which no reader
+        // counts, and a full record keeps the nearest (model 5.3). Every
+        // reader counts it at this height, with or without the despatch.
+        let block_height = tip_height.min(paid_height.saturating_add(
+            crate::fulfilment::DESPATCH_WINDOW_BLOCKS + crate::fulfilment::COMPLAINT_WINDOW_BLOCKS,
+        ));
         let parts = ComplaintParts {
             order,
             key,
@@ -9148,6 +9178,15 @@ impl AppState {
         purchase: &BuyerPurchase,
     ) -> Option<String> {
         self.complaint_checks(store_contract_id, purchase).err()
+    }
+
+    /// Whether claims this node holds show the kept unpaid copy `kept` paid,
+    /// so its upgrade to `Paid` is on its way (the Payments-tab list).
+    pub fn kept_seen_paid(&self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        kept.order.status != harvest_common::payment::OrderStatus::Paid
+            && self
+                .proven_paid_copy(&kept.order, &kept.store_key)
+                .is_some()
     }
 
     /// Why the buyer cannot complain about the purchase this node keeps
@@ -26556,6 +26595,144 @@ mod buy_flow_tests {
                 &order.order.id
             )
             .is_some());
+    }
+
+    /// **A complaint made in a window a despatch extended is dated at the
+    /// base window's close** (review round 6 of #143). The seller despatches
+    /// late, which extends the window; the buyer complains after the base
+    /// window has closed. Dated at the tip, the complaint would be farther
+    /// from its payment than a late complaint no reader counts, which a full
+    /// record keeps first, and a reader without the despatch would read it as
+    /// late. Dated at `paid + DESPATCH + COMPLAINT`, every reader counts it.
+    /// Red if the date goes back to the tip.
+    #[test]
+    fn a_complaint_in_an_extended_window_is_dated_at_the_base_close() {
+        use crate::fulfilment::{
+            complaint_standing, ComplaintStanding, COMPLAINT_WINDOW_BLOCKS, DESPATCH_WINDOW_BLOCKS,
+        };
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        let paid_at = harvest_common::payment::paid_height(&order).expect("paid");
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(paid_at + DESPATCH_WINDOW_BLOCKS + 500),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(
+                order.order.id.clone(),
+                harvest_common::fulfilment::AuthorizedDespatch {
+                    despatch,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        let base_close = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        move_tip_to(&mut state, base_close + 100);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(
+            state.complaint_refusal(STORE, &purchase),
+            None,
+            "inside the extended window"
+        );
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .expect("the buyer may complain");
+        let (key, complaint) = filed(&mut state);
+        complaint.verify(&key).expect("the record accepts it");
+        assert_eq!(complaint.block_height, base_close);
+        assert_eq!(
+            complaint_standing(&complaint, None, None),
+            ComplaintStanding::Counts,
+            "counted by a reader who never saw the despatch"
+        );
+    }
+
+    /// **The record read under another build of the store counts as the
+    /// record** (R5-B): the record is addressed by the store key alone, so a
+    /// complaint on it refuses a second one whichever loaded build of the
+    /// store it arrived under. Red if the on-record check reads only one
+    /// store.
+    #[test]
+    fn a_complaint_on_the_record_under_another_build_refuses_a_second() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        state.kept_purchases = vec![kept(&order)];
+        move_tip_to(
+            &mut state,
+            TIP_HEIGHT - 1 + crate::fulfilment::DESPATCH_WINDOW_BLOCKS + 1,
+        );
+        let store_key = seller_signing_key().verifying_key().to_bytes();
+        let complaint = sign_for_test(&state, &order, FeedbackCategory::Counterfeit);
+        let mut other_build = state.browsing_stores[STORE].clone();
+        other_build.complaints = vec![complaint];
+        state.browsing_stores.insert(vec![0xab; 32], other_build);
+        let refused = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(
+            refused.contains("already on the seller's record"),
+            "{refused}"
+        );
+    }
+
+    /// **A kept complaint a full record does not hold is not said to be on
+    /// it** (review round 6). Red if the full-record wording is dropped.
+    #[test]
+    fn a_kept_complaint_a_full_record_drops_is_said_so() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        let complaint = sign_for_test(&state, &order, FeedbackCategory::Counterfeit);
+        let mut held = kept(&order);
+        held.complaint = Some(harvest_common::delegate::KeptComplaint::of(&complaint));
+        state.kept_purchases = vec![held];
+        let store_key = seller_signing_key().verifying_key().to_bytes();
+        let said = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(said.contains("puts it on the seller's record"), "{said}");
+        // Full of complaints about other orders.
+        // About another order: only the count and the load state are read.
+        let mut other = complaint.clone();
+        other.order.order.id = harvest_common::payment::OrderId([0x77; 32]);
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.record = RecordLoad::Loaded;
+        store.complaints = vec![other; harvest_common::reputation::MAX_COMPLAINTS];
+        let said = state
+            .kept_complaint_refusal(&store_key, &order.order.id)
+            .expect("refused");
+        assert!(said.contains("record is full"), "{said}");
+    }
+
+    /// A complaint about `order` signed with the fixture conversation's
+    /// receipt key, dated at the current tip.
+    pub(super) fn sign_for_test(
+        state: &AppState,
+        order: &AuthorizedOrder,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Complaint {
+        let key = the_buyers_conversation()
+            .receipt_signing_key()
+            .expect("a receipt key");
+        let parts = ComplaintParts {
+            order: order.clone(),
+            key,
+            store_key: seller_signing_key().verifying_key(),
+            block_height: state.bitcoin.tips[&BitcoinNetwork::Signet]
+                .tip_height
+                .unwrap_or(0),
+            paid_height: harvest_common::payment::paid_height(order).expect("paid"),
+            conversation: the_buyers_conversation().buyer_public_key,
+        };
+        parts.sign(category).expect("signs")
     }
 
     /// **A seller who has been paid cannot take the complaint away** (review

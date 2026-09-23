@@ -891,11 +891,9 @@ fn gen_reputation(root: &Path) {
     }
     let ab_c = merged(&merged(&a, &b), &cc);
     let a_bc = merged(&a, &merged(&b, &cc));
-    println!(
-        "reputation-cap native: (A+B)+C == A+(B+C)? {}   honest all kept: {}",
-        cbor(&ab_c) == cbor(&a_bc),
-        honest.iter().all(|h| ab_c.complaints.contains(h))
-    );
+    assert_eq!(cbor(&ab_c), cbor(&a_bc), "reputation-cap: the merge is not associative");
+    assert!(honest.iter().all(|h| ab_c.complaints.contains(h)), "an honest complaint was dropped");
+    println!("reputation-cap native: (A+B)+C == A+(B+C), honest all kept");
     let mut c = Corpus::new(root, "reputation-cap", &pbytes);
     c.state("cap_A_full_late", &cbor(&a));
     c.state("cap_B_honest_near", &cbor(&b));

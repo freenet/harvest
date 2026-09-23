@@ -54,6 +54,20 @@ overseer's decisions of 2026-09-23. Two are fixed by removing or narrowing, one 
   bridge to watch the order's address. Whether a buyer holding a Ghost Key also asks is Ian's
   product call; nothing here needs a re-key to add it.
 
+**Revision 5.1** takes in review round 6 of the revision-5 code (labelled R6-*). Both of its
+P1s were in what the cap ASSUMED rather than in the cap itself, and both are closed by narrowing
+an existing rule rather than by adding one:
+
+- **Every complaint is bounded in bytes** (5.3). `MAX_COMPLAINT_BYTES` was derived from the
+  verifier's limits, but the proof's tip is a bridge-signed byte string nothing bounded, and an
+  order may name a bridge the seller runs. `Complaint::verify` now refuses a complaint past it.
+- **A reversal discounts a complaint only when every bridge its order names is recognised**
+  (section 6). A seller's own bridge could retract its own confirmation, so sockpuppet
+  complaints dated at their paid height, kept first by the cap, read as "payment reversed" and
+  counted for nothing while pushing honest complaints out.
+- **The honest UI dates a complaint no later than the base window's close** (5.3), so no late
+  complaint can outrank it; and a reader is told when a record is full.
+
 **Scope.** Harvest launches on signet. The invariant below is claimed for signet. On mainnet
 it additionally needs the reorg residual in 7.2 closed, and mainnet is gated on harvest#134.
 
@@ -69,7 +83,9 @@ it additionally needs the reorg residual in 7.2 closed, and mainnet is gated on 
 > **Conditional on the seller's watch** (section 7.4, R5-A): a bridge observes the order's
 > address only while some node has asked it to, and today only the seller's node asks. A
 > seller that never asks, or withdraws its request before the payment is deep enough, leaves
-> the buyer with no claim to keep. This blocks mainnet, not the signet beta.
+> the buyer with no claim to keep. Even an honest seller's watch lapses: it is renewed only while
+> the seller's tab is open, and only until 192 blocks past the anchor, while a payment may
+> confirm up to 2064 blocks past it (harvest#146). This blocks mainnet, not the signet beta.
 
 - **Genuine** means the order passed every payment blocker on the buyer's own node before any
   payment details were shown. That includes the complaint preconditions (section 4), the
@@ -108,7 +124,8 @@ The seller can do any of these, at any time, including after payment:
 | Pad the order's signed envelope, list one recognised bridge thousands of times, or submit non-minimal proofs | any size cap: the buyer's copy, the complaint, the record (R2-4, TM-E) |
 | Pay its own order address: early or late (to move the paid height), or repeatedly with large transactions (a flood that makes the address contract prune) | the window's start (TM-D); the buyer's claims (TM-B) |
 | Reuse one payment address across many orders, so one payment settles all of them (their windows overlap) | any rule that equates one paid order with one payment (R3: cap filling, record growth) |
-| Show the buyer a payment address anywhere else: the store's invoice list, the Payments tab (matched on the seller-written `buyer_fingerprint`), a message | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
+| Show the buyer a payment address anywhere else: the store's invoice list, a message (the Payments tab lists only the seller's own orders and the buyer's own kept purchases, the latter with no address) | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
+| Name its own bridge in a sockpuppet order, have it sign a padded tip, or have it retract its own confirmation | a byte bound derived rather than enforced (R6-1); a reversal rule that trusts any bridge the order names (R6-2) |
 | Publish a backdated despatch | the complaint window (P2-10) |
 | Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (section 6) |
 | Submit the buyer's own complaint to the record with a different copy of the order or proof | the record's tie-break |
@@ -379,12 +396,15 @@ substitute must show the same paid height.
 
 ### 5.3 The record
 
-- **At most `MAX_COMPLAINTS` (146) complaints** (R5-C). That is `RECORD_BUDGET_BYTES` (40 MiB of
-  freenet-core's 50 MiB state limit) over `MAX_COMPLAINT_BYTES`, the largest complaint that
-  verifies, derived like the kept purchase's bound (5.1) and pinned by the same test. So the
-  record never reaches the state limit, where an honest complaint's merge would be refused,
-  even if every complaint is the largest possible. An ordinary complaint is a few kilobytes,
-  so the cap binds only on a flood.
+- **At most `MAX_COMPLAINTS` (146) complaints, each at most `MAX_COMPLAINT_BYTES`** (R5-C,
+  R6-1). The count is `RECORD_BUDGET_BYTES` (40 MiB of freenet-core's 50 MiB state limit) over
+  `MAX_COMPLAINT_BYTES`, which is derived like the kept purchase's bound (5.1) and pinned by the
+  same test, and **enforced** by `Complaint::verify`: derived alone it was not a bound, since
+  the proof's tip is a byte string only its bridge signs, and an order may name a bridge the
+  seller runs. So the record never reaches the state limit, where an honest complaint's merge
+  would be refused. An ordinary complaint is a few kilobytes. The cap binds on a flood, or on a
+  store with 146 complaints in its life; a reader is then told the record is full
+  (`BrowsingStore::record_full`), since its count is a floor from then on.
 - **Past the cap, the complaints dated nearest their own paid height stay** and the farthest
   go: the distance is `|block_height - paid_height|`, both from the buyer's signed terms, the
   paid height checked against the proof (`Complaint::distance_from_payment`). The order id
@@ -402,10 +422,17 @@ substitute must show the same paid height.
   per-order tie-break to rank by the same distance first (`canonical_rank`), or which of an
   order's complaints arrived first could decide whether the order keeps its slot. The
   `reputation-cap` merge-law corpus and `at_the_cap_the_merge_obeys_the_merge_laws` check it.
+- **The honest UI dates a complaint no later than `paid_height + DESPATCH_WINDOW +
+  COMPLAINT_WINDOW`** (R6-3): the earlier of the tip and the base window's close. A complaint
+  filed in a window a late despatch extended would otherwise be farther from its payment than a
+  late complaint no reader counts, and a reader without the despatch would read it as late. Dated
+  so, every honest complaint is within the base window's distance, and a late complaint (farther
+  than its own window, which is at least that) never outranks it.
 - **With a reused address (section 2), one payment can back many complaints**, so the seller and
   sockpuppets complaining about their own orders can fill the record. What that buys them is
   stated in 7.3: to displace an honest complaint they need `MAX_COMPLAINTS` complaints dated
-  nearer their payments, each of which a reader counts.
+  nearer their payments, each of which a reader counts (a reversal of one discounts it only when
+  a recognised bridge attested it, section 6).
 - A record that does not load reads "record not loaded", never "clean record" (`RecordLoad`).
 
 ## 6. Reader rules (no re-key needed to change any of them)
@@ -423,13 +450,26 @@ substitute must show the same paid height.
   a complaint only if the union of the reversal's claims and the complaint's claims still folds
   to `Reversed`. So a reversal built by withholding a re-confirmation the complaint shows does
   not erase it.
+- **And only when every bridge the order names is recognised** (R6-2, `reversal_stands`). A
+  retraction is the one claim SPV cannot check, so it is taken on its bridge's word. A seller's
+  own bridge could otherwise "reverse" its sockpuppet orders at will, and those complaints,
+  dated at their paid height, are the ones a full record keeps first (5.3). An honest buyer pays
+  only orders whose bridges are all recognised (`BridgeNotRecognised`), so its complaint loses
+  nothing: only a reversal a recognised bridge attested discounts it. A bridge recognised once
+  and dropped later makes its reversals count for nothing, which errs toward the buyer, so this
+  needs no ever-recognised list.
 - **Counting never consults closure, retirement or backing.** A seller could backdate a closure
   anchor, so no rule of the form "discount orders after closure" is safe. Complaints are counted
   on the store key's record, whatever the store's status.
 - **Self-dealing and sockpuppets (#144, Ian's open call).**
-  - Every complaint carries its order's `trusted_bridges`. A reader MAY later discount complaints
-    (and paid-order history) whose bridges it does not recognise, as a reader-side filter with
-    no re-key.
+  - Every complaint carries its order's `trusted_bridges`. A reader-side filter that discounts
+    complaints whose bridges it does not recognise is **no longer free to add** (R6-4). Those
+    complaints can be dated at their paid height, which a full record keeps first (5.3), so such
+    a filter would let a seller's own-bridge complaints, counted for nothing, push honest
+    complaints out of a full record. Adding it needs the record to rank recognised-bridge
+    complaints first, which is a contract change, and section 8 freezes the ranking once
+    complaints exist. So #144 has to be decided before launch if the answer is "discount".
+    (Discounting paid-order history, which the record does not hold, is unaffected.)
   - Such a filter must use an **append-only list of every bridge ever recognised**, not the
     current one, or a key rotation would discount honest complaints made under the old key
     (TM-G).
@@ -497,13 +537,18 @@ retractions), not with a Harvest-local copy of it.
   the buyer's, before the upgrade, moves it later. That delays when the complaint can be
   filed (the `AwaitingDespatch` stage), by at most the payment window, and costs the buyer no
   time, because every window moves with it.
-- **A full record** (5.3, R5-C). An honest complaint is displaced only by `MAX_COMPLAINTS`
-  complaints about other orders, each dated nearer its own payment. Under today's reader rule
-  every one of those counts (a complaint dated no later than `paid_height + DESPATCH_WINDOW +
-  COMPLAINT_WINDOW` counts), so the record then already reads as 146 counted complaints. The
-  exception is an honest complaint filed in a window a late despatch extended: it is farther
-  from its payment than the base window, so late complaints that do not count can outrank it at
-  the cap.
+- **A full record** (5.3, R5-C, R6). An honest complaint is displaced only by `MAX_COMPLAINTS`
+  complaints about other orders, each dated nearer its own payment. Honest complaints are dated
+  within the base window's distance (5.3), so every one of those is too, and a reader counts it:
+  a complaint within the base window counts, and a reversal of it counts only if a recognised
+  bridge attested one (section 6). So the record then reads as 146 counted complaints, and says
+  it is full. What remains:
+  - a seller, or a long-lived store's honest history, can freeze the record at 146: later
+    complaints dated farther from their payment are dropped, and 146 is the most any record
+    shows. A reader is told the record is full, not how much it dropped;
+  - a genuine reorg reversal attested by a recognised bridge still discounts a complaint (7.2),
+    so on mainnet a seller who can arrange real reorgs of its own sockpuppet payments could fill
+    the record with discounted complaints. Mainnet-only, like 7.2.
 - **Re-verifying a dropped complaint.** A peer or buyer holding a complaint that a full record
   dropped sends it again on every exchange and every load (3.4); the record verifies it and
   drops it again. That is verification work proportional to what is sent, bounded by the cap
@@ -568,8 +613,15 @@ kept-purchase field changes; the claims it produces reach the buyer through the 
 contract the kept order is already watched under (3.2). Not built now: whether buyers get it is
 Ian's pending product call (section 9).
 
-On signet the seller's own node registers the watch as part of issuing the order, so an honest
-seller's orders are watched; the residual is a seller acting against its own record.
+**Honest sellers are not fully covered either** (R6, harvest#146). A bridge watch lapses about a
+day after its last request, and the seller's UI renews it only while the seller's tab is open
+(every 12 hours) and only until the tip is 192 blocks past the order's anchor
+(`WATCH_PAST_ANCHOR_BLOCKS`). A buyer is promised up to 2064 blocks for the payment to confirm
+(`PAYMENT_CONFIRMATION_SLACK_BLOCKS`), and a new watch does not scan blocks already mined
+(freenet/freenet-bitcoin#7). So a slow-confirming payment, or one made while the seller's tab
+stays closed for a day, can go unobserved even when the seller is honest. A buyer-side watch
+would need the same renewal, through the last block a complaint could count at. The seller's
+UI never sends `Unwatch` on its own.
 
 ## 8. Compatibility requirements this creates (TM-H)
 
@@ -593,7 +645,9 @@ seller's orders are watched; the residual is a seller acting against its own rec
   - every `MAX_*` bound;
   - `LEGACY_HARVEST_WEBAPP_CONTRACT_IDS` (append-only);
   - the `ScopedPayload` format;
-  - `MAX_COMPLAINTS` (never lowered: raising it re-keys and loses nothing) and the order a
+  - `MAX_COMPLAINT_BYTES`, now enforced per complaint (R6-1);
+  - `MAX_COMPLAINTS` (never lowered: raising it re-keys and loses nothing; a compile-time assert
+    keeps it at least 146 if a bound it is derived from is loosened) and the order a
     full record keeps by (`distance_from_payment`, then the order id; `canonical_rank` within
     an order). A later build that ranks differently keeps a different set at the cap, which
     drops complaints the earlier one kept.
@@ -618,8 +672,11 @@ complaint, each a dependency the model had not named. The overseer's decisions (
 
 ## 9. For Ian (does not block this PR; the code works for either answer)
 
-- **#144, bridge trust and self-dealing:** open. Readers count every complaint the contract
-  accepts; a discount filter can be added later (section 6).
+- **#144, bridge trust and self-dealing:** open, and now **time-bound** (R6-4). Readers count
+  every complaint the contract accepts. A filter discounting complaints through unrecognised
+  bridges can no longer be added later for free: with the cap it lets own-bridge complaints push
+  honest ones out, and fixing that needs a contract ranking change, which section 8 freezes once
+  complaints exist. So if the answer is "discount", it has to be decided before launch.
 - **TM-G: a Ghost Key on complaints.** `incentive-mechanism.md` assumed one. Recommendation:
   record that assumption as superseded by the receipted design, since payment is the cost of a
   complaint. Keep an optional separate attestation as a later addition if sockpuppet complaints
@@ -682,3 +739,10 @@ is needed. "Residual" means section 7.
 | **R5-A** (P1) the seller alone registers the bridge watch | Residual (1, 7.4): blocks mainnet, not signet; buyer-side watch is Ian's call, no re-key needed. |
 | **R5-B** (P1) filing needs the store's current state | Code (3.6): kept purchases filed from the kept record; Payments-tab list. |
 | **R5-C** (P1) the record filled with complaints that never count | Code (5.3): `MAX_COMPLAINTS`, nearest their payment kept; window stays reader-side. |
+| **R6-1** (P1) `MAX_COMPLAINT_BYTES` not a bound (unbounded tip) | Code (5.3): enforced in `Complaint::verify`. |
+| **R6-2** (P1) own-bridge reversals make distance-0 complaints count for nothing | Code (6): `reversal_stands` honours a reversal only when every bridge the order names is recognised. |
+| **R6-3** (P2) a complaint in a despatch-extended window outranked by late ones | Code (5.3): the UI dates complaints no later than the base window's close. |
+| **R6-4** (P2) the #144 discount filter conflicts with the cap | Model (6, 9): not free to add later; decide before launch. |
+| R6 P2 the record freezes at 146 | Residual (7.3); readers are told the record is full. |
+| R6 P2 honest sellers' watches lapse | Residual (1, 7.4); harvest#146. |
+| R6 P3 items (dropped complaint said to be on record, "to pay it" wording, first-run panel, row key, stale docs, test gaps) | Code, except the per-row `BitcoinState` clone (answered on the PR). |

@@ -646,6 +646,10 @@ pub fn KeptPurchases() -> Element {
     drop(app_state);
     // Newest first, as the orders list below.
     kept.sort_by_key(|k| std::cmp::Reverse(k.order.order.created_at));
+    let seen_paid: Vec<bool> = {
+        let state = APP_STATE.read();
+        kept.iter().map(|k| state.kept_seen_paid(k)).collect()
+    };
     rsx! {
         div { class: "card", style: "margin-top: 1rem;",
             h3 { "Your purchases" }
@@ -654,10 +658,13 @@ pub fn KeptPurchases() -> Element {
                 "is made from that copy, so it does not need the seller's store to be "
                 "online or unchanged."
             }
-            for purchase in kept.into_iter() {
+            for (purchase, seen_paid) in kept.into_iter().zip(seen_paid) {
                 KeptPurchaseRow {
-                    key: "{purchase.order.order.id}",
+                    // A kept purchase is one per order id on this node, but
+                    // its identity is the pair.
+                    key: "{hex::encode(purchase.store_key)}-{purchase.order.order.id}",
                     purchase,
+                    seen_paid,
                     bitcoin: bitcoin.clone(),
                 }
             }
@@ -668,6 +675,9 @@ pub fn KeptPurchases() -> Element {
 #[component]
 fn KeptPurchaseRow(
     purchase: harvest_common::delegate::KeptPurchase,
+    /// Claims this node holds prove the unpaid copy paid, and its upgrade
+    /// is on its way.
+    seen_paid: bool,
     bitcoin: crate::state::BitcoinState,
 ) -> Element {
     use harvest_common::payment::OrderStatus;
@@ -685,10 +695,19 @@ fn KeptPurchaseRow(
                         order_id: purchase.order.order.id.clone(),
                     },
                 }
-            } else {
+            } else if seen_paid {
                 p { class: "text-muted",
-                    "{amount} \u{00b7} Not yet seen paid. Your node keeps this order and \
-                     watches for its payment; to pay it, open the seller's store."
+                    "{amount} \u{00b7} Payment seen. Your node is keeping its proof of payment, \
+                     and a complaint can be made once it has."
+                }
+            } else {
+                // No "pay it here" (review round 6): a buyer who paid while
+                // the payment went unobserved (model 7.4) would read it as a
+                // prompt to pay again.
+                p { class: "text-muted",
+                    "{amount} \u{00b7} No payment seen yet. Your node keeps this order and \
+                     watches for its payment. If you have not paid, the seller's store page \
+                     is where to."
                 }
             }
         }

@@ -238,6 +238,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 // Said first and plainly: a closed store's key may be in
                 // someone else's hands, so nothing on this page can be
                 // bought, and the record stays visible (harvest#93, 6.4).
+                // Round 6 of #143: past the cap the count is a floor.
+                if store.record_full() {
+                    p { class: "text-warning",
+                        "This seller's record is full: it holds {harvest_common::reputation::MAX_COMPLAINTS} \
+                         complaints, the most a record can. A new complaint is kept only in place of \
+                         one dated farther from its payment, so the count here may be less than \
+                         every complaint ever made."
+                    }
+                }
+
                 if store.closed {
                     p { class: "text-warning",
                         "This store has closed. Its seller closed it because its key may be \

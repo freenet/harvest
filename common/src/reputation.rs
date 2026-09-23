@@ -138,8 +138,9 @@ pub struct ComplaintTerms {
 /// # Who can make a second, different complaint for one order
 ///
 /// * The buyer, by signing again with another category or block. Both are
-///   real; the slot keeps the one whose signed terms encode smaller (then
-///   the smaller signature), a total order over the buyer's own bytes, so
+///   real; the slot keeps the one dated nearer its payment, then the one
+///   whose signed terms encode smaller (then the smaller signature), a total
+///   order over the buyer's own bytes, so
 ///   which survives does not depend on arrival order -- and not on anything
 ///   the seller or a third party can vary.
 /// * Anyone, by attaching different valid payment evidence for the same
@@ -206,6 +207,16 @@ impl Complaint {
         // in another encoding at will (review round 2, R2-1).
         crate::payment::complaint_preconditions(&self.order)
             .map_err(|e| format!("the complained-about order cannot take a complaint: {e}"))?;
+        // Bounded as a whole (review round 6): the proof's tip is a byte
+        // string only a bridge signs, and the order may name one the seller
+        // runs. Without this one padded complaint could fill the record to
+        // freenet-core's state limit under the count cap.
+        let size = crate::to_cbor(self)?.len();
+        if size > MAX_COMPLAINT_BYTES {
+            return Err(format!(
+                "a complaint may carry at most {MAX_COMPLAINT_BYTES} bytes, and this one is {size}"
+            ));
+        }
         // Nothing rides along that the buyer did not sign (review round 1,
         // P1-3). `verify_scoped_signature` below decodes the envelope and
         // compares its payload, which tolerates bytes after the CBOR item and
@@ -367,9 +378,14 @@ pub type ReputationDelta = Vec<Complaint>;
 /// parts: the order's envelope and terms (`MAX_ORDER_ENVELOPE_BYTES` each,
 /// `payment::complaint_preconditions`), its proof's claims
 /// (`MAX_PROOF_CLAIM_BYTES`, refused past that by the verifier), and a few
-/// hundred bytes of tip, signatures, terms and framing, given 16 KiB. Not
-/// checked per complaint: it is what bounds [`MAX_COMPLAINTS`] in bytes.
-/// Pinned by `delegate::tests::a_maximal_verifying_purchase_fits_the_bound`.
+/// hundred bytes of tip, signatures, terms and framing, given 16 KiB.
+///
+/// **Checked per complaint** by [`Complaint::verify`] (review round 6 of
+/// #143): the derivation alone is not a bound, because the proof's tip is a
+/// bridge-signed byte string nothing else bounds, and an order may name a
+/// bridge the seller runs, which can sign a tip padded to megabytes. Enforced,
+/// it is what makes [`MAX_COMPLAINTS`] a byte bound. A genuine complaint fits:
+/// pinned by `delegate::tests::a_maximal_verifying_purchase_fits_the_bound`.
 pub const MAX_COMPLAINT_BYTES: usize = 2 * crate::payment::MAX_ORDER_ENVELOPE_BYTES
     + crate::payment::MAX_PROOF_CLAIM_BYTES
     + 16 * 1024;
@@ -390,11 +406,18 @@ pub const RECORD_BUDGET_BYTES: usize = 40 * 1024 * 1024;
 /// the first N of a total order is: see [`ReputationStateV1::apply_delta`]. So
 /// the budget is spent as a count, `RECORD_BUDGET_BYTES / MAX_COMPLAINT_BYTES`,
 /// which holds even if every complaint is the largest that verifies. An
-/// ordinary complaint is a few kilobytes, so this binds only on a flood.
+/// ordinary complaint is a few kilobytes. It binds on a flood, or on a store
+/// with 146 complaints in its life; past that, a reader sees the record is
+/// full (`ui/src/state.rs`, `BrowsingStore::record_full`).
 ///
 /// Raising it later re-keys the contract and loses nothing (the migration
 /// merges every complaint in). Lowering it would drop complaints.
 pub const MAX_COMPLAINTS: usize = RECORD_BUDGET_BYTES / MAX_COMPLAINT_BYTES;
+
+// Loosening a `MAX_*` bound it is derived from would lower it, and lowering it
+// drops complaints a record already holds (`docs/complaint-threat-model.md`
+// section 8). Raise `RECORD_BUDGET_BYTES` with it, or not at all.
+const _: () = assert!(MAX_COMPLAINTS >= 146);
 
 impl ReputationStateV1 {
     /// Verify the entire state: every complaint, and the canonical form
@@ -508,9 +531,9 @@ impl ReputationStateV1 {
                     slot.insert(complaint);
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    // Two complaints for one order: keep the smaller
-                    // encoding, so the survivor is a function of the two and
-                    // not of arrival order.
+                    // Two complaints for one order: keep the lower
+                    // `canonical_rank`, so the survivor is a function of the
+                    // two and not of arrival order.
                     if complaint.canonical_rank() < slot.get().canonical_rank() {
                         slot.insert(complaint);
                     }
@@ -1144,6 +1167,20 @@ mod tests {
         let mut want: BTreeSet<OrderId> = honest.iter().map(|c| c.order_id().clone()).collect();
         // The nearest of the seller's, which fills the one slot left.
         want.insert(seller_late[0].order_id().clone());
+        // Order ids are hashes: check the order-id order would keep a
+        // different set, so keeping the nearest is what this test sees.
+        let by_id: BTreeSet<OrderId> = seller_late
+            .iter()
+            .chain(&honest)
+            .map(|c| c.order_id().clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(CAP)
+            .collect();
+        assert_ne!(
+            by_id, want,
+            "precondition: the order-id order keeps another set"
+        );
 
         let mut flood_first = ReputationStateV1::default();
         apply(&mut flood_first, seller_late.clone());
@@ -1203,6 +1240,35 @@ mod tests {
         assert_eq!(state.complaints, vec![honest]);
     }
 
+    /// **A complaint past `MAX_COMPLAINT_BYTES` is refused, whatever makes it
+    /// big** (review round 6). The proof's tip is a byte string only its
+    /// bridge signs, and an order may name a bridge the seller runs: padded,
+    /// it still verifies, and without the bound one such complaint could fill
+    /// the record under the count cap. Red if `Complaint::verify` stops
+    /// bounding the whole complaint.
+    #[test]
+    fn a_complaint_padded_past_the_byte_bound_is_refused() {
+        use crate::payment::OrderPaymentProof;
+        use ed25519_dalek::Signer as _;
+        let mut order = paid(1);
+        let Some(OrderPaymentProof::OnChain(proof)) = order.payment_proof.as_mut() else {
+            panic!("on chain");
+        };
+        proof.tip.body_cbor.resize(MAX_COMPLAINT_BYTES, 0);
+        let mut signed = b"freenet-bitcoin/tip/v1\0".to_vec();
+        signed.extend_from_slice(&proof.tip.body_cbor);
+        proof.tip.signature = crate::test_orders::bridge_key()
+            .sign(&signed)
+            .to_bytes()
+            .to_vec();
+        order
+            .verify(&owner())
+            .expect("precondition: the padded tip still verifies");
+        let c = complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200);
+        let err = c.verify(&owner()).expect_err("past the byte bound");
+        assert!(err.contains("and this one is"), "{err}");
+    }
+
     /// **The real cap binds, and a record over it is refused** (R5-C). One
     /// more complaint than `MAX_COMPLAINTS`: the merge keeps
     /// `MAX_COMPLAINTS`, dropping the one dated farthest from its payment,
@@ -1223,6 +1289,9 @@ mod tests {
             .expect("applies");
         assert_eq!(state.complaints.len(), MAX_COMPLAINTS);
         assert!(state.complaints.iter().all(|c| c.order_id() != &farthest));
+        state
+            .verify(&params())
+            .expect("a full record is valid state (`>` not `>=` in `verify`)");
 
         let mut over = state.clone();
         over.complaints = all;
