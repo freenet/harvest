@@ -27088,8 +27088,13 @@ mod buy_flow_tests {
             "a failed send is not an offer"
         );
         state.keep_requests.clear();
-        // Answered without replacing it: not offered again this session.
+        // Answered without replacing it: not offered again this session,
+        // even once its marker has timed out (the in-flight marker alone
+        // would allow it then).
         state.on_kept_purchases(vec![kept(&paid)]);
+        for sent in state.keeps_sent.values_mut() {
+            sent.since_ms = 0;
+        }
         state.upgrade_kept_purchases();
         assert!(state.keep_requests.is_empty(), "once per freshness");
 
