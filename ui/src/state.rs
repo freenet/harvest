@@ -4061,16 +4061,10 @@ impl AppState {
     /// tab knows its code and the code opens THIS store.
     ///
     /// The code comes from the link the store was opened by, or else from
-    /// the owner its state names (a store's code is its owner's prefix).
-    /// Nothing is derived for an id that is itself an earlier one: an alias
-    /// is not a store to expand.
+    /// the owner its state names (a store's code is its owner's prefix). An
+    /// earlier id is never expanded in turn: its code opens the current id,
+    /// not it, so the check below refuses it.
     fn earlier_store_ids(&self, store_contract_id: &[u8]) -> Vec<Vec<u8>> {
-        if self
-            .conversation_recall_aliases
-            .contains_key(store_contract_id)
-        {
-            return Vec::new();
-        }
         let params = self
             .store_codes
             .get(store_contract_id)

@@ -67,15 +67,19 @@
 //! * A generation the node never registered answers `Missing`, is recorded
 //!   `Unresponsive`, and is asked again on the next load at the cost of two
 //!   node-local round trips.
-//! * Store keys are never exported; custody recovers them.
+//! * Store keys are never exported; custody recovers them. The store
+//!   REGISTRATIONS are carried, so a device comes out of a re-key registered
+//!   for a store it holds no key for; the delegate's `StoreList` answer says
+//!   which keys it holds, and custody recovers the rest (harvest#138).
 //! * A write made by a stale tab of an OLD UI, to its old delegate, after
 //!   that generation was sealed here, is not carried: re-walking a sealed
 //!   generation would undo deletions instead.
-//! * A buyer conversation is kept under the store's CONTRACT id. It is
-//!   imported whatever that id is, but the app recalls conversations by the
-//!   store's current id, so one kept under a store generation that has since
-//!   re-keyed is carried and not shown. That is the store re-key's gap, not
-//!   this migration's.
+//! * A buyer conversation is kept under the store's CONTRACT id, and is
+//!   imported whatever that id is. Since harvest#138 the app recalls a
+//!   store's conversations under its id at every earlier code-addressed
+//!   store generation as well as its current one, so one kept under a store
+//!   generation that has since re-keyed is shown again. One kept under a
+//!   whole-key generation (V1 to V16, before the store code) is not.
 //! * A family at its cap answers `Retryable`, so its predecessor is not
 //!   sealed and is walked again each load until there is room.
 //! * A generation that is registered here but NEVER answers -- a module the

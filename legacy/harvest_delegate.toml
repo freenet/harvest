@@ -175,3 +175,10 @@ description = "Superseded by harvest#123. V18 itself is the generation main ship
 date = "2026-09-20"
 code_hash = "09507e3f4f1432dd746cf4644aaa81678e25314798dc6069ce38409d1499fddd"
 delegate_key = "d1babbaced3c2f86c565ddb78db0ef2e8ba75b2e2bf02b797d5448bac1be230f"
+
+[[entry]]
+version = "V19"
+description = "Superseded by harvest#138. V19 is the generation #135 (harvest#123) shipped from `7bc8a69`: the first to IMPORT a predecessor's secrets, and so the first on which a device can hold a store's registration without its store key. The import carries `harvest:stores:` registrations and, deliberately, never `harvest:store_sk:` (harvest#93 Should Fix 4: the seed leaves the delegate only wrapped, in custody), and the UI decided wrap-or-recover on the registration, so after the V18 -> V19 walk it wrapped a key the delegate lacked and never recovered it: every `SignStoreUpdate` answered \"does not hold the key\" (reproduced on an isolated node). Its successor's `StoreList` answer names the registered store keys it HOLDS (`held_store_keys`, `#[serde(default)]`, so an older answer decodes as \"says nothing\"), and the UI recovers any registered key not among them. Nothing the successor exports or imports changed; the parameters are unchanged (empty). V19 answers an export like every generation from V5, so its secrets, including the registrations it imported from V18, are carried forward."
+date = "2026-09-22"
+code_hash = "29b781b43ee9ad30a0b151fd2db719cf909179994bb6ac577bdca6608005560d"
+delegate_key = "7811d1a63c2f905f17d6c238df8836d78dc98ac44467508c45398c61ad77a28a"

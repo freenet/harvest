@@ -493,6 +493,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#123, whose successor (not V18) gained the
             // import side of the export handshake; V18 only answers exports.
             "09507e3f4f1432dd746cf4644aaa81678e25314798dc6069ce38409d1499fddd".to_string(),
+            // V19, from `git show 7bc8a69:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#138: `StoreList` gained `held_store_keys`,
+            // so the UI can tell a carried registration from a held key.
+            "29b781b43ee9ad30a0b151fd2db719cf909179994bb6ac577bdca6608005560d".to_string(),
         ],
     );
 }
