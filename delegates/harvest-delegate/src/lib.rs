@@ -4,12 +4,12 @@ mod bip32;
 mod bitcoin;
 mod handlers;
 mod import;
+mod kept_purchases;
 mod known_stores;
 mod markers;
 mod messaging;
 mod migration;
 mod origin;
-mod paid_purchases;
 mod secrets;
 mod store_keys;
 
@@ -387,12 +387,13 @@ mod boundary_tests {
         );
     }
 
-    /// A `PaidPurchase` that decodes but never verifies -- good enough for a
+    /// A `PurchaseToKeep` that decodes but never verifies -- good enough for a
     /// test that only exercises the ORIGIN gate, which fires before this
     /// content is looked at.
-    fn unverified_paid_purchase() -> harvest_common::delegate::PaidPurchase {
+    fn unverified_purchase_to_keep() -> harvest_common::delegate::PurchaseToKeep {
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
-        harvest_common::delegate::PaidPurchase {
+        harvest_common::delegate::PurchaseToKeep {
+            complaint: None,
             store_key: [1u8; 32],
             conversation: [2u8; 32],
             order: AuthorizedOrder {
@@ -501,17 +502,17 @@ mod boundary_tests {
                 buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
-            // The buyer's own copy of a paid order (harvest#53 Phase C).
-            // `RememberPaidPurchase` writes it and `ListPaidPurchases` reads
+            // The buyer's kept purchases (harvest#53 Phase C).
+            // `KeepPurchase` writes one and `ListKeptPurchases` reads
             // it back; both are which paid orders a buyer holds, which is
             // exactly the linkage a pseudonymous marketplace withholds. The
             // gate fires before this content is ever validated, so a
             // never-verifying placeholder order is enough to exercise it.
-            to_cbor(&HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: Box::new(unverified_paid_purchase()),
+            to_cbor(&HarvestDelegateRequest::KeepPurchase {
+                keep: Box::new(unverified_purchase_to_keep()),
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ListPaidPurchases).expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListKeptPurchases).expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

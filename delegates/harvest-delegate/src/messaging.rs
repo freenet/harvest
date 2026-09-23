@@ -398,6 +398,16 @@ fn held_conversations<S: SecretStore>(
 ///
 /// The routing tag is derived from the secret, so what is answered and what
 /// is filed can never disagree about which conversation this is.
+/// The secret of every buyer conversation this delegate holds, for the
+/// kept-purchase check that a copy names its conversation's receipt key
+/// (`kept_purchases::keep`).
+pub(crate) fn held_conversation_secrets<S: SecretStore>(store: &S) -> Vec<[u8; 32]> {
+    held_conversations(store)
+        .into_iter()
+        .filter_map(|(_, record)| record.map(|record| record.secret.0))
+        .collect()
+}
+
 pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
     store: &mut S,
     request_id: RequestId,

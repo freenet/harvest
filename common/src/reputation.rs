@@ -109,6 +109,16 @@ pub struct ComplaintTerms {
     /// #143, R2-7): readers only ever read the height, and an anchor's hash
     /// was 32 bytes of buyer-chosen free text on a permanent record.
     pub block_height: u32,
+    /// The height the complaint's own evidence says the order was paid at,
+    /// `payment::paid_height` over the complaint's proof. Every window a
+    /// reader judges the complaint by counts from it.
+    ///
+    /// Signed, and checked against the proof by `Complaint::verify`, because
+    /// the evidence is signed by nobody: anyone re-submitting the buyer's
+    /// complaint could otherwise attach a different proof (one showing a
+    /// payment the seller made to its own address earlier) and move the
+    /// window's start (review of the threat model, TM-D).
+    pub paid_height: u32,
 }
 
 /// A buyer's complaint about one paid order of this store.
@@ -133,6 +143,8 @@ pub struct Complaint {
     pub category: FeedbackCategory,
     /// See [`ComplaintTerms::block_height`].
     pub block_height: u32,
+    /// See [`ComplaintTerms::paid_height`].
+    pub paid_height: u32,
     /// CBOR `ScopedPayload` over [`ComplaintTerms`]
     /// (`backing::store_key_envelope`).
     pub scoped_payload: Vec<u8>,
@@ -151,6 +163,7 @@ impl Complaint {
             order_id: self.order.order.id.clone(),
             category: self.category.clone(),
             block_height: self.block_height,
+            paid_height: self.paid_height,
         }
     }
 
@@ -218,6 +231,21 @@ impl Complaint {
             &self.terms(),
         )
         .map_err(|e| format!("the complaint is not signed by the order's buyer: {e}"))?;
+        // The evidence is the canonical minimal proof, so padding the record
+        // costs real fees (TM-E), and it shows the paid height the buyer
+        // signed, so nobody can move the window by swapping it (TM-D).
+        let proof = self
+            .order
+            .payment_proof
+            .as_ref()
+            .ok_or("the complained-about order carries no payment evidence")?;
+        crate::payment::verify_minimal_proof(&self.order.order, proof)?;
+        if crate::payment::paid_height(&self.order) != Some(self.paid_height) {
+            return Err(format!(
+                "the complaint says the order was paid at block {}, and its evidence does not",
+                self.paid_height
+            ));
+        }
         // Terms signed by the store key, the id the terms give, nothing
         // attached that the status does not use, and payment evidence that
         // verifies against the bridges the seller signed in. Last, because
@@ -414,7 +442,8 @@ impl ReputationStateV1 {
 mod tests {
     use super::*;
     use crate::test_orders::{
-        authorized, buyer_key, complaint, complaint_by, order, paid, proof, sign_scoped, store_key,
+        authorized, buyer_key, complaint, complaint_by, order, paid, proof, proof_at, sign_scoped,
+        store_key,
     };
     use ed25519_dalek::SigningKey;
 
@@ -599,6 +628,70 @@ mod tests {
         assert!(err.contains("not signed by the order's buyer"), "{err}");
     }
 
+    /// **Nobody re-submitting the buyer's complaint can move its window**
+    /// (review of the threat model, TM-D). The buyer signed the paid height
+    /// its evidence gives; the seller swaps in other genuine evidence for
+    /// the same order, one showing a payment at another height. The swap no
+    /// longer verifies. Red if `Complaint::verify` stops comparing the
+    /// signed paid height with the evidence.
+    #[test]
+    fn swapping_the_evidence_cannot_move_the_paid_height() {
+        let genuine = complaint(1);
+        let mut swapped = genuine.clone();
+        swapped.order.payment_proof = Some(proof_at(&order(1), 2, 150));
+        swapped
+            .order
+            .verify(&owner())
+            .expect("precondition: the swapped evidence is genuine");
+        assert_ne!(
+            crate::payment::paid_height(&swapped.order),
+            Some(genuine.paid_height),
+            "precondition: it shows another paid height"
+        );
+        let err = swapped.verify(&owner()).expect_err("the window moved");
+        assert!(err.contains("paid at block"), "{err}");
+    }
+
+    /// **A complaint carries the canonical minimal proof** (TM-E): padding
+    /// with a repeated claim, or with a second payment the first already
+    /// covers, is refused, though the verifier alone accepts both. Red if
+    /// `verify_minimal_proof` is dropped from `Complaint::verify`.
+    #[test]
+    fn a_complaint_whose_evidence_is_padded_is_refused() {
+        use crate::payment::OrderPaymentProof;
+        let OrderPaymentProof::OnChain(one) = proof(&order(1), 1) else {
+            panic!("on chain");
+        };
+        // A second payment to the same address: another transaction, so
+        // another outpoint.
+        let mut second = order(1);
+        second.amount_sats += 1;
+        let OrderPaymentProof::OnChain(other) = proof(&second, 2) else {
+            panic!("on chain");
+        };
+        let repeated = OrderPaymentProof::OnChain(crate::payment::OnChainPaymentProof {
+            claims: vec![one.claims[0].clone(), one.claims[0].clone()],
+            tip: one.tip.clone(),
+        });
+        let covered_twice = OrderPaymentProof::OnChain(crate::payment::OnChainPaymentProof {
+            claims: vec![one.claims[0].clone(), other.claims[0].clone()],
+            tip: one.tip.clone(),
+        });
+        for (what, evidence, needle) in [
+            ("repeated", repeated, "two claims about one outpoint"),
+            ("covered twice", covered_twice, "already covers"),
+        ] {
+            let mut padded = paid(1);
+            padded.payment_proof = Some(evidence);
+            padded
+                .verify(&owner())
+                .unwrap_or_else(|e| panic!("{what}: precondition, it verifies: {e}"));
+            let c = complaint_by(&buyer_key(1), padded, FeedbackCategory::NonDelivery, 200);
+            let err = c.verify(&owner()).expect_err(what);
+            assert!(err.contains(needle), "{what}: {err}");
+        }
+    }
+
     #[test]
     fn a_cancel_signature_is_not_a_complaint() {
         let genuine = complaint(1);
@@ -743,9 +836,12 @@ mod tests {
         free.amount_sats = 0;
         let mut unconfirmed = order(1);
         unconfirmed.required_confirmations = 0;
+        let mut distant = order(1);
+        distant.required_confirmations = crate::payment::MAX_REQUIRED_CONFIRMATIONS + 1;
         for (what, o, needle) in [
             ("a zero amount", free, "for nothing"),
             ("zero confirmations", unconfirmed, "before any confirmation"),
+            ("too many confirmations", distant, "more than the"),
         ] {
             let o = o.with_derived_id();
             let c = complaint_by(

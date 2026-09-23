@@ -570,6 +570,7 @@ impl core::fmt::Debug for KeptPurchase {
 pub struct KeptComplaint {
     pub category: crate::feedback::FeedbackCategory,
     pub block_height: u32,
+    pub paid_height: u32,
     pub scoped_payload: Vec<u8>,
     pub buyer_signature: Vec<u8>,
 }
@@ -580,6 +581,7 @@ impl KeptComplaint {
         Self {
             category: complaint.category.clone(),
             block_height: complaint.block_height,
+            paid_height: complaint.paid_height,
             scoped_payload: complaint.scoped_payload.clone(),
             buyer_signature: complaint.buyer_signature.clone(),
         }
@@ -591,6 +593,7 @@ impl KeptComplaint {
             order: order.clone(),
             category: self.category.clone(),
             block_height: self.block_height,
+            paid_height: self.paid_height,
             scoped_payload: self.scoped_payload.clone(),
             buyer_signature: self.buyer_signature.clone(),
         }
@@ -1860,7 +1863,7 @@ mod tests {
     /// and whose signed envelope are each at `MAX_ORDER_ENVELOPE_BYTES`, a
     /// proof whose claims fill `MAX_PROOF_CLAIM_BYTES` (one genuine claim,
     /// repeated: the verifier deduplicates before checking and budgets before
-    /// deduplicating), and a filed complaint. Red if the bound is set below
+    /// deduplicating), and a complaint's parts. Red if the bound is set below
     /// what verifies, as the fixed 64 KiB one was.
     #[test]
     fn a_maximal_verifying_purchase_fits_the_bound() {
@@ -1908,15 +1911,16 @@ mod tests {
         complaint_preconditions(&paid).expect("at the bound, not past it");
         paid.verify(&store_key().verifying_key())
             .expect("the maximal order verifies");
+        // Padded with repeats, this proof is not the minimal one a kept copy
+        // or a complaint must carry, so the delegate would refuse it: it is
+        // an upper bound on any proof that verifies, which is what the bound
+        // is derived from. The complaint's own parts are fixed-size.
         let complaint = crate::test_orders::complaint_by(
             &buyer_key(1),
             paid.clone(),
             crate::feedback::FeedbackCategory::NonDelivery,
             u32::MAX,
         );
-        complaint
-            .verify(&store_key().verifying_key())
-            .expect("and takes a complaint");
         let kept = KeptPurchase {
             store_key: [0xff; 32],
             conversation: [0xff; 32],

@@ -102,6 +102,12 @@ pub fn sign_scoped<T: serde::Serialize>(key: &SigningKey, data: &T) -> (Vec<u8>,
 /// A bridge-signed proof that `order` was paid. `seed` varies the mined block,
 /// so two seeds give two different, equally valid proofs for one order.
 pub fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
+    proof_at(order, seed, CONFIRM_HEIGHT)
+}
+
+/// [`proof`], for a payment confirmed at `confirmed_at`, with a tip deep
+/// enough for the order.
+pub fn proof_at(order: &Order, seed: u8, confirmed_at: u32) -> OrderPaymentProof {
     let bridge = bridge_key();
     let (spv, txid, block_hash) = payment_proof(
         &order.payment_script_pubkey,
@@ -110,7 +116,7 @@ pub fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
         [seed; 32],
     );
     let anchor = BlockAnchor {
-        height: CONFIRM_HEIGHT,
+        height: confirmed_at,
         hash: block_hash,
     };
     let claim = SignedClaim::sign(
@@ -133,7 +139,7 @@ pub fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
         &TipEntryBody {
             network: order.network,
             anchor: BlockAnchor {
-                height: CONFIRM_HEIGHT + order.required_confirmations - 1,
+                height: confirmed_at + order.required_confirmations - 1,
                 hash: BlockHash([9u8; 32]),
             },
             prev_hash: BlockHash([8u8; 32]),
@@ -174,17 +180,22 @@ pub fn complaint_by(
     category: FeedbackCategory,
     block_height: u32,
 ) -> Complaint {
+    // Whatever the evidence says, so a fixture with broken evidence still
+    // builds and the refusal under test is the one the test names.
+    let paid_height = crate::payment::paid_height(&order).unwrap_or(0);
     let terms = ComplaintTerms {
         tag: ComplaintTag::HarvestComplaintV1,
         order_id: order.order.id.clone(),
         category: category.clone(),
         block_height,
+        paid_height,
     };
     let (scoped_payload, buyer_signature) = sign_scoped(buyer, &terms);
     Complaint {
         order,
         category,
         block_height,
+        paid_height,
         scoped_payload,
         buyer_signature,
     }

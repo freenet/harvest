@@ -53,7 +53,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         ),
         crate::store_keys::creation_secret(fp),
         crate::import::folded_key(&[7u8; 32]),
-        crate::paid_purchases::paid_purchase_key(&[8u8; 32]),
+        crate::kept_purchases::kept_purchase_key(&[8u8; 32]),
     ]
 }
 
@@ -365,15 +365,13 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_verifying_key,
         } => crate::store_keys::subkeys(store, request_id, store_verifying_key),
 
-        // The buyer's own copy of a paid order (harvest#53 Phase C, review
-        // round 1 of #143, P1-2). Gated like everything else: which paid
-        // orders a buyer holds is private linkage, the same reasoning as the
-        // remembered-stores list above.
-        HarvestDelegateRequest::RememberPaidPurchase { purchase } => {
-            crate::paid_purchases::remember(store, *purchase)
-        }
+        // The buyer's kept purchases (harvest#53 Phase C,
+        // `docs/complaint-threat-model.md` section 3). Gated like everything
+        // else: which orders a buyer holds is private linkage, and each
+        // record carries a receipt seed.
+        HarvestDelegateRequest::KeepPurchase { keep } => crate::kept_purchases::keep(store, *keep),
 
-        HarvestDelegateRequest::ListPaidPurchases => crate::paid_purchases::list(store),
+        HarvestDelegateRequest::ListKeptPurchases => crate::kept_purchases::list(store),
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),
@@ -882,34 +880,35 @@ mod origin_gating_tests {
     ///
     /// Mutated red by removing the `authorize` call from `handle`.
     #[test]
-    fn another_web_app_cannot_read_or_remember_a_paid_purchase() {
-        use crate::paid_purchases::fixtures::purchase;
+    fn another_web_app_cannot_read_or_keep_a_purchase() {
+        use crate::kept_purchases::fixtures::{hold_conversation, to_keep};
+        use harvest_common::payment::OrderStatus;
 
         let mut store = MemSecrets::default();
-        let mine = purchase(1, 1);
-        let remembered = handle(
+        hold_conversation(&mut store, 1);
+        let kept = handle(
             &mut store,
             Some(&harvest()),
-            HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: Box::new(mine.clone()),
+            HarvestDelegateRequest::KeepPurchase {
+                keep: Box::new(to_keep(1, 1, OrderStatus::AwaitingPayment, 1)),
             },
         );
         assert!(
-            matches!(remembered, HarvestDelegateResponse::PaidPurchases { ref purchases } if purchases == &vec![mine.clone()]),
-            "the Harvest web app remembers a paid purchase through the handler: {remembered:?}"
+            matches!(kept, HarvestDelegateResponse::KeptPurchases { ref purchases } if purchases.len() == 1),
+            "the Harvest web app keeps a purchase through the handler: {kept:?}"
         );
         let before = store.list_secrets(b"");
 
         for request in [
-            HarvestDelegateRequest::ListPaidPurchases,
-            HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: Box::new(purchase(2, 1)),
+            HarvestDelegateRequest::ListKeptPurchases,
+            HarvestDelegateRequest::KeepPurchase {
+                keep: Box::new(to_keep(2, 1, OrderStatus::AwaitingPayment, 1)),
             },
         ] {
             let response = handle(&mut store, Some(&a_different_web_app()), request);
             assert!(
                 refusal_message(&response).contains("Harvest web app"),
-                "a foreign web app reached a buyer's paid purchases: {response:?}"
+                "a foreign web app reached a buyer's kept purchases: {response:?}"
             );
         }
         assert_eq!(store.list_secrets(b""), before, "and nothing changed");
