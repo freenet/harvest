@@ -25,6 +25,26 @@ P1s were again in NEW mechanisms, so revision 3 removes one mechanism rather tha
   before the complaint cannot strand it.
 - **The seller's power to reuse one address across many orders** is named in section 2.
 
+**Revision 4** takes in review round 4 (labelled R4-*) and codex round 4. Both round-4 P1s
+were again in mechanisms revision 3 added, and both judged a purchase by what the buyer's node
+had NOT seen. Revision 4 removes them, and adds nothing that decides anything:
+
+- **The lapsed-unpaid check is gone.** It read "unpaid" from the node's own address view, which
+  is empty after a reload, so a buyer who paid, closed the tab and came back after the last
+  settling block lost the purchase for good. Every kept unpaid order is now watched and shown
+  until it is paid (3.2).
+- **The fresher-evidence rule is gone.** A kept `Paid` copy is frozen at its upgrade. It only
+  mattered for a reorg deeper than the order's confirmations, it worked only within one tab,
+  and it gave the seller a way to move the paid height and grow the copy. That reorg is now a
+  stated mainnet residual (7.2).
+- Fixes that remove a way the node forgets what it holds, not new mechanisms: the upgrade also
+  runs when the tip advances; a kept order's address answers are unioned under both builds;
+  a never-kept copy's proof uses the same union as an upgrade; a failed re-assert is retried
+  on the existing watch tick.
+
+**Scope.** Harvest launches on signet. The invariant below is claimed for signet. On mainnet
+it additionally needs the reorg residual in 7.2 closed, and mainnet is gated on harvest#134.
+
 ## 1. The invariant
 
 > **Once a buyer has paid a genuine order, they can file exactly one complaint about it that
@@ -138,22 +158,30 @@ against, and every later seller act on the store is irrelevant to them.
 
 ### 3.2 Watching and upgrading
 
-For every kept order that can still be settled, the UI watches the address contract under the
-order's code hash **and** under the current generation pointer's hash. The pointer follows the
-bridges' redeploys; the order's hash is fixed at issue. Watching stops once the order's last
-settling block has passed unpaid.
+For **every** kept order still `AwaitingPayment`, the UI watches, and periodically re-reads,
+the address contract under the order's code hash **and** under the current generation
+pointer's hash, and shows the purchase card. The pointer follows the bridges' redeploys; the
+order's hash is fixed at issue. Nothing stops this but the upgrade to `Paid`: the node never
+decides an order lapsed from what it has not seen, because an empty or stale view is not
+evidence of non-payment (R4-1). That is at most 1,024 orders, all from the buyer's own presses
+(5.1). The card shows no address once the payment window has closed
+(`offers_payment_address`, `PaymentBlocker::AnchorStale`).
+
+Answers for those watches are unioned with the claims already held, under either build, never
+substituted (codex r4): the node resolves the address parameters from its kept orders as well
+as from the stores it has loaded.
 
 Once the claims it holds prove the order paid, the UI builds the **minimal covering proof**
 (section 5.2) over the **union** of every claim it holds for the order: the watched address
-contracts' claims and any store copy's. It then sends the `Paid` copy. The union matters,
-because a store copy carries only the claims the seller chose (R3). Delegate rules:
+contracts' claims and any store copy's. It then sends the `Paid` copy. It checks on every
+event that can make an order provable: a store's state, an address's claims, the kept list,
+and the chain tip (codex r4: for an evicted order the tip can be the only one). The union
+matters, because a store copy carries only the claims the seller chose (R3). Delegate rules:
 
 - a kept `AwaitingPayment` copy is replaced by a verifying `Paid` copy of the same id;
-- **a kept `Paid` copy with no complaint yet is replaced by a verifying `Paid` copy whose
-  evidence is strictly fresher** (a higher highest `as_of`). This way, a reorg that retracts
-  and re-confirms the payment before the complaint is filed leaves the kept copy on the
-  re-confirmation, not the stale claim a reversal would be built from (R3).
-- once a complaint is kept, the copy is frozen: the complaint signs its paid height;
+- **a kept `Paid` copy is never replaced** (revision 4 removed the fresher-evidence rule;
+  7.2 says what that leaves);
+- a kept `Paid` copy's complaint signs its paid height;
 - a record without a complaint gains one exactly once, and it must verify;
 - a held record that no longer decodes or verifies is overwritten.
 
@@ -174,8 +202,10 @@ it passes all of the fallback checks:
 
 Such a copy comes from a payment made on another device, before this build, or outside the
 app's flow. **Filing a complaint about it is the press that keeps it.** The complaint action
-sends the paid copy (minimal proof) together with the complaint, in one `KeepPurchase`. Until
-then, the copy is only as durable as the store's.
+sends the paid copy together with the complaint, in one `KeepPurchase`. Its minimal proof is
+built over the same union as an upgrade's (3.2), store claims plus the address contract's,
+so the seller's choice of claims does not set the paid height the complaint freezes (R4-4).
+Until then, the copy is only as durable as the store's.
 
 ### 3.4 Complain, then re-assert
 
@@ -194,7 +224,8 @@ re-assert would never cover it.
 whether or not the store is being viewed (TM-H). This runs on every arrival of the kept list,
 not only the first: the first list of a session can arrive from a freshly re-keyed delegate
 before the migration has imported the predecessor's records (R3). A failed PUT is tried again
-on the next arrival. A PUT to an existing record is merged by the contract's
+on the next arrival and on the watch tick, once a minute, so it does not wait for a list that
+may not come this session (R4-6). A PUT to an existing record is merged by the contract's
 `update_state`, which keeps one complaint per order under a total order, so the re-PUT is
 idempotent. The buyer's node is the durable copy, and the public record is a replica of it.
 This covers:
@@ -254,9 +285,11 @@ claims were read from, only that they verify.
 - A slot is consumed only by the buyer's own press: *Pay this order*, or *File a complaint*
   about a paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
   for ever takes one.
-- A slot taken by a *Pay* press that was never paid is held for the node's lifetime. That is
-  bounded by the buyer's own presses, 1,024 of them. Releasing a lapsed unpaid keep, against a
-  recognised bridge's signed tip, is a follow-up.
+- A slot taken by a *Pay* press that was never paid is held, and its address watched, for the
+  node's lifetime. That is bounded by the buyer's own presses, 1,024 of them (about 2,048
+  address watches). Releasing a lapsed unpaid keep needs positive evidence that it was never
+  paid, which the node does not have, so revision 4 removed the attempt rather than guessing
+  (R4-1).
 - At the cap the delegate answers with a typed `KeepPurchaseRefused { order_id, reason }`. The
   UI releases its marker, keeps the payment details hidden and shows why. Refusing to pay is
   the safe failure.
@@ -308,7 +341,7 @@ substitute must show the same paid height.
   payment can back many complaints**, so the seller and sockpuppets complaining about their own
   orders can make the record costly to host, or too big to load: about 700 complaints with a
   64 KB transaction, or about 200 at 256 KiB each. That record then reads "record unavailable",
-  never "clean record". It is a residual (7.2): the seller spends it to make its own record
+  never "clean record". It is a residual (7.3): the seller spends it to make its own record
   unreadable, which is itself a warning to a reader. The original sentence for scale: without
   reuse, filling it takes
   thousands of paid orders, each one a complaint the seller made against itself.
@@ -363,18 +396,38 @@ The fix belongs in freenet-bitcoin, and Harvest does not work around it:
 Until one lands, the invariant is conditional. The window is from confirmation to the buyer's
 next load of Harvest.
 
-### 7.2 Others
+### 7.2 Reorgs deeper than the order's confirmations (mainnet; gated on harvest#134)
+
+The kept copy is upgraded to `Paid` once the payment is `required_confirmations` deep, and is
+frozen from then on (revision 4). If a reorg deeper than that later retracts the buyer's
+payment and it is re-confirmed in another block:
+
+- the kept copy, and any complaint built from it, shows only the pre-reorg claim;
+- a seller's `PaymentReversed` built from {that claim, the retraction}, withholding the
+  re-confirmation, folds to `Reversed` on the union of the evidence (section 6), so it
+  discounts the complaint.
+
+The same holds for a reorg after the complaint is filed. The record's tie-break among copies of
+one buyer statement keeps the highest `as_of` (`canonical_rank`); with several outpoints a copy
+with one outpoint stale can tie with the honest one (R4-3). That also matters only here.
+
+Revision 3's fresher-evidence rule addressed the pre-complaint half, but only while one tab
+stayed open, and it cost a way for the seller to move the paid height and grow the kept copy.
+It was removed. Signet is produced by a single signer and does not reorg this deep in
+practice, so this does not block the signet launch. Closing it for mainnet, if it is closed in
+Harvest at all, needs the buyer's node to follow the payment's re-confirmation across
+sessions, and belongs with the reorg model freenet-bitcoin already has (`PaymentReversed`,
+retractions), not with a Harvest-local copy of it.
+
+### 7.3 Others
 
 - **Buyer-stated `block_height`.** It is not a clock. A buyer can state an in-window height after
   the window, so the window binds only the honest (P2-10, unchanged).
 - **The paid height a buyer's proof shows.** It is the latest in-window payment the node has
-  seen when the copy is kept or refreshed. A seller who pays its own address after the buyer,
-  before a complaint is filed, moves it later. That delays when the complaint can be filed
-  (the `AwaitingDespatch` stage), by at most the payment window, and costs the buyer no time,
-  because every window moves with it.
-- **A reorg after a complaint is filed**, deeper than the complaint's age: the complaint's
-  frozen copy may show only the pre-reorg claim, and a reversal built from it discounts the
-  complaint. Complaints are filed days after payment, so this needs a reorg days deep.
+  seen when the copy is upgraded, and fixed from then on. A seller who pays its own address
+  after the buyer, before the upgrade, moves it later. That delays when the complaint can be
+  filed (the `AwaitingDespatch` stage), by at most the payment window, and costs the buyer no
+  time, because every window moves with it.
 - **Record growth through a reused address** (5.3).
 - **An address-contract generation missed** when the bridges redeploy twice while the buyer is
   away. Only the order's and the current generation are watched.
@@ -397,9 +450,17 @@ next load of Harvest.
   readers look at the new one. A reader-driven legacy walk (#145) would close this.
 - **Kept-purchase list size.** 1,024 records at the derived bound would be about 290 MiB. That
   is reachable only by the buyer's own 1,024 presses, each on an order whose genuine claims
-  are about 256 KiB. With auto-keep removed, nothing else can add a record. A minimal proof for
-  an ordinary payment is a few kilobytes, so the list stays one response, and it is not paged
-  (TM P3).
+  are about 256 KiB. With auto-keep removed, nothing else can add a record, and with the
+  fresher-evidence rule removed a kept copy does not grow after its upgrade. A minimal proof
+  for an ordinary payment is a few kilobytes, so the list stays one response, and it is not
+  paged (TM P3).
+- **A complaint's evidence is decoded before its size bound is checked.** `Complaint::verify`
+  runs `verify_minimal_proof` and `paid_height` before `AuthorizedOrder::verify` enforces
+  `MAX_PROOF_CLAIMS` and `MAX_PROOF_CLAIM_BYTES` (codex r4 P1). Both are single linear passes
+  over a delta the contract has already decoded in full, and a delta that fails is refused
+  with no change to the state. So this is proportional work on junk anyone may submit
+  (section 2), not an amplification, and moving the bound earlier would re-key every contract
+  for no change to what is accepted. Recorded, not changed.
 
 ## 8. Compatibility requirements this creates (TM-H)
 
@@ -438,6 +499,7 @@ next load of Harvest.
   show up in practice. Either answer needs no reputation re-key.
 - **The conditional in 7.1** needs freenet-bitcoin#25 fixed before a mainnet launch. It does not
   block signet.
+- **The reorg residual in 7.2** also needs deciding before mainnet (harvest#134).
 
 ## 10. Findings checked against this model
 
@@ -462,7 +524,7 @@ is needed. "Residual" means section 7.
 | R2-5 conversation loss | Model (3.4): the record carries the receipt seed. Code. |
 | R2-6 store copy hides kept Paid | Model (3): kept copy first. Code. |
 | R2-7 `block_ref.hash` free text | Code: `block_height: u32`. |
-| R2-8 residual channels | Residual (7.2). |
+| R2-8 residual channels | Residual (7.3). |
 | R2 P3 items (verify in `complaint_checks`, signature before SPV, delegate binds the key, damaged copy, list retry, certificate re-verify, armour pin, despatch eviction, `RecordLoad` test) | Code, or a residual row. |
 | codex round 2 | Did not finish; no findings. Round 3 runs codex afresh. |
 | **TM-A** seller names the watched address contract | Code: `AddressContractNotCurrent` blocker; watch under the pointer's hash too (3.1, 3.2). |
@@ -472,6 +534,18 @@ is needed. "Residual" means section 7.
 | **TM-E** record bounded by bytes | Code: the contract requires the canonical minimal proof (5.2); an unloadable record reads "not loaded" (5.3). |
 | **TM-F** out-of-band payment skips the keep | Code: auto-keep paid copies naming my key (3.3). Residual before Paid is seen. |
 | **TM-G** #144 neutrality, sockpuppets, Ghost Key assumption | Model (6, 9): ever-recognised list; attestation as a separate record; Ian's call. |
-| **TM-H** format compatibility, migration walk, stale GET, re-assert sweep, PUT semantics | Model (3.4, 7.2, 8). Code: sweep on load; import family. |
-| **TM P3** list size; selection vs `paid_height` | Residual (7.2); fixed by 5.2 (one rule for both). |
+| **TM-H** format compatibility, migration walk, stale GET, re-assert sweep, PUT semantics | Model (3.4, 7.3, 8). Code: sweep on load; import family. |
+| **TM P3** list size; selection vs `paid_height` | Residual (7.3); fixed by 5.2 (one rule for both). |
 | New in revision 1: closure/retirement never discounts; reversal needs the union of evidence; re-assert; minimal proof; keep on the press | Code (3, 5, 6). |
+| **R4-1** (P1) the lapsed-unpaid check suppressed its own input | Model (3.2, 5.1): check removed; every kept unpaid order watched and shown until paid. Code. |
+| **R4-2** (P1) a stale kept copy after a reorg, fixed only within one tab | Model (3.2, 7.2): fresher-evidence rule removed; mainnet residual. Code. |
+| R4-3 freshness is the maximum `as_of` with several outpoints | Residual (7.2): only the record's tie-break still uses it, and only reorgs reach it. |
+| R4-4 the never-kept copy's proof from store claims only | Code (3.3): the same union as an upgrade. |
+| R4-5 the delegate's complaint arm against a fresher offered copy | Moot: no fresher copy is ever offered or kept. |
+| R4-6 a failed re-assert waits for a list arrival | Code (3.4): retried on the watch tick. |
+| R4 P3 items (refusal digest over the tip, per-step refusal, keep-timeout repaint, `upgrades_due` forever, owned-store-only views, tests passing for the wrong reason, import cases, `despatch_of`, `ConversationForgotten`, list-size claim) | Code, except: per-step refusal and `ConversationForgotten` are answered on the PR; the list-size claim holds again (7.3). |
+| codex r4 P1 proof bounds after decoding | Residual (7.3), with the reason. |
+| codex r4 P1 lapse from an empty cache | Same as R4-1. |
+| codex r4 P1 no upgrade on a tip | Code (3.2). |
+| codex r4 P2 paid copies not watched after reload | Moot: a kept paid copy is frozen, so there is nothing to watch for (7.2). |
+| codex r4 P2 no parameters for current-generation ids | Code (3.2): resolved from kept orders under both builds. |

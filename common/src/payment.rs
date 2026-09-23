@@ -1838,10 +1838,10 @@ pub fn paid_height(order: &AuthorizedOrder) -> Option<u32> {
 /// A reorg that retracts and re-confirms a payment adds claims at a later
 /// `as_of`, so fresher evidence is what a reader needs to see through a
 /// reversal built from the stale claims (`docs/complaint-threat-model.md`
-/// section 3.2). Two uses: the buyer's delegate replaces a kept paid copy
-/// that has no complaint yet with a strictly fresher one, and the
-/// reputation record keeps the freshest of several evidence copies for one
-/// buyer statement ([`crate::reputation::Complaint`]'s tie-break).
+/// section 7.2). One use: the reputation record keeps the freshest of
+/// several evidence copies for one buyer statement
+/// ([`crate::reputation::Complaint`]'s tie-break). The delegate's
+/// fresher-evidence rule was removed in revision 4 of that model.
 ///
 /// Reads claim bodies without checking signatures; callers verify the order.
 pub fn evidence_freshness(order: &AuthorizedOrder) -> u32 {
