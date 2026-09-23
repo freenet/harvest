@@ -46,7 +46,7 @@ The seller can do any of these, at any time, including after payment:
 | Publish fabricated `Paid` orders naming the buyer's receipt key, backed by its own bridge or by paying itself | anything that treats "a Paid order naming my key" as "my purchase" (R2-3) |
 | Pad the order's signed envelope, or list the same recognised bridge thousands of times | any size cap on the buyer's copy or on the complaint (R2-4) |
 | Publish a backdated despatch | the complaint window (P2-10) |
-| Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (see 5.3) |
+| Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (see 6) |
 | Submit the buyer's own complaint to the record with a different copy of the order or proof | the record's tie-break |
 | Never open Harvest again | anything that needs the seller to act: migrating the record at a future re-key, or publishing `Paid` |
 | Self-deal: pay its own orders and complain about them, or count them as history | the meaning of the record (#144) |
