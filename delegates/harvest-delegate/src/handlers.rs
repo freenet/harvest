@@ -1,30 +1,26 @@
 use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::MessageOrigin;
-use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey};
-use rsa::pss::BlindedSigningKey;
-use rsa::signature::{RandomizedSigner, SignatureEncoding};
-use sha2::Sha256;
 
-use harvest_common::delegate::{
-    HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration, TransactionRecord,
-};
+use harvest_common::delegate::{HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration};
 use harvest_common::{from_cbor, to_cbor};
 
-// Secret key prefixes for delegate storage
+// Secret key prefixes for delegate storage.
+//
+// The private half of a Ghost Key's retired per-device RSA key. Nothing reads
+// or writes it any more except the import family that keeps the two halves a
+// pair (`import::Family::RsaHalf`), because a predecessor may still export
+// one (harvest#53 Phase C).
+#[cfg(test)]
 fn rsa_sk_key(fp: &str) -> Vec<u8> {
     format!("harvest:rsa_sk:{fp}").into_bytes()
 }
 fn rsa_pk_key(fp: &str) -> Vec<u8> {
     format!("harvest:rsa_pk:{fp}").into_bytes()
 }
-fn tx_key(tx_id: &str) -> Vec<u8> {
-    format!("harvest:tx:{tx_id}").into_bytes()
-}
 fn stores_key(fp: &str) -> Vec<u8> {
     format!("harvest:stores:{fp}").into_bytes()
 }
-pub(crate) const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 
 /// Every shape of secret key this delegate writes, for a sample fingerprint
 /// and transaction id.
@@ -38,14 +34,12 @@ pub(crate) const TX_INDEX_KEY: &[u8] = b"harvest:tx_index";
 /// Keep in step with the builders above and with `crate::bitcoin`'s two
 /// constants.
 #[cfg(test)]
-pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
+pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
     vec![
         rsa_sk_key(fp),
         rsa_pk_key(fp),
-        tx_key(tx_id),
         stores_key(fp),
         crate::messaging::x25519_sk_key(fp),
-        TX_INDEX_KEY.to_vec(),
         crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
         crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
@@ -60,40 +54,23 @@ pub(crate) fn all_secret_key_shapes(fp: &str, tx_id: &str) -> Vec<Vec<u8>> {
     ]
 }
 
-fn load_tx_index<S: SecretStore>(store: &S) -> Vec<String> {
-    store
-        .get_secret(TX_INDEX_KEY)
-        .and_then(|bytes| from_cbor(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn save_tx_index<S: SecretStore>(store: &mut S, index: &[String]) {
-    if let Ok(bytes) = to_cbor(&index) {
-        store.set_secret(TX_INDEX_KEY, &bytes);
-    }
-}
-
 /// Answer one Harvest request, for the Harvest web app only.
 ///
 /// # Why every variant below is behind the gate, reads included
 ///
-/// The writes are the obvious half. `InitReputationKeys` mints an RSA key the
-/// store's whole reputation identity then rests on; `BeginTransaction` and
-/// `RecordBlindSignature` write the transaction ledger; `RegisterStore` decides
-/// which contracts the seller's UI will treat as their own stores;
-/// `SetMigrationMarker` can seal a migration as done that never ran, which
-/// loses data silently rather than loudly (see [`crate::markers`]).
-/// `BlindSignFeedbackToken` is the sharpest of them: it signs caller-supplied
-/// bytes with the seller's reputation key, so an ungated caller gets a signing
-/// oracle for an identity that is not theirs.
+/// The writes are the obvious half. `RegisterStore` decides which contracts
+/// the seller's UI will treat as their own stores; `SetMigrationMarker` can
+/// seal a migration as done that never ran, which loses data silently rather
+/// than loudly (see [`crate::markers`]); `SignStoreUpdate` signs with a store
+/// key.
 ///
 /// The reads are gated for the same reason as `crate::bitcoin`'s: each hands
-/// back something whose value is that it is private. `ListStores` and
-/// `ListTransactions` are the seller's commercial history -- which stores are
-/// theirs, who they have traded with -- and `GetRsaPublicKey` plus
-/// `GetMigrationMarker` let a caller confirm which pseudonymous ghostkey
-/// fingerprints and which store generations belong to this one user, which is
-/// exactly the linkage a pseudonymous marketplace exists to avoid.
+/// back something whose value is that it is private. `ListStores` is the
+/// seller's commercial history -- which stores are theirs -- and
+/// `GetRsaPublicKey` plus `GetMigrationMarker` let a caller confirm which
+/// pseudonymous ghostkey fingerprints and which store generations belong to
+/// this one user, which is exactly the linkage a pseudonymous marketplace
+/// exists to avoid.
 ///
 /// No caller outside the Harvest web app is broken by this, because none
 /// exists: this delegate is Harvest's own, and nothing else is expected to
@@ -116,19 +93,9 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
     }
 
     match request {
-        HarvestDelegateRequest::InitReputationKeys {
-            ghostkey_fingerprint,
-        } => handle_init_reputation_keys(store, &ghostkey_fingerprint),
-
         HarvestDelegateRequest::GetRsaPublicKey {
             ghostkey_fingerprint,
         } => handle_get_rsa_public_key(store, &ghostkey_fingerprint),
-
-        HarvestDelegateRequest::BlindSignFeedbackToken {
-            request_id,
-            ghostkey_fingerprint,
-            blinded_token,
-        } => handle_blind_sign(store, request_id, &ghostkey_fingerprint, &blinded_token),
 
         HarvestDelegateRequest::CreateListing { request_id, .. } => {
             // Listing creation requires calling the ghostkey delegate for signing.
@@ -139,27 +106,6 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
                 result: Err("listing creation via delegate not yet implemented -- sign listings from the UI via ghostkey delegate directly".into()),
             }
         }
-
-        HarvestDelegateRequest::BeginTransaction {
-            request_id,
-            transaction_id,
-            our_token,
-            our_blinded_token,
-        } => handle_begin_transaction(
-            store,
-            request_id,
-            &transaction_id,
-            our_token,
-            our_blinded_token,
-        ),
-
-        HarvestDelegateRequest::RecordBlindSignature {
-            request_id,
-            transaction_id,
-            blind_signature,
-        } => handle_record_blind_signature(store, request_id, &transaction_id, blind_signature),
-
-        HarvestDelegateRequest::ListTransactions => handle_list_transactions(store),
 
         // Buyer-to-seller messaging. `messaging` owns the secret and the
         // Diffie-Hellman; this is only the routing, the same shape as the
@@ -422,70 +368,6 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
     }
 }
 
-fn handle_init_reputation_keys<S: SecretStore>(
-    store: &mut S,
-    ghostkey_fingerprint: &str,
-) -> HarvestDelegateResponse {
-    // Check if keys already exist
-    if store
-        .get_secret(&rsa_pk_key(ghostkey_fingerprint))
-        .is_some()
-    {
-        // Return existing public key
-        return match store.get_secret(&rsa_pk_key(ghostkey_fingerprint)) {
-            Some(pk_der) => HarvestDelegateResponse::ReputationKeysInitialized {
-                ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
-                rsa_public_key_der: pk_der,
-            },
-            None => HarvestDelegateResponse::Error {
-                message: "RSA public key not found after existence check".into(),
-            },
-        };
-    }
-
-    // Generate a new RSA-2048 keypair for blind signing
-    // Use getrandom for the RNG in WASM context
-    let mut rng = rsa::rand_core::OsRng;
-    let private_key = match rsa::RsaPrivateKey::new(&mut rng, 2048) {
-        Ok(k) => k,
-        Err(e) => {
-            return HarvestDelegateResponse::Error {
-                message: format!("RSA key generation failed: {e}"),
-            }
-        }
-    };
-
-    let public_key = private_key.to_public_key();
-
-    // Serialize keys to DER
-    let sk_der = match private_key.to_pkcs1_der() {
-        Ok(d) => d.as_bytes().to_vec(),
-        Err(e) => {
-            return HarvestDelegateResponse::Error {
-                message: format!("serialize RSA private key: {e}"),
-            }
-        }
-    };
-
-    let pk_der = match public_key.to_pkcs1_der() {
-        Ok(d) => d.as_bytes().to_vec(),
-        Err(e) => {
-            return HarvestDelegateResponse::Error {
-                message: format!("serialize RSA public key: {e}"),
-            }
-        }
-    };
-
-    // Store both keys
-    store.set_secret(&rsa_sk_key(ghostkey_fingerprint), &sk_der);
-    store.set_secret(&rsa_pk_key(ghostkey_fingerprint), &pk_der);
-
-    HarvestDelegateResponse::ReputationKeysInitialized {
-        ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
-        rsa_public_key_der: pk_der,
-    }
-}
-
 fn handle_get_rsa_public_key<S: SecretStore>(
     store: &S,
     ghostkey_fingerprint: &str,
@@ -497,170 +379,11 @@ fn handle_get_rsa_public_key<S: SecretStore>(
         },
         None => HarvestDelegateResponse::Error {
             message: format!(
-                "no RSA keys for ghostkey {ghostkey_fingerprint} -- call InitReputationKeys first"
+                "no RSA public key for ghostkey {ghostkey_fingerprint}: none was ever made on \
+                 this device, so it addressed no reputation record"
             ),
         },
     }
-}
-
-/// Blind-sign a feedback token with the Ghost Key's per-device RSA key.
-///
-/// KNOWN GAP (harvest#93 phase 1b, #99 review): a store created since phase
-/// 1b addresses its record contract by the record key its STORE KEY derives
-/// (`custody::record_rsa_key`), not by this per-device key, so a token signed
-/// here would not verify against that record. Nothing reaches this today:
-/// feedback submission is not wired (#53). The store-key path belongs with
-/// that work; recorded in `docs/untested-invariants.md`.
-fn handle_blind_sign<S: SecretStore>(
-    store: &S,
-    request_id: u64,
-    ghostkey_fingerprint: &str,
-    blinded_token: &[u8],
-) -> HarvestDelegateResponse {
-    // Load RSA private key
-    let sk_der = match store.get_secret(&rsa_sk_key(ghostkey_fingerprint)) {
-        Some(b) => b,
-        None => {
-            return HarvestDelegateResponse::BlindSignatureResult {
-                request_id,
-                result: Err(format!("no RSA keys for ghostkey {ghostkey_fingerprint}")),
-            }
-        }
-    };
-
-    let private_key = match rsa::RsaPrivateKey::from_pkcs1_der(&sk_der) {
-        Ok(k) => k,
-        Err(e) => {
-            return HarvestDelegateResponse::BlindSignatureResult {
-                request_id,
-                result: Err(format!("deserialize RSA private key: {e}")),
-            }
-        }
-    };
-
-    let signing_key = BlindedSigningKey::<Sha256>::new(private_key);
-
-    // Blind-sign the token
-    let mut rng = rsa::rand_core::OsRng;
-    let signature = match signing_key.try_sign_with_rng(&mut rng, blinded_token) {
-        Ok(sig) => sig,
-        Err(e) => {
-            return HarvestDelegateResponse::BlindSignatureResult {
-                request_id,
-                result: Err(format!("blind signing failed: {e}")),
-            }
-        }
-    };
-
-    HarvestDelegateResponse::BlindSignatureResult {
-        request_id,
-        result: Ok(signature.to_bytes().to_vec()),
-    }
-}
-
-fn handle_begin_transaction<S: SecretStore>(
-    store: &mut S,
-    request_id: u64,
-    transaction_id: &str,
-    our_token: harvest_common::FeedbackToken,
-    our_blinded_token: Vec<u8>,
-) -> HarvestDelegateResponse {
-    let record = TransactionRecord {
-        transaction_id: transaction_id.to_string(),
-        our_token,
-        our_blinded_token,
-        blind_signature: None,
-        // A delegate MAY read the host clock -- unlike a contract, whose
-        // verdict must be a pure function of its inputs. This uses the host's
-        // clock via the runtime rather than chrono's `wasmbind` backend, which
-        // would make the module unloadable.
-        created_at: freenet_stdlib::time::now(),
-    };
-
-    let record_bytes = match to_cbor(&record) {
-        Ok(b) => b,
-        Err(e) => {
-            return HarvestDelegateResponse::TransactionRecorded {
-                request_id,
-                result: Err(format!("serialize transaction: {e}")),
-            }
-        }
-    };
-
-    store.set_secret(&tx_key(transaction_id), &record_bytes);
-
-    // Update index
-    let mut index = load_tx_index(store);
-    if !index.contains(&transaction_id.to_string()) {
-        index.push(transaction_id.to_string());
-        save_tx_index(store, &index);
-    }
-
-    HarvestDelegateResponse::TransactionRecorded {
-        request_id,
-        result: Ok(()),
-    }
-}
-
-fn handle_record_blind_signature<S: SecretStore>(
-    store: &mut S,
-    request_id: u64,
-    transaction_id: &str,
-    blind_signature: Vec<u8>,
-) -> HarvestDelegateResponse {
-    let record_bytes = match store.get_secret(&tx_key(transaction_id)) {
-        Some(b) => b,
-        None => {
-            return HarvestDelegateResponse::BlindSignatureRecorded {
-                request_id,
-                result: Err(format!("transaction {transaction_id} not found")),
-            }
-        }
-    };
-
-    let mut record: TransactionRecord = match from_cbor(&record_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            return HarvestDelegateResponse::BlindSignatureRecorded {
-                request_id,
-                result: Err(format!("deserialize transaction: {e}")),
-            }
-        }
-    };
-
-    record.blind_signature = Some(blind_signature);
-
-    let updated_bytes = match to_cbor(&record) {
-        Ok(b) => b,
-        Err(e) => {
-            return HarvestDelegateResponse::BlindSignatureRecorded {
-                request_id,
-                result: Err(format!("serialize updated transaction: {e}")),
-            }
-        }
-    };
-
-    store.set_secret(&tx_key(transaction_id), &updated_bytes);
-
-    HarvestDelegateResponse::BlindSignatureRecorded {
-        request_id,
-        result: Ok(()),
-    }
-}
-
-fn handle_list_transactions<S: SecretStore>(store: &S) -> HarvestDelegateResponse {
-    let index = load_tx_index(store);
-    let mut transactions = Vec::new();
-
-    for tx_id in &index {
-        if let Some(bytes) = store.get_secret(&tx_key(tx_id)) {
-            if let Ok(record) = from_cbor::<TransactionRecord>(&bytes) {
-                transactions.push(record);
-            }
-        }
-    }
-
-    HarvestDelegateResponse::TransactionList { transactions }
 }
 
 fn load_stores<S: SecretStore>(store: &S, ghostkey_fingerprint: &str) -> Vec<StoreRegistration> {
@@ -1089,7 +812,6 @@ mod origin_gating_tests {
             HarvestDelegateRequest::ListStores {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
             },
-            HarvestDelegateRequest::ListTransactions,
             HarvestDelegateRequest::GetRsaPublicKey {
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
             },

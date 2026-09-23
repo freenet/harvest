@@ -100,13 +100,7 @@ impl AddressGuardParams for crate::ghostkey_index::IndexParameters {
 
 impl AddressGuardParams for crate::reputation::ReputationParameters {
     fn address_guard_placeholder() -> Self {
-        Self {
-            // Deliberately not empty: an empty `Vec<u8>` and a populated one
-            // differ in CBOR by more than their contents, and the guard should
-            // compare the shape a real key produces.
-            rsa_public_key_der: b"harvest-address-guard-placeholder-rsa-der".to_vec(),
-            owner_verifying_key: placeholder_verifying_key(),
-        }
+        Self::new(placeholder_verifying_key())
     }
 }
 

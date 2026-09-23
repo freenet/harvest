@@ -4,15 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Harvest reputation contract: append-only negative feedback with RSA blind signature verification"
+description = "Harvest reputation contract: append-only receipted complaints about a store's paid orders"
 
 [dependencies]
 harvest-common = { workspace = true }
 freenet-stdlib = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
-rsa = { workspace = true }
-sha2 = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
@@ -26,8 +24,10 @@ getrandom = { workspace = true }
 # A dev-dependency is not linked into the `cdylib`, so this does not move the
 # code hash. Verified with `cargo make code-hashes` rather than assumed.
 ed25519-dalek = { workspace = true }
-# Only to build a `FeedbackEntry` fixture's timestamp in the harvest#55 tests.
+# Only to build a `Complaint` fixture (its order's timestamp, network and
+# block anchor) in the harvest#55 tests.
 chrono = { workspace = true }
+freenet-bitcoin-common = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

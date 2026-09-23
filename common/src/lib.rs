@@ -1,8 +1,8 @@
 //! Shared types for Harvest, the decentralized marketplace on Freenet.
 //!
 //! This crate defines the wire-format schemas used by the Harvest contracts,
-//! delegate, and UI: store listings, feedback-token protocol messages, and
-//! reputation contract state.
+//! delegate, and UI: store listings, orders and payments, and the reputation
+//! contract's complaints.
 
 #![deny(unsafe_code)]
 
@@ -27,6 +27,8 @@ pub mod migration;
 pub mod payment;
 pub mod reputation;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_orders;
 pub mod util;
 
 // Re-exports for convenience
@@ -37,13 +39,13 @@ pub use bitcoin_delegate::{
 pub use delegate::{
     BackupString, ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateRequest,
     HarvestDelegateResponse, ImportedConversation, MigratedSecretValue, PredecessorMarkerState,
-    RecalledConversation, RememberedStore, SecretImport, StoreRegistration, TransactionRecord,
+    RecalledConversation, RememberedStore, SecretImport, StoreRegistration,
 };
-pub use feedback::{FeedbackCategory, FeedbackToken, FeedbackTokenMsg};
+pub use feedback::FeedbackCategory;
 pub use listing::{AuthorizedListing, Listing, ListingId, ListingKind, PriceInfo};
 pub use mailbox::{ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1};
 pub use payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus, ProofError};
-pub use reputation::{FeedbackEntry, ReputationParameters, ReputationStateV1};
+pub use reputation::{Complaint, ReputationParameters, ReputationStateV1};
 pub use store::{StoreParameters, StoreStateV1};
 
 /// Contract id of the Harvest webapp container that this build targets.

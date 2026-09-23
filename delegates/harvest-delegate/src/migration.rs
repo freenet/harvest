@@ -363,7 +363,7 @@ mod tests {
             ghostkey_fingerprint: "fp".into(),
         })
         .expect("cbor");
-        let harvest_unit = to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor");
+        let harvest_unit = to_cbor(&HarvestDelegateRequest::ListRememberedStores).expect("cbor");
         // The migration-marker pair. They live on `HarvestDelegateRequest`
         // rather than on the migration enum, so they are ordinary requests --
         // but they are the newest names in the file, and a name that collided
@@ -425,7 +425,7 @@ mod tests {
     /// Mutated red by changing one key builder's prefix.
     #[test]
     fn every_secret_the_delegate_writes_is_under_the_exported_prefix() {
-        for key in crate::handlers::all_secret_key_shapes("fp", "tx") {
+        for key in crate::handlers::all_secret_key_shapes("fp") {
             assert!(
                 key.starts_with(SECRET_KEY_PREFIX),
                 "the delegate writes {} , which no export would carry",

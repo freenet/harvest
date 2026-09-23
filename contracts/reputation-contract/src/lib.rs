@@ -192,20 +192,18 @@ mod tests {
     /// existed. Found by review of #54, not by CI.
     fn parameters() -> Parameters<'static> {
         let owner = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
-        // `summarize_state` discards the decoded parameters, so only the SHAPE
-        // has to decode; this DER is never parsed.
-        let params = ReputationParameters::new(vec![9u8; 32], owner);
+        let params = ReputationParameters::new(owner);
         let mut bytes = vec![];
         into_writer(&params, &mut bytes).expect("encode parameters");
         Parameters::from(bytes)
     }
 
-    /// 32 nonces, not a handful: two small collections can agree on an order
+    /// 32 complaints, not a handful: two small collections can agree on an order
     /// by luck, which would make the guard below pass without meaning to.
     fn encoded_state() -> State<'static> {
         let mut state = ReputationStateV1::default();
         for i in 1u8..33 {
-            state.used_nonces.insert([i; 32]);
+            state.complaints.push(unsigned_complaint(i));
         }
         let mut bytes = vec![];
         into_writer(&state, &mut bytes).expect("encode state");
@@ -239,14 +237,14 @@ mod tests {
     /// different insertion orders must summarize to the same bytes through the
     /// entry point, not merely through the in-process helper.
     #[test]
-    fn two_peers_holding_the_same_nonces_summarize_identically() {
+    fn two_peers_holding_the_same_complaints_summarize_identically() {
         let mut ascending = ReputationStateV1::default();
         for i in 1u8..33 {
-            ascending.used_nonces.insert([i; 32]);
+            ascending.complaints.push(unsigned_complaint(i));
         }
         let mut descending = ReputationStateV1::default();
         for i in (1u8..33).rev() {
-            descending.used_nonces.insert([i; 32]);
+            descending.complaints.push(unsigned_complaint(i));
         }
 
         let encode = |s: &ReputationStateV1| {
@@ -263,32 +261,59 @@ mod tests {
         assert_eq!(
             a.as_ref(),
             b.as_ref(),
-            "two peers holding the same nonces must send the same summary bytes"
+            "two peers holding the same complaints must send the same summary bytes"
         );
     }
 
-    /// A feedback entry in the shape the state holds. Its signatures do not
-    /// verify, and nothing here needs them to: `get_state_delta` only reads.
-    fn unsigned_entry(nonce: u8) -> harvest_common::reputation::FeedbackEntry {
-        harvest_common::reputation::FeedbackEntry {
-            token: harvest_common::feedback::FeedbackToken {
-                target_reputation_contract: [5u8; 32],
-                nonce: [nonce; 32],
-                entry_key: [nonce; 32],
+    /// A complaint in the shape the state holds. Its signatures and evidence
+    /// do not verify, and nothing here needs them to: these paths only read,
+    /// summarize or re-encode. Verification is `harvest_common::reputation`'s
+    /// to test, with genuine fixtures.
+    fn unsigned_complaint(n: u8) -> harvest_common::reputation::Complaint {
+        use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+        let order = Order {
+            id: OrderId([n; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: String::new(),
+            amount_sats: 1,
+            network: BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![n],
+            payment_hash: None,
+            payment_address: String::new(),
+            required_confirmations: 1,
+            trusted_bridges: Vec::new(),
+            bitcoin_address_code_hash: None,
+            anchor: None,
+            order_binding: None,
+            listing_tag: None,
+            buyer_receipt_key: Some([n; 32]),
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        };
+        harvest_common::reputation::Complaint {
+            order: AuthorizedOrder {
+                order,
+                scoped_payload: vec![1, 2, 3],
+                signature: vec![4, 5, 6],
+                status: OrderStatus::Paid,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
             },
-            signature: vec![1, 2, 3],
             category: harvest_common::feedback::FeedbackCategory::NonDelivery,
-            comment: String::new(),
-            submitted_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
-            entry_signature: vec![4, 5, 6],
+            block_ref: BlockAnchor {
+                height: 100,
+                hash: BlockHash([n; 32]),
+            },
+            scoped_payload: vec![7, 8, 9],
+            buyer_signature: vec![10, 11, 12],
         }
     }
 
-    fn state_with_feedback() -> State<'static> {
+    fn state_with_complaints() -> State<'static> {
         let mut state = ReputationStateV1::default();
         for n in [1u8, 2] {
-            state.used_nonces.insert([n; 32]);
-            state.feedback.push(unsigned_entry(n));
+            state.complaints.push(unsigned_complaint(n));
         }
         let mut bytes = vec![];
         into_writer(&state, &mut bytes).expect("encode state");
@@ -315,7 +340,7 @@ mod tests {
 
         let delta = <Contract as ContractInterface>::get_state_delta(
             parameters(),
-            state_with_feedback(),
+            state_with_complaints(),
             empty_summary,
         )
         .expect("an empty summary must not be a decode error");
@@ -332,7 +357,7 @@ mod tests {
     #[test]
     fn an_empty_state_answers_with_an_empty_delta() {
         let some_summary =
-            <Contract as ContractInterface>::summarize_state(parameters(), state_with_feedback())
+            <Contract as ContractInterface>::summarize_state(parameters(), state_with_complaints())
                 .expect("summarize");
         for summary in [some_summary, StateSummary::from(vec![])] {
             let delta = <Contract as ContractInterface>::get_state_delta(
@@ -351,7 +376,7 @@ mod tests {
     /// unconditionally and failed. The mailbox contract already guarded this.
     #[test]
     fn merging_a_zero_byte_state_changes_nothing() {
-        let held = state_with_feedback();
+        let held = state_with_complaints();
         let out = <Contract as ContractInterface>::update_state(
             parameters(),
             held.clone(),
@@ -409,30 +434,11 @@ mod tests {
         assert_eq!(out, default);
     }
 
-    /// Parameters with a real RSA key, for the paths that parse it.
-    fn real_parameters() -> Parameters<'static> {
-        use rsa::pkcs1::EncodeRsaPublicKey;
-        let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("key");
-        let der = rsa::RsaPublicKey::from(&private)
-            .to_pkcs1_der()
-            .expect("der")
-            .as_bytes()
-            .to_vec();
-        let owner = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
-        let mut bytes = vec![];
-        into_writer(&ReputationParameters::new(der, owner), &mut bytes).expect("encode");
-        Parameters::from(bytes)
-    }
-
-    /// **`validate_state` refuses a state that is not byte-canonical (PR
-    /// #82 review, Should Fix 2).** Each of these decoded to a valid state
-    /// and was accepted, then rewritten by the next merge, while its summary
-    /// matched a canonical peer's so no delta ever repaired it.
     #[test]
     fn validate_state_refuses_non_canonical_bytes() {
         let validate = |bytes: Vec<u8>| {
             <Contract as ContractInterface>::validate_state(
-                real_parameters(),
+                parameters(),
                 State::from(bytes),
                 RelatedContracts::new(),
             )

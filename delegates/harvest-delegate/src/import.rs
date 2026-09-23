@@ -236,8 +236,6 @@ pub(crate) enum Family {
     Refused,
     /// A Ghost Key's store registrations: merged by store contract id.
     StoreRegistry,
-    /// The transaction index: merged as a set of ids.
-    TransactionIndex,
     /// The Bitcoin watch list: merged by (network, script).
     Watches,
     /// Half of a Ghost Key's RSA reputation keypair: only ever imported so
@@ -271,8 +269,6 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::Refused
     } else if key.starts_with(b"harvest:stores:") {
         Family::StoreRegistry
-    } else if key == crate::handlers::TX_INDEX_KEY {
-        Family::TransactionIndex
     } else if key == crate::bitcoin::BITCOIN_WATCHES_KEY {
         Family::Watches
     } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY {
@@ -345,17 +341,6 @@ pub(crate) fn import_secret<S: SecretStore>(
                 added
             },
         ),
-        Family::TransactionIndex => {
-            merge_list(store, key, value, |held: &mut Vec<String>, incoming| {
-                let before = held.len();
-                for id in incoming {
-                    if !held.contains(&id) {
-                        held.push(id);
-                    }
-                }
-                held.len() != before
-            })
-        }
         Family::Watches => merge_list(
             store,
             key,
@@ -643,22 +628,10 @@ mod tests {
         );
     }
 
-    /// The transaction index and the watch list merge by their identities.
+    /// The watch list merges by its identities.
     #[test]
-    fn the_transaction_index_and_watch_list_are_merged() {
+    fn the_watch_list_is_merged() {
         let mut store = MemSecrets::default();
-        store.set_secret(crate::handlers::TX_INDEX_KEY, &cbor(&vec!["a".to_string()]));
-        assert_eq!(
-            import_secret(
-                &mut store,
-                crate::handlers::TX_INDEX_KEY,
-                &cbor(&vec!["a".to_string(), "b".to_string()])
-            ),
-            SecretImport::Written
-        );
-        let held: Vec<String> =
-            from_cbor(&store.get_secret(crate::handlers::TX_INDEX_KEY).unwrap()).unwrap();
-        assert_eq!(held, vec!["a".to_string(), "b".to_string()]);
 
         let watch = |script: u8, label: &str| WatchedPayment {
             network: freenet_bitcoin_common::BitcoinNetwork::Signet,
@@ -826,23 +799,20 @@ mod tests {
         assert!(store.is_empty());
     }
 
-    /// A real RSA keypair, minted the way the delegate mints one.
-    fn rsa_pair(fp: &str) -> (Vec<u8>, Vec<u8>) {
-        let mut scratch = MemSecrets::default();
-        crate::handlers::handle(
-            &mut scratch,
-            Some(&crate::origin::test_origins::harvest()),
-            HarvestDelegateRequest::InitReputationKeys {
-                ghostkey_fingerprint: fp.into(),
-            },
-        );
+    /// A real RSA keypair in the encoding the retired `InitReputationKeys`
+    /// stored (PKCS#1 DER, both halves). A predecessor delegate may still
+    /// hold one; this delegate no longer mints them (harvest#53 Phase C).
+    /// Fresh per call, so two calls never share a key.
+    fn rsa_pair(_fp: &str) -> (Vec<u8>, Vec<u8>) {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
+        let sk = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("rsa keygen");
         (
-            scratch
-                .get_secret(format!("harvest:rsa_sk:{fp}").as_bytes())
-                .expect("sk"),
-            scratch
-                .get_secret(format!("harvest:rsa_pk:{fp}").as_bytes())
-                .expect("pk"),
+            sk.to_pkcs1_der().expect("sk der").as_bytes().to_vec(),
+            sk.to_public_key()
+                .to_pkcs1_der()
+                .expect("pk der")
+                .as_bytes()
+                .to_vec(),
         )
     }
 
@@ -961,10 +931,8 @@ mod tests {
         let expected = [
             Family::RsaHalf,
             Family::RsaHalf,
-            Family::Standalone, // tx record
             Family::StoreRegistry,
             Family::Standalone, // x25519 secret
-            Family::TransactionIndex,
             Family::Watches,
             Family::Standalone, // bridge config
             Family::PaymentXpub,
@@ -975,7 +943,7 @@ mod tests {
             Family::Standalone, // unfinished store creation
             Family::Folded,     // travelling "folded into" record
         ];
-        let shapes = crate::handlers::all_secret_key_shapes("fp1", "tx1");
+        let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(
             shapes.len(),
             expected.len(),

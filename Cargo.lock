@@ -3388,12 +3388,11 @@ dependencies = [
  "chrono",
  "ciborium",
  "ed25519-dalek",
+ "freenet-bitcoin-common",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "harvest-common",
- "rsa 0.9.10",
  "serde",
- "sha2 0.10.9",
 ]
 
 [[package]]

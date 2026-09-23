@@ -23,9 +23,9 @@ use harvest_common::{
     from_cbor, to_cbor, BitcoinDelegateRequest, HarvestDelegateRequest, HarvestDelegateResponse,
 };
 
-// RSA key generation (`InitReputationKeys`) and blind signing
-// (`BlindSignFeedbackToken`) need real randomness, via `rsa::rand_core::OsRng`.
-// `getrandom` (which `OsRng` sits on) has no OS backend on
+// Key generation (store keys, X25519 conversation keys) needs real
+// randomness, via `getrandom`. (It first arrived for the RSA blind-signing
+// keys, retired in harvest#53 Phase C.) `getrandom` has no OS backend on
 // `wasm32-unknown-unknown`, so the workspace enables its "custom" feature --
 // but that feature only *allows* registering a source, it doesn't provide
 // one. Without this registration the crate fails to LINK (missing
@@ -401,7 +401,7 @@ mod boundary_tests {
                 source_generation: 4,
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ListTransactions).expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListRememberedStores).expect("cbor"),
             to_cbor(&BtcReq::ListWatched).expect("cbor"),
             // The messaging family. `InitEncryptionKey` decides which key
             // buyers will encrypt to, and `DeriveConversationKeys` is a
