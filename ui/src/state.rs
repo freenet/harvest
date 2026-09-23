@@ -8890,7 +8890,10 @@ impl AppState {
         match response {
             // A per-device RSA key from before harvest#93 phase 1b: it only
             // LOCATES this identity's old reputation records (harvest#53
-            // Phase C, Option A), so it goes to the reputation migration.
+            // Phase C, Option A), so it goes to the reputation migration --
+            // which has usually started already, making this a no-op; the
+            // registration's id is what reliably finds such a record (see
+            // `migrate_ops::start_reputation_migration`).
             HarvestDelegateResponse::RsaPublicKey {
                 ghostkey_fingerprint,
                 rsa_public_key_der,
@@ -9196,9 +9199,12 @@ impl AppState {
     ///
     /// Called when the store's state arrives (its details carry the record
     /// key) and when the delegate reports a per-device RSA key. Starting
-    /// twice is a no-op: `migrate_ops` keys walks by their successor. Nothing
-    /// here waits on the RSA keys: the successor is the store key's alone, and
-    /// a walk with fewer locators is still correct, just less thorough.
+    /// twice is a no-op: `migrate_ops` keys walks by their successor, so a
+    /// per-device key helps only if it arrives before the store's state,
+    /// which is rare. Nothing here waits on the RSA keys: the successor is
+    /// the store key's alone, the registration's id reaches the seller's own
+    /// old record whatever key addressed it, and a walk with fewer locators
+    /// is still correct, just less thorough.
     ///
     /// SAFE TO CALL FROM A RESPONSE HANDLER, and it has to be.
     ///

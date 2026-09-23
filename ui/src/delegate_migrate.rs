@@ -110,13 +110,17 @@
 //! # Ordering against the contract migration
 //!
 //! The migration doctrine says to migrate delegate secrets before any contract
-//! whose parameters are derived from one. Harvest has one such parameter, the
-//! reputation contract's RSA key: `migrate_ops::start_reputation_migration`
-//! waits until the delegate has reported it, and nothing on connect asks. So
-//! when this walk imports an RSA public key, the app asks for it by
-//! fingerprint ([`Outcome::imported_rsa_fingerprints`],
-//! `crate::gateway::delegate_migrate_ops`), and the answer is what starts the
-//! reputation walk. Asking for a key the delegate does not hold would answer
+//! whose parameters are derived from one. Since harvest#53 Phase C no current
+//! parameter is: the reputation record is addressed by the store key. The
+//! RSA key survives only as a LOCATOR for the RSA generations' records, and
+//! `migrate_ops::start_reputation_migration` does not wait for it. When this
+//! walk imports an RSA public key the app asks for it by fingerprint
+//! ([`Outcome::imported_rsa_fingerprints`],
+//! `crate::gateway::delegate_migrate_ops`), and the answer re-starts the
+//! reputation walk -- a no-op if the store's own arrival started it first,
+//! which is the usual order. So the per-device key is rarely probed, and the
+//! registration's own `reputation_contract_id` is what reliably finds a
+//! seller's old record (review round 1 of #143, P2-11). Asking for a key the delegate does not hold would answer
 //! an `Error` that `AppState` reads as the failure of a store creation in
 //! flight, which is why only imported fingerprints are asked about.
 

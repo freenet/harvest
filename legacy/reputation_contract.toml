@@ -4,22 +4,25 @@
 # generation is derived from the WASM this build ships and is never listed
 # here.
 #
-# Instance ids are derived per seller: `BLAKE3(code_hash || cbor(
-# ReputationParameters))`, whose fields are the seller's RSA public key (DER)
-# and their ghostkey verifying key.
+# Instance ids are derived per store: `BLAKE3(code_hash || cbor(
+# ReputationParameters))`. Since harvest#53 Phase C the parameters are the
+# store key alone (`ReputationParameters { store_key }`), so the current
+# record needs no delegate secret to address, and a buyer can reach it from
+# the store they are looking at.
 #
-# THE RSA KEY IS THE ORDERING CONSTRAINT. `ReputationParameters
-# .rsa_public_key_der` is exactly the value the harvest delegate holds under
-# `harvest:rsa_pk:{fingerprint}` (see common/src/reputation.rs and
-# delegates/harvest-delegate/src/handlers.rs). So a reputation instance id --
-# for ANY generation, including the current one -- cannot be derived until the
-# delegate's secrets have been carried forward. Probing reputation first does
-# not merely fail to find anything: it would probe the WRONG ids and could seal
-# a "nothing there" marker over a recoverable instance. `ui/src/migrate.rs`
-# enforces the order in code.
+# Generations up to `LAST_RSA_REPUTATION_PARAM_GENERATION` (V15) were
+# addressed by `{rsa_public_key_der, owner_verifying_key}`: an RSA public key
+# (the store's record key since harvest#93 phase 1b, the Ghost Key's
+# per-device `harvest:rsa_pk:{fingerprint}` before it) and the Ghost Key.
+# `ui/src/migrate.rs::reputation_candidate_ids` derives those under their own
+# encoding (pinned as hex in `ui/src/migrate/tests.rs`), plus the seller's
+# registered id, which is what reliably finds an old record.
 #
-# The state is an append-only (grow-only) set of feedback entries deduplicated
-# by nonce, so folding generations is idempotent and cannot lose an entry.
+# The state is grow-only: complaints keyed by order id, one per order, and a
+# certificate back-filled when empty. The RSA generations held feedback
+# entries (none was ever written outside tests) and a certificate; they
+# decode into the current state with their certificate kept, so folding a
+# generation is idempotent and carries the certificate forward.
 
 [[entry]]
 version = "V1"

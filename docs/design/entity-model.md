@@ -142,6 +142,14 @@ section 5. Section 6 collects the decisions.
 
 This section describes the code as it is, before any of the changes below.
 
+> **Note (harvest#53 Phase C, 2026-09-23):** the reputation record described
+> here as addressed by an RSA key and the Ghost Key is now addressed by the
+> store key alone (`ReputationParameters { store_key }`), as "The record
+> follows the store" below commits to, and holds receipted complaints, not
+> blind-signed feedback. The details' `reputation_contract_id` is still
+> written but no longer followed; readers derive the record from the store's
+> owner key.
+
 ### Entities
 
 | Entity | What it is in the code | Where it lives |

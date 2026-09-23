@@ -326,9 +326,17 @@ pub fn start_store_key_migration(store_verifying_key: &[u8; 32]) {
 /// predecessors are the RSA generations' records, located by
 /// `migrate::reputation_candidates`; the walk carries their certificate
 /// forward. Keyed by the successor like every walk, so it runs once per
-/// session per store: an RSA key that becomes known after the walk (a
-/// per-device key the delegate migration imports later) is tried on the next
-/// load, not this one.
+/// session per store.
+///
+/// What actually finds a pre-Phase-C record is the registration's own
+/// `reputation_contract_id` (`ReputationLocators::registered_id`), the exact
+/// id this seller published, and the store details' record key for a store
+/// made since harvest#93 phase 1b. The Ghost Key's per-device RSA key (the
+/// key of a store made BEFORE 1b) is rarely probed: nothing asks the
+/// delegate for it except the delegate migration, when it imports one, and
+/// that answer usually arrives after this walk has started, which makes the
+/// second start a no-op; a later load does not ask again (review round 1 of
+/// #143, P2-11).
 pub fn start_reputation_migration(locators: migrate::ReputationLocators) {
     let label = format!(
         "reputation of store {}",

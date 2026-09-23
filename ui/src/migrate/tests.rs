@@ -2906,3 +2906,28 @@ fn only_a_definite_present_suppresses_a_notice() {
     assert_eq!(notice_gate(MarkerLookup::Absent), NoticeGate::Show);
     assert_eq!(notice_gate(MarkerLookup::Unavailable), NoticeGate::Show);
 }
+
+/// **The RSA generations' parameter bytes, pinned as hex** (review round 1
+/// of #143, nit). `rsa_reputation_params_cbor` is a frozen record of bytes
+/// already on the network, written out as a local struct; a serde or
+/// ed25519-dalek upgrade that changed how `Vec<u8>` or `VerifyingKey`
+/// encode would silently move every RSA-generation address, and every
+/// other test here derives its expectation through the same encoder. This
+/// one does not.
+#[test]
+fn rsa_generation_parameter_bytes_are_pinned() {
+    let key = SigningKey::from_bytes(&[61u8; 32]).verifying_key();
+    let params = rsa_reputation_params_cbor(&[1, 2, 3], &key).expect("encode");
+    let hex: String = params
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // map(2) { "rsa_public_key_der": [1, 2, 3] (a CBOR array of u8, serde's
+    // default for Vec<u8>), "owner_verifying_key": bytes(32) }.
+    assert_eq!(
+        hex,
+        "a2727273615f7075626c69635f6b65795f64657283010203736f776e65725f766572696679696e675f6b6579\
+         582070df9e2279adbec6d12bf2921184c9222eb24ed852005bf640139f52e59cd9ae"
+    );
+}
