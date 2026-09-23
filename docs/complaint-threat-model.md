@@ -107,7 +107,9 @@ details. The blockers include two added in revision 2:
 - `UnfitForComplaint`: the order fails the complaint preconditions (section 4).
 - `AddressContractNotCurrent`: the order's `bitcoin_address_code_hash` is not the address
   contract generation that the recognised bridges' signed pointer names. This is the same
-  pointer the seller's UI issues orders from, so an honest order always matches (TM-A).
+  pointer the seller's UI issues orders from, so an honest order matches until the bridges
+  redeploy. An unpaid order issued before a redeploy is then refused, and the buyer asks for it
+  again. Orders are payable for at most `MAX_ANCHOR_AGE_BLOCKS` anyway (TM-A).
 
 Pressing the control sends `KeepPurchase` with the seller-signed `AwaitingPayment` copy. The
 delegate:
@@ -151,6 +153,11 @@ against that seller that the buyer's node now keeps.
 
 The complaint is built from the kept `Paid` copy and signed with the kept `receipt_seed`. It is
 PUT to the record addressed by `store_key`, then kept in the record.
+
+While a kept copy is still `AwaitingPayment`, and its upgrade is on its way, the complaint
+waits. Built from a paid copy computed on the fly, it could name a different paid height from
+the upgrade the delegate keeps. The delegate would then refuse to keep the complaint, and the
+re-assert would never cover it.
 
 **On every load**, once per session, the UI PUTs every kept complaint again, whether or not the
 store is being viewed (TM-H). A PUT to an existing record is merged by the contract's

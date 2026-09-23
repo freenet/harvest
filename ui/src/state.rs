@@ -8633,6 +8633,23 @@ impl AppState {
             return Err("your complaint about this order is already on the seller's record".into());
         }
         let kept = self.kept_copy(&owner, order_id);
+        // A kept copy still awaiting payment means its upgrade to `Paid` is
+        // on its way. The complaint must be about the copy the delegate
+        // will hold: built from a paid copy computed here, it could name a
+        // different paid height from the upgrade the delegate keeps, which
+        // would then refuse to keep the complaint, and the re-assert would
+        // never cover it. So the complaint waits for the upgrade.
+        if kept.is_some_and(|kept| kept.order.status != harvest_common::payment::OrderStatus::Paid)
+        {
+            return Err(
+                "your node is still keeping its proof of payment; the complaint can be made once \
+                 it has"
+                    .into(),
+            );
+        }
+        // The kept paid copy when there is one, so the complaint and the
+        // record the delegate holds are about the same evidence.
+        let order = kept.map(|kept| kept.order.clone()).unwrap_or(order);
         if kept.is_some_and(|kept| kept.complaint.is_some()) {
             return Err(
                 "your complaint about this order is kept on this node, which puts it on the \
@@ -26425,6 +26442,36 @@ mod buy_flow_tests {
         assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order));
         state.upgrade_kept_purchases();
         assert!(state.keep_requests.is_empty(), "sent once");
+    }
+
+    /// **The complaint waits for the upgrade to be kept** (found by the UI
+    /// round's own review). While the kept copy is still awaiting payment,
+    /// the purchase reads paid from the claims, but a complaint built from
+    /// that computed copy could name a different paid height from the
+    /// upgrade the delegate keeps, which would refuse the complaint and the
+    /// re-assert would never cover it. So the control waits, and is offered
+    /// about the kept paid copy once it lands. Red if the complaint is built
+    /// before the upgrade is kept.
+    #[test]
+    fn a_complaint_waits_for_the_upgrade_to_be_kept() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        give_the_node_the_chain(&mut state, &unpaid, claims, tip);
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert!(
+            purchase.paid.is_some(),
+            "precondition: shown paid from the claims"
+        );
+        let refusal = state
+            .complaint_refusal(STORE, &purchase)
+            .expect("not before the upgrade is kept");
+        assert!(refusal.contains("still keeping its proof"), "{refusal}");
+
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
     }
 
     /// **A new store generation holding only the unpaid copy does not hide
