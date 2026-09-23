@@ -150,6 +150,7 @@ impl AppState {
             return;
         }
         let Some(request) = self.custody_needed(store_contract_id) else {
+            self.note_unrecoverable_store_key(store_contract_id);
             return;
         };
         let Some(store) = self
@@ -198,6 +199,41 @@ impl AppState {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = fingerprint;
+    }
+
+    /// Say once per session that this device cannot sign for one of its own
+    /// stores and why, when custody has nothing it can do about it
+    /// (harvest#138 review).
+    ///
+    /// The case: the store is registered here but the delegate does not hold
+    /// its key (a delegate re-key carries the registration and never the
+    /// key), and no connected, unretired backer has a copy to recover it
+    /// from. Without this the seller learns it only from a refused signature.
+    fn note_unrecoverable_store_key(&mut self, store_contract_id: &[u8]) {
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.backing_state.owner)
+        else {
+            return;
+        };
+        let key = owner.to_bytes();
+        let unheld_and_ours =
+            self.store_owner_key(store_contract_id) == Some(owner) && !self.holds_store_key(&key);
+        if !unheld_and_ours || self.pending_custody.contains_key(&key) {
+            return;
+        }
+        if !self.store_key_unheld_announced.insert(key) {
+            return;
+        }
+        self.notifications.push(
+            "This device does not hold your store's key, so it cannot sign anything for the \
+             store (despatch, cancel, invoices, listings). It is recovered from the backup \
+             wrapped to the Ghost Key that backs the store, once that Ghost Key is connected \
+             here; if no device ever made that backup, publish from the device that holds the \
+             key."
+                .into(),
+        );
     }
 
     /// A custody request could not be SENT. Give it up, and let it be tried
@@ -514,6 +550,12 @@ impl AppState {
         request_id: u64,
         result: Result<(), String>,
     ) {
+        // A success says the delegate now holds the key, whichever request
+        // it answers: a late answer to one `expire_custody` gave up on is
+        // still a key kept (harvest#138 review).
+        if result.is_ok() {
+            self.store_keys_held.insert(store, true);
+        }
         let Some(pending) = self.take_custody_answering(&store, request_id) else {
             return;
         };
@@ -523,10 +565,14 @@ impl AppState {
             ));
             return;
         }
-        self.store_keys_held.insert(store, true);
+        // Matched by KEY, not by the contract id the request named: a store
+        // migration can rewrite the registration's contract id while the
+        // vault prompt is open (harvest#138 review).
         let registered = self
-            .store_owner_key(&pending.store_contract_id)
-            .is_some_and(|key| key.to_bytes() == store);
+            .my_stores
+            .values()
+            .flatten()
+            .any(|s| s.store_verifying_key == Some(store));
         if registered {
             // The registration came across a delegate re-key and only the key
             // did not (harvest#138). It already names this store's own
@@ -536,6 +582,20 @@ impl AppState {
             self.notifications
                 .push("Recovered your store's key from your Ghost Key.".into());
             self.request_store_subkeys(store);
+            // Buyers' messages failed to open while the key was missing
+            // (`DeriveConversationKeys` answers an error, which is retried
+            // only on the next mailbox update): ask again now, or a quiet
+            // store's inbox stays unreadable for the session.
+            let ids: Vec<Vec<u8>> = self
+                .my_stores
+                .values()
+                .flatten()
+                .filter(|s| s.store_verifying_key == Some(store))
+                .map(|s| s.store_contract_id.clone())
+                .collect();
+            for id in ids {
+                self.ask_for_conversation_keys(&id);
+            }
             return;
         }
         let Some(registration) = self.recovered_registration(&pending, store) else {
@@ -1301,6 +1361,157 @@ mod tests {
         add_copy(&mut state, WrapScope::current());
         state.on_delegate_response(store_list_holding(vec![store_vk().to_bytes()]));
         assert!(state.pending_custody.is_empty());
+    }
+
+    /// One store list, two stores: each key's held state is its own
+    /// (harvest#138 review). Mutated red by applying one answer to every key.
+    #[test]
+    fn a_store_list_records_each_keys_held_state_on_its_own() {
+        let mut state = AppState::default();
+        let other = SigningKey::from_bytes(&[0x72; 32])
+            .verifying_key()
+            .to_bytes();
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            stores: vec![
+                StoreRegistration {
+                    store_contract_id: vec![ID; 32],
+                    reputation_contract_id: vec![ID + 1; 32],
+                    mailbox_contract_id: vec![ID + 2; 32],
+                    store_contract_key: None,
+                    store_verifying_key: Some(store_vk().to_bytes()),
+                },
+                StoreRegistration {
+                    store_contract_id: vec![9; 32],
+                    reputation_contract_id: vec![10; 32],
+                    mailbox_contract_id: vec![11; 32],
+                    store_contract_key: None,
+                    store_verifying_key: Some(other),
+                },
+            ],
+            held_store_keys: Some(vec![other]),
+        });
+        assert!(!state.holds_store_key(&store_vk().to_bytes()));
+        assert!(state.holds_store_key(&other));
+    }
+
+    /// A registered store whose key this device lacks, with nothing custody
+    /// can recover it from, is SAID, once per session, rather than left to a
+    /// refused signature (harvest#138 review). Mutated red by removing the
+    /// call and by removing the once-only guard.
+    #[test]
+    fn an_unrecoverable_store_key_is_said_once() {
+        let mut state = backed_store();
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        let said = |state: &AppState| {
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("does not hold your store's key"))
+                .count()
+        };
+        assert_eq!(said(&state), 1);
+        state.start_custody_where_needed();
+        state.start_custody_where_needed();
+        assert_eq!(said(&state), 1, "once per session");
+
+        // Held, or recoverable: nothing said.
+        let mut state = backed_store();
+        state.on_delegate_response(store_list_holding(vec![store_vk().to_bytes()]));
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_where_needed();
+        assert_eq!(said(&state), 0);
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        assert_eq!(said(&state), 0, "recovering instead");
+    }
+
+    /// A recovery that succeeds after its request was given up still says the
+    /// delegate holds the key (harvest#138 review). Mutated red by marking
+    /// held only for a matched answer.
+    #[test]
+    fn a_late_recovery_answer_still_marks_the_key_held() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        state.pending_custody.clear();
+        state.custody_started_ms.clear();
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 77,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        assert!(state.holds_store_key(&store_vk().to_bytes()));
+    }
+
+    /// The registration is found by its KEY: a store migration that rewrote
+    /// its contract id while the vault prompt was open does not make the
+    /// recovery rebuild it (harvest#138 review). Mutated red by matching on
+    /// the contract id the request named.
+    #[test]
+    fn a_registration_moved_to_a_new_contract_id_is_still_kept() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        sent_under(&mut state, store_vk().to_bytes(), 0);
+        // With its details loaded, so a rebuilt registration WOULD be made.
+        state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
+            Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: FINGERPRINT.to_string(),
+                reputation_contract_id: [0x0e; 32],
+                store_name: "Bean Shop".to_string(),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            });
+        state.my_stores.get_mut(FINGERPRINT).unwrap()[0].store_contract_id = vec![0x3d; 32];
+        let before = state.my_stores[FINGERPRINT].clone();
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        assert_eq!(state.my_stores[FINGERPRINT], before);
+    }
+
+    /// Buyers' messages that could not be opened while the key was missing
+    /// are asked about again once it is recovered (harvest#138 review).
+    /// Mutated red by not asking.
+    #[test]
+    fn recovering_a_registered_stores_key_asks_for_its_conversation_keys_again() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        state
+            .browsing_stores
+            .get_mut(&vec![ID; 32])
+            .unwrap()
+            .mailbox_messages
+            .push(harvest_common::mailbox::EncryptedMessage {
+                conversation_id: harvest_common::mailbox::ConversationId([4; 32]),
+                sender_public_key: vec![0x55; 32],
+                ciphertext: vec![1, 2, 3],
+                timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                nonce: [0; 24],
+            });
+        state.pending_conversation_key_requests.clear();
+        sent_under(&mut state, store_vk().to_bytes(), 0);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        assert!(
+            state
+                .pending_conversation_key_requests
+                .values()
+                .any(|asked| asked.contains(&vec![0x55; 32])),
+            "{:?}",
+            state.pending_conversation_key_requests
+        );
     }
 
     /// A store list from a delegate that predates `held_store_keys` says

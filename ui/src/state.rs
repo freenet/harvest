@@ -341,6 +341,11 @@ pub struct AppState {
     /// build before this one assumed of every registration.
     pub store_keys_held: HashMap<[u8; 32], bool>,
 
+    /// Store keys this session has told the seller it cannot recover, so it
+    /// is said once (harvest#138 review). See
+    /// `custody_flow::note_unrecoverable_store_key`.
+    pub store_key_unheld_announced: HashSet<[u8; 32]>,
+
     /// Custody requests waiting on the vault's wrap signature, by store key,
     /// and then on the Harvest delegate's answer. See `custody_flow`.
     pub pending_custody: std::collections::BTreeMap<[u8; 32], crate::custody_flow::CustodyRequest>,
@@ -4031,7 +4036,13 @@ impl AppState {
             .or_insert(0);
         *failures = failures.saturating_add(1);
         if *failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
-            if *failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            // Said for the store's own id only: its earlier ids fail with it
+            // when the delegate is unreachable, and one store is one notice
+            // (harvest#138 review).
+            let an_earlier_id = self
+                .conversation_recall_aliases
+                .contains_key(store_contract_id);
+            if *failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS && !an_earlier_id {
                 self.notifications.push(format!(
                     "Harvest could not recall your earlier conversations with a store: {why}. \
                      Reload to try again."
@@ -4051,9 +4062,37 @@ impl AppState {
     pub fn recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
         self.recall_buyer_conversations_kept_under(store_contract_id);
         for earlier in self.earlier_store_ids(store_contract_id) {
-            self.conversation_recall_aliases
-                .insert(earlier.clone(), store_contract_id.to_vec());
+            let newly = self
+                .conversation_recall_aliases
+                .insert(earlier.clone(), store_contract_id.to_vec())
+                .is_none();
+            if newly {
+                self.adopt_placeholder_for(&earlier);
+            }
             self.recall_buyer_conversations_kept_under(&earlier);
+        }
+    }
+
+    /// An earlier id asked about BEFORE it was known to be one (a backup
+    /// restored before its store was opened, harvest#138 review) had its
+    /// answer filed under a placeholder entry of its own, and holds the
+    /// claim, so the store's recall would skip it. Drop both, so it is asked
+    /// again and filed with the store. A claim in flight is left to answer,
+    /// and its answer is now filed with the store.
+    fn adopt_placeholder_for(&mut self, earlier: &[u8]) {
+        let placeholder = self
+            .browsing_stores
+            .get(earlier)
+            .is_some_and(|s| s.info.is_none() && s.owner.is_none());
+        if placeholder {
+            self.browsing_stores.remove(earlier);
+        }
+        let in_flight = self
+            .pending_conversation_recalls
+            .values()
+            .any(|asked| asked.as_slice() == earlier);
+        if !in_flight {
+            self.buyer_conversations_recalled.remove(earlier);
         }
     }
 
@@ -4065,24 +4104,29 @@ impl AppState {
     /// earlier id is never expanded in turn: its code opens the current id,
     /// not it, so the check below refuses it.
     fn earlier_store_ids(&self, store_contract_id: &[u8]) -> Vec<Vec<u8>> {
-        let params = self
+        let from_link = self
             .store_codes
             .get(store_contract_id)
-            .and_then(|code| StoreParameters::from_code(code))
-            .or_else(|| {
-                let owner = self.browsing_stores.get(store_contract_id)?.owner?;
-                let owner = ed25519_dalek::VerifyingKey::from_bytes(&owner).ok()?;
-                Some(StoreParameters::new(owner))
-            });
-        let Some(params) = params else {
-            return Vec::new();
-        };
+            .and_then(|code| StoreParameters::from_code(code));
+        let from_owner = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.owner)
+            .and_then(|owner| ed25519_dalek::VerifyingKey::from_bytes(&owner).ok())
+            .map(StoreParameters::new);
         // A code that does not open this store names another store's
         // generations; asking about them would file its conversations here.
-        match crate::gateway::store_ops::store_instance_id(&params) {
-            Ok(id) if id.as_bytes() == store_contract_id => {}
-            _ => return Vec::new(),
-        }
+        let opens_this_store = |params: &StoreParameters| {
+            crate::gateway::store_ops::store_instance_id(params)
+                .is_ok_and(|id| id.as_bytes() == store_contract_id)
+        };
+        let Some(params) = [from_link, from_owner]
+            .into_iter()
+            .flatten()
+            .find(|params| opens_this_store(params))
+        else {
+            return Vec::new();
+        };
         crate::migrate::earlier_code_store_ids(&params)
             .map(|ids| ids.iter().map(|id| id.as_bytes().to_vec()).collect())
             .unwrap_or_default()
@@ -4467,10 +4511,19 @@ impl AppState {
     /// earlier one of a store stands for that store.
     pub fn re_recall_buyer_conversations(&mut self, store_contract_id: &[u8]) {
         let store = self.recall_files_under(store_contract_id);
-        self.buyer_conversations_recalled.remove(&store);
+        // A claim whose recall is still in flight is kept: its answer is on
+        // the way, and a second chain beside it only races it, as in
+        // `forget_recalled_conversations`.
+        let in_flight: HashSet<Vec<u8>> = self
+            .pending_conversation_recalls
+            .values()
+            .cloned()
+            .collect();
         let aliases = &self.conversation_recall_aliases;
-        self.buyer_conversations_recalled
-            .retain(|asked| aliases.get(asked) != Some(&store));
+        self.buyer_conversations_recalled.retain(|asked| {
+            let this_store = *asked == store || aliases.get(asked) == Some(&store);
+            !this_store || in_flight.contains(asked)
+        });
         self.recall_buyer_conversations(&store);
     }
 
@@ -6386,16 +6439,6 @@ impl AppState {
         crate::messaging::read_mailbox(&store.mailbox_messages, &self.conversation_keys)
     }
 
-    /// Whether this store is one of the connected identities', and if so
-    /// which identity owns it.
-    /// The verifying key of the identity that owns `store_contract_id`, which
-    /// is the key every record the store holds must be signed by and the
-    /// owner every update to it names (harvest#52).
-    ///
-    /// The store's own key since harvest#93, as its registration records it.
-    /// `None` for a store that is not ours, and for one made before revision
-    /// 2, which was owned by its Ghost Key and has no store key: this build
-    /// cannot sign for it, and `crate::backing_flow` moves it to one.
     /// Record which of `stores`' keys the delegate said it holds. An answer
     /// that says nothing (a generation older than the field) changes nothing.
     pub(crate) fn note_held_store_keys(
@@ -6418,6 +6461,19 @@ impl AppState {
         self.store_keys_held.get(store).copied().unwrap_or(true)
     }
 
+    /// Whether this store is one of the connected identities', and if so
+    /// which identity owns it.
+    /// The verifying key of the identity that owns `store_contract_id`, which
+    /// is the key every record the store holds must be signed by and the
+    /// owner every update to it names (harvest#52).
+    ///
+    /// The store's own key since harvest#93, as its registration records it.
+    /// `None` for a store that is not ours, and for one made before revision
+    /// 2, which was owned by its Ghost Key and has no store key: this build
+    /// cannot sign for it, and `crate::backing_flow` moves it to one.
+    ///
+    /// A registration is not the key: whether this device can SIGN with it is
+    /// [`Self::holds_store_key`] (harvest#138).
     pub fn store_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
         let bytes = self
             .my_stores
@@ -23790,6 +23846,108 @@ mod store_rekey_recall_tests {
         expected.push(current());
         expected.sort();
         assert_eq!(asked_about, expected);
+    }
+
+    /// A restored backup kept under an earlier id is shown with the store
+    /// once its store is recalled, whichever came first (harvest#138
+    /// review): restored first, it was filed under a placeholder of its own
+    /// and held the claim, so the store's recall skipped it. Mutated red by
+    /// not adopting the placeholder.
+    #[test]
+    fn a_backup_restored_before_its_store_opened_is_shown_with_the_store() {
+        let mut state = buyer_state();
+        let old = earlier()[0].clone();
+        let tag = recalled(5).buyer_public_key;
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(harvest_common::ImportedConversation::Imported {
+                store_contract_id: old.clone(),
+                buyer_public_key: tag,
+            }),
+        });
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert!(state.browsing_stores.contains_key(&old), "the placeholder");
+
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        assert!(!state.browsing_stores.contains_key(&old), "adopted");
+        answer(&mut state, &old, vec![recalled(5)]);
+        let store = &state.browsing_stores[&current()];
+        assert_eq!(store.conversations.len(), 1);
+        assert_eq!(store.conversations[0].kept_under, Some(old));
+    }
+
+    /// Restored AFTER the store was opened: filed with the store directly.
+    #[test]
+    fn a_backup_restored_after_its_store_opened_is_shown_with_the_store() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        for id in std::iter::once(current()).chain(earlier()) {
+            answer(&mut state, &id, Vec::new());
+        }
+        let old = earlier()[0].clone();
+        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationImported {
+            request_id: 1,
+            result: Ok(harvest_common::ImportedConversation::Imported {
+                store_contract_id: old.clone(),
+                buyer_public_key: recalled(5).buyer_public_key,
+            }),
+        });
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert_eq!(state.browsing_stores[&current()].conversations.len(), 1);
+        assert!(!state.browsing_stores.contains_key(&old));
+    }
+
+    /// A re-ask leaves a recall still in flight alone rather than starting a
+    /// second beside it (harvest#138 review). Mutated red by dropping every
+    /// claim.
+    #[test]
+    fn a_re_ask_leaves_recalls_in_flight_alone() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        let before = state.pending_conversation_recalls.len();
+        state.re_recall_buyer_conversations(&current());
+        assert_eq!(state.pending_conversation_recalls.len(), before);
+    }
+
+    /// An unreachable delegate is one notice per store, not one per id
+    /// (harvest#138 review). Mutated red by notifying for earlier ids too.
+    #[test]
+    fn a_failed_recall_is_said_once_per_store() {
+        let mut state = buyer_state();
+        state.note_store_code(current(), params().code().to_string());
+        state.recall_buyer_conversations(&current());
+        for (request_id, asked) in asked(&state) {
+            for _ in 0..MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+                state.on_buyer_conversations_recall_failed(&asked, request_id, "down");
+            }
+        }
+        let said = state
+            .notifications
+            .iter()
+            .filter(|n| n.contains("could not recall"))
+            .count();
+        assert_eq!(said, 1);
+    }
+
+    /// A link code that does not open the store does not stop the owner's
+    /// code being used (harvest#138 review). Mutated red by taking the link's
+    /// code or nothing.
+    #[test]
+    fn a_wrong_link_code_falls_back_to_the_owner() {
+        let mut state = buyer_state();
+        let stranger = StoreParameters::new(
+            ed25519_dalek::SigningKey::from_bytes(&[0x3c; 32]).verifying_key(),
+        );
+        state.note_store_code(current(), stranger.code().to_string());
+        state.browsing_stores.get_mut(&current()).unwrap().owner = Some(owner().to_bytes());
+        state.recall_buyer_conversations(&current());
+        assert_eq!(
+            state.pending_conversation_recalls.len(),
+            1 + earlier().len()
+        );
     }
 
     /// With no link, the owner the store's state names gives its code. A code

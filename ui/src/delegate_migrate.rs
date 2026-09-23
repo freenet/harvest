@@ -57,8 +57,9 @@
 //!   those back. Sealing a predecessor therefore also writes a record that
 //!   TRAVELS (`harvest:folded:<key>`, `delegates/.../import.rs`), and a later
 //!   generation that imports it treats that predecessor as done. What is left:
-//!   this first walk has no such records to find, so something deleted on one
-//!   generation from V5 to V17 can come back from an older one, once.
+//!   V5 to V18 carry no such records (V19 is the first that does), so on a
+//!   node's first walk something deleted on one of them can come back from an
+//!   older one, once. A node that never loaded V19 has its first walk later.
 //!
 //! # What cannot be recovered
 //!

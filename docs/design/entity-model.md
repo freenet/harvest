@@ -1718,9 +1718,9 @@ left open, and what phase 1a deliberately does not do yet.
   `WrapStoreKeyFor` and `UnwrapStoreKey` go through those two functions, so
   adding custody adds callers rather than a second place that knows where a
   store key lives. Until phase 1b, a store key exists on one device only, and
-  a delegate re-key (which loses delegate secrets, since nothing drives the
-  export handshake yet) leaves the store readable but unsignable. That is the
-  gap custody closes.
+  a delegate re-key leaves the store readable but unsignable: the export
+  handshake (driven since harvest#123) carries the store's registration and
+  deliberately never its key. That is the gap custody closes.
 
 ### Backings, retirements and the closed flag
 
@@ -1880,8 +1880,8 @@ own migration probe (`migrate_ops::start_store_key_migration`).
 
 Phase 1b of #93 is store key custody: every device a seller uses gets the
 same store key, and a device that lost it (for example after a delegate
-re-key, which does not carry delegate secrets across) gets it back from
-its backing Ghost Key. The mechanism is the one the spike validated
+re-key, which carries other delegate secrets across since harvest#123 but
+never a store key) gets it back from its backing Ghost Key. The mechanism is the one the spike validated
 ("Store key custody" above). This section records where the build differs
 from the phase 1 API sketch and what it leaves for later.
 
@@ -1934,10 +1934,13 @@ from the phase 1 API sketch and what it leaves for later.
   from the state alone and the Ghost Keys connected to the tab: wrap if it
   holds the store key and the current backing has no copy under the current
   scope; recover if it does not hold the key and there is such a copy;
-  otherwise nothing. Each (store, backer) pair is tried once per session, so
-  a declined vault prompt does not come back on every update. A recovered
-  store is registered again with its store key, its published record, and
-  the mailbox its backer addresses, so it reappears in My Store.
+  otherwise nothing. "Holds" is what the delegate's `StoreList` answer says
+  (`held_store_keys`, harvest#138), never the registration, which a re-key
+  carries without the key. Each (store, backer) pair is tried once per
+  session, so a declined vault prompt does not come back on every update. A
+  recovered store that is not registered here is registered again with its
+  store key, its published record, and the mailbox its backer addresses, so
+  it reappears in My Store; one that is keeps its registration.
 
 ### Derived keys
 
