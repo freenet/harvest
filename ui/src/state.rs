@@ -27881,6 +27881,21 @@ mod buy_flow_tests {
         );
         assert_eq!(listed(&state), 0, "so the kept list does not");
 
+        // Hiding is safe only because the card judges a PAID kept purchase
+        // exactly as the kept row would: paid, with the same complaint
+        // answer (round 3 of the review).
+        let (mut paid_state, unpaid_order, claims, tip) = an_unkept_purchase();
+        paid_state.on_kept_purchases(vec![kept(&paid_on_claims(&unpaid_order, claims, tip))]);
+        past_the_despatch_deadline(&mut paid_state);
+        assert_eq!(listed(&paid_state), 0);
+        let card = purchases(&paid_state).remove(0);
+        assert!(card.paid.is_some(), "the card offers the complaint");
+        assert_eq!(
+            paid_state.complaint_refusal(STORE, &card),
+            paid_state.kept_complaint_refusal(&owner, &unpaid_order.order.id),
+            "with the same answer as the kept row"
+        );
+
         // The same order id kept under another store's key: this store's
         // card names it (from an acceptance) but cannot offer its complaint,
         // so the kept list still does.
