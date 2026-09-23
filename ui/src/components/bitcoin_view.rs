@@ -60,11 +60,6 @@ pub fn BitcoinView() -> Element {
 
             BridgeStatusBar { bridge_loaded, bridge: bridge.clone(), network, tip: tip.clone() }
 
-            // The buyer's own kept purchases, from the kept records alone
-            // (R5-B). Shown whatever else is: a buyer with no watch list and
-            // no store of their own still has these.
-            super::buy_view::KeptPurchases {}
-
             if show_first_run {
                 FirstRunPanel { bridge_loaded, bridge, network, tip, has_ghostkey }
             } else {

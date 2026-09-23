@@ -518,18 +518,24 @@ impl AppState {
         self.listings_awaiting_certificate = waiting;
         for crate::state::ListingAwaitingCertificate { mut pending, .. } in ready {
             let title = pending.listing.title.clone();
+            let id = pending.listing.id.clone();
             let Some(pem) = self.certificate_for(&pending) else {
-                self.notifications.push(listing_not_published(
-                    &title,
-                    "the Ghost Key vault returned no certificate for your Ghost Key",
-                ));
+                self.listing_dropped(
+                    &id,
+                    listing_not_published(
+                        &title,
+                        "the Ghost Key vault returned no certificate for your Ghost Key",
+                    ),
+                );
                 continue;
             };
             pending.certificate_pem = pem;
             if let Err(e) = self.request_listing_signature(pending) {
                 // Not "add it again": the store itself cannot be signed for.
-                self.notifications
-                    .push(format!("Your listing \"{title}\" was not published: {e}"));
+                self.listing_dropped(
+                    &id,
+                    format!("Your listing \"{title}\" was not published: {e}"),
+                );
             }
         }
     }
@@ -555,8 +561,10 @@ impl AppState {
                 });
         self.listings_awaiting_certificate = kept;
         for waiting in dropped {
-            self.notifications
-                .push(listing_not_published(&waiting.pending.listing.title, why));
+            self.listing_dropped(
+                &waiting.pending.listing.id,
+                listing_not_published(&waiting.pending.listing.title, why),
+            );
         }
     }
 
@@ -579,10 +587,13 @@ impl AppState {
             return;
         }
         for waiting in expired {
-            self.notifications.push(listing_not_published(
-                &waiting.pending.listing.title,
-                "the Ghost Key vault did not send your Ghost Key's certificate in time",
-            ));
+            self.listing_dropped(
+                &waiting.pending.listing.id,
+                listing_not_published(
+                    &waiting.pending.listing.title,
+                    "the Ghost Key vault did not send your Ghost Key's certificate in time",
+                ),
+            );
         }
         // The vault may be free now for a custody request that was deferred
         // while the listing waited.

@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use harvest_common::listing::{AuthorizedListing, ListingKind, PriceInfo};
+use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingKind, PriceInfo};
 
 use crate::gateway::APP_STATE;
 
@@ -186,12 +186,17 @@ fn StoreList() -> Element {
 #[component]
 fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
     let info = store.info.as_ref().unwrap();
-    // Counted the way the Reputation page counts them
+    // Counted the way the store's record (`StoreRecord`) counts them
     // (`BrowsingStore::complaint_standings`), so the badge and the record
     // agree, and neither reads the store's status.
     let counted_complaints = store.counted_complaints();
     let (record_class, record_text) = store.record.badge(counted_complaints);
     let mut show_messages = use_signal(|| false);
+    let mut show_record = use_signal(|| false);
+    // A listing its seller took down is not shown to buyers at all
+    // (harvest#70); one that sold out is, marked, so an old link does not
+    // land on a gap.
+    let listings = visible_listings(&store);
     // Read once, here, rather than inside the per-listing helper: this
     // component re-renders on every keystroke in the boxes below it, and the
     // answer cannot change between two listings of the same store.
@@ -213,8 +218,14 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     }
                     div { class: "store-meta",
                         // "Clean record" only once the record has been read
-                        // (review round 1 of #143, P1-5).
-                        span { class: "{record_class}", "{record_text}" }
+                        // (review round 1 of #143, P1-5). Opens the store's
+                        // record below (harvest#93 phase 2).
+                        button {
+                            class: "link-btn {record_class}",
+                            aria_expanded: if show_record() { "true" } else { "false" },
+                            onclick: move |_| show_record.toggle(),
+                            "{record_text}"
+                        }
                         p { class: "seller-id",
                             "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
                         }
@@ -257,27 +268,48 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 }
             }
 
-            // Contact seller button
-            div {
-                style: "margin-bottom: 1.5rem;",
-                button {
-                    class: if show_messages() { "btn btn-sm btn-outline" } else { "btn btn-primary" },
-                    onclick: move |_| show_messages.toggle(),
-                    if show_messages() { "Hide Messages" } else { "Contact Seller" }
+            if show_record() {
+                super::reputation_view::StoreRecord { store_contract_id: contract_id.clone() }
+            }
+
+            // A seller looking at their own store sees it as a buyer would,
+            // and is sent to My store to manage it rather than offered a way
+            // to message themselves (entity model, wireframe F).
+            if owned {
+                div { class: "own-store-banner",
+                    span { "This is your store as buyers see it." }
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| *super::app::ROUTE.write() = super::app::Route::MyStore,
+                        "Manage it in My store"
+                    }
+                }
+            } else {
+                div {
+                    style: "margin-bottom: 1.5rem;",
+                    button {
+                        class: if show_messages() { "btn btn-sm btn-outline" } else { "btn btn-primary" },
+                        onclick: move |_| show_messages.toggle(),
+                        if show_messages() { "Hide messages" } else { "Ask the seller" }
+                    }
+                }
+
+                if show_messages() {
+                    super::message_view::MessageView { store_contract_id: contract_id.clone() }
                 }
             }
 
-            if show_messages() {
-                super::message_view::MessageView { store_contract_id: contract_id.clone() }
-            }
-
-            if store.listings.is_empty() {
+            if listings.is_empty() {
                 p { class: "text-muted text-italic", "No listings yet." }
             } else {
-                p { class: "section-count", "{store.listings.len()} listing(s)" }
-                for listing in &store.listings {
+                p { class: "section-count",
+                    if listings.len() == 1 { "1 listing" } else { "{listings.len()} listings" }
+                }
+                for (listing , availability) in listings.iter() {
                     ListingCard {
+                        key: "{listing.listing.id}",
                         listing: listing.clone(),
+                        availability: availability.clone(),
                         // Only when it adds something. If the store's own
                         // certificate failed, the warning above already
                         // covers everything under it, and repeating it on
@@ -297,8 +329,9 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // bought from at all. The store-level check cannot
                         // see this: `buyable` is computed once per store,
                         // and a mismatched listing is a per-listing fact.
-                        buyable: buyable(&store, &contract_id, owned)
-                            .filter(|_| !store.unverified_listings.contains(&listing.listing.id)),
+                        // And for a listing its seller has marked sold out
+                        // (harvest#70): shown, never offered.
+                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing.id, availability),
                     }
                 }
             }
@@ -331,6 +364,36 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             }
         }
     }
+}
+
+/// The Buy control for one listing: what [`buyable`] allows for the store,
+/// less a listing whose own certificate did not verify, less one its seller
+/// marked sold out (harvest#70). The component renders exactly this, so the
+/// tests assert what the screen does.
+fn offered_buy(
+    store: &crate::state::BrowsingStore,
+    contract_id: &[u8],
+    owned: bool,
+    listing: &harvest_common::listing::ListingId,
+    availability: &ListingAvailability,
+) -> Option<Buyable> {
+    buyable(store, contract_id, owned)
+        .filter(|_| !store.unverified_listings.contains(listing))
+        .filter(|_| availability.is_buyable())
+}
+
+/// The listings a buyer sees, with each one's availability: every listing
+/// except those its seller took down (harvest#70). A sold-out one stays, so an
+/// old link lands on it rather than on a gap.
+fn visible_listings(
+    store: &crate::state::BrowsingStore,
+) -> Vec<(AuthorizedListing, ListingAvailability)> {
+    store
+        .listings
+        .iter()
+        .map(|l| (l.clone(), store.availability(&l.listing.id)))
+        .filter(|(_, availability)| *availability != ListingAvailability::Withdrawn)
+        .collect()
 }
 
 /// The invoices the viewer's own store has issued (`AppState::invoices_shown`).
@@ -462,13 +525,22 @@ fn buyable(
 #[component]
 fn ListingCard(
     listing: AuthorizedListing,
+    availability: ListingAvailability,
     certificate_mismatch: bool,
     buyable: Option<Buyable>,
 ) -> Element {
     let l = &listing.listing;
+    let stock = match &availability {
+        ListingAvailability::Available { quantity: Some(0) } | ListingAvailability::SoldOut => {
+            Some("Sold out".to_string())
+        }
+        ListingAvailability::Available { quantity: Some(n) } => Some(format!("{n} available")),
+        _ => None,
+    };
+    let sold_out = !availability.is_buyable();
 
     rsx! {
-        div { class: "listing-card",
+        div { class: if sold_out { "listing-card listing-sold-out" } else { "listing-card" },
             div { class: "listing-header",
                 h4 { "{l.title}" }
                 span { class: "badge {kind_badge_class(&l.kind)}",
@@ -479,8 +551,11 @@ fn ListingCard(
             // certificate that is not the seller's. Worth saying loudly,
             // precisely because everything around it checks out.
             if certificate_mismatch {
-                p { class: "text-warning",
-                    "This listing's ghostkey certificate is not this seller's."
+                // Neutral on purpose: the usual cause is a listing published
+                // before its certificate travelled with it, not a forgery,
+                // and "not this seller's" read as an accusation.
+                p { class: "text-muted",
+                    "This listing can\u{2019}t be verified as this seller\u{2019}s, so it can\u{2019}t be bought."
                 }
             }
             crate::markdown::Markdown {
@@ -490,6 +565,9 @@ fn ListingCard(
             div { class: "listing-footer",
                 if let Some(ref price) = l.price {
                     span { class: "listing-price", "{price.amount} {price.currency}" }
+                }
+                if let Some(ref stock) = stock {
+                    span { class: "listing-stock", "{stock}" }
                 }
                 {
                     let date = l.created_at.format("%Y-%m-%d").to_string();
@@ -765,5 +843,106 @@ mod typed_link_tests {
         assert!(typed_is_old_format_link(&format!(" ?store={old}\n")));
         assert!(!typed_is_old_format_link("3Bn8xWqLd6Tz9Kf"));
         assert!(!typed_is_old_format_link(&old), "a bare id is not a link");
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use harvest_common::listing::{Listing, ListingId, ListingStatus};
+
+    fn listing(n: u8) -> AuthorizedListing {
+        AuthorizedListing {
+            listing: Listing {
+                id: ListingId([n; 32]),
+                title: format!("Item {n}"),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn with_status(
+        store: &mut crate::state::BrowsingStore,
+        n: u8,
+        availability: ListingAvailability,
+    ) {
+        store.listing_statuses.insert(
+            ListingId([n; 32]),
+            ListingStatus {
+                listing: ListingId([n; 32]),
+                revision: 1,
+                availability,
+            },
+        );
+    }
+
+    /// A buyer never sees a taken-down listing, still sees a sold-out one,
+    /// and sees one with no status as on sale. Mutated red by dropping the
+    /// filter.
+    #[test]
+    fn taken_down_listings_are_hidden_and_sold_out_ones_shown() {
+        let mut store = crate::state::BrowsingStore {
+            listings: vec![listing(1), listing(2), listing(3)],
+            ..Default::default()
+        };
+        with_status(&mut store, 2, ListingAvailability::SoldOut);
+        with_status(&mut store, 3, ListingAvailability::Withdrawn);
+        let shown: Vec<(u8, ListingAvailability)> = visible_listings(&store)
+            .into_iter()
+            .map(|(l, a)| (l.listing.id.0[0], a))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (1, ListingAvailability::Available { quantity: None }),
+                (2, ListingAvailability::SoldOut),
+            ]
+        );
+    }
+
+    /// The Buy control is offered only on a listing still on sale, by the
+    /// expression the component renders. Mutated red by dropping the
+    /// `is_buyable` filter.
+    #[test]
+    fn only_a_listing_on_sale_offers_buy() {
+        let store = crate::state::BrowsingStore {
+            info: Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: "seller-fp".to_string(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Pots".to_string(),
+                description: String::new(),
+                encryption_public_key: Some([1u8; 32]),
+                record_public_key: None,
+            }),
+            seller_verifying_key: Some([2u8; 32]),
+            ..Default::default()
+        };
+        let offered = |availability: &ListingAvailability| {
+            offered_buy(
+                &store,
+                &[4u8; 32],
+                false,
+                &ListingId([9u8; 32]),
+                availability,
+            )
+            .is_some()
+        };
+        assert!(offered(&ListingAvailability::Available { quantity: None }));
+        assert!(offered(&ListingAvailability::Available {
+            quantity: Some(2)
+        }));
+        assert!(!offered(&ListingAvailability::Available {
+            quantity: Some(0)
+        }));
+        assert!(!offered(&ListingAvailability::SoldOut));
+        assert!(!offered(&ListingAvailability::Withdrawn));
     }
 }

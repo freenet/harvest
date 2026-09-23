@@ -1,71 +1,207 @@
 use dioxus::prelude::*;
 use harvest_common::listing::Listing;
 
-use super::listing_form::ListingForm;
 use crate::gateway::APP_STATE;
-use crate::state::{StoreDetails, StoreDetailsGap};
+use crate::state::{AppState, StoreDetails, StoreDetailsGap};
 
-/// One store a seller owns, as the identity card shows it.
-#[derive(Clone, PartialEq)]
-struct StoreCard {
-    contract_id: Vec<u8>,
-    label: String,
-    /// The store's code (harvest#52), `None` while the identity's key is not
-    /// known.
-    code: Option<String>,
+/// The pages of My store (harvest#93 phase 2, entity model section 4).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tab {
+    Overview,
+    Listings,
+    Orders,
+    Settings,
+}
+
+/// One store the seller can manage from this device: one with a store key
+/// (harvest#93). A store made before revision 2 is not one of these; its
+/// Ghost Key is offered a move instead (see [`StoreSetup`]).
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct SellerStore {
+    pub contract_id: Vec<u8>,
+    /// The Ghost Key this store is registered under on this device.
+    pub fingerprint: String,
+    /// The store's name, or "Store <code>" before it has one.
+    pub label: String,
+    /// The store's code (harvest#52).
+    pub code: Option<String>,
     /// The link to share, built from the code: see `store_link::share_link`
     /// for why it names the default node rather than this page's.
-    link: Option<String>,
+    pub link: Option<String>,
     /// Set when another key holds this store's address: what to tell the
     /// seller. See `AppState::foreign_store_owner`.
-    foreign_owner: Option<String>,
+    pub foreign_owner: Option<String>,
     /// Set when the store's published details need repairing.
-    gap: Option<StoreDetailsGap>,
+    pub gap: Option<StoreDetailsGap>,
     /// Current values, to fill the form with when editing.
-    details: StoreDetails,
+    pub details: StoreDetails,
     /// Whether we actually know what this store has published: its state has
-    /// arrived, or the GET for it gave up. False means the form below would
-    /// be filled with empty strings that look like lost details, and an edit
+    /// arrived, or the GET for it gave up. False means the form would be
+    /// filled with empty strings that look like lost details, and an edit
     /// submitted from it could not be given a version the contract accepts.
     /// See `state::AppState::store_details_are_resolved`.
-    details_resolved: bool,
-    /// The verdict a BUYER reaches about this store's ghostkey certificate.
+    pub details_resolved: bool,
+    /// The verdict a BUYER reaches about this store's Ghost Key certificate.
     ///
     /// Shown to the seller because it is the one thing about their own store
     /// they cannot otherwise see. Nothing in the publishing path fails when
-    /// the certificate is unusable -- the store publishes, the listings
-    /// publish, and only the buyer's storefront says the identity is
-    /// unbacked. Reading the same verdict here is what closes that gap.
-    certificate: crate::ghostkey_cert::CertificateStatus,
-    /// Whether a publish for this store is already on its way to the
-    /// delegate or the network. Gates the `PublishNow` button so a second
-    /// click can't queue a duplicate publish -- see
-    /// `state::AppState::store_publish_in_flight`.
-    publish_in_flight: bool,
-    /// Whether this is a store made before stores had their own keys
-    /// (harvest#93): owned by the Ghost Key itself, so this build cannot sign
-    /// for it, and it is offered a move instead of the ordinary controls.
-    legacy: bool,
+    /// the certificate is unusable: only the buyer's storefront says the
+    /// store is unbacked. Reading the same verdict here closes that gap.
+    pub certificate: crate::ghostkey_cert::CertificateStatus,
+    /// Whether a publish for this store is already on its way. Gates the
+    /// `PublishNow` button so a second click can't queue a duplicate publish;
+    /// see `state::AppState::store_publish_in_flight`.
+    pub publish_in_flight: bool,
+    /// Listings not taken down.
+    pub listings: usize,
+    /// Buyers' requests still waiting for an invoice.
+    pub requests: usize,
+    /// The store's record as its badge reads (`RecordLoad::badge`): "Clean
+    /// record" only once the record has been read, and complaints counted the
+    /// way the store page counts them.
+    pub record: String,
+    /// Invoices this seller issued, unpaid and still open, whose anchor is
+    /// too old for a buyer to start paying.
+    pub expired_invoices: usize,
+}
+
+/// Requests waiting for an invoice across every store this device manages:
+/// the number beside "My store" in the navigation.
+pub(crate) fn requests_needing_seller(state: &AppState) -> usize {
+    seller_stores(state).iter().map(|s| s.requests).sum()
+}
+
+/// Every store this device can manage, by name.
+pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
+    let mut stores: Vec<SellerStore> = state
+        .my_stores
+        .iter()
+        .flat_map(|(fingerprint, registrations)| {
+            registrations
+                .iter()
+                .map(move |registration| (fingerprint, registration))
+        })
+        .filter_map(|(fingerprint, registration)| {
+            let store_key = registration.store_verifying_key?;
+            if registration.store_contract_id.len() != 32 {
+                // Such a store cannot be updated either -- its contract key
+                // cannot be rebuilt -- so there is nothing to offer.
+                dioxus::logger::tracing::warn!(
+                    "Store registration has a {}-byte contract id, not 32 -- not shown",
+                    registration.store_contract_id.len()
+                );
+                return None;
+            }
+            let id = &registration.store_contract_id;
+            let browsing = state.browsing_stores.get(id);
+            let info = browsing.and_then(|b| b.info.as_ref());
+            let name = info.map(|info| info.store_name.clone());
+            let code = ed25519_dalek::VerifyingKey::from_bytes(&store_key)
+                .ok()
+                .map(|key| harvest_common::store::store_code(&key));
+            let expired_invoices = browsing
+                .map(|b| {
+                    b.orders
+                        .iter()
+                        .filter(|o| o.order.seller_fingerprint == *fingerprint)
+                        .filter(|o| state.needs_reissue(o))
+                        // Only while it is still open (harvest#53): once its
+                        // window has closed it has lapsed, which needs nothing
+                        // from the seller, and a cancelled one is settled.
+                        .filter(|o| {
+                            let tip = state
+                                .bitcoin
+                                .tips
+                                .get(&o.order.network)
+                                .and_then(|tip| tip.tip_height);
+                            matches!(
+                                crate::fulfilment::order_stage(
+                                    o,
+                                    state.despatch_of(o).as_ref(),
+                                    tip,
+                                    state.payment_sight(o),
+                                ),
+                                crate::fulfilment::OrderStage::AwaitingPayment { .. }
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            Some(SellerStore {
+                contract_id: id.clone(),
+                fingerprint: fingerprint.clone(),
+                label: match code.as_deref() {
+                    Some(code) => crate::store_link::store_label(code, name.as_deref()),
+                    None => name.clone().unwrap_or_else(|| "Your store".to_string()),
+                },
+                link: code.as_deref().map(crate::store_link::share_link),
+                foreign_owner: state.foreign_store_owner(id).map(|held| {
+                    crate::state::foreign_owner_message(code.as_deref().unwrap_or_default(), &held)
+                }),
+                code,
+                // The seller can only be prompted to publish a key the
+                // delegate has actually produced -- see
+                // `state::store_details_gap`.
+                gap: crate::state::store_details_gap(
+                    info,
+                    state.encryption_public_keys.contains_key(fingerprint),
+                ),
+                details: StoreDetails {
+                    store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
+                    description: info.map(|i| i.description.clone()).unwrap_or_default(),
+                },
+                details_resolved: state.store_details_are_resolved(id),
+                certificate: browsing
+                    .map(|b| b.certificate_status.clone())
+                    .unwrap_or_default(),
+                publish_in_flight: state.store_publish_in_flight(id),
+                listings: browsing
+                    .map(|b| {
+                        b.listings
+                            .iter()
+                            .filter(|l| {
+                                b.availability(&l.listing.id)
+                                    != harvest_common::listing::ListingAvailability::Withdrawn
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0),
+                requests: super::message_view::requests_awaiting_invoice(state, id),
+                record: browsing
+                    .map(|b| b.record.badge(b.counted_complaints()).1)
+                    .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
+                expired_invoices,
+            })
+        })
+        .collect();
+    stores.sort_by(|a, b| {
+        a.label
+            .to_lowercase()
+            .cmp(&b.label.to_lowercase())
+            .then_with(|| a.contract_id.cmp(&b.contract_id))
+    });
+    stores
 }
 
 #[component]
 pub fn MyStore() -> Element {
     let app_state = APP_STATE.read();
     let in_flight = app_state.request_any_access_in_flight;
+    let ghostkeys = app_state.ghostkeys.clone();
+    let has_harvest_delegate = app_state.harvest_delegate_key.is_some();
+    let stores = seller_stores(&app_state);
+    drop(app_state);
 
     rsx! {
-        div {
-            h2 { "My Store" }
-
-            if app_state.ghostkeys.is_empty() {
-                NoIdentity { in_flight: in_flight }
+        div { class: "my-store",
+            if ghostkeys.is_empty() {
+                h2 { "My store" }
+                NoIdentity { in_flight }
+            } else if stores.is_empty() {
+                h2 { "My store" }
+                FirstStore { ghostkeys, has_harvest_delegate }
             } else {
-                IdentityList {
-                    ghostkeys: app_state.ghostkeys.clone(),
-                    my_stores: app_state.my_stores.clone(),
-                    has_harvest_delegate: app_state.harvest_delegate_key.is_some(),
-                }
-                ConnectAnother { in_flight: in_flight }
+                StoreDashboard { stores, has_harvest_delegate }
             }
         }
     }
@@ -74,40 +210,27 @@ pub fn MyStore() -> Element {
 #[component]
 fn NoIdentity(in_flight: bool) -> Element {
     rsx! {
-        div { class: "card empty-state",
+        div { class: "card",
+            h3 { "Sell on Harvest" }
             p {
-                "Harvest needs a ghostkey identity to sign your store listings."
+                "A store on Harvest is backed by a Ghost Key: a Freenet identity you get by "
+                "donating. Buyers see the amount you donated as what you have at stake."
             }
-            p {
-                "If you've already created one, share it with Harvest below. "
-                "Otherwise, visit the Ghostkey Vault to create one."
-            }
-            div { style: "margin-top: 16px;",
-                button {
-                    class: "btn btn-primary",
-                    disabled: in_flight,
-                    onclick: move |_| connect_ghostkey(),
-                    if in_flight { "Waiting for vault…" } else { "Connect a ghostkey" }
+            ol { class: "steps",
+                li {
+                    "Get a Ghost Key from the Ghost Key vault, if you do not have one yet."
+                }
+                li {
+                    "Let Harvest use it. "
+                    button {
+                        class: "btn btn-sm btn-primary",
+                        disabled: in_flight,
+                        onclick: move |_| connect_ghostkey(),
+                        if in_flight { "Waiting for the vault\u{2026}" } else { "Choose a Ghost Key" }
+                    }
                 }
             }
-        }
-    }
-}
-
-/// Lets a user with one or more already-connected ghostkeys request
-/// access to ANOTHER one. Without this, the empty-state's "Connect"
-/// button disappears after the first successful share and there's no
-/// path to add a second identity.
-#[component]
-fn ConnectAnother(in_flight: bool) -> Element {
-    rsx! {
-        div { style: "margin-top: 16px;",
-            button {
-                class: "btn",
-                disabled: in_flight,
-                onclick: move |_| connect_ghostkey(),
-                if in_flight { "Waiting for vault…" } else { "Connect another ghostkey" }
-            }
+            p { class: "text-muted small", "Only buying? You do not need one. Go to Stores." }
         }
     }
 }
@@ -117,8 +240,7 @@ fn ConnectAnother(in_flight: bool) -> Element {
 /// renders as an overlay; the user picks one of their stored
 /// ghostkeys (or denies). On approval the delegate replies with a
 /// one-element `GhostKeyList` for the chosen key, which the response
-/// handler folds into APP_STATE.ghostkeys -- our `IdentityList`
-/// renders as soon as it appears.
+/// handler folds into APP_STATE.ghostkeys.
 pub(crate) fn connect_ghostkey() {
     use ghostkey_common::GhostkeyRequest;
 
@@ -143,7 +265,7 @@ pub(crate) fn connect_ghostkey() {
                 APP_STATE
                     .write()
                     .notifications
-                    .push("Still connecting to the gateway — please try again in a moment.".into());
+                    .push("Still connecting to the gateway. Please try again in a moment.".into());
                 return;
             }
         }
@@ -166,58 +288,84 @@ pub(crate) fn connect_ghostkey() {
     });
 }
 
+fn ghost_key_name(identity: &ghostkey_common::GhostKeyInfo) -> String {
+    match identity.label.as_deref().map(str::trim) {
+        Some(label) if !label.is_empty() => format!("Ghost Key \u{201c}{label}\u{201d}"),
+        _ => format!("Ghost Key {}", truncate_fingerprint(&identity.fingerprint)),
+    }
+}
+
+/// A Ghost Key is connected and no store exists yet (wireframe B). With more
+/// than one Ghost Key, one line picks which backs the store.
 #[component]
-fn IdentityList(
+fn FirstStore(
     ghostkeys: Vec<ghostkey_common::GhostKeyInfo>,
-    my_stores: std::collections::HashMap<String, Vec<harvest_common::StoreRegistration>>,
     has_harvest_delegate: bool,
 ) -> Element {
-    rsx! {
-        div {
-            h3 { "Your Identities" }
+    let mut chosen = use_signal(|| 0usize);
+    let index = chosen().min(ghostkeys.len().saturating_sub(1));
+    let identity = ghostkeys[index].clone();
 
-            if !has_harvest_delegate {
-                p { class: "text-warning",
-                    "Harvest delegate not yet registered. Store creation will be available once the delegate is loaded."
+    rsx! {
+        div { class: "card",
+            h3 { "Set up your store" }
+            if ghostkeys.len() > 1 {
+                div { class: "form-group",
+                    label { class: "form-label", r#for: "backing-key", "Backed by" }
+                    select {
+                        id: "backing-key",
+                        class: "form-select",
+                        onchange: move |e| chosen.set(e.value().parse().unwrap_or(0)),
+                        for (i , key) in ghostkeys.iter().enumerate() {
+                            option { value: "{i}", selected: i == index,
+                                "{ghost_key_name(key)} \u{00b7} {describe_notary_info(&key.notary_info)}"
+                            }
+                        }
+                    }
+                }
+            } else {
+                p { class: "text-muted",
+                    "Backed by {ghost_key_name(&identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
                 }
             }
-
-            for gk in &ghostkeys {
-                IdentityCard {
-                    identity: gk.clone(),
-                    stores: my_stores.get(&gk.fingerprint).cloned().unwrap_or_default(),
-                    has_harvest_delegate: has_harvest_delegate,
-                }
+            StoreSetup {
+                key: "{identity.fingerprint}",
+                identity: identity.clone(),
+                has_harvest_delegate,
+            }
+            UseAnotherKey {}
+            p { class: "text-muted small",
+                "You can move your store to a different Ghost Key later; it keeps its name, link "
+                "and record. Next: add a payout wallet, add a listing, share your link."
             }
         }
     }
 }
 
+/// Ask the vault for another Ghost Key, with the in-flight guard.
 #[component]
-fn IdentityCard(
-    identity: ghostkey_common::GhostKeyInfo,
-    stores: Vec<harvest_common::StoreRegistration>,
-    has_harvest_delegate: bool,
-) -> Element {
-    let mut show_listing_form = use_signal(|| false);
+fn UseAnotherKey() -> Element {
+    let in_flight = APP_STATE.read().request_any_access_in_flight;
+    rsx! {
+        button {
+            class: "link-btn",
+            disabled: in_flight,
+            onclick: move |_| connect_ghostkey(),
+            if in_flight { "Waiting for the vault\u{2026}" } else { "Use a different Ghost Key" }
+        }
+    }
+}
+
+/// Whatever one Ghost Key needs before it has a store this device can manage:
+/// creating one, moving a store made before revision 2, or waiting on either.
+#[component]
+fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: bool) -> Element {
     let mut show_store_form = use_signal(|| false);
-    // Which store's details form is open, if any. One signal rather than one
-    // per store: hooks cannot be created inside a loop.
-    let mut editing_store = use_signal(|| Option::<Vec<u8>>::None);
     let fp = identity.fingerprint.clone();
-    // A store this device can sign for: one with a store key (harvest#93).
-    // A store made before revision 2 does not count; it is offered a move.
-    let has_store = stores
-        .iter()
-        .any(|store| store.store_verifying_key.is_some());
-    let legacy_movable = APP_STATE
-        .read()
-        .legacy_store_to_move(&identity.fingerprint)
-        .is_some();
+    let legacy_movable = APP_STATE.read().legacy_store_to_move(&fp).is_some();
     // Single-flight (harvest#93 review, Must Fix 3): set from the moment a
     // creation or move starts until it is published or fails.
-    let creating =
-        APP_STATE.read().store_creation_in_flight.as_deref() == Some(identity.fingerprint.as_str());
+    let creating = APP_STATE.read().store_creation_in_flight.as_deref() == Some(fp.as_str());
     // No Cancel once the PUTs have started (#98 re-check).
     let publishing = APP_STATE.read().store_publishing;
     // A creation this Ghost Key's existing backing refused, waiting on the
@@ -226,405 +374,579 @@ fn IdentityCard(
         .read()
         .second_store_offer
         .clone()
-        .filter(|offer| offer.fingerprint == identity.fingerprint);
+        .filter(|offer| offer.fingerprint == fp);
     // A store made before revision 2 that has not loaded yet: offering
-    // "Create Store" now would make a second store instead of moving this
+    // "Create store" now would make a second store instead of moving this
     // one (#98 review, L3).
-    let legacy_loading = APP_STATE.read().legacy_store_loading(&identity.fingerprint);
-
-    // Buyers can only reach a store through a link the seller sends them, so
-    // the seller has to be able to see it. Built here rather than in rsx
-    // because it needs the page URL, which native builds don't have.
-    //
-    // Each store is labelled: a seller with two stores otherwise gets two
-    // 44-character links with nothing to tell them apart.
-    // A store made before revision 2 was addressed by the Ghost Key's own
-    // code; one since is addressed by its store key's (harvest#93).
-    let ghost_code: Option<String> = identity
-        .verifying_key_bytes
-        .as_deref()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
-        .map(|key| harvest_common::store::store_code(&key));
-    // Stores made before revision 2 are shown only while there is nothing
-    // else: once a store has moved, the old one is the past, not a second
-    // store to manage.
-    let stores: Vec<harvest_common::StoreRegistration> = if has_store {
-        stores
-            .into_iter()
-            .filter(|store| store.store_verifying_key.is_some())
-            .collect()
-    } else {
-        stores
-    };
-    let store_cards: Vec<StoreCard> = {
-        let app_state = APP_STATE.read();
-        stores
-            .iter()
-            .filter_map(|store| {
-                if store.store_contract_id.len() != 32 {
-                    // Dropping this silently left the seller a link short
-                    // with no indication which store was missing. Such a
-                    // store cannot be updated either -- its contract key
-                    // cannot be rebuilt -- so there is nothing to offer.
-                    dioxus::logger::tracing::warn!(
-                        "Store registration has a {}-byte contract id, not 32 -- no share link",
-                        store.store_contract_id.len()
-                    );
-                    return None;
-                }
-                let browsing = app_state.browsing_stores.get(&store.store_contract_id);
-                let info = browsing.and_then(|browsing| browsing.info.as_ref());
-                let name = info.map(|info| info.store_name.clone());
-                let code: Option<String> = match store.store_verifying_key {
-                    Some(bytes) => ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-                        .ok()
-                        .map(|key| harvest_common::store::store_code(&key)),
-                    None => ghost_code.clone(),
-                };
-                Some(StoreCard {
-                    legacy: store.store_verifying_key.is_none(),
-                    label: match code.as_deref() {
-                        Some(code) => crate::store_link::store_label(code, name.as_deref()),
-                        None => name.clone().unwrap_or_else(|| "Your store".to_string()),
-                    },
-                    code: code.clone(),
-                    link: code.as_deref().map(crate::store_link::share_link),
-                    foreign_owner: app_state.foreign_store_owner(&store.store_contract_id).map(
-                        |held| {
-                            crate::state::foreign_owner_message(
-                                code.as_deref().unwrap_or_default(),
-                                &held,
-                            )
-                        },
-                    ),
-                    // The seller can only be prompted to publish a key the
-                    // delegate has actually produced -- see
-                    // `state::store_details_gap`.
-                    gap: crate::state::store_details_gap(
-                        info,
-                        app_state
-                            .encryption_public_keys
-                            .contains_key(&identity.fingerprint),
-                    ),
-                    details: StoreDetails {
-                        store_name: info.map(|i| i.store_name.clone()).unwrap_or_default(),
-                        description: info.map(|i| i.description.clone()).unwrap_or_default(),
-                    },
-                    details_resolved: app_state
-                        .store_details_are_resolved(&store.store_contract_id),
-                    certificate: browsing
-                        .map(|browsing| browsing.certificate_status.clone())
-                        .unwrap_or_default(),
-                    publish_in_flight: app_state.store_publish_in_flight(&store.store_contract_id),
-                    contract_id: store.store_contract_id.clone(),
-                })
-            })
-            .collect()
-    };
+    let legacy_loading = APP_STATE.read().legacy_store_loading(&fp);
 
     rsx! {
-        div { class: "identity-card",
-            div {
-                span { class: "identity-name",
-                    if let Some(ref label) = identity.label {
-                        "{label}"
-                    } else {
-                        "{truncate_fingerprint(&identity.fingerprint)}"
-                    }
-                }
-                span { class: "identity-tier", "{describe_notary_info(&identity.notary_info)}" }
+        if !has_harvest_delegate {
+            p { class: "text-muted text-italic",
+                "Connecting to Harvest\u{2019}s delegate. Store creation is available once it loads."
             }
-            div {
-                if has_store {
+        }
+        if creating {
+            div { class: "row-between",
+                span { class: "text-muted text-italic", "Creating your store\u{2026}" }
+                // A creation can stall on an answer that never comes (#98
+                // review, L1). Cancelling keeps the store key and any signed
+                // backing, so trying again resumes it.
+                if !publishing {
                     button {
-                        class: if show_listing_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
-                        onclick: move |_| show_listing_form.toggle(),
-                        if show_listing_form() { "Cancel" } else { "Add Listing" }
-                    }
-                } else if creating {
-                    span { class: "text-warning", "Creating contracts... " }
-                    // A creation can stall on an answer that never comes
-                    // (#98 review, L1). Cancelling keeps the store key and
-                    // any signed backing, so trying again resumes it.
-                    if !publishing {
-                        button {
-                            class: "btn btn-sm btn-outline",
-                            onclick: move |_| APP_STATE.write().cancel_store_creation(),
-                            "Cancel"
-                        }
-                    }
-                } else if legacy_movable {
-                    button {
-                        class: "btn btn-sm btn-primary",
-                        disabled: !has_harvest_delegate,
-                        onclick: {
-                            let fp = identity.fingerprint.clone();
-                            move |_| move_legacy_store(fp.clone())
-                        },
-                        "Move this store"
-                    }
-                } else if legacy_loading {
-                    span { class: "text-muted text-italic", "Loading your existing store…" }
-                } else {
-                    button {
-                        class: if show_store_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
-                        disabled: !has_harvest_delegate,
-                        onclick: move |_| show_store_form.toggle(),
-                        if show_store_form() { "Cancel" } else { "Create Store" }
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| APP_STATE.write().cancel_store_creation(),
+                        "Cancel"
                     }
                 }
+            }
+        } else if legacy_movable {
+            p { class: "text-warning",
+                "This Ghost Key has a store made before stores had keys of their own, so this \
+                 version of Harvest cannot publish to it and buyers cannot pay it. Moving it gives \
+                 it a key, backed by this Ghost Key, and carries its name, description and \
+                 listings across. Its link changes, so share the new one; open orders are not \
+                 carried."
+            }
+            button {
+                class: "btn btn-sm btn-primary",
+                disabled: !has_harvest_delegate,
+                onclick: {
+                    let fp = fp.clone();
+                    move |_| move_legacy_store(fp.clone())
+                },
+                "Move this store"
+            }
+        } else if legacy_loading {
+            p { class: "text-muted text-italic", "Loading your existing store\u{2026}" }
+        } else if show_store_form() {
+            StoreDetailsForm {
+                heading: "",
+                submit_label: "Create store",
+                initial: StoreDetails::default(),
+                on_cancel: move |_| show_store_form.set(false),
+                on_submit: {
+                    let fp = fp.clone();
+                    move |details: StoreDetails| {
+                        show_store_form.set(false);
+                        initiate_store_creation(fp.clone(), details, Vec::new());
+                    }
+                },
+            }
+        } else {
+            button {
+                class: "btn btn-primary",
+                disabled: !has_harvest_delegate,
+                onclick: move |_| show_store_form.set(true),
+                "Create a store"
             }
         }
 
         if let Some(offer) = second_store {
-            div { class: "store-share",
+            div { class: "notice",
                 p { class: "text-warning",
                     "This Ghost Key already backs {offer.other_store}. A Ghost Key backs one \
                      store at a time, so a buyer who has loaded both will treat BOTH as \
                      unbacked and will not pay either. This version has no way to undo that: \
                      use a different Ghost Key unless you mean it."
                 }
-                button {
-                    class: "btn btn-sm btn-outline",
-                    onclick: move |_| {
-                        let started = APP_STATE.write().confirm_second_store();
-                        match started {
-                            Ok(request) => {
-                                #[cfg(target_arch = "wasm32")]
-                                send_store_creation_requests(
-                                    APP_STATE
-                                        .read()
-                                        .pending_store_creation
-                                        .as_ref()
-                                        .map(|p| p.ghostkey_fingerprint.clone())
-                                        .unwrap_or_default(),
-                                    request,
-                                );
-                                #[cfg(not(target_arch = "wasm32"))]
-                                let _ = request;
+                div { class: "form-actions",
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| {
+                            let started = APP_STATE.write().confirm_second_store();
+                            match started {
+                                Ok(request) => {
+                                    #[cfg(target_arch = "wasm32")]
+                                    send_store_creation_requests(
+                                        APP_STATE
+                                            .read()
+                                            .pending_store_creation
+                                            .as_ref()
+                                            .map(|p| p.ghostkey_fingerprint.clone())
+                                            .unwrap_or_default(),
+                                        request,
+                                    );
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let _ = request;
+                                }
+                                Err(e) => APP_STATE
+                                    .write()
+                                    .notifications
+                                    .push(format!("Could not create the store: {e}")),
                             }
-                            Err(e) => APP_STATE
-                                .write()
-                                .notifications
-                                .push(format!("Could not create the store: {e}")),
-                        }
-                    },
-                    "Open a second store under it anyway"
-                }
-                button {
-                    class: "btn btn-sm btn-outline",
-                    onclick: move |_| APP_STATE.write().second_store_offer = None,
-                    "Not now"
+                        },
+                        "Open a second store under it anyway"
+                    }
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| APP_STATE.write().second_store_offer = None,
+                        "Not now"
+                    }
                 }
             }
         }
+    }
+}
 
-        if !store_cards.is_empty() {
-            div { class: "store-share",
-                p { class: "text-muted",
-                    "Share this link so buyers can open your store:"
+/// The seller's dashboard: one store at a time, titled by its name, with a
+/// switcher when there is more than one (entity model, wireframe C).
+#[component]
+fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Element {
+    // Pinned to the store first shown, so a store arriving later, or a name
+    // arriving that reorders the list, does not switch the page under the
+    // seller (and remount it, losing an open form).
+    let mut selected = use_signal(|| Some(stores[0].contract_id.clone()));
+    let tab = use_signal(|| Tab::Overview);
+    let store = selected()
+        .and_then(|id| stores.iter().find(|s| s.contract_id == id).cloned())
+        .unwrap_or_else(|| stores[0].clone());
+
+    // Counts what needs the seller, not everything there is: a request
+    // waiting for an invoice.
+    let orders_label = match store.requests {
+        0 => "Orders".to_string(),
+        n => format!("Orders ({n})"),
+    };
+    let listings_label = format!("Listings ({})", store.listings);
+    let current = tab();
+
+    rsx! {
+        div { class: "dashboard",
+        div { class: "dashboard-head",
+            h2 { class: "dashboard-title", "{store.label}" }
+            if stores.len() > 1 {
+                select {
+                    class: "form-select store-switcher",
+                    aria_label: "Switch store",
+                    onchange: {
+                        let ids: Vec<Vec<u8>> = stores.iter().map(|s| s.contract_id.clone()).collect();
+                        move |e: Event<FormData>| {
+                            if let Some(id) = e.value().parse::<usize>().ok().and_then(|i| ids.get(i)) {
+                                selected.set(Some(id.clone()));
+                            }
+                        }
+                    },
+                    for (i , s) in stores.iter().enumerate() {
+                        option { value: "{i}", selected: s.contract_id == store.contract_id, "{s.label}" }
+                    }
                 }
-                for card in store_cards.iter().cloned() {
-                    div { class: "store-share-row",
-                        span { class: "store-share-label", "{card.label}" }
-                        if let Some(ref link) = card.link {
-                            // Styled as a value to copy rather than a form
-                            // field: it is readonly, and dressed as an input
-                            // it read as something to edit.
-                            input {
-                                class: "copy-field",
-                                readonly: true,
-                                spellcheck: false,
-                                // Named, because `aria-label` REPLACES the
-                                // visible label beside it: a seller with two
-                                // stores would otherwise hear the same string
-                                // for both, which is the distinction the row
-                                // above exists to draw.
-                                aria_label: "{card.label} store link, select to copy",
-                                value: "{link}",
-                            }
-                        }
-                        if let Some(ref code) = card.code {
-                            p { class: "text-muted",
-                                "Store code: "
-                                code { "{code}" }
-                                ". The link opens Harvest on a buyer's own Freenet node at its \
-                                 usual address. A buyer whose node runs elsewhere can open \
-                                 Harvest and enter this code instead."
-                            }
-                        }
-                        if let Some(ref refusal) = card.foreign_owner {
-                            p { class: "text-warning", "{refusal}" }
-                        }
+            }
+        }
+        div { class: "tabs", role: "tablist",
+            for (t , label) in [
+                (Tab::Overview, "Overview".to_string()),
+                (Tab::Listings, listings_label.clone()),
+                (Tab::Orders, orders_label.clone()),
+                (Tab::Settings, "Settings".to_string()),
+            ]
+            {
+                button {
+                    class: if current == t { "tab active" } else { "tab" },
+                    role: "tab",
+                    aria_selected: if current == t { "true" } else { "false" },
+                    onclick: {
+                        let mut tab = tab;
+                        move |_| tab.set(t)
+                    },
+                    "{label}"
+                }
+            }
+        }
+        // One keyed item in a list, so switching stores REMOUNTS the body and
+        // nothing per-store (an open form, its typed values, an edit in
+        // progress) carries over to the other store. A key on a lone node is
+        // not compared (dioxus diffs keys only in lists), which is why this
+        // is a loop of one.
+        for body in std::iter::once(store.clone()) {
+            StoreBody {
+                key: "{bs58::encode(&body.contract_id).into_string()}",
+                store: body.clone(),
+                tab,
+                has_harvest_delegate,
+            }
+        }
+        }
+    }
+}
 
-                        // Nothing is offered until we know what the store
-                        // has published. Before this, the button said "Edit
-                        // details" and the form opened filled with empty
-                        // strings -- which reads as details that have been
-                        // lost, so the seller retypes them, and the edit is
-                        // then published at a version the store contract
-                        // discards as stale.
-                        if card.legacy {
-                            p { class: "text-warning",
-                                "This store was made before stores had keys of their own, so this \
-                                 version of Harvest cannot publish to it and buyers cannot pay it. \
-                                 Moving it gives it a key, backed by this Ghost Key, and carries \
-                                 its name, description and listings across. Its link changes, so \
-                                 share the new one; open orders are not carried."
-                            }
-                        } else if !card.details_resolved {
-                            p { class: "text-muted text-italic",
-                                "Loading this store's published details…"
-                            }
+/// The page of My store that is showing, for one store.
+#[component]
+fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -> Element {
+    // Whether the details form is open, shared by Overview (whose repair
+    // prompt opens it) and Settings (where it lives). Per store, because this
+    // component is remounted when the store changes.
+    let editing_details = use_signal(|| false);
+    rsx! {
+        div { class: "tab-body",
+            match tab() {
+                Tab::Overview => rsx! { Overview { store: store.clone(), tab, editing_details } },
+                Tab::Listings => rsx! {
+                    super::seller_listings::SellerListings {
+                        store_contract_id: store.contract_id.clone(),
+                        fingerprint: store.fingerprint.clone(),
+                    }
+                },
+                Tab::Orders => rsx! {
+                    super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
+                    super::invoice_form::StorePayments {
+                        store_contract_id: store.contract_id.clone(),
+                        seller_fingerprint: store.fingerprint.clone(),
+                    }
+                },
+                Tab::Settings => rsx! {
+                    Settings { store: store.clone(), editing_details, has_harvest_delegate }
+                },
+            }
+        }
+    }
+}
+
+/// What needs the seller, what is left to set up, the link to share, and the
+/// store's record (wireframe C).
+#[component]
+fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>) -> Element {
+    let has_wallet = APP_STATE.read().bitcoin.payment_xpub.is_some();
+    let wallet_known = APP_STATE.read().bitcoin.payment_xpub_loaded;
+    let details_done = store.details_resolved && store.gap.is_none();
+    let setup_done = details_done && has_wallet && store.listings > 0;
+    let mut go = move |t: Tab| tab.set(t);
+
+    let needs: bool = store.foreign_owner.is_some()
+        || (store.details_resolved && store.gap.is_some())
+        || !store.certificate.is_verified()
+        || store.expired_invoices > 0
+        || store.requests > 0;
+
+    rsx! {
+        section { class: "card",
+            h3 { "Needs you" }
+            if let Some(ref refusal) = store.foreign_owner {
+                p { class: "text-warning", "{refusal}" }
+            }
+            if !store.details_resolved {
+                p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
+            } else if let Some(gap) = store.gap {
+                // The repair prompt says what is wrong and what publishing
+                // fixes, as a one-click action where nothing needs typing.
+                div { class: "need",
+                    p { class: "text-warning", "{gap.message()}" }
+                    StoreDetailsButton { store: store.clone(), editing_details, on_open_form: move |_| go(Tab::Settings) }
+                }
+            }
+            if store.details_resolved && !store.certificate.is_verified() {
+                // Editing the details will not fix this, so it is not phrased
+                // as a repair prompt: a certificate that does not verify is
+                // either an identity this build cannot read or one that is
+                // not the seller's, and both need looking at.
+                p { class: "text-warning",
+                    "Buyers see this store as unbacked: {store.certificate.label()}."
+                    if let Some(why) = store.certificate.detail() {
+                        " ({why})"
+                    }
+                }
+            }
+            if store.requests > 0 {
+                div { class: "need row-between",
+                    strong {
+                        if store.requests == 1 {
+                            "1 buyer is waiting for an invoice."
                         } else {
-                            // The repair prompt. Says what is wrong and what
-                            // publishing fixes, rather than offering a bare form
-                            // and leaving the seller to guess why it is there.
-                            if let Some(gap) = card.gap {
-                                p { class: "text-warning", "{gap.message()}" }
-                            }
+                            "{store.requests} buyers are waiting for an invoice."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
+                }
+            }
+            if store.expired_invoices > 0 {
+                div { class: "need row-between",
+                    span {
+                        if store.expired_invoices == 1 {
+                            "1 unpaid invoice is too old for a buyer to start paying. Issue it again if they still want it."
+                        } else {
+                            "{store.expired_invoices} unpaid invoices are too old for a buyer to start paying. Issue them again if the buyers still want them."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Orders), "Open orders" }
+                }
+            }
+            if !needs && store.details_resolved {
+                p { class: "text-muted", "Nothing needs you right now." }
+            }
+        }
 
-                            // Editing the details will not fix this, so it is
-                            // deliberately not phrased as a repair prompt: a
-                            // certificate that does not verify is either an
-                            // identity this build cannot read or one that is
-                            // not the seller's, and both need looking at
-                            // rather than republishing.
-                            if !card.certificate.is_verified() {
-                                p { class: "text-warning",
-                                    "Buyers see this store as unbacked: {card.certificate.label()}."
-                                    if let Some(why) = card.certificate.detail() {
-                                        " ({why})"
-                                    }
-                                }
-                            }
-
-                            button {
-                                class: if card.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
-                                // Only the `PublishNow` path can double-fire a
-                                // real network request on a double-click --
-                                // `ToggleForm` just flips a local signal, so
-                                // it is left enabled. See
-                                // `state::AppState::store_publish_in_flight`
-                                // for why this can never get stuck disabled.
-                                disabled: store_details_button_action(
-                                        card.gap,
-                                        editing_store() == Some(card.contract_id.clone()),
-                                    ) == StoreDetailsAction::PublishNow
-                                    && card.publish_in_flight,
-                                onclick: {
-                                    let id = card.contract_id.clone();
-                                    let details = card.details.clone();
-                                    let gap = card.gap;
-                                    move |_| {
-                                        let id = id.clone();
-                                        // Recomputed at click time, not
-                                        // captured from the render that drew
-                                        // this button: `editing_store` can
-                                        // change between renders, and this is
-                                        // what keeps a store whose form is
-                                        // open from being silently published
-                                        // with the old, on-record details
-                                        // when `NoEncryptionKey` appears while
-                                        // the seller has unsaved edits open
-                                        // (#80 review).
-                                        let is_editing = editing_store() == Some(id.clone());
-                                        match store_details_button_action(gap, is_editing) {
-                                            // See `store_details_button_action`
-                                            // for why this publishes instead
-                                            // of opening the form (#78).
-                                            StoreDetailsAction::PublishNow => {
-                                                // Fresh read, not
-                                                // `card.publish_in_flight`:
-                                                // that was snapshotted when
-                                                // this render started, and two
-                                                // clicks can land before
-                                                // Dioxus re-renders the
-                                                // `disabled` attribute above
-                                                // (#80 review).
-                                                if APP_STATE.read().store_publish_in_flight(&id) {
-                                                    return;
-                                                }
-                                                publish_store_details(id, details.clone());
-                                            }
-                                            StoreDetailsAction::ToggleForm => {
-                                                if is_editing {
-                                                    editing_store.set(None);
-                                                } else {
-                                                    editing_store.set(Some(id));
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                                if store_details_button_action(
-                                    card.gap,
-                                    editing_store() == Some(card.contract_id.clone()),
-                                ) == StoreDetailsAction::PublishNow
-                                {
-                                    "Publish details"
-                                } else if editing_store() == Some(card.contract_id.clone()) {
-                                    "Cancel"
-                                } else if card.gap.is_some() {
-                                    "Publish details"
-                                } else {
-                                    "Edit details"
-                                }
-                            }
-
-                            // The invoice FORM sits under the store it
-                            // issues on -- an invoice goes to one store's
-                            // contract, and a seller with two stores has to be
-                            // able to tell which. The payment KEY inside this
-                            // panel is not per-store: it is one key and one
-                            // derivation counter for the whole app, shown here
-                            // because this is where it is needed. The panel
-                            // says so rather than letting the placement imply
-                            // otherwise.
-                            super::invoice_form::StorePayments {
-                                store_contract_id: card.contract_id.clone(),
-                                seller_fingerprint: fp.clone(),
-                            }
-
-                            if editing_store() == Some(card.contract_id.clone()) {
-                                StoreDetailsForm {
-                                    heading: if card.gap.is_some() { "Publish Store Details" } else { "Edit Store Details" },
-                                    submit_label: "Publish",
-                                    initial: card.details.clone(),
-                                    on_submit: {
-                                        let id = card.contract_id.clone();
-                                        move |details: StoreDetails| {
-                                            editing_store.set(None);
-                                            publish_store_details(id.clone(), details);
-                                        }
-                                    },
-                                }
-                            }
+        if !setup_done {
+            section { class: "card",
+                h3 { "Set up" }
+                ul { class: "checklist",
+                    li { class: "done", "Store created" }
+                    li { class: if details_done { "done" } else { "" },
+                        "Name and description published"
+                        if !details_done && store.details_resolved {
+                            button { class: "link-btn", onclick: move |_| go(Tab::Settings), "Settings" }
+                        }
+                    }
+                    li { class: if has_wallet { "done" } else { "" },
+                        "Payout wallet"
+                        if !has_wallet && wallet_known {
+                            button { class: "link-btn", onclick: move |_| go(Tab::Settings), "Add one" }
+                        }
+                    }
+                    li { class: if store.listings > 0 { "done" } else { "" },
+                        "A listing"
+                        if store.listings == 0 {
+                            button { class: "link-btn", onclick: move |_| go(Tab::Listings), "Add one" }
                         }
                     }
                 }
             }
         }
 
-        if show_store_form() {
-            StoreDetailsForm {
-                heading: "Create Your Store",
-                submit_label: "Create Store",
-                initial: StoreDetails::default(),
-                on_submit: move |details: StoreDetails| {
-                    show_store_form.set(false);
-                    initiate_store_creation(identity.fingerprint.clone(), details, Vec::new());
-                },
+        section { class: "card",
+            h3 { "Share your store" }
+            if let Some(ref code) = store.code {
+                div { class: "share-row",
+                    span { class: "share-label", "Store code" }
+                    code { class: "share-value", "{code}" }
+                }
+            }
+            if let Some(ref link) = store.link {
+                div { class: "share-row",
+                    span { class: "share-label", "Link" }
+                    // Styled as a value to copy rather than a form field: it
+                    // is readonly, and dressed as an input it read as
+                    // something to edit.
+                    input {
+                        class: "copy-field",
+                        readonly: true,
+                        spellcheck: false,
+                        aria_label: "{store.label} store link, select to copy",
+                        value: "{link}",
+                    }
+                }
+            }
+            p { class: "text-muted small",
+                "Buyers need Freenet running. The link opens your store on their own node at its "
+                "usual address; a buyer whose node runs elsewhere can enter the code in Stores."
             }
         }
 
-        if show_listing_form() {
-            ListingForm {
-                on_submit: move |listing: Listing| {
-                    show_listing_form.set(false);
-                    sign_and_submit_listing(fp.clone(), listing);
+        section { class: "card",
+            h3 { "Your record" }
+            p { "{store.record}" }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: {
+                    let id = store.contract_id.clone();
+                    move |_| super::app::open_store_page(id.clone())
                 },
+                "See your store as buyers do"
+            }
+        }
+    }
+}
+
+/// The store-details button, with the repair logic `store_details_button_action`
+/// decides: publish straight away when nothing needs typing, otherwise open the
+/// form.
+#[component]
+fn StoreDetailsButton(
+    store: SellerStore,
+    editing_details: Signal<bool>,
+    on_open_form: EventHandler<()>,
+) -> Element {
+    let is_editing = editing_details();
+    let action = store_details_button_action(store.gap, is_editing);
+    rsx! {
+        button {
+            class: if store.gap.is_some() { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
+            // Only the `PublishNow` path can double-fire a real network
+            // request on a double-click -- `ToggleForm` just flips a local
+            // signal, so it is left enabled. See
+            // `state::AppState::store_publish_in_flight` for why this can
+            // never get stuck disabled.
+            disabled: action == StoreDetailsAction::PublishNow && store.publish_in_flight,
+            onclick: {
+                let id = store.contract_id.clone();
+                let details = store.details.clone();
+                let gap = store.gap;
+                move |_| {
+                    // Recomputed at click time, not captured from the render
+                    // that drew this button: the form can open or close
+                    // between renders, and this is what keeps a store whose
+                    // form is open from being silently published with the
+                    // old, on-record details when `NoEncryptionKey` appears
+                    // while the seller has unsaved edits open (#80 review).
+                    let is_editing = editing_details();
+                    match store_details_button_action(gap, is_editing) {
+                        // See `store_details_button_action` for why this
+                        // publishes instead of opening the form (#78).
+                        StoreDetailsAction::PublishNow => {
+                            // Fresh read: two clicks can land before Dioxus
+                            // re-renders the `disabled` attribute (#80 review).
+                            if APP_STATE.read().store_publish_in_flight(&id) {
+                                return;
+                            }
+                            publish_store_details(id.clone(), details.clone());
+                        }
+                        StoreDetailsAction::ToggleForm => {
+                            editing_details.set(!is_editing);
+                            if !is_editing {
+                                on_open_form.call(());
+                            }
+                        }
+                    }
+                }
+            },
+            if action == StoreDetailsAction::PublishNow {
+                "Publish details"
+            } else if is_editing {
+                "Cancel"
+            } else if store.gap.is_some() {
+                "Publish details"
+            } else {
+                "Edit"
+            }
+        }
+    }
+}
+
+/// Store details, payout wallet, the Ghost Key behind the store, and other
+/// stores (wireframe E).
+#[component]
+fn Settings(
+    store: SellerStore,
+    editing_details: Signal<bool>,
+    has_harvest_delegate: bool,
+) -> Element {
+    let (identity, others, in_flight, busy) = {
+        let state = APP_STATE.read();
+        let identity = state
+            .ghostkeys
+            .iter()
+            .find(|k| k.fingerprint == store.fingerprint)
+            .cloned();
+        // Connected Ghost Keys with no store this device can manage: each can
+        // open one, or move one made before revision 2.
+        let others: Vec<ghostkey_common::GhostKeyInfo> = state
+            .ghostkeys
+            .iter()
+            .filter(|k| state.signable_store_for(&k.fingerprint).is_none())
+            .cloned()
+            .collect();
+        // A key whose creation is under way, or waiting on the seller's
+        // answer about a second store, stays open when the seller comes back
+        // to this tab, so its progress, Cancel and question are not hidden.
+        let busy: Vec<String> = state
+            .store_creation_in_flight
+            .iter()
+            .cloned()
+            .chain(
+                state
+                    .second_store_offer
+                    .iter()
+                    .map(|o| o.fingerprint.clone()),
+            )
+            .collect();
+        (identity, others, state.request_any_access_in_flight, busy)
+    };
+    let mut other_open = use_signal(|| Option::<String>::None);
+
+    rsx! {
+        section { class: "card",
+            div { class: "row-between",
+                h3 { "Store details" }
+                if store.details_resolved {
+                    StoreDetailsButton { store: store.clone(), editing_details, on_open_form: move |_| {} }
+                }
+            }
+            if !store.details_resolved {
+                // Nothing is offered until we know what the store has
+                // published: a form filled with empty strings reads as lost
+                // details, and an edit from it would be published at a
+                // version the contract discards as stale.
+                p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
+            } else if editing_details() {
+                StoreDetailsForm {
+                    heading: "",
+                    submit_label: "Publish",
+                    initial: store.details.clone(),
+                    on_cancel: move |_| editing_details.set(false),
+                    on_submit: {
+                        let id = store.contract_id.clone();
+                        move |details: StoreDetails| {
+                            editing_details.set(false);
+                            publish_store_details(id.clone(), details);
+                        }
+                    },
+                }
+            } else {
+                if let Some(gap) = store.gap {
+                    p { class: "text-warning", "{gap.message()}" }
+                }
+                p { strong { "{store.details.store_name}" } }
+                if !store.details.description.is_empty() {
+                    crate::markdown::Markdown {
+                        source: store.details.description.clone(),
+                        class: "store-desc",
+                    }
+                }
+            }
+        }
+
+        section { class: "card",
+            h3 { "Payout wallet" }
+            super::invoice_form::PayoutWallet {}
+            p { class: "text-muted small",
+                "Each invoice gets a new address from this wallet. Harvest can create addresses but "
+                "can never spend your coins."
+            }
+        }
+
+        section { class: "card",
+            h3 { "Backed by" }
+            if let Some(ref identity) = identity {
+                p {
+                    "{ghost_key_name(identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
+                }
+            }
+            p { class: if store.certificate.is_verified() { "text-muted small" } else { "text-warning" },
+                "Buyers see: {store.certificate.label()}."
+            }
+            p { class: "text-muted small", "Buyers see this as what you have at stake." }
+        }
+
+        section { class: "card",
+            h3 { "Another store" }
+            p { class: "text-muted small",
+                "A new store starts with its own name, link and an empty record. Use a different "
+                "Ghost Key to keep the two apart."
+            }
+            for other in others {
+                div { class: "other-key", key: "{other.fingerprint}",
+                    div { class: "row-between",
+                        span { "{ghost_key_name(&other)} \u{00b7} {describe_notary_info(&other.notary_info)}" }
+                        if other_open() != Some(other.fingerprint.clone()) && !busy.contains(&other.fingerprint) {
+                            button {
+                                class: "btn btn-sm btn-outline",
+                                onclick: {
+                                    let fp = other.fingerprint.clone();
+                                    move |_| other_open.set(Some(fp.clone()))
+                                },
+                                "Open a store with it"
+                            }
+                        }
+                    }
+                    if other_open() == Some(other.fingerprint.clone()) || busy.contains(&other.fingerprint) {
+                        StoreSetup { identity: other.clone(), has_harvest_delegate }
+                    }
+                }
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                disabled: in_flight,
+                onclick: move |_| connect_ghostkey(),
+                if in_flight { "Waiting for the vault\u{2026}" } else { "Use another Ghost Key" }
             }
         }
     }
@@ -639,16 +961,19 @@ fn StoreDetailsForm(
     submit_label: String,
     initial: StoreDetails,
     on_submit: EventHandler<StoreDetails>,
+    on_cancel: EventHandler<()>,
 ) -> Element {
     let mut store_name = use_signal(|| initial.store_name.clone());
     let mut description = use_signal(|| initial.description.clone());
 
     rsx! {
-        div { class: "card",
-            h3 { "{heading}" }
+        div { class: "details-form",
+            if !heading.is_empty() {
+                h3 { "{heading}" }
+            }
 
             div { class: "form-group",
-                label { class: "form-label", "Store Name" }
+                label { class: "form-label", "Store name" }
                 input {
                     class: "form-input",
                     r#type: "text",
@@ -679,16 +1004,23 @@ fn StoreDetailsForm(
                 }
             }
 
-            button {
-                class: "btn btn-primary",
-                disabled: store_name().trim().is_empty(),
-                onclick: move |_| {
-                    on_submit.call(StoreDetails {
-                        store_name: store_name().trim().to_string(),
-                        description: description().trim().to_string(),
-                    });
-                },
-                "{submit_label}"
+            div { class: "form-actions",
+                button {
+                    class: "btn btn-primary",
+                    disabled: store_name().trim().is_empty(),
+                    onclick: move |_| {
+                        on_submit.call(StoreDetails {
+                            store_name: store_name().trim().to_string(),
+                            description: description().trim().to_string(),
+                        });
+                    },
+                    "{submit_label}"
+                }
+                button {
+                    class: "btn btn-outline",
+                    onclick: move |_| on_cancel.call(()),
+                    "Cancel"
+                }
             }
         }
     }
@@ -1152,30 +1484,6 @@ fn extract_json_field<'a>(info: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-/// Sign a new listing with the store key and publish it (harvest#93).
-///
-/// The store is the Ghost Key's first store this device holds a store key
-/// for. A seller whose only store predates store keys is offered a move
-/// instead of this form, so reaching here without one is reported rather than
-/// signed for with the wrong key.
-fn sign_and_submit_listing(fingerprint: String, listing: Listing) {
-    let mut state = APP_STATE.write();
-    let Some(store_contract_id) = state.signable_store_for(&fingerprint) else {
-        state.notifications.push(format!(
-            "Cannot add the listing: {}",
-            crate::state::NO_STORE_KEY_MESSAGE
-        ));
-        return;
-    };
-    let title = listing.title.clone();
-    match state.queue_listing_signature(store_contract_id, fingerprint, listing) {
-        Ok(()) => dioxus::logger::tracing::info!("Queued listing for signing: {title}"),
-        Err(e) => state
-            .notifications
-            .push(format!("Cannot add the listing: {e}")),
-    }
-}
-
 fn truncate_fingerprint(fp: &str) -> String {
     if fp.len() > 12 {
         format!("{}...", &fp[..12])
@@ -1347,5 +1655,79 @@ mod notary_info_tests {
     fn a_date_alone_is_still_worth_showing() {
         let info = r#"{"delegate-key-created":"2024-08-13 15:45:36"}"#;
         assert_eq!(describe_notary_info(info), "donated 13 August 2024");
+    }
+}
+
+#[cfg(test)]
+mod seller_stores_tests {
+    use super::*;
+    use harvest_common::listing::{
+        AuthorizedListing, ListingAvailability, ListingId, ListingKind, ListingStatus,
+    };
+
+    fn registration(id: u8, key: Option<[u8; 32]>) -> harvest_common::StoreRegistration {
+        harvest_common::StoreRegistration {
+            store_contract_id: vec![id; 32],
+            reputation_contract_id: vec![0u8; 32],
+            mailbox_contract_id: vec![0u8; 32],
+            store_contract_key: None,
+            store_verifying_key: key,
+        }
+    }
+
+    fn listing(n: u8) -> AuthorizedListing {
+        AuthorizedListing {
+            listing: Listing {
+                id: ListingId([n; 32]),
+                title: format!("Item {n}"),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// My store manages only stores this device holds a store key for, and
+    /// counts listings a buyer can see, not ones taken down. Mutated red by
+    /// dropping the key filter and the `Withdrawn` filter.
+    #[test]
+    fn only_keyed_stores_are_managed_and_taken_down_listings_do_not_count() {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![
+                registration(1, Some(crate::state::test_store_key())),
+                registration(2, None),
+            ],
+        );
+        let mut store = crate::state::BrowsingStore {
+            listings: vec![listing(1), listing(2)],
+            ..Default::default()
+        };
+        store.listing_statuses.insert(
+            ListingId([2; 32]),
+            ListingStatus {
+                listing: ListingId([2; 32]),
+                revision: 1,
+                availability: ListingAvailability::Withdrawn,
+            },
+        );
+        state.browsing_stores.insert(vec![1u8; 32], store);
+        let stores = seller_stores(&state);
+        assert_eq!(
+            stores.len(),
+            1,
+            "a store made before store keys is offered a move instead"
+        );
+        assert_eq!(stores[0].contract_id, vec![1u8; 32]);
+        assert_eq!(stores[0].fingerprint, "fp");
+        assert_eq!(stores[0].listings, 1);
+        assert_eq!(stores[0].requests, 0);
+        assert!(stores[0].code.is_some() && stores[0].link.is_some());
+        assert_eq!(requests_needing_seller(&state), 0);
     }
 }

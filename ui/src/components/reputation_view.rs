@@ -13,50 +13,36 @@ struct ComplaintRow {
     store_name: Option<String>,
 }
 
+/// One store's record: its complaints, and nothing else's (harvest#93 phase 2).
+///
+/// This replaces the old top-level Reputation tab, which pooled every browsed
+/// store's complaints into one list. A record belongs to a store, so it is
+/// shown on that store's page; the seller's overview shows its count. Each
+/// complaint is counted the way the store's badge counts it
+/// (`BrowsingStore::complaint_standings`), so the two cannot disagree.
 #[component]
-pub fn ReputationView() -> Element {
-    let rows: Vec<ComplaintRow> = {
-        let app_state = APP_STATE.read();
-        app_state
-            .browsing_stores
-            .values()
-            .flat_map(|store| {
-                let store_name = store.info.as_ref().map(|i| i.store_name.clone());
-                store
-                    .complaint_standings()
-                    .map(move |(complaint, standing)| ComplaintRow {
-                        standing,
-                        complaint: complaint.clone(),
-                        store_name: store_name.clone(),
-                    })
-            })
-            .collect()
-    };
+pub fn StoreRecord(store_contract_id: Vec<u8>) -> Element {
+    let rows: Vec<ComplaintRow> = APP_STATE
+        .read()
+        .browsing_stores
+        .get(&store_contract_id)
+        .map(|store| {
+            store
+                .complaint_standings()
+                .map(|(complaint, standing)| ComplaintRow {
+                    standing,
+                    complaint: complaint.clone(),
+                    store_name: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let counted = rows.iter().filter(|r| r.standing.counts()).count();
 
     rsx! {
-        div {
-            h2 { "Reputation" }
-
-            div { class: "info-box",
-                p {
-                    "A seller's record holds complaints only, as categories, with no free text. "
-                    "Each one names an order that the order's own Bitcoin bridges say was paid, "
-                    "and only that order's buyer can make it, so a stranger cannot make one up "
-                    "and the seller cannot take one down."
-                }
-                p {
-                    "What it cannot tell you: the seller chooses which bridges their orders "
-                    "trust, so a seller who pays themselves through a bridge they run can put "
-                    "orders, and complaints, on their own record. And a record with no "
-                    "complaints says nothing about the orders nobody complained about."
-                }
-            }
-
+        div { class: "store-record",
             if rows.is_empty() {
-                p { class: "text-muted text-italic",
-                    "No complaints loaded. Browse a store to see its record."
-                }
+                p { class: "text-muted", "No complaints." }
             } else {
                 p { class: "section-count",
                     "{counted} complaint(s) counted, of {rows.len()} on record"
@@ -64,6 +50,18 @@ pub fn ReputationView() -> Element {
                 for row in rows.iter() {
                     ComplaintCard { row: row.clone() }
                 }
+            }
+            p { class: "text-muted small",
+                "A record holds complaints only, as categories, with no free text. Each one "
+                "names an order that the order's own Bitcoin bridges say was paid, and only that "
+                "order's buyer can make it, so a stranger cannot make one up and the seller "
+                "cannot take one down."
+            }
+            p { class: "text-muted small",
+                "What it cannot tell you: the seller chooses which bridges their orders trust, so "
+                "a seller who pays themselves through a bridge they run can put orders, and "
+                "complaints, on their own record. And a record with no complaints says nothing "
+                "about the orders nobody complained about."
             }
         }
     }

@@ -24,7 +24,7 @@
 
 use dioxus::prelude::*;
 use freenet_bitcoin_common::BitcoinNetwork;
-use harvest_common::listing::{AuthorizedListing, ListingId};
+use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingId};
 
 use crate::gateway::{bitcoin_config, bitcoin_ops, APP_STATE};
 use crate::state::PendingInvoice;
@@ -45,13 +45,24 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
     bitcoin_config::settleable_networks()
 }
 
-/// The seller-side payments panel for one store: the payment key, the form
-/// that issues an invoice against a listing, and the invoices already issued.
+/// The seller-side invoices panel for one store: the form that issues an
+/// invoice against a listing, and the invoices already issued. The payment
+/// key itself is set in My store > Settings ([`PayoutWallet`]).
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
     let mut show_form = use_signal(|| false);
 
-    let (xpub, xpub_loaded, store_loaded, listings, orders, live, needs_reissue) = {
+    let (
+        xpub,
+        xpub_loaded,
+        store_loaded,
+        listings,
+        sold_out,
+        orders,
+        live,
+        needs_reissue,
+        has_listings,
+    ) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         let mine = invoices_issued_by(
@@ -75,29 +86,43 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // would let them invoice it -- is the same trap `publish_store_details`
             // documents at length for the store's version number.
             state.store_details_are_resolved(&store_contract_id),
-            store.map(|s| s.listings.clone()).unwrap_or_default(),
+            // Only what a buyer can still buy: an invoice for a listing the
+            // seller marked sold out or took down (harvest#70) is one the
+            // storefront no longer offers.
+            store.map(issuable_listings).unwrap_or_default(),
+            store.map(sold_out_ids).unwrap_or_default(),
             mine,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
             needs_reissue,
+            store.is_some_and(|s| !s.listings.is_empty()),
         )
     };
 
     rsx! {
         div { class: "card",
-            h4 { "Payments" }
+            h3 { "Invoices" }
 
-            PaymentKeyPanel { xpub: xpub.clone(), xpub_loaded }
+            if xpub_loaded && xpub.is_none() {
+                p { class: "text-muted",
+                    "Add a payout wallet in Settings before issuing an invoice: each invoice is "
+                    "paid to a new address from it."
+                }
+            }
 
             if xpub.is_some() {
                 if !store_loaded {
                     p { class: "text-muted text-italic",
                         "Loading this store's listings\u{2026}"
                     }
+                } else if listings.is_empty() && has_listings {
+                    p { class: "text-muted text-italic",
+                        "Nothing to invoice: every listing is taken down."
+                    }
                 } else if listings.is_empty() {
                     p { class: "text-muted text-italic",
-                        "Add a listing first \u{2014} an invoice is issued against one, so a \
+                        "Add a listing first: an invoice is issued against one, so a \
                          buyer can see what they are paying for."
                     }
                 } else {
@@ -111,6 +136,7 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                             store_contract_id: store_contract_id.clone(),
                             seller_fingerprint: seller_fingerprint.clone(),
                             listings: listings.clone(),
+                            sold_out: sold_out.clone(),
                             on_submitted: move |_| show_form.set(false),
                         }
                     }
@@ -345,6 +371,29 @@ fn MarkDespatched(
     }
 }
 
+/// The listings an invoice may be issued for: every listing except those the
+/// seller took down (harvest#70). A sold-out one stays, marked, so a seller
+/// can issue again an invoice that expired for the last one they had.
+fn issuable_listings(store: &crate::state::BrowsingStore) -> Vec<AuthorizedListing> {
+    store
+        .listings
+        .iter()
+        .filter(|l| store.availability(&l.listing.id) != ListingAvailability::Withdrawn)
+        .cloned()
+        .collect()
+}
+
+/// The listings in `listings` that are sold out, to mark in the picker.
+fn sold_out_ids(store: &crate::state::BrowsingStore) -> Vec<ListingId> {
+    store
+        .listings
+        .iter()
+        .map(|l| &l.listing.id)
+        .filter(|id| !store.availability(id).is_buyable())
+        .cloned()
+        .collect()
+}
+
 /// The invoices on a store that THIS seller issued, newest first.
 ///
 /// A store contract carries every order, and the seller's panel is about
@@ -381,6 +430,21 @@ pub fn PaymentWatchNote() -> Element {
             "picked up later, so a seller waiting to be paid should open Harvest more than "
             "once a day."
         }
+    }
+}
+
+/// The payout wallet, as My store > Settings shows it.
+#[component]
+pub fn PayoutWallet() -> Element {
+    let (xpub, xpub_loaded) = {
+        let state = APP_STATE.read();
+        (
+            state.bitcoin.payment_xpub.clone(),
+            state.bitcoin.payment_xpub_loaded,
+        )
+    };
+    rsx! {
+        PaymentKeyPanel { xpub, xpub_loaded }
     }
 }
 
@@ -507,6 +571,8 @@ fn InvoiceForm(
     store_contract_id: Vec<u8>,
     seller_fingerprint: String,
     listings: Vec<AuthorizedListing>,
+    /// Listings marked sold out, labelled so in the picker.
+    sold_out: Vec<ListingId>,
     on_submitted: EventHandler<()>,
 ) -> Element {
     // Which listing, by its display id. `ListingId` is not a form value, so
@@ -537,7 +603,11 @@ fn InvoiceForm(
                 for listing in listings.iter() {
                     option {
                         value: "{listing.listing.id}",
-                        "{listing.listing.title}"
+                        if sold_out.contains(&listing.listing.id) {
+                            "{listing.listing.title} (sold out)"
+                        } else {
+                            "{listing.listing.title}"
+                        }
                     }
                 }
             }
@@ -801,5 +871,58 @@ mod tests {
             let why = parse_required_confirmations(refused).expect_err(refused);
             assert!(why.contains("At least one"), "{refused}: {why}");
         }
+    }
+}
+
+#[cfg(test)]
+mod issuable_tests {
+    use super::*;
+    use harvest_common::listing::{Listing, ListingKind, ListingStatus};
+
+    fn listing(n: u8) -> AuthorizedListing {
+        AuthorizedListing {
+            listing: Listing {
+                id: ListingId([n; 32]),
+                title: format!("Item {n}"),
+                description: String::new(),
+                kind: ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// The picker offers everything but what was taken down, and marks what
+    /// is sold out. Mutated red by dropping the filter.
+    #[test]
+    fn taken_down_listings_cannot_be_invoiced_from_the_picker() {
+        let mut store = crate::state::BrowsingStore {
+            listings: vec![listing(1), listing(2), listing(3), listing(4)],
+            ..Default::default()
+        };
+        for (n, availability) in [
+            (2, ListingAvailability::SoldOut),
+            (3, ListingAvailability::Withdrawn),
+            (4, ListingAvailability::Available { quantity: Some(5) }),
+        ] {
+            store.listing_statuses.insert(
+                ListingId([n; 32]),
+                ListingStatus {
+                    listing: ListingId([n; 32]),
+                    revision: 1,
+                    availability,
+                },
+            );
+        }
+        let ids: Vec<u8> = issuable_listings(&store)
+            .iter()
+            .map(|l| l.listing.id.0[0])
+            .collect();
+        assert_eq!(ids, vec![1, 2, 4]);
+        let sold: Vec<u8> = sold_out_ids(&store).iter().map(|id| id.0[0]).collect();
+        assert_eq!(sold, vec![2, 3]);
     }
 }

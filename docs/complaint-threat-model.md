@@ -46,7 +46,7 @@ had NOT seen. Revision 4 removes them, and adds nothing that decides anything:
 overseer's decisions of 2026-09-23. Two are fixed by removing or narrowing, one is recorded:
 
 - **R5-B: filing no longer needs the store.** A kept purchase is judged from the kept record
-  alone, and the Payments tab lists every kept purchase with its complaint control (3.6).
+  alone, and My purchases lists every kept purchase with its complaint control (3.6).
 - **R5-C: a full record drops the latest-dated complaints first.** The record holds at most
   `MAX_COMPLAINTS`, kept nearest their own paid heights (5.3). The window is still the
   reader's; #53 decision 4 stands.
@@ -125,7 +125,7 @@ The seller can do any of these, at any time, including after payment:
 | Pad the order's signed envelope, list one recognised bridge thousands of times, or submit non-minimal proofs | any size cap: the buyer's copy, the complaint, the record (R2-4, TM-E) |
 | Pay its own order address: early or late (to move the paid height), or repeatedly with large transactions (a flood that makes the address contract prune) | the window's start (TM-D); the buyer's claims (TM-B) |
 | Reuse one payment address across many orders, so one payment settles all of them (their windows overlap) | any rule that equates one paid order with one payment (R3: cap filling, record growth) |
-| Show the buyer a payment address anywhere else: the store's invoice list, a message (the Payments tab lists only the seller's own orders and the buyer's own kept purchases, the latter with no address) | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
+| Show the buyer a payment address anywhere else: the store's invoice list, a message (the footer's payment diagnostics list only the seller's own orders; My purchases lists the buyer's own kept purchases with no address, beside the same purchase cards the store page shows) | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
 | Name its own bridge in a sockpuppet order, have it sign a padded tip, or have it retract its own confirmation | a byte bound derived rather than enforced (R6-1); a reversal rule that trusts any bridge the order names (R6-2) |
 | Publish a backdated despatch | the complaint window (P2-10) |
 | Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (section 6) |
@@ -303,8 +303,10 @@ reputation record whatever build of the store is current (`ReputationParameters 
 the receipt seed, and the kept paid copy. So a kept purchase is judged from the kept record
 alone (`kept_complaint_checks`), wherever the control is shown:
 
-- on the store page's purchase card, when the store is loaded;
-- in the Payments tab's list of kept purchases (`KeptPurchases`), which reads nothing but the
+- on the purchase card (the store page's, and the same card on My purchases), when the store is
+  loaded;
+- in My purchases' list of kept purchases (`KeptPurchases`; the Payments tab's until harvest#93
+  phase 2 moved it), which reads nothing but the
   kept list, so a store re-keyed while the seller stays away, or one nobody hosts, leaves the
   control where it was.
 

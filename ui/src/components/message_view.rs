@@ -898,15 +898,34 @@ fn Conversation(
                 &published,
                 crate::gateway::APP_STATE.read().conversation_keys.get(&tag),
             ) {
-                super::buy_view::AcceptRequest {
-                    key: "{bs58::encode(request.digest).into_string()}",
-                    store_contract_id: store_contract_id.clone(),
-                    tag: tag.clone(),
-                    listing_id: request.listing_id.clone(),
-                    listing_title: request.listing_title.clone(),
-                    order_binding: request.order_binding,
-                    buyer_receipt_key: request.buyer_receipt_key,
-                    quantity: request.quantity,
+                // The key sits on the first node of the loop body, the only
+                // place dioxus reads a list key from, so each request keeps
+                // its own accept control's state when an earlier one drops
+                // out of the list.
+                div { key: "{bs58::encode(request.digest).into_string()}",
+                    // A request made before the listing sold out, or for a
+                    // listing since replaced by an edit (harvest#70), can
+                    // still be answered: the buyer asked while it was on
+                    // sale. The seller is told, so they decide knowingly.
+                    if !crate::gateway::APP_STATE
+                        .read()
+                        .listing_availability(&store_contract_id, &request.listing_id)
+                        .is_buyable()
+                    {
+                        p { class: "text-muted small",
+                            "{request.listing_title} is no longer on sale in your store. You can still \
+                             invoice this buyer, since they asked while it was, or reply to say it has gone."
+                        }
+                    }
+                    super::buy_view::AcceptRequest {
+                        store_contract_id: store_contract_id.clone(),
+                        tag: tag.clone(),
+                        listing_id: request.listing_id.clone(),
+                        listing_title: request.listing_title.clone(),
+                        order_binding: request.order_binding,
+                        buyer_receipt_key: request.buyer_receipt_key,
+                        quantity: request.quantity,
+                    }
                 }
             }
 
@@ -1297,6 +1316,69 @@ fn describe(content: &MessageContent) -> String {
     }
 }
 
+/// How many buyers' requests in one of our stores' inboxes are still waiting
+/// for an invoice: the count My store shows beside Orders and in the top
+/// navigation, so a seller sees that a request arrived without opening the
+/// inbox (harvest#93 phase 2).
+///
+/// The same rule the inbox itself uses to offer the accept control
+/// ([`unanswered_requests`]), per conversation, so the count and the controls
+/// cannot disagree.
+pub(crate) fn requests_awaiting_invoice(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+) -> usize {
+    let Some(store) = state.browsing_stores.get(store_contract_id) else {
+        return 0;
+    };
+    count_unanswered(
+        state.mailbox_entries(store_contract_id),
+        &store.listings,
+        &store.orders,
+        |tag| state.conversation_keys.get(tag),
+        |listing| store.availability(listing).is_buyable(),
+    )
+}
+
+/// [`requests_awaiting_invoice`] over given entries, grouped by conversation,
+/// each group judged with its own conversation's keys.
+///
+/// Counts only requests for a listing the store holds and still has on sale.
+/// The inbox still offers Accept on the others (a buyer who asked before an
+/// item sold out, or before an edit replaced it, can still be invoiced), but
+/// a count the seller cannot bring to zero by answering, since a reply that
+/// declines publishes no order, teaches them to ignore it.
+fn count_unanswered<'a>(
+    entries: Vec<MailboxEntry>,
+    listings: &[harvest_common::listing::AuthorizedListing],
+    published: &[harvest_common::payment::AuthorizedOrder],
+    keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
+    on_sale: impl Fn(&harvest_common::listing::ListingId) -> bool,
+) -> usize {
+    let mut conversations: Vec<(Vec<u8>, Vec<MailboxEntry>)> = Vec::new();
+    for entry in entries {
+        match conversations
+            .iter_mut()
+            .find(|(tag, _)| tag.as_slice() == entry.conversation())
+        {
+            Some((_, group)) => group.push(entry),
+            None => conversations.push((entry.conversation().to_vec(), vec![entry])),
+        }
+    }
+    conversations
+        .iter()
+        .map(|(tag, group)| {
+            unanswered_requests(group, listings, published, keys_for(tag))
+                .iter()
+                .filter(|request| {
+                    listings.iter().any(|l| l.listing.id == request.listing_id)
+                        && on_sale(&request.listing_id)
+                })
+                .count()
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
@@ -1385,6 +1467,53 @@ mod inbox_tests {
             status_scoped_payload: None,
             status_signature: None,
         }
+    }
+
+    /// The count beside Orders is the number of accept controls the inbox
+    /// would show, summed over conversations, each judged with its OWN keys,
+    /// less requests for a listing not on sale or not in the store.
+    #[test]
+    fn the_orders_count_is_the_unanswered_requests_across_conversations() {
+        let id = ListingId([9u8; 32]);
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        // The same listing and binding asked in a second conversation.
+        let mut other = request(id.clone(), 1, [7u8; 32]);
+        if let MailboxEntry::Readable { conversation, .. } = &mut other {
+            *conversation = vec![5u8; 32];
+        }
+        let entries = vec![
+            request(id.clone(), 2, [3u8; 32]),
+            readable(MessageContent::Text("hello".into()), [4u8; 32]),
+            other,
+        ];
+        let first = keys();
+        let second = crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]);
+        let keys_for = |tag: &[u8]| {
+            if tag == [5u8; 32].as_slice() {
+                Some(&second)
+            } else {
+                Some(&first)
+            }
+        };
+        assert_eq!(
+            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| true),
+            2
+        );
+
+        // An order under the FIRST conversation's tag answers only its
+        // request: the second conversation computes a different tag.
+        let answered = vec![published(1, Some(BINDING), Some(first.listing_tag(&id)))];
+        assert_eq!(
+            count_unanswered(entries.clone(), &listings, &answered, keys_for, |_| true),
+            1
+        );
+
+        // Not on sale, or never in this store: not counted.
+        assert_eq!(
+            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| false),
+            0
+        );
+        assert_eq!(count_unanswered(entries, &[], &[], keys_for, |_| true), 0);
     }
 
     /// **The seller is offered an Accept only when there is a request.**

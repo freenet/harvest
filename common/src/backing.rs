@@ -277,6 +277,15 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     fn slot(&self) -> Bytes32;
     /// Whether the store owned by `owner` may hold this record.
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String>;
+    /// Which of two records for one slot is kept: the higher rank, and on
+    /// equal ranks the smaller encoding. Zero for every record whose slot
+    /// holds one statement for good (a backing, a retirement, a closure, a
+    /// copy), so for those the rule is the smaller encoding alone, as it
+    /// always was. A listing status ranks by its revision, so a later one
+    /// supersedes an earlier (harvest#70).
+    fn rank(&self) -> u64 {
+        0
+    }
     /// What a verify error calls this kind of record.
     const WHAT: &'static str;
 }
@@ -320,13 +329,27 @@ fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
     crate::to_cbor(record).expect("a signed record always serializes to CBOR")
 }
 
+/// Whether `held` stays when `incoming` arrives for the same slot: it ranks
+/// higher, or ranks the same and encodes no larger. A total order on records
+/// (rank descending, then bytes ascending), so a per-slot maximum of it is
+/// idempotent, commutative and associative.
+fn keeps_held<T: SignedRecord>(held: &T, incoming: &T) -> bool {
+    match held.rank().cmp(&incoming.rank()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => record_bytes(held) <= record_bytes(incoming),
+    }
+}
+
 /// A grow-only set of signed records, one per slot.
 ///
 /// # Merge model
 ///
-/// Union by slot. Two different records for one slot -- which needs whoever
-/// signs it to have signed twice, with different content -- resolve to the
-/// one whose CBOR encoding is SMALLER, the same rule and for the same reason
+/// Union by slot. Two different records for one slot resolve first by
+/// [`SignedRecord::rank`], the higher kept, which only a listing status sets
+/// (its revision, harvest#70); every other kind ranks zero, so for those, two
+/// records for one slot -- which needs whoever signs it to have signed twice,
+/// with different content -- resolve to the one whose CBOR encoding is SMALLER, the same rule and for the same reason
 /// as `store::merge_order`'s equal-rank tie-break: it is a pure function of
 /// content, so every replica holding both picks the same one, and it rewards
 /// nobody for stapling bytes onto a genuine record. Note what that means: on
@@ -360,12 +383,12 @@ impl<T: SignedRecord> SignedSetV1<T> {
         self.records.is_empty()
     }
 
-    /// Fold one already-verified record in, keeping the smaller encoding on a
-    /// clash. See the type's docs.
+    /// Fold one already-verified record in, keeping the higher rank and, on
+    /// equal ranks, the smaller encoding. See the type's docs.
     fn merge_record(&mut self, incoming: T) {
         let slot = incoming.slot();
         match self.records.get(&slot) {
-            Some(held) if record_bytes(held) <= record_bytes(&incoming) => {}
+            Some(held) if keeps_held(held, &incoming) => {}
             _ => {
                 self.records.insert(slot, incoming);
             }
@@ -598,6 +621,8 @@ pub enum StoreKeyMessage {
     Listing,
     Order,
     OrderStatus,
+    /// A listing's availability (harvest#70).
+    ListingStatus,
     BackingAcceptance,
     Retirement,
     Closure,
@@ -627,6 +652,8 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
         Some(StoreKeyMessage::Order)
     } else if is::<(crate::payment::OrderId, crate::payment::OrderStatus)>(payload) {
         Some(StoreKeyMessage::OrderStatus)
+    } else if is::<crate::listing::ListingStatus>(payload) {
+        Some(StoreKeyMessage::ListingStatus)
     } else if is::<BackingAcceptance>(payload) {
         Some(StoreKeyMessage::BackingAcceptance)
     } else if is::<Retirement>(payload) {

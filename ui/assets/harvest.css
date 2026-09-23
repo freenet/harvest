@@ -158,11 +158,10 @@ body::before {
 
 .harvest-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  padding-bottom: var(--space-md);
-  margin-bottom: var(--space-xl);
-  border-bottom: 2px solid var(--color-wheat);
+  gap: var(--space-md);
+  padding-bottom: var(--space-sm);
 }
 
 .harvest-title-group {
@@ -184,10 +183,15 @@ body::before {
   letter-spacing: -0.02em;
 }
 
+/* Top-level pages: Stores / My purchases / My store (harvest#93 phase 2).
+   A row of text tabs under the title, underlined when current: the
+   difference is carried by weight and a rule, not by colour. */
 .harvest-nav {
   display: flex;
-  align-items: center;
-  gap: var(--space-sm);
+  gap: var(--space-lg);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-xl);
+  overflow-x: auto;
 }
 
 .harvest-status {
@@ -202,29 +206,31 @@ body::before {
 .harvest-status.connecting { color: var(--accent-warm); }
 .harvest-status.error { color: #b44; }
 
-.nav-btn {
+.nav-btn,
+.tab {
   font-family: var(--font-body);
-  font-size: 0.85rem;
+  font-size: 0.95rem;
   font-weight: 500;
-  padding: 0.4rem 0.9rem;
-  border-radius: var(--radius);
+  padding: 0.5rem 0 0.6rem;
+  margin-bottom: -1px;
   cursor: pointer;
-  transition: all 0.15s ease;
-  border: 1px solid var(--border);
+  border: none;
+  border-bottom: 2px solid transparent;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
-.nav-btn:hover {
-  background: var(--bg-card);
-  border-color: var(--accent);
-  color: var(--accent);
+.nav-btn:hover,
+.tab:hover {
+  color: var(--text-primary);
 }
 
-.nav-btn.active {
-  background: var(--accent);
-  color: var(--color-cream);
-  border-color: var(--accent);
+.nav-btn.active,
+.tab.active {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-bottom-color: var(--text-primary);
 }
 
 /* ---- Headings ---- */
@@ -957,4 +963,320 @@ h4 {
 .btc-tx-status {
   flex-shrink: 0;
   margin-left: auto;
+}
+
+/* ---- Shared small pieces (harvest#93 phase 2) ---- */
+
+.small {
+  font-size: 0.85rem;
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  color: var(--text-primary);
+}
+
+.harvest-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+
+.harvest-footer .link-btn {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.form-actions {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.form-input-short {
+  max-width: 16rem;
+}
+
+.card h3 {
+  margin-bottom: var(--space-sm);
+}
+
+.card > p + p,
+.card > p + div,
+.card > div + p {
+  margin-top: var(--space-sm);
+}
+
+/* ---- My store ---- */
+
+.dashboard-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+
+.dashboard-title {
+  margin-bottom: var(--space-sm);
+}
+
+.store-switcher {
+  width: auto;
+  max-width: 100%;
+}
+
+.tabs {
+  display: flex;
+  gap: var(--space-lg);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-lg);
+  overflow-x: auto;
+}
+
+.tab {
+  font-size: 0.9rem;
+}
+
+.need + .need {
+  margin-top: var(--space-sm);
+}
+
+.need .text-warning {
+  margin-bottom: var(--space-xs);
+}
+
+.checklist {
+  list-style: none;
+}
+
+.checklist li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: 0.2rem 0;
+}
+
+.checklist li::before {
+  content: "";
+  flex: none;
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 1px solid var(--text-muted);
+  border-radius: 2px;
+  transform: translateY(0.1rem);
+}
+
+.checklist li.done {
+  color: var(--text-muted);
+}
+
+.checklist li.done::before {
+  content: "\2713";
+  font-size: 0.7rem;
+  line-height: 0.75rem;
+  text-align: center;
+  border-color: var(--text-muted);
+}
+
+.share-row {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-xs);
+}
+
+.share-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.share-value {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+
+.steps {
+  margin: var(--space-md) 0 var(--space-md) 1.2rem;
+}
+
+.steps li + li {
+  margin-top: var(--space-sm);
+}
+
+.notice {
+  margin-top: var(--space-md);
+}
+
+.other-key {
+  padding: var(--space-sm) 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-sm);
+}
+
+.details-form {
+  margin-top: var(--space-sm);
+}
+
+/* ---- My store > Listings ---- */
+
+.seller-listing {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-md);
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+  margin-bottom: var(--space-sm);
+}
+
+.seller-listing-off {
+  background: transparent;
+}
+
+.seller-listing-off .seller-listing-title {
+  color: var(--text-muted);
+}
+
+.seller-listing-main {
+  min-width: 0;
+}
+
+.seller-listing-title {
+  margin-bottom: 0.1rem;
+}
+
+.seller-listing-meta {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.seller-listing-meta .listing-price {
+  font-size: 0.85rem;
+}
+
+.seller-listing-meta .sep {
+  color: var(--border);
+}
+
+.status-on {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.status-off {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.seller-listing-actions {
+  display: flex;
+  gap: var(--space-xs);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex: none;
+}
+
+/* ---- Store page ---- */
+
+.own-store-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-lg);
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.store-record {
+  margin: calc(-1 * var(--space-sm)) 0 var(--space-lg);
+}
+
+.listing-stock {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.listing-sold-out {
+  background: transparent;
+}
+
+.listing-sold-out h4,
+.listing-sold-out .listing-price {
+  color: var(--text-muted);
+}
+
+/* ---- My purchases ---- */
+
+.purchase-store-name {
+  margin-bottom: 0;
+}
+
+/* ---- Narrow screens ---- */
+
+@media (max-width: 600px) {
+  .harvest-app {
+    padding: var(--space-md) var(--space-md) var(--space-xl);
+  }
+
+  .harvest-title {
+    font-size: 1.4rem;
+  }
+
+  .harvest-nav,
+  .tabs {
+    gap: var(--space-md);
+  }
+
+  .card {
+    padding: var(--space-md);
+  }
+
+  .seller-listing {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .seller-listing-actions {
+    justify-content: flex-start;
+  }
+
+  .share-row {
+    grid-template-columns: 1fr;
+    gap: 0.1rem;
+  }
+
+  .store-header-inner {
+    flex-direction: column;
+  }
 }
