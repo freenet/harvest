@@ -227,6 +227,158 @@ fn fingerprint_of(vk: &VerifyingKey) -> String {
     bs58::encode(blake3::hash(vk.as_bytes()).as_bytes()).into_string()
 }
 
+// --- harvest#53 Phase C: the reputation record's re-addressing ------------
+
+/// A throwaway RSA public key (PKCS#1 DER) standing in for a store's record
+/// key. The RSA generations' contract parses it in `validate_state`, so it
+/// has to be a real key; nothing ever signed with its private half.
+const THROWAWAY_RSA_DER_HEX: &str = "3082010a0282010100b27faa28bf26a8ca2b29176d45f8bbd501eceaea7fa8bc9d5c56411194fd3bf68ee21e6576a8035e3786b418fd747d78fac7ba13c561f1f1bffe38749887d98b98be0ff960e9333decfe41f6402354bbaa0dbb8254b8770c426966b54b3752f03b1fb22e133ac076f9434a953540fe668fa71f12b4372e7115c9956f2383db314860e6096563b77d4afd7989e9aa0b13f71fa375eb4e35ce9f682f68cda8e28922a165734366d42446b02dc1d794a09b4d09ebcca455f31451736b54f88a735b62a13d182a7f333a56728a8abadd14360a03fb3411a6f8e6a6b35716cdd3c476b357adc0f184c661ea4e4ab8fd002b01ade77037e0fc9a2440da88a19918e40b0203010001";
+
+/// The last generation addressed by the RSA key and the Ghost Key, and the
+/// hash the registry must give it.
+const REPUTATION_PLANT_AT: (u32, &str) = (
+    15,
+    "78ae80d2bcb3e80299a977da3a437a44cced8b74367f53d24e407c2b171d362e",
+);
+
+/// The RSA generations' parameters, written out independently of
+/// `migrate.rs`'s copy for the reason `LegacyStoreParameters` gives.
+#[derive(serde::Serialize)]
+struct RsaReputationParameters {
+    rsa_public_key_der: Vec<u8>,
+    owner_verifying_key: VerifyingKey,
+}
+
+/// The RSA generations' state, as every live record holds it: the seller's
+/// certificate and no feedback (no producer of a feedback entry ever
+/// shipped).
+#[derive(serde::Serialize)]
+struct RsaGenerationReputationState {
+    owner_certificate_pem: String,
+    feedback: Vec<()>,
+    used_nonces: Vec<[u8; 32]>,
+}
+
+/// Scenario 4: a V15 reputation record holding the seller's certificate is
+/// found through `migrate::reputation_candidates` (Option A: the RSA key as
+/// a legacy address input only), folded by `ReputationOps`, and the
+/// certificate lands at the record the store key addresses under this
+/// build.
+async fn scenario_reputation(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 4: a V15 reputation record's certificate is carried to the store-key record ==");
+    let (generation, want) = REPUTATION_PLANT_AT;
+    let row = migrate::reputation_lineage()
+        .iter()
+        .find(|e| e.generation == generation)
+        .expect("the registry declares V15");
+    assert_eq!(hex::encode(row.code_hash), want, "V15 no longer has the hash planted at");
+    assert_eq!(
+        migrate::LAST_RSA_REPUTATION_PARAM_GENERATION, generation,
+        "V15 is the last RSA-addressed generation"
+    );
+    let v15 = legacy_wasm_from_git(repo, "reputation_contract", want);
+    let current = read_wasm(&repo.join("ui/public/contracts/reputation_contract.wasm"));
+
+    let store = SigningKey::from_bytes(&[0x5C; 32]).verifying_key();
+    let ghost = SigningKey::from_bytes(&[0x6D; 32]).verifying_key();
+    let record_der = hex::decode(THROWAWAY_RSA_DER_HEX).unwrap();
+    // A second key that addressed nothing: the per-device key of a store
+    // made after harvest#93 1b, which every walk also tries.
+    let mut per_device_der = record_der.clone();
+    let last = per_device_der.len() - 1;
+    per_device_der[last] ^= 1;
+
+    let rsa_params = Parameters::from(
+        harvest_common::to_cbor(&RsaReputationParameters {
+            rsa_public_key_der: record_der.clone(),
+            owner_verifying_key: ghost,
+        })
+        .unwrap(),
+    );
+    let (v15_container, v15_id) = container(&v15, rsa_params);
+    let current_params =
+        migrate::encode_params(&migrate::reputation_params(&store)).expect("encode");
+    let (curr_container, curr_id) = container(&current, current_params.clone());
+    assert_eq!(migrate::current_id(&code_hash(&current), &current_params), curr_id);
+    println!("  V15 record (stdlib key derivation): {v15_id}");
+    println!("  store-key record under this build:  {curr_id}");
+
+    // The walk reaches the node's own address for V15, from the record key,
+    // and does not list the registration's id a second time when it is the
+    // same record.
+    let locators = || migrate::ReputationLocators {
+        store_key: store,
+        ghost_key: ghost,
+        rsa_public_keys: vec![per_device_der.clone(), record_der.clone()],
+        registered_id: Some(v15_id),
+    };
+    let ids = migrate::reputation_candidate_ids(&locators()).expect("derive");
+    assert!(ids.contains(&v15_id), "the walk must reach the V15 record");
+    assert_eq!(ids.iter().filter(|i| **i == v15_id).count(), 1, "no duplicate");
+    assert!(!ids.contains(&curr_id), "the successor is not its own predecessor");
+    println!("  {} candidates, V15 record at position {}", ids.len(), ids.iter().position(|i| *i == v15_id).unwrap());
+
+    const CERT: &str = "-----BEGIN REHEARSAL SELLER CERT-----";
+    let planted = harvest_common::to_cbor(&RsaGenerationReputationState {
+        owner_certificate_pem: CERT.into(),
+        feedback: Vec::new(),
+        used_nonces: Vec::new(),
+    })
+    .unwrap();
+    println!("  PUT the V15 record ({} bytes) ...", planted.len());
+    node.put(v15_container, planted).await.expect("PUT V15 record (the V15 contract accepts it)");
+    match node.get(v15_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 =
+                harvest_common::from_cbor(&bytes).expect("an RSA-generation state decodes as the new type");
+            println!("  read back V15: certificate {:?}, {} complaints", s.owner_certificate_pem, s.complaints.len());
+            assert_eq!(s.owner_certificate_pem, CERT);
+        }
+        other => panic!("V15 record did not read back: {other:?}"),
+    }
+
+    println!("\n  -- probe as the current build --");
+    let params = migrate::reputation_params(&store);
+    let mut session = ProbeSession::start_with_candidates(
+        migrate::ReputationOps { params: params.clone() },
+        harvest_common::reputation::ReputationStateV1::default(),
+        migrate::reputation_candidates(&locators()).expect("candidates"),
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        match node.get(candidate).await {
+            GetOutcome::State(bytes) => {
+                println!("  GET {candidate} -> state, {} bytes", bytes.len());
+                session.on_state(candidate, &bytes)
+            }
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    let (outcome, seal) = session.take_result().expect("probe finished");
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, v15_id, "the V15 record is the source");
+    assert_eq!(merged.owner_certificate_pem, CERT, "the certificate is carried");
+    assert!(merged.complaints.is_empty());
+
+    let forward = harvest_common::to_cbor(merged).unwrap();
+    println!("  PUT forward to {curr_id} ({} bytes) ...", forward.len());
+    node.put(curr_container, forward).await.expect("the current contract accepts the carried record");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            println!("  store-key record now: certificate {:?}, {} complaints", s.owner_certificate_pem, s.complaints.len());
+            assert_eq!(s.owner_certificate_pem, CERT, "the certificate is at the store-key record");
+        }
+        other => panic!("the store-key record did not read back: {other:?}"),
+    }
+    println!("  SCENARIO 4 PASSED: the V15 certificate is at the store-key record");
+}
+
 // --- the node ------------------------------------------------------------
 
 #[derive(Debug)]
@@ -523,6 +675,11 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // code is a prefix of, not the encoding. Superseded by harvest#93 phase
         // 1a (a store key owns the store).
         (18, Code),
+        // V19 (`b5eddce7`) and V20 (`9e0561ce`) were missed the same way, and
+        // added with harvest#53 Phase C when this harness next ran. Neither
+        // touched `StoreParameters`: still the store code.
+        (19, Code),
+        (20, Code),
     ]
 };
 
@@ -639,6 +796,15 @@ async fn main() {
     );
 
     let mut node = Node::connect().await;
+
+    // `REHEARSAL_ONLY=reputation` runs scenario 4 alone (harvest#53 Phase C),
+    // so the reputation re-addressing can be rehearsed without the store
+    // scenarios' own preconditions.
+    if std::env::var("REHEARSAL_ONLY").as_deref() == Ok("reputation") {
+        scenario_reputation(&mut node, &repo).await;
+        println!("\nSCENARIO 4 ONLY: PASSED");
+        return;
+    }
 
     // ================= scenario 1: populated predecessors =================
     println!("\n== scenario 1: populated predecessor generations ==");
@@ -872,6 +1038,8 @@ async fn main() {
         migrate::marker_key(Artifact::Store, &s_curr_id, &current_hash)
     );
     assert!(!would_write_marker);
+
+    scenario_reputation(&mut node, &repo).await;
 
     // ============ scenario 3: the durable marker, on the live delegate ============
     println!("\n== scenario 3: the repeat gate's marker, against the real delegate ==");
