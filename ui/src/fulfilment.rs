@@ -194,7 +194,7 @@ fn extra_confirmations(order: &AuthorizedOrder) -> u32 {
 /// window could first become provable: the window's last block plus the
 /// confirmations the order requires beyond it. `None` for an order with no
 /// anchor, which no on-chain payment can settle.
-fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
+pub(crate) fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
     let window = order.order.payment_window()?;
     Some(window.end().saturating_add(extra_confirmations(order)))
 }

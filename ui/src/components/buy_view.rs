@@ -834,6 +834,9 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // fixes it. The seller's inbox offers a keyed request afresh even
         // beside an unkeyed order (`message_view::unanswered_requests`).
         PaymentBlocker::CommitmentLacksBuyerKey => Remedy::AskAgain,
+        // The thread the order was agreed in is gone; a new request starts a
+        // new one.
+        PaymentBlocker::ConversationForgotten => Remedy::AskAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown

@@ -2005,6 +2005,12 @@ pub enum PaymentBlocker {
     /// buyer's only capability to complain. See
     /// `docs/buyer-conversation-persistence.md`.
     ConversationNotKept,
+    /// A kept purchase whose conversation this node no longer holds: the
+    /// buyer forgot it, or it was evicted (256 are kept). The kept record
+    /// still carries the receipt seed, so a paid purchase keeps its
+    /// complaint (R2-5); what is gone is the thread the order was agreed in,
+    /// so no payment details are shown for an unpaid one.
+    ConversationForgotten,
     /// This node's delegate does not yet hold its own copy of this order for
     /// this conversation (`docs/complaint-threat-model.md` section 3.1).
     ///
@@ -2121,6 +2127,11 @@ impl PaymentBlocker {
                  the key that reads this conversation. Pay now and you may not be able to read \
                  what the seller sends afterwards. Send the seller a message to try again."
                 .to_string(),
+            PaymentBlocker::ConversationForgotten => "The conversation this order came from is no \
+                 longer on this node, so no payment details are shown. Your node still keeps \
+                 its copy of the order: if you have paid, it is still your purchase once the \
+                 payment is seen."
+                .to_string(),
             PaymentBlocker::PurchaseNotKept => "Your node has not yet kept its own copy of this \
                  order, which is what a complaint about it would rest on. Pay this order to \
                  keep it; the payment details appear once it is kept."
@@ -2208,7 +2219,9 @@ impl BuyerPurchase {
             | PaymentBlocker::CommitmentNotForThisBuyer
             | PaymentBlocker::CommitmentLacksBuyerKey
             | PaymentBlocker::CommitmentNotRequested
-            | PaymentBlocker::NotAwaitingPayment(_) => false,
+            | PaymentBlocker::NotAwaitingPayment(_)
+            // The cancel is signed with the conversation's key, which is gone.
+            | PaymentBlocker::ConversationForgotten => false,
             PaymentBlocker::NoTrustedBridge
             | PaymentBlocker::BridgeNotRecognised(_)
             | PaymentBlocker::DestinationDisagrees
@@ -5373,6 +5386,15 @@ impl AppState {
                 if message.addressing != Addressing::ToBuyer {
                     continue;
                 }
+                // A kept purchase is filed under the conversation the delegate
+                // kept it for, whichever thread an acceptance names it in: the
+                // loop below adds it there (review round 3, P3).
+                if store.owner.is_some_and(|owner| {
+                    self.kept_copy(&owner, &order_id)
+                        .is_some_and(|kept| kept.conversation != conversation.buyer_public_key)
+                }) {
+                    continue;
+                }
                 let candidate = self.judge_purchase(
                     store,
                     Some(conversation),
@@ -5407,6 +5429,12 @@ impl AppState {
         if let Some(owner) = store.owner {
             for kept in self.kept_purchases.iter().filter(|k| k.store_key == owner) {
                 if purchases.iter().any(|p| p.order_id == kept.order.order.id) {
+                    continue;
+                }
+                // An unpaid keep whose last settling block has passed with no
+                // payment in sight is over: nothing left to pay or complain
+                // about (review round 3, P3).
+                if self.kept_unpaid_lapsed(kept) {
                     continue;
                 }
                 let conversation = store
@@ -5450,10 +5478,11 @@ impl AppState {
             .or_else(|| kept.map(|kept| kept.order.clone()));
         let blockers = match conversation {
             Some(conversation) => self.payment_blockers(store, conversation, commitment.as_ref()),
-            // The conversation is gone, and with it the key that reads what
-            // the seller says. A paid purchase is still shown paid, from
-            // `paid`, whatever this says.
-            None => vec![PaymentBlocker::ConversationNotKept],
+            // The conversation is gone (only a kept purchase is listed without
+            // one). Not `ConversationNotKept`, whose remedy is to send a
+            // message (review round 3, P3). A paid purchase is still shown
+            // paid, from `paid`, whatever this says.
+            None => vec![PaymentBlocker::ConversationForgotten],
         };
         BuyerPurchase {
             order_id,
@@ -6521,6 +6550,7 @@ impl AppState {
         for kept in self.kept_purchases.iter().filter(|kept| {
             kept.store_key == owner
                 && kept.order.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                && !self.kept_unpaid_lapsed(kept)
         }) {
             for id in self.kept_order_address_instances(&kept.order.order) {
                 if !ids.contains(&id) {
@@ -6559,11 +6589,9 @@ impl AppState {
     pub fn kept_address_contracts_to_watch(&self) -> Vec<([u8; 32], BitcoinNetwork)> {
         use harvest_common::payment::OrderStatus;
         let mut ids: Vec<([u8; 32], BitcoinNetwork)> = Vec::new();
-        for kept in self
-            .kept_purchases
-            .iter()
-            .filter(|kept| kept.order.status == OrderStatus::AwaitingPayment)
-        {
+        for kept in self.kept_purchases.iter().filter(|kept| {
+            kept.order.status == OrderStatus::AwaitingPayment && !self.kept_unpaid_lapsed(kept)
+        }) {
             for id in self.kept_order_address_instances(&kept.order.order) {
                 if !ids.iter().any(|(held, _)| *held == id) {
                     ids.push((id, kept.order.order.network));
@@ -6839,6 +6867,14 @@ impl AppState {
                 if !wanted.contains(&id) {
                     wanted.push(id);
                 }
+            }
+        }
+        // And every kept unpaid order's, whether or not its store is loaded
+        // (review round 3, P3): a stale first answer hides the payment the
+        // upgrade needs as surely as it hides a store order's.
+        for (id, _) in self.kept_address_contracts_to_watch() {
+            if !wanted.contains(&id) {
+                wanted.push(id);
             }
         }
         let due = self.bitcoin.address_rereads.due(&wanted, now_ms);
@@ -7300,7 +7336,13 @@ impl AppState {
         // write to, or a payment would never be seen (TM-A). Compared
         // against the same signed pointer the seller's `order_for_invoice`
         // issues from.
+        // Not for an order already kept: both builds are watched for it
+        // (model 3.2), and after a redeploy this would read as "ask for it
+        // again", inviting a second payment (review round 3, P3). An order
+        // already paid returned above.
+        let kept = self.holds_kept_copy(store, conversation, &commitment.order.id);
         match self.bitcoin.address_generation.code_hash() {
+            _ if kept => {}
             Some(current) if commitment.order.bitcoin_address_code_hash == Some(current) => {}
             Some(_) => blockers.push(PaymentBlocker::AddressContractNotCurrent {
                 generation_known: true,
@@ -7318,10 +7360,30 @@ impl AppState {
         }
         // And last of all, the one the buyer clears by pressing "Pay this
         // order" (model section 3.1).
-        if !self.holds_kept_copy(store, conversation, &commitment.order.id) {
+        if !kept {
             blockers.push(PaymentBlocker::PurchaseNotKept);
         }
         blockers
+    }
+
+    /// Whether `kept` is an unpaid keep whose last settling block has passed
+    /// with no covering payment in sight: nothing will settle it now, so it
+    /// is not watched, re-read or shown (review round 3, P3; model 3.2).
+    /// Unknown until the tip is known.
+    fn kept_unpaid_lapsed(&self, kept: &harvest_common::delegate::KeptPurchase) -> bool {
+        use harvest_common::payment::OrderStatus;
+        if kept.order.status != OrderStatus::AwaitingPayment {
+            return false;
+        }
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&kept.order.order.network)
+            .and_then(|tip| tip.tip_height);
+        match (tip, crate::fulfilment::last_settling_block(&kept.order)) {
+            (Some(tip), Some(last)) => tip > last && !self.payment_sight(&kept.order).covered,
+            _ => false,
+        }
     }
 
     /// Whether this node's delegate keeps a copy of order `order_id` of
@@ -22816,10 +22878,9 @@ mod buy_flow_tests {
                 "the delegate's kept copy",
                 Box::new(|s: &mut AppState| s.kept_purchases.clear()),
             ),
-            (
-                "the bridges' address-contract pointer",
-                Box::new(|s: &mut AppState| s.bitcoin.address_generation = Default::default()),
-            ),
+            // The bridges' address-contract pointer is not an input once the
+            // order is kept (both builds are watched, review round 3); before
+            // keep it is, see the check after this loop.
             (
                 "the store's identity key",
                 Box::new(|s: &mut AppState| {
@@ -22877,6 +22938,15 @@ mod buy_flow_tests {
         // out, because a fresh one carries a fresh `conversation_id` and the
         // acceptance then cannot be read at all -- safe, but for the wrong
         // reason, which would make this case prove nothing.
+        // The bridges' address-contract pointer, for an order not yet kept.
+        let (mut unkept, _) = buyer_after_acceptance(&order);
+        unkept.bitcoin.address_generation = Default::default();
+        assert!(purchases(&unkept)[0].blockers.contains(
+            &PaymentBlocker::AddressContractNotCurrent {
+                generation_known: false
+            }
+        ));
+
         let (mut not_kept, _) = buyer_after_acceptance_with(&order, false);
         not_kept.kept_purchases = vec![kept(&order)];
         assert!(
@@ -27041,6 +27111,94 @@ mod buy_flow_tests {
         assert!(state.keep_requests.is_empty(), "frozen by its complaint");
     }
 
+    /// **A kept purchase is filed under the conversation it was kept for**
+    /// (review round 3, P3): with that conversation forgotten and a stray
+    /// thread carrying an acceptance naming the order, the purchase is filed
+    /// under the kept conversation, with the forgotten-conversation blocker
+    /// rather than "send a message" or "not issued to you". Red if the
+    /// acceptance's thread decides, or the blocker is `ConversationNotKept`.
+    #[test]
+    fn a_kept_purchase_is_filed_under_its_kept_conversation() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        let real = the_buyers_conversation().buyer_public_key;
+        let mut stray =
+            BuyerConversation::opened_from_secret_for_test(&[42u8; 32], &seller_encryption_key())
+                .expect("open");
+        stray.mark_kept();
+        let stray_tag = stray.buyer_public_key;
+        let misdirected = crate::messaging::seal_order_accepted(
+            &seller_keys_for(&stray_tag),
+            &stray_tag,
+            &stray.conversation_id,
+            &unpaid.order.id,
+        )
+        .expect("seal");
+        let store = state.browsing_stores.get_mut(STORE).expect("store");
+        store.conversations = vec![stray];
+        store.mailbox_messages.push(misdirected);
+
+        let held = purchases(&state);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].conversation, real, "the kept conversation");
+        assert_eq!(
+            held[0].blockers,
+            vec![PaymentBlocker::ConversationForgotten]
+        );
+        assert!(!held[0].cancellable());
+    }
+
+    /// **A kept order is not told its address contract is out of date**
+    /// (review round 3, P3): both builds are watched for it, and "ask for it
+    /// again" after a redeploy would invite a second payment. Red if the
+    /// check applies to kept orders.
+    #[test]
+    fn a_kept_order_is_not_refused_after_a_redeploy() {
+        let (mut state, _, _, _) = a_kept_unpaid_purchase();
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([9u8; 32]);
+        assert!(
+            purchases(&state)[0].blockers.is_empty(),
+            "{:?}",
+            purchases(&state)[0].blockers
+        );
+    }
+
+    /// **A lapsed unpaid keep is not watched, re-read or shown** (review
+    /// round 3, P3; model 3.2): once its last settling block has passed with
+    /// no payment in sight, nothing can settle it. Red if it stays watched or
+    /// listed.
+    #[test]
+    fn a_lapsed_unpaid_keep_is_not_watched_or_shown() {
+        let (mut state, unpaid, _, _) = a_kept_unpaid_purchase();
+        state.browsing_stores.get_mut(STORE).unwrap().orders.clear();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .clear();
+        assert_eq!(purchases(&state).len(), 1, "listed while it can settle");
+        assert!(!state.kept_address_contracts_to_watch().is_empty());
+        let own = unpaid.order.bitcoin_address_instance_id().unwrap();
+        assert!(
+            state.due_address_rereads(0).0.contains(&own),
+            "re-read while it can settle"
+        );
+
+        let last = crate::fulfilment::last_settling_block(&unpaid).expect("anchored");
+        move_tip_to(&mut state, last + 1);
+        assert!(purchases(&state).is_empty(), "not shown");
+        assert!(
+            state.kept_address_contracts_to_watch().is_empty(),
+            "not watched"
+        );
+        assert!(state.address_contracts_to_watch(STORE).is_empty());
+        assert!(
+            !state.due_address_rereads(0).0.contains(&own),
+            "not re-read"
+        );
+    }
+
     /// **The upgrade's proof is built over the union of the claims** (review
     /// round 3, TM-D): a store `Paid` copy carrying only a payment the seller
     /// made to its own address, plus the address claims showing the buyer's
@@ -27485,6 +27643,7 @@ mod payment_blocker_wording_tests {
                 generation_known: false,
             },
             PaymentBlocker::ConversationNotKept,
+            PaymentBlocker::ConversationForgotten,
             PaymentBlocker::PurchaseNotKept,
         ];
 
@@ -27516,6 +27675,7 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::UnfitForComplaint(_)
                 | PaymentBlocker::AddressContractNotCurrent { .. }
                 | PaymentBlocker::ConversationNotKept
+                | PaymentBlocker::ConversationForgotten
                 | PaymentBlocker::PurchaseNotKept => {}
             }
             seen.insert(std::mem::discriminant(blocker));
@@ -27534,7 +27694,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 22;
+    const EVERY_BLOCKER: usize = 23;
 
     /// **Every blocker says something, and says it as prose.**
     ///
