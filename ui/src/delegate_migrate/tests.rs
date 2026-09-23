@@ -118,7 +118,10 @@ impl DelegateCalls for Fake {
                 // sealed, as the real delegate does.
                 HarvestDelegateRequest::ImportMigratedSecret {
                     predecessor, key, ..
-                } if key.starts_with(b"harvest:folded:") && !node.garbled_imports => {
+                } if key.starts_with(b"harvest:folded:")
+                    && !node.garbled_imports
+                    && node.retry_key.as_ref() != Some(&key) =>
+                {
                     node.staged
                         .entry(predecessor)
                         .or_default()
@@ -738,4 +741,29 @@ fn a_retryably_unfinished_carrier_stops_the_walk() {
         None,
         "V16, folded into V17, is not walked while V17 is only waiting on a retry"
     );
+}
+
+/// The same when it is the travelling record's OWN write that is waiting on
+/// a retry. Mutated red by counting only a written record as staged.
+#[test]
+fn a_carrier_whose_travelling_record_is_waiting_on_a_retry_stops_the_walk() {
+    let fake = Fake::default();
+    {
+        let mut node = fake.0.borrow_mut();
+        node.retry_key = Some(folded(&generation(16)));
+        node.old.insert(
+            generation(17),
+            Old::Holds(vec![(folded(&generation(16)), b"1".to_vec())]),
+        );
+        node.old.insert(
+            generation(16),
+            Old::Holds(vec![(
+                b"harvest:buyer_conv:s:forgotten".to_vec(),
+                b"conv".to_vec(),
+            )]),
+        );
+    }
+    let out = outcome(&fake);
+    assert!(out.walk.halted, "{}", summarize(&out.report));
+    assert_eq!(secret(&fake, "harvest:buyer_conv:s:forgotten"), None);
 }

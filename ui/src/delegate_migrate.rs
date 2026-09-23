@@ -298,7 +298,8 @@ pub struct Walk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Carrier {
     pub predecessor: [u8; 32],
-    /// It carried at least one travelling record.
+    /// It carried at least one travelling record that was not refused
+    /// permanently (staged, or waiting on a retry).
     pub staged: bool,
     /// At least one of its items failed for a reason a retry may fix, or its
     /// seal failed.
@@ -602,7 +603,12 @@ impl<T: DelegateCalls> SuccessorSecretsIo for Successor<T> {
                 walk.written.push(item.key.to_vec());
             }
             let carrier = walk.carrier_for(predecessor);
-            if item.key.starts_with(b"harvest:folded:") && outcome == SecretImport::Written {
+            // Any answer but a permanent refusal: a travelling record whose
+            // own write is only waiting on a retry is as unresolved as one
+            // staged and not yet sealed.
+            if item.key.starts_with(b"harvest:folded:")
+                && !matches!(outcome, SecretImport::Permanent(_))
+            {
                 carrier.staged = true;
             }
             if matches!(outcome, SecretImport::Retryable(_)) {
