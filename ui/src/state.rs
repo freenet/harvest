@@ -53,9 +53,13 @@ pub struct AppState {
     ///
     /// Doubles as the "already asked" record (`register_store_mailbox`), so
     /// an entry here means both "this is the mailbox's owning store" and
-    /// "we have sent (or are still trying to send) its subscribe". Only
-    /// [`AppState::on_mailbox_subscribe_failed`] may remove an entry, and
-    /// only within its retry budget -- see `mailbox_subscribe_failures`.
+    /// "we have sent (or are still trying to send) its subscribe". Two things
+    /// may remove an entry: [`AppState::on_mailbox_subscribe_failed`], only
+    /// once its retry budget is spent (see `mailbox_subscribe_failures`), and
+    /// [`AppState::adopt_migrated_contract_id`], when a migration has
+    /// superseded the mailbox itself -- its successor is registered in the
+    /// same step, and two mailboxes routed to one store would overwrite each
+    /// other's `mailbox_messages`.
     pub mailbox_to_store: HashMap<Vec<u8>, Vec<u8>>,
     /// How many times a mailbox's subscribe has failed to SEND, keyed by
     /// mailbox contract id (#107, marker sweep).
@@ -3472,6 +3476,21 @@ impl AppState {
     /// as it should: a durable write is newer than our in-memory guess. The
     /// masking is therefore self-limiting, confined to the one value the
     /// probe has positively established is stale.
+    ///
+    /// # Why the routing is redone here, and not left to `StoreList`
+    ///
+    /// A registration's mailbox is routed (`mailbox_to_store`, the store's
+    /// `mailbox_contract_id`, the subscribe) only by
+    /// [`AppState::route_own_store`], and that used to run from the
+    /// `StoreList` handler alone. On a load after a re-key the local
+    /// delegate answers `ListStores` before this runs -- this waits for the
+    /// forward PUT's round trip -- so the PREDECESSOR mailbox was routed, the
+    /// repoint below moved only `my_stores`, and the successor mailbox, the
+    /// one buyers now write to, was dropped as belonging to no store. Every
+    /// load went the same way until a second `ListStores` (harvest#148). So
+    /// each registration this repoint changes is routed again here, and the
+    /// routing table is repointed with it: both orders now end in the same
+    /// state.
     pub fn adopt_migrated_contract_id(&mut self, predecessor: &[u8], successor: Vec<u8>) {
         if predecessor == successor {
             return;
@@ -3488,8 +3507,11 @@ impl AppState {
         self.withheld_settlements
             .retain(|_, (store, _)| store.as_slice() != predecessor);
 
+        // The (store, mailbox) pairs whose routing this repoint changes.
+        let mut rerouted: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for stores in self.my_stores.values_mut() {
             for registration in stores.iter_mut() {
+                let mut moved = false;
                 if registration.store_contract_id == predecessor {
                     registration.store_contract_id = successor.clone();
                     // The recorded key belonged to the predecessor's code
@@ -3497,15 +3519,53 @@ impl AppState {
                     // rebuild from the bundled contract, which is the right
                     // answer for the current generation.
                     registration.store_contract_key = None;
+                    moved = true;
                 }
                 if registration.reputation_contract_id == predecessor {
                     registration.reputation_contract_id = successor.clone();
                 }
                 if registration.mailbox_contract_id == predecessor {
                     registration.mailbox_contract_id = successor.clone();
+                    moved = true;
+                }
+                if moved {
+                    rerouted.push((
+                        registration.store_contract_id.clone(),
+                        registration.mailbox_contract_id.clone(),
+                    ));
                 }
             }
         }
+
+        // The routing table, before the re-route reads it. A superseded
+        // mailbox leaves it: its successor takes its place below. A
+        // superseded store keeps its mailboxes, under the successor's id.
+        self.mailbox_to_store.remove(predecessor);
+        for owner in self.mailbox_to_store.values_mut() {
+            if owner.as_slice() == predecessor {
+                *owner = successor.clone();
+            }
+        }
+        for (store, mailbox) in rerouted {
+            self.route_own_store(&store, &mailbox);
+        }
+    }
+
+    /// Subscribe to one of our own stores and route its mailbox: what every
+    /// registration needs after a reload, and after a migration moves it.
+    ///
+    /// Nothing else re-fetches a seller's own store after a reload: it is
+    /// subscribed at creation time and never again, so without this the
+    /// Browse tab is empty for the very seller who owns the store. Both
+    /// halves are idempotent (`note_store_subscribed`,
+    /// `register_store_mailbox`), so the `StoreList` answer and
+    /// [`AppState::adopt_migrated_contract_id`] can both call it, in either
+    /// order.
+    pub(crate) fn route_own_store(&mut self, store_contract_id: &[u8], mailbox_contract_id: &[u8]) {
+        if self.note_store_subscribed(store_contract_id) {
+            subscribe_to_own_store(store_contract_id.to_vec());
+        }
+        self.register_store_mailbox(store_contract_id, mailbox_contract_id);
     }
 
     /// Fold the delegate's answer to `ListStores` into what we already know,
@@ -3767,6 +3827,15 @@ impl AppState {
             }
             // Already ours: every `StoreList` answer re-registers, and the
             // map doubles as the record of what we have already asked for.
+            // The store's own record of its mailbox is set all the same: a
+            // migration that moved the store and not the mailbox reaches
+            // here under the successor store's id, whose entry has never
+            // been told (harvest#148). Seller replies and invoice accepts
+            // read it.
+            self.browsing_stores
+                .entry(store_contract_id.to_vec())
+                .or_default()
+                .mailbox_contract_id = Some(mailbox_contract_id.to_vec());
             return;
         }
 
@@ -10255,10 +10324,7 @@ impl AppState {
                 // recover (#99 review).
                 self.start_custody_where_needed();
 
-                // Nothing else re-fetches these after a reload: the seller's
-                // own store is subscribed at creation time and never again,
-                // so without this the Browse tab is empty for the very seller
-                // who owns the store.
+                // See `route_own_store`.
                 let registrations: Vec<(Vec<u8>, Vec<u8>)> = self
                     .my_stores
                     .get(&ghostkey_fingerprint)
@@ -10270,10 +10336,7 @@ impl AppState {
                     })
                     .unwrap_or_default();
                 for (store_contract_id, mailbox_contract_id) in registrations {
-                    if self.note_store_subscribed(&store_contract_id) {
-                        subscribe_to_own_store(store_contract_id.clone());
-                    }
-                    self.register_store_mailbox(&store_contract_id, &mailbox_contract_id);
+                    self.route_own_store(&store_contract_id, &mailbox_contract_id);
                 }
 
                 // A store owned by a store key (harvest#93) is found at its
@@ -12802,6 +12865,94 @@ mod tests {
             stores[0].mailbox_contract_id,
             vec![11u8; 32],
             "nor its mailbox -- this is the id the seller's messages arrive at"
+        );
+    }
+
+    /// The routing a seller's inbox depends on, after a re-key that moved
+    /// the store (1 -> 9) and its mailbox (3 -> 11).
+    fn assert_routed_to_successor(state: &AppState, order: &str) {
+        assert_eq!(
+            state.mailbox_to_store.get(&vec![11u8; 32]),
+            Some(&vec![9u8; 32]),
+            "{order}: the successor mailbox, where buyers now write, routes to the successor store"
+        );
+        assert_eq!(
+            state
+                .browsing_stores
+                .get(&vec![9u8; 32])
+                .and_then(|store| store.mailbox_contract_id.clone()),
+            Some(vec![11u8; 32]),
+            "{order}: seller replies and invoice accepts go to the successor mailbox"
+        );
+        assert!(
+            !state.mailbox_to_store.contains_key(&vec![3u8; 32]),
+            "{order}: the superseded mailbox routes nowhere, or two mailboxes overwrite one store's messages"
+        );
+        assert!(
+            state.subscribed_stores.contains(&vec![9u8; 32]),
+            "{order}: the successor store is fetched"
+        );
+    }
+
+    /// harvest#148, the order every load after a re-key takes: the local
+    /// delegate's `StoreList` arrives BEFORE the migration adopts (the adopt
+    /// waits for the forward PUT's round trip). The predecessor mailbox was
+    /// routed and the successor dropped as "belongs to no store we know",
+    /// every load, until a second `ListStores`. Mutated red by removing the
+    /// re-route from `adopt_migrated_contract_id` (fails at the first
+    /// assert), by removing the `mailbox_to_store.remove(predecessor)`, and
+    /// by dropping the `browsing_stores` write from the "already ours" arm.
+    #[test]
+    fn a_migration_after_the_store_list_routes_the_successor_mailbox() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+        assert_eq!(state.mailbox_to_store[&vec![3u8; 32]], vec![1u8; 32]);
+
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+        state.adopt_migrated_contract_id(&[2u8; 32], vec![10u8; 32]);
+        state.adopt_migrated_contract_id(&[3u8; 32], vec![11u8; 32]);
+
+        assert_routed_to_successor(&state, "store list, then adopt");
+    }
+
+    /// The same moves, the mailbox's walk finishing before the store's.
+    #[test]
+    fn a_mailbox_migration_before_the_store_migration_routes_the_same() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+
+        state.adopt_migrated_contract_id(&[3u8; 32], vec![11u8; 32]);
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+
+        assert_routed_to_successor(&state, "mailbox adopted first");
+    }
+
+    /// The other order, which already worked: adopt first, then the stale
+    /// `StoreList` answer is rewritten on the way in. Pinned so the fix for
+    /// the first order cannot break it.
+    #[test]
+    fn a_store_list_after_the_migration_routes_the_successor_mailbox() {
+        let mut state = AppState::default();
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+        state.adopt_migrated_contract_id(&[3u8; 32], vec![11u8; 32]);
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+
+        assert_routed_to_successor(&state, "adopt, then store list");
+    }
+
+    /// A store that moved while its mailbox did not keeps its mailbox,
+    /// under the successor's id, and its record of the mailbox follows.
+    #[test]
+    fn a_store_migration_alone_keeps_its_mailbox_routed() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![registration(1, None)]));
+
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+
+        assert_eq!(state.mailbox_to_store[&vec![3u8; 32]], vec![9u8; 32]);
+        assert_eq!(
+            state.browsing_stores[&vec![9u8; 32]].mailbox_contract_id,
+            Some(vec![3u8; 32])
         );
     }
 
