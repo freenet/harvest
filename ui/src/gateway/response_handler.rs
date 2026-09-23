@@ -186,24 +186,22 @@ fn handle_contract_response(response: ContractResponse) {
     }
 }
 
-/// If the state bytes deserialize as a StoreStateV1, extract the reputation
-/// contract ID so we can subscribe to it automatically.
+/// If the state bytes deserialize as a StoreStateV1, the reputation record
+/// its store key addresses, so we can subscribe to it automatically.
+///
+/// Derived from the store's OWNER key (harvest#53 Phase C), which the store
+/// contract authenticates against its own address, rather than read from the
+/// details' `reputation_contract_id`: every store published before Phase C
+/// names an RSA generation's record there, and a version-0 detail is signed
+/// by nobody. `AppState::on_contract_state` derives the same id through the
+/// same function, which is what matches the record's state to its store.
 fn check_for_reputation_link(state_bytes: &[u8]) -> Option<Vec<u8>> {
     let store_state =
         harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(state_bytes).ok()?;
-    // Version 0 is "no details published", and nothing signs it. A store
-    // written before the PR #82 re-review can carry any reputation id there,
-    // so following it would subscribe to whatever contract a third party
-    // named. Only signed details are followed.
-    if store_state.info.info.version == 0 {
-        return None;
-    }
-    let reputation_id = store_state.info.info.reputation_contract_id;
-    // Don't follow if it's all zeros (uninitialized)
-    if reputation_id == [0u8; 32] {
-        return None;
-    }
-    Some(reputation_id.to_vec())
+    let owner = store_state.owner?;
+    super::store_ops::reputation_instance_id(&owner)
+        .ok()
+        .map(|id| id.as_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -309,19 +307,28 @@ mod tests {
         assert_eq!(waiting.try_recv(), Ok(Some(Primed::Held)));
     }
 
-    /// An unsigned version-0 reputation id is not followed; a signed one is
-    /// (PR #82 round-3 review).
+    /// The record followed is the one the store KEY addresses, whatever id
+    /// the details name, and a store with no owner key links to nothing
+    /// (harvest#53 Phase C).
     #[test]
-    fn only_a_signed_reputation_link_is_followed() {
+    fn the_reputation_link_is_the_store_keys_record() {
         let mut state = harvest_common::store::StoreStateV1::default();
         state.info.info.reputation_contract_id = [0xBB; 32];
+        state.info.info.version = 1;
         let bytes =
             |s: &harvest_common::store::StoreStateV1| harvest_common::to_cbor(s).expect("encode");
-        assert_eq!(check_for_reputation_link(&bytes(&state)), None);
-        state.info.info.version = 1;
-        assert_eq!(
+        assert_eq!(check_for_reputation_link(&bytes(&state)), None, "no owner");
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        state.owner = Some(owner);
+        let expected = super::super::store_ops::reputation_instance_id(&owner)
+            .expect("derive")
+            .as_bytes()
+            .to_vec();
+        assert_eq!(check_for_reputation_link(&bytes(&state)), Some(expected));
+        assert_ne!(
             check_for_reputation_link(&bytes(&state)),
-            Some(vec![0xBB; 32])
+            Some(vec![0xBB; 32]),
+            "the details' id is not what is followed"
         );
     }
 }

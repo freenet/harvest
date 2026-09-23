@@ -234,6 +234,12 @@ fn PurchaseCard(
             }
             if let Some(settled) = purchase.settled() {
                 SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
+                if settled.status == harvest_common::payment::OrderStatus::Paid {
+                    FileComplaint {
+                        store_contract_id: store_contract_id.clone(),
+                        purchase: purchase.clone(),
+                    }
+                }
             } else {
             match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
                 // Everything checks out, so the payment details are shown --
@@ -354,6 +360,110 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
                 },
                 "Cancel order"
             }
+        }
+    }
+}
+
+/// The buyer's control to complain about one of their PAID purchases
+/// (harvest#53 Phase C).
+///
+/// A category, never free text: the complaint lands on a public, permanent
+/// record nobody can moderate. Two steps, because it cannot be withdrawn.
+/// Shown only when a complaint could be made; otherwise the reason, or the
+/// complaint already on record.
+#[component]
+fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+    use harvest_common::feedback::FeedbackCategory;
+    let order_id = purchase.order_id.clone();
+    let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
+    let mut problem = use_signal(|| Option::<String>::None);
+    let (on_record, sent, refusal) = {
+        let state = APP_STATE.read();
+        (
+            state.complaint_on_record(&store_contract_id, &order_id),
+            state.complaint_sent(&store_contract_id, &order_id),
+            state.complaint_refusal(&store_contract_id, &purchase),
+        )
+    };
+    let short = order_id.short();
+    if let Some(complaint) = on_record {
+        return rsx! {
+            p { class: "text-muted",
+                "Your complaint about order {short} ({super::reputation_view::category_label(&complaint.category)}) \
+                 is on the seller's public record."
+            }
+        };
+    }
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Complaint about order {short} sent. It shows on the seller's record once the \
+                 network has it."
+            }
+        };
+    }
+    if let Some(why) = refusal {
+        return rsx! {
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "No complaint can be made about order {short} right now: {why}."
+            }
+        };
+    }
+    rsx! {
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        match chosen() {
+            Some(category) => rsx! {
+                p { class: "text-warning",
+                    "Complain that order {short} was \"{super::reputation_view::category_label(&category)}\"? \
+                     This goes on the seller's public record permanently, cannot be withdrawn, \
+                     and is one per order."
+                }
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: {
+                        let store_contract_id = store_contract_id.clone();
+                        let order_id = order_id.clone();
+                        move |_| {
+                            chosen.set(None);
+                            let result = APP_STATE.write().file_complaint(
+                                &store_contract_id,
+                                &order_id,
+                                category.clone(),
+                            );
+                            problem.set(result.err());
+                        }
+                    },
+                    "Yes, complain"
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| chosen.set(None),
+                    "Go back"
+                }
+            },
+            None => rsx! {
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "Something wrong with order {short}? You can put one complaint on the \
+                     seller's public record:"
+                }
+                for category in FeedbackCategory::ALL {
+                    {
+                        let label = super::reputation_view::category_label(&category);
+                        rsx! {
+                            button {
+                                class: "btn btn-sm btn-outline",
+                                onclick: move |_| {
+                                    problem.set(None);
+                                    chosen.set(Some(category.clone()));
+                                },
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 }

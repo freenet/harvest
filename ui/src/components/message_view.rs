@@ -1273,20 +1273,11 @@ fn MessageCard(entry: MailboxEntry, authored_here: bool) -> Element {
 
 /// What to show for one message's content.
 ///
-/// Only `Text` is something a buyer can compose today; the other variants
-/// exist for the feedback-token exchange, which is not built. They are named
-/// rather than rendered as empty, so a seller who receives one is told
-/// something arrived that this build cannot present rather than being shown a
-/// blank message.
+/// Every variant is named rather than rendered as empty, so a reader is never
+/// shown a blank message.
 fn describe(content: &MessageContent) -> String {
     match content {
         MessageContent::Text(text) => text.clone(),
-        MessageContent::InitiateTransaction { message, .. } => {
-            format!("{message}\n\n(This message also carries a feedback-token request, which this version of Harvest cannot act on.)")
-        }
-        MessageContent::AcceptTransaction { message, .. } => {
-            format!("{message}\n\n(This message also carries a blind signature, which this version of Harvest cannot act on.)")
-        }
         MessageContent::Decline { reason } => format!("Declined: {reason}"),
         MessageContent::OrderRequest {
             quantity,

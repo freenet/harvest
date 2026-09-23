@@ -320,55 +320,42 @@ pub fn start_store_key_migration(store_verifying_key: &[u8; 32]) {
     }
 }
 
-/// Start the reputation migration, which cannot run until the delegate has
-/// produced this identity's RSA public key.
+/// Start one store's reputation migration (harvest#53 Phase C, Option A).
 ///
-/// **This is the ordering constraint, enforced.**
-/// `ReputationParameters::rsa_public_key_der` is that key, so it is an input to
-/// the reputation contract's address: without it there is no way to derive a
-/// predecessor id at all, and no way to derive the CURRENT one either. Running
-/// this before the key arrives would probe ids belonging to nobody, find
-/// nothing, and could seal that verdict over a recoverable instance.
-///
-/// [`migrate::reputation_probe_inputs`] is what makes that structural rather
-/// than remembered -- there is no way to call this without the key, and a
-/// missing key returns without starting anything rather than substituting a
-/// placeholder.
-pub fn start_reputation_migration(fingerprint: &str, verifying_key_bytes: &[u8]) {
-    let Some(vk) = verifying_key(verifying_key_bytes) else {
-        return;
-    };
-    let der = super::APP_STATE
-        .read()
-        .rsa_public_keys
-        .get(fingerprint)
-        .cloned();
-    let Some(inputs) = migrate::reputation_probe_inputs(der.as_ref(), &vk) else {
-        // Not yet, never "nothing to migrate". The next delegate response for
-        // this identity calls back in.
-        info!("reputation migration for {fingerprint} waits on the delegate's RSA public key");
-        return;
-    };
-
-    match migrate::encode_params(&inputs.params) {
-        Ok(params) => start(
+/// The successor is the record the store key addresses under this build. The
+/// predecessors are the RSA generations' records, located by
+/// `migrate::reputation_candidates`; the walk carries their certificate
+/// forward. Keyed by the successor like every walk, so it runs once per
+/// session per store: an RSA key that becomes known after the walk (a
+/// per-device key the delegate migration imports later) is tried on the next
+/// load, not this one.
+pub fn start_reputation_migration(locators: migrate::ReputationLocators) {
+    let label = format!(
+        "reputation of store {}",
+        harvest_common::store::store_code(&locators.store_key)
+    );
+    let reputation_params = migrate::reputation_params(&locators.store_key);
+    match (
+        migrate::encode_params(&reputation_params),
+        migrate::reputation_candidates(&locators),
+    ) {
+        (Ok(params), Ok(candidates)) => start(
             Artifact::Reputation,
-            fingerprint,
+            &label,
             params,
             REPUTATION_CONTRACT_WASM,
-            |p| {
-                Session::Reputation(Box::new(ProbeSession::start(
+            move |_p| {
+                Session::Reputation(Box::new(ProbeSession::start_with_candidates(
                     ReputationOps {
-                        params: inputs.params.clone(),
+                        params: reputation_params.clone(),
                     },
                     local_snapshot(),
-                    p,
-                    migrate::reputation_lineage(),
+                    candidates.clone(),
                     migrate::fold_all_policy(),
                 )))
             },
         ),
-        Err(e) => warn!("cannot migrate reputation for {fingerprint}: {e}"),
+        (Err(e), _) | (_, Err(e)) => warn!("cannot migrate the {label}: {e}"),
     }
 }
 

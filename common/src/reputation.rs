@@ -318,7 +318,11 @@ impl ReputationStateV1 {
         // One slot per order. Rebuilding from `self` as well as the delta is
         // what normalises a state that arrived out of order.
         let mut by_order: BTreeMap<OrderId, Complaint> = BTreeMap::new();
-        for complaint in self.complaints.drain(..).chain(incoming.into_iter().cloned()) {
+        for complaint in self
+            .complaints
+            .drain(..)
+            .chain(incoming.into_iter().cloned())
+        {
             match by_order.entry(complaint.order_id().clone()) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(complaint);
@@ -384,7 +388,9 @@ mod tests {
             .apply_delta(&params(), &Some(vec![c]))
             .expect("a genuine complaint applies");
         assert_eq!(state.complaints.len(), 1);
-        state.verify(&params()).expect("and the result is valid state");
+        state
+            .verify(&params())
+            .expect("and the result is valid state");
     }
 
     /// **Only a PAID order can be complained about.** The receipted design's
@@ -397,7 +403,9 @@ mod tests {
             let mut unpaid = authorized(&store_key(), order(1), OrderStatus::AwaitingPayment);
             unpaid.status = status;
             let c = complaint_by(&buyer_key(1), unpaid, FeedbackCategory::NonDelivery, 200);
-            let err = c.verify(&owner()).expect_err("an unpaid order must be refused");
+            let err = c
+                .verify(&owner())
+                .expect_err("an unpaid order must be refused");
             assert!(err.contains("paid order"), "{status:?}: {err}");
         }
     }
@@ -429,7 +437,10 @@ mod tests {
         ] {
             let c = complaint_by(&key, paid(1), FeedbackCategory::NonDelivery, 200);
             let err = c.verify(&owner()).expect_err(who);
-            assert!(err.contains("not signed by the order's buyer"), "{who}: {err}");
+            assert!(
+                err.contains("not signed by the order's buyer"),
+                "{who}: {err}"
+            );
         }
     }
 
@@ -565,11 +576,14 @@ mod tests {
 
         for second in [buyer_again, other_evidence] {
             let mut a = ReputationStateV1::default();
-            a.apply_delta(&params(), &Some(vec![first.clone()])).unwrap();
-            a.apply_delta(&params(), &Some(vec![second.clone()])).unwrap();
+            a.apply_delta(&params(), &Some(vec![first.clone()]))
+                .unwrap();
+            a.apply_delta(&params(), &Some(vec![second.clone()]))
+                .unwrap();
             let mut b = ReputationStateV1::default();
             b.apply_delta(&params(), &Some(vec![second])).unwrap();
-            b.apply_delta(&params(), &Some(vec![first.clone()])).unwrap();
+            b.apply_delta(&params(), &Some(vec![first.clone()]))
+                .unwrap();
             assert_eq!(a.complaints.len(), 1, "one order, one complaint");
             assert_eq!(
                 crate::to_cbor(&a).unwrap(),
@@ -655,7 +669,9 @@ mod tests {
         merged
             .merge(&params(), &ReputationStateV1::default())
             .unwrap();
-        merged.verify(&params()).expect("merging nothing still normalises");
+        merged
+            .verify(&params())
+            .expect("merging nothing still normalises");
     }
 
     /// **Seeded random merge laws, byte for byte**, over states built from

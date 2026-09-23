@@ -189,3 +189,10 @@ description = "Superseded by harvest#53 Phase B (the buyer's receipt key, the bu
 date = "2026-09-23"
 code_hash = "9917c1fbad0ed1754d25f318b8c3384db327d389219c2ed715bc5f7e4343b6c1"
 delegate_key = "e3a063b5723b1fc82466b541d8725644197121520640575962d12f4ddd9a1fc4"
+
+[[entry]]
+version = "V21"
+description = "Superseded by harvest#53 Phase C (the receipted complaint), which changed `harvest-common`: `reputation.rs` replaced `FeedbackEntry` with `Complaint` (a buyer-signed complaint about one PAID order of the store) and `ReputationParameters` lost its RSA key, `FeedbackCategory` lost `Other`, and `delegate.rs` lost the blind-signature and transaction requests (`InitReputationKeys`, `BlindSignFeedbackToken`, `BeginTransaction`, `RecordBlindSignature`, `ListTransactions`, `TransactionRecord`). `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This delegate's did too: it no longer answers `InitReputationKeys`, `BlindSignFeedbackToken` or the transaction requests, and no longer mints or signs with an RSA key. `GetRsaPublicKey` stays, read-only, so the reputation migration can locate a record addressed by a per-device key. The import family for RSA halves stays (a predecessor may still export a pair); the transaction-index family is gone, so a predecessor's `harvest:tx_index` would import as a standalone value (none was ever written). V21 is the generation #136 shipped (`3f3ef7b`). The parameters are unchanged (empty)."
+date = "2026-09-23"
+code_hash = "0ab16ff67f87e11da81e179ab75481791b165d631af0a86966e2421255da3b62"
+delegate_key = "0557c435c3bcb2701fc9848875d6f52d3ce311c2fff16ba77aae86617ebf2aea"

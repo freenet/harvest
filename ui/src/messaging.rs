@@ -100,24 +100,15 @@ pub struct PlaintextMessage {
     pub content: MessageContent,
 }
 
-/// The content of a message -- can be text, a feedback token exchange,
-/// or a transaction-related message.
+/// The content of a message: text, or one of the purchase steps.
+///
+/// The feedback-token exchange's two variants (`InitiateTransaction`,
+/// `AcceptTransaction`) are gone with the blind signatures they carried
+/// (harvest#53 Phase C). Nothing ever sent either.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MessageContent {
     /// Free-form text message.
     Text(String),
-    /// Buyer's initial contact with feedback token request.
-    InitiateTransaction {
-        listing_id: Vec<u8>,
-        message: String,
-        blinded_feedback_token: Vec<u8>,
-        target_reputation_contract: [u8; 32],
-    },
-    /// Seller's response with blind signature on the feedback token.
-    AcceptTransaction {
-        message: String,
-        blind_signature: Vec<u8>,
-    },
     /// Either party declining or cancelling.
     Decline { reason: String },
     /// A buyer asking to buy a listing.

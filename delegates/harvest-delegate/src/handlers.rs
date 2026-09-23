@@ -2,7 +2,9 @@ use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::MessageOrigin;
 
-use harvest_common::delegate::{HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration};
+use harvest_common::delegate::{
+    HarvestDelegateRequest, HarvestDelegateResponse, StoreRegistration,
+};
 use harvest_common::{from_cbor, to_cbor};
 
 // Secret key prefixes for delegate storage.

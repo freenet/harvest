@@ -7,7 +7,7 @@ use dioxus::logger::tracing::{debug, info, warn};
 use harvest_common::listing::AuthorizedListing;
 use harvest_common::mailbox::EncryptedMessage;
 use harvest_common::payment::AuthorizedOrder;
-use harvest_common::reputation::FeedbackEntry;
+use harvest_common::reputation::Complaint;
 use harvest_common::store::{StoreInfoV1, StoreParameters};
 use harvest_common::{
     BitcoinDelegateResponse, BridgeEndpoint, HarvestDelegateResponse, StoreRegistration,
@@ -130,7 +130,12 @@ pub struct AppState {
     /// (GhostKeyList success, AccessDenied, NoIdentityAvailable, Error).
     pub request_any_access_in_flight: bool,
 
-    /// RSA public keys for our identities (fingerprint -> DER bytes).
+    /// The per-device RSA public keys our identities' reputation records were
+    /// addressed by before harvest#93 phase 1b (fingerprint -> DER bytes),
+    /// as the delegate's `RsaPublicKey` reports them.
+    ///
+    /// Used ONLY to locate those records for the reputation migration
+    /// (harvest#53 Phase C, Option A): nothing verifies or signs with them.
     pub rsa_public_keys: HashMap<String, Vec<u8>>,
 
     /// Long-term X25519 public keys the harvest delegate holds for our own
@@ -287,9 +292,9 @@ pub struct AppState {
     /// correlation that does not exist.
     pub next_messaging_request_id: u64,
 
-    /// Store creation pending RSA key response. When InitReputationKeys
-    /// is sent, the store details are stored here. When ReputationKeysInitialized
-    /// arrives, the response handler picks this up and creates the contracts.
+    /// A store creation waiting on its inputs (the certificate, the store key
+    /// and its subkeys); `start_store_creation_if_ready` proceeds once all
+    /// have arrived.
     pub pending_store_creation: Option<PendingStoreCreation>,
 
     /// Signature requests sent to the ghostkey delegate and not yet
@@ -411,6 +416,16 @@ pub struct AppState {
     /// The buyer's own cancellations sent, by store and order id (harvest#53
     /// Phase B).
     pub buyer_cancellations_sent: HashSet<OrderAt>,
+
+    /// The buyer's complaints sent this session, by store and order id
+    /// (harvest#53 Phase C), so the control does not come back while one is
+    /// on its way to the record.
+    pub complaints_sent: HashSet<OrderAt>,
+
+    /// Off-target only: complaints recorded instead of published, with the
+    /// store key whose record they go to.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub published_complaints: Vec<(ed25519_dalek::VerifyingKey, Complaint)>,
 
     /// Off-target only: despatches recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]
@@ -611,8 +626,10 @@ pub struct PendingStoreCreation {
     pub certificate_pem: String,
     pub store_name: String,
     pub description: String,
-    /// Filled by the harvest delegate's `ReputationKeysInitialized` response.
-    /// `None` until it arrives.
+    /// The store's record public key, from `StoreSubkeys` (harvest#93 phase
+    /// 1b), published in `StoreInfoV1::record_public_key` so another device
+    /// can check its own derivation. No longer a reputation parameter
+    /// (harvest#53 Phase C). `None` until it arrives.
     pub rsa_public_key_der: Option<Vec<u8>>,
     /// Filled from the store key's inbox key (`custody_flow`'s
     /// `fill_creation_from_subkeys`, harvest#93 phase 1b); the per-Ghost-Key
@@ -2157,8 +2174,10 @@ pub struct BrowsingStore {
     pub reputation_contract_id: Option<Vec<u8>>,
     /// Mailbox contract ID (will be set when we know it).
     pub mailbox_contract_id: Option<Vec<u8>>,
-    /// Negative feedback entries from the reputation contract.
-    pub feedback: Vec<FeedbackEntry>,
+    /// Buyers' complaints from the store's reputation record (harvest#53
+    /// Phase C). Every one the contract accepted names a paid order of this
+    /// store; whether it COUNTS is `fulfilment::complaint_standing`'s call.
+    pub complaints: Vec<Complaint>,
     /// Encrypted messages from the mailbox contract.
     pub mailbox_messages: Vec<EncryptedMessage>,
     /// The buyer's conversations with this store, oldest first.
@@ -3542,7 +3561,18 @@ impl AppState {
                         "Received store state for {:?}",
                         &contract_id[..8.min(contract_id.len())]
                     );
-                    let reputation_id = store_state.info.info.reputation_contract_id.to_vec();
+                    // The record the store KEY addresses under this build
+                    // (harvest#53 Phase C), not the id the details name: the
+                    // details of every store published before Phase C name
+                    // an RSA generation's record, and the store key is
+                    // authenticated by the store's own address, so this
+                    // needs no signature to be believed. `None` for a store
+                    // with no owner key, which predates store keys.
+                    let reputation_id = store_state.owner.and_then(|owner| {
+                        crate::gateway::store_ops::reputation_instance_id(&owner)
+                            .ok()
+                            .map(|id| id.as_bytes().to_vec())
+                    });
 
                     // A store the seller just created, or one they own, arrives
                     // without anyone having followed a link. Show it, unless a link
@@ -3615,7 +3645,7 @@ impl AppState {
                         .into_values()
                         .map(|d| (d.despatch.order_id.clone(), d))
                         .collect();
-                    store.reputation_contract_id = Some(reputation_id.clone());
+                    store.reputation_contract_id = reputation_id.clone();
 
                     // The Ghost Key behind this store may also back another
                     // store this reader has loaded, and the reverse: re-apply
@@ -3647,8 +3677,13 @@ impl AppState {
 
                     // Register the reverse mapping so incoming reputation state
                     // can be matched to this store
-                    self.reputation_to_store
-                        .insert(reputation_id, contract_id.clone());
+                    if let Some(reputation_id) = reputation_id {
+                        self.reputation_to_store
+                            .insert(reputation_id, contract_id.clone());
+                    }
+                    // One of ours: its details carry the record key that
+                    // locates its pre-Phase-C reputation record.
+                    self.start_reputation_migration(&contract_id);
 
                     // Ask the delegate for whatever conversations this node
                     // has had with this store. Here rather than on the
@@ -3691,20 +3726,20 @@ impl AppState {
             Err(e) => e,
             Ok(reputation_state) => {
                 info!(
-                    "Received reputation state ({} entries)",
-                    reputation_state.feedback.len()
+                    "Received reputation state ({} complaints)",
+                    reputation_state.complaints.len()
                 );
 
                 // Look up which store this reputation belongs to
                 if let Some(store_id) = self.reputation_to_store.get(&contract_id).cloned() {
                     if let Some(store) = self.browsing_stores.get_mut(&store_id) {
-                        store.feedback = reputation_state.feedback;
+                        store.complaints = reputation_state.complaints;
                     }
                 } else {
                     info!("Reputation state for unknown store -- caching by contract ID");
                     // Cache it; will be linked when the store state arrives
                     let store = self.browsing_stores.entry(contract_id).or_default();
-                    store.feedback = reputation_state.feedback;
+                    store.complaints = reputation_state.complaints;
                 }
                 return;
             }
@@ -7637,6 +7672,210 @@ impl AppState {
         Ok(())
     }
 
+    /// What `file_complaint` would refuse with, if anything, and what it
+    /// signs with otherwise. One function for both, so the buyer's control is
+    /// shown exactly when pressing it could work.
+    fn complaint_checks(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Result<
+        (
+            harvest_common::payment::AuthorizedOrder,
+            ed25519_dalek::SigningKey,
+            ed25519_dalek::VerifyingKey,
+            freenet_bitcoin_common::BlockAnchor,
+        ),
+        String,
+    > {
+        use harvest_common::payment::OrderStatus;
+        let order_id = &purchase.order_id;
+        let order = purchase
+            .settled()
+            .filter(|o| o.status == OrderStatus::Paid)
+            .cloned()
+            .ok_or("only a paid order can be complained about")?;
+        let store = self
+            .browsing_stores
+            .get(store_contract_id)
+            .ok_or("this store is not loaded")?;
+        if store.complaints.iter().any(|c| c.order_id() == order_id) {
+            return Err("your complaint about this order is already on the seller's record".into());
+        }
+        if self.complaint_sent(store_contract_id, order_id) {
+            return Err("your complaint about this order is on its way".into());
+        }
+        let key = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)
+            .and_then(|c| c.receipt_signing_key())
+            .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        let store_key = store
+            .store_verifying_key
+            .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+            .ok_or("this store's key is not known here")?;
+        let tip = self.bitcoin.tips.get(&order.order.network);
+        let tip_height = tip.and_then(|t| t.tip_height);
+        let despatch = self.despatch_of(&order);
+        let stage = crate::fulfilment::order_stage(
+            &order,
+            despatch.as_ref(),
+            tip_height,
+            self.payment_sight(&order),
+        );
+        match stage {
+            crate::fulfilment::OrderStage::Despatched { .. }
+            | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {}
+            crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. } => {
+                return Err(format!(
+                    "the seller has until block {despatch_by} to despatch, and a complaint can \
+                     be made once they record a despatch or that deadline passes"
+                ))
+            }
+            crate::fulfilment::OrderStage::Closed { closed_at } => {
+                return Err(format!(
+                    "the complaint window closed at block {closed_at}, and the order counts as \
+                     complete"
+                ))
+            }
+            crate::fulfilment::OrderStage::Unknown => {
+                return Err(
+                    "your node cannot place this order against the Bitcoin chain yet".into(),
+                )
+            }
+            _ => return Err("this order cannot be complained about".into()),
+        }
+        let anchor = tip.and_then(|t| t.current_anchor()).ok_or(
+            "your node has not seen a recent Bitcoin block yet, and a complaint has to name one \
+             to say when it was made",
+        )?;
+        Ok((order, key, store_key, anchor))
+    }
+
+    /// Why the buyer cannot complain about this purchase right now, or
+    /// `None` when they can. The control shows this in place of its form.
+    pub fn complaint_refusal(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<String> {
+        self.complaint_checks(store_contract_id, purchase).err()
+    }
+
+    /// Whether the buyer's complaint about `order_id` in this store was sent
+    /// this session.
+    pub fn complaint_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.complaints_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// The buyer's complaint about this order, if the store's record holds
+    /// one.
+    pub fn complaint_on_record(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<Complaint> {
+        self.browsing_stores
+            .get(store_contract_id)?
+            .complaints
+            .iter()
+            .find(|c| c.order_id() == order_id)
+            .cloned()
+    }
+
+    /// The BUYER complains about one of their PAID purchases (harvest#53
+    /// Phase C): the conversation's receipt key -- the key the seller signed
+    /// into the order's terms -- signs `ComplaintTerms { order id, category,
+    /// a recent block }`, and the complaint goes to the record the store key
+    /// addresses, carrying the paid order as its own evidence.
+    ///
+    /// Offered once the seller has recorded a despatch or the despatch
+    /// deadline has passed, and until the complaint window closes
+    /// (`fulfilment::order_stage`). One complaint per order: the record keeps
+    /// one per order id, so there is no second complaint to make.
+    pub fn file_complaint(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        use ed25519_dalek::Signer as _;
+        let purchase = self
+            .buyer_purchases(store_contract_id)
+            .into_iter()
+            .find(|p| &p.order_id == order_id)
+            .ok_or("this order is not one of your purchases at this store")?;
+        let (order, key, store_key, block_ref) =
+            self.complaint_checks(store_contract_id, &purchase)?;
+        let terms = harvest_common::reputation::ComplaintTerms {
+            tag: harvest_common::reputation::ComplaintTag::HarvestComplaintV1,
+            order_id: order.order.id.clone(),
+            category: category.clone(),
+            block_ref,
+        };
+        let envelope =
+            harvest_common::backing::store_key_envelope(harvest_common::to_cbor(&terms)?)?;
+        let buyer_signature = key.sign(&envelope).to_bytes().to_vec();
+        let complaint = Complaint {
+            order,
+            category,
+            block_ref,
+            scoped_payload: envelope,
+            buyer_signature,
+        };
+        // Checked before sending, against the key the record is addressed
+        // by: the contract refuses in silence otherwise.
+        complaint
+            .verify(&store_key)
+            .map_err(|e| format!("the complaint would be refused: {e}"))?;
+        info!("Complaining about order {}", order_id.short());
+        self.complaints_sent
+            .insert(order_at(store_contract_id, order_id));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store_contract_id = store_contract_id.to_vec();
+            let id = order_id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) =
+                    crate::gateway::store_ops::submit_complaint(store_key, complaint).await
+                {
+                    dioxus::logger::tracing::error!("Failed to publish the complaint: {}", e);
+                    crate::gateway::APP_STATE.write().on_complaint_send_failed(
+                        &store_contract_id,
+                        &id,
+                        &e,
+                    );
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.published_complaints.push((store_key, complaint));
+        Ok(())
+    }
+
+    /// The complaint never reached the node: release the marker so the
+    /// control comes back, and say so. See [`Self::on_despatch_send_failed`].
+    pub(crate) fn on_complaint_send_failed(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        reason: &str,
+    ) {
+        self.complaints_sent
+            .remove(&order_at(store_contract_id, order_id));
+        self.notifications.push(format!(
+            "Could not send your complaint about order {}: {reason}",
+            order_id.short()
+        ));
+    }
+
     /// The seller's despatch of `order`, from the store that holds this very
     /// record (harvest#53 Phase B).
     ///
@@ -8293,14 +8532,14 @@ impl AppState {
     /// Publish a new store's contracts, once every input creation needs has
     /// arrived.
     ///
-    /// `initiate_store_creation` fires two requests together -- `GetCertificate`
-    /// to the ghostkey delegate and `InitReputationKeys` to the harvest
-    /// delegate -- and the two answer independently, in whichever order they
-    /// happen to. So neither response can assume it is the last one, and the
-    /// decision to proceed belongs here rather than in either handler.
+    /// Creation's inputs -- the certificate from the ghostkey delegate, the
+    /// store key and its subkeys from the harvest delegate -- answer
+    /// independently, in whichever order they happen to. So no response can
+    /// assume it is the last one, and the decision to proceed belongs here
+    /// rather than in any handler.
     ///
-    /// Before this gate, `ReputationKeysInitialized` took the pending creation
-    /// and went ahead on its own. A certificate arriving second was then
+    /// Before this gate, the RSA key's response (since retired) took the
+    /// pending creation and went ahead on its own. A certificate arriving second was then
     /// written into a slot already emptied, and silently discarded: the store
     /// published with an empty `certificate_pem`, leaving a buyer no trust
     /// chain to check the seller against. That was already wrong for the
@@ -8352,28 +8591,23 @@ impl AppState {
     /// Handle a response from the harvest delegate.
     pub fn on_delegate_response(&mut self, response: HarvestDelegateResponse) {
         match response {
-            HarvestDelegateResponse::ReputationKeysInitialized {
-                ghostkey_fingerprint,
-                rsa_public_key_der,
-            } => {
-                info!("RSA keys initialized for {}", ghostkey_fingerprint);
-                self.rsa_public_keys
-                    .insert(ghostkey_fingerprint.clone(), rsa_public_key_der.clone());
-                self.start_reputation_migration(&ghostkey_fingerprint);
-
-                // A store's record key now derives from its store key
-                // (harvest#93 phase 1b): creation takes it from
-                // `StoreSubkeys`, not from this per-device key.
-                let _ = rsa_public_key_der;
-            }
-
+            // A per-device RSA key from before harvest#93 phase 1b: it only
+            // LOCATES this identity's old reputation records (harvest#53
+            // Phase C, Option A), so it goes to the reputation migration.
             HarvestDelegateResponse::RsaPublicKey {
                 ghostkey_fingerprint,
                 rsa_public_key_der,
             } => {
                 self.rsa_public_keys
                     .insert(ghostkey_fingerprint.clone(), rsa_public_key_der);
-                self.start_reputation_migration(&ghostkey_fingerprint);
+                let stores: Vec<Vec<u8>> = self
+                    .my_stores
+                    .get(&ghostkey_fingerprint)
+                    .map(|regs| regs.iter().map(|r| r.store_contract_id.clone()).collect())
+                    .unwrap_or_default();
+                for store in stores {
+                    self.start_reputation_migration(&store);
+                }
             }
 
             // The connect path's recall found no key. Mint one, but only once
@@ -8651,28 +8885,22 @@ impl AppState {
         }
     }
 
-    /// Start this identity's reputation migration, now that the delegate has
-    /// produced its RSA public key.
+    /// Start the reputation migration for one of OUR stores (harvest#53
+    /// Phase C, Option A): carry the RSA generations' record, which holds the
+    /// seller's certificate, forward to the record the store key addresses.
     ///
-    /// **This is the ordering constraint the migration doctrine names.**
-    /// `ReputationParameters::rsa_public_key_der` IS that key, so it is an
-    /// input to the reputation contract's address. Until the key is in hand
-    /// there is no way to derive a predecessor reputation instance -- or the
-    /// current one -- so probing earlier would walk ids belonging to nobody,
-    /// find nothing, and risk sealing that verdict over a recoverable
-    /// instance. The store and mailbox contracts have no such dependency and
-    /// start as soon as the ghostkey is known.
+    /// Called when the store's state arrives (its details carry the record
+    /// key) and when the delegate reports a per-device RSA key. Starting
+    /// twice is a no-op: `migrate_ops` keys walks by their successor. Nothing
+    /// here waits on the RSA keys: the successor is the store key's alone, and
+    /// a walk with fewer locators is still correct, just less thorough.
     ///
-    /// Called from both delegate responses that can carry the key, because
-    /// which one arrives depends on whether the identity already had keys.
-    /// Starting twice is a no-op: `migrate_ops` keys in-flight probes by their
-    /// marker.
     /// SAFE TO CALL FROM A RESPONSE HANDLER, and it has to be.
     ///
     /// Every caller of this is inside
     /// `apply_delegate_response(&mut APP_STATE.write(), ..)`, so a write guard
-    /// is held. `migrate_ops::start_reputation_migration` opens with an
-    /// `APP_STATE.read()` (migrate_ops.rs:257), and taking that second borrow
+    /// is held. `migrate_ops`'s walks take their own `APP_STATE` borrows
+    /// (`local_snapshot`), and taking that second borrow
     /// panics -- which, under this workspace's `panic = "abort"`, never drops
     /// the guard and leaves APP_STATE borrowed for the rest of the page's life.
     /// One such call bricks the whole app, not just itself.
@@ -8681,27 +8909,65 @@ impl AppState {
     /// only the call that needs its own borrow is deferred. `spawn_local`
     /// queues onto a `queueMicrotask`-drained queue, which cannot run until
     /// this synchronous statement has returned and the guard has dropped.
-    pub fn start_reputation_migration(&self, _ghostkey_fingerprint: &str) {
+    pub fn start_reputation_migration(&self, _store_contract_id: &[u8]) {
         #[cfg(target_arch = "wasm32")]
         {
-            let Some(vk) = self
-                .ghostkeys
-                .iter()
-                .find(|k| k.fingerprint == _ghostkey_fingerprint)
-                .and_then(|k| k.verifying_key_bytes.clone())
-            else {
-                // The vault has not shared this identity's verifying key, so
-                // the owner half of the parameters is missing too. Nothing to
-                // do until it does; `GhostKeyList` starts the other two
-                // migrations at that point and this one retries on the next
-                // key response.
+            let Some(locators) = self.reputation_locators(_store_contract_id) else {
                 return;
             };
-            let fingerprint = _ghostkey_fingerprint.to_string();
             wasm_bindgen_futures::spawn_local(async move {
-                crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+                crate::gateway::migrate_ops::start_reputation_migration(locators);
             });
         }
+    }
+
+    /// What locates one of OUR stores' superseded reputation records
+    /// (`migrate::ReputationLocators`), or `None` until the store key and
+    /// the backing Ghost Key's verifying key are both known here.
+    ///
+    /// The RSA keys are whichever this device can see: the record key the
+    /// store's published details carry, and the Ghost Key's per-device key
+    /// if the delegate reported one.
+    pub(crate) fn reputation_locators(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Option<crate::migrate::ReputationLocators> {
+        let store_key = self.store_owner_key(store_contract_id)?;
+        let (fingerprint, registration) = self.my_stores.iter().find_map(|(fp, regs)| {
+            regs.iter()
+                .find(|r| r.store_contract_id == store_contract_id)
+                .map(|r| (fp, r))
+        })?;
+        let ghost_key = self
+            .ghostkeys
+            .iter()
+            .find(|k| &k.fingerprint == fingerprint)
+            .and_then(|k| k.verifying_key_bytes.as_ref())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())?;
+        let mut rsa_public_keys = Vec::new();
+        if let Some(der) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.info.as_ref())
+            .and_then(|i| i.record_public_key.clone())
+        {
+            rsa_public_keys.push(der);
+        }
+        if let Some(der) = self.rsa_public_keys.get(fingerprint) {
+            if !rsa_public_keys.contains(der) {
+                rsa_public_keys.push(der.clone());
+            }
+        }
+        let registered_id = <[u8; 32]>::try_from(registration.reputation_contract_id.as_slice())
+            .ok()
+            .map(freenet_stdlib::prelude::ContractInstanceId::new);
+        Some(crate::migrate::ReputationLocators {
+            store_key,
+            ghost_key,
+            rsa_public_keys,
+            registered_id,
+        })
     }
 
     /// A signature has arrived, from the Ghost Key vault or from the store
@@ -9040,20 +9306,18 @@ impl AppState {
                     }
                 }
 
-                // Reputation migration retries for EVERY identity we know a
-                // verifying key for, not just the ones just shared: both halves
-                // of `ReputationParameters` must be present at once and they
-                // arrive from DIFFERENT delegates in no fixed order, so whichever
-                // lands second has to start the probe. Collected after the merge
-                // so a key shared in this very response is included.
-                let all_identities: Vec<(String, Vec<u8>)> = self
-                    .ghostkeys
-                    .iter()
-                    .filter_map(|k| {
-                        k.verifying_key_bytes
-                            .clone()
-                            .map(|vk| (k.fingerprint.clone(), vk))
-                    })
+                // Reputation migration retries for EVERY store of ours whose
+                // locators are now complete, not just the ones just shared: a
+                // store's locators need the store key, its details and the
+                // backing Ghost Key's verifying key, which arrive from
+                // different places in no fixed order, so whichever lands last
+                // has to start the walk (harvest#53 Phase C). Collected after
+                // the merge so a key shared in this very response is included.
+                let all_identities: Vec<crate::migrate::ReputationLocators> = self
+                    .my_stores
+                    .values()
+                    .flatten()
+                    .filter_map(|r| self.reputation_locators(&r.store_contract_id))
                     .collect();
 
                 // EVERYTHING BELOW RUNS OUTSIDE THIS BORROW, AND MUST.
@@ -9109,8 +9373,8 @@ impl AppState {
                         }
                     }
 
-                    for (fingerprint, vk) in all_identities {
-                        crate::gateway::migrate_ops::start_reputation_migration(&fingerprint, &vk);
+                    for locators in all_identities {
+                        crate::gateway::migrate_ops::start_reputation_migration(locators);
                     }
 
                     // A RECALL, which never mints: safe before the delegate
@@ -16000,56 +16264,19 @@ mod delegate_correlation_tests {
         }
     }
 
-    /// **The RSA key decides where the reputation contract LIVES.**
-    ///
-    /// `ReputationParameters` carries the RSA public key, and a contract's
-    /// address is `BLAKE3(code_hash || cbor(parameters))` -- so a key filed
-    /// under the wrong identity puts that identity's reputation contract at an
-    /// address derived from somebody else's key. The store then publishes a
-    /// reputation link pointing at a contract nobody owns, inside a signed
-    /// record, and every buyer follows it to nothing.
-    ///
-    /// Observed red by filing under `pending_store_creation`'s fingerprint.
+    /// A creation never adopts a per-device RSA key, for its own identity or
+    /// another's: `start_store_creation_if_ready` gates on this field, and
+    /// since harvest#93 phase 1b the record key a store publishes derives
+    /// from its store key.
     #[test]
-    fn an_rsa_key_is_filed_under_the_identity_the_delegate_named() {
+    fn a_creation_does_not_adopt_a_per_device_rsa_key() {
         let mut state = with_another_creation_in_flight();
 
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
             ghostkey_fingerprint: OURS.to_string(),
             rsa_public_key_der: vec![7u8; 16],
         });
-
-        assert_eq!(
-            state.rsa_public_keys.get(OURS),
-            Some(&vec![7u8; 16]),
-            "the key must be filed under the identity the delegate answered about"
-        );
-        assert!(
-            !state.rsa_public_keys.contains_key(THEIRS),
-            "a key was filed under an identity the delegate said nothing about"
-        );
-    }
-
-    /// And the creation waiting on a DIFFERENT identity must not adopt it.
-    ///
-    /// This is the sharper half: adopting it would let the creation proceed
-    /// (`start_store_creation_if_ready` gates on this field being `Some`) and
-    /// publish a store whose reputation contract is addressed by another
-    /// seller's key. The guard is the `pending.ghostkey_fingerprint ==
-    /// ghostkey_fingerprint` check.
-    ///
-    /// Observed red by removing that check.
-    #[test]
-    fn a_creation_does_not_adopt_another_identitys_rsa_key() {
-        let mut state = with_another_creation_in_flight();
-
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
-            ghostkey_fingerprint: OURS.to_string(),
-            rsa_public_key_der: vec![7u8; 16],
-        });
-        // Nor, since harvest#93 phase 1b, the matching identity's per-device
-        // key: a store's record key derives from its store key.
-        state.on_delegate_response(HarvestDelegateResponse::ReputationKeysInitialized {
+        state.on_delegate_response(HarvestDelegateResponse::RsaPublicKey {
             ghostkey_fingerprint: THEIRS.to_string(),
             rsa_public_key_der: vec![7u8; 16],
         });
@@ -24524,6 +24751,163 @@ mod buy_flow_tests {
             .despatches
             .insert(order.order.id.clone(), genuine.clone());
         assert_eq!(state.despatch_of(&order), Some(genuine));
+    }
+
+    /// A buyer holding a PAID purchase at `STORE`, with the chain loaded.
+    /// Paid at `TIP_HEIGHT - 1` (`a_paid_order`).
+    fn a_paid_purchase() -> (AppState, AuthorizedOrder) {
+        let (paid, claims, tip) = a_paid_order();
+        let mut settled = paid.clone();
+        settled.status = OrderStatus::Paid;
+        settled.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims.clone(),
+            tip.clone(),
+        ));
+        let (mut state, _) = buyer_after_acceptance(&settled);
+        give_the_node_the_chain(&mut state, &settled, claims, tip);
+        (state, settled)
+    }
+
+    /// The seller's despatch of `order`, recorded in `STORE`.
+    fn despatched(state: &mut AppState, order: &AuthorizedOrder) {
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(TIP_HEIGHT),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .insert(
+                order.order.id.clone(),
+                harvest_common::fulfilment::AuthorizedDespatch {
+                    despatch,
+                    scoped_payload,
+                    signature,
+                },
+            );
+    }
+
+    fn move_tip_to(state: &mut AppState, height: u32) {
+        let mut view = tip_at(height);
+        view.signed_tip = state.bitcoin.tips[&BitcoinNetwork::Signet]
+            .signed_tip
+            .clone();
+        state.bitcoin.tips.insert(BitcoinNetwork::Signet, view);
+    }
+
+    /// **harvest#53 Phase C: the buyer of a despatched, paid order complains,
+    /// and the record's contract accepts what they publish** -- signed by the
+    /// order's receipt key, about a paid order of this store, applied to the
+    /// record the store key addresses.
+    #[test]
+    fn a_buyer_complains_about_a_paid_order_with_a_complaint_the_record_accepts() {
+        use harvest_common::feedback::FeedbackCategory;
+        let (mut state, order) = a_paid_purchase();
+        despatched(&mut state, &order);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+
+        state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::Counterfeit)
+            .expect("the buyer may complain");
+        assert!(state.complaint_sent(STORE, &order.order.id));
+        assert!(
+            state
+                .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+                .is_err(),
+            "one complaint per order"
+        );
+
+        let (store_key, complaint) = state.published_complaints.pop().expect("published");
+        assert_eq!(store_key, seller_signing_key().verifying_key());
+        assert_eq!(complaint.category, FeedbackCategory::Counterfeit);
+        assert_eq!(complaint.order.order, order.order, "the paid order travels");
+        complaint
+            .verify(&store_key)
+            .expect("verifies under the record's rules");
+
+        // Through the bytes a PUT carries, into the record's own merge.
+        let bytes = crate::gateway::store_ops::complaint_state_bytes(complaint.clone()).unwrap();
+        let published: harvest_common::reputation::ReputationStateV1 =
+            harvest_common::from_cbor(&bytes).unwrap();
+        let params = crate::migrate::reputation_params(&store_key);
+        let mut record = harvest_common::reputation::ReputationStateV1 {
+            owner_certificate_pem: "SELLER-CERT".into(),
+            ..Default::default()
+        };
+        record
+            .merge(&params, &published)
+            .expect("the record accepts it");
+        assert_eq!(record.complaints, vec![complaint.clone()]);
+        assert_eq!(
+            record.owner_certificate_pem, "SELLER-CERT",
+            "the cert survives"
+        );
+
+        // Once the record holds it, the card says so instead of offering
+        // another.
+        state.complaints_sent.clear();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .complaints
+            .push(complaint);
+        let purchase = purchases(&state).remove(0);
+        let refused = state.complaint_refusal(STORE, &purchase).expect("refused");
+        assert!(
+            refused.contains("already on the seller's record"),
+            "{refused}"
+        );
+        assert!(state.complaint_on_record(STORE, &order.order.id).is_some());
+    }
+
+    /// The complaint is offered only between "the seller has despatched or
+    /// missed the deadline" and "the window has closed", and only for a paid
+    /// order. Red if `complaint_checks` stops consulting the order's stage.
+    #[test]
+    fn a_complaint_is_offered_only_inside_its_window() {
+        use crate::fulfilment::{COMPLAINT_WINDOW_BLOCKS, DESPATCH_WINDOW_BLOCKS};
+        use harvest_common::feedback::FeedbackCategory;
+        let paid_at = TIP_HEIGHT - 1;
+
+        // Paid, not despatched, deadline not passed: the seller still has time.
+        let (mut state, order) = a_paid_purchase();
+        let purchase = purchases(&state).remove(0);
+        let refused = state
+            .complaint_refusal(STORE, &purchase)
+            .expect("too early");
+        assert!(refused.contains("despatch"), "{refused}");
+        assert!(state
+            .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
+            .is_err());
+
+        // The despatch deadline passed with nothing recorded: open.
+        move_tip_to(&mut state, paid_at + DESPATCH_WINDOW_BLOCKS + 1);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+
+        // The window closed: the order counts as complete.
+        move_tip_to(
+            &mut state,
+            paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS + 1,
+        );
+        let purchase = purchases(&state).remove(0);
+        let refused = state.complaint_refusal(STORE, &purchase).expect("too late");
+        assert!(refused.contains("closed"), "{refused}");
+
+        // An unpaid order takes no complaint at all.
+        let (unpaid, _, _) = a_paid_order();
+        let (state, _) = buyer_after_acceptance(&unpaid);
+        let purchase = purchases(&state).remove(0);
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
     }
 }
 

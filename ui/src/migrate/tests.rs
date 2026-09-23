@@ -20,7 +20,7 @@ use freenet_migrate::Outcome;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
 use harvest_common::listing::{AuthorizedListing, Listing, ListingId, ListingKind};
 use harvest_common::mailbox::{EncryptedMessage, MailboxStateV1};
-use harvest_common::reputation::{FeedbackEntry, ReputationStateV1};
+use harvest_common::reputation::{Complaint, ReputationStateV1};
 use harvest_common::store::StoreStateV1;
 
 use super::*;
@@ -318,6 +318,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#53 Phase B: the buyer's receipt key
                 // on an order, the buyer's cancel, and the despatch part.
                 "b5eddce776f5f38e47682e94ede5bbd7f4d12fb0acd23bc826dcbff81708737b",
+                // V20, from `git show 3f3ef7b:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#53 Phase C; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "9e0561ce17ef6e62dae5b3a75f70c9e00d742aa6afb5b813d369208f75efc16d",
             ],
         ),
         (
@@ -370,6 +374,12 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // this artifact moves only because `harvest-common` is
                 // compiled into it.
                 "57af8e42fb73260f5b38e9fc27116eaa9e4183b464c8b921e971adfb4dff72db",
+                // V15, from `git show 3f3ef7b:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#53 Phase C,
+                // which is this contract's own change: receipted complaints,
+                // and the record addressed by the store key. The last
+                // generation addressed by an RSA key and the Ghost Key.
+                "78ae80d2bcb3e80299a977da3a437a44cced8b74367f53d24e407c2b171d362e",
             ],
         ),
         (
@@ -417,6 +427,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#53 Phase B; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "fad8339c66fe289d07a7b651fef92f55aa36444862c59151523d0e68dac93cf2",
+                // V15, from `git show 3f3ef7b:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#53 Phase C; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "397f30059eea7a5d8cc4fa4a7f364c772cbfda15ce2b62bb65db1c048b0f1d43",
             ],
         ),
         (
@@ -427,6 +441,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // superseded by harvest#53 Phase B; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "0df754b5c0066bf4ed02b800a293b8eb219ff3c4178af1a0239a8cf7eec7faec",
+                // V2, from `git show 3f3ef7b:ui/public/contracts/index_contract.wasm`.
+                // Superseded by harvest#53 Phase C; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "88fe938bc67b794a497a1e9c657d527c9d857cc394259c02bb7e594000729a29",
             ],
         ),
     ];
@@ -527,6 +545,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#53 Phase B: it signs a despatch, and a
             // recalled conversation carries the buyer's receipt seed.
             "9917c1fbad0ed1754d25f318b8c3384db327d389219c2ed715bc5f7e4343b6c1".to_string(),
+            // V21, from `git show 3f3ef7b:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#53 Phase C: the blind-signature and
+            // transaction requests are gone, and nothing mints an RSA key.
+            "0ab16ff67f87e11da81e179ab75481791b165d631af0a86966e2421255da3b62".to_string(),
         ],
     );
 }
@@ -670,52 +692,123 @@ fn each_generation_is_a_different_instance() {
     );
 }
 
-// --- the ordering constraint --------------------------------------------
+// --- reputation: the RSA generations (harvest#53 Phase C) ----------------
 
-/// A reputation probe cannot be assembled without the delegate's RSA public
-/// key.
-///
-/// `ReputationParameters::rsa_public_key_der` is an input to the reputation
-/// contract's address, so a probe started before the delegate answered would
-/// walk ids belonging to nobody, find nothing, and could seal that verdict
-/// over a recoverable instance. Making the inputs unconstructible is what
-/// turns that from a rule someone has to remember into something the compiler
-/// enforces.
-///
-/// Mutated red by having `reputation_probe_inputs` substitute an empty key
-/// instead of returning `None`.
-#[test]
-fn a_reputation_probe_needs_the_delegates_rsa_key_first() {
-    assert!(
-        reputation_probe_inputs(None, &seller_vk()).is_none(),
-        "a missing RSA key must block the reputation probe, not default it"
-    );
-    assert!(
-        reputation_probe_inputs(Some(&Vec::new()), &seller_vk()).is_none(),
-        "an empty RSA key is a missing one; it must not be probed with"
-    );
-    assert!(
-        reputation_probe_inputs(Some(&vec![1u8, 2, 3]), &seller_vk()).is_some(),
-        "a present key must produce probe inputs"
-    );
+fn store_vk() -> VerifyingKey {
+    SigningKey::from_bytes(&[61u8; 32]).verifying_key()
 }
 
-/// The RSA key is genuinely part of the address, not merely carried alongside
-/// it. Two different keys for the same owner name two different contracts.
-///
-/// This is what the ordering constraint is FOR: probing with the wrong key is
-/// not a degraded search, it is a search of the wrong place.
+fn locators(rsa: Vec<Vec<u8>>, registered: Option<ContractInstanceId>) -> ReputationLocators {
+    ReputationLocators {
+        store_key: store_vk(),
+        ghost_key: seller_vk(),
+        rsa_public_keys: rsa,
+        registered_id: registered,
+    }
+}
+
+/// The id an RSA generation's record was published at, derived here with the
+/// field set the RSA generations' `ReputationParameters` had.
+fn rsa_generation_id(code_hash: &[u8; 32], der: &[u8]) -> ContractInstanceId {
+    #[derive(serde::Serialize)]
+    struct Old {
+        rsa_public_key_der: Vec<u8>,
+        owner_verifying_key: VerifyingKey,
+    }
+    let params = encode_params(&Old {
+        rsa_public_key_der: der.to_vec(),
+        owner_verifying_key: seller_vk(),
+    })
+    .expect("encode");
+    current_id(code_hash, &params)
+}
+
+/// **Every RSA generation is probed at the address it was published at,
+/// for every RSA key known, and at no store-key address.** Deriving them from
+/// today's parameters would probe addresses that never existed and report a
+/// clean "nothing to migrate" -- the silent failure the store split exists
+/// for. Red if the RSA generations are derived from `reputation_params`.
 #[test]
-fn the_rsa_key_changes_the_reputation_instance_id() {
-    let a = reputation_probe_inputs(Some(&vec![1u8; 64]), &seller_vk()).expect("inputs");
-    let b = reputation_probe_inputs(Some(&vec![2u8; 64]), &seller_vk()).expect("inputs");
-    let hash = [9u8; 32];
-    let id_a = current_id(&hash, &encode_params(&a.params).expect("encode"));
-    let id_b = current_id(&hash, &encode_params(&b.params).expect("encode"));
-    assert_ne!(
-        id_a, id_b,
-        "the RSA public key must be part of the reputation contract's address"
+fn rsa_generations_are_probed_under_their_own_encoding() {
+    let record = vec![1u8; 40];
+    let per_device = vec![2u8; 40];
+    let ids = reputation_candidate_ids(&locators(vec![record.clone(), per_device.clone()], None))
+        .expect("derive");
+    let rsa_rows: Vec<_> = reputation_lineage()
+        .iter()
+        .filter(|e| e.generation <= LAST_RSA_REPUTATION_PARAM_GENERATION)
+        .collect();
+    assert!(
+        !rsa_rows.is_empty(),
+        "precondition: the registry has RSA rows"
     );
+    for row in &rsa_rows {
+        for der in [&record, &per_device] {
+            assert!(
+                ids.contains(&rsa_generation_id(&row.code_hash, der)),
+                "V{} under one of the RSA keys is missing",
+                row.generation
+            );
+        }
+        let store_key_id = current_id(
+            &row.code_hash,
+            &encode_params(&reputation_params(&store_vk())).unwrap(),
+        );
+        assert!(
+            !ids.contains(&store_key_id),
+            "V{} was derived under the store key, where it never lived",
+            row.generation
+        );
+    }
+    // The newest RSA generation first: `NewestFirst` asks for it.
+    let newest = rsa_rows.iter().max_by_key(|e| e.generation).unwrap();
+    assert_eq!(ids[0], rsa_generation_id(&newest.code_hash, &record));
+}
+
+/// With no RSA key known, the RSA generations contribute nothing, and the
+/// registered id -- the exact record this seller made -- is still tried,
+/// once, and last.
+#[test]
+fn the_registered_reputation_id_is_tried_once_and_last() {
+    let registered = ContractInstanceId::new([77u8; 32]);
+    let ids = reputation_candidate_ids(&locators(Vec::new(), Some(registered))).expect("derive");
+    assert_eq!(
+        ids,
+        vec![registered],
+        "no RSA key, so only the registered id"
+    );
+
+    let der = vec![3u8; 40];
+    let newest = reputation_lineage()
+        .iter()
+        .filter(|e| e.generation <= LAST_RSA_REPUTATION_PARAM_GENERATION)
+        .max_by_key(|e| e.generation)
+        .unwrap();
+    let derived = rsa_generation_id(&newest.code_hash, &der);
+    let ids =
+        reputation_candidate_ids(&locators(vec![der.clone()], Some(derived))).expect("derive");
+    assert_eq!(
+        ids.iter().filter(|id| **id == derived).count(),
+        1,
+        "a registered id the derivation already produced is not probed twice"
+    );
+    let ids = reputation_candidate_ids(&locators(vec![der], Some(registered))).expect("derive");
+    assert_eq!(ids.last(), Some(&registered));
+}
+
+/// The current record is the store key's, and no candidate is it.
+#[test]
+fn no_reputation_candidate_is_the_current_record() {
+    let current_hash: [u8; 32] = *blake3::hash(include_bytes!(
+        "../../public/contracts/reputation_contract.wasm"
+    ))
+    .as_bytes();
+    let current = current_id(
+        &current_hash,
+        &encode_params(&reputation_params(&store_vk())).unwrap(),
+    );
+    let ids = reputation_candidate_ids(&locators(vec![vec![1u8; 40]], None)).expect("derive");
+    assert!(!ids.contains(&current));
 }
 
 // --- the store's parameter-encoding splits ------------------------------
@@ -919,6 +1012,9 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // the first owned by a store key. Still the code, 29B; the code is
         // now the store key's, and the probe derives it from that key.
         (19, Code),
+        // V20: harvest#53 Phase B (`3f3ef7b`). Still the store key's code,
+        // 29B.
+        (20, Code),
     ]
 };
 
@@ -2060,7 +2156,7 @@ fn the_fold_says_what_it_could_not_carry() {
 /// flaps and each flap is a PUT.
 #[test]
 fn re_folding_a_generation_is_a_no_op_for_reputation_and_store() {
-    let rep_params = reputation_params(vec![1u8; 32], &seller_vk());
+    let rep_params = reputation_params(&store_vk());
     let rep_ops = ReputationOps {
         params: rep_params.clone(),
     };
@@ -2098,40 +2194,72 @@ fn empty_states_are_not_real() {
     assert!(mailbox.is_real(&mailbox_with(vec![message(1, 1_700_000_000)])));
 
     let reputation = ReputationOps {
-        params: reputation_params(vec![1u8; 32], &seller_vk()),
+        params: reputation_params(&store_vk()),
     };
     assert!(!reputation.is_real(&ReputationStateV1::default()));
-    let mut with_feedback = ReputationStateV1::default();
-    with_feedback.feedback.push(dummy_feedback());
-    assert!(reputation.is_real(&with_feedback));
+    let mut with_complaint = ReputationStateV1::default();
+    with_complaint.complaints.push(dummy_complaint());
+    assert!(reputation.is_real(&with_complaint));
+    // A certificate alone is real (harvest#53 Phase C, Option A): it is all
+    // an RSA generation's record holds, and what the walk carries forward.
+    // Red against the old rule, which counted only feedback.
+    let cert_only = ReputationStateV1 {
+        owner_certificate_pem: "CERT".to_string(),
+        ..Default::default()
+    };
+    assert!(reputation.is_real(&cert_only));
 }
 
-/// A feedback entry that exists but does not verify. Used only where the
-/// signature is not the property under test.
-fn dummy_feedback() -> FeedbackEntry {
-    FeedbackEntry {
-        token: harvest_common::feedback::FeedbackToken {
-            target_reputation_contract: [5u8; 32],
-            nonce: [4u8; 32],
-            entry_key: [4u8; 32],
+/// A complaint that exists but does not verify. Used only where the
+/// signatures are not the property under test.
+fn dummy_complaint() -> Complaint {
+    use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+    Complaint {
+        order: AuthorizedOrder {
+            order: Order {
+                id: OrderId([4u8; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: vec![0u8; 22],
+                payment_hash: None,
+                payment_address: String::new(),
+                required_confirmations: 1,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: Some([4u8; 32]),
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            },
+            scoped_payload: vec![0u8; 8],
+            signature: vec![0u8; 64],
+            status: OrderStatus::Paid,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
         },
-        signature: vec![0u8; 8],
         category: harvest_common::feedback::FeedbackCategory::NonDelivery,
-        comment: String::new(),
-        submitted_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
-        entry_signature: vec![0u8; 64],
+        block_ref: freenet_bitcoin_common::BlockAnchor {
+            height: 100,
+            hash: freenet_bitcoin_common::BlockHash([4u8; 32]),
+        },
+        scoped_payload: vec![0u8; 8],
+        buyer_signature: vec![0u8; 64],
     }
 }
 
 /// A merge that cannot be applied keeps the primary rather than losing it.
 ///
-/// `ReputationStateV1::apply_delta` rejects the whole delta if any entry's
-/// RSA signature does not verify. The documented `ProbeStateOps` behaviour is
+/// `ReputationStateV1::apply_delta` rejects the whole delta if any complaint
+/// does not verify. The documented `ProbeStateOps` behaviour is
 /// keep-primary, and getting that backwards would let one bad entry from an
 /// old generation erase a good newer one.
 #[test]
 fn an_unverifiable_merge_keeps_the_primary() {
-    let params = reputation_params(vec![1u8; 32], &seller_vk());
+    let params = reputation_params(&store_vk());
     let ops = ReputationOps {
         params: params.clone(),
     };
@@ -2141,8 +2269,7 @@ fn an_unverifiable_merge_keeps_the_primary() {
     };
 
     let mut bad = ReputationStateV1::default();
-    bad.feedback.push(dummy_feedback());
-    bad.used_nonces.insert([4u8; 32]);
+    bad.complaints.push(dummy_complaint());
 
     let merged = ops.merge_generations(primary.clone(), bad);
     assert_eq!(
@@ -2167,11 +2294,10 @@ fn an_unverifiable_merge_keeps_the_primary() {
 /// going through the same helper.
 #[test]
 fn a_wholly_discarded_predecessor_generation_is_reported() {
-    // Reputation: one unverifiable entry rejects the whole delta.
-    let rep_params = reputation_params(vec![1u8; 32], &seller_vk());
+    // Reputation: one unverifiable complaint rejects the whole delta.
+    let rep_params = reputation_params(&store_vk());
     let mut unverifiable = ReputationStateV1::default();
-    unverifiable.feedback.push(dummy_feedback());
-    unverifiable.used_nonces.insert([4u8; 32]);
+    unverifiable.complaints.push(dummy_complaint());
 
     let rep = merge_reputation_reporting_discard(
         ReputationStateV1::default(),
@@ -2183,7 +2309,7 @@ fn a_wholly_discarded_predecessor_generation_is_reported() {
         "a reputation generation refused in full must be reported, not kept quiet"
     );
     assert!(
-        rep.state.feedback.is_empty(),
+        rep.state.complaints.is_empty(),
         "keep-primary is still the behaviour"
     );
 

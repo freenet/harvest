@@ -13,8 +13,8 @@
 //! Silence is success and writes nothing. An order whose windows have all
 //! passed with no complaint reads as finished to everyone, whether or not
 //! either party ever opens Harvest again. Only what a STRANGER has to be able
-//! to read gets written: the payment, the seller's despatch (Phase B), and (in
-//! a later phase) a complaint.
+//! to read gets written: the payment, the seller's despatch (Phase B), and the
+//! buyer's complaint (Phase C).
 //!
 //! # Why these live in the UI crate and not in `harvest-common`
 //!
@@ -316,9 +316,10 @@ pub fn order_stage(
             let despatched_at = despatch
                 .filter(|d| d.despatch.order_id == order.order.id)
                 .map(|d| d.despatch.anchor.height);
-            let complaint_until = despatch_by
-                .max(despatched_at.unwrap_or(0))
-                .saturating_add(COMPLAINT_WINDOW_BLOCKS);
+            // The one computation of the window's end, shared with how a
+            // reader counts a complaint (`complaint_standing`), so the card
+            // and the record cannot disagree about when it closed.
+            let complaint_until = complaint_window_end(order, despatch).unwrap_or(despatch_by);
             if let Some(despatched_at) = despatched_at {
                 return if tip <= complaint_until {
                     OrderStage::Despatched {
@@ -347,6 +348,100 @@ pub fn order_stage(
                 }
             }
         }
+    }
+}
+
+/// Whether a complaint against a payment the store later records as
+/// reversed still counts against the seller.
+///
+/// **The one place this decision lives** (harvest#53 design, section 8).
+/// Resolved for now as a reader-side rule: the contract accepts a complaint
+/// only against a `Paid` order, and if that payment is later reversed on the
+/// chain, readers show the complaint as "payment reversed" and do not count
+/// it -- the buyer's money did not stay with the seller, so the complaint no
+/// longer carries the cost that gives it weight. It is Ian's call to revisit;
+/// change this and every reader follows, with no re-key.
+pub fn complaint_against_reversed_payment_counts() -> bool {
+    false
+}
+
+/// How a reader counts one complaint on a seller's record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComplaintStanding {
+    /// Counts against the seller.
+    Counts,
+    /// Signed after the complaint window closed at `closed_at`, by its own
+    /// block reference. Shown, not counted.
+    Late { closed_at: u32 },
+    /// The store records the order's payment as reversed. Shown as such, and
+    /// counted only if [`complaint_against_reversed_payment_counts`] says so.
+    PaymentReversed,
+}
+
+impl ComplaintStanding {
+    pub fn counts(self) -> bool {
+        match self {
+            ComplaintStanding::Counts => true,
+            ComplaintStanding::Late { .. } => false,
+            ComplaintStanding::PaymentReversed => complaint_against_reversed_payment_counts(),
+        }
+    }
+}
+
+/// The last block at which the buyer of `order` may complain: the despatch
+/// deadline or the despatch's own anchor, whichever is later, plus
+/// [`COMPLAINT_WINDOW_BLOCKS`] -- the same end [`order_stage`] reads.
+/// `None` when the order's paid height cannot be read.
+pub fn complaint_window_end(
+    order: &AuthorizedOrder,
+    despatch: Option<&AuthorizedDespatch>,
+) -> Option<u32> {
+    let paid_at = paid_height(order)?;
+    let despatch_by = paid_at.saturating_add(DESPATCH_WINDOW_BLOCKS);
+    let despatched_at = despatch
+        .filter(|d| d.despatch.order_id == order.order.id)
+        .map(|d| d.despatch.anchor.height)
+        .unwrap_or(0);
+    Some(
+        despatch_by
+            .max(despatched_at)
+            .saturating_add(COMPLAINT_WINDOW_BLOCKS),
+    )
+}
+
+/// How a reader counts `complaint` (harvest#53 Phase C).
+///
+/// `store_order` is the store's current record of the complained-about
+/// order, if the reader has the store loaded and it still holds the order
+/// (`enforce_order_cap` prunes old ones); `despatch` is the store's despatch
+/// of it, if any. Neither is needed: the complaint carries its own paid
+/// order, which the contract verified.
+///
+/// # What the block reference can and cannot show
+///
+/// It is a lower bound, like a despatch's anchor: every past block hash is
+/// public, so a buyer can backdate a complaint to any block inside the
+/// window, and a window's close is not enforceable against a buyer who does.
+/// What it does show is a complaint honestly signed late, which is not
+/// counted.
+pub fn complaint_standing(
+    complaint: &harvest_common::reputation::Complaint,
+    store_order: Option<&AuthorizedOrder>,
+    despatch: Option<&AuthorizedDespatch>,
+) -> ComplaintStanding {
+    let reversed = store_order.is_some_and(|held| {
+        held.order.id == complaint.order.order.id && held.status == OrderStatus::PaymentReversed
+    });
+    if reversed {
+        return ComplaintStanding::PaymentReversed;
+    }
+    match complaint_window_end(&complaint.order, despatch) {
+        Some(closed_at) if complaint.block_ref.height > closed_at => {
+            ComplaintStanding::Late { closed_at }
+        }
+        // Inside the window, or a window this reader cannot place: the
+        // payment is verified either way, so the complaint counts.
+        _ => ComplaintStanding::Counts,
     }
 }
 
@@ -383,8 +478,9 @@ impl OrderStage {
     ///
     /// A seller can record a despatch (harvest#53 Phase B), so a despatch
     /// window that closes with none recorded is now a fact about the SELLER,
-    /// and is said and styled as one. Nothing in this build takes a complaint
-    /// yet, so no sentence here offers one.
+    /// and is said and styled as one. The buyer's complaint (Phase C) is
+    /// offered by the buyer's own card, not here: this card is shared with
+    /// the seller.
     pub fn describe(self, tip_height: Option<u32>, status: OrderStatus) -> Option<String> {
         // " (about 3 days)", or nothing when this reader has no tip to count
         // from: a duration made up without one is a made-up number.
@@ -1297,5 +1393,103 @@ mod tests {
         assert_eq!(approx_duration(144), "about 24 hours");
         assert_eq!(approx_duration(DESPATCH_WINDOW_BLOCKS), "about 7 days");
         assert_eq!(approx_duration(COMPLAINT_WINDOW_BLOCKS), "about 14 days");
+    }
+
+    /// A complaint about `order` made at `block`, in the shape the record
+    /// holds. Its signatures are not what `complaint_standing` judges: the
+    /// contract verified them before any reader sees it.
+    fn complaint_at(order: &AuthorizedOrder, block: u32) -> harvest_common::reputation::Complaint {
+        harvest_common::reputation::Complaint {
+            order: order.clone(),
+            category: harvest_common::feedback::FeedbackCategory::NonDelivery,
+            block_ref: anchor(block),
+            scoped_payload: Vec::new(),
+            buyer_signature: Vec::new(),
+        }
+    }
+
+    /// harvest#53 Phase C: a complaint counts when it was made inside the
+    /// window the order's own card shows, and not when it was honestly made
+    /// after; a recorded despatch moves the window's end later, never
+    /// earlier. Red if `complaint_standing` stops comparing the block to the
+    /// window, or measures it from anything but `complaint_window_end`.
+    #[test]
+    fn a_complaint_counts_inside_the_window_and_not_after() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let end = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        assert_eq!(complaint_window_end(&paid, None), Some(end));
+
+        for block in [paid_at + 1, end] {
+            assert_eq!(
+                complaint_standing(&complaint_at(&paid, block), Some(&paid), None),
+                ComplaintStanding::Counts,
+                "made at {block}, inside the window"
+            );
+        }
+        let late = complaint_standing(&complaint_at(&paid, end + 1), Some(&paid), None);
+        assert_eq!(late, ComplaintStanding::Late { closed_at: end });
+        assert!(!late.counts());
+
+        // A despatch anchored late extends the window to its own anchor plus
+        // the complaint window.
+        let despatched = end + 500;
+        let despatch = despatch_at(&paid, despatched);
+        assert_eq!(
+            complaint_standing(&complaint_at(&paid, end + 1), Some(&paid), Some(&despatch)),
+            ComplaintStanding::Counts
+        );
+        // And the card agrees about where that window ends.
+        assert_eq!(
+            order_stage(
+                &paid,
+                Some(&despatch),
+                Some(end + 1),
+                PaymentSight::default()
+            ),
+            OrderStage::Despatched {
+                despatched_at: despatched,
+                complaint_until: despatched + COMPLAINT_WINDOW_BLOCKS,
+            }
+        );
+
+        // Without the store's copy (pruned, or not loaded), the complaint's
+        // own paid order places the window.
+        assert_eq!(
+            complaint_standing(&complaint_at(&paid, end + 1), None, None),
+            ComplaintStanding::Late { closed_at: end }
+        );
+    }
+
+    /// **A complaint against a payment the store later records as reversed
+    /// is shown as such and not counted** (design section 8, resolved as a
+    /// reader-side rule). Red if the reversal check is removed, or if
+    /// `complaint_against_reversed_payment_counts` is flipped without meaning
+    /// to.
+    #[test]
+    fn a_complaint_against_a_reversed_payment_does_not_count() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let complaint = complaint_at(&paid, paid_at + 10);
+        let mut reversed = paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+
+        let standing = complaint_standing(&complaint, Some(&reversed), None);
+        assert_eq!(standing, ComplaintStanding::PaymentReversed);
+        assert!(!complaint_against_reversed_payment_counts());
+        assert!(!standing.counts());
+
+        // A reversal of a DIFFERENT order does not touch this complaint.
+        let mut other = order(OrderStatus::PaymentReversed, 20_000);
+        other.order.amount_sats = 20_000;
+        let other = AuthorizedOrder {
+            order: other.order.with_derived_id(),
+            ..other
+        };
+        assert_ne!(other.order.id, paid.order.id);
+        assert_eq!(
+            complaint_standing(&complaint, Some(&other), None),
+            ComplaintStanding::Counts
+        );
     }
 }

@@ -27,11 +27,13 @@
 //!
 //! * **Store** -- the seller's ghostkey verifying key.
 //! * **Mailbox** -- the owner's ghostkey verifying key.
-//! * **Reputation** -- the seller's RSA public key AND their verifying key.
+//! * **Reputation** -- the store key, since harvest#53 Phase C. Before it, an
+//!   RSA public key and the Ghost Key; see "Reputation" below.
 //!
-//! The first two need nothing but the ghostkey, which is why a store is
-//! recoverable even for a seller whose delegate secrets are gone. The third
-//! does not, and that asymmetry is the ordering constraint below.
+//! None of the current addresses needs anything the delegate holds, which is
+//! why a seller's data is recoverable even when their delegate secrets are
+//! gone. The reputation record's RSA generations are the exception, and only
+//! for stores made before harvest#93 phase 1b (a per-device key).
 //!
 //! ## When the PARAMETERS change, not just the code
 //!
@@ -53,20 +55,17 @@
 //! fold names the seller's key as their owner (see [`StoreOps`]), which is
 //! exactly the key their contract verified every record against.
 //!
-//! # The ordering constraint
+//! # Reputation: the RSA generations (harvest#53 Phase C, Option A)
 //!
-//! `ReputationParameters::rsa_public_key_der` is exactly the value the harvest
-//! delegate holds under `harvest:rsa_pk:{fingerprint}`. So a reputation
-//! instance id -- for **any** generation, the current one included -- cannot be
-//! derived until that secret has been carried forward. Probing reputation
-//! first would not merely fail to find anything: it would probe ids derived
-//! from the wrong key, get nothing, and could seal a "nothing there" marker
-//! over a perfectly recoverable instance.
-//!
-//! Here the constraint is structural rather than a rule to remember:
-//! [`reputation_probe_inputs`] cannot be constructed without the RSA key, and
-//! the only source of that key is a delegate response. Store and mailbox have
-//! no such dependency and run as soon as the ghostkey is known.
+//! Up to [`LAST_RSA_REPUTATION_PARAM_GENERATION`] a reputation record was
+//! addressed by `{rsa_public_key_der, owner_verifying_key}`: an RSA key the
+//! blind-signed feedback tokens were to be verified against, and the Ghost
+//! Key. Phase C deleted the blind signatures and re-addressed the record by
+//! the store key, so those records are found only by re-deriving the old
+//! parameters: [`ReputationLocators`] carries the RSA public keys that can do
+//! it, and nothing else about the RSA scheme survives. No feedback entry was
+//! ever written outside tests, so what the walk carries forward is the
+//! seller's certificate; see [`ReputationOps::is_real`].
 //!
 //! # When the probe runs
 //!
@@ -429,41 +428,115 @@ pub fn index_params(ghost_key: &ed25519_dalek::VerifyingKey) -> IndexParameters 
     IndexParameters::new(*ghost_key)
 }
 
-pub fn reputation_params(
-    rsa_public_key_der: Vec<u8>,
-    owner_verifying_key: &ed25519_dalek::VerifyingKey,
-) -> ReputationParameters {
-    ReputationParameters::new(rsa_public_key_der, *owner_verifying_key)
+/// The parameters a store's reputation record is published under: the store
+/// key alone (harvest#53 Phase C).
+pub fn reputation_params(store_key: &ed25519_dalek::VerifyingKey) -> ReputationParameters {
+    ReputationParameters::new(*store_key)
 }
 
-/// The reputation probe's inputs, which cannot be assembled without the RSA
-/// public key the harvest delegate holds.
+/// The last reputation generation addressed by an RSA public key and the
+/// Ghost Key (`{rsa_public_key_der, owner_verifying_key}`). Every generation
+/// after it is addressed by the store key alone.
 ///
-/// This type exists to make the ordering constraint structural rather than
-/// remembered: there is no way to start a reputation probe while the delegate
-/// secret is still missing, because there is no way to build this.
-pub struct ReputationProbeInputs {
-    pub params: ReputationParameters,
-}
+/// A fixed historical fact, like [`LAST_WHOLE_KEY_STORE_PARAM_GENERATION`]:
+/// V15 is the build Phase B published (`78ae80d2`), the last before Phase C.
+pub const LAST_RSA_REPUTATION_PARAM_GENERATION: u32 = 15;
 
-/// Assemble the reputation probe's inputs, or `None` if the delegate has not
-/// yet produced this identity's RSA public key.
+/// The parameter bytes reputation generations up to and including
+/// [`LAST_RSA_REPUTATION_PARAM_GENERATION`] were published under.
 ///
-/// `None` means **not yet**, never "nothing to migrate". The caller must not
-/// substitute a placeholder key or fall back to probing without one: the ids
-/// would be wrong, the walk would find nothing, and a seal on that would
-/// strand a recoverable instance permanently.
-pub fn reputation_probe_inputs(
-    rsa_public_key_der: Option<&Vec<u8>>,
-    owner_verifying_key: &ed25519_dalek::VerifyingKey,
-) -> Option<ReputationProbeInputs> {
-    let der = rsa_public_key_der?;
-    if der.is_empty() {
-        return None;
+/// A frozen record of bytes already on the network, written out rather than
+/// derived from the live struct, for the reason [`legacy_store_params_cbor`]
+/// gives. The RSA key here only ever LOCATES an old record (harvest#53
+/// Phase C, Option A): nothing verifies with it and nothing signs with its
+/// private half any more.
+fn rsa_reputation_params_cbor(
+    rsa_public_key_der: &[u8],
+    ghost_key: &ed25519_dalek::VerifyingKey,
+) -> Result<Parameters<'static>, String> {
+    #[derive(serde::Serialize)]
+    struct RsaReputationParameters {
+        rsa_public_key_der: Vec<u8>,
+        owner_verifying_key: ed25519_dalek::VerifyingKey,
     }
-    Some(ReputationProbeInputs {
-        params: reputation_params(der.clone(), owner_verifying_key),
+    encode_params(&RsaReputationParameters {
+        rsa_public_key_der: rsa_public_key_der.to_vec(),
+        owner_verifying_key: *ghost_key,
     })
+}
+
+/// What locates a store's superseded reputation records.
+///
+/// Before Phase C a record was addressed by an RSA public key and the Ghost
+/// Key, and which RSA key depended on when the store was made: the store's
+/// record key (`StoreInfoV1::record_public_key`, derived from the store key)
+/// since harvest#93 phase 1b, the Ghost Key's per-device key
+/// (`GetRsaPublicKey`) before it. Both are tried when known. The
+/// registration's own `reputation_contract_id` is the exact record this
+/// seller made, whatever its derivation, so it is tried too.
+pub struct ReputationLocators {
+    pub store_key: ed25519_dalek::VerifyingKey,
+    pub ghost_key: ed25519_dalek::VerifyingKey,
+    pub rsa_public_keys: Vec<Vec<u8>>,
+    pub registered_id: Option<ContractInstanceId>,
+}
+
+/// Every superseded reputation instance to probe for one store, newest
+/// generation first, each derived under the parameter encoding its
+/// generation was published with, then the registered id if no derivation
+/// produced it.
+///
+/// The order is what `NewestFirst` asks for: by the registry's declared
+/// generation, descending. Within an RSA generation the keys are in the order
+/// given, which does not matter: at most one of them addressed anything.
+pub fn reputation_candidate_ids(
+    locators: &ReputationLocators,
+) -> Result<Vec<ContractInstanceId>, String> {
+    let current = encode_params(&reputation_params(&locators.store_key))?;
+    let rsa: Vec<Parameters<'static>> = locators
+        .rsa_public_keys
+        .iter()
+        .filter(|der| !der.is_empty())
+        .map(|der| rsa_reputation_params_cbor(der, &locators.ghost_key))
+        .collect::<Result<_, _>>()?;
+    let mut by_generation: Vec<(u32, ContractInstanceId)> = Vec::new();
+    for entry in reputation_lineage() {
+        if entry.generation <= LAST_RSA_REPUTATION_PARAM_GENERATION {
+            for params in &rsa {
+                by_generation.push((
+                    entry.generation,
+                    contract_id_from_code_hash(&entry.code_hash, params),
+                ));
+            }
+        } else {
+            by_generation.push((
+                entry.generation,
+                contract_id_from_code_hash(&entry.code_hash, &current),
+            ));
+        }
+    }
+    // Stable, so keys keep their given order within a generation.
+    by_generation.sort_by_key(|(generation, _)| core::cmp::Reverse(*generation));
+    let mut ids: Vec<ContractInstanceId> = by_generation.into_iter().map(|(_, id)| id).collect();
+    if let Some(registered) = locators.registered_id {
+        if !ids.contains(&registered) {
+            // Last: an id whose generation is unknown is treated as the
+            // oldest, so a derived candidate's state is the newer side of
+            // every fold.
+            ids.push(registered);
+        }
+    }
+    Ok(ids)
+}
+
+/// [`reputation_candidate_ids`] as the ordering-proof type `ProbeSession`
+/// wants. `assume_ordered` is safe for the reason [`store_candidates`] gives.
+pub fn reputation_candidates(
+    locators: &ReputationLocators,
+) -> Result<freenet_migrate::NewestFirst, String> {
+    Ok(freenet_migrate::NewestFirst::assume_ordered(
+        reputation_candidate_ids(locators)?,
+    ))
 }
 
 /// CBOR-encode parameters the way the contracts do.
@@ -911,11 +984,13 @@ impl ProbeStateOps for ReputationOps {
         decode_probed_state("reputation", bytes)
     }
 
-    /// Feedback is what a reputation contract is for. A state holding only a
-    /// certificate is the shell created alongside a store and carries nothing
-    /// to recover.
+    /// A state holding complaints OR the seller's certificate is worth
+    /// carrying (harvest#53 Phase C, Option A). No RSA generation ever held a
+    /// feedback entry outside tests, so the certificate is all a predecessor
+    /// has; counting only complaints, as this once did with feedback, would
+    /// call every live record empty and carry nothing.
     fn is_real(&self, state: &Self::State) -> bool {
-        !state.feedback.is_empty()
+        !state.complaints.is_empty() || !state.owner_certificate_pem.is_empty()
     }
 
     fn merge_with_local(&self, recovered: Self::State, local: &Self::State) -> Self::State {

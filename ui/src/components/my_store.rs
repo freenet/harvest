@@ -63,7 +63,6 @@ pub fn MyStore() -> Element {
                 IdentityList {
                     ghostkeys: app_state.ghostkeys.clone(),
                     my_stores: app_state.my_stores.clone(),
-                    rsa_keys: app_state.rsa_public_keys.clone(),
                     has_harvest_delegate: app_state.harvest_delegate_key.is_some(),
                 }
                 ConnectAnother { in_flight: in_flight }
@@ -171,7 +170,6 @@ pub(crate) fn connect_ghostkey() {
 fn IdentityList(
     ghostkeys: Vec<ghostkey_common::GhostKeyInfo>,
     my_stores: std::collections::HashMap<String, Vec<harvest_common::StoreRegistration>>,
-    rsa_keys: std::collections::HashMap<String, Vec<u8>>,
     has_harvest_delegate: bool,
 ) -> Element {
     rsx! {
@@ -188,7 +186,6 @@ fn IdentityList(
                 IdentityCard {
                     identity: gk.clone(),
                     stores: my_stores.get(&gk.fingerprint).cloned().unwrap_or_default(),
-                    has_rsa_key: rsa_keys.contains_key(&gk.fingerprint),
                     has_harvest_delegate: has_harvest_delegate,
                 }
             }
@@ -200,7 +197,6 @@ fn IdentityList(
 fn IdentityCard(
     identity: ghostkey_common::GhostKeyInfo,
     stores: Vec<harvest_common::StoreRegistration>,
-    has_rsa_key: bool,
     has_harvest_delegate: bool,
 ) -> Element {
     let mut show_listing_form = use_signal(|| false);
