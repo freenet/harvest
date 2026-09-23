@@ -1098,6 +1098,12 @@ fn unanswered_requests(
             // only move their own asks. A buyer whose clock runs behind the
             // seller's by more than the time between the seller issuing and
             // the buyer asking again is not surfaced until they ask later.
+            // The other direction: a buyer whose clock runs AHEAD of the
+            // seller's by more than the seller took to answer stamps the
+            // answered ask after `issued`, so once that answer is cancelled
+            // the ask is offered to the seller again although the buyer
+            // withdrew it. No tolerance is added for either, because one
+            // would widen the first case's wait to cure the second.
             answers
                 .iter()
                 .map(|order| order.order.created_at)

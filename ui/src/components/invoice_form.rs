@@ -182,8 +182,8 @@ fn CancelInvoice(
     let (pending, sent) = {
         let state = APP_STATE.read();
         (
-            state.cancellation_pending(&order_id),
-            state.cancellations_sent.contains(&order_id),
+            state.cancellation_pending(&store_contract_id, &order_id),
+            state.cancellation_sent(&store_contract_id, &order_id),
         )
     };
     let short = order_id.short();
@@ -263,8 +263,8 @@ fn MarkDespatched(
                 .browsing_stores
                 .get(&store_contract_id)
                 .is_some_and(|store| store.despatches.contains_key(&order_id)),
-            state.despatch_pending(&order_id),
-            state.despatches_sent.contains(&order_id),
+            state.despatch_pending(&store_contract_id, &order_id),
+            state.despatch_sent(&store_contract_id, &order_id),
             state.despatch_refusal(&store_contract_id, &order_id),
         )
     };

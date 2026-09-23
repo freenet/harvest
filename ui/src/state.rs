@@ -389,10 +389,12 @@ pub struct AppState {
     /// them, in order.
     pub stores_from_my_indexes: Vec<Vec<u8>>,
 
-    /// Cancellations signed, checked and sent, by order id, so the seller's
-    /// control does not reappear on an invoice whose cancellation is on its
-    /// way to the store. Session-only: a reload shows the store's own answer.
-    pub cancellations_sent: HashSet<harvest_common::payment::OrderId>,
+    /// Cancellations signed, checked and sent, by store and order id, so the
+    /// seller's control does not reappear on an invoice whose cancellation is
+    /// on its way to the store. Session-only: a reload shows the store's own
+    /// answer. Keyed by the store too because an order id is a hash of the
+    /// terms alone, which two stores can both hold ([`OrderAt`]).
+    pub cancellations_sent: HashSet<OrderAt>,
 
     /// Off-target only: cancelled invoices recorded instead of published, so
     /// the cancel flow can be followed in a test (harvest#53). Holds the
@@ -400,13 +402,15 @@ pub struct AppState {
     #[cfg(not(target_arch = "wasm32"))]
     pub published_cancellations: Vec<harvest_common::payment::AuthorizedOrder>,
 
-    /// Despatches signed, checked and sent, by order id, so the seller's
-    /// control does not come back while the despatch is on its way to the
-    /// store (harvest#53 Phase B). Session-only, like `cancellations_sent`.
-    pub despatches_sent: HashSet<harvest_common::payment::OrderId>,
+    /// Despatches signed, checked and sent, by store and order id, so the
+    /// seller's control does not come back while the despatch is on its way
+    /// to the store (harvest#53 Phase B). Session-only, like
+    /// `cancellations_sent`.
+    pub despatches_sent: HashSet<OrderAt>,
 
-    /// The buyer's own cancellations sent, by order id (harvest#53 Phase B).
-    pub buyer_cancellations_sent: HashSet<harvest_common::payment::OrderId>,
+    /// The buyer's own cancellations sent, by store and order id (harvest#53
+    /// Phase B).
+    pub buyer_cancellations_sent: HashSet<OrderAt>,
 
     /// Off-target only: despatches recorded instead of published.
     #[cfg(not(target_arch = "wasm32"))]
@@ -880,6 +884,25 @@ pub(crate) const NO_STORE_KEY_MESSAGE: &str =
      keys has to be moved to one first (My Store offers it); for a store created on another \
      device, open its link here with the Ghost Key that backs it connected, and Harvest \
      recovers the key from the store.";
+
+/// What a seller is told when their store's key is registered on this device
+/// but the delegate does not hold it (harvest#138): after a delegate re-key,
+/// until custody recovers it from the copy wrapped to a backing Ghost Key.
+/// Said in place of a control whose signature the delegate would refuse.
+pub(crate) const STORE_KEY_NOT_HELD_MESSAGE: &str =
+    "this device does not hold your store's key yet. Harvest recovers it from the copy wrapped \
+     to a Ghost Key that backs the store, once that Ghost Key is connected here.";
+
+/// One order in one store: the key of the session markers for records on
+/// their way to a store. An [`harvest_common::payment::OrderId`] is a hash of
+/// the order's terms alone, which name no store, so two stores can hold an
+/// order with the same id, and a marker keyed by the id alone would refuse
+/// the second store's control for the session (#136 review, round 5).
+pub type OrderAt = (Vec<u8>, harvest_common::payment::OrderId);
+
+fn order_at(store_contract_id: &[u8], order_id: &harvest_common::payment::OrderId) -> OrderAt {
+    (store_contract_id.to_vec(), order_id.clone())
+}
 
 /// Wrap a freshly-signed invoice as the record the store contract stores.
 ///
@@ -7106,9 +7129,7 @@ impl AppState {
     ) -> Result<(), String> {
         use harvest_common::payment::OrderStatus;
 
-        let store_key = self
-            .store_owner_key(store_contract_id)
-            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())?;
+        let store_key = self.signing_store_key(store_contract_id)?;
         let order = self
             .browsing_stores
             .get(store_contract_id)
@@ -7133,7 +7154,9 @@ impl AppState {
         if self.payment_on_its_way(&order) {
             return Err(PAYMENT_ON_ITS_WAY.to_string());
         }
-        if self.cancellation_pending(order_id) || self.cancellations_sent.contains(order_id) {
+        if self.cancellation_pending(store_contract_id, order_id)
+            || self.cancellation_sent(store_contract_id, order_id)
+        {
             return Err("this invoice is already being cancelled".to_string());
         }
         info!("Cancelling invoice {}", order_id.short());
@@ -7216,9 +7239,7 @@ impl AppState {
     > {
         use harvest_common::payment::OrderStatus;
 
-        let store_key = self
-            .store_owner_key(store_contract_id)
-            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())?;
+        let store_key = self.signing_store_key(store_contract_id)?;
         let store = self
             .browsing_stores
             .get(store_contract_id)
@@ -7243,7 +7264,9 @@ impl AppState {
         if store.despatches.contains_key(order_id) {
             return Err("this order is already marked despatched".to_string());
         }
-        if self.despatch_pending(order_id) || self.despatches_sent.contains(order_id) {
+        if self.despatch_pending(store_contract_id, order_id)
+            || self.despatch_sent(store_contract_id, order_id)
+        {
             return Err("this order's despatch is already on its way".to_string());
         }
         let anchor = self
@@ -7311,10 +7334,12 @@ impl AppState {
     /// class in `docs/untested-invariants.md`).
     pub(crate) fn on_despatch_send_failed(
         &mut self,
+        store_contract_id: &[u8],
         order_id: &harvest_common::payment::OrderId,
         reason: &str,
     ) {
-        self.despatches_sent.remove(order_id);
+        self.despatches_sent
+            .remove(&order_at(store_contract_id, order_id));
         self.notifications.push(format!(
             "Could not record the despatch of order {}: {reason}",
             order_id.short()
@@ -7326,21 +7351,79 @@ impl AppState {
     /// [`Self::on_despatch_send_failed`].
     pub(crate) fn on_buyer_cancellation_send_failed(
         &mut self,
+        store_contract_id: &[u8],
         order_id: &harvest_common::payment::OrderId,
         reason: &str,
     ) {
-        self.buyer_cancellations_sent.remove(order_id);
+        self.buyer_cancellations_sent
+            .remove(&order_at(store_contract_id, order_id));
         self.notifications.push(format!(
             "Could not cancel order {}: {reason}",
             order_id.short()
         ));
     }
 
-    /// Whether a despatch of `order_id` is waiting on its signature.
-    pub fn despatch_pending(&self, order_id: &harvest_common::payment::OrderId) -> bool {
+    /// Whether a despatch of `order_id` in this store is waiting on its
+    /// signature.
+    pub fn despatch_pending(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
         self.pending_signatures.iter().any(|pending| {
-            matches!(pending, PendingSignature::Despatch(d) if &d.despatch.order_id == order_id)
+            matches!(pending, PendingSignature::Despatch(d)
+                if &d.despatch.order_id == order_id && d.store_contract_id == store_contract_id)
         })
+    }
+
+    /// Whether a despatch of `order_id` in this store was sent this session.
+    pub fn despatch_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.despatches_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// Whether a seller's cancellation of `order_id` in this store was sent
+    /// this session.
+    pub fn cancellation_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.cancellations_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// Whether the buyer's cancellation of `order_id` in this store was sent
+    /// this session.
+    pub fn buyer_cancellation_sent(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        self.buyer_cancellations_sent
+            .contains(&order_at(store_contract_id, order_id))
+    }
+
+    /// The store key this device can SIGN for `store_contract_id` with: the
+    /// registration names it AND the delegate holds it (harvest#138). A
+    /// control that signs is refused here rather than shown and then refused
+    /// by the delegate, which after a delegate re-key is every seller until
+    /// custody recovers the key (#136 review, round 5).
+    fn signing_store_key(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Result<ed25519_dalek::VerifyingKey, String> {
+        let key = self
+            .store_owner_key(store_contract_id)
+            .ok_or_else(|| NO_STORE_KEY_MESSAGE.to_string())?;
+        if !self.holds_store_key(&key.to_bytes()) {
+            return Err(STORE_KEY_NOT_HELD_MESSAGE.to_string());
+        }
+        Ok(key)
     }
 
     /// The store key signed a despatch: verify it and publish it, with its
@@ -7370,8 +7453,10 @@ impl AppState {
             ));
             return;
         }
-        self.despatches_sent
-            .insert(despatch.despatch.order_id.clone());
+        self.despatches_sent.insert(order_at(
+            &pending.store_contract_id,
+            &despatch.despatch.order_id,
+        ));
         #[cfg(target_arch = "wasm32")]
         {
             let store_contract_id = pending.store_contract_id;
@@ -7386,9 +7471,11 @@ impl AppState {
                 .await
                 {
                     dioxus::logger::tracing::error!("Failed to publish the despatch: {}", e);
-                    crate::gateway::APP_STATE
-                        .write()
-                        .on_despatch_send_failed(&id, &e);
+                    crate::gateway::APP_STATE.write().on_despatch_send_failed(
+                        &store_contract_id,
+                        &id,
+                        &e,
+                    );
                 }
             });
         }
@@ -7461,7 +7548,7 @@ impl AppState {
         if self.payment_on_its_way(&order) {
             return Err(PAYMENT_ON_ITS_WAY_BUYER.to_string());
         }
-        if self.buyer_cancellations_sent.contains(order_id) {
+        if self.buyer_cancellation_sent(store_contract_id, order_id) {
             return Err("this order is already being cancelled".to_string());
         }
         Ok((order, key, store_key))
@@ -7518,7 +7605,8 @@ impl AppState {
             .verify(&store_key)
             .map_err(|e| format!("the cancellation would be refused: {e}"))?;
         info!("Cancelling purchase {}", order_id.short());
-        self.buyer_cancellations_sent.insert(order_id.clone());
+        self.buyer_cancellations_sent
+            .insert(order_at(store_contract_id, order_id));
         #[cfg(target_arch = "wasm32")]
         {
             let store_contract_id = store_contract_id.to_vec();
@@ -7533,7 +7621,7 @@ impl AppState {
                     dioxus::logger::tracing::error!("Failed to publish the cancellation: {}", e);
                     crate::gateway::APP_STATE
                         .write()
-                        .on_buyer_cancellation_send_failed(&id, &e);
+                        .on_buyer_cancellation_send_failed(&store_contract_id, &id, &e);
                 }
             });
         }
@@ -7568,10 +7656,16 @@ impl AppState {
         })
     }
 
-    /// Whether a cancellation of `order_id` is waiting on its signature.
-    pub fn cancellation_pending(&self, order_id: &harvest_common::payment::OrderId) -> bool {
+    /// Whether a cancellation of `order_id` in this store is waiting on its
+    /// signature.
+    pub fn cancellation_pending(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
         self.pending_signatures.iter().any(|pending| {
-            matches!(pending, PendingSignature::Cancellation(c) if &c.order.order.id == order_id)
+            matches!(pending, PendingSignature::Cancellation(c)
+                if &c.order.order.id == order_id && c.store_contract_id == store_contract_id)
         })
     }
 
@@ -7610,7 +7704,8 @@ impl AppState {
         // Held until the store shows the cancellation or the send fails, so
         // the control does not come back on an invoice whose cancellation is
         // on its way.
-        self.cancellations_sent.insert(cancelled.order.id.clone());
+        self.cancellations_sent
+            .insert(order_at(&store_contract_id, &cancelled.order.id));
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             let id = cancelled.order.id.clone();
@@ -7619,7 +7714,9 @@ impl AppState {
             {
                 dioxus::logger::tracing::error!("Failed to publish the cancellation: {}", e);
                 let mut state = crate::gateway::APP_STATE.write();
-                state.cancellations_sent.remove(&id);
+                state
+                    .cancellations_sent
+                    .remove(&order_at(&store_contract_id, &id));
                 state
                     .notifications
                     .push(format!("Could not cancel invoice {short}: {e}"));
@@ -23330,7 +23427,7 @@ mod buy_flow_tests {
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("an unpaid invoice in our own store can be cancelled");
-        assert!(state.cancellation_pending(&order.order.id));
+        assert!(state.cancellation_pending(STORE, &order.order.id));
         assert!(
             state.published_cancellations.is_empty(),
             "not before it is signed"
@@ -23338,9 +23435,9 @@ mod buy_flow_tests {
 
         answer_the_store_key_request(&mut state, &seller_signing_key());
 
-        assert!(!state.cancellation_pending(&order.order.id));
+        assert!(!state.cancellation_pending(STORE, &order.order.id));
         assert!(
-            state.cancellations_sent.contains(&order.order.id),
+            state.cancellation_sent(STORE, &order.order.id),
             "the control stays down until the store shows the cancellation"
         );
         assert!(state.cancel_invoice(STORE, &order.order.id).is_err());
@@ -23425,7 +23522,7 @@ mod buy_flow_tests {
             .next()
             .expect("queued");
         state.store_key_signature_failed(request_id, "the delegate said no");
-        assert!(!state.cancellation_pending(&order.order.id));
+        assert!(!state.cancellation_pending(STORE, &order.order.id));
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("a withdrawn cancellation can be asked for again");
@@ -23557,7 +23654,7 @@ mod buy_flow_tests {
         show_a_payment_row(&mut state, &order, order.order.amount_sats);
         answer_the_store_key_request(&mut state, &seller_signing_key());
         assert!(state.published_cancellations.is_empty());
-        assert!(!state.cancellations_sent.contains(&order.order.id));
+        assert!(!state.cancellation_sent(STORE, &order.order.id));
         assert!(
             state
                 .notifications
@@ -23868,7 +23965,7 @@ mod buy_flow_tests {
         state
             .buyer_cancel_order(STORE, &order.order.id)
             .expect("the buyer may cancel their own unpaid order");
-        assert!(state.buyer_cancellations_sent.contains(&order.order.id));
+        assert!(state.buyer_cancellation_sent(STORE, &order.order.id));
         assert!(
             state.buyer_cancel_order(STORE, &order.order.id).is_err(),
             "once is enough"
@@ -23989,6 +24086,135 @@ mod buy_flow_tests {
         assert!(purchase.cancellable());
     }
 
+    /// A registered store whose key the delegate says it does not hold
+    /// (harvest#138: every seller, right after a delegate re-key, until
+    /// custody recovers the key) gets no despatch control: the delegate
+    /// would refuse the signature every time (#136 review, round 5).
+    #[test]
+    fn a_seller_whose_delegate_lacks_the_store_key_is_not_offered_a_despatch() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        let stores = state.my_stores["seller-fp"].clone();
+        state.note_held_store_keys(&stores, Some(&[]));
+
+        assert_eq!(
+            state.despatch_refusal(STORE, &order.order.id).as_deref(),
+            Some(STORE_KEY_NOT_HELD_MESSAGE)
+        );
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+        assert!(
+            state.pending_store_key_requests.is_empty(),
+            "nothing is asked of a delegate that would refuse it"
+        );
+
+        // Once custody recovers the key, the control comes back.
+        let held = [seller_signing_key().verifying_key().to_bytes()];
+        state.note_held_store_keys(&stores, Some(&held));
+        assert_eq!(state.despatch_refusal(STORE, &order.order.id), None);
+    }
+
+    /// The seller's cancel is refused the same way, before the delegate is
+    /// asked.
+    #[test]
+    fn a_seller_whose_delegate_lacks_the_store_key_cannot_start_a_cancel() {
+        let (mut state, order) = seller_holding_an_unpaid_invoice();
+        let stores = state
+            .my_stores
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        state.note_held_store_keys(&stores, Some(&[]));
+
+        assert_eq!(
+            state.cancel_invoice(STORE, &order.order.id),
+            Err(STORE_KEY_NOT_HELD_MESSAGE.to_string())
+        );
+        assert!(state.pending_store_key_requests.is_empty());
+    }
+
+    /// An order id is a hash of the terms alone, which name no store, so two
+    /// of this seller's stores can hold an order with the same id. A despatch
+    /// on its way to one must not refuse the other's (codex, #136 review
+    /// round 5).
+    #[test]
+    fn a_despatch_on_its_way_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[77u8; 32];
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        with_a_twin_store(&mut state, OTHER);
+
+        state
+            .despatch_order(STORE, &order.order.id)
+            .expect("queued");
+        assert_eq!(
+            state.despatch_refusal(OTHER, &order.order.id),
+            None,
+            "a despatch waiting on its signature in one store"
+        );
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.despatch_sent(STORE, &order.order.id));
+        assert!(!state.despatch_sent(OTHER, &order.order.id));
+        assert_eq!(
+            state.despatch_refusal(OTHER, &order.order.id),
+            None,
+            "a despatch sent to one store"
+        );
+    }
+
+    /// Put a copy of `STORE`, and of its registration where there is one,
+    /// under `other`: a second store holding an order with the same id.
+    fn with_a_twin_store(state: &mut AppState, other: &[u8]) {
+        let copy = state.browsing_stores[STORE].clone();
+        state.browsing_stores.insert(other.to_vec(), copy);
+        for stores in state.my_stores.values_mut() {
+            if let Some(mut twin) = stores
+                .iter()
+                .find(|s| s.store_contract_id == STORE)
+                .cloned()
+            {
+                twin.store_contract_id = other.to_vec();
+                stores.push(twin);
+            }
+        }
+    }
+
+    /// The seller's cancel markers are per store too (#136 review, round 5).
+    #[test]
+    fn a_cancel_on_its_way_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[78u8; 32];
+        let (mut state, order) = seller_holding_an_unpaid_invoice();
+        with_a_twin_store(&mut state, OTHER);
+        state
+            .cancel_invoice(STORE, &order.order.id)
+            .expect("queued");
+        assert!(!state.cancellation_pending(OTHER, &order.order.id));
+        answer_the_store_key_request(&mut state, &seller_signing_key());
+        assert!(state.cancellation_sent(STORE, &order.order.id));
+        assert!(!state.cancellation_sent(OTHER, &order.order.id));
+        state
+            .cancel_invoice(OTHER, &order.order.id)
+            .expect("the other store's invoice is not already being cancelled");
+    }
+
+    /// And the buyer's.
+    #[test]
+    fn a_buyers_cancel_sent_to_one_store_does_not_refuse_the_same_order_in_another() {
+        const OTHER: &[u8] = &[79u8; 32];
+        let order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, _) = buyer_after_acceptance(&order);
+        with_a_twin_store(&mut state, OTHER);
+        state
+            .buyer_cancel_order(STORE, &order.order.id)
+            .expect("sent");
+        assert!(!state.buyer_cancellation_sent(OTHER, &order.order.id));
+        state
+            .buyer_cancel_order(OTHER, &order.order.id)
+            .expect("the other store's order is not already being cancelled");
+    }
+
     /// A seller who owns `STORE`, holding one PAID order of theirs.
     fn seller_holding_a_despatchable_order() -> (AppState, AuthorizedOrder) {
         let (paid, claims, tip) = a_paid_order();
@@ -24021,7 +24247,7 @@ mod buy_flow_tests {
         state
             .despatch_order(STORE, &order.order.id)
             .expect("a paid order in our own store can be despatched");
-        assert!(state.despatch_pending(&order.order.id));
+        assert!(state.despatch_pending(STORE, &order.order.id));
         assert!(
             state.despatch_order(STORE, &order.order.id).is_err(),
             "one at a time"
@@ -24029,8 +24255,8 @@ mod buy_flow_tests {
 
         answer_the_store_key_request(&mut state, &seller_signing_key());
 
-        assert!(!state.despatch_pending(&order.order.id));
-        assert!(state.despatches_sent.contains(&order.order.id));
+        assert!(!state.despatch_pending(STORE, &order.order.id));
+        assert!(state.despatch_sent(STORE, &order.order.id));
         assert!(state.despatch_order(STORE, &order.order.id).is_err());
         let (sent_order, despatch) = state.published_despatches.pop().expect("published");
         assert_eq!(sent_order, order, "the order rides along");
@@ -24168,7 +24394,7 @@ mod buy_flow_tests {
             .expect("queued");
         answer_the_store_key_request(&mut state, &SigningKey::from_bytes(&[99u8; 32]));
         assert!(state.published_despatches.is_empty());
-        assert!(!state.despatches_sent.contains(&order.order.id));
+        assert!(!state.despatch_sent(STORE, &order.order.id));
         assert!(
             state
                 .notifications
@@ -24189,9 +24415,9 @@ mod buy_flow_tests {
             .despatch_order(STORE, &order.order.id)
             .expect("queued");
         answer_the_store_key_request(&mut state, &seller_signing_key());
-        assert!(state.despatches_sent.contains(&order.order.id));
-        state.on_despatch_send_failed(&order.order.id, "the node is gone");
-        assert!(!state.despatches_sent.contains(&order.order.id));
+        assert!(state.despatch_sent(STORE, &order.order.id));
+        state.on_despatch_send_failed(STORE, &order.order.id, "the node is gone");
+        assert!(!state.despatch_sent(STORE, &order.order.id));
         assert!(
             state
                 .notifications
@@ -24211,8 +24437,8 @@ mod buy_flow_tests {
         state
             .buyer_cancel_order(STORE, &unpaid.order.id)
             .expect("sent");
-        state.on_buyer_cancellation_send_failed(&unpaid.order.id, "the node is gone");
-        assert!(!state.buyer_cancellations_sent.contains(&unpaid.order.id));
+        state.on_buyer_cancellation_send_failed(STORE, &unpaid.order.id, "the node is gone");
+        assert!(!state.buyer_cancellation_sent(STORE, &unpaid.order.id));
         assert!(state
             .notifications
             .iter()
@@ -24236,7 +24462,7 @@ mod buy_flow_tests {
             .next()
             .expect("a request");
         state.store_key_signature_failed(request_id, "refused");
-        assert!(!state.despatch_pending(&order.order.id));
+        assert!(!state.despatch_pending(STORE, &order.order.id));
         assert!(
             state
                 .notifications

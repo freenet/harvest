@@ -295,7 +295,7 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
     let (sent, refusal) = {
         let state = APP_STATE.read();
         (
-            state.buyer_cancellations_sent.contains(&order_id),
+            state.buyer_cancellation_sent(&store_contract_id, &order_id),
             state.buyer_cancel_refusal(&store_contract_id, &purchase),
         )
     };
