@@ -270,7 +270,8 @@ impl Expect {
     /// completed (harvest#150). Every generation from V5 answers both
     /// predecessor calls with a message when it runs (checked live by
     /// `tests/rehearsal/delegate-rehearsal.sh`, "every exporting generation
-    /// answers"), so an empty answer is the node's.
+    /// answers", on an empty delegate for each; with data for the two
+    /// newest), so an empty answer is the node's.
     ///
     /// That holds on freenet-core 0.2.134 and later. Before it (#5287) a
     /// network node also answered a registered delegate that FAILED to run

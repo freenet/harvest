@@ -103,7 +103,7 @@ start_node() {
   NODE_PID=$!
   for _ in $(seq 1 90); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 1; done
   local owner
-  owner=$(ss -ltnp | grep "127.0.0.1:$PORT " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  owner=$(ss -ltnp | grep "127.0.0.1:$PORT " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
   [ "$owner" = "$NODE_PID" ] || { echo "the node did not start, or port $PORT is not ours (see $d/stdout.log)" >&2; exit 1; }
   echo "   node pid $NODE_PID, network mode, gateway isolated"
 }

@@ -105,9 +105,15 @@ impl Node {
             }))
             .await
             .expect("send RegisterDelegate");
-        // The node answers a registration; drain it so it is not read as the
-        // answer to the first request.
-        let _ = tokio::time::timeout(Duration::from_secs(10), self.api.recv()).await;
+        // The node answers a registration, and on a network node its answer
+        // is a `DelegateResponse` with no messages: the very shape the app
+        // reads as "not registered". So it is waited for, not merely drained
+        // on a timer: a late one would otherwise be taken as the answer to
+        // the first request and read as a generation that answers nothing.
+        match tokio::time::timeout(Duration::from_secs(60), self.api.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { key: answered, .. })) if answered == key => {}
+            other => panic!("registration of {key} not acknowledged: {other:?}"),
+        }
         println!("registered delegate {key}");
         key
     }
