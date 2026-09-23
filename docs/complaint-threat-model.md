@@ -161,10 +161,12 @@ against, and every later seller act on the store is irrelevant to them.
 For **every** kept order still `AwaitingPayment`, the UI watches, and periodically re-reads,
 the address contract under the order's code hash **and** under the current generation
 pointer's hash, and shows the purchase card. The pointer follows the bridges' redeploys; the
-order's hash is fixed at issue. Nothing stops this but the upgrade to `Paid`: the node never
-decides an order lapsed from what it has not seen, because an empty or stale view is not
-evidence of non-payment (R4-1). That is at most 1,024 orders, all from the buyer's own presses
-(5.1). The card shows no address once the payment window has closed
+order's hash is fixed at issue. It stops at the upgrade to `Paid`, or once the bridge-signed
+tip passes the last block any complaint about the order could count at
+(`last_settling_block + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS`), after which
+nothing is lost by not watching (R5). The node never decides an order lapsed from what it has
+not seen, because an empty or stale view is not evidence of non-payment (R4-1). That is at most
+1,024 orders, all from the buyer's own presses (5.1). The card shows no address once the payment window has closed
 (`offers_payment_address`, `PaymentBlocker::AnchorStale`).
 
 Answers for those watches are unioned with the claims already held, under either build, never
@@ -203,8 +205,10 @@ it passes all of the fallback checks:
 Such a copy comes from a payment made on another device, before this build, or outside the
 app's flow. **Filing a complaint about it is the press that keeps it.** The complaint action
 sends the paid copy together with the complaint, in one `KeepPurchase`. Its minimal proof is
-built over the same union as an upgrade's (3.2), store claims plus the address contract's,
-so the seller's choice of claims does not set the paid height the complaint freezes (R4-4).
+built over the union of the store's claims and the order's own address contract's, when that
+union proves it paid (R4-4); otherwise the store copy's own proof is used. Only the order's
+own build is watched for such a copy, not the current generation's, so for an order naming a
+contract nobody writes to the union is the store's claims alone.
 Until then, the copy is only as durable as the store's.
 
 ### 3.4 Complain, then re-assert
@@ -224,8 +228,9 @@ re-assert would never cover it.
 whether or not the store is being viewed (TM-H). This runs on every arrival of the kept list,
 not only the first: the first list of a session can arrive from a freshly re-keyed delegate
 before the migration has imported the predecessor's records (R3). A failed PUT is tried again
-on the next arrival and on the watch tick, once a minute, so it does not wait for a list that
-may not come this session (R4-6). A PUT to an existing record is merged by the contract's
+on the next arrival and on the watch tick, so it does not wait for a list that may not come this
+session (R4-6). The retry backs off, doubling from a minute to an hour, so a record that keeps
+refusing is not sent a PUT a minute (R5). A PUT to an existing record is merged by the contract's
 `update_state`, which keeps one complaint per order under a total order, so the re-PUT is
 idempotent. The buyer's node is the durable copy, and the public record is a replica of it.
 This covers:
@@ -285,8 +290,8 @@ claims were read from, only that they verify.
 - A slot is consumed only by the buyer's own press: *Pay this order*, or *File a complaint*
   about a paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
   for ever takes one.
-- A slot taken by a *Pay* press that was never paid is held, and its address watched, for the
-  node's lifetime. That is bounded by the buyer's own presses, 1,024 of them (about 2,048
+- A slot taken by a *Pay* press that was never paid is held for the node's lifetime, and its
+  address watched until no complaint about it could count (3.2). That is bounded by the buyer's own presses, 1,024 of them (about 2,048
   address watches). Releasing a lapsed unpaid keep needs positive evidence that it was never
   paid, which the node does not have, so revision 4 removed the attempt rather than guessing
   (R4-1).
@@ -341,7 +346,7 @@ substitute must show the same paid height.
   payment can back many complaints**, so the seller and sockpuppets complaining about their own
   orders can make the record costly to host, or too big to load: about 700 complaints with a
   64 KB transaction, or about 200 at 256 KiB each. That record then reads "record unavailable",
-  never "clean record". It is a residual (7.3): the seller spends it to make its own record
+  never "clean record" (but see R5-C in 8a: one kept just under the limit loads). It is a residual (7.3): the seller spends it to make its own record
   unreadable, which is itself a warning to a reader. The original sentence for scale: without
   reuse, filling it takes
   thousands of paid orders, each one a complaint the seller made against itself.
@@ -423,9 +428,12 @@ retractions), not with a Harvest-local copy of it.
 
 - **Buyer-stated `block_height`.** It is not a clock. A buyer can state an in-window height after
   the window, so the window binds only the honest (P2-10, unchanged).
-- **The paid height a buyer's proof shows.** It is the latest in-window payment the node has
-  seen when the copy is upgraded, and fixed from then on. A seller who pays its own address
-  after the buyer, before the upgrade, moves it later. That delays when the complaint can be
+- **The paid height a buyer's proof shows.** It is fixed at the upgrade. The selection takes
+  payments already deep enough first, then the latest, so a seller can move it either way: a
+  self-payment that confirmed earlier and is deep enough while the buyer's is still shallow is
+  chosen, moving it EARLIER by up to `required_confirmations - 1` blocks plus the buyer's own
+  confirmation delay (R5 P3), which shortens every window by that much; a self-payment after
+  the buyer's, before the upgrade, moves it later. That delays when the complaint can be
   filed (the `AwaitingDespatch` stage), by at most the payment window, and costs the buyer no
   time, because every window moves with it.
 - **Record growth through a reused address** (5.3).
@@ -489,6 +497,37 @@ retractions), not with a Harvest-local copy of it.
   decoded, re-encoded and verified by `Complaint::verify` in every build, pins it
   (`a_complaint_from_the_first_build_still_verifies`).
 
+## 8a. Open after review round 5 (these block the merge)
+
+Round 5 attacked this model directly and found three ways a paid buyer on signet can lose the
+complaint. None is in a mechanism added in rounds 3 to 5; each is a dependency the model did
+not name. Recorded here so the next revision addresses them rather than rediscovering them.
+
+- **R5-A: the seller decides whether the bridge ever observes the payment.** A bridge scans
+  only addresses it has been asked to watch (`ui/src/bitcoin_inbox.rs`), and only the
+  seller's node asks (`watches_wanted`). A seller that never registers the watch, or
+  unwatches after the buyer's transaction appears, leaves the buyer with no claim at depth, so
+  the kept copy never upgrades and the complaint is never offered. Candidate fix: keep, watch,
+  then reveal, with the buyer's own node registering interest before the address is shown.
+  That is a freenet-bitcoin interaction (who may register a watch, and under what policy), so
+  it is decided with that layer, not built as a Harvest-local copy. **Needs a design decision.**
+- **R5-B: filing needs the store's current state.** `complaint_checks` and the purchase card
+  read `browsing_stores[..].owner`, and only the current build's store address is loaded. A
+  store re-key while the seller never returns, or a store nobody hosts, leaves no complaint
+  control. Candidate fix, which removes a dependency: file from the kept record alone
+  (`store_key`, receipt seed and paid copy are all in it; the record's address derives from
+  `store_key`), in a view that does not need the store, with the despatch optional.
+- **R5-C: the record can be filled with complaints that never count.** `Complaint::verify` does
+  not relate `block_height` to `paid_height`, so a seller with sockpuppet orders on a reused
+  address can fill its record with `Late` complaints to just under freenet-core's state limit.
+  They verify and do not count, and an honest complaint's merge is then refused. So 5.3's
+  "reads unavailable, never clean" is false for a record kept just under the limit. Candidate
+  fix: the contract refuses a `block_height` past the window. That makes the window a contract
+  rule, reversing decision 4 of the #53 design ("reader-side, tunable without a re-key"), and
+  a contract window cannot include the despatch extension, which readers take from the
+  store's current copy (and which a seller can also withdraw after a buyer files in it:
+  R5 P2). **Needs Ian's call.**
+
 ## 9. For Ian (does not block this PR; the code works for either answer)
 
 - **#144, bridge trust and self-dealing:** open. Readers count every complaint the contract
@@ -532,7 +571,7 @@ is needed. "Residual" means section 7.
 | **TM-C** unbounded confirmations; paying near the window's end | Code: `MAX_REQUIRED_CONFIRMATIONS` in the shared predicate. The window end is already covered by `AnchorStale` (section 1). |
 | **TM-D** paid height movable | Code: `ComplaintTerms.paid_height`, checked by the contract; latest-first selection (5.2). |
 | **TM-E** record bounded by bytes | Code: the contract requires the canonical minimal proof (5.2); an unloadable record reads "not loaded" (5.3). |
-| **TM-F** out-of-band payment skips the keep | Code: auto-keep paid copies naming my key (3.3). Residual before Paid is seen. |
+| **TM-F** out-of-band payment skips the keep | Revision 3 removed auto-keep: the complaint press keeps it (3.3). Residual until then (7.3). |
 | **TM-G** #144 neutrality, sockpuppets, Ghost Key assumption | Model (6, 9): ever-recognised list; attestation as a separate record; Ian's call. |
 | **TM-H** format compatibility, migration walk, stale GET, re-assert sweep, PUT semantics | Model (3.4, 7.3, 8). Code: sweep on load; import family. |
 | **TM P3** list size; selection vs `paid_height` | Residual (7.3); fixed by 5.2 (one rule for both). |
