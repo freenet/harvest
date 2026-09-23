@@ -46,6 +46,7 @@ use harvest_common::mailbox::{
 use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
 use harvest_common::reputation::{
     Complaint, ComplaintTag, ComplaintTerms, ReputationParameters, ReputationStateV1,
+    MAX_COMPLAINTS,
 };
 use harvest_common::store::{
     AuthorizedStoreInfoV1, ListingsV1, OrdersV1, StoreInfoV1, StoreParameters, StoreStateV1,
@@ -856,6 +857,61 @@ fn gen_reputation(root: &Path) {
     s.complaints.reverse();
     assert!(s.verify(&params).is_err());
     c.state("adv_unsorted_C123", &cbor(&s));
+    c.finish();
+
+    // #143 R5-C: the cap binds. A full record of the seller's own late
+    // complaints (A), honest complaints dated near their payments (B), a
+    // second, far-dated statement by one of those buyers whose terms encode
+    // smaller (C), and the full record once the honest ones have arrived (D).
+    // The honest complaints must survive every grouping, and the far
+    // statement must never cost its order its slot.
+    let dated = |n: u8, after: u32, category: FeedbackCategory| {
+        let order = fx.authorized(&fx.receipted_order(n), OrderStatus::Paid, 1);
+        let paid_at = harvest_common::payment::paid_height(&order).expect("paid");
+        complaint_by(&complaint_buyer(n), order, category, paid_at + after)
+    };
+    let seller_late: Vec<Complaint> = (0..MAX_COMPLAINTS)
+        .map(|i| dated(100 + i as u8, 5_000 + i as u32, FeedbackCategory::NonDelivery))
+        .collect();
+    let honest: Vec<Complaint> =
+        (1u8..=3).map(|n| dated(n, 150 + u32::from(n), FeedbackCategory::NonDelivery)).collect();
+    let far = dated(1, 9_000, FeedbackCategory::Counterfeit);
+    assert!(
+        cbor(&moved_terms(&far)) < cbor(&moved_terms(&honest[0])),
+        "the far statement's terms encode smaller, so only the distance ranks the near one first"
+    );
+    let a = build(cert, seller_late);
+    assert_eq!(a.complaints.len(), MAX_COMPLAINTS);
+    let b = build(cert, honest.clone());
+    let cc = build("", vec![far]);
+    let d = merged(&a, &b);
+    assert_eq!(d.complaints.len(), MAX_COMPLAINTS);
+    for h in &honest {
+        assert!(d.complaints.contains(h), "an honest complaint was dropped for a late one");
+    }
+    let ab_c = merged(&merged(&a, &b), &cc);
+    let a_bc = merged(&a, &merged(&b, &cc));
+    println!(
+        "reputation-cap native: (A+B)+C == A+(B+C)? {}   honest all kept: {}",
+        cbor(&ab_c) == cbor(&a_bc),
+        honest.iter().all(|h| ab_c.complaints.contains(h))
+    );
+    let mut c = Corpus::new(root, "reputation-cap", &pbytes);
+    c.state("cap_A_full_late", &cbor(&a));
+    c.state("cap_B_honest_near", &cbor(&b));
+    c.state("cap_C_order1_far_statement", &cbor(&cc));
+    c.state("cap_D_full_with_honest", &cbor(&d));
+    c.transition("cap_A_full_late", "cap_D_full_with_honest");
+    let bc = merged(&b, &cc);
+    c.state("cap_BC_honest_and_far", &cbor(&bc));
+    c.transition("cap_B_honest_near", "cap_BC_honest_and_far");
+    let summ = a.summarize();
+    let delta = b.delta(&summ).expect("non-empty delta");
+    let mut r = a.clone();
+    r.apply_delta(&params, &Some(delta.clone())).unwrap();
+    r.verify(&params).unwrap();
+    assert_eq!(cbor(&r.complaints), cbor(&d.complaints));
+    c.delta_step(&cbor(&a), &cbor(&summ), &cbor(&delta), &cbor(&r));
     c.finish();
 }
 

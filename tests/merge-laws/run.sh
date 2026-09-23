@@ -35,7 +35,7 @@ if [ ${#corpora[@]} -eq 0 ]; then
     store-copies store-copies-bad
     store-fulfilment store-fulfilment-cap store-fulfilment-bad
     store-r98cap store-r98race store-r98retire
-    reputation reputation-empty reputation-adv reputation-rr
+    reputation reputation-empty reputation-adv reputation-rr reputation-cap
     mailbox mailbox-empty mailbox-adv mailbox-cap mailbox-cap2 mailbox-cap3
     mailbox-noncanon mailbox-rr
     index index-cap index-bad index-clash index-adv
