@@ -95,6 +95,13 @@ that number or adds a corpus to the list.
 record's unsigned certificate field. The reputation contract now accepts only
 empty or a genuine Ghost Key certificate in its one canonical armour
 (`check_owner_certificate`), so the corpus's divergent certificates are refused
-and the count is 0 (sweep at #143's contracts, 39 corpora, 2026-09-23).
+and the count is 0 (sweep at #143's contracts, 40 corpora, 2026-09-23).
 First-writer-wins between two genuine certificates is still #81.
+
+`reputation-cap` (#143 review round 5, R5-C) exercises the record's cap: a full
+record of late complaints, honest complaints dated near their payments, a far
+second statement by one of those buyers whose terms encode smaller, and the
+full record once the honest ones arrive. It is zero violations and zero
+inconclusive; the generator itself asserts the associativity it is built
+around, so a corpus that stops exercising it fails to generate.
 Everything else is expected to be zero violations and zero inconclusive.
