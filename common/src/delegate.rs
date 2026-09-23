@@ -1924,6 +1924,15 @@ mod tests {
             crate::feedback::FeedbackCategory::NonDelivery,
             u32::MAX,
         );
+        // The same parts bound a complaint on the record (R5-C: what makes
+        // `MAX_COMPLAINTS` a byte bound).
+        let complaint_len = crate::to_cbor(&complaint).expect("encodes").len();
+        assert!(
+            complaint_len <= crate::reputation::MAX_COMPLAINT_BYTES,
+            "a maximal verifying complaint is {complaint_len} bytes, over the {} a record \
+             budgets for one",
+            crate::reputation::MAX_COMPLAINT_BYTES
+        );
         let kept = KeptPurchase {
             store_key: [0xff; 32],
             conversation: [0xff; 32],

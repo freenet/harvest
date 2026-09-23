@@ -35,6 +35,18 @@
 //! reversal of the payment means for a complaint, are reader-side judgements
 //! (the UI's `fulfilment::complaint_standing`). The contract checks only what
 //! is a function of the complaint's own bytes and the store key.
+//!
+//! # Full record: the latest-dated go first
+//!
+//! A record holds at most [`MAX_COMPLAINTS`], so it never reaches freenet-core's
+//! state limit, where an honest complaint's merge would be refused (review
+//! round 5 of #143, R5-C). Past that it keeps the complaints dated nearest
+//! their own paid height and drops the farthest
+//! ([`Complaint::distance_from_payment`]). That is an ORDER, not a window: it
+//! reads only the buyer's two signed heights, and the window stays the
+//! reader's. A seller filling its record with late complaints about its own
+//! orders drops only its own late ones; a complaint nearer its payment than
+//! all of them stays.
 
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -265,10 +277,28 @@ impl Complaint {
         *hasher.finalize().as_bytes()
     }
 
+    /// How far the height the buyer says the complaint was made at is from
+    /// the height its evidence says the order was paid at, either side. Both
+    /// are in the buyer's signed terms, and the paid height is checked
+    /// against the proof, so nobody but the buyer sets it.
+    ///
+    /// What a full record keeps by (R5-C): nearest first. Either side,
+    /// rather than signed, so a complaint dated before its payment does not
+    /// outrank one dated after it. The honest UI dates a complaint at the
+    /// tip when it is filed, which is after the payment.
+    pub fn distance_from_payment(&self) -> u32 {
+        self.block_height.abs_diff(self.paid_height)
+    }
+
     /// What the per-order tie-break compares, smallest first. See
     /// [`ReputationStateV1::apply_delta`].
     ///
-    /// What the BUYER signed comes first: the terms (order id, category,
+    /// [`Self::distance_from_payment`] comes first, so the tie-break and the
+    /// full record's eviction are ONE total order; with two orders, a merge
+    /// that evicts could otherwise depend on which of an order's complaints
+    /// arrived first. It is a function of the buyer's signed terms.
+    ///
+    /// Then what the BUYER signed: the terms (order id, category,
     /// block), then the buyer's signature over them. Only when those are
     /// byte-identical -- one buyer statement -- does the rest decide, which
     /// is the order's seller signature and the payment evidence. So the
@@ -277,8 +307,9 @@ impl Complaint {
     /// statements (review round 1, P2-9: ranking on the whole encoding let
     /// the seller's re-signed terms decide which of the buyer's complaints
     /// survived).
-    fn canonical_rank(&self) -> (Vec<u8>, Vec<u8>, std::cmp::Reverse<u32>, Vec<u8>) {
+    fn canonical_rank(&self) -> (u32, Vec<u8>, Vec<u8>, std::cmp::Reverse<u32>, Vec<u8>) {
         (
+            self.distance_from_payment(),
             crate::to_cbor(&self.terms()).expect("complaint terms always serialize"),
             self.buyer_signature.clone(),
             // Among copies of ONE buyer statement, the freshest evidence
@@ -329,10 +360,52 @@ pub type ReputationSummary = BTreeSet<[u8; 32]>;
 /// Delta: complaints to add.
 pub type ReputationDelta = Vec<Complaint>;
 
+/// The largest complaint, in bytes of its CBOR encoding.
+///
+/// Derived from what [`Complaint::verify`] accepts, the same way as
+/// `delegate::MAX_KEPT_PURCHASE_BYTES`, because a complaint holds the same
+/// parts: the order's envelope and terms (`MAX_ORDER_ENVELOPE_BYTES` each,
+/// `payment::complaint_preconditions`), its proof's claims
+/// (`MAX_PROOF_CLAIM_BYTES`, refused past that by the verifier), and a few
+/// hundred bytes of tip, signatures, terms and framing, given 16 KiB. Not
+/// checked per complaint: it is what bounds [`MAX_COMPLAINTS`] in bytes.
+/// Pinned by `delegate::tests::a_maximal_verifying_purchase_fits_the_bound`.
+pub const MAX_COMPLAINT_BYTES: usize = 2 * crate::payment::MAX_ORDER_ENVELOPE_BYTES
+    + crate::payment::MAX_PROOF_CLAIM_BYTES
+    + 16 * 1024;
+
+/// The bytes a record's complaints may take: 40 MiB of freenet-core's 50 MiB
+/// state limit, the rest left for the certificate and the framing.
+pub const RECORD_BUDGET_BYTES: usize = 40 * 1024 * 1024;
+
+/// How many complaints one record holds (review round 5 of #143, R5-C).
+///
+/// # Why a count, and why this one
+///
+/// Without a cap, a seller with sockpuppet orders on a reused address could
+/// fill its record with complaints to just under freenet-core's state limit,
+/// and an honest complaint's merge would then be refused. A byte budget met
+/// by walking complaints in order is not associative, whichever way the walk
+/// treats one that does not fit (the mailbox found this, harvest#85). Keeping
+/// the first N of a total order is: see [`ReputationStateV1::apply_delta`]. So
+/// the budget is spent as a count, `RECORD_BUDGET_BYTES / MAX_COMPLAINT_BYTES`,
+/// which holds even if every complaint is the largest that verifies. An
+/// ordinary complaint is a few kilobytes, so this binds only on a flood.
+///
+/// Raising it later re-keys the contract and loses nothing (the migration
+/// merges every complaint in). Lowering it would drop complaints.
+pub const MAX_COMPLAINTS: usize = RECORD_BUDGET_BYTES / MAX_COMPLAINT_BYTES;
+
 impl ReputationStateV1 {
     /// Verify the entire state: every complaint, and the canonical form
     /// described on the type.
     pub fn verify(&self, parameters: &ReputationParameters) -> Result<(), String> {
+        if self.complaints.len() > MAX_COMPLAINTS {
+            return Err(format!(
+                "a record holds at most {MAX_COMPLAINTS} complaints, and this one has {}",
+                self.complaints.len()
+            ));
+        }
         for complaint in &self.complaints {
             complaint.verify(&parameters.store_key)?;
         }
@@ -377,10 +450,34 @@ impl ReputationStateV1 {
     /// All or nothing: the whole delta is verified before any of it is
     /// committed, so a caller that keeps the state it passed in never takes
     /// on complaints from a delta it was told to reject.
+    ///
+    /// # At most [`MAX_COMPLAINTS`]
+    ///
+    /// Each order keeps its lowest-ranked complaint
+    /// ([`Complaint::canonical_rank`]), and of those, the `MAX_COMPLAINTS`
+    /// nearest their payment stay, the order id breaking ties (R5-C). That
+    /// is "the first N orders of one total order over complaints", which is
+    /// a function of the union of everything ever merged,
+    /// so the merge stays commutative, associative and idempotent: a
+    /// complaint a merge drops is one that N nearer orders already outrank,
+    /// and any later merge only adds to those N. That needs the per-order
+    /// tie-break to rank by distance first too, which is why
+    /// `canonical_rank` does.
     pub fn apply_delta(
         &mut self,
         parameters: &ReputationParameters,
         delta: &Option<ReputationDelta>,
+    ) -> Result<(), String> {
+        self.apply_delta_capped(parameters, delta, MAX_COMPLAINTS)
+    }
+
+    /// [`Self::apply_delta`] with the cap as a parameter, so the tests can
+    /// reach it with a handful of complaints rather than hundreds.
+    fn apply_delta_capped(
+        &mut self,
+        parameters: &ReputationParameters,
+        delta: &Option<ReputationDelta>,
+        cap: usize,
     ) -> Result<(), String> {
         let Some(complaints) = delta else {
             return Ok(());
@@ -420,7 +517,18 @@ impl ReputationStateV1 {
                 }
             }
         }
-        self.complaints = by_order.into_values().collect();
+        let mut kept: Vec<Complaint> = by_order.into_values().collect();
+        if kept.len() > cap {
+            // Nearest their payment first; the order id breaks a tie, and is
+            // unique here. Then back to the canonical order-id order.
+            kept.sort_by(|a, b| {
+                (a.distance_from_payment(), a.order_id())
+                    .cmp(&(b.distance_from_payment(), b.order_id()))
+            });
+            kept.truncate(cap);
+            kept.sort_by(|a, b| a.order_id().cmp(b.order_id()));
+        }
+        self.complaints = kept;
         Ok(())
     }
 
@@ -963,10 +1071,19 @@ mod tests {
                 })
                 .collect()
         };
+        // The buyer's statement dated nearer the payment, and among equal
+        // distances the smaller terms (R5-C put the distance first).
         let lower_terms = std::cmp::min(
-            crate::to_cbor(&x.terms()).unwrap(),
-            crate::to_cbor(&y.terms()).unwrap(),
-        );
+            (
+                x.distance_from_payment(),
+                crate::to_cbor(&x.terms()).unwrap(),
+            ),
+            (
+                y.distance_from_payment(),
+                crate::to_cbor(&y.terms()).unwrap(),
+            ),
+        )
+        .1;
         for a in variants(&x) {
             for b in variants(&y) {
                 for (first, second) in [(&a, &b), (&b, &a)] {
@@ -985,6 +1102,188 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Order `n`'s genuine complaint, dated `after` blocks after its payment.
+    fn dated(n: u8, after: u32) -> Complaint {
+        let paid_at = crate::payment::paid_height(&paid(n)).expect("the fixture is paid");
+        complaint_by(
+            &buyer_key(n),
+            paid(n),
+            FeedbackCategory::NonDelivery,
+            paid_at + after,
+        )
+    }
+
+    /// **A full record drops the latest-dated complaints first, and never an
+    /// honest one for a later one** (review round 5 of #143, R5-C). A seller
+    /// fills its record past the cap with late complaints about its own
+    /// orders; the buyers' complaints, dated nearer their payments, all stay,
+    /// whichever arrives first and however the deltas are split. Red if the
+    /// cap is dropped (the record grows past it), or if it keeps anything
+    /// but the nearest (`truncate` over the order-id order keeps the
+    /// seller's instead: their orders are numbered first here).
+    #[test]
+    fn a_full_record_drops_the_latest_dated_first() {
+        const CAP: usize = 4;
+        let seller_late: Vec<Complaint> =
+            (1u8..=5).map(|n| dated(n, 5_000 + u32::from(n))).collect();
+        let honest: Vec<Complaint> = (11u8..=13).map(|n| dated(n, 150 + u32::from(n))).collect();
+        let apply = |state: &mut ReputationStateV1, complaints: Vec<Complaint>| {
+            state
+                .apply_delta_capped(&params(), &Some(complaints), CAP)
+                .expect("genuine complaints apply");
+        };
+        let orders = |state: &ReputationStateV1| -> BTreeSet<OrderId> {
+            state
+                .complaints
+                .iter()
+                .map(|c| c.order_id().clone())
+                .collect()
+        };
+        let mut want: BTreeSet<OrderId> = honest.iter().map(|c| c.order_id().clone()).collect();
+        // The nearest of the seller's, which fills the one slot left.
+        want.insert(seller_late[0].order_id().clone());
+
+        let mut flood_first = ReputationStateV1::default();
+        apply(&mut flood_first, seller_late.clone());
+        assert_eq!(flood_first.complaints.len(), CAP, "the cap binds");
+        apply(&mut flood_first, honest.clone());
+
+        let mut honest_first = ReputationStateV1::default();
+        apply(&mut honest_first, honest.clone());
+        for one in seller_late.iter().rev() {
+            apply(&mut honest_first, vec![one.clone()]);
+        }
+
+        let mut together = ReputationStateV1::default();
+        apply(&mut together, [seller_late, honest].concat());
+
+        for (what, state) in [
+            ("flood first", &flood_first),
+            ("honest first, flood one at a time", &honest_first),
+            ("one delta", &together),
+        ] {
+            assert_eq!(orders(state), want, "{what}");
+            state.verify(&params()).expect("canonical");
+        }
+        assert_eq!(
+            crate::to_cbor(&flood_first).unwrap(),
+            crate::to_cbor(&honest_first).unwrap()
+        );
+        assert_eq!(
+            crate::to_cbor(&flood_first).unwrap(),
+            crate::to_cbor(&together).unwrap()
+        );
+    }
+
+    /// **A complaint dated before its payment does not outrank one dated
+    /// nearer it after** (R5-C, [`Complaint::distance_from_payment`]). No
+    /// honest complaint is dated before its payment, so a reader could one
+    /// day stop counting those; ranked as "not late at all" they would then
+    /// be a flood that pushes out honest complaints. Red if the distance
+    /// becomes a saturating difference.
+    #[test]
+    fn a_complaint_dated_before_its_payment_does_not_outrank_a_nearer_one() {
+        let paid_at = crate::payment::paid_height(&paid(2)).expect("paid");
+        let early = complaint_by(&buyer_key(1), paid(1), FeedbackCategory::NonDelivery, 0);
+        early
+            .verify(&owner())
+            .expect("it verifies: the contract reads no clock");
+        assert!(
+            paid_at > 50,
+            "precondition: room to date one 50 blocks nearer"
+        );
+        let honest = dated(2, paid_at - 50);
+        assert!(early.distance_from_payment() > honest.distance_from_payment());
+        let mut state = ReputationStateV1::default();
+        state
+            .apply_delta_capped(&params(), &Some(vec![early, honest.clone()]), 1)
+            .expect("applies");
+        assert_eq!(state.complaints, vec![honest]);
+    }
+
+    /// **The real cap binds, and a record over it is refused** (R5-C). One
+    /// more complaint than `MAX_COMPLAINTS`: the merge keeps
+    /// `MAX_COMPLAINTS`, dropping the one dated farthest from its payment,
+    /// and `verify` (the contract's `validate_state`) refuses the state that
+    /// holds them all. Red if either check is removed.
+    #[test]
+    fn a_record_holds_at_most_max_complaints() {
+        assert!(
+            MAX_COMPLAINTS >= 100,
+            "{MAX_COMPLAINTS}: a flood's bound, not an honest one"
+        );
+        assert!(MAX_COMPLAINTS < usize::from(u8::MAX));
+        let all: Vec<Complaint> = (1u8..=(MAX_COMPLAINTS as u8 + 1))
+            .map(|n| dated(n, 100 + u32::from(n)))
+            .collect();
+        let farthest = all.last().expect("some").order_id().clone();
+        let mut state = ReputationStateV1::default();
+        state
+            .apply_delta(&params(), &Some(all.clone()))
+            .expect("applies");
+        assert_eq!(state.complaints.len(), MAX_COMPLAINTS);
+        assert!(state.complaints.iter().all(|c| c.order_id() != &farthest));
+
+        let mut over = state.clone();
+        over.complaints = all;
+        over.complaints
+            .sort_by(|a, b| a.order_id().cmp(b.order_id()));
+        let err = over.verify(&params()).expect_err("over the cap");
+        assert!(err.contains("at most"), "{err}");
+    }
+
+    /// **At the cap, the merge still obeys the merge laws, byte for byte**
+    /// (R5-C). Seeded random states over a pool where the cap binds, with
+    /// orders holding two buyer statements: one dated near the payment whose
+    /// terms encode LARGER, one dated far whose terms encode smaller. Red if
+    /// the per-order tie-break stops ranking by distance first: a merge that
+    /// drops an order's near statement for its far one can then drop the
+    /// order altogether, and which of its statements arrived first decides
+    /// the result.
+    #[test]
+    fn at_the_cap_the_merge_obeys_the_merge_laws() {
+        use crate::merge_laws::{assert_laws, Rng};
+        const CAP: usize = 3;
+        let mut pool: Vec<Complaint> = (1u8..=6).map(|n| dated(n, 100 * u32::from(n))).collect();
+        for n in [2u8, 4] {
+            // Far, and `Counterfeit` against `NonDelivery`: find a pair whose
+            // terms order is the opposite of their distance order.
+            let far = complaint_by(
+                &buyer_key(n),
+                paid(n),
+                FeedbackCategory::Counterfeit,
+                crate::payment::paid_height(&paid(n)).unwrap() + 9_000,
+            );
+            let near = pool
+                .iter()
+                .find(|c| c.order_id() == far.order_id())
+                .expect("in the pool");
+            assert!(
+                crate::to_cbor(&far.terms()).unwrap() < crate::to_cbor(&near.terms()).unwrap(),
+                "precondition: the far statement's terms encode smaller, so only the distance \
+                 ranks the near one first"
+            );
+            pool.push(far);
+        }
+        let mut rng = Rng::new(0x5eed_0c5c);
+        let states: Vec<ReputationStateV1> = (0..80)
+            .map(|_| {
+                let mut s = ReputationStateV1::default();
+                s.apply_delta_capped(&params(), &Some(rng.subset(&pool, 5)), CAP)
+                    .expect("apply");
+                s
+            })
+            .collect();
+        let merge = |a: &ReputationStateV1, b: &ReputationStateV1| {
+            let mut out = a.clone();
+            out.apply_delta_capped(&params(), &Some(b.complaints.clone()), CAP)
+                .expect("merge");
+            out
+        };
+        let enc = |s: &ReputationStateV1| crate::to_cbor(s).expect("encode");
+        assert_laws(&states, 100, &mut rng, merge, enc);
     }
 
     /// A delta is all-or-nothing.
