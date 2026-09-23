@@ -670,6 +670,17 @@ fn complaint_by(
     Complaint { order, category, block_height: height, paid_height, scoped_payload, buyer_signature }
 }
 
+/// The terms a complaint's buyer signs, from the complaint's own fields.
+fn moved_terms(c: &Complaint) -> ComplaintTerms {
+    ComplaintTerms {
+        tag: ComplaintTag::HarvestComplaintV1,
+        order_id: c.order.order.id.clone(),
+        category: c.category.clone(),
+        block_height: c.block_height,
+        paid_height: c.paid_height,
+    }
+}
+
 /// The genuine complaint about the fixture store's paid order `n`.
 fn complaint_fx(fx: &StoreFx, n: u8, category: FeedbackCategory) -> Complaint {
     let order = fx.authorized(&fx.receipted_order(n), OrderStatus::Paid, 1);
@@ -803,6 +814,43 @@ fn gen_reputation(root: &Path) {
     // violation. (A second GENUINE certificate would still exercise #81;
     // the corpus has only one, the E2E test Ghost Key's.)
     c.state("adv_other_cert_C2", &cbor(&build("-----BEGIN OTHER CERT-----", vec![f[1].clone()])));
+    // #143 round 2 / threat model: the same buyer statement with the ORDER
+    // re-signed by the seller in another envelope (bytes after the CBOR
+    // item). Accepted since R2-1, and it takes C1's one slot: the survivor
+    // is decided by the total order, whichever arrives first.
+    let mut c1r = f[0].clone();
+    let mut envelope = c1r.order.scoped_payload.clone();
+    envelope.extend_from_slice(&[0u8; 8]);
+    c1r.order.signature = fx.seller.sign(&envelope).to_bytes().to_vec();
+    c1r.order.scoped_payload = envelope;
+    c.state("adv_C1_resigned_order_envelope", &cbor(&build(cert, vec![c1r])));
+    // Padded evidence: C1 with its one claim repeated. The verifier alone
+    // accepts it; a complaint must carry the minimal proof (TM-E). Refused.
+    let mut c1p = f[0].clone();
+    if let Some(harvest_common::payment::OrderPaymentProof::OnChain(proof)) =
+        c1p.order.payment_proof.as_mut()
+    {
+        let first = proof.claims[0].clone();
+        proof.claims.push(first);
+    }
+    let s = raw(vec![c1p]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_C1_padded_evidence", &cbor(&s));
+    // A paid height the evidence does not give (TM-D), validly signed by
+    // the buyer. Refused.
+    let mut moved = complaint_by(
+        &complaint_buyer(17),
+        f[0].order.clone(),
+        FeedbackCategory::NonDelivery,
+        300,
+    );
+    moved.paid_height += 1;
+    let (scoped_payload, buyer_signature) = sign_scoped(&complaint_buyer(17), &moved_terms(&moved));
+    moved.scoped_payload = scoped_payload;
+    moved.buyer_signature = buyer_signature;
+    let s = raw(vec![moved]);
+    assert!(s.verify(&params).is_err());
+    c.state("adv_C1_moved_paid_height", &cbor(&s));
     // Unsorted complaints: refused by verify (strictly ascending).
     let mut s = build(cert, vec![f[0].clone(), f[1].clone(), f[2].clone()]);
     s.complaints.reverse();
