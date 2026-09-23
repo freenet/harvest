@@ -167,13 +167,6 @@ pub fn paid(n: u8) -> AuthorizedOrder {
     authorized(&store_key(), order(n), OrderStatus::Paid)
 }
 
-pub fn block(height: u32) -> BlockAnchor {
-    BlockAnchor {
-        height,
-        hash: BlockHash([(height % 251) as u8; 32]),
-    }
-}
-
 /// A complaint about `order`, signed by `buyer`.
 pub fn complaint_by(
     buyer: &SigningKey,
@@ -181,18 +174,17 @@ pub fn complaint_by(
     category: FeedbackCategory,
     block_height: u32,
 ) -> Complaint {
-    let block_ref = block(block_height);
     let terms = ComplaintTerms {
         tag: ComplaintTag::HarvestComplaintV1,
         order_id: order.order.id.clone(),
         category: category.clone(),
-        block_ref,
+        block_height,
     };
     let (scoped_payload, buyer_signature) = sign_scoped(buyer, &terms);
     Complaint {
         order,
         category,
-        block_ref,
+        block_height,
         scoped_payload,
         buyer_signature,
     }
@@ -201,4 +193,36 @@ pub fn complaint_by(
 /// The genuine complaint about paid order `n`, by its buyer.
 pub fn complaint(n: u8) -> Complaint {
     complaint_by(&buyer_key(n), paid(n), FeedbackCategory::NonDelivery, 200)
+}
+
+/// The same order envelope re-encoded compactly: the payload as one CBOR
+/// byte string instead of an array of integers. ciborium decodes either
+/// into a `Vec<u8>`, so it is the same terms under a fresh seller
+/// signature, the same order id, and a valid store record.
+pub fn compact_envelope(envelope: &[u8]) -> Vec<u8> {
+    use ciborium::Value;
+    let mut value: Value = ciborium::from_reader(envelope).expect("an envelope decodes");
+    let Value::Map(entries) = &mut value else {
+        panic!("an envelope is a map");
+    };
+    let mut rewrote = false;
+    for (key, field) in entries.iter_mut() {
+        if key.as_text() == Some("payload") {
+            let Value::Array(items) = field else {
+                panic!("the payload encodes as an array of integers");
+            };
+            let bytes: Vec<u8> = items
+                .iter()
+                .map(|item| {
+                    u8::try_from(item.as_integer().expect("a byte")).expect("a byte")
+                })
+                .collect();
+            *field = Value::Bytes(bytes);
+            rewrote = true;
+        }
+    }
+    assert!(rewrote, "the envelope has a payload");
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).expect("encodes");
+    out
 }

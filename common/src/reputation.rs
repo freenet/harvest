@@ -37,7 +37,6 @@
 //! is a function of the complaint's own bytes and the store key.
 
 use ed25519_dalek::VerifyingKey;
-use freenet_bitcoin_common::BlockAnchor;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,15 +99,16 @@ pub struct ComplaintTerms {
     pub tag: ComplaintTag,
     pub order_id: OrderId,
     pub category: FeedbackCategory,
-    /// A recent Bitcoin block: the complaint was signed no earlier than it.
-    /// A lower bound only, like a despatch's anchor (`fulfilment`): every
-    /// past block hash is public, so a buyer can name an early one.
+    /// The Bitcoin height the buyer says the complaint was made at, which
+    /// is what the reader-side window reads (`fulfilment::complaint_standing`).
     ///
-    /// Only the HEIGHT is read (the reader-side window). The hash is 32
-    /// bytes nobody checks against a chain; it is signed by the buyer and
-    /// fixed-size, so it carries nothing the buyer did not choose, and no
-    /// reader treats it as evidence.
-    pub block_ref: BlockAnchor,
+    /// The buyer's own statement and nothing more: no chain can check it, so
+    /// a buyer can name an in-window height after the window closed, and the
+    /// window binds only the honest (`docs/complaint-threat-model.md`
+    /// section 7). A height rather than a block anchor (review round 2 of
+    /// #143, R2-7): readers only ever read the height, and an anchor's hash
+    /// was 32 bytes of buyer-chosen free text on a permanent record.
+    pub block_height: u32,
 }
 
 /// A buyer's complaint about one paid order of this store.
@@ -131,7 +131,8 @@ pub struct Complaint {
     /// The order, at `Paid`, with its seller-signed terms and its evidence.
     pub order: AuthorizedOrder,
     pub category: FeedbackCategory,
-    pub block_ref: BlockAnchor,
+    /// See [`ComplaintTerms::block_height`].
+    pub block_height: u32,
     /// CBOR `ScopedPayload` over [`ComplaintTerms`]
     /// (`backing::store_key_envelope`).
     pub scoped_payload: Vec<u8>,
@@ -149,7 +150,7 @@ impl Complaint {
             tag: ComplaintTag::HarvestComplaintV1,
             order_id: self.order.order.id.clone(),
             category: self.category.clone(),
-            block_ref: self.block_ref,
+            block_height: self.block_height,
         }
     }
 
@@ -160,6 +161,12 @@ impl Complaint {
 
     /// Check the complaint against the store key `owner`: a PAID order of
     /// this store, complained about by that order's buyer.
+    ///
+    /// Reads nothing but the complaint and `owner`, which is the record's own
+    /// parameter: no store state, no backing, no clock
+    /// (`docs/complaint-threat-model.md` section 3). The cheap checks run
+    /// first and the payment evidence last, so a forged complaint costs one
+    /// signature check rather than an SPV proof (review round 2, P3).
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
         if self.order.status != OrderStatus::Paid {
             return Err(format!(
@@ -167,46 +174,27 @@ impl Complaint {
                 self.order.status
             ));
         }
-        // "Costs a real payment" by construction: an order for nothing, or an
-        // on-chain order that counts as paid before any confirmation, is not
-        // one (review round 1, nit). A Lightning order is final on the
-        // preimage and names no confirmations.
-        if self.order.order.amount_sats == 0 {
-            return Err("a complaint must name an order for a non-zero amount".into());
-        }
-        if self.order.order.payment_hash.is_none() && self.order.order.required_confirmations == 0 {
-            return Err(
-                "a complaint must name an on-chain order that needs at least one confirmation"
-                    .into(),
-            );
-        }
-        // Nothing rides along that nobody signed for (review round 1, P1-3).
-        // `verify_scoped_signature` below decodes each envelope and compares
-        // its payload, which tolerates bytes after the CBOR item and map keys
-        // the decoder skips; on a permanent, public record those are a
-        // free-text channel (section 7, decision 2) and a way to bloat it.
-        // So both signed envelopes must be byte for byte what their signed
-        // data gives.
+        // The same rules the buyer checked before paying
+        // (`payment::complaint_preconditions`): a real payment, and a
+        // bounded order. Nothing about how the seller ENCODED the order
+        // envelope is checked, because the seller can re-sign the same terms
+        // in another encoding at will (review round 2, R2-1).
+        crate::payment::complaint_preconditions(&self.order)
+            .map_err(|e| format!("the complained-about order cannot take a complaint: {e}"))?;
+        // Nothing rides along that the buyer did not sign (review round 1,
+        // P1-3). `verify_scoped_signature` below decodes the envelope and
+        // compares its payload, which tolerates bytes after the CBOR item and
+        // map keys the decoder skips; on a permanent, public record those are
+        // a free-text channel (section 7, decision 2) and a way to bloat it.
+        // The buyer's own software makes this envelope, so it can always be
+        // exact. The ORDER's envelope is the seller's, bounded by size above
+        // instead; what the seller signs into its own record is #144.
         let terms_bytes = crate::to_cbor(&self.terms())?;
         if !crate::backing::is_exact_harvest_envelope(&self.scoped_payload, &terms_bytes) {
             return Err(
                 "the complaint's signed payload is not exactly the envelope of its terms".into(),
             );
         }
-        let order_bytes = crate::to_cbor(&self.order.order)?;
-        if !crate::backing::is_exact_harvest_envelope(&self.order.scoped_payload, &order_bytes) {
-            return Err(
-                "the complained-about order's signed payload is not exactly the envelope of its \
-                 terms"
-                    .into(),
-            );
-        }
-        // Terms signed by the store key, the id the terms give, nothing
-        // attached that the status does not use, and payment evidence that
-        // verifies against the bridges the seller signed in.
-        self.order
-            .verify(owner)
-            .map_err(|e| format!("the complained-about order does not verify: {e}"))?;
         // Weak and malformed keys are refused here, the one place every
         // buyer act is checked against (`Order::buyer_verifying_key`).
         let buyer_key = self
@@ -229,7 +217,14 @@ impl Complaint {
             &buyer_key,
             &self.terms(),
         )
-        .map_err(|e| format!("the complaint is not signed by the order's buyer: {e}"))
+        .map_err(|e| format!("the complaint is not signed by the order's buyer: {e}"))?;
+        // Terms signed by the store key, the id the terms give, nothing
+        // attached that the status does not use, and payment evidence that
+        // verifies against the bridges the seller signed in. Last, because
+        // it is the expensive one.
+        self.order
+            .verify(owner)
+            .map_err(|e| format!("the complained-about order does not verify: {e}"))
     }
 
     /// Content digest of the whole complaint, signatures and evidence
@@ -419,7 +414,7 @@ impl ReputationStateV1 {
 mod tests {
     use super::*;
     use crate::test_orders::{
-        authorized, block, buyer_key, complaint, complaint_by, order, paid, proof, sign_scoped,
+        authorized, buyer_key, complaint, complaint_by, order, paid, proof, sign_scoped,
         store_key,
     };
     use ed25519_dalek::SigningKey;
@@ -556,8 +551,8 @@ mod tests {
         c.category = FeedbackCategory::Counterfeit;
         altered.push(("category", c));
         let mut c = genuine.clone();
-        c.block_ref = block(201);
-        altered.push(("block_ref", c));
+        c.block_height = 201;
+        altered.push(("block_height", c));
         // Another paid order naming the SAME buyer key, so the only thing
         // that can refuse the swap is that the buyer's signature names order
         // 1's id (review round 1, testing #1: swapping in order 2, which
@@ -587,6 +582,24 @@ mod tests {
     /// **A buyer's cancel signature cannot be replayed as a complaint.** The
     /// same key signs `(order id, Cancelled)` for the buyer's cancel; the
     /// complaint's tag is what keeps the two apart.
+    /// **A forged complaint costs a signature check, not an SPV proof**
+    /// (review round 2 of #143, P3). A complaint with a stranger's signature
+    /// and broken evidence is refused for the signature. Red if the order,
+    /// with its payment evidence, is verified first.
+    #[test]
+    fn a_forged_complaint_is_refused_before_its_evidence_is_checked() {
+        let mut broken = paid(1);
+        broken.payment_proof = Some(proof(&order(2), 1));
+        let c = complaint_by(
+            &SigningKey::from_bytes(&[77u8; 32]),
+            broken,
+            FeedbackCategory::NonDelivery,
+            200,
+        );
+        let err = c.verify(&owner()).expect_err("forged");
+        assert!(err.contains("not signed by the order's buyer"), "{err}");
+    }
+
     #[test]
     fn a_cancel_signature_is_not_a_complaint() {
         let genuine = complaint(1);
@@ -658,26 +671,69 @@ mod tests {
         }
     }
 
-    /// The same for the ORDER's envelope, which the seller signs: a
-    /// self-dealing seller must not be able to carry text onto their own
-    /// record inside a complaint's order either. Red if the order half of
-    /// the exact-envelope check is dropped.
+    /// **The seller cannot switch the complaint off by re-signing the order**
+    /// (review round 2 of #143, R2-1). After payment, the seller re-signs the
+    /// same terms in a more compact envelope, or with bytes after it. Either
+    /// is a valid store record for the same order id (and the compact one
+    /// wins the store's merge, which keeps the smaller encoding), so every
+    /// buyer copy taken from the store may be it. The complaint still
+    /// verifies. Red if `Complaint::verify` requires the order's envelope to
+    /// be exact again, as round 1's fix did.
     #[test]
-    fn a_complained_about_order_whose_envelope_carries_extra_bytes_is_refused() {
-        let mut order = paid(1);
-        let mut envelope = order.scoped_payload.clone();
-        envelope.push(0x00);
-        let (scoped_payload, signature) = resign(&store_key(), envelope);
-        order.scoped_payload = scoped_payload;
-        order.signature = signature;
-        order
-            .verify(&owner())
-            .expect("precondition: the store contract's own check accepts it");
-        let c = complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200);
-        let err = c
-            .verify(&owner())
-            .expect_err("an order envelope with extra bytes");
-        assert!(err.contains("order's signed payload"), "{err}");
+    fn a_seller_re_signed_order_envelope_still_takes_the_complaint() {
+        let genuine = paid(1);
+        let compact = crate::test_orders::compact_envelope(&genuine.scoped_payload);
+        assert!(
+            compact.len() < genuine.scoped_payload.len(),
+            "precondition: the compact envelope is smaller, so it wins the store's merge"
+        );
+        let mut padded = genuine.scoped_payload.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+        for (what, envelope) in [("compact", compact), ("padded", padded)] {
+            let mut order = genuine.clone();
+            let (scoped_payload, signature) = resign(&store_key(), envelope);
+            order.scoped_payload = scoped_payload;
+            order.signature = signature;
+            order
+                .verify(&owner())
+                .unwrap_or_else(|e| panic!("{what}: precondition, a valid store record: {e}"));
+            assert_eq!(order.order.id, genuine.order.id, "{what}: the same order");
+            complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200)
+                .verify(&owner())
+                .unwrap_or_else(|e| panic!("{what}: the complaint must still verify: {e}"));
+        }
+    }
+
+    /// **An order the seller padded past the bound takes no complaint, and
+    /// one inside it does** (`payment::complaint_preconditions`). The buyer
+    /// refuses to pay the first (`PaymentBlocker::UnfitForComplaint`), so no
+    /// genuine buyer holds one. Red if the envelope bound is dropped.
+    #[test]
+    fn an_order_envelope_past_the_bound_takes_no_complaint() {
+        use crate::payment::MAX_ORDER_ENVELOPE_BYTES;
+        let genuine = paid(1);
+        for (len, accepted) in [
+            (MAX_ORDER_ENVELOPE_BYTES, true),
+            (MAX_ORDER_ENVELOPE_BYTES + 1, false),
+        ] {
+            let mut envelope = genuine.scoped_payload.clone();
+            envelope.resize(len, 0);
+            let mut order = genuine.clone();
+            let (scoped_payload, signature) = resign(&store_key(), envelope);
+            order.scoped_payload = scoped_payload;
+            order.signature = signature;
+            order
+                .verify(&owner())
+                .expect("precondition: the store contract accepts it");
+            let verdict = complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200)
+                .verify(&owner());
+            if accepted {
+                verdict.unwrap_or_else(|e| panic!("{len} bytes is inside the bound: {e}"));
+            } else {
+                let err = verdict.expect_err("past the bound");
+                assert!(err.contains("a complaint may carry"), "{err}");
+            }
+        }
     }
 
     /// An order for nothing, or an on-chain order paid at zero
@@ -689,11 +745,11 @@ mod tests {
         let mut unconfirmed = order(1);
         unconfirmed.required_confirmations = 0;
         for (what, o, needle) in [
-            ("a zero amount", free, "non-zero amount"),
+            ("a zero amount", free, "for nothing"),
             (
                 "zero confirmations",
                 unconfirmed,
-                "at least one confirmation",
+                "before any confirmation",
             ),
         ] {
             let o = o.with_derived_id();

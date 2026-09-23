@@ -363,39 +363,46 @@ pub enum HarvestDelegateRequest {
     /// with none): the records are keyed by store code alone.
     ListRememberedStores,
 
-    // === The buyer's own copy of a paid order (harvest#53 Phase C) ===
-    /// Keep this buyer's copy of one of their PAID orders, so a complaint
-    /// about it never depends on the seller keeping the order in the store
-    /// (review round 1 of #143, P1-2).
+    // === The buyer's kept purchases (harvest#53 Phase C) ===
+    /// Keep, upgrade, or add the filed complaint to the buyer's copy of one
+    /// of their orders (`docs/complaint-threat-model.md` section 3).
     ///
-    /// # Why the buyer needs a copy
+    /// # Why the buyer keeps a copy, and from when
     ///
-    /// The complaint carries the paid order as its own evidence, and the
-    /// buyer reads the order out of the store's state. The seller controls
-    /// what that state keeps: `store::enforce_order_cap` drops the oldest
-    /// orders past `MAX_ORDERS`, so 4,096 newer unpaid orders -- free to
-    /// issue -- push a paid one out, and with it the buyer's evidence. A
-    /// copy kept here, once seen, survives that.
+    /// A complaint carries the order as its evidence, and the seller
+    /// controls every copy the store holds: it can evict an order by
+    /// flooding the store, re-sign it, or replace it in a new generation.
+    /// So the buyer keeps the seller-signed order BEFORE paying: the UI asks
+    /// for this when the buyer presses to pay, and shows no payment details
+    /// until the delegate's list holds the copy. Only that press consumes a
+    /// slot, so orders the seller mints into the buyer's conversation never
+    /// take one (review round 2 of #143, R2-2 and R2-3).
     ///
-    /// # What is refused
+    /// # The rules, per order id
     ///
-    /// Anything that is not a `Paid` order verifying under `store_key`
-    /// (terms, and payment evidence against the bridges the seller signed
-    /// in), or whose encoding exceeds `MAX_PAID_PURCHASE_BYTES`; and a new
-    /// order once `MAX_PAID_PURCHASES` are kept. Idempotent: a copy already
-    /// held for that order id is kept as it is.
+    /// * A new copy must be `AwaitingPayment` or `Paid`, verify under
+    ///   `store_key`, meet `payment::complaint_preconditions`, and name the
+    ///   receipt key of `conversation`, which this delegate must hold. The
+    ///   delegate derives the receipt seed from that conversation and keeps
+    ///   it in the record, so losing the conversation later does not lose
+    ///   the complaint (R2-5).
+    /// * A kept `AwaitingPayment` copy is replaced by a verifying `Paid` copy.
+    /// * A kept `Paid` copy is never replaced, but it may gain the filed
+    ///   complaint, once, and only one that verifies against it.
+    /// * A held record that no longer decodes or verifies is overwritten.
     ///
-    /// Answered with [`HarvestDelegateResponse::PaidPurchases`], the whole
-    /// list.
+    /// Answered with [`HarvestDelegateResponse::KeptPurchases`], or with
+    /// [`HarvestDelegateResponse::KeepPurchaseRefused`] naming the order, so
+    /// the UI can release its marker and say why.
     ///
-    /// Boxed only because an `AuthorizedOrder` is large next to every other
+    /// Boxed because an `AuthorizedOrder` is large next to every other
     /// request (`clippy::large_enum_variant`); a `Box` encodes exactly as
-    /// its contents, so the wire form is `{ purchase: PaidPurchase }`.
-    RememberPaidPurchase { purchase: Box<PaidPurchase> },
+    /// its contents.
+    KeepPurchase { keep: Box<PurchaseToKeep> },
 
-    /// Every paid order this node keeps a copy of. Answered with
-    /// [`HarvestDelegateResponse::PaidPurchases`].
-    ListPaidPurchases,
+    /// Every purchase this node keeps. Answered with
+    /// [`HarvestDelegateResponse::KeptPurchases`].
+    ListKeptPurchases,
 
     // === Store keys (harvest#93, revision 2) ===
     /// Mint a new store key: a fresh Ed25519 key, from the host's RNG, kept in
@@ -493,31 +500,132 @@ pub enum HarvestDelegateRequest {
     },
 }
 
-/// A buyer's own copy of one of their paid orders (harvest#53 Phase C). See
-/// [`HarvestDelegateRequest::RememberPaidPurchase`].
+/// What the UI asks the delegate to keep (harvest#53 Phase C). See
+/// [`HarvestDelegateRequest::KeepPurchase`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct PaidPurchase {
+pub struct PurchaseToKeep {
     /// The store key the order's terms are signed by: the store's identity,
-    /// which outlives any one store contract generation (a re-key moves the
-    /// contract id, never this), and the key the store's reputation record
-    /// is addressed by.
+    /// which outlives any one store contract generation, and the key its
+    /// reputation record is addressed by.
     pub store_key: [u8; 32],
-    /// The buyer conversation the order was issued to (its routing tag),
-    /// whose receipt key the order names.
+    /// The buyer conversation the order was issued to (its public key),
+    /// whose receipt key the order must name.
     pub conversation: [u8; 32],
-    /// The order at `Paid`, with its evidence.
+    /// The seller-signed order, `AwaitingPayment` or `Paid`.
     pub order: crate::payment::AuthorizedOrder,
+    /// The complaint the buyer filed about it, if any. Only on a `Paid`
+    /// order, and only once.
+    #[serde(default)]
+    pub complaint: Option<KeptComplaint>,
 }
 
-/// How many paid orders one node keeps a copy of. Past it a new one is
-/// refused out loud, not an old one dropped. A complaint is only offered
-/// within weeks of payment, so this is years of purchases.
-pub const MAX_PAID_PURCHASES: usize = 1024;
+/// A buyer's kept copy of one of their orders, as the delegate holds and
+/// returns it (harvest#53 Phase C). See
+/// [`HarvestDelegateRequest::KeepPurchase`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct KeptPurchase {
+    /// See [`PurchaseToKeep::store_key`].
+    pub store_key: [u8; 32],
+    /// See [`PurchaseToKeep::conversation`].
+    pub conversation: [u8; 32],
+    /// The seed of the order's receipt key, derived by the delegate from
+    /// the conversation when the copy was first kept
+    /// ([`crate::mailbox::buyer_receipt_seed_from_secret`]). Kept here so
+    /// the complaint does not depend on the conversation surviving: 256
+    /// conversations are kept, oldest out, and a buyer may forget one
+    /// (review round 2 of #143, R2-5). Secret.
+    pub receipt_seed: [u8; 32],
+    /// The order, `AwaitingPayment` until the buyer's node sees it paid.
+    pub order: crate::payment::AuthorizedOrder,
+    /// The complaint the buyer filed, kept so the UI can put it back on the
+    /// record whenever the record lacks it (`docs/complaint-threat-model.md`
+    /// section 3.4).
+    #[serde(default)]
+    pub complaint: Option<KeptComplaint>,
+}
 
-/// The largest paid order kept, in bytes of its CBOR encoding. A genuine
-/// order with its on-chain evidence is a few kilobytes; the bound is what
-/// makes [`MAX_PAID_PURCHASES`] a bound on bytes.
-pub const MAX_PAID_PURCHASE_BYTES: usize = 64 * 1024;
+impl KeptPurchase {
+    /// The filed complaint, as the reputation record holds it.
+    pub fn filed_complaint(&self) -> Option<crate::reputation::Complaint> {
+        self.complaint.as_ref().map(|kept| kept.about(&self.order))
+    }
+}
+
+impl core::fmt::Debug for KeptPurchase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Field by field, for the reason `RecalledConversation`'s gives.
+        f.debug_struct("KeptPurchase")
+            .field("store_key", &self.store_key)
+            .field("conversation", &self.conversation)
+            .field("receipt_seed", &Redacted)
+            .field("order", &self.order)
+            .field("complaint", &self.complaint)
+            .finish()
+    }
+}
+
+/// The buyer's half of a complaint: everything but the order it is about,
+/// which the kept record already holds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct KeptComplaint {
+    pub category: crate::feedback::FeedbackCategory,
+    pub block_height: u32,
+    pub scoped_payload: Vec<u8>,
+    pub buyer_signature: Vec<u8>,
+}
+
+impl KeptComplaint {
+    /// The buyer's half of `complaint`.
+    pub fn of(complaint: &crate::reputation::Complaint) -> Self {
+        Self {
+            category: complaint.category.clone(),
+            block_height: complaint.block_height,
+            scoped_payload: complaint.scoped_payload.clone(),
+            buyer_signature: complaint.buyer_signature.clone(),
+        }
+    }
+
+    /// The whole complaint, about `order`.
+    pub fn about(&self, order: &crate::payment::AuthorizedOrder) -> crate::reputation::Complaint {
+        crate::reputation::Complaint {
+            order: order.clone(),
+            category: self.category.clone(),
+            block_height: self.block_height,
+            scoped_payload: self.scoped_payload.clone(),
+            buyer_signature: self.buyer_signature.clone(),
+        }
+    }
+}
+
+/// How many purchases one node keeps. Past it a new one is refused out
+/// loud, and the buyer is not shown payment details: refusing to pay is the
+/// safe failure. Only the buyer's own press to pay takes a slot, so this is
+/// years of purchases.
+pub const MAX_KEPT_PURCHASES: usize = 1024;
+
+/// The largest kept purchase, in bytes of its CBOR encoding.
+///
+/// # Derived from what verifies, so a genuine copy always fits
+///
+/// Review round 2 of #143 (R2-4) found a fixed 64 KiB bound below a genuine
+/// proof. Every part of a kept record is bounded by something the record
+/// must pass anyway:
+///
+/// * the order's envelope and its terms, `MAX_ORDER_ENVELOPE_BYTES` each
+///   (`payment::complaint_preconditions`);
+/// * the proof's claims, `MAX_PROOF_CLAIM_BYTES` (the verifier refuses
+///   more);
+/// * the rest -- the tip, the seller's signature, the keys, the seed, the
+///   complaint's terms, envelope and signature, and CBOR framing -- a few
+///   hundred bytes, given 16 KiB.
+///
+/// So a copy that verifies fits. The UI keeps the minimal proof
+/// (`payment::minimal_on_chain_proof`), which is far smaller; this bound
+/// does not rely on it. Pinned by
+/// `a_maximal_verifying_purchase_fits_the_bound`.
+pub const MAX_KEPT_PURCHASE_BYTES: usize = 2 * crate::payment::MAX_ORDER_ENVELOPE_BYTES
+    + crate::payment::MAX_PROOF_CLAIM_BYTES
+    + 16 * 1024;
 
 /// A store this node remembers visiting.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -730,11 +838,21 @@ pub enum HarvestDelegateResponse {
         stores: Vec<RememberedStore>,
     },
 
-    /// Every paid order this node keeps a copy of, after whichever
-    /// `RememberPaidPurchase` or `ListPaidPurchases` asked. The whole list,
-    /// for the reason [`Self::RememberedStores`] gives.
-    PaidPurchases {
-        purchases: Vec<PaidPurchase>,
+    /// Every purchase this node keeps, after whichever `KeepPurchase` or
+    /// `ListKeptPurchases` asked. The whole list, for the reason
+    /// [`Self::RememberedStores`] gives. Carries each purchase's receipt
+    /// seed.
+    KeptPurchases {
+        purchases: Vec<KeptPurchase>,
+    },
+
+    /// A `KeepPurchase` was refused. Names the order, unlike
+    /// [`Self::Error`], so the UI releases that order's marker and shows the
+    /// reason where the payment details would have been (review round 2 of
+    /// #143, R2-4).
+    KeepPurchaseRefused {
+        order_id: crate::payment::OrderId,
+        reason: String,
     },
 
     /// Whether the migration named by `marker` is already recorded as done.
@@ -1333,10 +1451,12 @@ mod tests {
             R::MigratedSecretImported { .. } => (25, false),
             R::EncryptionKeyAbsent { .. } => (26, false),
             // Public orders the buyer already read out of store state.
-            R::PaidPurchases { .. } => (27, false),
+            // Each kept purchase's receipt seed.
+            R::KeptPurchases { .. } => (27, true),
+            R::KeepPurchaseRefused { .. } => (28, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 28;
+    const RESPONSE_VARIANTS: usize = 29;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1372,8 +1492,8 @@ mod tests {
             Q::RecordPredecessorMarker { .. } => (23, false),
             // Any secret this delegate holds, private keys included.
             Q::ImportMigratedSecret { .. } => (24, true),
-            Q::RememberPaidPurchase { .. } => (25, false),
-            Q::ListPaidPurchases => (26, false),
+            Q::KeepPurchase { .. } => (25, false),
+            Q::ListKeptPurchases => (26, false),
         }
     }
     const REQUEST_VARIANTS: usize = 27;
@@ -1571,17 +1691,28 @@ mod tests {
                     record_public_key: vec![21u8; 8],
                 }),
             },
-            R::PaidPurchases {
-                purchases: vec![paid_purchase()],
+            R::KeptPurchases {
+                purchases: vec![KeptPurchase {
+                    store_key: [17u8; 32],
+                    conversation: [1u8; 32],
+                    receipt_seed: SECRET,
+                    order: crate::test_orders::paid(1),
+                    complaint: None,
+                }],
+            },
+            R::KeepPurchaseRefused {
+                order_id: crate::payment::OrderId([3u8; 32]),
+                reason: "refused".into(),
             },
         ]
     }
 
-    fn paid_purchase() -> PaidPurchase {
-        PaidPurchase {
+    fn purchase_to_keep() -> PurchaseToKeep {
+        PurchaseToKeep {
             store_key: [17u8; 32],
             conversation: [1u8; 32],
             order: crate::test_orders::paid(1),
+            complaint: None,
         }
     }
 
@@ -1716,11 +1847,79 @@ mod tests {
                 request_id: 47,
                 store_verifying_key: [17u8; 32],
             },
-            Q::RememberPaidPurchase {
-                purchase: Box::new(paid_purchase()),
+            Q::KeepPurchase {
+                keep: Box::new(purchase_to_keep()),
             },
-            Q::ListPaidPurchases,
+            Q::ListKeptPurchases,
         ]
+    }
+
+    /// **A genuine purchase always fits what the delegate keeps**
+    /// (`MAX_KEPT_PURCHASE_BYTES`, review round 2 of #143, R2-4). The
+    /// largest record that still passes every check: an order whose terms
+    /// and whose signed envelope are each at `MAX_ORDER_ENVELOPE_BYTES`, a
+    /// proof whose claims fill `MAX_PROOF_CLAIM_BYTES` (one genuine claim,
+    /// repeated: the verifier deduplicates before checking and budgets before
+    /// deduplicating), and a filed complaint. Red if the bound is set below
+    /// what verifies, as the fixed 64 KiB one was.
+    #[test]
+    fn a_maximal_verifying_purchase_fits_the_bound() {
+        use crate::payment::{
+            complaint_preconditions, OrderPaymentProof, OrderStatus, MAX_ORDER_ENVELOPE_BYTES,
+            MAX_PROOF_CLAIM_BYTES,
+        };
+        use crate::test_orders::{buyer_key, compact_envelope, order, proof, store_key};
+        use ed25519_dalek::Signer as _;
+
+        // Terms as large as the bound allows, with room for the envelope's
+        // own framing around them once compacted.
+        let mut terms = order(1);
+        terms.seller_fingerprint = String::new();
+        let base = crate::to_cbor(&terms.clone().with_derived_id()).expect("encodes").len();
+        terms.seller_fingerprint = "s".repeat(MAX_ORDER_ENVELOPE_BYTES - base - 128);
+        let terms = terms.with_derived_id();
+        let terms_len = crate::to_cbor(&terms).expect("encodes").len();
+        assert!(terms_len > MAX_ORDER_ENVELOPE_BYTES - 256 && terms_len <= MAX_ORDER_ENVELOPE_BYTES);
+
+        let mut paid = crate::test_orders::authorized(&store_key(), terms.clone(), OrderStatus::Paid);
+        let mut envelope = compact_envelope(&paid.scoped_payload);
+        assert!(envelope.len() <= MAX_ORDER_ENVELOPE_BYTES, "{}", envelope.len());
+        envelope.resize(MAX_ORDER_ENVELOPE_BYTES, 0);
+        paid.signature = store_key().sign(&envelope).to_bytes().to_vec();
+        paid.scoped_payload = envelope;
+
+        let OrderPaymentProof::OnChain(mut on_chain) = proof(&terms, 1) else {
+            panic!("an on-chain fixture");
+        };
+        let claim = on_chain.claims[0].clone();
+        let cost = crate::to_cbor(&claim).expect("encodes").len();
+        on_chain.claims = vec![claim; MAX_PROOF_CLAIM_BYTES / cost];
+        paid.payment_proof = Some(OrderPaymentProof::OnChain(on_chain));
+
+        complaint_preconditions(&paid).expect("at the bound, not past it");
+        paid.verify(&store_key().verifying_key())
+            .expect("the maximal order verifies");
+        let complaint = crate::test_orders::complaint_by(
+            &buyer_key(1),
+            paid.clone(),
+            crate::feedback::FeedbackCategory::NonDelivery,
+            u32::MAX,
+        );
+        complaint
+            .verify(&store_key().verifying_key())
+            .expect("and takes a complaint");
+        let kept = KeptPurchase {
+            store_key: [0xff; 32],
+            conversation: [0xff; 32],
+            receipt_seed: [0xff; 32],
+            order: paid,
+            complaint: Some(KeptComplaint::of(&complaint)),
+        };
+        let len = crate::to_cbor(&kept).expect("encodes").len();
+        assert!(
+            len <= MAX_KEPT_PURCHASE_BYTES,
+            "a maximal verifying purchase is {len} bytes, over the {MAX_KEPT_PURCHASE_BYTES} kept"
+        );
     }
 
     /// Check one sample: classified correctly, and nothing printed from it
