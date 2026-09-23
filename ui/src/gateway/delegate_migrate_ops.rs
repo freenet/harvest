@@ -289,5 +289,9 @@ async fn refresh_from_delegate(rsa_fingerprints: Vec<String>) {
         app.forget_recalled_conversations();
         app.recall_conversations_for_known_stores();
         app.sync_remembered_stores();
+        // The kept purchases the migration imported: their payment details,
+        // their complaints, and the re-assert of each (review round 3; the
+        // first list of the session came from the delegate before the import).
+        app.sync_kept_purchases();
     }
 }

@@ -245,6 +245,14 @@ fn PurchaseCard(
                 }
             } else if let Some(settled) = purchase.settled() {
                 SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
+            } else if purchase.unconfirmed_paid() {
+                // A `Paid` record the fallback checks refuse: a bridge this app
+                // does not recognise, or an order no complaint could be made
+                // about. Not shown as paid (review round 3, P2-C).
+                p { class: "text-warning",
+                    "The seller's record says this order is paid, but it is not a purchase this \
+                     app can confirm as yours."
+                }
             } else if purchase.ready_to_keep() {
                 // Everything checks out but this node does not keep its own
                 // copy yet: the press keeps it, and the payment details
@@ -320,10 +328,23 @@ fn PayThisOrder(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element 
         )
     };
     if let Some(why) = refusal {
+        // A refusal may be transient (the node would not save it); the press
+        // asks again (review round 3, P3).
         return rsx! {
             p { class: "text-warning",
                 "Your node would not keep a copy of this order, so no payment details are \
                  shown: {why}"
+            }
+            if let Some(why) = problem() {
+                p { class: "text-warning", "{why}" }
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
+                    problem.set(result.err());
+                },
+                "Try again"
             }
         };
     }
@@ -443,13 +464,17 @@ fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element
     let order_id = purchase.order_id.clone();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
+    // The refusal is read only when there is no complaint on record: it ends
+    // in a full verification of the complaint (memoised, review round 3
+    // P2-D), which a card with nothing to offer does not need.
     let (on_record, sent, refusal) = {
         let state = APP_STATE.read();
-        (
-            state.complaint_on_record(&store_contract_id, &order_id),
-            state.complaint_sent(&store_contract_id, &order_id),
-            state.complaint_refusal(&store_contract_id, &purchase),
-        )
+        let on_record = state.complaint_on_record(&store_contract_id, &order_id);
+        let sent = state.complaint_sent(&order_id);
+        let refusal = (on_record.is_none() && !sent)
+            .then(|| state.complaint_refusal(&store_contract_id, &purchase))
+            .flatten();
+        (on_record, sent, refusal)
     };
     let short = order_id.short();
     if let Some(complaint) = on_record {
@@ -463,8 +488,8 @@ fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element
     if sent {
         return rsx! {
             p { class: "text-muted",
-                "Complaint about order {short} sent. It shows on the seller's record once the \
-                 network has it."
+                "Complaint about order {short} is being kept on your node. It goes to the \
+                 seller's record once it is kept, and shows there once the network has it."
             }
         };
     }

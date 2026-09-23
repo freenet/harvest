@@ -423,20 +423,49 @@ thread_local! {
     /// build's. A test cannot sign a claim as the build's bridge (nobody
     /// here has its key), so a test of a rule that needs a RECOGNISED bridge
     /// to have signed the evidence recognises the one its fixture signs
-    /// with. Per thread, so no other test sees it.
+    /// with, for as long as it holds the [`RecognisedForTest`] guard.
     static RECOGNISED_FOR_TEST: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Treat bridge `id` as recognised for the rest of this test's thread.
+/// A bridge recognised for a test, until this is dropped (review round 3,
+/// testing lens: without a reset, a thread the harness reuses would carry one
+/// test's recognition into the next). Held by the test, or by the
+/// `AppState` a fixture built (`AppState::test_guards`).
 #[cfg(test)]
-pub(crate) fn recognise_for_test(id: freenet_bitcoin_common::BridgeId) {
-    RECOGNISED_FOR_TEST.with(|ids| ids.borrow_mut().push(id.to_bs58()));
+#[must_use = "the bridge is recognised only while the guard is held"]
+#[derive(Debug)]
+pub(crate) struct RecognisedForTest(String);
+
+#[cfg(test)]
+impl Drop for RecognisedForTest {
+    fn drop(&mut self) {
+        RECOGNISED_FOR_TEST.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            if let Some(at) = ids.iter().position(|held| *held == self.0) {
+                ids.remove(at);
+            }
+        });
+    }
+}
+
+/// Treat bridge `id` as recognised on this thread while the guard lives.
+#[cfg(test)]
+pub(crate) fn recognise_for_test(id: freenet_bitcoin_common::BridgeId) -> RecognisedForTest {
+    let id = id.to_bs58();
+    RECOGNISED_FOR_TEST.with(|ids| ids.borrow_mut().push(id.clone()));
+    RecognisedForTest(id)
 }
 
 #[cfg(test)]
 fn recognised_for_test(id: &str) -> bool {
     RECOGNISED_FOR_TEST.with(|ids| ids.borrow().iter().any(|held| held == id))
+}
+
+/// Whether any bridge is recognised for a test on this thread.
+#[cfg(test)]
+pub(crate) fn any_recognised_for_test() -> bool {
+    RECOGNISED_FOR_TEST.with(|ids| !ids.borrow().is_empty())
 }
 
 #[cfg(not(test))]
