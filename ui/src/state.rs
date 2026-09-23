@@ -5718,7 +5718,18 @@ impl AppState {
         order_id: &harvest_common::payment::OrderId,
         reason: String,
     ) {
+        // The card shows a refused press to pay; a refused upgrade or
+        // complaint has no card of its own to show it on, so it is said.
+        let pressed = self
+            .keeps_sent
+            .contains(&(order_id.clone(), KeepStep::Keep));
         self.keeps_sent.retain(|(id, _)| id != order_id);
+        if !pressed {
+            self.notifications.push(format!(
+                "Your node would not keep its copy of order {}: {reason}",
+                order_id.short()
+            ));
+        }
         self.keep_refusals.insert(order_id.clone(), reason);
     }
 
@@ -26275,6 +26286,13 @@ mod buy_flow_tests {
             vec![PaymentBlocker::PurchaseNotKept],
             "still no payment details"
         );
+        assert!(state.notifications.is_empty(), "the card says it");
+        // A refused upgrade has no card to say it on, so it is notified.
+        state.on_keep_refused(&unpaid.order.id, "the node refused to save".into());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("the node refused to save")));
     }
 
     /// Only an order ready to pay is kept by the press: any other blocker
@@ -26462,6 +26480,25 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&free);
         let purchase = purchases(&state).remove(0);
         assert_eq!(purchase.paid, None, "0 sats");
+        state.keep_due_purchases(STORE);
+        assert!(state.keep_requests.is_empty(), "not kept");
+        assert!(state.complaint_refusal(STORE, &purchase).is_some());
+
+        // Genuinely paid through a recognised bridge, but padded past what a
+        // complaint may carry (the bridge listed hundreds of times): the
+        // preconditions are the only check that refuses this one.
+        let (padded, claims, tip) = a_paid_order_where(|order| {
+            order.trusted_bridges = vec![order.trusted_bridges[0]; 200];
+        });
+        let padded = paid_on_claims(&padded, claims, tip);
+        assert!(
+            padded.verify(&seller_signing_key().verifying_key()).is_ok(),
+            "precondition: a padded Paid record the store contract accepts"
+        );
+        assert!(harvest_common::payment::complaint_preconditions(&padded).is_err());
+        let (mut state, _) = buyer_after_acceptance(&padded);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid, None, "too large to complain about");
         state.keep_due_purchases(STORE);
         assert!(state.keep_requests.is_empty(), "not kept");
         assert!(state.complaint_refusal(STORE, &purchase).is_some());
