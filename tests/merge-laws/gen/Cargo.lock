@@ -656,10 +656,7 @@ dependencies = [
  "freenet-scaffold",
  "ghostkey-common",
  "harvest-common",
- "rand_core",
- "rsa",
  "serde",
- "sha2",
 ]
 
 [[package]]

@@ -220,7 +220,20 @@ async fn read_back(node: &mut Node, key: &DelegateKey) -> Seeded {
 async fn seed(url: &str, wasm: &[u8], out: &str) {
     let mut node = Node::connect(url).await;
     let key = node.register(wasm).await;
-    node.harvest(&key, HarvestDelegateRequest::InitReputationKeys { ghostkey_fingerprint: FP.into() }).await;
+    // The seeded generation is a predecessor that still mints the per-device
+    // RSA key; harvest#53 Phase C deleted the request from harvest-common
+    // (the key survives only as a legacy reputation-address input), so it is
+    // sent by name, which is all the delegate's CBOR decoding looks at.
+    #[derive(Serialize)]
+    enum LegacyRequest {
+        InitReputationKeys { ghostkey_fingerprint: String },
+    }
+    let answer = node
+        .ask(&key, harvest_common::to_cbor(&LegacyRequest::InitReputationKeys { ghostkey_fingerprint: FP.into() }).unwrap())
+        .await;
+    if let Ok(HarvestDelegateResponse::Error { message }) = harvest_common::from_cbor::<HarvestDelegateResponse>(&answer) {
+        panic!("the seeded generation refused InitReputationKeys: {message}");
+    }
     node.harvest(
         &key,
         HarvestDelegateRequest::RegisterStore {
