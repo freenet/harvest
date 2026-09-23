@@ -340,7 +340,10 @@ fn a_network_nodes_empty_answer_for_a_skipped_generation_is_walked_past() {
 /// read as nothing and its call times out and is retried, as before.
 #[test]
 fn only_a_predecessor_call_reads_an_empty_answer_as_missing() {
-    assert_eq!(Expect::AnyFrom.reply_to_empty_answer(), Some(Reply::Missing));
+    assert_eq!(
+        Expect::AnyFrom.reply_to_empty_answer(),
+        Some(Reply::Missing)
+    );
     assert_eq!(Expect::Export.reply_to_empty_answer(), Some(Reply::Missing));
     for current in [
         Expect::PredecessorMarker([1; 32]),
