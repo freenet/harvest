@@ -5905,7 +5905,7 @@ impl AppState {
     /// Put every kept complaint back on its record, once per complaint per
     /// session (`docs/complaint-threat-model.md` section 3.4). See
     /// [`complaints_to_reassert`], which decides the set.
-    fn reassert_kept_complaints(&mut self) {
+    pub(crate) fn reassert_kept_complaints(&mut self) {
         let due = complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted);
         for (store_key, complaint) in due {
             self.complaints_reasserted
@@ -5931,8 +5931,36 @@ impl AppState {
         }
     }
 
+    /// Whether a kept complaint is waiting to be put back: its PUT failed
+    /// this session (review round 4, P2-6). The watch timer asks, so a
+    /// failed PUT is tried again once a minute rather than only on the next
+    /// arrival of the kept list, which may not come this session: a
+    /// complaint that never reaches the record counts for no reader.
+    pub fn reasserts_due(&self) -> bool {
+        self.kept_purchases_loaded
+            && !complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
+                .is_empty()
+    }
+
+    /// Whether a `KeepPurchase` marker has outlived [`KEEP_TIMEOUT_MS`] at
+    /// `now_ms` and is still held: the card still reads it as on its way
+    /// until something repaints (review round 4, P3).
+    pub fn keeps_timed_out(&self, now_ms: u64) -> bool {
+        self.keeps_sent
+            .values()
+            .any(|sent| now_ms.saturating_sub(sent.since_ms) >= KEEP_TIMEOUT_MS)
+    }
+
+    /// Let go of every marker [`Self::keeps_timed_out`] finds, which is also
+    /// what repaints the card.
+    pub fn drop_timed_out_keeps(&mut self, now_ms: u64) {
+        self.keeps_sent
+            .retain(|_, sent| now_ms.saturating_sub(sent.since_ms) < KEEP_TIMEOUT_MS);
+    }
+
     /// Putting the kept complaint about `order_id` on its record failed:
-    /// release its marker, so the next arrival of the kept list tries again.
+    /// release its marker, so the watch timer, or the next arrival of the
+    /// kept list, tries again.
     pub(crate) fn on_reassert_failed(&mut self, order_id: &harvest_common::payment::OrderId) {
         self.complaints_reasserted.remove(order_id);
     }
@@ -26963,6 +26991,16 @@ mod buy_flow_tests {
         );
         state.on_kept_purchases(vec![record]);
         assert_eq!(state.reasserted_complaints.len(), 1, "once per session");
+        assert!(!state.reasserts_due(), "nothing waiting");
+
+        // The PUT failed, and no further kept list arrives this session:
+        // the watch timer's question says so, and its answer puts it back
+        // (review round 4, P2-6). Red if only a list arrival retries.
+        state.on_reassert_failed(&order.order.id);
+        assert!(state.reasserts_due(), "a failed PUT is due again");
+        state.reassert_kept_complaints();
+        assert_eq!(state.reasserted_complaints.len(), 2, "put back");
+        assert!(!state.reasserts_due());
     }
 
     /// A `KeepPurchase` that never reached the delegate is sent again on the
@@ -26998,8 +27036,14 @@ mod buy_flow_tests {
         let key = (unpaid.order.id.clone(), KeepStep::Keep);
         state.keeps_sent.get_mut(&key).unwrap().since_ms = now_ms() - KEEP_TIMEOUT_MS + 5_000;
         assert!(state.keep_sent(&unpaid.order.id), "not yet");
+        assert!(!state.keeps_timed_out(now_ms()));
         state.keeps_sent.get_mut(&key).unwrap().since_ms = now_ms() - KEEP_TIMEOUT_MS - 1;
         assert!(!state.keep_sent(&unpaid.order.id), "timed out");
+        // The watch timer sees it and lets it go, which repaints the card
+        // (review round 4, P3).
+        assert!(state.keeps_timed_out(now_ms()));
+        state.drop_timed_out_keeps(now_ms());
+        assert!(state.keeps_sent.is_empty());
         state
             .keep_purchase(STORE, &unpaid.order.id)
             .expect("pressed");

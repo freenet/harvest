@@ -106,6 +106,20 @@ pub fn start() {
                 if kept_list_due {
                     APP_STATE.write().sync_kept_purchases();
                 }
+                // A kept complaint whose PUT failed, put back (review round
+                // 4, P2-6); and a keep that timed out, let go so its card
+                // repaints (P3). Both decided under a read.
+                let now = crate::state::now_ms();
+                let (reasserts_due, keeps_timed_out) = {
+                    use dioxus::prelude::ReadableExt;
+                    let state = APP_STATE.peek();
+                    (state.reasserts_due(), state.keeps_timed_out(now))
+                };
+                if reasserts_due || keeps_timed_out {
+                    let mut state = APP_STATE.write();
+                    state.reassert_kept_complaints();
+                    state.drop_timed_out_keeps(now);
+                }
             })
         });
     });
