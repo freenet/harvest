@@ -85,8 +85,10 @@ anyway (#29).
   is open is followed. There is no build-time fallback. Until the address
   generation resolves, `order_for_invoice` refuses to issue an invoice (#30).
 - **What is sent.** `state::AppState::watches_wanted` picks the seller's own
-  unpaid, anchored orders that name the bridge, up to a day of blocks past the
-  payable window, and only under a Ghost Key the vault has listed for this app.
+  unpaid, anchored orders that name the bridge, until the tip is
+  `WATCH_PAST_ANCHOR_BLOCKS` (2208) past the anchor: the whole payment window
+  plus the deepest confirmation count an order may ask for (harvest#146). Only
+  under a Ghost Key the vault has listed for this app.
   `bitcoin_inbox::InboxTracker::plan` batches them. Each request is sealed to
   the bridge, bound to the store's verified seller key, signed by the ghostkey
   delegate, and submitted with the floor it was dated against. It is renewed
@@ -111,6 +113,13 @@ Known limits:
   about a minute of the invoice and the bridge polls its inbox every 30
   seconds, but that is not a bound: the seller's own signing, a key the vault
   refused, or a request the network dropped all delay it.
+- **Renewal needs the seller's tab open.** A bridge ends a watch about a day
+  after the request that last asked for it, and only the seller's open tab
+  renews it, so a seller away for more than a day is not watched for, and a
+  payment confirming meanwhile is not observed (freenet-bitcoin#7 would find it
+  on the next renewal inside the window; freenet-bitcoin#26 would make the
+  watch sent at issue last the whole window). See
+  `docs/complaint-threat-model.md` section 7.4.
 - **Requests that are never read are noticed, not repaired.** A request that
   leaves the inbox unread is sent again, but nothing more is done about it.
   The seller is told, once for as long as it lasts, if a key with anything

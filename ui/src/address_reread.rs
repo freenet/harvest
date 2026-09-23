@@ -72,7 +72,8 @@
 //! Nothing here. The caller passes only addresses still worth asking about,
 //! which is how an invoice nobody ever pays stops being asked about: see
 //! `AppState::address_contracts_to_reread`, which drops an order that has
-//! settled and one whose anchor has aged out of the payable window. An
+//! settled and one whose anchor is past the payment window and the depth a
+//! payment at its end needs (`state::WATCH_PAST_ANCHOR_BLOCKS`). An
 //! order the buyer's delegate keeps is asked about for longer: until it is
 //! paid, or the tip passes the last block any complaint about it could count
 //! at (`AppState::kept_order_could_still_count`), since a paid buyer who

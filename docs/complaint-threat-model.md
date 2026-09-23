@@ -83,9 +83,10 @@ it additionally needs the reorg residual in 7.2 closed, and mainnet is gated on 
 > **Conditional on the seller's watch** (section 7.4, R5-A): a bridge observes the order's
 > address only while some node has asked it to, and today only the seller's node asks. A
 > seller that never asks, or withdraws its request before the payment is deep enough, leaves
-> the buyer with no claim to keep. Even an honest seller's watch lapses: it is renewed only while
-> the seller's tab is open, and only until 192 blocks past the anchor, while a payment may
-> confirm up to 2064 blocks past it (harvest#146). This blocks mainnet, not the signet beta.
+> the buyer with no claim to keep. Even an honest seller's watch lapses if the seller's tab stays
+> closed: it is renewed only while the tab is open, and a bridge ends a watch about a day after
+> its last renewal (harvest#146, freenet/freenet-bitcoin#26). This blocks mainnet, not the
+> signet beta.
 
 - **Genuine** means the order passed every payment blocker on the buyer's own node before any
   payment details were shown. That includes the complaint preconditions (section 4), the
@@ -615,15 +616,33 @@ kept-purchase field changes; the claims it produces reach the buyer through the 
 contract the kept order is already watched under (3.2). Not built now: whether buyers get it is
 Ian's pending product call (section 9).
 
-**Honest sellers are not fully covered either** (R6, harvest#146). A bridge watch lapses about a
-day after its last request, and the seller's UI renews it only while the seller's tab is open
-(every 12 hours) and only until the tip is 192 blocks past the order's anchor
-(`WATCH_PAST_ANCHOR_BLOCKS`). A buyer is promised up to 2064 blocks for the payment to confirm
-(`PAYMENT_CONFIRMATION_SLACK_BLOCKS`), and a new watch does not scan blocks already mined
-(freenet/freenet-bitcoin#7). So a slow-confirming payment, or one made while the seller's tab
-stays closed for a day, can go unobserved even when the seller is honest. A buyer-side watch
-would need the same renewal, through the last block a complaint could count at. The seller's
-UI never sends `Unwatch` on its own.
+**Honest sellers are covered only while their tab is open** (R6, harvest#146). The seller's UI
+renews each unpaid order's watch every 12 hours until the tip is `WATCH_PAST_ANCHOR_BLOCKS`
+(2208) past the order's anchor: the whole payment window the contract allows
+(`PAYMENT_WINDOW_BLOCKS`, 2064) plus the most confirmations an order may require (144), so a
+payment confirming in the window's last block is still watched until it is provable. Until
+harvest#146 this stopped at 192 blocks, measured from the end of the time a buyer may send
+rather than the end of the time a payment may confirm, and a slow-confirming payment inside the
+window was never seen.
+
+What still is not covered is a seller who is not online. Renewal is client-driven, and a bridge
+ends a watch about a day after the request that last asked for it (freenet-bitcoin
+`WATCH_LIFETIME_MS`). So:
+
+- a seller whose tab stays closed for more than about a day after the last renewal is not
+  watched for until they come back, and a payment confirming meanwhile is not observed;
+- when they come back inside the order's window, the renewal registers the watch again, but a
+  new watch does not scan blocks already mined (freenet/freenet-bitcoin#7), so a payment that
+  confirmed while they were away is still not found. Harvest already sends the anchor as
+  `scan_from_height`, so #7 closes this case with no Harvest change;
+- a seller who comes back after the window has closed sends nothing, since nothing could
+  settle the order any more.
+
+Closing the offline case needs a watch that lasts as long as its requester asks, within a
+bridge-set bound, so the watch sent at issue covers the whole window: filed as
+freenet/freenet-bitcoin#26, and not worked around in Harvest. A buyer-side watch would need the
+same renewal, through the last block a complaint could count at. The seller's UI never sends
+`Unwatch` on its own.
 
 ## 8. Compatibility requirements this creates (TM-H)
 
@@ -751,5 +770,5 @@ is needed. "Residual" means section 7.
 | **R6-3** (P2) a complaint in a despatch-extended window outranked by late ones | Code (5.3): the UI dates complaints no later than the base window's close. |
 | **R6-4** (P2) the #144 discount filter conflicts with the cap | Model (6, 9): not free to add later; decide before launch. |
 | R6 P2 the record freezes at 146 | Residual (7.3); readers are told the record is full. |
-| R6 P2 honest sellers' watches lapse | Residual (1, 7.4); harvest#146. |
+| R6 P2 honest sellers' watches lapse | Fixed for a seller whose tab is open (harvest#146: renewal now covers the whole payment window). Residual for a seller who is offline (1, 7.4): needs freenet/freenet-bitcoin#7 and #26. |
 | R6 P3 items (dropped complaint said to be on record, "to pay it" wording, first-run panel, row key, stale docs, test gaps) | Code, except the per-row `BitcoinState` clone (answered on the PR). |
