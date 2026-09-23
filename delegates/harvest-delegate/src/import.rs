@@ -248,6 +248,9 @@ pub(crate) enum Family {
     BuyerConversation,
     /// A remembered store: capped.
     KnownStore,
+    /// A buyer's own copy of a paid order (harvest#53 Phase C): capped, and
+    /// re-validated exactly as `RememberPaidPurchase` is.
+    PaidPurchase,
     /// A travelling "folded into" record: staged until the predecessor
     /// carrying it is sealed.
     Folded,
@@ -279,6 +282,8 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::BuyerConversation
     } else if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
         Family::KnownStore
+    } else if key.starts_with(crate::paid_purchases::PAID_PURCHASE_PREFIX.as_bytes()) {
+        Family::PaidPurchase
     } else if key.starts_with(b"harvest:folded:") {
         Family::Folded
     } else {
@@ -369,6 +374,7 @@ pub(crate) fn import_secret<S: SecretStore>(
             crate::messaging::MAX_BUYER_CONVERSATIONS,
         ),
         Family::KnownStore => crate::known_stores::import(store, key, value),
+        Family::PaidPurchase => crate::paid_purchases::import(store, key, value),
         // Only reached if a caller bypasses `import`; staging needs the
         // predecessor, so a direct copy is the one wrong answer.
         Family::Folded => SecretImport::Permanent("a travelling record needs its carrier".into()),
@@ -942,6 +948,7 @@ mod tests {
             Family::Refused,    // store key
             Family::Standalone, // unfinished store creation
             Family::Folded,     // travelling "folded into" record
+            Family::PaidPurchase,
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(

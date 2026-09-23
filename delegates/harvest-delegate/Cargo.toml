@@ -56,6 +56,11 @@ bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 [dev-dependencies]
 # The custody tests sign as the Ghost Key vault does.
 ghostkey-common = { workspace = true }
+# Enables `freenet_bitcoin_common::spv::testing`, so `paid_purchases` tests
+# build a genuinely signed, genuinely paid order (harvest#53 Phase C) rather
+# than stubbing out payment verification -- same reasoning as
+# `common/Cargo.toml` and `contracts/store-contract/Cargo.toml`.
+freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -9,6 +9,7 @@ mod markers;
 mod messaging;
 mod migration;
 mod origin;
+mod paid_purchases;
 mod secrets;
 mod store_keys;
 
@@ -386,6 +387,43 @@ mod boundary_tests {
         );
     }
 
+    /// A `PaidPurchase` that decodes but never verifies -- good enough for a
+    /// test that only exercises the ORIGIN gate, which fires before this
+    /// content is looked at.
+    fn unverified_paid_purchase() -> harvest_common::delegate::PaidPurchase {
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+        harvest_common::delegate::PaidPurchase {
+            store_key: [1u8; 32],
+            conversation: [2u8; 32],
+            order: AuthorizedOrder {
+                order: Order {
+                    id: OrderId([0u8; 32]),
+                    buyer_fingerprint: String::new(),
+                    seller_fingerprint: String::new(),
+                    amount_sats: 0,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    payment_script_pubkey: vec![],
+                    payment_hash: None,
+                    payment_address: String::new(),
+                    required_confirmations: 1,
+                    trusted_bridges: vec![],
+                    bitcoin_address_code_hash: None,
+                    anchor: None,
+                    order_binding: None,
+                    listing_tag: None,
+                    buyer_receipt_key: None,
+                    created_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+                },
+                scoped_payload: vec![],
+                signature: vec![],
+                status: OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            },
+        }
+    }
+
     /// Every family is refused at the same point, including the migration
     /// export, which is the one that was already checked.
     ///
@@ -463,6 +501,17 @@ mod boundary_tests {
                 buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
+            // The buyer's own copy of a paid order (harvest#53 Phase C).
+            // `RememberPaidPurchase` writes it and `ListPaidPurchases` reads
+            // it back; both are which paid orders a buyer holds, which is
+            // exactly the linkage a pseudonymous marketplace withholds. The
+            // gate fires before this content is ever validated, so a
+            // never-verifying placeholder order is enough to exercise it.
+            to_cbor(&HarvestDelegateRequest::RememberPaidPurchase {
+                purchase: unverified_paid_purchase(),
+            })
+            .expect("cbor"),
+            to_cbor(&HarvestDelegateRequest::ListPaidPurchases).expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));
