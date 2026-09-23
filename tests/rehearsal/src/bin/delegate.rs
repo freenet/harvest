@@ -209,11 +209,18 @@ fn signet_vpub() -> String {
 }
 
 async fn read_back(node: &mut Node, key: &DelegateKey) -> Seeded {
-    let rsa = match node
-        .harvest(key, HarvestDelegateRequest::GetRsaPublicKey { ghostkey_fingerprint: FP.into() })
-        .await
-    {
-        HarvestDelegateResponse::RsaPublicKey { rsa_public_key_der, .. } => rsa_public_key_der,
+    let rsa_answer = node
+        .ask(
+            key,
+            harvest_common::to_cbor(&HarvestDelegateRequest::GetRsaPublicKey { ghostkey_fingerprint: FP.into() })
+                .unwrap(),
+        )
+        .await;
+    let rsa = match harvest_common::from_cbor::<HarvestDelegateResponse>(&rsa_answer) {
+        Ok(HarvestDelegateResponse::RsaPublicKey { rsa_public_key_der, .. }) => rsa_public_key_der,
+        // A generation from harvest#53 Phase C on cannot mint one, so a
+        // delegate seeded at one of them holds none (see `seed`).
+        Ok(HarvestDelegateResponse::Error { message }) if message.starts_with("no RSA public key") => Vec::new(),
         other => panic!("GetRsaPublicKey: {other:?}"),
     };
     // Mints if absent -- which is exactly the check: after a migration it
@@ -273,11 +280,23 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
     enum LegacyRequest {
         InitReputationKeys { ghostkey_fingerprint: String },
     }
-    let answer = node
-        .ask(&key, harvest_common::to_cbor(&LegacyRequest::InitReputationKeys { ghostkey_fingerprint: FP.into() }).unwrap())
-        .await;
-    if let Ok(HarvestDelegateResponse::Error { message }) = harvest_common::from_cbor::<HarvestDelegateResponse>(&answer) {
-        panic!("the seeded generation refused InitReputationKeys: {message}");
+    // From V22 (harvest#53 Phase C) on, a seeded generation no longer knows
+    // the request at all and the node reports it as an error; it then holds
+    // no RSA key, and the RSA check compares two absences (said in `check`).
+    // The RSA import is still exercised by any scenario seeding V21 or older.
+    match node
+        .ask_shape(&key, harvest_common::to_cbor(&LegacyRequest::InitReputationKeys { ghostkey_fingerprint: FP.into() }).unwrap())
+        .await
+    {
+        Ok(answer) => {
+            if let Ok(HarvestDelegateResponse::Error { message }) = harvest_common::from_cbor::<HarvestDelegateResponse>(&answer) {
+                panic!("the seeded generation refused InitReputationKeys: {message}");
+            }
+        }
+        Err(e) if e.contains("InitReputationKeys") => {
+            println!("the seeded generation cannot mint an RSA key (harvest#53 Phase C); none seeded");
+        }
+        Err(e) => panic!("InitReputationKeys: {e}"),
     }
     node.harvest(
         &key,
@@ -321,7 +340,7 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
         other => panic!("SetPaymentXpub: {other:?}"),
     }
     let seeded = read_back(&mut node, &key).await;
-    assert!(!seeded.rsa_public_key_der.is_empty() && !seeded.stores.is_empty() && !seeded.xpub.is_empty());
+    assert!(!seeded.stores.is_empty() && !seeded.xpub.is_empty());
     std::fs::write(out, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
     println!("seeded {key}: {seeded:#?}");
 }
@@ -418,7 +437,15 @@ async fn check(url: &str, wasm: &[u8], seeded: &str, predecessor_hex: &str) {
             failures.push(what.to_string());
         }
     };
-    compare("RSA public key", got.rsa_public_key_der == expected.rsa_public_key_der, format!("{} bytes", got.rsa_public_key_der.len()));
+    compare(
+        "RSA public key",
+        got.rsa_public_key_der == expected.rsa_public_key_der,
+        if expected.rsa_public_key_der.is_empty() {
+            "none seeded (the seeded generation cannot mint one), none held".to_string()
+        } else {
+            format!("{} bytes", got.rsa_public_key_der.len())
+        },
+    );
     compare(
         "X25519 public key (the predecessor's, not a new one)",
         got.x25519_public_key == expected.x25519_public_key,

@@ -211,7 +211,10 @@ fn make_listing(sk: &SigningKey, fingerprint: &str, title: &str, at: i64) -> Aut
             currency: "BTC".into(),
         }),
         created_at,
-    };
+    }
+    // The id every generation since terms-derived ids checks (the label id
+    // above is replaced; generations before that accept either).
+    .with_derived_id();
     let (scoped_payload, signature) = scoped_sign(sk, &listing);
     AuthorizedListing {
         listing,
@@ -975,6 +978,70 @@ impl Node {
 }
 
 /// Run one probe to completion over a live node, mirroring `migrate_ops::pump`.
+/// Scenario 5: a store at the NEWEST superseded generation, owned by its key
+/// and addressed by its code (V17 on), is found by the walk, and its state is
+/// accepted by this build's contract as it is. The whole-key scenario 1
+/// plants states built from today's types at V4/V5, whose contracts no longer
+/// decode them; this one rehearses the step a real upgrade takes.
+async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current: &[u8]) {
+    println!("\n== scenario 5: a store at the newest superseded generation is carried forward ==");
+    let newest = migrate::store_lineage()
+        .iter()
+        .max_by_key(|e| e.generation)
+        .expect("a superseded generation");
+    let wasm = legacy_wasm_from_git(repo, "store_contract", &hex::encode(newest.code_hash));
+    let seller = SigningKey::from_bytes(&[9u8; 32]);
+    let vk = seller.verifying_key();
+    let fp = fingerprint_of(&vk);
+    let params = current_params(&vk);
+    let (old_container, old_id) = container(&wasm, params.clone());
+    let (curr_container, curr_id) = container(current, params);
+    println!("  V{} instance {old_id}; current instance {curr_id}", newest.generation);
+    assert!(
+        migrate::store_candidate_ids(&vk).unwrap().contains(&old_id),
+        "the walk must reach the generation state is planted at"
+    );
+    let planted = StoreStateV1 {
+        owner: Some(vk),
+        info: make_info(&seller, &fp, "Newest Generation Store", 4),
+        listings: harvest_common::store::ListingsV1 {
+            listings: vec![make_listing(&seller, &fp, "newest-listing", 1_758_000_000)],
+        },
+        ..Default::default()
+    };
+    node.put(old_container, harvest_common::to_cbor(&planted).unwrap())
+        .await
+        .expect("PUT at the newest superseded generation");
+    let (outcome, seal) = run_probe(node, &vk, migrate::store_candidates(&vk).unwrap()).await;
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, old_id);
+    assert_eq!(titles(merged), vec!["newest-listing".to_string()]);
+    node.put(curr_container, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current contract accepts the carried state");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: StoreStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            println!(
+                "  current generation holds: store_name={:?} listings={:?} statuses={}",
+                s.info.info.store_name,
+                titles(&s),
+                s.listing_statuses.records.len()
+            );
+            assert_eq!(titles(&s), vec!["newest-listing".to_string()]);
+            assert_eq!(s.info.info.store_name, "Newest Generation Store");
+            for l in &s.listings.listings {
+                l.verify(&vk).expect("a carried listing still verifies");
+            }
+        }
+        other => panic!("current generation did not read back: {other:?}"),
+    }
+}
+
 async fn run_probe(
     node: &mut Node,
     vk: &VerifyingKey,
@@ -1111,6 +1178,9 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // touched `StoreParameters`: still the store code.
         (19, Code),
         (20, Code),
+        // V21: harvest#53 Phase C, superseded by harvest#70's listing
+        // statuses. `StoreParameters` untouched: still the store code.
+        (21, Code),
     ]
 };
 
@@ -1235,6 +1305,13 @@ async fn main() {
         scenario_reputation(&mut node, &repo).await;
         scenario_reputation_cap_carried(&mut node, &repo).await;
         println!("\nSCENARIO 4 ONLY: PASSED");
+        return;
+    }
+    // `REHEARSAL_ONLY=newest` plants a store at the newest superseded
+    // generation and folds it into this build (harvest#70's re-key).
+    if std::env::var("REHEARSAL_ONLY").as_deref() == Ok("newest") {
+        scenario_newest_store_generation(&mut node, &repo, &current).await;
+        println!("\nSCENARIO 5 ONLY: PASSED");
         return;
     }
 
