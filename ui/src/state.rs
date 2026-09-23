@@ -8962,11 +8962,13 @@ impl AppState {
         let registered_id = <[u8; 32]>::try_from(registration.reputation_contract_id.as_slice())
             .ok()
             .map(freenet_stdlib::prelude::ContractInstanceId::new);
+        let current_id = crate::gateway::store_ops::reputation_instance_id(&store_key).ok()?;
         Some(crate::migrate::ReputationLocators {
             store_key,
             ghost_key,
             rsa_public_keys,
             registered_id,
+            current_id,
         })
     }
 

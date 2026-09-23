@@ -704,7 +704,32 @@ fn locators(rsa: Vec<Vec<u8>>, registered: Option<ContractInstanceId>) -> Reputa
         ghost_key: seller_vk(),
         rsa_public_keys: rsa,
         registered_id: registered,
+        current_id: current_reputation_id(),
     }
+}
+
+/// The store-key record under this build's reputation code.
+fn current_reputation_id() -> ContractInstanceId {
+    crate::gateway::store_ops::reputation_instance_id(&store_vk()).expect("derive")
+}
+
+/// **A registration naming the current record has no predecessor** (review
+/// round 1, P2-7): every store this build creates registers the current id,
+/// and probing it as a predecessor GETs our own record and reports a false
+/// recovery. Red if the early return is removed.
+#[test]
+fn a_registration_naming_the_current_record_walks_nothing() {
+    let ids = reputation_candidate_ids(&locators(
+        vec![vec![1u8; 40]],
+        Some(current_reputation_id()),
+    ))
+    .expect("derive");
+    assert!(ids.is_empty(), "no predecessor to probe: {ids:?}");
+    // And a registration naming something else still walks.
+    let other = ContractInstanceId::new([9u8; 32]);
+    let ids = reputation_candidate_ids(&locators(vec![], Some(other))).expect("derive");
+    assert!(ids.contains(&other));
+    assert!(!ids.contains(&current_reputation_id()));
 }
 
 /// The id an RSA generation's record was published at, derived here with the
@@ -2182,6 +2207,33 @@ fn re_folding_a_generation_is_a_no_op_for_reputation_and_store() {
         "re-folding a store generation changed the state, so a re-run of the migration \
          is not a fixed point"
     );
+}
+
+/// **A predecessor's certificate is carried forward only as the successor
+/// contract accepts it** (review round 1, P1-4): a genuine one in canonical
+/// armour, anything else as nothing -- and a state whose only content was a
+/// certificate that does not hold up is then a miss, not a recovery the
+/// successor would refuse. Red if `ReputationOps::decode` stops reducing
+/// the certificate.
+#[test]
+fn a_predecessor_certificate_is_carried_only_as_the_contract_accepts_it() {
+    let ops = ReputationOps {
+        params: reputation_params(&store_vk()),
+    };
+    let fixture = include_str!("../../../tests/fixtures/ghostkey-certificate.pem");
+    let encode = |pem: &str| {
+        harvest_common::to_cbor(&ReputationStateV1 {
+            owner_certificate_pem: pem.to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let genuine = ops.decode(&encode(&fixture.replace('\n', "\r\n"))).expect("decodes");
+    assert_eq!(genuine.owner_certificate_pem, fixture, "re-armoured canonically");
+    assert!(ops.is_real(&genuine));
+    let junk = ops.decode(&encode("-----BEGIN CERT-----")).expect("decodes");
+    assert_eq!(junk.owner_certificate_pem, "");
+    assert!(!ops.is_real(&junk), "nothing the successor would take");
 }
 
 /// An empty mailbox or reputation state is a miss.

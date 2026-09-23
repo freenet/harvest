@@ -96,6 +96,31 @@ impl CertificateStatus {
 /// means "the production key", which is the only one a shipped build uses.
 const PRODUCTION_MASTER: Option<VerifyingKey> = None;
 
+/// The certificate a reputation record may carry, from whatever `pem` was
+/// offered: the canonical armour of a genuine Ghost Key certificate, or the
+/// empty string.
+///
+/// The reputation contract accepts exactly these two (harvest#53 Phase C,
+/// review round 1 P1-4: `reputation_contract::check_owner_certificate`), so
+/// everything that writes the field goes through here first -- store
+/// creation, and the migration carrying a predecessor's certificate forward.
+/// A certificate that does not verify, or verifies but was armoured some
+/// other way, would otherwise make the contract refuse the whole write.
+pub fn record_certificate(pem: &str) -> String {
+    record_certificate_under(pem, &PRODUCTION_MASTER)
+}
+
+fn record_certificate_under(pem: &str, master: &Option<VerifyingKey>) -> String {
+    if pem.trim().is_empty() {
+        return String::new();
+    }
+    GhostkeyCertificateV1::from_armored_string(pem)
+        .ok()
+        .filter(|cert| cert.verify(master).is_ok())
+        .and_then(|cert| cert.to_armored_string().ok())
+        .unwrap_or_default()
+}
+
 /// The key a certificate certifies, if it chains to `master` (the production
 /// master key when `None`).
 fn certified_key(pem: &str, master: &Option<VerifyingKey>) -> Result<VerifyingKey, String> {
@@ -303,5 +328,34 @@ mod tests {
                 CertificateStatus::Absent
             );
         }
+    }
+
+    /// **What store creation and the migration write to a reputation record
+    /// is what its contract accepts** (review round 1, P1-4): a genuine
+    /// certificate in canonical armour, reflowed or not; nothing for text or
+    /// a certificate that does not chain. Red if `record_certificate` passes
+    /// its input through.
+    #[test]
+    fn a_record_certificate_is_canonical_and_genuine_or_empty() {
+        let (_, pem) = issue_ghostkey();
+        let master = test_master();
+        assert_eq!(record_certificate_under(&pem, &master), pem);
+        let reflowed = pem.replace('\n', "\r\n");
+        assert_eq!(
+            record_certificate_under(&reflowed, &master),
+            pem,
+            "a genuine certificate is re-armoured into the one canonical form"
+        );
+        for junk in ["Contact me off-platform", "-----BEGIN CERT-----", ""] {
+            assert_eq!(record_certificate_under(junk, &master), "", "{junk:?}");
+        }
+        assert_eq!(
+            record_certificate_under(&pem, &PRODUCTION_MASTER),
+            "",
+            "a certificate that does not chain to the master key is dropped"
+        );
+        // The contract's own fixture, under the production key.
+        let fixture = include_str!("../../tests/fixtures/ghostkey-certificate.pem");
+        assert_eq!(record_certificate(fixture), fixture);
     }
 }

@@ -10,6 +10,75 @@ use harvest_common::reputation::{
 #[allow(dead_code)]
 struct Contract;
 
+/// Freenet's master key, as `ghostkey_lib` knows it: `None` means the
+/// production key, the only one a deployed contract checks against.
+const PRODUCTION_MASTER: Option<ed25519_dalek::VerifyingKey> = None;
+
+/// The record's owner certificate is empty, or a genuine Ghost Key
+/// certificate in its one canonical armoured form, and nothing else
+/// (harvest#53 Phase C, review round 1 P1-4).
+///
+/// # Why the contract checks it
+///
+/// The record is addressed by the public store key and a buyer's PUT
+/// creates it, so anyone can be the first to write this field. Unchecked it
+/// was a free-text field on a permanent, public, unmoderatable record, which
+/// is exactly what "categories only" (design section 7, decision 2) rules
+/// out.
+///
+/// * **Bounded** before anything is parsed, by the bound a backing's
+///   certificate has (`backing::MAX_CERTIFICATE_PEM_BYTES`).
+/// * **Genuine**: it chains to Freenet's master key through a notary. The
+///   only text a genuine certificate holds is the notary's `info`, which the
+///   master key signed; anyone can mint a certificate under a notary of
+///   their own, and that one is refused here.
+/// * **Canonical**: the PEM is byte for byte what re-armouring the parsed
+///   certificate gives. The armour parser skips text outside the markers and
+///   the CBOR decoder skips unknown keys, so without this a genuine
+///   certificate could carry a paragraph after its END line.
+///
+/// What it does NOT establish: that the certificate is the SELLER's. The
+/// contract cannot see which Ghost Key backs the store (that is the store
+/// contract's state), and certificates are public, so a stranger can still
+/// be first to plant somebody's genuine certificate. That is harvest#81's
+/// first-writer-wins, carries no text, and no reader treats this field as
+/// the seller's identity: the store's backings are where that is read, and
+/// verified against the backing key (`ui/src/ghostkey_cert.rs`).
+pub fn check_owner_certificate(
+    pem: &str,
+    master: &Option<ed25519_dalek::VerifyingKey>,
+) -> Result<(), String> {
+    use ghostkey_lib::armorable::Armorable;
+    use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
+
+    if pem.is_empty() {
+        return Ok(());
+    }
+    let bound = harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES;
+    if pem.len() > bound {
+        return Err(format!(
+            "the owner certificate is {} bytes and may be at most {bound}",
+            pem.len()
+        ));
+    }
+    let certificate = GhostkeyCertificateV1::from_armored_string(pem)
+        .map_err(|e| format!("the owner certificate is not a Ghost Key certificate: {e}"))?;
+    certificate
+        .verify(master)
+        .map_err(|e| format!("the owner certificate does not chain to Freenet's master key: {e}"))?;
+    let canonical = certificate
+        .to_armored_string()
+        .map_err(|e| format!("the owner certificate does not re-armour: {e}"))?;
+    if canonical != pem {
+        return Err(
+            "the owner certificate is not in its canonical armoured form (text outside the \
+             markers, other line breaks, or extra encoded fields)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(
@@ -32,6 +101,11 @@ impl ContractInterface for Contract {
                     .into(),
             });
         }
+
+        check_owner_certificate(&reputation_state.owner_certificate_pem, &PRODUCTION_MASTER)
+            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                reason: format!("State verification failed: {e}"),
+            })?;
 
         let parameters = from_reader::<ReputationParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
@@ -107,6 +181,12 @@ impl ContractInterface for Contract {
         if nothing_here {
             return Ok(UpdateModification::valid(State::from(vec![])));
         }
+
+        // The merge back-fills the certificate from whichever side has one,
+        // so the result is what has to hold up: a state `validate_state`
+        // would refuse must not come out of here either.
+        check_owner_certificate(&reputation_state.owner_certificate_pem, &PRODUCTION_MASTER)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
 
         let mut updated_state = vec![];
         into_writer(&reputation_state, &mut updated_state)
@@ -446,7 +526,7 @@ mod tests {
         let mut canonical = vec![];
         into_writer(
             &ReputationStateV1 {
-                owner_certificate_pem: "CERT".into(),
+                owner_certificate_pem: FIXTURE_CERTIFICATE.into(),
                 ..Default::default()
             },
             &mut canonical,
@@ -474,7 +554,7 @@ mod tests {
         into_writer(
             &WithExtraKey {
                 state: ReputationStateV1 {
-                    owner_certificate_pem: "CERT".into(),
+                    owner_certificate_pem: FIXTURE_CERTIFICATE.into(),
                     ..Default::default()
                 },
                 unknown: 1,
@@ -483,5 +563,162 @@ mod tests {
         )
         .expect("encode");
         assert!(validate(extra).is_err(), "an unknown key must be refused");
+    }
+
+    /// A genuine Ghost Key certificate, chained to Freenet's production
+    /// master key: the test Ghost Key the E2E walk-throughs use. Public by
+    /// nature, like every certificate (it is in that store's backings on the
+    /// live network); its signing key is not in this repository.
+    const FIXTURE_CERTIFICATE: &str = include_str!("../../../tests/fixtures/ghostkey-certificate.pem");
+
+    fn validate_cert(pem: &str) -> Result<ValidateResult, ContractError> {
+        let mut bytes = vec![];
+        into_writer(
+            &ReputationStateV1 {
+                owner_certificate_pem: pem.into(),
+                ..Default::default()
+            },
+            &mut bytes,
+        )
+        .expect("encode");
+        <Contract as ContractInterface>::validate_state(
+            parameters(),
+            State::from(bytes),
+            RelatedContracts::new(),
+        )
+    }
+
+    /// The fixture has to be genuine, or every refusal below passes for
+    /// the wrong reason.
+    #[test]
+    fn a_genuine_certificate_and_no_certificate_are_accepted() {
+        check_owner_certificate(FIXTURE_CERTIFICATE, &PRODUCTION_MASTER)
+            .expect("the fixture is a genuine, canonical Ghost Key certificate");
+        assert!(matches!(validate_cert(FIXTURE_CERTIFICATE), Ok(ValidateResult::Valid)));
+        assert!(matches!(validate_cert(""), Ok(ValidateResult::Valid)));
+    }
+
+    /// **No free text in the certificate field** (review round 1, P1-4):
+    /// arbitrary text, a genuine certificate with text after it or reflowed,
+    /// and an oversized field are all refused, by `validate_state` and by
+    /// `update_state`. Red if the check is removed from either entry point
+    /// (the update half is `a_merge_cannot_back_fill_an_unchecked_certificate`).
+    #[test]
+    fn the_certificate_field_carries_nothing_but_a_genuine_certificate() {
+        let mut appended = FIXTURE_CERTIFICATE.to_string();
+        appended.push_str("Pay me or I post your address. contact@example\n");
+        let reflowed = FIXTURE_CERTIFICATE.replace('\n', "\r\n");
+        let prefixed = format!("hello\n{FIXTURE_CERTIFICATE}");
+        let oversized = "x".repeat(harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES + 1);
+        for (what, pem) in [
+            ("free text", "Contact me off-platform".to_string()),
+            ("text after the END line", appended),
+            ("text before the BEGIN line", prefixed),
+            ("other line breaks", reflowed),
+            ("oversized", oversized),
+        ] {
+            assert!(
+                check_owner_certificate(&pem, &PRODUCTION_MASTER).is_err(),
+                "{what} must be refused"
+            );
+            assert!(validate_cert(&pem).is_err(), "{what}: validate_state must refuse it");
+        }
+        // The bound is checked BEFORE the parse: a megabyte of armour costs
+        // nothing to refuse, which is its point.
+        let huge = "x".repeat(harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES + 1);
+        let err = check_owner_certificate(&huge, &PRODUCTION_MASTER).expect_err("oversized");
+        assert!(err.contains("may be at most"), "refused by the bound, not the parser: {err}");
+    }
+
+    /// A certificate minted under a notary of the minter's own, whose `info`
+    /// says anything they like, is structurally perfect and canonical, and
+    /// refused because it does not chain to the production master key. This
+    /// is the check that makes the notary text trustworthy rather than a
+    /// channel.
+    #[test]
+    fn a_self_minted_certificate_is_refused() {
+        use ghostkey_lib::armorable::Armorable;
+        use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
+        use ghostkey_lib::notary_certificate::NotaryCertificateV1;
+        let master = ed25519_dalek::SigningKey::from_bytes(&[0x21; 32]);
+        let (notary, notary_key) =
+            NotaryCertificateV1::new(&master, &"any text the minter likes".to_string())
+                .expect("mint a notary");
+        let (cert, _) = GhostkeyCertificateV1::new(&notary, &notary_key);
+        let pem = cert.to_armored_string().expect("armour");
+        check_owner_certificate(&pem, &Some(master.verifying_key()))
+            .expect("precondition: genuine under its own master, and canonical");
+        let err = check_owner_certificate(&pem, &PRODUCTION_MASTER)
+            .expect_err("refused under Freenet's master key");
+        assert!(err.contains("does not chain"), "{err}");
+        assert!(validate_cert(&pem).is_err());
+    }
+
+    /// `update_state` checks the certificate the merge produces: a state
+    /// carrying free text as its certificate cannot back-fill it into an
+    /// empty record. Red if the check is removed from `update_state`.
+    #[test]
+    fn a_merge_cannot_back_fill_an_unchecked_certificate() {
+        let encode = |pem: &str| {
+            let mut bytes = vec![];
+            into_writer(
+                &ReputationStateV1 {
+                    owner_certificate_pem: pem.into(),
+                    ..Default::default()
+                },
+                &mut bytes,
+            )
+            .expect("encode");
+            bytes
+        };
+        let merge = |held: Vec<u8>, incoming: Vec<u8>| {
+            <Contract as ContractInterface>::update_state(
+                parameters(),
+                State::from(held),
+                vec![UpdateData::State(State::from(incoming))],
+            )
+        };
+        assert!(
+            merge(encode(""), encode("Contact me off-platform")).is_err(),
+            "free text must not be back-filled"
+        );
+        let out = merge(encode(""), encode(FIXTURE_CERTIFICATE))
+            .expect("a genuine certificate back-fills")
+            .unwrap_valid();
+        let merged: ReputationStateV1 = from_reader(out.as_ref()).expect("decode");
+        assert_eq!(merged.owner_certificate_pem, FIXTURE_CERTIFICATE);
+    }
+
+    /// An update that is neither a state nor a delta is refused (review
+    /// round 1, testing #4: the `InvalidUpdate` arm had no test).
+    #[test]
+    fn an_update_that_is_neither_a_state_nor_a_delta_is_refused() {
+        let out = <Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(vec![]),
+            vec![UpdateData::RelatedState {
+                related_to: ContractInstanceId::new([1u8; 32]),
+                state: State::from(vec![]),
+            }],
+        );
+        assert!(matches!(out, Err(ContractError::InvalidUpdate)), "{out:?}");
+    }
+
+    /// **`validate_state` refuses a forged complaint** (review round 1,
+    /// testing #2): the entry point the network calls runs
+    /// `ReputationStateV1::verify`, not only the in-process helper. Red if
+    /// `validate_state` stops verifying the complaints.
+    #[test]
+    fn validate_state_refuses_a_forged_complaint() {
+        let mut state = ReputationStateV1::default();
+        state.complaints.push(unsigned_complaint(1));
+        let mut bytes = vec![];
+        into_writer(&state, &mut bytes).expect("encode");
+        let out = <Contract as ContractInterface>::validate_state(
+            parameters(),
+            State::from(bytes),
+            RelatedContracts::new(),
+        );
+        assert!(out.is_err(), "a complaint nobody genuinely signed must be refused");
     }
 }

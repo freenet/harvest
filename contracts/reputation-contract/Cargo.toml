@@ -12,18 +12,15 @@ freenet-stdlib = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 getrandom = { workspace = true }
+# The owner certificate on the record is checked here, in the contract, so a
+# record cannot carry anything but a genuine Ghost Key certificate (harvest#53
+# Phase C, review round 1 P1-4). The same crate and version the UI verifies
+# certificates with (`ui/src/ghostkey_cert.rs`); a second version would be a
+# second idea of what a certificate is.
+ghostkey_lib = "0.2"
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-# The contract's entry points take `ReputationParameters`, which can only be
-# built through `ReputationParameters::new` from a real `VerifyingKey` -- that
-# is the single construction site on purpose, because the field set is hashed
-# into the reputation contract's address. A test therefore needs a key, and
-# only a test does. Same reasoning, and same dependency, as
-# `contracts/mailbox-contract`.
-#
-# A dev-dependency is not linked into the `cdylib`, so this does not move the
-# code hash. Verified with `cargo make code-hashes` rather than assumed.
-ed25519-dalek = { workspace = true }
 # Only to build a `Complaint` fixture (its order's timestamp, network and
 # block anchor) in the harvest#55 tests.
 chrono = { workspace = true }

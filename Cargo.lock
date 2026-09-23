@@ -3391,6 +3391,7 @@ dependencies = [
  "freenet-bitcoin-common",
  "freenet-stdlib",
  "getrandom 0.2.17",
+ "ghostkey_lib",
  "harvest-common",
  "serde",
 ]

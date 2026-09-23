@@ -314,8 +314,11 @@ pub async fn create_store_contracts(
     let reputation_params_bytes = harvest_common::to_cbor(&reputation_params)
         .map_err(|e| format!("serialize reputation params: {e}"))?;
 
+    // Only what the contract accepts: a genuine certificate in canonical
+    // armour, or none (`ghostkey_cert::record_certificate`). Anything else
+    // would make this PUT, and with it the store's creation, fail.
     let reputation_state = harvest_common::reputation::ReputationStateV1 {
-        owner_certificate_pem: certificate_pem.clone(),
+        owner_certificate_pem: crate::ghostkey_cert::record_certificate(&certificate_pem),
         ..Default::default()
     };
     let reputation_state_bytes = harvest_common::to_cbor(&reputation_state)

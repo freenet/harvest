@@ -479,6 +479,10 @@ pub struct ReputationLocators {
     pub ghost_key: ed25519_dalek::VerifyingKey,
     pub rsa_public_keys: Vec<Vec<u8>>,
     pub registered_id: Option<ContractInstanceId>,
+    /// The record this build addresses for `store_key`: the successor.
+    /// A registration naming it was made on this build (or already
+    /// migrated), so it has no predecessor; see [`reputation_candidate_ids`].
+    pub current_id: ContractInstanceId,
 }
 
 /// Every superseded reputation instance to probe for one store, newest
@@ -492,6 +496,15 @@ pub struct ReputationLocators {
 pub fn reputation_candidate_ids(
     locators: &ReputationLocators,
 ) -> Result<Vec<ContractInstanceId>, String> {
+    // A registration that names the CURRENT record belongs to a store made
+    // on this build, or to one whose migration already moved it: there is
+    // no predecessor. Walking anyway probed the current record as if it were
+    // one (review round 1, P2-7): a GET of our own record that swallowed the
+    // app's own, a false "recovered your reputation" notice, and a walk for
+    // every store this build creates.
+    if locators.registered_id == Some(locators.current_id) {
+        return Ok(Vec::new());
+    }
     let current = encode_params(&reputation_params(&locators.store_key))?;
     let rsa: Vec<Parameters<'static>> = locators
         .rsa_public_keys
@@ -980,8 +993,18 @@ pub struct ReputationOps {
 impl ProbeStateOps for ReputationOps {
     type State = ReputationStateV1;
 
+    /// Decoded with its certificate reduced to what the successor contract
+    /// accepts: the canonical armour of a genuine Ghost Key certificate, or
+    /// nothing (`ghostkey_cert::record_certificate`). The contract refuses
+    /// any other certificate outright (review round 1, P1-4), so carrying
+    /// one forward unchanged would make the whole forward PUT fail, and with
+    /// it every complaint it carries, on every load.
     fn decode(&self, bytes: &[u8]) -> Option<Self::State> {
-        decode_probed_state("reputation", bytes)
+        decode_probed_state::<ReputationStateV1>("reputation", bytes).map(|mut state| {
+            state.owner_certificate_pem =
+                crate::ghostkey_cert::record_certificate(&state.owner_certificate_pem);
+            state
+        })
     }
 
     /// A state holding complaints OR the seller's certificate is worth
