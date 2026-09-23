@@ -82,32 +82,34 @@ fn active_network(bitcoin: &BitcoinState) -> BitcoinNetwork {
     bitcoin_config::default_network()
 }
 
-/// Every order, across every store we've loaded state for, where one of our
-/// connected Ghost Keys is buyer or seller. Depends on having browsed (or
-/// registered) the relevant store at least once -- same scoping `MyStore`
-/// already uses for listings.
+/// Every order in the stores this node's own Ghost Keys own: the seller's
+/// own book, across every store of theirs whose state has loaded.
+///
+/// # Only the SELLER's orders
+///
+/// This used to include orders naming one of our fingerprints as the buyer.
+/// `buyer_fingerprint` is written by the seller, and each card shows a
+/// payment address, so any seller could put an address in front of a buyer
+/// here that the buyer's own node never kept (review round 3 of #143,
+/// P1-A). A buyer's orders are shown only on the store page's purchase card,
+/// which shows an address only once the buyer's node keeps the order
+/// (`docs/complaint-threat-model.md` section 3.1). Ownership is by this
+/// node's own store registrations, not by the order's `seller_fingerprint`,
+/// which is seller-written too.
 ///
 /// An order still awaiting payment is left out when its store is not
 /// `payable` -- closed, or unbacked (harvest#93 review, Must Fix 2): its card
 /// would show a payment address nobody should use. Settled orders stay, as
 /// history.
 pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
-    let my_fingerprints: std::collections::HashSet<&str> = app_state
-        .ghostkeys
-        .iter()
-        .map(|k| k.fingerprint.as_str())
-        .collect();
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
-        .values()
-        .flat_map(|s| {
+        .iter()
+        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
+        .flat_map(|(_, s)| {
             s.orders
                 .iter()
                 .filter(move |o| s.payable() || o.status != OrderStatus::AwaitingPayment)
-        })
-        .filter(|o| {
-            my_fingerprints.contains(o.order.buyer_fingerprint.as_str())
-                || my_fingerprints.contains(o.order.seller_fingerprint.as_str())
         })
         .cloned()
         .collect();
@@ -994,6 +996,16 @@ mod payable_tests {
         });
         let awaiting = order(OrderStatus::AwaitingPayment, 1);
         let cancelled = order(OrderStatus::Cancelled, 2);
+        state.my_stores.insert(
+            "me".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: None,
+            }],
+        );
         let store = state.browsing_stores.entry(vec![1; 32]).or_default();
         store.orders = vec![awaiting.clone(), cancelled.clone()];
         store.store_verifying_key = Some([7; 32]);

@@ -295,11 +295,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 
             super::buy_view::Purchases { store_contract_id: contract_id.clone() }
 
-            // No payment address on a store buyers must not pay: closed, or
+            // The seller's own invoices, on their own store only. A buyer's
+            // orders show on the purchase card above, which reveals an
+            // address only once the buyer's node keeps the order (review
+            // round 3 of #143, P1-A): listing every order here put any of
+            // the seller's addresses in front of a buyer who kept nothing.
+            // No payment address on a store nobody should pay: closed, or
             // backed by nothing a reader can believe in (Must Fix 2).
-            if store.payable() {
-                StoreInvoices { orders: store.orders.clone() }
-            } else if !store.orders.is_empty() {
+            if owned && store.payable() {
+                StoreInvoices { orders: APP_STATE.read().invoices_shown(&contract_id) }
+            } else if owned && !store.orders.is_empty() {
                 p { class: "text-muted",
                     "This store's invoices are not shown: it has closed, or nothing vouches \
                      for the key that signs them, so none of them should be paid."
@@ -309,7 +314,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     }
 }
 
-/// The invoices a store has issued, as a buyer sees them.
+/// The invoices the viewer's own store has issued (`AppState::invoices_shown`).
 ///
 /// They are on the store contract and public, which is not an oversight:
 /// decentralized payment verification is impossible unless everyone can see

@@ -7736,6 +7736,22 @@ impl AppState {
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
     }
 
+    /// The invoices the store page lists with their payment addresses: every
+    /// order of a store this node owns, while the store is payable, and
+    /// nothing for anyone else's store (review round 3 of #143, P1-A). A
+    /// buyer sees an address only on their purchase card, once their node
+    /// keeps the order (`docs/complaint-threat-model.md` section 3.1).
+    pub fn invoices_shown(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
+        match self.browsing_stores.get(store_contract_id) {
+            Some(store)
+                if store.payable() && self.store_owner_fingerprint(store_contract_id).is_some() =>
+            {
+                store.orders.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
         self.my_stores.iter().find_map(|(fingerprint, stores)| {
             stores
@@ -20124,7 +20140,9 @@ mod buy_flow_tests {
         // The complaint preconditions refuse it too (round 3, defence in
         // depth), with their own words.
         let blockers = purchases(&state)[0].blockers.clone();
-        assert!(blockers.iter().any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
+        assert!(blockers
+            .iter()
+            .any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
             without_unfit(&blockers),
             vec![
@@ -23039,7 +23057,9 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&order);
 
         let blockers = purchases(&state)[0].blockers.clone();
-        assert!(blockers.iter().any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
+        assert!(blockers
+            .iter()
+            .any(|b| matches!(b, PaymentBlocker::UnfitForComplaint(_))));
         assert_eq!(
             without_unfit(&blockers),
             vec![
@@ -26298,6 +26318,50 @@ mod buy_flow_tests {
         let purchase = purchases(&state).remove(0);
         assert!(purchase.blockers.is_empty(), "{:?}", purchase.blockers);
         assert_eq!(purchase.commitment.as_ref(), Some(&unpaid));
+    }
+
+    /// **No view offers a buyer a payment address while `PurchaseNotKept`
+    /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
+    /// and not the Payments tab, even for an order that names one of this
+    /// node's Ghost Keys as its buyer. The seller's own book still shows.
+    /// Red if either view lists orders of a store this node does not own.
+    #[test]
+    fn no_view_shows_an_address_before_the_order_is_kept() {
+        let (mut state, mut unpaid, _, _) = an_unkept_purchase();
+        state.ghostkeys.push(ghostkey_common::GhostKeyInfo {
+            fingerprint: "buyer-fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        });
+        unpaid.order.buyer_fingerprint = "buyer-fp".into();
+        let unpaid = resigned(unpaid, &seller_signing_key());
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
+        assert!(state.browsing_stores[STORE].payable());
+        assert!(!purchases(&state)[0].blockers.is_empty(), "not kept");
+        assert!(state.invoices_shown(STORE).is_empty(), "store page");
+        assert!(
+            crate::components::bitcoin_view::my_orders(&state).is_empty(),
+            "Payments tab"
+        );
+
+        // The seller's own store lists its own invoices.
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
+            }],
+        );
+        assert_eq!(state.invoices_shown(STORE), vec![unpaid.clone()]);
+        assert_eq!(
+            crate::components::bitcoin_view::my_orders(&state),
+            vec![unpaid]
+        );
     }
 
     /// **A refused keep releases the marker and says why** (model section
