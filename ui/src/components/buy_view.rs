@@ -706,8 +706,8 @@ fn KeptPurchaseRow(
                 // prompt to pay again.
                 p { class: "text-muted",
                     "{amount} \u{00b7} No payment seen yet. Your node keeps this order and \
-                     watches for its payment. If you have not paid, the seller's store page \
-                     is where to."
+                     follows what the bridge reports for its address. If you have not paid, \
+                     the seller's store page is where to."
                 }
             }
         }

@@ -473,10 +473,8 @@ pub fn reversal_stands(
     reversal: &AuthorizedOrder,
 ) -> bool {
     use harvest_common::payment::{verify_payment_proof, ProofError};
-    let bridges = &complaint.order.order.trusted_bridges;
-    if bridges.is_empty()
-        || !crate::components::bitcoin_view::unrecognised_bridges(&complaint.order.order).is_empty()
-    {
+    // A complaint's order names at least one bridge (`Complaint::verify`).
+    if !crate::components::bitcoin_view::unrecognised_bridges(&complaint.order.order).is_empty() {
         return false;
     }
     let (Some(OrderPaymentProof::OnChain(theirs)), Some(OrderPaymentProof::OnChain(ours))) = (
@@ -808,6 +806,20 @@ mod tests {
             complaint_standing(&complaint, Some(&reversed), None),
             ComplaintStanding::PaymentReversed,
             "the same reversal from a recognised bridge still discounts it"
+        );
+        // The case that matters: one recognised bridge AND one the seller
+        // runs. Any bridge the order names may sign the retraction, so ANY
+        // unrecognised one disqualifies the reversal (round 6b).
+        let mut mixed = complaint.clone();
+        mixed
+            .order
+            .order
+            .trusted_bridges
+            .push(freenet_bitcoin_common::BridgeId([0x5e; 32]));
+        assert_eq!(
+            complaint_standing(&mixed, Some(&reversed), None),
+            ComplaintStanding::Counts,
+            "a recognised bridge alongside the seller's own does not make the reversal stand"
         );
     }
 

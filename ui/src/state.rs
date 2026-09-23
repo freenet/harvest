@@ -2317,7 +2317,8 @@ struct ComplaintParts {
     key: ed25519_dalek::SigningKey,
     /// The store key, which addresses the record.
     store_key: ed25519_dalek::VerifyingKey,
-    /// The current tip: when the buyer says the complaint was made.
+    /// When the buyer says the complaint was made: the tip, or the base
+    /// window's close if that is sooner (`complaint_parts`).
     block_height: u32,
     /// `payment::paid_height` over `order`.
     paid_height: u32,
@@ -9030,8 +9031,8 @@ impl AppState {
                 .any(BrowsingStore::record_full);
             return Err(if full_without_it {
                 "your complaint about this order is kept on this node, but the seller's record \
-                 is full and holds complaints dated nearer their payments, so it does not show \
-                 yours; your node offers it again each time Harvest opens"
+                 is full and does not show it: a full record keeps the complaints dated nearest \
+                 their payments. Your node offers it again each time Harvest opens"
             } else {
                 "your complaint about this order is kept on this node, which puts it on the \
                  seller's record each time Harvest opens"
@@ -9241,7 +9242,7 @@ impl AppState {
     /// Phase C, `docs/complaint-threat-model.md` sections 3.4, 3.5): the
     /// order's receipt key -- the key the seller signed into the order's
     /// terms, held in the kept record -- signs `ComplaintTerms { order id,
-    /// category, the current tip height, the paid height }`, about the paid
+    /// category, the date (see `complaint_parts`), the paid height }`, about the paid
     /// copy with its minimal proof.
     ///
     /// **Kept first, then PUT.** The complaint goes to the delegate in a

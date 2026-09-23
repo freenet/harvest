@@ -295,8 +295,8 @@ impl Complaint {
     ///
     /// What a full record keeps by (R5-C): nearest first. Either side,
     /// rather than signed, so a complaint dated before its payment does not
-    /// outrank one dated after it. The honest UI dates a complaint at the
-    /// tip when it is filed, which is after the payment.
+    /// outrank one dated after it. The honest UI dates a complaint after its
+    /// payment, at the tip or the base window's close, whichever is sooner.
     pub fn distance_from_payment(&self) -> u32 {
         self.block_height.abs_diff(self.paid_height)
     }
@@ -1239,6 +1239,10 @@ mod tests {
             .expect("applies");
         assert_eq!(state.complaints, vec![honest]);
     }
+
+    // Lowering the complaint bound (or a bound it is derived from) tightens
+    // `Complaint::verify` for complaints already made (threat model 8).
+    const _: () = assert!(MAX_COMPLAINT_BYTES >= 286_720);
 
     /// **A complaint past `MAX_COMPLAINT_BYTES` is refused, whatever makes it
     /// big** (review round 6). The proof's tip is a byte string only its

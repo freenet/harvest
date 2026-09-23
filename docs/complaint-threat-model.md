@@ -456,8 +456,10 @@ substitute must show the same paid height.
   dated at their paid height, are the ones a full record keeps first (5.3). An honest buyer pays
   only orders whose bridges are all recognised (`BridgeNotRecognised`), so its complaint loses
   nothing: only a reversal a recognised bridge attested discounts it. A bridge recognised once
-  and dropped later makes its reversals count for nothing, which errs toward the buyer, so this
-  needs no ever-recognised list.
+  and dropped later makes its reversals count for nothing. That errs toward the buyer, and costs
+  an honest seller whose buyer's payment was genuinely reorged away under a rotated bridge: the
+  complaint then counts. TM-G's append-only list of every bridge ever recognised would remove
+  that cost; it is not built, since it matters only for reorg reversals (7.2, mainnet).
 - **Counting never consults closure, retirement or backing.** A seller could backdate a closure
   anchor, so no rule of the form "discount orders after closure" is safe. Complaints are counted
   on the store key's record, whatever the store's status.
@@ -645,7 +647,12 @@ UI never sends `Unwatch` on its own.
   - every `MAX_*` bound;
   - `LEGACY_HARVEST_WEBAPP_CONTRACT_IDS` (append-only);
   - the `ScopedPayload` format;
-  - `MAX_COMPLAINT_BYTES`, now enforced per complaint (R6-1);
+  - `MAX_COMPLAINT_BYTES`, now enforced per complaint (R6-1). Adding that check was itself a
+    tightening, allowed only because no reputation generation that holds complaints has ever
+    been published (`legacy/reputation_contract.toml` lists only the RSA generations). The
+    migration fold's base is not re-verified before its forward PUT, so a predecessor complaint
+    the successor refuses would lose the whole record, not just that complaint. A compile-time
+    assert in the tests keeps the bound from being lowered;
   - `MAX_COMPLAINTS` (never lowered: raising it re-keys and loses nothing; a compile-time assert
     keeps it at least 146 if a bound it is derived from is loosened) and the order a
     full record keeps by (`distance_from_payment`, then the order id; `canonical_rank` within
