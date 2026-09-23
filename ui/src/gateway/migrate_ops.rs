@@ -926,19 +926,22 @@ fn send_forward(forwarded: Forwarded, params: Parameters<'static>, forward: Forw
         }
     });
 
-    // The deadlines. What each means is `migrate_seal::forward_timer`: the
-    // first only says the write is slow and keeps waiting, so an answer that
-    // arrives after it still adopts (harvest#152); the last gives up. An
-    // expired wait is `Unconfirmed`, never a confirmation: a send that was
-    // accepted by the WebSocket and never answered by the node establishes
-    // nothing about whether the state landed, and reading it as success is
-    // precisely what condition 1 exists to stop.
-    for fire_at in [
-        migrate_seal::FORWARD_SLOW_NOTICE_MS,
-        migrate_seal::FORWARD_GIVE_UP_MS,
-    ] {
+    // The deadlines. What each means is `migrate_seal::forward_timer`: for a
+    // mailbox the first only says the write is slow and keeps waiting, so an
+    // answer that arrives after it still adopts (harvest#152); for every
+    // other artifact the first is the give-up, as before. An expired wait is
+    // `Unconfirmed`, never a confirmation: a send that was accepted by the
+    // WebSocket and never answered by the node establishes nothing about
+    // whether the state landed, and reading it as success is precisely what
+    // condition 1 exists to stop.
+    let give_up = migrate_seal::forward_give_up_ms(artifact);
+    let mut deadlines = vec![migrate_seal::FORWARD_SLOW_NOTICE_MS];
+    if give_up != migrate_seal::FORWARD_SLOW_NOTICE_MS {
+        deadlines.push(give_up);
+    }
+    for fire_at in deadlines {
         gloo_timers::callback::Timeout::new(fire_at, move || {
-            match migrate_seal::forward_timer(fire_at) {
+            match migrate_seal::forward_timer(artifact, fire_at) {
                 migrate_seal::ForwardTimer::StillWaiting => note_slow_forward(successor, fire_at),
                 migrate_seal::ForwardTimer::GiveUp => {
                     settle_forward(successor, Confirmation::Unconfirmed)
@@ -956,7 +959,8 @@ fn send_forward(forwarded: Forwarded, params: Parameters<'static>, forward: Forw
 fn note_slow_forward(successor: ContractInstanceId, elapsed_ms: u32) {
     if let Some(artifact) = FORWARDS.with(|f| f.borrow().get(&successor).map(|fw| fw.artifact)) {
         info!(
-            "migration: the recovered {} state sent to {successor} is not acknowledged after              {} s; still waiting for the node (a network PUT answers after its remote hops)",
+            "migration: the recovered {} state sent to {successor} is not acknowledged after \
+             {} s; still waiting for the node (a network PUT answers after its remote hops)",
             artifact.as_str(),
             elapsed_ms / 1000
         );

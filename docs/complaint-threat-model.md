@@ -629,18 +629,26 @@ What still is not covered is a seller who is not online. Renewal is client-drive
 ends a watch about a day after the request that last asked for it (freenet-bitcoin
 `WATCH_LIFETIME_MS`). So:
 
-- a seller whose tab stays closed for more than about a day after the last renewal is not
-  watched for until they come back, and a payment confirming meanwhile is not observed;
+- a seller whose tab stays closed stops being watched for between 12 and 24 hours later (the
+  bridge's day counts from the last renewal, which is at most 12 hours old), and a payment
+  confirming meanwhile is not observed;
 - when they come back inside the order's window, the renewal registers the watch again, but a
   new watch does not scan blocks already mined (freenet/freenet-bitcoin#7), so a payment that
-  confirmed while they were away is still not found. Harvest already sends the anchor as
-  `scan_from_height`, so #7 closes this case with no Harvest change;
+  confirmed while they were away is still not found. Harvest already sends the oldest anchor in
+  each request as `scan_from_height`, so #7 would narrow this, but its design bounds how far
+  back a request may rewind (the withdrawn version used 144 blocks; the bridge keeps 1000), so
+  an anchor from early in a 2064-block window may be clamped;
 - a seller who comes back after the window has closed sends nothing, since nothing could
   settle the order any more.
 
 Closing the offline case needs a watch that lasts as long as its requester asks, within a
 bridge-set bound, so the watch sent at issue covers the whole window: filed as
-freenet/freenet-bitcoin#26, and not worked around in Harvest. A buyer-side watch would need the
+freenet/freenet-bitcoin#26, and not worked around in Harvest.
+
+A seller with a great many unpaid invoices is not fully covered either. A bridge holds at most
+1000 scripts per Ghost Key and refuses a new one past that without saying so, while renewals keep
+their places. So the seller's UI renews only its newest 500 unpaid orders per key
+(`WATCHES_PER_GHOSTKEY`), and the oldest beyond that are not watched through their window. A buyer-side watch would need the
 same renewal, through the last block a complaint could count at. The seller's UI never sends
 `Unwatch` on its own.
 

@@ -107,7 +107,7 @@ secret before it stops, so checking values alone passes a broken walk.
 A `freenet network` node answers a PUT only after its remote hops; the
 isolated gateway has none, so it answers the migration's forward PUT at once.
 Every rehearsal therefore takes the fast path through
-`migrate_ops::send_forward`. The slow path (an answer after the probe's 12 s,
+`migrate_ops::send_forward`. The slow path (a mailbox forward answered after the probe's 12 s,
 which used to discard the forward and leave a migrated seller's new mailbox
 unrouted for that load, harvest#152) is covered only by the host tests on
 `migrate_seal::forward_timer`, and by a post-publish load on a real peer:

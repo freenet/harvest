@@ -87,7 +87,9 @@ anyway (#29).
 - **What is sent.** `state::AppState::watches_wanted` picks the seller's own
   unpaid, anchored orders that name the bridge, until the tip is
   `WATCH_PAST_ANCHOR_BLOCKS` (2208) past the anchor: the whole payment window
-  plus the deepest confirmation count an order may ask for (harvest#146). Only
+  plus the deepest confirmation count an order may ask for (harvest#146), and
+  no more than the newest 500 per Ghost Key (`WATCHES_PER_GHOSTKEY`: the bridge
+  refuses new scripts past 1000 per key while renewals keep their places). Only
   under a Ghost Key the vault has listed for this app.
   `bitcoin_inbox::InboxTracker::plan` batches them. Each request is sealed to
   the bridge, bound to the store's verified seller key, signed by the ghostkey
@@ -115,9 +117,10 @@ Known limits:
   refused, or a request the network dropped all delay it.
 - **Renewal needs the seller's tab open.** A bridge ends a watch about a day
   after the request that last asked for it, and only the seller's open tab
-  renews it, so a seller away for more than a day is not watched for, and a
-  payment confirming meanwhile is not observed (freenet-bitcoin#7 would find it
-  on the next renewal inside the window; freenet-bitcoin#26 would make the
+  renews it, so a seller away for more than 12 to 24 hours is not watched for,
+  and a payment confirming meanwhile is not observed (freenet-bitcoin#7 would
+  find it on a renewal inside the window, within the rewind bound its design
+  sets; freenet-bitcoin#26 would make the
   watch sent at issue last the whole window). See
   `docs/complaint-threat-model.md` section 7.4.
 - **Requests that are never read are noticed, not repaired.** A request that

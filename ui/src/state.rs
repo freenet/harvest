@@ -818,10 +818,12 @@ pub(crate) fn request_certificate(fingerprint: String) {
 /// [`harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS`]. A payment that
 /// confirms in the window's last block still settles the order, and it
 /// becomes provable only once it is as deep as the order requires, so the
-/// address has to stay watched and re-read until then. The most any order
-/// may require is used rather than this order's own count, because the
-/// bridge publishes depth in rungs (2, 4, 8, ...) and the rung that first
-/// covers the order's count can be deeper than the count itself.
+/// address has to stay re-read until then. (The bridge itself keeps a watch
+/// while a payment it has seen is shallow, so the renewal only has to reach
+/// the window's end; the re-reads, which find the deeper claims on a node
+/// whose copy went stale, have to reach the depth.) The most any order may
+/// require is used rather than this order's own count so the bound is one
+/// number for every order; it costs at most 143 blocks of watching.
 ///
 /// This used to be `MAX_ANCHOR_AGE_BLOCKS + 144`, 192 blocks: it measured
 /// from the end of the time a buyer may SEND, not from the end of the time a
@@ -840,6 +842,29 @@ pub(crate) fn request_certificate(fingerprint: String) {
 /// `docs/complaint-threat-model.md` section 7.4.
 pub const WATCH_PAST_ANCHOR_BLOCKS: u32 = harvest_common::payment::PAYMENT_WINDOW_BLOCKS
     + harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+
+/// The most payment scripts one Ghost Key asks a bridge to watch, the newest
+/// orders first.
+///
+/// A bridge holds at most 1000 scripts per Ghost Key (freenet-bitcoin
+/// `bridge/src/inbox.rs`, `MAX_WATCHES_PER_GHOSTKEY`) and fills its places
+/// first come, first served: a renewal of a script it holds always succeeds,
+/// and a NEW script past the cap is refused, silently, since the request is
+/// read and removed like any other. With every unpaid invoice now renewed
+/// for about fifteen days ([`WATCH_PAST_ANCHOR_BLOCKS`]), a seller with more
+/// than about 65 unpaid invoices a day would fill the cap with stale ones and
+/// have the bridge refuse the fresh invoice a buyer is about to pay (#154
+/// review round 1).
+///
+/// So only the newest this many are renewed. The rest stop being asked
+/// about, and the bridge lets each go about a day after its last renewal,
+/// which is what the headroom below the cap is for: a key keeps renewing
+/// 500, and the ones it has just dropped hold at most another day's worth
+/// of places. The cost is stated rather than hidden: past this many unpaid
+/// invoices, the oldest are not watched through their whole window, and a
+/// very late payment to one of them is not observed. A fresh invoice is
+/// preferred because it is the one most likely to be paid.
+pub const WATCHES_PER_GHOSTKEY: usize = 500;
 
 /// Milliseconds since the Unix epoch by this machine's clock.
 pub(crate) fn now_ms() -> u64 {
@@ -11994,6 +12019,13 @@ impl AppState {
                     None => groups.push((fingerprint.clone(), ghostkey, wanted)),
                 }
             }
+        }
+        // Newest first across every store of the key, not only within one,
+        // and no more than the bridge will hold for the key with room for the
+        // ones just dropped: see [`WATCHES_PER_GHOSTKEY`].
+        for (_, _, wanted) in &mut groups {
+            wanted.sort_by_key(|w| std::cmp::Reverse(w.anchor_height));
+            wanted.truncate(WATCHES_PER_GHOSTKEY);
         }
         groups
     }
@@ -24413,6 +24445,8 @@ mod buy_flow_tests {
         let anchored_at = probe.order.anchor.expect("anchored").height;
         let window = probe.order.payment_window().expect("anchored");
         let last_settling = *window.end() - anchored_at;
+        // The fixture needs one confirmation, so this equals `last_settling`;
+        // the deep-confirmation case is the next test.
         let provable = last_settling + probe.order.required_confirmations.saturating_sub(1);
         // Past the old bound, well inside the window.
         let past_the_old_bound = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS + 145;
@@ -24449,6 +24483,92 @@ mod buy_flow_tests {
         );
         assert!(state.watches_wanted(inbox::bridge()).is_empty());
         assert!(state.address_contracts_to_reread(STORE).is_empty());
+    }
+
+    /// **An order needing the most confirmations any order may ask for is
+    /// still watched until a payment at the window's end is that deep**, and
+    /// not a block after the bound. The case the confirmation term of the
+    /// bound exists for, run through the predicate rather than only the
+    /// constant: red with that term dropped from `WATCH_PAST_ANCHOR_BLOCKS`
+    /// (review round 1, testing lens).
+    #[test]
+    fn an_order_needing_the_deepest_confirmations_is_watched_until_that_deep() {
+        use harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+        let gk = inbox::authority().mint();
+        let deep = |age: u32| {
+            let mut order = an_order_naming_the_test_bridge(age);
+            order.order.required_confirmations = MAX_REQUIRED_CONFIRMATIONS;
+            resigned(order, &seller_signing_key())
+        };
+        let probe = deep(0);
+        let anchored_at = probe.order.anchor.expect("anchored").height;
+        let last_settling = *probe.order.payment_window().expect("anchored").end() - anchored_at;
+        let provable = last_settling + MAX_REQUIRED_CONFIRMATIONS - 1;
+
+        let state = a_seller_selling(vec![deep(provable)], gk.id().0);
+        assert_eq!(state.watches_wanted(inbox::bridge()).len(), 1);
+        assert_eq!(state.address_contracts_to_reread(STORE).len(), 1);
+
+        let state = a_seller_selling(
+            vec![deep(crate::state::WATCH_PAST_ANCHOR_BLOCKS + 1)],
+            gk.id().0,
+        );
+        assert!(state.watches_wanted(inbox::bridge()).is_empty());
+        assert!(state.address_contracts_to_reread(STORE).is_empty());
+    }
+
+    /// **Past the per-key budget, the newest orders are the ones watched**,
+    /// across every store of the key (#154 review round 1). A bridge refuses a
+    /// new script past its cap while renewals keep their places, so without
+    /// the budget a seller with a fortnight of unpaid invoices would have the
+    /// fresh one refused. Red with the truncation removed, and with the
+    /// cross-store sort removed (the second store's newest would be cut).
+    #[test]
+    fn past_the_per_key_budget_the_newest_orders_are_watched() {
+        use crate::state::WATCHES_PER_GHOSTKEY;
+        let gk = inbox::authority().mint();
+        // One more than the budget, oldest first so the store's own order is
+        // not what puts the newest in front.
+        let orders: Vec<AuthorizedOrder> = (0..=WATCHES_PER_GHOSTKEY as u32)
+            .rev()
+            .map(|age| an_order_naming_the_test_bridge(age + 10))
+            .collect();
+        let mut state = a_seller_selling(orders, gk.id().0);
+        // A second store of the same key, holding the newest order of all.
+        let second: Vec<u8> = vec![0x5e; 32];
+        state
+            .my_stores
+            .get_mut("seller-fp")
+            .expect("the seller")
+            .push(StoreRegistration {
+                store_contract_id: second.clone(),
+                reputation_contract_id: vec![12u8; 32],
+                mailbox_contract_id: vec![13u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            });
+        state.begin_browsing(second.clone());
+        let newest = an_order_naming_the_test_bridge(1);
+        {
+            let store = state.browsing_stores.get_mut(&second).expect("the store");
+            store.seller_verifying_key = Some(gk.id().0);
+            store.store_verifying_key = Some(gk.id().0);
+            store.orders = vec![newest];
+        }
+
+        let wanted = state.watches_wanted(inbox::bridge());
+        assert_eq!(wanted.len(), 1, "one key, one group");
+        let heights: Vec<Option<u32>> = wanted[0].2.iter().map(|w| w.anchor_height).collect();
+        assert_eq!(heights.len(), WATCHES_PER_GHOSTKEY, "held to the budget");
+        assert_eq!(
+            heights[0],
+            Some(TIP_HEIGHT - 1),
+            "the other store's newest order comes first"
+        );
+        assert!(
+            !heights.contains(&Some(TIP_HEIGHT - (WATCHES_PER_GHOSTKEY as u32 + 10))),
+            "the oldest is the one dropped"
+        );
     }
 
     /// The bound covers the deepest confirmation count any order may ask
