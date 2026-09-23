@@ -139,6 +139,11 @@ impl ContractInterface for Contract {
             from_reader::<ReputationStateV1, &[u8]>(state.as_ref())
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
+        // The held state passed `validate_state` when it was stored, so its
+        // certificate is known good; only a certificate the merge changed
+        // needs the chain check below (review round 2 of #143, P3: it was
+        // re-verified on every update).
+        let held_certificate = reputation_state.owner_certificate_pem.clone();
 
         for update in data {
             match update {
@@ -185,8 +190,10 @@ impl ContractInterface for Contract {
         // The merge back-fills the certificate from whichever side has one,
         // so the result is what has to hold up: a state `validate_state`
         // would refuse must not come out of here either.
-        check_owner_certificate(&reputation_state.owner_certificate_pem, &PRODUCTION_MASTER)
-            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
+        if reputation_state.owner_certificate_pem != held_certificate {
+            check_owner_certificate(&reputation_state.owner_certificate_pem, &PRODUCTION_MASTER)
+                .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
+        }
 
         let mut updated_state = vec![];
         into_writer(&reputation_state, &mut updated_state)
@@ -350,7 +357,7 @@ mod tests {
     /// summarize or re-encode. Verification is `harvest_common::reputation`'s
     /// to test, with genuine fixtures.
     fn unsigned_complaint(n: u8) -> harvest_common::reputation::Complaint {
-        use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
+        use freenet_bitcoin_common::BitcoinNetwork;
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
         let order = Order {
             id: OrderId([n; 32]),
@@ -381,10 +388,8 @@ mod tests {
                 status_signature: None,
             },
             category: harvest_common::feedback::FeedbackCategory::NonDelivery,
-            block_ref: BlockAnchor {
-                height: 100,
-                hash: BlockHash([n; 32]),
-            },
+            block_height: 200,
+            paid_height: 100,
             scoped_payload: vec![7, 8, 9],
             buyer_signature: vec![10, 11, 12],
         }
