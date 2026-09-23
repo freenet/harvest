@@ -9072,6 +9072,16 @@ impl AppState {
                     .to_string(),
             );
         }
+        // Past the cap a buyer's software refuses to pay the order
+        // (`PaymentBlocker::UnfitForComplaint`), so issuing it would publish
+        // a debt nobody will settle. The forms refuse it first.
+        if invoice.required_confirmations > harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS {
+            return Err(format!(
+                "an invoice may require at most {} confirmations, or buyers could not complain \
+                 about it in time and will not pay it",
+                harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS
+            ));
+        }
         // The store has to be one of ours, and the fingerprint that signs has
         // to be the one that owns it -- the store contract verifies every
         // order against `StoreParameters::seller_verifying_key`, so an invoice
@@ -16127,6 +16137,11 @@ mod invoice_tests {
         let mut instant = invoice();
         instant.required_confirmations = 0;
         assert!(state.issue_invoice(instant).is_err());
+        // Nor more than a complaint allows (TM-C).
+        let mut slow = invoice();
+        slow.required_confirmations = harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS + 1;
+        let refused = state.issue_invoice(slow).expect_err("over the cap");
+        assert!(refused.contains("at most 144"), "{refused}");
     }
 
     /// "No key configured" and "we have not asked yet" have to stay distinct,

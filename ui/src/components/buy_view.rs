@@ -591,11 +591,10 @@ pub fn AcceptRequest(
     let mut accepted = use_signal(|| false);
 
     let parsed_amount = amount().trim().parse::<u64>().ok().filter(|n| *n > 0);
-    let parsed_confirmations = confirmations()
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n > 0);
+    // The invoice form's own rule, so the two seller controls refuse the
+    // same values (`docs/complaint-threat-model.md` section 4).
+    let confirmations_read = super::invoice_form::parse_required_confirmations(&confirmations());
+    let parsed_confirmations = confirmations_read.as_ref().ok().copied();
     let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
 
     if accepted() {
@@ -650,6 +649,9 @@ pub fn AcceptRequest(
                     min: "1",
                     value: "{confirmations}",
                     oninput: move |event| confirmations.set(event.value()),
+                }
+                if let Err(why) = confirmations_read {
+                    p { class: "text-warning", "{why}" }
                 }
             }
             if let Some(message) = problem() {

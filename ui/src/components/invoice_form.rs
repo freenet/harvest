@@ -525,11 +525,8 @@ fn InvoiceForm(
     let mut confirmations = use_signal(|| "1".to_string());
 
     let parsed_amount = amount().trim().parse::<u64>().ok().filter(|n| *n > 0);
-    let parsed_confirmations = confirmations()
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n > 0);
+    let confirmations_read = parse_required_confirmations(&confirmations());
+    let parsed_confirmations = confirmations_read.as_ref().ok().copied();
     let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
 
     rsx! {
@@ -582,12 +579,8 @@ fn InvoiceForm(
                 value: "{confirmations}",
                 oninput: move |e| confirmations.set(e.value()),
             }
-            if parsed_confirmations.is_none() {
-                p { class: "text-warning",
-                    "At least one confirmation. Accepting zero would count a payment as "
-                    "settled while it is still only in the mempool, where it can still be "
-                    "replaced."
-                }
+            if let Err(why) = confirmations_read {
+                p { class: "text-warning", "{why}" }
             }
 
             PaymentWatchNote {}
@@ -690,6 +683,32 @@ fn issue_invoice(invoice: PendingInvoice) {
     }
 }
 
+/// The confirmations a seller typed, or why an order may not require that
+/// many. Shared by this form and the accept control in `buy_view`, so both
+/// refuse the same values.
+///
+/// At least one: accepting zero would count a payment as settled while it is
+/// still only in the mempool. At most
+/// [`harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS`]: an order needing
+/// more could not read as paid in time for a complaint about it, so buyers'
+/// software refuses to pay it (`docs/complaint-threat-model.md` section 4).
+pub(crate) fn parse_required_confirmations(input: &str) -> Result<u32, String> {
+    use harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+    match input.trim().parse::<u32>() {
+        Ok(n) if n > MAX_REQUIRED_CONFIRMATIONS => Err(format!(
+            "At most {MAX_REQUIRED_CONFIRMATIONS} confirmations, about a day of blocks. An \
+             order needing more could not count as paid in time for a buyer to complain about \
+             it, so buyers will not pay it."
+        )),
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(
+            "At least one confirmation. Accepting zero would count a payment as settled \
+             while it is still only in the mempool, where it can still be replaced."
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +782,26 @@ mod tests {
     fn a_seller_with_no_invoices_gets_an_empty_list() {
         assert!(invoices_issued_by(&[], "me").is_empty());
         assert!(invoices_issued_by(&[order("someone-else", 1)], "me").is_empty());
+    }
+
+    /// **The seller's forms refuse what a buyer would refuse to pay**
+    /// (`docs/complaint-threat-model.md` section 4, TM-C): zero, and more
+    /// than `MAX_REQUIRED_CONFIRMATIONS`, each with a reason. Red if either
+    /// bound is dropped.
+    #[test]
+    fn the_confirmations_input_refuses_zero_and_more_than_the_cap() {
+        use harvest_common::payment::MAX_REQUIRED_CONFIRMATIONS;
+        assert_eq!(parse_required_confirmations(" 1 "), Ok(1));
+        assert_eq!(
+            parse_required_confirmations(&MAX_REQUIRED_CONFIRMATIONS.to_string()),
+            Ok(MAX_REQUIRED_CONFIRMATIONS)
+        );
+        let too_many = parse_required_confirmations(&(MAX_REQUIRED_CONFIRMATIONS + 1).to_string())
+            .expect_err("over the cap");
+        assert!(too_many.contains("At most 144"), "{too_many}");
+        for refused in ["0", "", "two", "-1"] {
+            let why = parse_required_confirmations(refused).expect_err(refused);
+            assert!(why.contains("At least one"), "{refused}: {why}");
+        }
     }
 }
