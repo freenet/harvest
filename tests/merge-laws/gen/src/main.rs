@@ -655,15 +655,19 @@ fn complaint_by(
     category: FeedbackCategory,
     height: u32,
 ) -> Complaint {
-    let block_ref = BlockAnchor { height, hash: BlockHash([(height % 251) as u8; 32]) };
+    // The height the complaint's own proof shows it paid at, which the
+    // contract checks the signed value against; 0 for an unpaid order, whose
+    // complaint is refused before that is looked at.
+    let paid_height = harvest_common::payment::paid_height(&order).unwrap_or(0);
     let terms = ComplaintTerms {
         tag: ComplaintTag::HarvestComplaintV1,
         order_id: order.order.id.clone(),
         category: category.clone(),
-        block_ref,
+        block_height: height,
+        paid_height,
     };
     let (scoped_payload, buyer_signature) = sign_scoped(buyer, &terms);
-    Complaint { order, category, block_ref, scoped_payload, buyer_signature }
+    Complaint { order, category, block_height: height, paid_height, scoped_payload, buyer_signature }
 }
 
 /// The genuine complaint about the fixture store's paid order `n`.
