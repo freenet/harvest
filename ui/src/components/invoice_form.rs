@@ -258,8 +258,9 @@ fn CancelInvoice(
 /// (harvest#53 Phase B).
 ///
 /// Two steps, like the cancel, because the record is public and permanent.
-/// Hidden once the store holds a despatch for the order: the card's stage
-/// line then says so.
+/// Hidden once a despatch of the order is on record
+/// (`AppState::despatch_recorded`), read from the same source as the
+/// card's stage line, which then says so.
 #[component]
 fn MarkDespatched(
     store_contract_id: Vec<u8>,
@@ -270,10 +271,7 @@ fn MarkDespatched(
     let (recorded, pending, sent, refusal) = {
         let state = APP_STATE.read();
         (
-            state
-                .browsing_stores
-                .get(&store_contract_id)
-                .is_some_and(|store| store.despatches.contains_key(&order_id)),
+            state.despatch_recorded(&store_contract_id, &order_id),
             state.despatch_pending(&store_contract_id, &order_id),
             state.despatch_sent(&store_contract_id, &order_id),
             state.despatch_refusal(&store_contract_id, &order_id),

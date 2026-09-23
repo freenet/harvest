@@ -8624,7 +8624,7 @@ impl AppState {
                 }
             ));
         }
-        if store.despatches.contains_key(order_id) {
+        if self.despatch_recorded(store_contract_id, order_id) {
             return Err("this order is already marked despatched".to_string());
         }
         if self.despatch_pending(store_contract_id, order_id)
@@ -8642,6 +8642,34 @@ impl AppState {
                  one to say when it was made. Wait for the chain data to load and try again.",
             )?;
         Ok((store_key, order, anchor))
+    }
+
+    /// Whether a despatch of `order_id`, an order in this store, is on record:
+    /// in this store's state, or in any store holding this very record
+    /// ([`AppState::despatch_of`], which is what the order's stage line
+    /// reads).
+    ///
+    /// Both, because they can disagree for a while after a store re-key:
+    /// the predecessor generation's state, despatch and all, can be on hand
+    /// while the successor's copy has not caught up. The stage line then
+    /// said "the seller says it was despatched" above a "Mark despatched"
+    /// button that read only this store, and pressing it would have signed a
+    /// second despatch of the same order (harvest#150). One source for the
+    /// words and the control keeps them in step.
+    pub fn despatch_recorded(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> bool {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return false;
+        };
+        store.despatches.contains_key(order_id)
+            || store
+                .orders
+                .iter()
+                .find(|order| &order.order.id == order_id)
+                .is_some_and(|order| self.despatch_of(order).is_some())
     }
 
     /// Why the seller cannot record a despatch of this order right now, or
@@ -26502,6 +26530,56 @@ mod buy_flow_tests {
             state.notifications
         );
         state.despatch_order(STORE, &order.order.id).expect("again");
+    }
+
+    /// harvest#150 (b): after a store re-key the predecessor generation's
+    /// state, with the despatch, can be on hand while the successor's copy
+    /// has not caught up. The order's stage line (`despatch_of`) then said
+    /// "despatched" while the control, reading only the successor, still
+    /// offered "Mark despatched" -- a second despatch of the same order.
+    /// Both now read one source. Mutated red by reading only this store's
+    /// `despatches` in `despatch_recorded`.
+    #[test]
+    fn a_despatch_held_by_the_predecessor_generation_is_not_offered_again() {
+        let (mut state, order) = seller_holding_a_despatchable_order();
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: anchor(TIP_HEIGHT),
+        };
+        let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+            &seller_signing_key(),
+            harvest_common::to_cbor(&despatch).unwrap(),
+        )
+        .unwrap();
+        let predecessor = state.browsing_stores.entry(vec![0x01; 32]).or_default();
+        predecessor.owner = Some(seller_signing_key().verifying_key().to_bytes());
+        predecessor.orders = vec![order.clone()];
+        predecessor.despatches.insert(
+            order.order.id.clone(),
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            },
+        );
+        assert!(
+            !state.browsing_stores[STORE]
+                .despatches
+                .contains_key(&order.order.id),
+            "precondition: the successor has not caught up"
+        );
+        assert!(
+            state.despatch_of(&order).is_some(),
+            "precondition: the stage line reads it as despatched"
+        );
+
+        assert!(state.despatch_recorded(STORE, &order.order.id));
+        assert_eq!(
+            state.despatch_refusal(STORE, &order.order.id).as_deref(),
+            Some("this order is already marked despatched")
+        );
+        assert!(state.despatch_order(STORE, &order.order.id).is_err());
+        assert!(state.pending_signatures.is_empty());
     }
 
     /// `despatch_of` reads the despatch from the store holding THIS record,
