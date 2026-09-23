@@ -7967,19 +7967,32 @@ impl AppState {
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
     }
 
-    /// The invoices the store page lists with their payment addresses: every
-    /// order of a store this node owns, while the store is payable, and
-    /// nothing for anyone else's store (review round 3 of #143, P1-A). A
-    /// buyer sees an address only on their purchase card, once their node
-    /// keeps the order (`docs/complaint-threat-model.md` section 3.1).
+    /// The invoices the store page lists: every order of a store this node
+    /// owns, while the store is payable; for anyone else's store, only the
+    /// orders past `AwaitingPayment` (review round 3 of #143, P1-A; narrowed
+    /// in round 4, P3). A buyer sees a payment address only on their
+    /// purchase card, once their node keeps the order
+    /// (`docs/complaint-threat-model.md` section 3.1). The public record of
+    /// settled invoices stays readable to everyone, and carries no address:
+    /// the card offers one only for an order awaiting payment
+    /// (`fulfilment::offers_payment_address`).
     pub fn invoices_shown(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
-        match self.browsing_stores.get(store_contract_id) {
-            Some(store)
-                if store.payable() && self.store_owner_fingerprint(store_contract_id).is_some() =>
-            {
-                store.orders.clone()
-            }
-            _ => Vec::new(),
+        use harvest_common::payment::OrderStatus;
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return Vec::new();
+        };
+        if self.store_owner_fingerprint(store_contract_id).is_none() {
+            return store
+                .orders
+                .iter()
+                .filter(|order| order.status != OrderStatus::AwaitingPayment)
+                .cloned()
+                .collect();
+        }
+        if store.payable() {
+            store.orders.clone()
+        } else {
+            Vec::new()
         }
     }
 
@@ -26594,6 +26607,23 @@ mod buy_flow_tests {
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "Payments tab"
         );
+        // A settled order of the same store is listed in both, as history:
+        // its card offers no address (review round 4, P3).
+        let mut settled = unpaid.clone();
+        settled.status = OrderStatus::Cancelled;
+        assert!(!crate::fulfilment::offers_payment_address(&settled, Some(TIP_HEIGHT)));
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .push(settled.clone());
+        assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
+        assert_eq!(
+            crate::components::bitcoin_view::my_orders(&state),
+            vec![settled.clone()]
+        );
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 
         // The seller's own store lists its own invoices.
         state.my_stores.insert(

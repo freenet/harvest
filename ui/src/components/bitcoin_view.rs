@@ -101,15 +101,32 @@ fn active_network(bitcoin: &BitcoinState) -> BitcoinNetwork {
 /// `payable` -- closed, or unbacked (harvest#93 review, Must Fix 2): its card
 /// would show a payment address nobody should use. Settled orders stay, as
 /// history.
+///
+/// And, from anyone else's store, a buyer's history: orders naming one of
+/// this node's Ghost Keys as buyer that are past `AwaitingPayment` (review
+/// round 4, P3). Their cards offer no address
+/// (`fulfilment::offers_payment_address`), so the seller-written fingerprint
+/// can put nothing payable here.
 pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrder> {
+    let my_fingerprints: std::collections::HashSet<&str> = app_state
+        .ghostkeys
+        .iter()
+        .map(|k| k.fingerprint.as_str())
+        .collect();
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
         .iter()
-        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
-        .flat_map(|(_, s)| {
-            s.orders
-                .iter()
-                .filter(move |o| s.payable() || o.status != OrderStatus::AwaitingPayment)
+        .flat_map(|(id, s)| {
+            let owned = app_state.store_owner_fingerprint(id).is_some();
+            let fingerprints = &my_fingerprints;
+            s.orders.iter().filter(move |o| {
+                if owned {
+                    s.payable() || o.status != OrderStatus::AwaitingPayment
+                } else {
+                    o.status != OrderStatus::AwaitingPayment
+                        && fingerprints.contains(o.order.buyer_fingerprint.as_str())
+                }
+            })
         })
         .cloned()
         .collect();
