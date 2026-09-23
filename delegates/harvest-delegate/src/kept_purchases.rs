@@ -778,7 +778,11 @@ mod tests {
             import(&mut other, &key, &value),
             SecretImport::AlreadyAuthoritative
         ));
-        assert_eq!(other.get_secret(&key), held_before, "complaint vs complaint");
+        assert_eq!(
+            other.get_secret(&key),
+            held_before,
+            "complaint vs complaint"
+        );
 
         // A held paid copy is not replaced by an incoming unpaid one, nor by
         // an incoming paid one that differs only in its evidence.

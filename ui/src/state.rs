@@ -5938,8 +5938,7 @@ impl AppState {
     /// complaint that never reaches the record counts for no reader.
     pub fn reasserts_due(&self) -> bool {
         self.kept_purchases_loaded
-            && !complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted)
-                .is_empty()
+            && !complaints_to_reassert(&self.kept_purchases, &self.complaints_reasserted).is_empty()
     }
 
     /// Whether a `KeepPurchase` marker has outlived [`KEEP_TIMEOUT_MS`] at
@@ -26611,7 +26610,10 @@ mod buy_flow_tests {
         // its card offers no address (review round 4, P3).
         let mut settled = unpaid.clone();
         settled.status = OrderStatus::Cancelled;
-        assert!(!crate::fulfilment::offers_payment_address(&settled, Some(TIP_HEIGHT)));
+        assert!(!crate::fulfilment::offers_payment_address(
+            &settled,
+            Some(TIP_HEIGHT)
+        ));
         state
             .browsing_stores
             .get_mut(STORE)
@@ -27250,10 +27252,7 @@ mod buy_flow_tests {
                 .any(|(id, _)| *id == own),
             "its address is watched"
         );
-        assert!(
-            state.due_address_rereads(0).0.contains(&own),
-            "and re-read"
-        );
+        assert!(state.due_address_rereads(0).0.contains(&own), "and re-read");
 
         // The address contract's next answer carries the payment.
         state
@@ -27299,7 +27298,10 @@ mod buy_flow_tests {
             tip_id.to_vec(),
             freenet_bitcoin_common::to_cbor(&a_tip_state(TIP_HEIGHT)).expect("cbor"),
         );
-        let upgrade = state.keep_requests.pop().expect("the tip sends the upgrade");
+        let upgrade = state
+            .keep_requests
+            .pop()
+            .expect("the tip sends the upgrade");
         assert_eq!(upgrade.order.status, OrderStatus::Paid);
     }
 

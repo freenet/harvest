@@ -557,10 +557,11 @@ mod tests {
         // The shared predicate itself refuses it (review round 4, P3): the
         // later check in `verify` has the same words, so the assertion above
         // alone passed with the precondition deleted.
+        let precondition = crate::payment::complaint_preconditions(&c.order)
+            .expect_err("the precondition refuses it");
         assert!(
-            crate::payment::complaint_preconditions(&c.order)
-                .expect_err("the precondition refuses it")
-                .contains("names no buyer key"),
+            precondition.contains("names no buyer key"),
+            "{precondition}"
         );
 
         let mut identity = [0u8; 32];
