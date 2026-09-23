@@ -198,6 +198,10 @@ pub struct AppState {
     /// where an answer is filed.
     pub conversation_recall_aliases: HashMap<Vec<u8>, Vec<u8>>,
 
+    /// Stores whose recall failure has been said this session: once per
+    /// store, whichever of its ids failed (harvest#138 review).
+    pub recall_failure_announced: HashSet<Vec<u8>>,
+
     /// How many times a `ListBuyerConversations` send has failed for a given
     /// store, keyed the same way `buyer_conversations_recalled` is. A send
     /// failure is not a refusal -- nothing was ever asked -- so the claim is
@@ -4035,14 +4039,15 @@ impl AppState {
             .entry(store_contract_id.to_vec())
             .or_insert(0);
         *failures = failures.saturating_add(1);
-        if *failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
-            // Said for the store's own id only: its earlier ids fail with it
-            // when the delegate is unreachable, and one store is one notice
-            // (harvest#138 review).
-            let an_earlier_id = self
-                .conversation_recall_aliases
-                .contains_key(store_contract_id);
-            if *failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS && !an_earlier_id {
+        let failures = *failures;
+        if failures >= MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS {
+            // Once per store, whichever of its ids failed: its earlier ids
+            // fail with it when the delegate is unreachable (harvest#138
+            // review).
+            let store = self.recall_files_under(store_contract_id);
+            if failures == MAX_BUYER_CONVERSATION_RECALL_ATTEMPTS
+                && self.recall_failure_announced.insert(store)
+            {
                 self.notifications.push(format!(
                     "Harvest could not recall your earlier conversations with a store: {why}. \
                      Reload to try again."
@@ -4079,13 +4084,33 @@ impl AppState {
     /// claim, so the store's recall would skip it. Drop both, so it is asked
     /// again and filed with the store. A claim in flight is left to answer,
     /// and its answer is now filed with the store.
+    ///
+    /// The entry itself is left alone: it may be more than a placeholder
+    /// (a store being browsed, a mailbox registered under that id), so only
+    /// its conversations move (harvest#138 review, round 2).
     fn adopt_placeholder_for(&mut self, earlier: &[u8]) {
-        let placeholder = self
+        let current = self.recall_files_under(earlier);
+        let moved: Vec<crate::messaging::BuyerConversation> = self
             .browsing_stores
-            .get(earlier)
-            .is_some_and(|s| s.info.is_none() && s.owner.is_none());
-        if placeholder {
-            self.browsing_stores.remove(earlier);
+            .get_mut(earlier)
+            .map(|entry| std::mem::take(&mut entry.conversations))
+            .unwrap_or_default();
+        if !moved.is_empty() {
+            let store = self.browsing_stores.entry(current).or_default();
+            for mut conversation in moved {
+                if store
+                    .conversations
+                    .iter()
+                    .any(|held| held.buyer_public_key == conversation.buyer_public_key)
+                {
+                    continue;
+                }
+                conversation.kept_under = Some(earlier.to_vec());
+                store.conversations.push(conversation);
+            }
+            store
+                .conversations
+                .sort_by_key(|held| (held.created_at, held.buyer_public_key));
         }
         let in_flight = self
             .pending_conversation_recalls
@@ -4262,6 +4287,7 @@ impl AppState {
         // Kept under an earlier generation's id: shown with the store's
         // current one, and remembered as kept under the id asked about.
         let filed_under = self.recall_files_under(&asked);
+        self.recall_failure_announced.remove(&filed_under);
         let kept_under = (filed_under != asked).then(|| asked.clone());
         let store_contract_id = filed_under.as_slice();
         if conversations.is_empty() {
@@ -23868,13 +23894,29 @@ mod store_rekey_recall_tests {
         answer(&mut state, &old, vec![recalled(5)]);
         assert!(state.browsing_stores.contains_key(&old), "the placeholder");
 
+        // The entry under the old id may be more than a placeholder (a
+        // mailbox registered there, say): it stays, and only its
+        // conversations move.
+        state
+            .browsing_stores
+            .get_mut(&old)
+            .unwrap()
+            .mailbox_contract_id = Some(vec![0x6d; 32]);
         state.note_store_code(current(), params().code().to_string());
         state.recall_buyer_conversations(&current());
-        assert!(!state.browsing_stores.contains_key(&old), "adopted");
-        answer(&mut state, &old, vec![recalled(5)]);
+        let entry = &state.browsing_stores[&old];
+        assert!(entry.conversations.is_empty(), "moved to the store");
+        assert_eq!(
+            entry.mailbox_contract_id,
+            Some(vec![0x6d; 32]),
+            "and nothing else touched"
+        );
         let store = &state.browsing_stores[&current()];
         assert_eq!(store.conversations.len(), 1);
-        assert_eq!(store.conversations[0].kept_under, Some(old));
+        assert_eq!(store.conversations[0].kept_under, Some(old.clone()));
+        // Asked again, filed with the store, not doubled.
+        answer(&mut state, &old, vec![recalled(5)]);
+        assert_eq!(state.browsing_stores[&current()].conversations.len(), 1);
     }
 
     /// Restored AFTER the store was opened: filed with the store directly.

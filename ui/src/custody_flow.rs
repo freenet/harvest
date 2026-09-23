@@ -220,7 +220,18 @@ impl AppState {
         let key = owner.to_bytes();
         let unheld_and_ours =
             self.store_owner_key(store_contract_id) == Some(owner) && !self.holds_store_key(&key);
-        if !unheld_and_ours || self.pending_custody.contains_key(&key) {
+        let closed = self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|s| s.closed);
+        if !unheld_and_ours || closed || self.pending_custody.contains_key(&key) {
+            return;
+        }
+        // Only when there is NOTHING to recover from here. A copy under a
+        // connected backer that was already tried this session (declined,
+        // timed out, refused) has its own message, and "connect the Ghost
+        // Key" would be wrong advice for it (harvest#138 review, round 2).
+        if self.a_connected_backer_has_a_copy(store_contract_id) {
             return;
         }
         if !self.store_key_unheld_announced.insert(key) {
@@ -229,11 +240,39 @@ impl AppState {
         self.notifications.push(
             "This device does not hold your store's key, so it cannot sign anything for the \
              store (despatch, cancel, invoices, listings). It is recovered from the backup \
-             wrapped to the Ghost Key that backs the store, once that Ghost Key is connected \
-             here; if no device ever made that backup, publish from the device that holds the \
-             key."
+             wrapped to a Ghost Key that backs the store, once that Ghost Key is connected \
+             here. If no device ever made that backup, this device cannot sign for the store."
                 .into(),
         );
+    }
+
+    /// Whether a connected Ghost Key that backs the store (and is not
+    /// retired) has a copy of its key under the current scope, whether or not
+    /// it was tried this session.
+    fn a_connected_backer_has_a_copy(&self, store_contract_id: &[u8]) -> bool {
+        let Some(state) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .map(|s| &s.backing_state)
+        else {
+            return false;
+        };
+        let scope = WrapScope::current();
+        state
+            .backings
+            .records
+            .values()
+            .map(|b| b.statement.backer)
+            .filter(|b| {
+                !state
+                    .retirements
+                    .records
+                    .contains_key(&harvest_common::store::Bytes32(b.to_bytes()))
+            })
+            .any(|backer| {
+                copy_for(state, &backer, &scope).is_some()
+                    && self.connected_fingerprint(&backer.to_bytes()).is_some()
+            })
     }
 
     /// A custody request could not be SENT. Give it up, and let it be tried
@@ -556,15 +595,6 @@ impl AppState {
         if result.is_ok() {
             self.store_keys_held.insert(store, true);
         }
-        let Some(pending) = self.take_custody_answering(&store, request_id) else {
-            return;
-        };
-        if let Err(why) = result {
-            self.notifications.push(format!(
-                "Your store's key could not be recovered from your Ghost Key: {why}"
-            ));
-            return;
-        }
         // Matched by KEY, not by the contract id the request named: a store
         // migration can rewrite the registration's contract id while the
         // vault prompt is open (harvest#138 review).
@@ -573,6 +603,21 @@ impl AppState {
             .values()
             .flatten()
             .any(|s| s.store_verifying_key == Some(store));
+        let pending = self.take_custody_answering(&store, request_id);
+        // A late success for a registered store still needs the follow-up
+        // below: its buyers' messages are unreadable until it runs (round 2).
+        let late_success_for_a_registered_store = pending.is_none() && registered && result.is_ok();
+        let pending = match pending {
+            Some(pending) => Some(pending),
+            None if late_success_for_a_registered_store => None,
+            None => return,
+        };
+        if let Err(why) = result {
+            self.notifications.push(format!(
+                "Your store's key could not be recovered from your Ghost Key: {why}"
+            ));
+            return;
+        }
         if registered {
             // The registration came across a delegate re-key and only the key
             // did not (harvest#138). It already names this store's own
@@ -598,6 +643,9 @@ impl AppState {
             }
             return;
         }
+        let Some(pending) = pending else {
+            return;
+        };
         let Some(registration) = self.recovered_registration(&pending, store) else {
             self.notifications.push(
                 "Your store's key was recovered, but the store could not be registered on this \
@@ -1437,12 +1485,47 @@ mod tests {
         state.on_delegate_response(store_list_holding(Vec::new()));
         state.pending_custody.clear();
         state.custody_started_ms.clear();
+        state.store_subkeys_requested.clear();
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
             request_id: 77,
             store_verifying_key: store_vk().to_bytes(),
             result: Ok(()),
         });
         assert!(state.holds_store_key(&store_vk().to_bytes()));
+        // And the follow-up a matched answer gets still runs (round 2).
+        assert!(state
+            .store_subkeys_requested
+            .contains(&store_vk().to_bytes()));
+    }
+
+    /// A recovery that was tried and failed, with the copy there and the
+    /// backer connected, is not told to "connect the Ghost Key": it has its
+    /// own message (harvest#138 review, round 2). Mutated red by ignoring
+    /// whether a connected backer has a copy.
+    #[test]
+    fn a_failed_recovery_is_not_called_unrecoverable() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        sent_under(&mut state, store_vk().to_bytes(), 0);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Err("the vault refused".into()),
+        });
+        state.start_custody_where_needed();
+        assert!(
+            !state
+                .notifications
+                .iter()
+                .any(|n| n.contains("does not hold your store's key")),
+            "{:?}",
+            state.notifications
+        );
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("could not be recovered")));
     }
 
     /// The registration is found by its KEY: a store migration that rewrote
