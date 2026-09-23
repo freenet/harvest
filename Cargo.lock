@@ -1951,7 +1951,7 @@ dependencies = [
  "rsa 0.9.10",
  "serde",
  "serde_bytes",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "x25519-dalek",
  "zeroize",
 ]
@@ -1976,7 +1976,7 @@ dependencies = [
  "ripemd",
  "rsa 0.9.10",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "x25519-dalek",
 ]
 
