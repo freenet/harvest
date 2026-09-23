@@ -240,9 +240,10 @@ pub fn watch_due(
 pub struct WatchWanted {
     pub network: BitcoinNetwork,
     pub script: Vec<u8>,
-    /// The height the order was anchored at. No payment to a freshly derived
-    /// address can predate it, so it is sent as the height the bridge may start
-    /// scanning from.
+    /// The height the order was anchored at (for a script several orders pay
+    /// to, the earliest of their anchors: see `AppState::watches_wanted`). No
+    /// payment to a freshly derived address can predate it, so it is sent as
+    /// the height the bridge may start scanning from.
     ///
     /// Only a hint. The bridge this was written against ignores it and starts a
     /// new watch at its next scan (freenet-bitcoin#7), so a payment mined

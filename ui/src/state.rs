@@ -12027,8 +12027,29 @@ impl AppState {
         // see [`WATCHES_PER_GHOSTKEY`].
         for (_, _, wanted) in &mut groups {
             wanted.sort_by_key(|w| std::cmp::Reverse(w.anchor_height));
-            let mut seen = std::collections::HashSet::new();
-            wanted.retain(|w| seen.insert((w.network, w.script.clone())));
+            // The entry kept for a reused script takes the EARLIEST anchor
+            // of the orders paying to it: the anchor is sent as the height
+            // the bridge may start scanning from, and the older order's
+            // payment can be no earlier than its own anchor, not the newer's.
+            let mut first: std::collections::HashMap<(BitcoinNetwork, Vec<u8>), usize> =
+                std::collections::HashMap::new();
+            let mut kept: Vec<crate::bitcoin_inbox::WatchWanted> = Vec::new();
+            for w in wanted.drain(..) {
+                match first.get(&(w.network, w.script.clone())) {
+                    Some(&at) => {
+                        let held = &mut kept[at].anchor_height;
+                        *held = match (*held, w.anchor_height) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                    None => {
+                        first.insert((w.network, w.script.clone()), kept.len());
+                        kept.push(w);
+                    }
+                }
+            }
+            *wanted = kept;
             wanted.truncate(WATCHES_PER_GHOSTKEY);
         }
         groups
@@ -24527,7 +24548,8 @@ mod buy_flow_tests {
     /// the budget a seller with a fortnight of unpaid invoices would have the
     /// fresh one refused. Red with the truncation removed, with the
     /// cross-store sort removed (the second store's newest would be cut), and
-    /// with the de-duplication removed (a reused address spends two places).
+    /// with the de-duplication removed (a reused address spends two places),
+    /// and with the kept entry's anchor left at the newer order's.
     #[test]
     fn past_the_per_key_budget_the_newest_orders_are_watched() {
         use crate::state::WATCHES_PER_GHOSTKEY;
@@ -24590,6 +24612,17 @@ mod buy_flow_tests {
             scripts.len(),
             WATCHES_PER_GHOSTKEY,
             "every place is a distinct script: the reused address took one"
+        );
+        let reused_script = on_its_own_address(11).order.payment_script_pubkey;
+        let reused_entry = wanted[0]
+            .2
+            .iter()
+            .find(|w| w.script == reused_script)
+            .expect("the reused address is watched");
+        assert_eq!(
+            reused_entry.anchor_height,
+            Some(TIP_HEIGHT - 12),
+            "a reused address is scanned from its EARLIER order's anchor"
         );
         assert!(
             !heights.contains(&Some(TIP_HEIGHT - (WATCHES_PER_GHOSTKEY as u32 + 10))),
