@@ -4095,6 +4095,19 @@ impl AppState {
             .get_mut(earlier)
             .map(|entry| std::mem::take(&mut entry.conversations))
             .unwrap_or_default();
+        // A bare placeholder -- nothing but the conversations just moved --
+        // is dropped; anything more is left.
+        let bare = self.active_store_id.as_deref() != Some(earlier)
+            && self.browsing_stores.get(earlier).is_some_and(|e| {
+                e.info.is_none()
+                    && e.owner.is_none()
+                    && e.mailbox_contract_id.is_none()
+                    && e.mailbox_messages.is_empty()
+                    && e.sent_messages.is_empty()
+            });
+        if bare {
+            self.browsing_stores.remove(earlier);
+        }
         if !moved.is_empty() {
             let store = self.browsing_stores.entry(current).or_default();
             for mut conversation in moved {
@@ -23894,9 +23907,15 @@ mod store_rekey_recall_tests {
         answer(&mut state, &old, vec![recalled(5)]);
         assert!(state.browsing_stores.contains_key(&old), "the placeholder");
 
-        // The entry under the old id may be more than a placeholder (a
-        // mailbox registered there, say): it stays, and only its
-        // conversations move.
+        // A bare placeholder is dropped on adoption...
+        let mut bare = state.clone();
+        bare.note_store_code(current(), params().code().to_string());
+        bare.recall_buyer_conversations(&current());
+        assert!(!bare.browsing_stores.contains_key(&old));
+        assert_eq!(bare.browsing_stores[&current()].conversations.len(), 1);
+
+        // ...but one that is more than a placeholder (a mailbox registered
+        // there, say) stays, and only its conversations move.
         state
             .browsing_stores
             .get_mut(&old)

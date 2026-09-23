@@ -603,10 +603,15 @@ impl AppState {
             .values()
             .flatten()
             .any(|s| s.store_verifying_key == Some(store));
+        // Taken before the answer is matched: a mismatched answer while a
+        // DIFFERENT attempt is live leaves that attempt to report (round 3).
+        let another_attempt_live = self.pending_custody.contains_key(&store);
         let pending = self.take_custody_answering(&store, request_id);
         // A late success for a registered store still needs the follow-up
         // below: its buyers' messages are unreadable until it runs (round 2).
-        let late_success_for_a_registered_store = pending.is_none() && registered && result.is_ok();
+        // Only when no attempt is live: one that is will say it itself.
+        let late_success_for_a_registered_store =
+            pending.is_none() && !another_attempt_live && registered && result.is_ok();
         let pending = match pending {
             Some(pending) => Some(pending),
             None if late_success_for_a_registered_store => None,
@@ -643,6 +648,8 @@ impl AppState {
             }
             return;
         }
+        // Not registered: only a matched answer gets here (a late one returned
+        // above), and rebuilding the registration needs its request.
         let Some(pending) = pending else {
             return;
         };
@@ -1483,6 +1490,24 @@ mod tests {
         let mut state = backed_store();
         add_copy(&mut state, WrapScope::current());
         state.on_delegate_response(store_list_holding(Vec::new()));
+        // A late answer while a DIFFERENT attempt is live leaves it alone.
+        state
+            .pending_custody
+            .get_mut(&store_vk().to_bytes())
+            .expect("an attempt is live")
+            .request_id = Some(5);
+        let said_before = state.notifications.len();
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 77,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        assert!(state.pending_custody.contains_key(&store_vk().to_bytes()));
+        assert_eq!(
+            state.notifications.len(),
+            said_before,
+            "the live attempt reports"
+        );
         state.pending_custody.clear();
         state.custody_started_ms.clear();
         state.store_subkeys_requested.clear();
