@@ -20,6 +20,10 @@
 //! Usage:
 //!   delegate seed  <ws-url-with-authToken> <delegate.wasm> <out.json>
 //!   delegate check <ws-url-with-authToken> <delegate.wasm> <seeded.json> <predecessor-key-hex>
+//!   delegate answers <ws-url-with-authToken> <delegate.wasm> <generation-number>
+//!     (whether that generation, registered, answers the walk's probe and
+//!      export with a message -- what the app's reading of an empty answer as
+//!      "not registered" rests on, harvest#150)
 //!   delegate touch <ws-url-with-authToken> <delegate.wasm>
 //!     (touch: register the delegate and give it a remembered store and a
 //!      store registration of its own, for the populated-successor scenario)
@@ -131,6 +135,35 @@ impl Node {
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => panic!("node error: {e}"),
+            }
+        }
+    }
+
+    /// Send one message and say what shape the node's answer took, without
+    /// judging it: a message, an answer holding none, or an error.
+    async fn ask_shape(&mut self, key: &DelegateKey, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.api
+            .send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+                key: key.clone(),
+                params: Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload))],
+            }))
+            .await
+            .expect("send delegate message");
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), self.api.recv()).await {
+                Err(_) => return Err("no answer within 20s".into()),
+                Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                    return values
+                        .into_iter()
+                        .find_map(|value| match value {
+                            OutboundDelegateMsg::ApplicationMessage(msg) => Some(msg.payload),
+                            _ => None,
+                        })
+                        .ok_or_else(|| "an answer holding no message".to_string());
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(format!("node error: {e}")),
             }
         }
     }
@@ -283,6 +316,52 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
 
 fn freenet_bitcoin_common_network() -> freenet_bitcoin_common::BitcoinNetwork {
     freenet_bitcoin_common::BitcoinNetwork::Signet
+}
+
+/// Whether a registered generation answers the walk's two predecessor calls
+/// (the `ListStores` probe and `ExportSecrets`) with a MESSAGE on this node.
+///
+/// The app reads an empty answer to either as "this node never registered
+/// that generation" (harvest#150), because that is how a `freenet network`
+/// node says it. That is sound only if every generation it walks, when
+/// registered, answers with a message -- on the node users run today, not
+/// the one it was built against. This is that check.
+async fn answers(url: &str, wasm: &[u8], generation: u32) {
+    let mut node = Node::connect(url).await;
+    let key = node.register(wasm).await;
+    let probe = node
+        .ask_shape(
+            &key,
+            harvest_common::to_cbor(&HarvestDelegateRequest::ListStores { ghostkey_fingerprint: String::new() }).unwrap(),
+        )
+        .await;
+    let export = node
+        .ask_shape(
+            &key,
+            harvest_common::to_cbor(&harvest_common::migration::HarvestMigrationRequest::ExportSecrets {
+                source_generation: generation,
+            })
+            .unwrap(),
+        )
+        .await
+        .and_then(|payload| {
+            freenet_migrate::ExportedSecrets::from_bytes(&payload)
+                .map(|exported| exported.source_generation)
+                .map_err(|e| format!("a message that is not an export: {e:?}"))
+        });
+    match &probe {
+        Ok(_) => println!("V{generation} probe: a message"),
+        Err(e) => println!("V{generation} probe: {e}"),
+    }
+    match &export {
+        Ok(g) => println!("V{generation} export: an export from V{g}"),
+        Err(e) => println!("V{generation} export: {e}"),
+    }
+    if probe.is_err() || export.as_ref().map_or(true, |g| *g != generation) {
+        println!("V{generation} ANSWERS: NO");
+        std::process::exit(1);
+    }
+    println!("V{generation} ANSWERS: yes");
 }
 
 async fn touch(url: &str, wasm: &[u8]) {
@@ -611,6 +690,9 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("seed") => seed(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("touch") => touch(&args[2], &std::fs::read(&args[3]).unwrap()).await,
+        Some("answers") => {
+            answers(&args[2], &std::fs::read(&args[3]).unwrap(), args[4].parse().expect("a generation number")).await
+        }
         Some("check") => check(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         Some("seed-store") => seed_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("check-store") => check_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,

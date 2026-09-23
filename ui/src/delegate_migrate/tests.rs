@@ -357,6 +357,30 @@ fn only_a_predecessor_call_reads_an_empty_answer_as_missing() {
     }
 }
 
+/// And only from the delegate the call is waiting on: an empty answer from
+/// any other delegate (the current one, another predecessor) leaves the call
+/// waiting. The transport's `offer_empty` is this decision plus the slot.
+/// Mutated red by dropping the key comparison.
+#[test]
+fn an_empty_answer_from_another_delegate_is_not_taken() {
+    let waiting = key(generation(21));
+    for expect in [Expect::AnyFrom, Expect::Export] {
+        assert_eq!(
+            expect.take_empty_answer(&waiting, &waiting),
+            Some(Reply::Missing)
+        );
+        assert_eq!(expect.take_empty_answer(&waiting, &key(CURRENT)), None);
+        assert_eq!(
+            expect.take_empty_answer(&waiting, &key(generation(20))),
+            None
+        );
+    }
+    assert_eq!(
+        Expect::PredecessorMarker([1; 32]).take_empty_answer(&key(CURRENT), &key(CURRENT)),
+        None
+    );
+}
+
 /// The newest generation's value wins a key two generations share, because
 /// they are offered newest first and the current delegate never overwrites.
 #[test]

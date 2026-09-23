@@ -39,10 +39,14 @@
 #   newest:   the newest predecessor holds the data (the common upgrade); every
 #             older generation is unregistered and must not stop the walk.
 #
-# In both the walk must report the seeded generation `imported`, must not say
-# "stopped" or "current delegate unavailable", and the current delegate must
-# then answer every seeded secret value for value and hold the seeded
-# generation sealed `Done`.
+# In both the walk must report the seeded generation `imported`, must reach a
+# verdict on every generation (no "stopped", "current delegate unavailable",
+# "incomplete", or "did not reach every generation"), and the current
+# delegate must then answer every seeded secret value for value and hold the
+# seeded generation sealed `Done`.
+#
+# First, on its own node: every generation from V5, registered, answers the
+# walk's two predecessor calls with a message (see `answers_all`).
 set -euo pipefail
 
 NEWUI=$(readlink -f "$1")
@@ -53,7 +57,8 @@ PORT=${REHEARSAL_WS_PORT:-7697}
 NETPORT=${REHEARSAL_NET_PORT:-31697}
 CONTAINER=$(cat "$REPO/published-contract/contract-id.txt")
 HARNESS=$HERE/target/debug/delegate
-[ -x "$HARNESS" ] || (cd "$HERE" && cargo build --bin delegate)
+# Always (incremental, so cheap): a stale binary would check an old harness.
+(cd "$HERE" && cargo build --quiet --bin delegate)
 mkdir -p "$WORK"
 
 # Oldest first, as the registry lists them: "V<n> <code_hash> <delegate_key>".
@@ -88,14 +93,18 @@ start_node() {
   local d=$1
   rm -rf "$d"; mkdir -p "$d"/{config,data,log,cache}
   if ss -ltn | grep -q "127.0.0.1:$PORT "; then echo "port $PORT is in use" >&2; exit 1; fi
-  FREENET_WEBAPP_CACHE_DIR=$d/cache setsid freenet network --is-gateway --skip-load-from-network \
+  # No `setsid`: in a script (no job control) the background child is the
+  # node itself, so `$!` is its pid from the start, and a node that never
+  # binds is still stopped by the EXIT trap rather than left running.
+  FREENET_WEBAPP_CACHE_DIR=$d/cache freenet network --is-gateway --skip-load-from-network \
     --disable-auto-update --public-network-address 127.0.0.1 --public-network-port "$NETPORT" \
     --network-port "$NETPORT" --ws-api-address 127.0.0.1 --ws-api-port "$PORT" \
     --config-dir "$d/config" --data-dir "$d/data" --log-dir "$d/log" > "$d/stdout.log" 2>&1 < /dev/null &
-  for _ in $(seq 1 60); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 1; done
-  # The pid that owns the socket, not `$!`: setsid may fork.
-  NODE_PID=$(ss -ltnp | grep "127.0.0.1:$PORT " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
-  [ -n "$NODE_PID" ] || { echo "the node did not start (see $d/stdout.log)" >&2; exit 1; }
+  NODE_PID=$!
+  for _ in $(seq 1 90); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 1; done
+  local owner
+  owner=$(ss -ltnp | grep "127.0.0.1:$PORT " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  [ "$owner" = "$NODE_PID" ] || { echo "the node did not start, or port $PORT is not ours (see $d/stdout.log)" >&2; exit 1; }
   echo "   node pid $NODE_PID, network mode, gateway isolated"
 }
 
@@ -126,9 +135,10 @@ scenario() {
   echo "   ${walk:-(no walk line)}"
   local ok=1
   [ -n "$walk" ] || ok=0
-  grep -qE "$gen: imported [1-9]" <<< "$walk" || { echo "   FAIL: $gen was not imported"; ok=0; }
-  if grep -qE "stopped|current delegate unavailable" <<< "$walk"; then
-    echo "   FAIL: the walk stopped before reaching every generation"; ok=0
+  grep -qE "(: |, )$gen: imported [1-9]" <<< "$walk" || { echo "   FAIL: $gen was not imported"; ok=0; }
+  if grep -qE "stopped|current delegate unavailable|incomplete" <<< "$walk" \
+      || grep -q "did not reach every generation" "$d/load.log"; then
+    echo "   FAIL: the walk did not reach a verdict on every generation"; ok=0
   fi
   if "$HARNESS" check "$URL&authToken=$(token)" "$NEWUI/harvest_delegate.wasm" "$d/seeded.json" "$key" \
       > "$d/check.txt" 2>&1; then
@@ -144,7 +154,31 @@ scenario() {
   if [ "$ok" = 1 ]; then echo "   PASS"; else FAILED=1; fi
 }
 
+# Every generation the walk asks (V5 on), registered on today's node, must
+# answer both predecessor calls with a message: the app reads an empty answer
+# as "not registered", which is right only if a registered one never gives
+# one. A generation that no longer runs on this node fails here too.
+answers_all() {
+  local d=$WORK/answers row v code key n
+  echo "== every exporting generation answers the probe and the export with a message"
+  start_node "$d/node"
+  publish_ui || { echo "   FAIL: could not publish the UI under test"; FAILED=1; stop_node; return; }
+  for row in "${ROWS[@]}"; do
+    read -r v code key <<< "$row"
+    n=${v#V}
+    [ "$n" -ge 5 ] || continue
+    wasm_by_hash "$code" "$d/$v.wasm"
+    if "$HARNESS" answers "$URL&authToken=$(token)" "$d/$v.wasm" "$n" > "$d/$v.txt" 2>&1; then
+      echo "   $v: yes"
+    else
+      echo "   FAIL: $(grep -E "probe:|export:|panicked" "$d/$v.txt" | tr '\n' ' ')"; FAILED=1
+    fi
+  done
+  stop_node
+}
+
 echo "== build under test: delegate $(b3sum --no-names "$NEWUI/harvest_delegate.wasm" | cut -c1-8)"
+answers_all
 scenario skipped "${SECOND[0]}" "${SECOND[1]}" "${SECOND[2]}"
 scenario newest "${NEWEST[0]}" "${NEWEST[1]}" "${NEWEST[2]}"
 if [ "$FAILED" = 0 ]; then echo "DELEGATE REHEARSAL PASSED"; else echo "DELEGATE REHEARSAL FAILED"; exit 1; fi

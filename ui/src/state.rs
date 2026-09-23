@@ -3537,17 +3537,36 @@ impl AppState {
             }
         }
 
-        // The routing table, before the re-route reads it. A superseded
-        // mailbox leaves it: its successor takes its place below. A
-        // superseded store keeps its mailboxes, under the successor's id.
+        // The routing table, before the re-route reads it. Every entry the
+        // move touches leaves it and is claimed afresh by `route_own_store`
+        // below: a superseded mailbox because its successor takes its place,
+        // and one owned by a superseded store because the fresh claim is what
+        // re-reads the mailbox under the successor store and gives it a new
+        // subscribe retry budget. A repoint in place did neither: the
+        // mailbox's messages, usually already fetched under the predecessor
+        // (a node-local read beats the forward PUT this waits for), stayed
+        // where the inbox no longer looks, and a subscribe retry still
+        // running for the predecessor store found the mapping gone and gave
+        // up in silence (#151 review, round 1).
         self.mailbox_to_store.remove(predecessor);
-        for owner in self.mailbox_to_store.values_mut() {
-            if owner.as_slice() == predecessor {
-                *owner = successor.clone();
-            }
-        }
+        self.mailbox_to_store
+            .retain(|_, owner| owner.as_slice() != predecessor);
+        // What the predecessor store already holds is shown at once rather
+        // than after the re-read, when the successor holds nothing yet.
+        let carried = self
+            .browsing_stores
+            .get(predecessor)
+            .map(|store| store.mailbox_messages.clone())
+            .unwrap_or_default();
         for (store, mailbox) in rerouted {
+            if store == successor && !carried.is_empty() {
+                let entry = self.browsing_stores.entry(store.clone()).or_default();
+                if entry.mailbox_messages.is_empty() {
+                    entry.mailbox_messages = carried.clone();
+                }
+            }
             self.route_own_store(&store, &mailbox);
+            self.ask_for_conversation_keys(&store);
         }
     }
 
@@ -8656,6 +8675,13 @@ impl AppState {
     /// button that read only this store, and pressing it would have signed a
     /// second despatch of the same order (harvest#150). One source for the
     /// words and the control keeps them in step.
+    ///
+    /// The residual: a despatch that exists ONLY in a predecessor
+    /// generation, written there after the migration's last forward (a stale
+    /// tab of an old UI), hides the control while buyers, who read the
+    /// current store, never see it. Carrying it forward is the migration's
+    /// job, not this control's; offering a second despatch instead would
+    /// publish two for one order.
     pub fn despatch_recorded(
         &self,
         store_contract_id: &[u8],
@@ -12969,11 +12995,31 @@ mod tests {
     }
 
     /// A store that moved while its mailbox did not keeps its mailbox,
-    /// under the successor's id, and its record of the mailbox follows.
+    /// under the successor's id, and its record of the mailbox follows. The
+    /// messages already fetched come with it: the seller's own mailbox is a
+    /// node-local read, so it usually lands under the predecessor before the
+    /// adopt, and the inbox reads the successor (#151 review, round 1: red
+    /// with the carry removed). The mailbox is claimed afresh, so its retry
+    /// budget is its own again.
     #[test]
     fn a_store_migration_alone_keeps_its_mailbox_routed() {
         let mut state = AppState::default();
         state.on_delegate_response(store_list(vec![registration(1, None)]));
+        let message = EncryptedMessage {
+            conversation_id: harvest_common::mailbox::ConversationId([0x5a; 32]),
+            sender_public_key: vec![0x5d; 32],
+            ciphertext: vec![0x5c; 48],
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a time"),
+            nonce: [0x5b; 24],
+        };
+        state
+            .browsing_stores
+            .get_mut(&vec![1u8; 32])
+            .expect("routed by the store list")
+            .mailbox_messages = vec![message.clone()];
+        state
+            .mailbox_subscribe_failures
+            .insert(vec![3u8; 32], MAX_MAILBOX_SUBSCRIBE_ATTEMPTS - 1);
 
         state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
 
@@ -12982,6 +13028,46 @@ mod tests {
             state.browsing_stores[&vec![9u8; 32]].mailbox_contract_id,
             Some(vec![3u8; 32])
         );
+        assert_eq!(
+            state.browsing_stores[&vec![9u8; 32]].mailbox_messages,
+            vec![message],
+            "the inbox reads the successor store"
+        );
+        assert!(
+            !state
+                .mailbox_subscribe_failures
+                .contains_key(&vec![3u8; 32]),
+            "a fresh claim, with a fresh retry budget"
+        );
+    }
+
+    /// Two stores under one Ghost Key, only one of which moved: the other's
+    /// routing is untouched, and nothing is cross-wired between them.
+    #[test]
+    fn a_migration_of_one_store_leaves_another_stores_routing_alone() {
+        let mut state = AppState::default();
+        state.on_delegate_response(store_list(vec![
+            registration(1, None),
+            registration(20, None),
+        ]));
+        state.adopt_migrated_contract_id(&[1u8; 32], vec![9u8; 32]);
+        state.adopt_migrated_contract_id(&[3u8; 32], vec![11u8; 32]);
+
+        assert_routed_to_successor(&state, "two stores");
+        assert_eq!(state.mailbox_to_store[&vec![22u8; 32]], vec![20u8; 32]);
+        assert_eq!(
+            state.browsing_stores[&vec![20u8; 32]].mailbox_contract_id,
+            Some(vec![22u8; 32])
+        );
+        assert_eq!(state.mailbox_to_store.len(), 2);
+
+        // And a later StoreList (stale ids for store 1) changes nothing.
+        state.on_delegate_response(store_list(vec![
+            registration(1, None),
+            registration(20, None),
+        ]));
+        assert_routed_to_successor(&state, "two stores, after a second StoreList");
+        assert_eq!(state.mailbox_to_store.len(), 2);
     }
 
     /// The converse: the repoint must not become a permanent veto on the

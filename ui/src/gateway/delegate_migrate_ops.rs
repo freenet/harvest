@@ -181,8 +181,7 @@ pub fn offer_empty(delegate: &DelegateKey) -> bool {
         let mut slot = w.borrow_mut();
         let Some(reply) = slot
             .as_ref()
-            .filter(|waiter| &waiter.delegate == delegate)
-            .and_then(|waiter| waiter.expect.reply_to_empty_answer())
+            .and_then(|waiter| waiter.expect.take_empty_answer(&waiter.delegate, delegate))
         else {
             return false;
         };
