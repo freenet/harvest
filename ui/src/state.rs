@@ -647,13 +647,13 @@ pub struct AppState {
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
 
-    /// Listing statuses the store key has signed, with the store each is for.
-    /// Filled only off wasm, where nothing publishes them, so a test can see
-    /// what would have been sent (harvest#70).
     /// Remembered stores My purchases is loading in the background: GET out,
     /// state not yet arrived. See `store_link::load_remembered_store`.
     pub background_loads: HashSet<Vec<u8>>,
 
+    /// Listing statuses the store key has signed, with the store each is for.
+    /// Filled only off wasm, where nothing publishes them, so a test can see
+    /// what would have been sent (harvest#70).
     pub signed_statuses_ready: Vec<(Vec<u8>, harvest_common::listing::AuthorizedListingStatus)>,
 
     /// Listing statuses this session has signed and sent, per (store,
@@ -9770,6 +9770,13 @@ impl AppState {
         if matches!(withdrawn, Some(PendingSignature::BackingAcceptance(_))) {
             self.store_creation_failed(&format!(
                 "the store's key did not accept the backing: {reason}"
+            ));
+            return;
+        }
+        if matches!(withdrawn, Some(PendingSignature::ListingStatus(_))) {
+            self.notifications.push(format!(
+                "{} ({reason})",
+                crate::listing_status_flow::LISTING_STATUS_NOT_SAVED
             ));
             return;
         }
@@ -21246,6 +21253,63 @@ mod buy_flow_tests {
         );
     }
 
+    /// **My store's overview counts the orders a seller must reissue, and
+    /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
+    /// fresh one and a cancelled one do not. Pins the composition in
+    /// `my_store::seller_stores` (seller filter, `needs_reissue`, and
+    /// `order_stage` still `AwaitingPayment`), which no other test reaches.
+    #[test]
+    fn the_overview_counts_only_orders_that_need_reissuing() {
+        let fresh = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT)),
+            OrderStatus::AwaitingPayment,
+        );
+        let expired = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let mut settled = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - MAX_ANCHOR_AGE_BLOCKS - 2)),
+            OrderStatus::AwaitingPayment,
+        );
+        cancel(&mut settled, &seller_signing_key());
+        let fingerprint = expired.order.seller_fingerprint.clone();
+
+        let mut state = AppState::default();
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        state.my_stores.insert(
+            fingerprint,
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![0u8; 32],
+                mailbox_contract_id: vec![0u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(test_store_key()),
+            }],
+        );
+        state.browsing_stores.insert(
+            STORE.to_vec(),
+            BrowsingStore {
+                orders: vec![fresh, expired, settled],
+                ..Default::default()
+            },
+        );
+        let stores = crate::components::my_store::seller_stores(&state);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].expired_invoices, 1);
+        // Read before the record arrives: never a clean reading.
+        assert_eq!(stores[0].record, RecordLoad::Loading.badge(0).1);
+        state.browsing_stores.get_mut(STORE).unwrap().record = RecordLoad::Loaded;
+        let stores = crate::components::my_store::seller_stores(&state);
+        assert_eq!(stores[0].record, "Clean record");
+    }
+
     /// **A seller who cannot see the chain is not told to reissue
     /// everything.**
     ///
@@ -27766,9 +27830,38 @@ mod buy_flow_tests {
         assert_eq!(purchase.commitment.as_ref(), Some(&unpaid));
     }
 
+    /// **My purchases lists a kept purchase once** (harvest#125 review): an
+    /// order a loaded store's purchase card already shows is left out of the
+    /// kept list below it, so a paid order is not shown twice with two
+    /// complaint controls; a kept order no card shows stays listed. Red if
+    /// the kept list ignores `shown`, or `shown` misses the card's orders.
+    #[test]
+    fn my_purchases_lists_a_kept_purchase_once() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state.on_kept_purchases(vec![kept(&unpaid)]);
+        let rows = crate::components::purchases_view::purchase_rows(&state);
+        let shown = crate::components::purchases_view::shown_order_ids(&state, &rows);
+        assert_eq!(shown, vec![unpaid.order.id.clone()], "the card shows it");
+        assert!(
+            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown)
+                .is_empty(),
+            "so the kept list does not"
+        );
+        // A store that is not loaded shows no card, so its kept order stays.
+        state.browsing_stores.remove(STORE);
+        let rows = crate::components::purchases_view::purchase_rows(&state);
+        let shown = crate::components::purchases_view::shown_order_ids(&state, &rows);
+        assert_eq!(
+            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown)
+                .len(),
+            1
+        );
+    }
+
     /// **No view offers a buyer a payment address while `PurchaseNotKept`
     /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
-    /// and not the Payments tab, even for an order that names one of this
+    /// and not the payment diagnostics (the Payments tab until harvest#93
+    /// phase 2), even for an order that names one of this
     /// node's Ghost Keys as its buyer. The seller's own book still shows.
     /// Red if either view lists orders of a store this node does not own.
     #[test]
@@ -27789,10 +27882,10 @@ mod buy_flow_tests {
         assert!(state.invoices_shown(STORE).is_empty(), "store page");
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
-            "Payments tab"
+            "payment diagnostics"
         );
         // Another settled order of the same store is on its public list,
-        // with no address (review round 4, P3), and NOT on the Payments tab,
+        // with no address (review round 4, P3), and NOT on the diagnostics,
         // which lists nothing it cannot check is this buyer's (round 5).
         let mut other = unpaid.clone();
         other.order.amount_sats += 1;
@@ -27812,7 +27905,7 @@ mod buy_flow_tests {
         assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
-            "Payments tab"
+            "payment diagnostics"
         );
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 

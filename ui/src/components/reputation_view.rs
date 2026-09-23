@@ -4,6 +4,7 @@ use harvest_common::reputation::Complaint;
 
 use crate::fulfilment::ComplaintStanding;
 use crate::gateway::APP_STATE;
+use crate::state::RecordLoad;
 
 /// One complaint as a reader sees it: what it says, and how it counts.
 #[derive(Clone, PartialEq)]
@@ -22,27 +23,28 @@ struct ComplaintRow {
 /// (`BrowsingStore::complaint_standings`), so the two cannot disagree.
 #[component]
 pub fn StoreRecord(store_contract_id: Vec<u8>) -> Element {
-    let rows: Vec<ComplaintRow> = APP_STATE
+    let (rows, empty_text): (Vec<ComplaintRow>, String) = APP_STATE
         .read()
         .browsing_stores
         .get(&store_contract_id)
         .map(|store| {
-            store
+            let rows = store
                 .complaint_standings()
                 .map(|(complaint, standing)| ComplaintRow {
                     standing,
                     complaint: complaint.clone(),
                     store_name: None,
                 })
-                .collect()
+                .collect();
+            (rows, empty_record_text(store.record))
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| (Vec::new(), empty_record_text(RecordLoad::Loading)));
     let counted = rows.iter().filter(|r| r.standing.counts()).count();
 
     rsx! {
         div { class: "store-record",
             if rows.is_empty() {
-                p { class: "text-muted", "No complaints." }
+                p { class: "text-muted", "{empty_text}" }
             } else {
                 p { class: "section-count",
                     "{counted} complaint(s) counted, of {rows.len()} on record"
@@ -64,6 +66,17 @@ pub fn StoreRecord(store_contract_id: Vec<u8>) -> Element {
                 "about the orders nobody complained about."
             }
         }
+    }
+}
+
+/// What a record with no complaints to show says. "No complaints" only once
+/// the record has been read; until then, the same words as the store's badge
+/// (`RecordLoad::badge`), so opening the record never turns "Record
+/// unavailable" into a clean reading (review round 1 of #143, P1-5).
+fn empty_record_text(record: RecordLoad) -> String {
+    match record {
+        RecordLoad::Loaded => "No complaints.".to_string(),
+        other => format!("{}.", other.badge(0).1),
     }
 }
 
@@ -109,5 +122,27 @@ pub(crate) fn category_label(category: &FeedbackCategory) -> &'static str {
         FeedbackCategory::NonDelivery => "Not delivered",
         FeedbackCategory::Misrepresented => "Not as described",
         FeedbackCategory::Counterfeit => "Counterfeit",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opening an unread record never reads as clean: only a loaded record
+    /// with nothing in it says "No complaints". Red if the empty text ignores
+    /// the load state.
+    #[test]
+    fn an_unread_record_is_not_called_clean() {
+        assert_eq!(empty_record_text(RecordLoad::Loaded), "No complaints.");
+        for unread in [
+            RecordLoad::Loading,
+            RecordLoad::NotFound,
+            RecordLoad::Unavailable,
+        ] {
+            let text = empty_record_text(unread);
+            assert!(!text.contains("No complaints"), "{unread:?}: {text}");
+            assert_eq!(text, format!("{}.", unread.badge(0).1));
+        }
     }
 }

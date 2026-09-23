@@ -61,6 +61,20 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
     let mut adding = use_signal(|| false);
     let mut editing = use_signal(|| Option::<ListingId>::None);
     let mut show_taken_down = use_signal(|| false);
+    // "Saving" is judged against the clock (`listing_status_pending_at`),
+    // which is read only when this renders. Re-render every few seconds, so a
+    // row whose echo never came leaves "Saving" when its window ends, not at
+    // the next unrelated change (harvest#125 review).
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
 
     let (resolved, mut rows) = {
         let state = APP_STATE.read();

@@ -765,9 +765,19 @@ fn rsa_generation_id(code_hash: &[u8; 32], der: &[u8]) -> ContractInstanceId {
 }
 
 /// The superseded store-key generations (V16 on), newest first, each at the
-/// address it was published at for `store_vk()`.
+/// address it was published at for `store_vk()`: derived here with the field
+/// set V16 shipped with, independently of `reputation_params`, so a change to
+/// `ReputationParameters` that the migration does not split for turns these
+/// tests red rather than agreeing with itself (harvest#125 review).
 fn store_key_generation_ids() -> Vec<ContractInstanceId> {
-    let params = encode_params(&reputation_params(&store_vk())).unwrap();
+    #[derive(serde::Serialize)]
+    struct V16 {
+        store_key: VerifyingKey,
+    }
+    let params = encode_params(&V16 {
+        store_key: store_vk(),
+    })
+    .unwrap();
     let mut rows: Vec<_> = reputation_lineage()
         .iter()
         .filter(|e| e.generation > LAST_RSA_REPUTATION_PARAM_GENERATION)

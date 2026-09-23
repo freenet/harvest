@@ -40,14 +40,11 @@ pub fn BitcoinView() -> Element {
     // gets the expanded live-data panel instead of an empty table. Once
     // either appears, the compact status bar plus payments-first layout
     // takes over.
-    let show_first_run = watches_loaded
-        && watches.is_empty()
-        && orders.is_empty()
-        && app_state.kept_purchases.is_empty();
+    let show_first_run = watches_loaded && watches.is_empty() && orders.is_empty();
 
     rsx! {
         div {
-            h2 { "Payments" }
+            h2 { "Bitcoin bridge status" }
 
             div { class: "info-box",
                 p {

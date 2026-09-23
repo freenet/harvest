@@ -39,6 +39,15 @@ use crate::state::{AppState, PendingSignature};
 /// so this is only reached when something went wrong without saying so.
 pub(crate) const SAVING_WINDOW_MS: i64 = 60_000;
 
+/// Said when a listing's availability could not be signed or published. A
+/// listing with no status reads as on sale with no count, so an edited
+/// listing whose carried-over status failed (sold out, or a count) is on sale
+/// until the seller sets it again; the message says so, since the row alone
+/// cannot (harvest#125 review).
+pub(crate) const LISTING_STATUS_NOT_SAVED: &str =
+    "A listing's availability was not saved, so buyers see what the store last had (an edited \
+     listing shows as on sale with no count). Set it again from Listings.";
+
 /// How long an edit's original shows "Saving" while its replacement goes out:
 /// the certificate wait (`LISTING_CERTIFICATE_TIMEOUT_MS`) plus the saving
 /// window, after which every drop path has reported.
@@ -372,7 +381,7 @@ impl AppState {
                     state.on_listing_status_publish_failed(&store_id, &listing, revision);
                     state
                         .notifications
-                        .push(format!("Could not update the listing: {e}"));
+                        .push(format!("{LISTING_STATUS_NOT_SAVED} ({e})"));
                 }
             });
         }

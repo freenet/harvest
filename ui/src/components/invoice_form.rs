@@ -86,9 +86,9 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // would let them invoice it -- is the same trap `publish_store_details`
             // documents at length for the store's version number.
             state.store_details_are_resolved(&store_contract_id),
-            // Only what a buyer can still buy: an invoice for a listing the
-            // seller marked sold out or took down (harvest#70) is one the
-            // storefront no longer offers.
+            // Every listing except those taken down (harvest#70); a sold-out
+            // one stays, marked, so an invoice that expired unpaid for the
+            // last one can be issued again (`issuable_listings`).
             store.map(issuable_listings).unwrap_or_default(),
             store.map(sold_out_ids).unwrap_or_default(),
             mine,

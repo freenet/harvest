@@ -5,7 +5,7 @@ mod invoice_form;
 mod listing_form;
 pub(crate) mod message_view;
 pub(crate) mod my_store;
-mod purchases_view;
+pub(crate) mod purchases_view;
 mod reputation_view;
 mod seller_listings;
 mod store_view;

@@ -75,6 +75,9 @@ pub fn MyPurchases() -> Element {
     let rows = purchase_rows(&APP_STATE.read());
     let loading = !APP_STATE.read().background_loads.is_empty();
     let any_kept = !APP_STATE.read().kept_purchases.is_empty();
+    // The orders the store cards below already show, so the kept list does
+    // not show them a second time.
+    let shown = shown_order_ids(&APP_STATE.read(), &rows);
 
     rsx! {
         div {
@@ -118,9 +121,21 @@ pub fn MyPurchases() -> Element {
             // while its seller stays away, or one nobody hosts, still leaves
             // the buyer these. On this page since the Payments tab became
             // the footer's diagnostics (harvest#93 phase 2).
-            super::buy_view::KeptPurchases {}
+            super::buy_view::KeptPurchases { shown }
         }
     }
+}
+
+/// Every order the store cards on this page show (`AppState::buyer_purchases`
+/// of each row's store).
+pub(crate) fn shown_order_ids(
+    state: &AppState,
+    rows: &[PurchaseRow],
+) -> Vec<harvest_common::payment::OrderId> {
+    rows.iter()
+        .flat_map(|row| state.buyer_purchases(&row.store_contract_id))
+        .map(|purchase| purchase.order_id)
+        .collect()
 }
 
 fn summary(orders: usize, conversations: usize) -> String {

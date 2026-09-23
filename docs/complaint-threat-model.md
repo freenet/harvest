@@ -305,16 +305,18 @@ alone (`kept_complaint_checks`), wherever the control is shown:
 
 - on the purchase card (the store page's, and the same card on My purchases), when the store is
   loaded;
-- in My purchases' list of kept purchases (`KeptPurchases`; the Payments tab's until harvest#93
-  phase 2 moved it), which reads nothing but the
-  kept list, so a store re-keyed while the seller stays away, or one nobody hosts, leaves the
-  control where it was.
+- in My purchases' list of kept purchases (`KeptPurchases`; on the Payments tab until harvest#93
+  phase 2 moved it), which reads nothing but the kept list, so a store re-keyed while the
+  seller stays away, or one nobody hosts, leaves the control where it was. An order a loaded
+  store's card on the same page already shows is left out of this list
+  (`kept_purchases_to_list`), so no order carries two controls.
 
 Two things are read from any loaded store under the same owner key, and neither is required:
 the seller's despatch (without it, the despatch deadline decides when the complaint opens),
 and whether a loaded record already holds this buyer's complaint (without it, the kept
 complaint and the in-flight marker still refuse a second one). The list shows no payment
-address, ever; an unpaid kept order is listed as held and is paid from the store's page (3.1).
+address, ever; an unpaid kept order is listed as held and is paid from its purchase card once
+its store is loaded (3.1).
 
 ## 4. The complaint preconditions: one predicate, checked in three places
 
