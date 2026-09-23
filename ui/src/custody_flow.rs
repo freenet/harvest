@@ -375,11 +375,19 @@ impl AppState {
         for store in &expired {
             let request = self.pending_custody.remove(store);
             self.custody_started_ms.remove(store);
-            // A recovery whose key another attempt already recovered did not
-            // fail in any sense the seller needs to hear (harvest#138 review).
-            let already_recovered =
-                matches!(request.map(|r| r.purpose), Some(CustodyPurpose::Recover(_)))
-                    && self.store_keys_held.get(store) == Some(&true);
+            // A recovery of a REGISTERED store whose key another attempt
+            // already recovered did not fail in any sense the seller needs to
+            // hear (harvest#138 review). An unregistered store is still not
+            // this device's (a late success rebuilds nothing), so it is said,
+            // as in `on_store_key_recovered_inner`.
+            let registered = self
+                .my_stores
+                .values()
+                .flatten()
+                .any(|s| s.store_verifying_key == Some(*store));
+            let already_recovered = registered
+                && matches!(request.map(|r| r.purpose), Some(CustodyPurpose::Recover(_)))
+                && self.store_keys_held.get(store) == Some(&true);
             news |= !already_recovered;
         }
         if news {
@@ -1592,6 +1600,22 @@ mod tests {
             .notifications
             .iter()
             .any(|n| n.contains("could not be recovered")));
+
+        // And the same for a timeout instead of a failure.
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 5);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 77,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        state.expire_custody(u64::MAX);
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("did not finish")));
     }
 
     /// A recovery that was tried and failed, with the copy there and the
