@@ -4097,14 +4097,12 @@ impl AppState {
             .unwrap_or_default();
         // A bare placeholder -- nothing but the conversations just moved --
         // is dropped; anything more is left.
+        // Compared whole, so a field added later counts as "more".
         let bare = self.active_store_id.as_deref() != Some(earlier)
-            && self.browsing_stores.get(earlier).is_some_and(|e| {
-                e.info.is_none()
-                    && e.owner.is_none()
-                    && e.mailbox_contract_id.is_none()
-                    && e.mailbox_messages.is_empty()
-                    && e.sent_messages.is_empty()
-            });
+            && self
+                .browsing_stores
+                .get(earlier)
+                .is_some_and(|e| *e == BrowsingStore::default());
         if bare {
             self.browsing_stores.remove(earlier);
         }

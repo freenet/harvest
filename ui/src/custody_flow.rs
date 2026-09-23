@@ -589,12 +589,6 @@ impl AppState {
         request_id: u64,
         result: Result<(), String>,
     ) {
-        // A success says the delegate now holds the key, whichever request
-        // it answers: a late answer to one `expire_custody` gave up on is
-        // still a key kept (harvest#138 review).
-        if result.is_ok() {
-            self.store_keys_held.insert(store, true);
-        }
         // Matched by KEY, not by the contract id the request named: a store
         // migration can rewrite the registration's contract id while the
         // vault prompt is open (harvest#138 review).
@@ -603,56 +597,37 @@ impl AppState {
             .values()
             .flatten()
             .any(|s| s.store_verifying_key == Some(store));
-        // Taken before the answer is matched: a mismatched answer while a
-        // DIFFERENT attempt is live leaves that attempt to report (round 3).
-        let another_attempt_live = self.pending_custody.contains_key(&store);
-        let pending = self.take_custody_answering(&store, request_id);
-        // A late success for a registered store still needs the follow-up
-        // below: its buyers' messages are unreadable until it runs (round 2).
-        // Only when no attempt is live: one that is will say it itself.
-        let late_success_for_a_registered_store =
-            pending.is_none() && !another_attempt_live && registered && result.is_ok();
-        let pending = match pending {
-            Some(pending) => Some(pending),
-            None if late_success_for_a_registered_store => None,
-            None => return,
+        // What a success MEANS -- the delegate now holds the key -- is acted
+        // on once, on the transition to held, whichever request it answers
+        // and in whatever order the answers of several attempts arrive
+        // (harvest#138 review, rounds 2-4). Tying it to the matched request
+        // instead lost the follow-up for a late answer, or reported it twice
+        // when a second attempt was live.
+        let known_held = self.store_keys_held.get(&store) == Some(&true);
+        if result.is_ok() {
+            self.store_keys_held.insert(store, true);
+            if registered && !known_held {
+                self.after_registered_store_key_recovered(store);
+            }
+        }
+        let Some(pending) = self.take_custody_answering(&store, request_id) else {
+            return;
         };
         if let Err(why) = result {
-            self.notifications.push(format!(
-                "Your store's key could not be recovered from your Ghost Key: {why}"
-            ));
-            return;
-        }
-        if registered {
-            // The registration came across a delegate re-key and only the key
-            // did not (harvest#138). It already names this store's own
-            // contracts, where a registration rebuilt here would derive the
-            // mailbox from the recovering backer (see
-            // `recovered_registration`), so it is kept as it is.
-            self.notifications
-                .push("Recovered your store's key from your Ghost Key.".into());
-            self.request_store_subkeys(store);
-            // Buyers' messages failed to open while the key was missing
-            // (`DeriveConversationKeys` answers an error, which is retried
-            // only on the next mailbox update): ask again now, or a quiet
-            // store's inbox stays unreadable for the session.
-            let ids: Vec<Vec<u8>> = self
-                .my_stores
-                .values()
-                .flatten()
-                .filter(|s| s.store_verifying_key == Some(store))
-                .map(|s| s.store_contract_id.clone())
-                .collect();
-            for id in ids {
-                self.ask_for_conversation_keys(&id);
+            // An attempt that failed after another already recovered the key
+            // is not news, and saying it would be false.
+            if self.store_keys_held.get(&store) != Some(&true) {
+                self.notifications.push(format!(
+                    "Your store's key could not be recovered from your Ghost Key: {why}"
+                ));
             }
             return;
         }
-        // Not registered: only a matched answer gets here (a late one returned
-        // above), and rebuilding the registration needs its request.
-        let Some(pending) = pending else {
+        if registered {
+            // Handled on the transition above; the registration came across a
+            // delegate re-key and is kept as it is.
             return;
-        };
+        }
         let Some(registration) = self.recovered_registration(&pending, store) else {
             self.notifications.push(
                 "Your store's key was recovered, but the store could not be registered on this \
@@ -678,6 +653,33 @@ impl AppState {
             },
             "the recovered store's registration",
         );
+    }
+
+    /// A registered store's key is held again (harvest#138): say so, and redo
+    /// what failed while it was missing.
+    ///
+    /// The registration came across a delegate re-key and only the key did
+    /// not. It already names this store's own contracts, where a
+    /// registration rebuilt here would derive the mailbox from the recovering
+    /// backer (see `recovered_registration`), so it is kept as it is.
+    fn after_registered_store_key_recovered(&mut self, store: [u8; 32]) {
+        self.notifications
+            .push("Recovered your store's key from your Ghost Key.".into());
+        self.request_store_subkeys(store);
+        // Buyers' messages failed to open while the key was missing
+        // (`DeriveConversationKeys` answers an error, which is retried only on
+        // the next mailbox update): ask again now, or a quiet store's inbox
+        // stays unreadable for the session.
+        let ids: Vec<Vec<u8>> = self
+            .my_stores
+            .values()
+            .flatten()
+            .filter(|s| s.store_verifying_key == Some(store))
+            .map(|s| s.store_contract_id.clone())
+            .collect();
+        for id in ids {
+            self.ask_for_conversation_keys(&id);
+        }
     }
 
     /// The registration a recovered store gets: its record from its published
@@ -1496,31 +1498,47 @@ mod tests {
             .get_mut(&store_vk().to_bytes())
             .expect("an attempt is live")
             .request_id = Some(5);
-        let said_before = state.notifications.len();
-        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
-            request_id: 77,
-            store_verifying_key: store_vk().to_bytes(),
-            result: Ok(()),
-        });
-        assert!(state.pending_custody.contains_key(&store_vk().to_bytes()));
-        assert_eq!(
-            state.notifications.len(),
-            said_before,
-            "the live attempt reports"
-        );
-        state.pending_custody.clear();
-        state.custody_started_ms.clear();
         state.store_subkeys_requested.clear();
+        let recovered = |state: &AppState| {
+            state
+                .notifications
+                .iter()
+                .filter(|n| n.contains("Recovered your store's key"))
+                .count()
+        };
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
             request_id: 77,
             store_verifying_key: store_vk().to_bytes(),
             result: Ok(()),
         });
         assert!(state.holds_store_key(&store_vk().to_bytes()));
-        // And the follow-up a matched answer gets still runs (round 2).
+        assert!(
+            state.pending_custody.contains_key(&store_vk().to_bytes()),
+            "the live attempt is left to its own answer"
+        );
+        // The follow-up runs on the transition to held, once (rounds 2-4).
+        assert_eq!(recovered(&state), 1);
         assert!(state
             .store_subkeys_requested
             .contains(&store_vk().to_bytes()));
+        // The live attempt then fails: not news, and not said.
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 5,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Err("the vault refused".into()),
+        });
+        assert!(state.pending_custody.is_empty());
+        assert!(!state
+            .notifications
+            .iter()
+            .any(|n| n.contains("could not be recovered")));
+        // A further success is not said twice.
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 6,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        assert_eq!(recovered(&state), 1);
     }
 
     /// A recovery that was tried and failed, with the copy there and the
