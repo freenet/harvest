@@ -24,7 +24,8 @@ blake3 = "1"
 hex = "0.4"
 bs58 = { version = "0.5", features = ["check"] }
 serde_json = "1"
-freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main" }
+# `test-support` for genuine SPV fixtures (scenario 4d), as tests/merge-laws/gen uses.
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main", features = ["test-support"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
