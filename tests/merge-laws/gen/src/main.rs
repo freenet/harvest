@@ -900,9 +900,10 @@ fn gen_reputation(root: &Path) {
     c.state("cap_C_order1_far_statement", &cbor(&cc));
     c.state("cap_D_full_with_honest", &cbor(&d));
     c.transition("cap_A_full_late", "cap_D_full_with_honest");
-    let bc = merged(&b, &cc);
-    c.state("cap_BC_honest_and_far", &cbor(&bc));
-    c.transition("cap_B_honest_near", "cap_BC_honest_and_far");
+    // B + C is B itself: the far statement loses its order's slot to the
+    // near one. Not a state of its own (fdev would dedup it, and the pair
+    // would read as a reversed transition).
+    assert_eq!(cbor(&merged(&b, &cc)), cbor(&b), "the near statement keeps the slot");
     let summ = a.summarize();
     let delta = b.delta(&summ).expect("non-empty delta");
     let mut r = a.clone();
