@@ -464,6 +464,18 @@ it is carried whatever that id is, but it is only shown while the store still
 lives at that id, so one kept under a store generation that has since re-keyed
 is carried and not shown -- the store re-key's gap, not this one's.)
 
+(Closed by harvest#138, for every store addressed by its code. The app now
+recalls a store's conversations under the id it had at each earlier
+code-addressed store generation (V17 on, from `legacy/store_contract.toml`) as
+well as its current one, and shows what it finds with the store. The
+conversation stays KEPT under the id it was opened with: the delegate never
+hands back the secret, so the app cannot re-keep it under the new id. It
+remembers that id instead (`BuyerConversation::kept_under`), and backing up,
+marking saved and forgetting the conversation name it, which is where the
+delegate looks. A conversation kept under a whole-key generation (V1 to V16,
+before the store code) is still not recalled; no store but test ones existed
+then.)
+
 ## The shape of the change, as built
 
 Six request families on the harvest delegate, behind the same

@@ -376,7 +376,9 @@ async fn store_key_report(node: &mut Node, key: &DelegateKey, store: [u8; 32]) -
         .harvest(key, HarvestDelegateRequest::ListStores { ghostkey_fingerprint: STORE_FP.into() })
         .await
     {
-        HarvestDelegateResponse::StoreList { stores, .. } => {
+        HarvestDelegateResponse::StoreList { stores, held_store_keys, .. } => {
+            // `None` from a generation older than the field (V18, V19).
+            println!("  StoreList held_store_keys: {:?}", held_store_keys.map(|keys| keys.contains(&store)));
             stores.iter().any(|s| s.store_verifying_key == Some(store))
         }
         other => panic!("ListStores: {other:?}"),
