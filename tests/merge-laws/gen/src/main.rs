@@ -53,6 +53,11 @@ use harvest_common::store::{
 };
 use serde::Serialize;
 
+
+/// The E2E test Ghost Key's public certificate, genuine under Freenet's
+/// master key (`tests/fixtures/ghostkey-certificate.pem`).
+const OWNER_CERT: &str = include_str!("../../../fixtures/ghostkey-certificate.pem");
+
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
     harvest_common::to_cbor(v).expect("encode")
 }
@@ -687,7 +692,9 @@ fn gen_reputation(root: &Path) {
         s.verify(&params).unwrap();
         s
     };
-    let cert = "-----BEGIN THROWAWAY OWNER CERT-----";
+    // A genuine Ghost Key certificate: the contract refuses anything else
+    // in this field since #143 review round 1 (P1-4).
+    let cert = OWNER_CERT;
     let merged = |base: &ReputationStateV1, other: &ReputationStateV1| {
         // Mirror of update_state's State arm.
         let mut s = base.clone();
@@ -787,7 +794,10 @@ fn gen_reputation(root: &Path) {
     let s = raw(vec![complaint_by(&complaint_buyer(90), unpaid, FeedbackCategory::NonDelivery, 300)]);
     assert!(s.verify(&params).is_err());
     c.state("adv_unpaid_order", &cbor(&s));
-    // #81: a different non-empty owner certificate (not covered by anything).
+    // Free text in the certificate field: refused by the contract since #143
+    // review round 1 (P1-4), where it used to be #81's first-writer-wins
+    // violation. (A second GENUINE certificate would still exercise #81;
+    // the corpus has only one, the E2E test Ghost Key's.)
     c.state("adv_other_cert_C2", &cbor(&build("-----BEGIN OTHER CERT-----", vec![f[1].clone()])));
     // Unsorted complaints: refused by verify (strictly ascending).
     let mut s = build(cert, vec![f[0].clone(), f[1].clone(), f[2].clone()]);
@@ -804,7 +814,9 @@ fn gen_reputation_rr(root: &Path) {
     let fx = StoreFx::new();
     let params = ReputationParameters::new(fx.seller.verifying_key());
     let pbytes = cbor(&params);
-    let cert = "-----BEGIN THROWAWAY OWNER CERT-----";
+    // A genuine Ghost Key certificate: the contract refuses anything else
+    // in this field since #143 review round 1 (P1-4).
+    let cert = OWNER_CERT;
     let honest = |complaints: Vec<Complaint>| {
         let mut s = ReputationStateV1 { owner_certificate_pem: cert.into(), ..Default::default() };
         if !complaints.is_empty() {

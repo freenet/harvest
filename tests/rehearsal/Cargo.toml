@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 harvest-common = { path = "../../common" }
 ghostkey-common = "0.3"
+# `ui/src/ghostkey_cert.rs`, compiled in by path like `migrate.rs`.
+ghostkey_lib = "0.2"
 freenet-stdlib = { version = "0.8.5", features = ["net"] }
 freenet-migrate = { version = "0.6", default-features = false, features = ["ui"] }
 freenet-scaffold = "0.2.2"

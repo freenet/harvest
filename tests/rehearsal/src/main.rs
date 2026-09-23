@@ -7,6 +7,11 @@
 
 #[path = "../../../ui/src/migrate.rs"]
 mod migrate;
+// `migrate::ReputationOps::decode` reduces a certificate to what the
+// reputation contract accepts, through the UI's own certificate check.
+#[path = "../../../ui/src/ghostkey_cert.rs"]
+#[allow(dead_code)]
+mod ghostkey_cert;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -282,8 +287,10 @@ async fn scenario_reputation(node: &mut Node, repo: &Path) {
     let store = SigningKey::from_bytes(&[0x5C; 32]).verifying_key();
     let ghost = SigningKey::from_bytes(&[0x6D; 32]).verifying_key();
     let record_der = hex::decode(THROWAWAY_RSA_DER_HEX).unwrap();
-    // A second key that addressed nothing: the per-device key of a store
-    // made after harvest#93 1b, which every walk also tries.
+    // A second key that addressed nothing here: a Ghost Key's per-device
+    // key, which addressed the records of stores made BEFORE harvest#93 1b
+    // (this store, made after, used its record key). The walk tries it too
+    // when it is known.
     let mut per_device_der = record_der.clone();
     let last = per_device_der.len() - 1;
     per_device_der[last] ^= 1;
@@ -311,6 +318,7 @@ async fn scenario_reputation(node: &mut Node, repo: &Path) {
         ghost_key: ghost,
         rsa_public_keys: vec![per_device_der.clone(), record_der.clone()],
         registered_id: Some(v15_id),
+        current_id: curr_id,
     };
     let ids = migrate::reputation_candidate_ids(&locators()).expect("derive");
     assert!(ids.contains(&v15_id), "the walk must reach the V15 record");
@@ -318,7 +326,10 @@ async fn scenario_reputation(node: &mut Node, repo: &Path) {
     assert!(!ids.contains(&curr_id), "the successor is not its own predecessor");
     println!("  {} candidates, V15 record at position {}", ids.len(), ids.iter().position(|i| *i == v15_id).unwrap());
 
-    const CERT: &str = "-----BEGIN REHEARSAL SELLER CERT-----";
+    // A genuine Ghost Key certificate: since #143 review round 1 (P1-4) the
+    // record's contract refuses anything else in this field, and the fold
+    // reduces anything else to nothing.
+    const CERT: &str = include_str!("../../fixtures/ghostkey-certificate.pem");
     let planted = harvest_common::to_cbor(&RsaGenerationReputationState {
         owner_certificate_pem: CERT.into(),
         feedback: Vec::new(),
@@ -376,7 +387,106 @@ async fn scenario_reputation(node: &mut Node, repo: &Path) {
         }
         other => panic!("the store-key record did not read back: {other:?}"),
     }
-    println!("  SCENARIO 4 PASSED: the V15 certificate is at the store-key record");
+    println!("  SCENARIO 4a PASSED: the V15 certificate is at the store-key record");
+
+    scenario_reputation_by_registration(node, repo, &current, CERT).await;
+}
+
+/// Scenario 4b (#143 review round 1, P2-13): a store made BEFORE harvest#93
+/// phase 1b, whose record lives under the Ghost Key's per-device RSA key at
+/// V10, reached ONLY through the registration's id -- the per-device key is
+/// not in the locators, which is the usual case (review P2-11). Then the
+/// registration naming the current record walks nothing (P2-7).
+async fn scenario_reputation_by_registration(node: &mut Node, repo: &Path, current: &[u8], cert: &str) {
+    println!("\n== scenario 4b: a pre-1b V10 record under the per-device key, found only through the registered id ==");
+    const V10: &str = "3c55af21e5658f03121bbeccfe347d4d530b57139251048767089596145e0594";
+    let row = migrate::reputation_lineage()
+        .iter()
+        .find(|e| hex::encode(e.code_hash) == V10)
+        .expect("the registry declares V10");
+    assert_eq!(row.generation, 10);
+    let v10 = legacy_wasm_from_git(repo, "reputation_contract", V10);
+
+    let store = SigningKey::from_bytes(&[0x5D; 32]).verifying_key();
+    let ghost = SigningKey::from_bytes(&[0x6E; 32]).verifying_key();
+    let mut per_device_der = hex::decode(THROWAWAY_RSA_DER_HEX).unwrap();
+    // The per-device key: planted under, never given to the walk.
+    let last = per_device_der.len() - 1;
+    per_device_der[last] ^= 2;
+    let (v10_container, v10_id) = container(
+        &v10,
+        Parameters::from(
+            harvest_common::to_cbor(&RsaReputationParameters {
+                rsa_public_key_der: per_device_der.clone(),
+                owner_verifying_key: ghost,
+            })
+            .unwrap(),
+        ),
+    );
+    let current_params = migrate::encode_params(&migrate::reputation_params(&store)).expect("encode");
+    let (curr_container, curr_id) = container(current, current_params);
+    println!("  V10 record (per-device key): {v10_id}");
+    println!("  store-key record:            {curr_id}");
+
+    let locators = |registered| migrate::ReputationLocators {
+        store_key: store,
+        ghost_key: ghost,
+        rsa_public_keys: Vec::new(),
+        registered_id: registered,
+        current_id: curr_id,
+    };
+    // The derivations alone cannot reach it: no RSA key is known.
+    let derived = migrate::reputation_candidate_ids(&locators(None)).expect("derive");
+    assert!(!derived.contains(&v10_id), "no locator but the registration reaches it");
+    let ids = migrate::reputation_candidate_ids(&locators(Some(v10_id))).expect("derive");
+    assert_eq!(ids.last(), Some(&v10_id), "the registration's id is tried, last");
+
+    let planted = harvest_common::to_cbor(&RsaGenerationReputationState {
+        owner_certificate_pem: cert.into(),
+        feedback: Vec::new(),
+        used_nonces: Vec::new(),
+    })
+    .unwrap();
+    node.put(v10_container, planted).await.expect("PUT V10 record (the V10 contract accepts it)");
+
+    let params = migrate::reputation_params(&store);
+    let mut session = ProbeSession::start_with_candidates(
+        migrate::ReputationOps { params: params.clone() },
+        harvest_common::reputation::ReputationStateV1::default(),
+        migrate::reputation_candidates(&locators(Some(v10_id))).expect("candidates"),
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        match node.get(candidate).await {
+            GetOutcome::State(bytes) => session.on_state(candidate, &bytes),
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    let (outcome, seal) = session.take_result().expect("probe finished");
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    let Outcome::Recovered { merged, source, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert_eq!(*source, v10_id, "the V10 record is the source");
+    assert_eq!(merged.owner_certificate_pem, cert, "the certificate is carried");
+    node.put(curr_container, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current contract accepts the carried record");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: harvest_common::reputation::ReputationStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(s.owner_certificate_pem, cert, "the certificate is at the store-key record");
+        }
+        other => panic!("the store-key record did not read back: {other:?}"),
+    }
+    println!("  SCENARIO 4b PASSED: the pre-1b certificate reached the store-key record through the registered id");
+
+    // P2-7: once the registration names the current record, nothing to walk.
+    let none = migrate::reputation_candidate_ids(&locators(Some(curr_id))).expect("derive");
+    assert!(none.is_empty(), "a registration naming the current record walks nothing: {none:?}");
+    println!("  SCENARIO 4c PASSED: a registration naming the current record yields no candidates");
 }
 
 // --- the node ------------------------------------------------------------
