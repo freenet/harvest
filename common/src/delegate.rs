@@ -387,7 +387,11 @@ pub enum HarvestDelegateRequest {
     ///
     /// Answered with [`HarvestDelegateResponse::PaidPurchases`], the whole
     /// list.
-    RememberPaidPurchase { purchase: PaidPurchase },
+    ///
+    /// Boxed only because an `AuthorizedOrder` is large next to every other
+    /// request (`clippy::large_enum_variant`); a `Box` encodes exactly as
+    /// its contents, so the wire form is `{ purchase: PaidPurchase }`.
+    RememberPaidPurchase { purchase: Box<PaidPurchase> },
 
     /// Every paid order this node keeps a copy of. Answered with
     /// [`HarvestDelegateResponse::PaidPurchases`].
@@ -1713,7 +1717,7 @@ mod tests {
                 store_verifying_key: [17u8; 32],
             },
             Q::RememberPaidPurchase {
-                purchase: paid_purchase(),
+                purchase: Box::new(paid_purchase()),
             },
             Q::ListPaidPurchases,
         ]

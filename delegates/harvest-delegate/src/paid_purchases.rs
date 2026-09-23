@@ -394,6 +394,33 @@ mod tests {
         assert_eq!(purchases(remember(&mut secrets, mine.clone())), vec![mine]);
     }
 
+    /// A genuinely paid order whose encoding exceeds
+    /// `MAX_PAID_PURCHASE_BYTES` is refused, so the cap bounds bytes and not
+    /// only entries. Red if the size check in `validate` is dropped.
+    #[test]
+    fn an_oversized_paid_order_is_refused() {
+        let mut big = order(7);
+        big.seller_fingerprint = "x".repeat(MAX_PAID_PURCHASE_BYTES);
+        let big = big.with_derived_id();
+        let oversized = PaidPurchase {
+            store_key: store_signing_key().verifying_key().to_bytes(),
+            conversation: [7u8; 32],
+            order: authorized(&store_signing_key(), big, OrderStatus::Paid, 1),
+        };
+        oversized
+            .order
+            .verify(&store_signing_key().verifying_key())
+            .expect("precondition: it is genuinely paid");
+        let mut secrets = MemSecrets::default();
+        match remember(&mut secrets, oversized) {
+            HarvestDelegateResponse::Error { message } => {
+                assert!(message.contains("bytes"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(purchases(list(&secrets)).is_empty());
+    }
+
     /// Mutated red by dropping the `status == Paid` check in `validate`.
     #[test]
     fn an_unpaid_order_is_refused() {

@@ -63,9 +63,9 @@ pub fn check_owner_certificate(
     }
     let certificate = GhostkeyCertificateV1::from_armored_string(pem)
         .map_err(|e| format!("the owner certificate is not a Ghost Key certificate: {e}"))?;
-    certificate
-        .verify(master)
-        .map_err(|e| format!("the owner certificate does not chain to Freenet's master key: {e}"))?;
+    certificate.verify(master).map_err(|e| {
+        format!("the owner certificate does not chain to Freenet's master key: {e}")
+    })?;
     let canonical = certificate
         .to_armored_string()
         .map_err(|e| format!("the owner certificate does not re-armour: {e}"))?;
@@ -569,7 +569,8 @@ mod tests {
     /// master key: the test Ghost Key the E2E walk-throughs use. Public by
     /// nature, like every certificate (it is in that store's backings on the
     /// live network); its signing key is not in this repository.
-    const FIXTURE_CERTIFICATE: &str = include_str!("../../../tests/fixtures/ghostkey-certificate.pem");
+    const FIXTURE_CERTIFICATE: &str =
+        include_str!("../../../tests/fixtures/ghostkey-certificate.pem");
 
     fn validate_cert(pem: &str) -> Result<ValidateResult, ContractError> {
         let mut bytes = vec![];
@@ -594,7 +595,10 @@ mod tests {
     fn a_genuine_certificate_and_no_certificate_are_accepted() {
         check_owner_certificate(FIXTURE_CERTIFICATE, &PRODUCTION_MASTER)
             .expect("the fixture is a genuine, canonical Ghost Key certificate");
-        assert!(matches!(validate_cert(FIXTURE_CERTIFICATE), Ok(ValidateResult::Valid)));
+        assert!(matches!(
+            validate_cert(FIXTURE_CERTIFICATE),
+            Ok(ValidateResult::Valid)
+        ));
         assert!(matches!(validate_cert(""), Ok(ValidateResult::Valid)));
     }
 
@@ -621,13 +625,19 @@ mod tests {
                 check_owner_certificate(&pem, &PRODUCTION_MASTER).is_err(),
                 "{what} must be refused"
             );
-            assert!(validate_cert(&pem).is_err(), "{what}: validate_state must refuse it");
+            assert!(
+                validate_cert(&pem).is_err(),
+                "{what}: validate_state must refuse it"
+            );
         }
         // The bound is checked BEFORE the parse: a megabyte of armour costs
         // nothing to refuse, which is its point.
         let huge = "x".repeat(harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES + 1);
         let err = check_owner_certificate(&huge, &PRODUCTION_MASTER).expect_err("oversized");
-        assert!(err.contains("may be at most"), "refused by the bound, not the parser: {err}");
+        assert!(
+            err.contains("may be at most"),
+            "refused by the bound, not the parser: {err}"
+        );
     }
 
     /// A certificate minted under a notary of the minter's own, whose `info`
@@ -719,6 +729,9 @@ mod tests {
             State::from(bytes),
             RelatedContracts::new(),
         );
-        assert!(out.is_err(), "a complaint nobody genuinely signed must be refused");
+        assert!(
+            out.is_err(),
+            "a complaint nobody genuinely signed must be refused"
+        );
     }
 }

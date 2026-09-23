@@ -5173,13 +5173,13 @@ impl AppState {
                     .paid_purchases
                     .iter()
                     .any(|kept| kept.order.order.id == order.order.id);
-                (!held && !self.paid_purchases_sent.contains(&order.order.id)).then(|| {
+                (!held && !self.paid_purchases_sent.contains(&order.order.id)).then_some(
                     harvest_common::delegate::PaidPurchase {
                         store_key: owner,
                         conversation: purchase.conversation,
                         order,
-                    }
-                })
+                    },
+                )
             })
             .collect();
         for purchase in due {
@@ -5189,7 +5189,7 @@ impl AppState {
             send_paid_purchase_request(
                 self.harvest_delegate_key.clone(),
                 harvest_common::HarvestDelegateRequest::RememberPaidPurchase {
-                    purchase: purchase.clone(),
+                    purchase: Box::new(purchase.clone()),
                 },
                 Some(purchase.order.order.id.clone()),
             );
@@ -25214,14 +25214,25 @@ mod buy_flow_tests {
             despatched(&mut state, &order);
             seller(state.browsing_stores.get_mut(STORE).unwrap());
             let purchase = purchases(&state).remove(0);
-            assert!(purchase.settled().is_none(), "{what}: precondition, the pay checks trip");
-            assert_eq!(purchase.paid.as_ref(), Some(&order), "{what}: still paid, still theirs");
+            assert!(
+                purchase.settled().is_none(),
+                "{what}: precondition, the pay checks trip"
+            );
+            assert_eq!(
+                purchase.paid.as_ref(),
+                Some(&order),
+                "{what}: still paid, still theirs"
+            );
             assert_eq!(state.complaint_refusal(STORE, &purchase), None, "{what}");
             state
                 .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             let (key, complaint) = state.published_complaints.pop().expect("published");
-            assert_eq!(key, seller_signing_key().verifying_key(), "{what}: the owner's record");
+            assert_eq!(
+                key,
+                seller_signing_key().verifying_key(),
+                "{what}: the owner's record"
+            );
             complaint.verify(&key).expect("the record accepts it");
         }
     }
@@ -25241,7 +25252,10 @@ mod buy_flow_tests {
         let sent = std::mem::take(&mut state.paid_purchase_requests);
         assert_eq!(sent.len(), 1, "the paid order's copy goes to the delegate");
         assert_eq!(sent[0].order, order);
-        assert_eq!(sent[0].store_key, seller_signing_key().verifying_key().to_bytes());
+        assert_eq!(
+            sent[0].store_key,
+            seller_signing_key().verifying_key().to_bytes()
+        );
         state.remember_paid_purchases(STORE);
         assert!(state.paid_purchase_requests.is_empty(), "once per session");
         // The delegate answers with what it keeps.
@@ -25253,7 +25267,11 @@ mod buy_flow_tests {
         store.orders.clear();
         store.despatches.clear();
         let purchase = purchases(&state).remove(0);
-        assert_eq!(purchase.paid.as_ref(), Some(&order), "the kept copy stands in");
+        assert_eq!(
+            purchase.paid.as_ref(),
+            Some(&order),
+            "the kept copy stands in"
+        );
         // And floods the mailbox: the acceptance goes too.
         state
             .browsing_stores
@@ -25291,7 +25309,11 @@ mod buy_flow_tests {
         unpaid.payment_proof = None;
         assert_eq!(AppState::paid_order(&store, &conversation, &unpaid), None);
         let mut elsewhere = store.clone();
-        elsewhere.owner = Some(SigningKey::from_bytes(&[0x57; 32]).verifying_key().to_bytes());
+        elsewhere.owner = Some(
+            SigningKey::from_bytes(&[0x57; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         assert_eq!(
             AppState::paid_order(&elsewhere, &conversation, &order),
             None,
@@ -25390,10 +25412,17 @@ mod buy_flow_tests {
             .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
             .expect("filed");
         let purchase = purchases(&state).remove(0);
-        assert!(state.complaint_refusal(STORE, &purchase).is_some(), "on its way");
+        assert!(
+            state.complaint_refusal(STORE, &purchase).is_some(),
+            "on its way"
+        );
         state.on_complaint_send_failed(STORE, &order.order.id, "no node");
         let purchase = purchases(&state).remove(0);
-        assert_eq!(state.complaint_refusal(STORE, &purchase), None, "offered again");
+        assert_eq!(
+            state.complaint_refusal(STORE, &purchase),
+            None,
+            "offered again"
+        );
         assert!(state.notifications.iter().any(|n| n.contains("no node")));
     }
 

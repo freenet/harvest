@@ -508,7 +508,7 @@ mod boundary_tests {
             // gate fires before this content is ever validated, so a
             // never-verifying placeholder order is enough to exercise it.
             to_cbor(&HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: unverified_paid_purchase(),
+                purchase: Box::new(unverified_paid_purchase()),
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ListPaidPurchases).expect("cbor"),

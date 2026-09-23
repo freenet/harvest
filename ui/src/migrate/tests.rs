@@ -2228,10 +2228,17 @@ fn a_predecessor_certificate_is_carried_only_as_the_contract_accepts_it() {
         })
         .unwrap()
     };
-    let genuine = ops.decode(&encode(&fixture.replace('\n', "\r\n"))).expect("decodes");
-    assert_eq!(genuine.owner_certificate_pem, fixture, "re-armoured canonically");
+    let genuine = ops
+        .decode(&encode(&fixture.replace('\n', "\r\n")))
+        .expect("decodes");
+    assert_eq!(
+        genuine.owner_certificate_pem, fixture,
+        "re-armoured canonically"
+    );
     assert!(ops.is_real(&genuine));
-    let junk = ops.decode(&encode("-----BEGIN CERT-----")).expect("decodes");
+    let junk = ops
+        .decode(&encode("-----BEGIN CERT-----"))
+        .expect("decodes");
     assert_eq!(junk.owner_certificate_pem, "");
     assert!(!ops.is_real(&junk), "nothing the successor would take");
 }
@@ -2918,11 +2925,7 @@ fn only_a_definite_present_suppresses_a_notice() {
 fn rsa_generation_parameter_bytes_are_pinned() {
     let key = SigningKey::from_bytes(&[61u8; 32]).verifying_key();
     let params = rsa_reputation_params_cbor(&[1, 2, 3], &key).expect("encode");
-    let hex: String = params
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = params.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     // map(2) { "rsa_public_key_der": [1, 2, 3] (a CBOR array of u8, serde's
     // default for Vec<u8>), "owner_verifying_key": bytes(32) }.
     assert_eq!(

@@ -370,7 +370,7 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         // orders a buyer holds is private linkage, the same reasoning as the
         // remembered-stores list above.
         HarvestDelegateRequest::RememberPaidPurchase { purchase } => {
-            crate::paid_purchases::remember(store, purchase)
+            crate::paid_purchases::remember(store, *purchase)
         }
 
         HarvestDelegateRequest::ListPaidPurchases => crate::paid_purchases::list(store),
@@ -891,7 +891,7 @@ mod origin_gating_tests {
             &mut store,
             Some(&harvest()),
             HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: mine.clone(),
+                purchase: Box::new(mine.clone()),
             },
         );
         assert!(
@@ -903,7 +903,7 @@ mod origin_gating_tests {
         for request in [
             HarvestDelegateRequest::ListPaidPurchases,
             HarvestDelegateRequest::RememberPaidPurchase {
-                purchase: purchase(2, 1),
+                purchase: Box::new(purchase(2, 1)),
             },
         ] {
             let response = handle(&mut store, Some(&a_different_web_app()), request);

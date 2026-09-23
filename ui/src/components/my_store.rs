@@ -1208,10 +1208,7 @@ mod store_details_button_tests {
     /// blank or stale fields.
     #[test]
     fn gaps_needing_seller_input_open_the_form() {
-        for gap in [
-            StoreDetailsGap::NeverPublished,
-            StoreDetailsGap::NoName,
-        ] {
+        for gap in [StoreDetailsGap::NeverPublished, StoreDetailsGap::NoName] {
             assert_eq!(
                 store_details_button_action(Some(gap), false),
                 StoreDetailsAction::ToggleForm,

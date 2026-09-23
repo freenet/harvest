@@ -174,8 +174,7 @@ impl Complaint {
         if self.order.order.amount_sats == 0 {
             return Err("a complaint must name an order for a non-zero amount".into());
         }
-        if self.order.order.payment_hash.is_none() && self.order.order.required_confirmations == 0
-        {
+        if self.order.order.payment_hash.is_none() && self.order.order.required_confirmations == 0 {
             return Err(
                 "a complaint must name an on-chain order that needs at least one confirmation"
                     .into(),
@@ -566,9 +565,14 @@ mod tests {
         let mut other = order(2);
         other.buyer_receipt_key = Some(buyer_key(1).verifying_key().to_bytes());
         let other = authorized(&store_key(), other.with_derived_id(), OrderStatus::Paid);
-        complaint_by(&buyer_key(1), other.clone(), FeedbackCategory::NonDelivery, 200)
-            .verify(&owner())
-            .expect("precondition: buyer 1 can complain about that order");
+        complaint_by(
+            &buyer_key(1),
+            other.clone(),
+            FeedbackCategory::NonDelivery,
+            200,
+        )
+        .verify(&owner())
+        .expect("precondition: buyer 1 can complain about that order");
         let mut c = genuine.clone();
         c.order = other;
         altered.push(("order", c));
@@ -670,7 +674,9 @@ mod tests {
             .verify(&owner())
             .expect("precondition: the store contract's own check accepts it");
         let c = complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200);
-        let err = c.verify(&owner()).expect_err("an order envelope with extra bytes");
+        let err = c
+            .verify(&owner())
+            .expect_err("an order envelope with extra bytes");
         assert!(err.contains("order's signed payload"), "{err}");
     }
 
@@ -684,7 +690,11 @@ mod tests {
         unconfirmed.required_confirmations = 0;
         for (what, o, needle) in [
             ("a zero amount", free, "non-zero amount"),
-            ("zero confirmations", unconfirmed, "at least one confirmation"),
+            (
+                "zero confirmations",
+                unconfirmed,
+                "at least one confirmation",
+            ),
         ] {
             let o = o.with_derived_id();
             let c = complaint_by(
