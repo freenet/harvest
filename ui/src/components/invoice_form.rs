@@ -179,11 +179,12 @@ fn CancelInvoice(
 ) -> Element {
     let mut confirming = use_signal(|| false);
     let mut problem = use_signal(|| Option::<String>::None);
-    let (pending, sent) = {
+    let (pending, sent, unsignable) = {
         let state = APP_STATE.read();
         (
             state.cancellation_pending(&store_contract_id, &order_id),
             state.cancellation_sent(&store_contract_id, &order_id),
+            state.store_key_refusal(&store_contract_id),
         )
     };
     let short = order_id.short();
@@ -191,6 +192,16 @@ fn CancelInvoice(
     if pending {
         return rsx! {
             p { class: "text-muted", "Cancelling invoice {short}\u{2026}" }
+        };
+    }
+    // Said instead of a button the delegate would refuse: this device holds
+    // no key that can sign for the store, as `MarkDespatched` does (#136
+    // review, round 5).
+    if let Some(why) = unsignable {
+        return rsx! {
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "Invoice {short} cannot be cancelled from this device yet: {why}"
+            }
         };
     }
     if sent {

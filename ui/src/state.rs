@@ -7408,6 +7408,13 @@ impl AppState {
             .contains(&order_at(store_contract_id, order_id))
     }
 
+    /// Why this device cannot sign for `store_contract_id` right now, or
+    /// `None` when it can. For a control that signs, shown in place of its
+    /// button.
+    pub fn store_key_refusal(&self, store_contract_id: &[u8]) -> Option<String> {
+        self.signing_store_key(store_contract_id).err()
+    }
+
     /// The store key this device can SIGN for `store_contract_id` with: the
     /// registration names it AND the delegate holds it (harvest#138). A
     /// control that signs is refused here rather than shown and then refused
@@ -24125,6 +24132,11 @@ mod buy_flow_tests {
             .collect::<Vec<_>>();
         state.note_held_store_keys(&stores, Some(&[]));
 
+        assert_eq!(
+            state.store_key_refusal(STORE).as_deref(),
+            Some(STORE_KEY_NOT_HELD_MESSAGE),
+            "the cancel control says why instead of showing its button"
+        );
         assert_eq!(
             state.cancel_invoice(STORE, &order.order.id),
             Err(STORE_KEY_NOT_HELD_MESSAGE.to_string())

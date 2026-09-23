@@ -30,7 +30,13 @@
 //!      carries the registration but never the key, harvest#138 F1)
 //!   delegate recover-store <ws-url-with-authToken> <delegate.wasm> <seeded-store.json>
 //!     (what custody's Recover does: unwrap the seeded copy with the stand-in
-//!      backer's wrap signature, then check the successor signs again)
+//!      backer's wrap signature, then check the successor signs again,
+//!      including a `Despatch`, harvest#53 Phase B)
+//!   delegate seed-store-state <seeded-store.json> <out-dir>
+//!     (no node: write the seeded seller's store -- owner and custody copy --
+//!      as `store.parameters` / `store.state` / `store.code` for `fdev
+//!      publish` at an earlier store generation, so a store re-key has a
+//!      real state to carry; harvest#53 Phase B)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
