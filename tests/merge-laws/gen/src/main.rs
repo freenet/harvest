@@ -275,6 +275,8 @@ impl StoreFx {
 
     fn listing(&self, i: u32) -> AuthorizedListing {
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: format!("Item {i}"),
             description: format!("Fresh item number {i}"),
@@ -301,6 +303,8 @@ impl StoreFx {
 
     fn order(&self, buyer: &str, created: i64) -> Order {
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: buyer.into(),
             seller_fingerprint: "throwaway-seller-fp".into(),
@@ -1716,6 +1720,7 @@ fn gen_status(root: &Path) {
     let mut c = Corpus::new(root, "store-status-bad", &params);
     for (n, s) in &bad { c.state(n, &cbor(s)); }
     c.finish();
+}
 
 use harvest_common::fulfilment::{AuthorizedDespatch, Despatch};
 

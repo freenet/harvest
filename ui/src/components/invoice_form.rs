@@ -718,6 +718,8 @@ mod tests {
             chrono::DateTime::from_timestamp(1_700_000_000 + minutes * 60, 0).expect("timestamp");
         AuthorizedOrder {
             order: Order {
+                request_id: None,
+                derivation: None,
                 id: OrderId([0u8; 32]),
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),

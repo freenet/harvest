@@ -96,6 +96,8 @@ pub fn ListingForm(on_submit: EventHandler<Listing>) -> Element {
                         let now = Utc::now();
                         let listing_title = title().trim().to_string();
                         let listing = Listing {
+                            checkout: None,
+                            choices: Vec::new(),
                             // Stamped by `with_derived_id` below, out of the
                             // finished terms: a listing whose id is not the
                             // one its terms give is refused by every peer

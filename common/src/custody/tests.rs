@@ -138,6 +138,8 @@ fn the_current_scope_is_harvests_webapp_id() {
 
 fn listing() -> crate::Listing {
     crate::Listing {
+        checkout: None,
+        choices: Vec::new(),
         id: crate::ListingId([0; 32]),
         title: "harvest/store-key-wrap/v1".into(),
         description: String::new(),

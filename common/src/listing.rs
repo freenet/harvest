@@ -143,9 +143,219 @@ pub struct Listing {
     pub kind: ListingKind,
     pub price: Option<PriceInfo>,
     pub created_at: DateTime<Utc>,
+    /// Fixed terms that let a buyer check out without waiting for the seller
+    /// (instant checkout): a price in satoshis and a fixed delivery price.
+    /// `None` is a quote-only listing, which is every listing published
+    /// before this field existed: the buyer sends a request and the seller
+    /// names the total.
+    ///
+    /// Skipped when absent, so a listing without it encodes exactly as
+    /// before: its id ([`ListingId::from_terms`]) and the signature over it
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<FixedCheckout>,
+    /// Options the buyer picks one of per group ("Size: S / M / L"). No price
+    /// difference and no stock per option. Allowed on quote-only listings too.
+    /// Skipped when empty, for the same reason as `checkout`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<ChoiceGroup>,
 }
 
+/// The most choice groups a listing may offer, options per group, and
+/// characters in any one name. Checked by [`Listing::checkout_problem`] and
+/// [`Listing::choices_problem`], which the UI applies before signing and the
+/// seller's delegate applies before auto-invoicing. The store contract does
+/// not enforce them: only the store key's holder can add a listing, so an
+/// oversized one costs nobody but them, the same exposure listings already
+/// carry.
+pub const MAX_CHOICE_GROUPS: usize = 4;
+pub const MAX_CHOICE_OPTIONS: usize = 12;
+pub const MAX_DELIVERY_REGIONS: usize = 12;
+pub const MAX_TERM_NAME_CHARS: usize = 40;
+
+/// What makes a listing buyable without the seller at the keyboard.
+///
+/// A total a buyer can be shown before anyone answers needs two numbers the
+/// free-text [`PriceInfo`] cannot give: the item price in satoshis, and the
+/// delivery price for where the buyer is. Both are here, and nothing else:
+/// no rate engine, no weights, no per-choice prices.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct FixedCheckout {
+    /// The price of one, in satoshis.
+    pub unit_sats: u64,
+    pub delivery: DeliveryPrice,
+}
+
+/// The delivery price, fixed in advance.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum DeliveryPrice {
+    /// Delivery is part of the item price, wherever the buyer is.
+    Included,
+    /// A flat price per region, per order (not per item). A region not in
+    /// the list is not offered: "US 2000, EU 5000, elsewhere not offered".
+    ByRegion(Vec<RegionPrice>),
+}
+
+/// One row of a [`DeliveryPrice::ByRegion`] table.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct RegionPrice {
+    /// As the seller typed it, and as the buyer picks it.
+    pub region: String,
+    /// Satoshis, per order.
+    pub sats: u64,
+}
+
+/// One set of options a buyer picks one of.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ChoiceGroup {
+    /// "Size".
+    pub name: String,
+    /// "S", "M", "L".
+    pub options: Vec<String>,
+}
+
+/// Why a buyer's selection cannot be priced against a listing's fixed terms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutRefusal {
+    /// The listing has no fixed checkout: it is quote-only.
+    QuoteOnly,
+    /// The region is not in the listing's delivery table, or a region was
+    /// named for a listing whose delivery is included (or none for one
+    /// priced by region).
+    RegionNotOffered,
+    /// The selection names a different number of choices than the listing
+    /// has groups, or an option a group does not offer.
+    InvalidChoice,
+    /// Quantity zero, or above [`MAX_INSTANT_QUANTITY`].
+    Quantity,
+    /// The total does not fit in a `u64`.
+    Overflow,
+}
+
+/// The most items one instant-checkout order may carry. A larger order goes
+/// through a request, where the seller names the total.
+pub const MAX_INSTANT_QUANTITY: u32 = 10;
+
 impl Listing {
+    /// Why this listing's fixed terms are unusable, or `None` when they are
+    /// fine (or absent). A listing with bad terms is treated as quote-only by
+    /// every reader.
+    pub fn checkout_problem(&self) -> Option<String> {
+        let checkout = self.checkout.as_ref()?;
+        if checkout.unit_sats == 0 {
+            return Some("an instant-checkout price must be more than zero".into());
+        }
+        if let DeliveryPrice::ByRegion(rows) = &checkout.delivery {
+            if rows.is_empty() {
+                return Some("add at least one delivery region, or include delivery".into());
+            }
+            if rows.len() > MAX_DELIVERY_REGIONS {
+                return Some(format!("at most {MAX_DELIVERY_REGIONS} delivery regions"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for row in rows {
+                let name = row.region.trim();
+                if name.is_empty() || name.chars().count() > MAX_TERM_NAME_CHARS {
+                    return Some(format!(
+                        "each delivery region needs a name of 1 to {MAX_TERM_NAME_CHARS} characters"
+                    ));
+                }
+                if !seen.insert(name.to_lowercase()) {
+                    return Some(format!("the delivery region \"{name}\" is listed twice"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Why this listing's choices are unusable, or `None`.
+    pub fn choices_problem(&self) -> Option<String> {
+        if self.choices.len() > MAX_CHOICE_GROUPS {
+            return Some(format!("at most {MAX_CHOICE_GROUPS} choices"));
+        }
+        for group in &self.choices {
+            let name = group.name.trim();
+            if name.is_empty() || name.chars().count() > MAX_TERM_NAME_CHARS {
+                return Some(format!(
+                    "each choice needs a name of 1 to {MAX_TERM_NAME_CHARS} characters"
+                ));
+            }
+            if group.options.is_empty() || group.options.len() > MAX_CHOICE_OPTIONS {
+                return Some(format!(
+                    "\"{name}\" needs 1 to {MAX_CHOICE_OPTIONS} options"
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for option in &group.options {
+                let o = option.trim();
+                if o.is_empty() || o.chars().count() > MAX_TERM_NAME_CHARS {
+                    return Some(format!(
+                        "each option of \"{name}\" needs 1 to {MAX_TERM_NAME_CHARS} characters"
+                    ));
+                }
+                if !seen.insert(o.to_lowercase()) {
+                    return Some(format!("\"{name}\" lists \"{o}\" twice"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether a buyer can check out without the seller: fixed terms present
+    /// and well formed, choices well formed, and a sale.
+    pub fn offers_instant_checkout(&self) -> bool {
+        self.kind == ListingKind::Sale
+            && self.checkout.is_some()
+            && self.checkout_problem().is_none()
+            && self.choices_problem().is_none()
+    }
+
+    /// The total, in satoshis, for `quantity` items delivered to `region`
+    /// with `choices` picked (one option per group, in group order).
+    ///
+    /// The one place the total is computed: the buyer's UI shows it and
+    /// sends it, and the seller's delegate recomputes it and refuses to
+    /// invoice when the two differ, so a listing changed between the buyer
+    /// reading it and the delegate answering never produces a total the
+    /// buyer did not see.
+    pub fn instant_total(
+        &self,
+        quantity: u32,
+        region: Option<&str>,
+        choices: &[String],
+    ) -> Result<u64, CheckoutRefusal> {
+        if !self.offers_instant_checkout() {
+            return Err(CheckoutRefusal::QuoteOnly);
+        }
+        let checkout = self.checkout.as_ref().ok_or(CheckoutRefusal::QuoteOnly)?;
+        if quantity == 0 || quantity > MAX_INSTANT_QUANTITY {
+            return Err(CheckoutRefusal::Quantity);
+        }
+        if choices.len() != self.choices.len()
+            || self
+                .choices
+                .iter()
+                .zip(choices)
+                .any(|(group, picked)| !group.options.iter().any(|o| o == picked))
+        {
+            return Err(CheckoutRefusal::InvalidChoice);
+        }
+        let delivery = match (&checkout.delivery, region) {
+            (DeliveryPrice::Included, None) => 0,
+            (DeliveryPrice::ByRegion(rows), Some(region)) => rows
+                .iter()
+                .find(|row| row.region == region)
+                .map(|row| row.sats)
+                .ok_or(CheckoutRefusal::RegionNotOffered)?,
+            _ => return Err(CheckoutRefusal::RegionNotOffered),
+        };
+        checkout
+            .unit_sats
+            .checked_mul(u64::from(quantity))
+            .and_then(|items| items.checked_add(delivery))
+            .ok_or(CheckoutRefusal::Overflow)
+    }
+
     /// Stamp this listing with the id its own terms give.
     ///
     /// Every producer must go through this, because
@@ -489,6 +699,8 @@ mod tests {
     ) -> AuthorizedListing {
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Widget".into(),
             description: "A nice widget".into(),
@@ -633,6 +845,8 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId::from_label("Widget"),
             title: "Widget".into(),
             description: "n/a".into(),
@@ -804,6 +1018,8 @@ mod listing_identity_tests {
     fn listing_priced(price: &str) -> Listing {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Ghost Pepper".to_string(),
             description: String::new(),
@@ -906,6 +1122,8 @@ mod listing_identity_tests {
     fn the_listing_id_derivation_is_pinned() {
         let created_at = DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Ghost Pepper".into(),
             description: "Hot".into(),
@@ -1005,5 +1223,183 @@ mod listing_identity_tests {
             one.listings, other.listings,
             "and the result must not depend on which arrived first"
         );
+    }
+}
+
+#[cfg(test)]
+mod instant_terms_tests {
+    use super::*;
+
+    fn listing(checkout: Option<FixedCheckout>, choices: Vec<ChoiceGroup>) -> Listing {
+        Listing {
+            id: ListingId([0; 32]),
+            title: "Mug".into(),
+            description: String::new(),
+            kind: ListingKind::Sale,
+            price: None,
+            created_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout,
+            choices,
+        }
+        .with_derived_id()
+    }
+
+    fn by_region() -> FixedCheckout {
+        FixedCheckout {
+            unit_sats: 10_000,
+            delivery: DeliveryPrice::ByRegion(vec![
+                RegionPrice {
+                    region: "US".into(),
+                    sats: 2_000,
+                },
+                RegionPrice {
+                    region: "EU".into(),
+                    sats: 5_000,
+                },
+            ]),
+        }
+    }
+
+    fn size() -> Vec<ChoiceGroup> {
+        vec![ChoiceGroup {
+            name: "Size".into(),
+            options: vec!["S".into(), "M".into(), "L".into()],
+        }]
+    }
+
+    #[test]
+    fn the_total_is_items_plus_the_regions_delivery() {
+        let l = listing(Some(by_region()), size());
+        assert_eq!(l.instant_total(3, Some("EU"), &["M".into()]), Ok(35_000));
+        assert_eq!(l.instant_total(1, Some("US"), &["S".into()]), Ok(12_000));
+    }
+
+    #[test]
+    fn included_delivery_takes_no_region() {
+        let l = listing(
+            Some(FixedCheckout {
+                unit_sats: 7,
+                delivery: DeliveryPrice::Included,
+            }),
+            vec![],
+        );
+        assert_eq!(l.instant_total(2, None, &[]), Ok(14));
+        assert_eq!(
+            l.instant_total(2, Some("US"), &[]),
+            Err(CheckoutRefusal::RegionNotOffered)
+        );
+    }
+
+    #[test]
+    fn a_region_not_listed_is_not_offered() {
+        let l = listing(Some(by_region()), vec![]);
+        assert_eq!(
+            l.instant_total(1, Some("Mars"), &[]),
+            Err(CheckoutRefusal::RegionNotOffered)
+        );
+        assert_eq!(
+            l.instant_total(1, None, &[]),
+            Err(CheckoutRefusal::RegionNotOffered)
+        );
+    }
+
+    #[test]
+    fn choices_must_be_one_offered_option_per_group() {
+        let l = listing(Some(by_region()), size());
+        assert_eq!(
+            l.instant_total(1, Some("US"), &[]),
+            Err(CheckoutRefusal::InvalidChoice)
+        );
+        assert_eq!(
+            l.instant_total(1, Some("US"), &["XL".into()]),
+            Err(CheckoutRefusal::InvalidChoice)
+        );
+        assert_eq!(
+            l.instant_total(1, Some("US"), &["S".into(), "M".into()]),
+            Err(CheckoutRefusal::InvalidChoice)
+        );
+    }
+
+    #[test]
+    fn quantity_is_bounded_and_overflow_refused() {
+        let l = listing(Some(by_region()), vec![]);
+        assert_eq!(
+            l.instant_total(0, Some("US"), &[]),
+            Err(CheckoutRefusal::Quantity)
+        );
+        assert_eq!(
+            l.instant_total(MAX_INSTANT_QUANTITY + 1, Some("US"), &[]),
+            Err(CheckoutRefusal::Quantity)
+        );
+        let huge = listing(
+            Some(FixedCheckout {
+                unit_sats: u64::MAX / 2,
+                delivery: DeliveryPrice::Included,
+            }),
+            vec![],
+        );
+        assert_eq!(
+            huge.instant_total(3, None, &[]),
+            Err(CheckoutRefusal::Overflow)
+        );
+    }
+
+    /// Quote-only, a gift, or malformed terms all read as quote-only.
+    #[test]
+    fn only_well_formed_sale_terms_offer_instant_checkout() {
+        assert!(!listing(None, vec![]).offers_instant_checkout());
+        let mut gift = listing(Some(by_region()), vec![]);
+        gift.kind = ListingKind::Gift;
+        assert!(!gift.offers_instant_checkout());
+        let zero = listing(
+            Some(FixedCheckout {
+                unit_sats: 0,
+                delivery: DeliveryPrice::Included,
+            }),
+            vec![],
+        );
+        assert!(!zero.offers_instant_checkout());
+        let dup = listing(
+            Some(FixedCheckout {
+                unit_sats: 1,
+                delivery: DeliveryPrice::ByRegion(vec![
+                    RegionPrice {
+                        region: "US".into(),
+                        sats: 1,
+                    },
+                    RegionPrice {
+                        region: "us".into(),
+                        sats: 2,
+                    },
+                ]),
+            }),
+            vec![],
+        );
+        assert!(
+            !dup.offers_instant_checkout(),
+            "a region listed twice has no one price"
+        );
+        let empty_group = listing(
+            Some(by_region()),
+            vec![ChoiceGroup {
+                name: "Size".into(),
+                options: vec![],
+            }],
+        );
+        assert!(!empty_group.offers_instant_checkout());
+        assert!(listing(Some(by_region()), size()).offers_instant_checkout());
+    }
+
+    /// A listing without the new fields encodes, and so is identified and
+    /// signed, exactly as before they existed.
+    #[test]
+    fn a_listing_without_terms_encodes_as_before() {
+        let l = listing(None, vec![]);
+        let value: ciborium::Value = crate::from_cbor(&crate::to_cbor(&l).unwrap()).unwrap();
+        assert!(!value
+            .as_map()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| matches!(k.as_text(), Some("checkout") | Some("choices"))));
     }
 }

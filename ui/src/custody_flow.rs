@@ -1313,6 +1313,8 @@ mod tests {
                 pending: crate::state::PendingListing {
                     fingerprint: FINGERPRINT.to_string(),
                     listing: harvest_common::listing::Listing {
+                        checkout: None,
+                        choices: Vec::new(),
                         id: harvest_common::listing::ListingId([0; 32]),
                         title: "Beans".to_string(),
                         description: String::new(),

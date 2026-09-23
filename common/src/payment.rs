@@ -159,6 +159,14 @@ impl OrderId {
     /// on an order that already carries the answer gives the same answer --
     /// which is what lets [`AuthorizedOrder::verify`] demand that they match.
     pub fn from_terms(order: &Order) -> Self {
+        // An order that answers a request is identified by the request, so
+        // a store can hold only one answer to it. See [`Order::request_id`].
+        if let Some(request) = order.request_id {
+            let mut h = blake3::Hasher::new();
+            h.update(b"harvest/order-id/request/v1");
+            h.update(&request);
+            return Self(*h.finalize().as_bytes());
+        }
         let mut probe = order.clone();
         probe.id = Self([0u8; 32]);
         // Infallible for the same reason as `order_content_digest`: `Order`
@@ -553,7 +561,65 @@ pub struct Order {
     /// act is possible on that order, which is the safe direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buyer_receipt_key: Option<[u8; 32]>,
+    /// The buyer request this order answers, when it answers one through
+    /// instant checkout: [`request_id`] over the conversation's routing tag
+    /// and the nonce the buyer sent.
+    ///
+    /// **It is what the order's id is derived from** when present (see
+    /// [`OrderId::from_terms`]), so a store holds at most ONE order per
+    /// request: two answers to one request -- a retry, a replayed request,
+    /// or two of the seller's devices both answering -- are one map entry,
+    /// and the existing per-id merge (higher status rank, then the smaller
+    /// encoding) picks the same one on every replica. A payment always
+    /// wins that merge, so the one a buyer paid is the one that stays.
+    ///
+    /// Derived rather than chosen by the buyer so a third party cannot
+    /// replay it: a copy of a published request id sent from another
+    /// conversation yields a different id, and so cannot make the seller's
+    /// delegate publish an order that displaces somebody else's invoice.
+    ///
+    /// `serde(default, skip_serializing_if)` like the fields above: an order
+    /// without it encodes exactly as before, so every earlier signature and
+    /// every earlier id still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<[u8; 32]>,
+    /// Where this order's payment address came from in the seller's wallet:
+    /// which account key and which index on its receive chain.
+    ///
+    /// Public so any device holding the same payment key can move its
+    /// address counter past every index a published order already names,
+    /// exactly, instead of scanning scripts (harvest#77). The address itself
+    /// is public anyway; the index says only how many addresses the seller
+    /// has handed out, which the order count already shows.
+    ///
+    /// Skipped when absent, for the signature reason above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<AddressDerivation>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Which wallet key and index an order's payment address was derived from.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AddressDerivation {
+    /// The account key's BIP-32 fingerprint: the first four bytes of
+    /// HASH160 of its public key.
+    pub account: [u8; 4],
+    /// The index on the account's receive chain (`m/0/index` below it).
+    pub index: u32,
+}
+
+/// The request id of one buyer request: see [`Order::request_id`].
+///
+/// `routing_tag` is the conversation's routing tag (the buyer's ephemeral
+/// X25519 public key on the mailbox envelope), `nonce` the value the buyer
+/// sent inside the sealed request. Only a message sealed under that
+/// conversation can carry a nonce the seller will pair with that tag, and
+/// only the buyer and seller can seal under it.
+pub fn request_id(routing_tag: &[u8; 32], nonce: &[u8; 16]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("harvest request id v1");
+    h.update(routing_tag);
+    h.update(nonce);
+    *h.finalize().as_bytes()
 }
 
 impl Order {
@@ -2291,6 +2357,8 @@ mod lightning_tests {
     fn lightning_order(payment_hash: Option<[u8; 32]>) -> Order {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -2574,6 +2642,8 @@ mod order_identity_tests {
     fn terms(address: &str, amount_sats: u64) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2717,6 +2787,8 @@ mod order_identity_tests {
     fn the_order_id_derivation_is_pinned() {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let order = Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2824,6 +2896,8 @@ mod address_instance_tests {
     fn terms(code_hash: Option<[u8; 32]>) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2918,6 +2992,8 @@ mod proof_assembly_tests {
     fn order_for(amount_sats: u64, required_confirmations: u32) -> Order {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),

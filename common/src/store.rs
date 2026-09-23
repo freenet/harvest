@@ -652,6 +652,22 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
             // Stale: we already hold a later transition for this order.
         }
         std::cmp::Ordering::Equal => {
+            // Two orders under one id with DIFFERENT terms happen only for
+            // orders identified by the request they answer
+            // (`Order::request_id`): two answers to one request. The larger
+            // amount wins before the encoding does, so a seller cannot
+            // replace a paid order with a cheaper one of their own, paid
+            // with a token amount, to shrink what their store shows it took.
+            // For every other order one id means one set of terms, so the
+            // amounts are equal and this changes nothing.
+            match incoming.order.amount_sats.cmp(&existing.order.amount_sats) {
+                std::cmp::Ordering::Greater => {
+                    orders.insert(id, incoming);
+                    return;
+                }
+                std::cmp::Ordering::Less => return,
+                std::cmp::Ordering::Equal => {}
+            }
             let existing_bytes =
                 crate::to_cbor(existing).expect("AuthorizedOrder always serializes to CBOR");
             let incoming_bytes =
@@ -1675,6 +1691,8 @@ mod order_tests {
         let seller_fp = "seller-fingerprint";
         let ts = timestamp(created_at_secs);
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: buyer_fp.into(),
             seller_fingerprint: seller_fp.into(),
@@ -3232,6 +3250,8 @@ mod order_tests {
     ) -> (OrderId, AuthorizedOrder) {
         let ts = timestamp(created_at_secs);
         let order = Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: format!("buyer-{seed}"),
             seller_fingerprint: "seller".into(),
@@ -3887,6 +3907,8 @@ mod order_tests {
     fn make_listing(signer: &SigningKey, title: &str) -> AuthorizedListing {
         let ts = timestamp(1_700_000_000);
         let listing = crate::listing::Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: title.into(),
             description: String::new(),
@@ -5582,6 +5604,8 @@ mod listing_status_tests {
             Some(crate::backing::StoreKeyMessage::ListingStatus)
         );
         let listing = crate::listing::Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0; 32]),
             title: "t".into(),
             description: String::new(),
@@ -5624,5 +5648,152 @@ mod listing_status_tests {
             states.push(state_with(picked));
         }
         assert_laws(&states, 300, &mut rng, merged, bytes);
+    }
+}
+
+#[cfg(test)]
+mod one_order_per_request_tests {
+    //! Instant checkout: an order answering a buyer request is identified by
+    //! the request, so a store holds one answer per request whatever arrives
+    //! in whatever order.
+    use super::*;
+    use crate::payment::{request_id, Order, OrderStatus};
+    use crate::test_orders::{authorized, order, store_key};
+
+    fn parent() -> StoreStateV1 {
+        StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        }
+    }
+
+    fn answering(n: u8, request: [u8; 32], amount_sats: u64) -> Order {
+        let mut o = order(n);
+        o.request_id = Some(request);
+        o.amount_sats = amount_sats;
+        o.with_derived_id()
+    }
+
+    fn fold(records: &[AuthorizedOrder]) -> OrdersV1 {
+        let mut orders = OrdersV1::default();
+        let params = StoreParameters::new(store_key().verifying_key());
+        for r in records {
+            orders
+                .apply_delta(&parent(), &params, &Some(vec![r.clone()]))
+                .expect("a genuinely signed order applies");
+        }
+        orders
+    }
+
+    /// Two different answers to one request (two devices, or a retry that
+    /// derived a second address) end as ONE order, the same one in either
+    /// arrival order. Mutated red by dropping the request branch from
+    /// `OrderId::from_terms` (the two then have different ids and both stay).
+    #[test]
+    fn two_answers_to_one_request_are_one_order_in_either_order() {
+        let req = request_id(&[7; 32], &[1; 16]);
+        let a = authorized(
+            &store_key(),
+            answering(1, req, 50_000),
+            OrderStatus::AwaitingPayment,
+        );
+        let b = authorized(
+            &store_key(),
+            answering(2, req, 50_000),
+            OrderStatus::AwaitingPayment,
+        );
+        assert_eq!(a.order.id, b.order.id, "one request, one id");
+        assert_ne!(a.order.payment_script_pubkey, b.order.payment_script_pubkey);
+        let ab = fold(&[a.clone(), b.clone()]);
+        let ba = fold(&[b, a]);
+        assert_eq!(ab.orders.len(), 1);
+        assert_eq!(crate::to_cbor(&ab).unwrap(), crate::to_cbor(&ba).unwrap());
+    }
+
+    /// Different requests are different orders, even with identical terms
+    /// otherwise.
+    #[test]
+    fn different_requests_are_different_orders() {
+        let a = answering(1, request_id(&[7; 32], &[1; 16]), 50_000);
+        let b = answering(1, request_id(&[7; 32], &[2; 16]), 50_000);
+        assert_ne!(a.id, b.id);
+        // And the routing tag is part of it: the same nonce copied into
+        // another conversation is another request.
+        let c = answering(1, request_id(&[8; 32], &[1; 16]), 50_000);
+        assert_ne!(a.id, c.id);
+    }
+
+    /// A payment beats an unpaid duplicate, whichever arrives first, so the
+    /// invoice a buyer paid is the one the store keeps.
+    #[test]
+    fn the_paid_answer_wins_over_an_unpaid_duplicate() {
+        let req = request_id(&[7; 32], &[3; 16]);
+        let paid = authorized(&store_key(), answering(1, req, 50_000), OrderStatus::Paid);
+        let unpaid = authorized(
+            &store_key(),
+            answering(2, req, 40_000),
+            OrderStatus::AwaitingPayment,
+        );
+        for orders in [
+            fold(&[paid.clone(), unpaid.clone()]),
+            fold(&[unpaid, paid.clone()]),
+        ] {
+            let kept = orders.orders.values().next().unwrap();
+            assert_eq!(kept.status, OrderStatus::Paid);
+            assert_eq!(
+                kept.order.payment_script_pubkey,
+                paid.order.payment_script_pubkey
+            );
+        }
+    }
+
+    /// At equal status the larger amount wins, so a seller cannot swap a
+    /// paid order for a cheaper paid one under the same request id. Mutated
+    /// red by removing the amount comparison from `merge_order` (the
+    /// encoding then decides, and the smaller amount encodes smaller).
+    #[test]
+    fn a_cheaper_order_cannot_displace_a_paid_one() {
+        let req = request_id(&[7; 32], &[4; 16]);
+        let real = authorized(&store_key(), answering(1, req, 900_000), OrderStatus::Paid);
+        // Same buyer and terms but the amount (and its own address), so the
+        // first byte the encodings differ in is the amount's.
+        let mut cheap = answering(1, req, 1);
+        cheap.payment_script_pubkey = vec![0x00, 0x14, 0xee, 0xbb];
+        let token = authorized(&store_key(), cheap.with_derived_id(), OrderStatus::Paid);
+        assert!(
+            crate::to_cbor(&token).unwrap() < crate::to_cbor(&real).unwrap(),
+            "the fixture must be one the encoding tie-break alone would get wrong"
+        );
+        for orders in [
+            fold(&[real.clone(), token.clone()]),
+            fold(&[token, real.clone()]),
+        ] {
+            assert_eq!(
+                orders.orders.values().next().unwrap().order.amount_sats,
+                900_000
+            );
+        }
+    }
+
+    /// An order with no request id is identified by its terms exactly as
+    /// before, and encodes without either new field.
+    #[test]
+    fn an_order_without_a_request_is_unchanged() {
+        let o = order(5);
+        let bytes = crate::to_cbor(&o).unwrap();
+        let value: ciborium::Value = crate::from_cbor(&bytes).unwrap();
+        let keys: Vec<String> = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_string))
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k == "request_id" || k == "derivation"),
+            "{keys:?}"
+        );
+        let mut probe = o.clone();
+        probe.id = crate::payment::OrderId([0; 32]);
+        assert_eq!(crate::payment::OrderId::from_terms(&probe), o.id);
     }
 }

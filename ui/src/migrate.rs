@@ -1944,6 +1944,8 @@ mod predecessor_generation_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let old = signed(
             Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: v1_listing_id("seller-fp", &created_at, "Ghost Pepper"),
                 title: "Ghost Pepper".into(),
                 description: "Hot".into(),
@@ -1997,6 +1999,8 @@ mod predecessor_generation_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let good = signed(
             Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([0u8; 32]),
                 title: "Ghost Pepper".into(),
                 description: "Hot".into(),
@@ -2043,6 +2047,8 @@ mod uncarried_tests {
     fn listing_with_a_foreign_id(key: &SigningKey, title: &str) -> AuthorizedListing {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing = Listing {
+            checkout: None,
+            choices: Vec::new(),
             // Not `with_derived_id`. Any id that is not the one these terms
             // give stands in for "derived by a generation that is not this
             // one" -- which is what a predecessor's records are.
@@ -2165,6 +2171,8 @@ mod uncarried_tests {
 
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let order = Order {
+            request_id: None,
+            derivation: None,
             // Not `with_derived_id`, for the same reason as the listing above.
             id: OrderId([0xCD; 32]),
             buyer_fingerprint: String::new(),

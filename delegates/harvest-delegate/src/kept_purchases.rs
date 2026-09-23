@@ -387,6 +387,8 @@ pub(crate) mod fixtures {
     /// distinct order ids.
     pub(crate) fn order(n: u16, c: u8) -> Order {
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fingerprint".into(),

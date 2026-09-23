@@ -202,6 +202,8 @@ fn scoped_sign<T: serde::Serialize>(sk: &SigningKey, data: &T) -> (Vec<u8>, Vec<
 fn make_listing(sk: &SigningKey, fingerprint: &str, title: &str, at: i64) -> AuthorizedListing {
     let created_at = ts(at);
     let listing = Listing {
+        checkout: None,
+        choices: Vec::new(),
         id: ListingId::from_label(title),
         title: title.to_string(),
         description: format!("{title} -- written by the rehearsal harness"),
@@ -520,6 +522,8 @@ struct ComplaintFx {
 impl ComplaintFx {
     fn order(&self, n: u8) -> Order {
         Order {
+            request_id: None,
+            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: format!("complainer-{n}"),
             seller_fingerprint: "throwaway-seller-fp".into(),
