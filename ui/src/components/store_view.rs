@@ -200,6 +200,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             .counts()
         })
         .count();
+    let (record_class, record_text) = store.record.badge(counted_complaints);
     let mut show_messages = use_signal(|| false);
     // Read once, here, rather than inside the per-listing helper: this
     // component re-renders on every keystroke in the boxes below it, and the
@@ -221,13 +222,9 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         }
                     }
                     div { class: "store-meta",
-                        if counted_complaints == 0 {
-                            span { class: "reputation-clean", "Clean record" }
-                        } else {
-                            span { class: "reputation-negative",
-                                "{counted_complaints} complaint(s)"
-                            }
-                        }
+                        // "Clean record" only once the record has been read
+                        // (review round 1 of #143, P1-5).
+                        span { class: "{record_class}", "{record_text}" }
                         p { class: "seller-id",
                             "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
                         }

@@ -1022,14 +1022,16 @@ pub struct StoreDetails {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StoreDetailsGap {
     /// Still at version 0, the uninitialized state -- nothing has ever been
-    /// published, so the store has no name, no description, and no link to
-    /// the seller's reputation.
+    /// published, so the store has no name and no description.
+    ///
+    /// Not "and no reputation link": since harvest#53 Phase C a reader
+    /// derives a store's record from the store key, and the details'
+    /// `reputation_contract_id` is not followed, so the record is reachable
+    /// whatever the details say. A `NoReputationLink` gap existed for that
+    /// field and is gone with it (review round 1 of #143, P1-6).
     NeverPublished,
     /// Published, but with no name a buyer can read.
     NoName,
-    /// Published, but naming no reputation contract, so the seller's
-    /// feedback history cannot be reached from the store.
-    NoReputationLink,
     /// Published, but carrying no encryption key, so no buyer can send this
     /// seller a message.
     ///
@@ -1046,16 +1048,12 @@ impl StoreDetailsGap {
         match self {
             StoreDetailsGap::NeverPublished => {
                 "This store's details were never published. Buyers who open your link see a \
-                 storefront with no name and no description, and your reputation record \
-                 cannot be reached from it. Publishing the details below fixes all three."
+                 storefront with no name and no description. Publishing the details below \
+                 fixes both."
             }
             StoreDetailsGap::NoName => {
                 "This store has no name. Buyers who open your link see an unnamed storefront. \
                  Publishing the details below fixes it."
-            }
-            StoreDetailsGap::NoReputationLink => {
-                "This store does not name your reputation contract, so buyers cannot reach your \
-                 feedback history from it. Publishing the details below restores the link."
             }
             StoreDetailsGap::NoEncryptionKey => {
                 "This store publishes no encryption key, so buyers who open it are told they \
@@ -1089,10 +1087,10 @@ pub fn store_details_gap(
     if info.store_name.trim().is_empty() {
         return Some(StoreDetailsGap::NoName);
     }
-    if info.reputation_contract_id == [0u8; 32] {
-        return Some(StoreDetailsGap::NoReputationLink);
-    }
-    // Last of the four: a store nobody can find the name of is worse than one
+    // A zero `reputation_contract_id` is not a gap: readers derive the
+    // record from the store key (harvest#53 Phase C).
+    //
+    // Last of the three: a store nobody can find the name of is worse than one
     // nobody can message, and only one prompt is shown at a time.
     if info.encryption_public_key.is_none() && encryption_key_ready {
         return Some(StoreDetailsGap::NoEncryptionKey);
@@ -1187,7 +1185,7 @@ impl PendingStoreEdit {
     /// one and left `None` when it has not. Unlike the certificate, it does
     /// NOT gate publication: a store with no key is a store buyers cannot
     /// message, which is bad, whereas a store whose details never publish at
-    /// all has no name, no description and no reputation link, which is
+    /// all has no name and no description, which is
     /// worse. `store_details_gap` reports the missing key afterwards so the
     /// seller has a route back to it.
     fn store_info(
@@ -2106,6 +2104,42 @@ impl BuyerPurchase {
     }
 }
 
+/// How far a store's reputation record has loaded (harvest#53 Phase C,
+/// review round 1 of #143, P1-5).
+///
+/// An empty complaint list reads as "Clean record" only once the record
+/// itself has been read. Before that, and when the node said it holds
+/// nothing or the fetch failed, an empty list is an absence of information,
+/// and a badge that turned it into praise would be the one thing on the page
+/// a seller could arrange by making their record hard to fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordLoad {
+    /// Asked for, nothing back yet.
+    #[default]
+    Loading,
+    /// Read: the complaints are the record's.
+    Loaded,
+    /// The node answered that it holds no such record. Not proof there is
+    /// none -- a dead-ended GET answers the same -- and not a clean record.
+    NotFound,
+    /// The fetch failed.
+    Unavailable,
+}
+
+impl RecordLoad {
+    /// The badge for a store whose record is in this state, holding
+    /// `counted` complaints that count: `(css class, text)`.
+    pub fn badge(self, counted: usize) -> (&'static str, String) {
+        match self {
+            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "Clean record".into()),
+            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaint(s)")),
+            RecordLoad::Loading => ("text-muted", "Record loading".into()),
+            RecordLoad::NotFound => ("text-muted", "No record found".into()),
+            RecordLoad::Unavailable => ("text-muted", "Record unavailable".into()),
+        }
+    }
+}
+
 /// One row of the store list. See [`AppState::store_list_rows`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoreListRow {
@@ -2211,6 +2245,8 @@ pub struct BrowsingStore {
     /// Phase C). Every one the contract accepted names a paid order of this
     /// store; whether it COUNTS is `fulfilment::complaint_standing`'s call.
     pub complaints: Vec<Complaint>,
+    /// Whether [`Self::complaints`] is the record, or just nothing yet.
+    pub record: RecordLoad,
     /// Encrypted messages from the mailbox contract.
     pub mailbox_messages: Vec<EncryptedMessage>,
     /// The buyer's conversations with this store, oldest first.
@@ -3808,12 +3844,14 @@ impl AppState {
                 if let Some(store_id) = self.reputation_to_store.get(&contract_id).cloned() {
                     if let Some(store) = self.browsing_stores.get_mut(&store_id) {
                         store.complaints = reputation_state.complaints;
+                        store.record = RecordLoad::Loaded;
                     }
                 } else {
                     info!("Reputation state for unknown store -- caching by contract ID");
                     // Cache it; will be linked when the store state arrives
                     let store = self.browsing_stores.entry(contract_id).or_default();
                     store.complaints = reputation_state.complaints;
+                    store.record = RecordLoad::Loaded;
                 }
                 return;
             }
@@ -8109,6 +8147,30 @@ impl AppState {
             "Could not send your complaint about order {}: {reason}",
             order_id.short()
         ));
+    }
+
+    /// The node answered NotFound for `contract_id`: if it is a store's
+    /// reputation record not yet read, say so rather than leave it loading
+    /// (P1-5). A record already read stays read: NotFound is unauthenticated
+    /// and a dead-ended GET answers it for a record that exists.
+    pub fn on_record_absent(&mut self, contract_id: &[u8]) {
+        self.set_record_unless_loaded(contract_id, RecordLoad::NotFound);
+    }
+
+    /// Fetching a store's reputation record failed (P1-5).
+    pub fn on_record_unavailable(&mut self, contract_id: &[u8]) {
+        self.set_record_unless_loaded(contract_id, RecordLoad::Unavailable);
+    }
+
+    fn set_record_unless_loaded(&mut self, contract_id: &[u8], to: RecordLoad) {
+        let Some(store_id) = self.reputation_to_store.get(contract_id).cloned() else {
+            return;
+        };
+        if let Some(store) = self.browsing_stores.get_mut(&store_id) {
+            if store.record != RecordLoad::Loaded {
+                store.record = to;
+            }
+        }
     }
 
     /// The seller's despatch of `order`, from the store that holds this very
@@ -12520,7 +12582,7 @@ mod tests {
     }
 
     /// Version 0 is the uninitialized state: nothing was ever signed or
-    /// published, so the store has no name and no reputation link. This is
+    /// published, so the store has no name and no description. This is
     /// every store created before details were published at all, and every
     /// store left behind by a creation interrupted before its signed update.
     #[test]
@@ -12539,14 +12601,15 @@ mod tests {
         );
     }
 
-    /// The half nobody would notice. A store can carry a perfectly good name
-    /// and still name no reputation contract, which leaves the seller's
-    /// feedback history unreachable from it.
+    /// A store naming no reputation contract needs no repair: readers derive
+    /// the record from the store key, and the details' id is not followed
+    /// (review round 1 of #143, P1-6: the prompt told sellers their record
+    /// was unreachable when it was not). Red if the gap comes back.
     #[test]
-    fn a_published_store_without_a_reputation_link_needs_repair() {
+    fn a_published_store_without_a_reputation_link_needs_no_repair() {
         assert_eq!(
             store_details_gap(Some(&published_info(1, "Bean Shop", [0u8; 32])), false),
-            Some(StoreDetailsGap::NoReputationLink)
+            None
         );
     }
 
@@ -21490,6 +21553,8 @@ mod buy_flow_tests {
         let (order, _, _) = a_paid_order();
         let (mut state, _) = buyer_after_acceptance(&order);
         let seller = seller_signing_key().verifying_key();
+        // The fixture's store names its owner; start from one that does not.
+        state.browsing_stores.get_mut(STORE).unwrap().owner = None;
 
         assert!(
             state.delta_owner_key(STORE).is_none(),
@@ -25225,6 +25290,50 @@ mod buy_flow_tests {
             AppState::paid_order(&elsewhere, &conversation, &order),
             None,
             "an order that does not verify under this store's owner is not theirs here"
+        );
+    }
+
+    /// **An unread record is never "Clean record"** (review round 1 of
+    /// #143, P1-5): loading, not found and unavailable each say so, and only
+    /// a record that was read with nothing counted is clean. A NotFound or a
+    /// failed fetch after the record was read does not un-read it. Red if
+    /// the badge ignores the load state or the reputation arm stops marking
+    /// the record read.
+    #[test]
+    fn an_unread_record_is_never_a_clean_record() {
+        for (state, text) in [
+            (RecordLoad::Loading, "Record loading"),
+            (RecordLoad::NotFound, "No record found"),
+            (RecordLoad::Unavailable, "Record unavailable"),
+            (RecordLoad::Loaded, "Clean record"),
+        ] {
+            assert_eq!(state.badge(0).1, text);
+        }
+        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaint(s)");
+        assert_eq!(RecordLoad::default(), RecordLoad::Loading);
+
+        let (mut state, _) = a_paid_purchase();
+        let record = vec![0x77u8; 32];
+        state
+            .reputation_to_store
+            .insert(record.clone(), STORE.to_vec());
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Loading);
+        state.on_record_unavailable(&record);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Unavailable);
+        state.on_record_absent(&record);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::NotFound);
+        // The record arrives: read.
+        let bytes =
+            harvest_common::to_cbor(&harvest_common::reputation::ReputationStateV1::default())
+                .unwrap();
+        state.on_contract_state(record.clone(), bytes);
+        assert_eq!(state.browsing_stores[STORE].record, RecordLoad::Loaded);
+        state.on_record_absent(&record);
+        state.on_record_unavailable(&record);
+        assert_eq!(
+            state.browsing_stores[STORE].record,
+            RecordLoad::Loaded,
+            "a later NotFound or failure does not un-read it"
         );
     }
 

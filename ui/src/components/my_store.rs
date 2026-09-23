@@ -718,7 +718,7 @@ enum StoreDetailsAction {
 /// network call, no vault prompt, and no notification -- indistinguishable
 /// from the button being broken, and exactly what was reported in #78.
 ///
-/// Every other gap (`NeverPublished`, `NoName`, `NoReputationLink`) needs the
+/// Every other gap (`NeverPublished`, `NoName`) needs the
 /// seller to actually provide something -- at minimum a store name -- so
 /// those still open the form, as does an ordinary "Edit details" click
 /// (`gap` is `None`).
@@ -1211,7 +1211,6 @@ mod store_details_button_tests {
         for gap in [
             StoreDetailsGap::NeverPublished,
             StoreDetailsGap::NoName,
-            StoreDetailsGap::NoReputationLink,
         ] {
             assert_eq!(
                 store_details_button_action(Some(gap), false),
@@ -1253,7 +1252,6 @@ mod store_details_button_tests {
             None,
             Some(StoreDetailsGap::NeverPublished),
             Some(StoreDetailsGap::NoName),
-            Some(StoreDetailsGap::NoReputationLink),
             Some(StoreDetailsGap::NoEncryptionKey),
         ] {
             assert_eq!(

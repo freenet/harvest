@@ -141,6 +141,12 @@ fn handle_contract_response(response: ContractResponse) {
             APP_STATE
                 .write()
                 .on_address_reuse_absent(instance_id.as_bytes());
+            // And to a store's reputation record, so the store page says
+            // "no record found" rather than "Clean record" (#143 review
+            // round 1, P1-5). Only a record id matches, so any other
+            // contract's NotFound passes through untouched.
+            #[cfg(target_arch = "wasm32")]
+            APP_STATE.write().on_record_absent(instance_id.as_bytes());
 
             // Nothing else acts on it. `AppState` already has a
             // `store_state_unavailable` set that this could feed, and feeding
@@ -368,6 +374,10 @@ fn follow_reputation_link(_reputation_id: Vec<u8>) {
             let contract_id = freenet_stdlib::prelude::ContractInstanceId::new(id_bytes);
             if let Err(e) = super::get_contract(&contract_id, true).await {
                 error!("Failed to subscribe to reputation contract: {}", e);
+                // Said on the store page rather than read as a clean record
+                // (P1-5).
+                use dioxus::prelude::WritableExt;
+                APP_STATE.write().on_record_unavailable(&reputation_id);
             }
         });
     }
