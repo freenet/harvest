@@ -162,10 +162,8 @@ pub fn mailbox_lineage() -> &'static [ContractLineageEntry] {
 
 /// Superseded generations of the Ghost Key index contract, oldest first.
 ///
-/// Empty: the index is new in harvest#93 phase 1c, so no earlier generation
-/// was ever published (see `legacy/index_contract.toml`). The probe is wired
-/// all the same, so the re-key that first supersedes it only has to append a
-/// row.
+/// The index is new in harvest#93 phase 1c; its first superseded generation
+/// is harvest#53 Phase B's (see `legacy/index_contract.toml`).
 pub fn index_lineage() -> &'static [ContractLineageEntry] {
     index_gen::LEGACY_INDEX_CONTRACT
 }
@@ -2092,6 +2090,7 @@ mod uncarried_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         };
         let message = harvest_common::to_cbor(&order).expect("serialize");

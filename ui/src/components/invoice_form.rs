@@ -149,6 +149,12 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                 order_id: order.order.id.clone(),
                             }
                         }
+                        if order.status == harvest_common::payment::OrderStatus::Paid {
+                            MarkDespatched {
+                                store_contract_id: store_contract_id.clone(),
+                                order_id: order.order.id.clone(),
+                            }
+                        }
                     }
                 }
             }
@@ -232,6 +238,99 @@ fn CancelInvoice(
                     confirming.set(true);
                 },
                 "Cancel invoice"
+            }
+        }
+    }
+}
+
+/// The seller's control to record that a paid order has been sent
+/// (harvest#53 Phase B).
+///
+/// Two steps, like the cancel, because the record is public and permanent.
+/// Hidden once the store holds a despatch for the order: the card's stage
+/// line then says so.
+#[component]
+fn MarkDespatched(
+    store_contract_id: Vec<u8>,
+    order_id: harvest_common::payment::OrderId,
+) -> Element {
+    let mut confirming = use_signal(|| false);
+    let mut problem = use_signal(|| Option::<String>::None);
+    let (recorded, pending, sent, refusal) = {
+        let state = APP_STATE.read();
+        (
+            state
+                .browsing_stores
+                .get(&store_contract_id)
+                .is_some_and(|store| store.despatches.contains_key(&order_id)),
+            state.despatch_pending(&order_id),
+            state.despatches_sent.contains(&order_id),
+            state.despatch_refusal(&store_contract_id, &order_id),
+        )
+    };
+    let short = order_id.short();
+
+    if recorded {
+        return rsx! {};
+    }
+    if pending {
+        return rsx! {
+            p { class: "text-muted", "Recording the despatch of order {short}\u{2026}" }
+        };
+    }
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Despatch of order {short} sent. It shows here once the store has it."
+            }
+        };
+    }
+    // Said instead of a button that would refuse when pressed: no store key
+    // on this device, or no chain data recent enough to anchor it.
+    if let Some(why) = refusal {
+        return rsx! {
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "Order {short} cannot be marked despatched yet: {why}"
+            }
+        };
+    }
+    rsx! {
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        if confirming() {
+            p { class: "text-warning",
+                "Mark order {short} as despatched? This is public and cannot be undone. Only "
+                "do it once the goods are on their way."
+            }
+            button {
+                class: "btn btn-sm btn-primary",
+                onclick: {
+                    let store_contract_id = store_contract_id.clone();
+                    let order_id = order_id.clone();
+                    move |_| {
+                        confirming.set(false);
+                        let result = APP_STATE
+                            .write()
+                            .despatch_order(&store_contract_id, &order_id);
+                        problem.set(result.err());
+                    }
+                },
+                "Yes, it has been sent"
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| confirming.set(false),
+                "Not yet"
+            }
+        } else {
+            button {
+                class: "btn btn-sm btn-primary",
+                onclick: move |_| {
+                    problem.set(None);
+                    confirming.set(true);
+                },
+                "Mark despatched"
             }
         }
     }
@@ -526,6 +625,10 @@ fn InvoiceForm(
                             // is what this form is for.
                             reply_to: None,
                             order_binding: None,
+                            // Nor a buyer's receipt key (harvest#53 Phase B):
+                            // no buyer asked, so nobody can cancel it but the
+                            // seller or complain about it.
+                            buyer_receipt_key: None,
                         });
                         amount.set(String::new());
                         buyer.set(String::new());
@@ -601,6 +704,7 @@ mod tests {
                 anchor: None,
                 order_binding: None,
                 listing_tag: None,
+                buyer_receipt_key: None,
                 created_at,
             }
             .with_derived_id(),

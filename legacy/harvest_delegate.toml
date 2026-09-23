@@ -182,3 +182,10 @@ description = "Superseded by harvest#138. V19 is the generation #135 (harvest#12
 date = "2026-09-22"
 code_hash = "29b781b43ee9ad30a0b151fd2db719cf909179994bb6ac577bdca6608005560d"
 delegate_key = "7811d1a63c2f905f17d6c238df8836d78dc98ac44467508c45398c61ad77a28a"
+
+[[entry]]
+version = "V20"
+description = "Superseded by harvest#53 Phase B (the buyer's receipt key, the buyer's cancel and the seller's despatch), which changed `harvest-common`: `Order` gained `buyer_receipt_key`, `AuthorizedOrder::verify` accepts a `Cancelled` signed by it, `StoreStateV1` gained `fulfilment`, `classify_store_key_message` gained `Despatch`, and `RecalledConversation` gained `buyer_receipt_seed`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This delegate's did too: it signs a `Despatch` with the store key (`SignStoreUpdate`), and a recalled buyer conversation now carries `buyer_receipt_seed`, derived from the stored conversation secret, so the buyer can sign a cancel after a reload. No request, response or secret family was added or removed, and the parameters are unchanged (empty). V20 is the generation harvest#138 shipped (`99bbd59`): its `StoreList` names the store keys it holds (`held_store_keys`), and it answers an export request and imports a predecessor's, so its secrets, including registrations carried from V19 and V18, are carried forward by `ui/src/delegate_migrate.rs`."
+date = "2026-09-23"
+code_hash = "9917c1fbad0ed1754d25f318b8c3384db327d389219c2ed715bc5f7e4343b6c1"
+delegate_key = "e3a063b5723b1fc82466b541d8725644197121520640575962d12f4ddd9a1fc4"

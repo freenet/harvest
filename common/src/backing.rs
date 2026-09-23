@@ -603,6 +603,8 @@ pub enum StoreKeyMessage {
     Closure,
     /// A wrapped copy of the store key (harvest#93 phase 1b).
     Copy,
+    /// The seller's statement that an order was sent (harvest#53 Phase B).
+    Despatch,
 }
 
 /// Which kind of store-key message `payload` is, or `None` if it is none of
@@ -633,6 +635,8 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
         Some(StoreKeyMessage::Closure)
     } else if is::<crate::custody::StoreKeyCopy>(payload) {
         Some(StoreKeyMessage::Copy)
+    } else if is::<crate::fulfilment::Despatch>(payload) {
+        Some(StoreKeyMessage::Despatch)
     } else {
         None
     }
@@ -1961,6 +1965,19 @@ mod tests {
                 .unwrap()
             ),
             Some(StoreKeyMessage::Closure)
+        );
+        // A despatch (harvest#53 Phase B): without this the delegate refuses
+        // to sign one, and the seller's despatch control fails every time.
+        let despatch = crate::fulfilment::Despatch {
+            order_id: crate::payment::OrderId([9u8; 32]),
+            anchor: freenet_bitcoin_common::BlockAnchor {
+                height: 800_000,
+                hash: freenet_bitcoin_common::BlockHash([4u8; 32]),
+            },
+        };
+        assert_eq!(
+            classify_store_key_message(&crate::to_cbor(&despatch).unwrap()),
+            Some(StoreKeyMessage::Despatch)
         );
         // A bare backing statement is the GHOST KEY's message. The contract
         // verifies it against the backer, so a store-key signature over it

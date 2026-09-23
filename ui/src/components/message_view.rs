@@ -905,6 +905,7 @@ fn Conversation(
                     listing_id: request.listing_id.clone(),
                     listing_title: request.listing_title.clone(),
                     order_binding: request.order_binding,
+                    buyer_receipt_key: request.buyer_receipt_key,
                     quantity: request.quantity,
                 }
             }
@@ -1004,9 +1005,9 @@ fn attribution(
 
 /// The request to buy this conversation is waiting on, if any.
 ///
-/// Newest first, so a buyer who asked twice gets the second ask acted on
-/// rather than the first. `entries` is a seller's own inbox view, which
-/// `mailbox_entries` returns newest-first.
+/// `entries` is a seller's own inbox view, which `mailbox_entries` returns
+/// newest first. The result is ordered by content digest (see the end of the
+/// function for why).
 ///
 /// # Why direction is not checked here, and where it IS
 ///
@@ -1039,9 +1040,11 @@ fn unanswered_requests(
                     listing_id,
                     quantity,
                     order_binding,
+                    buyer_receipt_key,
                     ..
                 },
             digest,
+            timestamp,
             ..
         } = entry
         else {
@@ -1049,16 +1052,57 @@ fn unanswered_requests(
         };
         // Already answered, decided from the seller's OWN published state
         // rather than from anything in the mailbox: an order carrying this
-        // request's binding and this listing's tag is the answer to it, and
-        // the buyer can neither forge nor withdraw one. The tag stands in for
-        // the listing id orders no longer publish (harvest#57); only this
-        // conversation's keys can compute it.
+        // request's binding and this listing's tag is the answer to it. The
+        // buyer cannot forge one. The tag stands in for the listing id orders
+        // no longer publish (harvest#57); only this conversation's keys can
+        // compute it.
         let answered = keys.is_some_and(|keys| {
             let tag = keys.listing_tag(listing_id);
-            published.iter().any(|order| {
-                order.order.order_binding == Some(*order_binding)
-                    && order.order.listing_tag == Some(tag)
-            })
+            let answers: Vec<&harvest_common::payment::AuthorizedOrder> = published
+                .iter()
+                .filter(|order| {
+                    order.order.order_binding == Some(*order_binding)
+                        && order.order.listing_tag == Some(tag)
+                        // A request carrying the buyer's receipt key
+                        // (harvest#53 Phase B) is answered only by an order
+                        // carrying THAT key: an order without it is one the
+                        // buyer refuses to pay (`CommitmentLacksBuyerKey`),
+                        // and the buyer is told to send the request again.
+                        && (buyer_receipt_key.is_none()
+                            || order.order.buyer_receipt_key == *buyer_receipt_key)
+                })
+                .collect();
+            if answers
+                .iter()
+                .any(|order| order.status != harvest_common::payment::OrderStatus::Cancelled)
+            {
+                return true;
+            }
+            // Only CANCELLED answers. The buyer can now withdraw one (the
+            // buyer cancel, harvest#53 Phase B), and "cancel it and ask
+            // again" is the ordinary way to put a mistake right -- but the
+            // binding, the tag and the key are all fixed per conversation, so
+            // the cancelled order matches the new request exactly as it
+            // matched the old one. Nothing published says WHICH ask an order
+            // answered (an order carries no quantity and no request digest),
+            // so the ask is placed in time instead: a cancelled order answers
+            // every ask made up to the moment the seller issued it (its
+            // signed `created_at`), and an ask made after the newest
+            // cancelled answer is waiting. That holds however the seller
+            // chose among several asks, and however often one was resent
+            // (round 4 of harvest#136: an earlier count of distinct asks
+            // against cancelled orders re-offered a withdrawn request
+            // whenever the seller had not answered oldest first).
+            //
+            // The ask's time is the writer's own timestamp, so a buyer can
+            // only move their own asks. A buyer whose clock runs behind the
+            // seller's by more than the time between the seller issuing and
+            // the buyer asking again is not surfaced until they ask later.
+            answers
+                .iter()
+                .map(|order| order.order.created_at)
+                .max()
+                .is_some_and(|issued| *timestamp <= issued)
         });
         if answered {
             continue;
@@ -1066,10 +1110,11 @@ fn unanswered_requests(
         // One control per distinct request. Two identical requests are one
         // ask repeated, and offering the seller two controls for it would
         // invite two published debts for one order.
-        if requests
-            .iter()
-            .any(|held| held.listing_id == *listing_id && held.quantity == *quantity)
-        {
+        if requests.iter().any(|held| {
+            held.listing_id == *listing_id
+                && held.quantity == *quantity
+                && held.buyer_receipt_key == *buyer_receipt_key
+        }) {
             continue;
         }
         requests.push(PendingRequest {
@@ -1081,9 +1126,24 @@ fn unanswered_requests(
                 .unwrap_or_default(),
             quantity: *quantity,
             order_binding: *order_binding,
+            buyer_receipt_key: *buyer_receipt_key,
             digest: *digest,
         });
     }
+    // An unkeyed request with a keyed twin (same listing, quantity and
+    // binding: a buyer's resend from a build that carries the receipt key,
+    // harvest#53 Phase B) is one ask, not two. Only the keyed one is offered:
+    // accepting the unkeyed one would publish an order the buyer refuses to
+    // pay, and the keyed control would then invite a second debt.
+    let keyed: Vec<(harvest_common::listing::ListingId, u32, [u8; 32])> = requests
+        .iter()
+        .filter(|r| r.buyer_receipt_key.is_some())
+        .map(|r| (r.listing_id.clone(), r.quantity, r.order_binding))
+        .collect();
+    requests.retain(|r| {
+        r.buyer_receipt_key.is_some()
+            || !keyed.contains(&(r.listing_id.clone(), r.quantity, r.order_binding))
+    });
     // Ordered by the entry's own content digest, NOT by the timestamp
     // `entries` arrives in. That timestamp is chosen by whoever wrote the
     // message and signed by nobody -- `read_mailbox` says so where it sorts
@@ -1112,6 +1172,9 @@ struct PendingRequest {
     listing_title: String,
     quantity: u32,
     order_binding: [u8; 32],
+    /// The buyer's receipt key from the request (harvest#53 Phase B), copied
+    /// into the commitment the same way `order_binding` is.
+    buyer_receipt_key: Option<[u8; 32]>,
     /// `harvest_common::mailbox::entry_digest` of the message this came from.
     ///
     /// Used to order the controls deterministically without consulting a
@@ -1284,6 +1347,7 @@ mod inbox_tests {
                 shipping: "12 Example St".into(),
                 note: String::new(),
                 order_binding: BINDING,
+                buyer_receipt_key: None,
             },
             digest,
         )
@@ -1314,6 +1378,7 @@ mod inbox_tests {
                 anchor: None,
                 order_binding: binding,
                 listing_tag: tag,
+                buyer_receipt_key: None,
                 created_at,
             },
             scoped_payload: Vec::new(),
@@ -1404,8 +1469,9 @@ mod inbox_tests {
     /// two cards they could reasonably pay both of.
     ///
     /// "Answered" is decided from the seller's OWN published state, which the
-    /// buyer can neither forge nor withdraw: an order carrying this request's
-    /// binding and this listing's tag. Not from the mailbox, where the seller's
+    /// buyer cannot forge: an order carrying this request's binding and this
+    /// listing's tag. (The buyer CAN withdraw one by cancelling it; see
+    /// `a_request_after_a_cancelled_answer_is_offered_again`.) Not from the mailbox, where the seller's
     /// acceptance can be lost or evicted.
     #[test]
     fn a_request_already_answered_is_not_offered_again() {
@@ -1429,6 +1495,167 @@ mod inbox_tests {
             .is_empty(),
             "an order carrying this request's binding and listing tag IS the answer to it"
         );
+    }
+
+    /// harvest#53 Phase B: a request carrying the buyer's receipt key is
+    /// answered only by an order carrying that key. An order without it is
+    /// one the buyer refuses to pay, and the buyer is told to send the request
+    /// again, so the seller must be offered the control for the keyed resend;
+    /// and a keyed request is not folded into an unkeyed one.
+    #[test]
+    fn a_keyed_request_is_answered_only_by_an_order_carrying_its_key() {
+        let id = ListingId([9u8; 32]);
+        let key = [0x33; 32];
+        let keyed = |digest: [u8; 32]| {
+            readable(
+                MessageContent::OrderRequest {
+                    listing_id: id.clone(),
+                    quantity: 1,
+                    shipping: "12 Example St".into(),
+                    note: String::new(),
+                    order_binding: BINDING,
+                    buyer_receipt_key: Some(key),
+                },
+                digest,
+            )
+        };
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let tag = keys().listing_tag(&id);
+        let unkeyed_order = published(7, Some(BINDING), Some(tag));
+        let mut keyed_order = published(8, Some(BINDING), Some(tag));
+        keyed_order.order.buyer_receipt_key = Some(key);
+
+        let open = unanswered_requests(
+            &[keyed([2u8; 32])],
+            &listings,
+            std::slice::from_ref(&unkeyed_order),
+            Some(&keys()),
+        );
+        assert_eq!(open.len(), 1, "an order without the key does not answer it");
+        assert_eq!(open[0].buyer_receipt_key, Some(key));
+        assert!(unanswered_requests(
+            &[keyed([2u8; 32])],
+            &listings,
+            &[unkeyed_order, keyed_order],
+            Some(&keys())
+        )
+        .is_empty());
+
+        // The old unkeyed request and the keyed resend are ONE ask, offered
+        // as the keyed request, in either order.
+        for entries in [
+            [request(id.clone(), 1, [1u8; 32]), keyed([2u8; 32])],
+            [keyed([2u8; 32]), request(id.clone(), 1, [1u8; 32])],
+        ] {
+            let one = unanswered_requests(&entries, &listings, &[], Some(&keys()));
+            assert_eq!(one.len(), 1);
+            assert_eq!(one[0].buyer_receipt_key, Some(key));
+        }
+        // A different quantity is a different ask.
+        let two = unanswered_requests(
+            &[request(id.clone(), 2, [1u8; 32]), keyed([2u8; 32])],
+            &listings,
+            &[],
+            Some(&keys()),
+        );
+        assert_eq!(two.len(), 2);
+    }
+
+    /// **A buyer who cancels and asks again reaches the seller** (rounds 3
+    /// and 4 of harvest#136).
+    ///
+    /// The binding, the listing tag and the receipt key are all fixed per
+    /// conversation, so a cancelled order matches every later request for the
+    /// same listing in that conversation. An order that is not cancelled
+    /// answers every ask; a cancelled one answers the asks made up to when
+    /// the seller issued it, whichever of them the seller chose and however
+    /// often one was resent; an ask made after the newest cancelled answer is
+    /// waiting.
+    #[test]
+    fn a_request_after_a_cancelled_answer_is_offered_again() {
+        use harvest_common::payment::OrderStatus::{AwaitingPayment, Cancelled, Paid};
+        let id = ListingId([9u8; 32]);
+        let key = [0x33; 32];
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).expect("timestamp");
+        let ask = |quantity: u32, digest: u8, when: i64| {
+            let mut entry = readable(
+                MessageContent::OrderRequest {
+                    listing_id: id.clone(),
+                    quantity,
+                    shipping: "12 Example St".into(),
+                    note: String::new(),
+                    order_binding: BINDING,
+                    buyer_receipt_key: Some(key),
+                },
+                [digest; 32],
+            );
+            if let MailboxEntry::Readable { timestamp, .. } = &mut entry {
+                *timestamp = at(when);
+            }
+            entry
+        };
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let tag = keys().listing_tag(&id);
+        let order = |n: u8, status, issued: i64| {
+            let mut order = published(n, Some(BINDING), Some(tag));
+            order.order.buyer_receipt_key = Some(key);
+            order.order.created_at = at(issued);
+            order.status = status;
+            order
+        };
+        let open = |entries: &[MailboxEntry],
+                    orders: &[harvest_common::payment::AuthorizedOrder]| {
+            unanswered_requests(entries, &listings, orders, Some(&keys()))
+                .iter()
+                .map(|r| r.digest[0])
+                .collect::<Vec<u8>>()
+        };
+        let cancelled_at_200 = [order(7, Cancelled, 200)];
+
+        // Asked, answered, cancelled: answered -- including an ask stamped in
+        // the very second the order was issued.
+        assert_eq!(open(&[ask(1, 1, 100)], &cancelled_at_200), Vec::<u8>::new());
+        assert_eq!(open(&[ask(1, 1, 200)], &cancelled_at_200), Vec::<u8>::new());
+        assert_eq!(open(&[ask(1, 1, 201)], &cancelled_at_200), vec![1]);
+        // A resend before the answer (a fresh digest, as every real resend
+        // has) is answered by it too.
+        assert_eq!(
+            open(&[ask(1, 2, 150), ask(1, 1, 100)], &cancelled_at_200),
+            Vec::<u8>::new()
+        );
+        // Two different asks, the seller answering the NEWER one: both are
+        // answered, so the one the buyer just withdrew is not offered again.
+        assert_eq!(
+            open(&[ask(2, 2, 110), ask(1, 1, 100)], &cancelled_at_200),
+            Vec::<u8>::new()
+        );
+
+        // Asked again after the cancel (newest first): the new ask waits,
+        // the old one does not.
+        let again = [ask(2, 3, 300), ask(1, 1, 100)];
+        assert_eq!(open(&again, &cancelled_at_200), vec![3]);
+        let found = unanswered_requests(&again, &listings, &cancelled_at_200, Some(&keys()));
+        assert_eq!(found[0].quantity, 2);
+
+        // Answered again, however the new order stands.
+        for status in [AwaitingPayment, Paid, Cancelled] {
+            assert_eq!(
+                open(&again, &[order(7, Cancelled, 200), order(8, status, 400)]),
+                Vec::<u8>::new(),
+                "{status:?}"
+            );
+        }
+        // An order that is not cancelled answers every ask, even one made
+        // after it was issued: a second debt for one purchase is the worse
+        // mistake.
+        assert_eq!(
+            open(&again, &[order(8, AwaitingPayment, 200)]),
+            Vec::<u8>::new()
+        );
+        // A cancelled answer for ANOTHER listing answers nothing here.
+        let mut elsewhere = order(7, Cancelled, 400);
+        elsewhere.order.listing_tag = Some(keys().listing_tag(&ListingId([8u8; 32])));
+        assert_eq!(open(&[ask(1, 1, 100)], &[elsewhere]), vec![1]);
     }
 
     /// **Nothing short of that answers the request.**

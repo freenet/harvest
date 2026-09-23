@@ -176,6 +176,21 @@ pub enum MessageContent {
         /// compares against what their own node derives. See
         /// `state::AppState::payment_blockers`.
         order_binding: [u8; 32],
+        /// The key the seller must sign into the commitment so the buyer can
+        /// later act on the order themselves: cancel it before paying, or
+        /// complain after (harvest#53 Phase B). The verifying half of
+        /// [`harvest_common::mailbox::buyer_receipt_seed_from_secret`] over
+        /// this conversation's secret.
+        ///
+        /// Checked the same way as `order_binding`: the buyer compares the
+        /// published commitment against what their OWN node derives, never
+        /// against this field.
+        ///
+        /// `serde(default)` so a request sealed by an earlier build still
+        /// opens; it comes back `None`, and a commitment answering it carries
+        /// no buyer key, which the buyer then refuses to pay.
+        #[serde(default)]
+        buyer_receipt_key: Option<[u8; 32]>,
     },
     /// The seller has published the order commitment for a request, and this
     /// is its id.
@@ -315,6 +330,23 @@ pub struct BuyerConversation {
     /// under, or the delegate answers that it holds no such conversation.
     /// `None` for one kept under the store's current id.
     pub kept_under: Option<Vec<u8>>,
+    /// The seed of the key this buyer signs with for orders in this
+    /// conversation (harvest#53 Phase B), derived like `order_binding`:
+    /// here from the secret when opened, and by the delegate on recall.
+    /// All-zeros from a delegate that predates the field means none. A
+    /// secret, so it prints as `redacted` ([`ReceiptSeed`]).
+    receipt_seed: ReceiptSeed,
+}
+
+/// The buyer's receipt-key seed (harvest#53 Phase B). A secret -- it signs
+/// for the buyer -- so `Debug` never prints it, like [`ConversationKeys`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReceiptSeed([u8; 32]);
+
+impl std::fmt::Debug for ReceiptSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReceiptSeed(redacted)")
+    }
 }
 
 impl BuyerConversation {
@@ -358,6 +390,9 @@ impl BuyerConversation {
             kept: false,
             order_binding: harvest_common::mailbox::order_binding_from_secret(&secret.to_bytes()),
             kept_under: None,
+            receipt_seed: ReceiptSeed(harvest_common::mailbox::buyer_receipt_seed_from_secret(
+                &secret.to_bytes(),
+            )),
         })
     }
 
@@ -389,12 +424,33 @@ impl BuyerConversation {
             // conversation in that state. See `usable_order_binding`.
             order_binding: recalled.order_binding,
             kept_under: None,
+            // Carried for the same reason: the secret stayed in the delegate.
+            receipt_seed: ReceiptSeed(recalled.buyer_receipt_seed),
         }
     }
 
     /// The value a commitment must carry to be this buyer's.
     pub fn order_binding(&self) -> [u8; 32] {
         self.order_binding
+    }
+
+    /// The key this buyer signs with for orders in this conversation, or
+    /// `None` when there is none: a recalled conversation whose delegate
+    /// answered no seed (all-zeros, the `serde(default)` of an older
+    /// delegate). All-zeros is refused rather than used, because it is a
+    /// seed ANYONE can derive the key of, and a seller who signed its public
+    /// half into an order could then sign as "the buyer".
+    pub fn receipt_signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
+        (self.receipt_seed.0 != [0u8; 32])
+            .then(|| ed25519_dalek::SigningKey::from_bytes(&self.receipt_seed.0))
+    }
+
+    /// The verifying half of [`Self::receipt_signing_key`]: what a
+    /// commitment must carry as `buyer_receipt_key` to be payable by this
+    /// buyer.
+    pub fn buyer_receipt_key(&self) -> Option<[u8; 32]> {
+        self.receipt_signing_key()
+            .map(|key| key.verifying_key().to_bytes())
     }
 
     /// The tag an order this conversation asked for carries, for `listing`.
@@ -515,6 +571,7 @@ impl BuyerConversation {
                 shipping,
                 note,
                 order_binding: self.order_binding,
+                buyer_receipt_key: self.buyer_receipt_key(),
             },
         )
     }
@@ -1864,6 +1921,25 @@ mod buy_flow_tests {
     /// second channel. The seller here is reconstructed from nothing but an
     /// X25519 secret, which is all the harvest delegate holds, so a pass
     /// cannot come from the two halves of this module drifting together.
+    /// The buyer's receipt seed signs for the buyer, so neither it nor the
+    /// conversation that holds it prints it (harvest#53 Phase B).
+    #[test]
+    fn the_receipt_seed_does_not_print_itself() {
+        let secret = [0xA7u8; 32];
+        let seller = Seller::new(31);
+        let buyer = BuyerConversation::opened_from_secret_for_test(&secret, &seller.public_key())
+            .expect("open");
+        let seed = harvest_common::mailbox::buyer_receipt_seed_from_secret(&secret);
+        let printed = format!("{buyer:?}");
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let as_array = format!("{:?}", seed);
+        assert!(printed.contains("ReceiptSeed(redacted)"), "{printed}");
+        assert!(
+            !printed.contains(&hex) && !printed.contains(&as_array),
+            "{printed}"
+        );
+    }
+
     #[test]
     fn a_buyers_order_request_reaches_the_seller_intact() {
         let seller = Seller::new(31);
@@ -1884,6 +1960,7 @@ mod buy_flow_tests {
                         shipping,
                         note,
                         order_binding,
+                        buyer_receipt_key,
                     },
                 ..
             } => {
@@ -1895,6 +1972,17 @@ mod buy_flow_tests {
                 // and nobody else's -- see
                 // `harvest_common::mailbox::order_binding_from_secret`.
                 assert_eq!(order_binding, &buyer.order_binding());
+                // And the key the buyer will sign with (harvest#53 Phase B),
+                // which is the shared derivation over this conversation's
+                // secret.
+                let expected = ed25519_dalek::SigningKey::from_bytes(
+                    &harvest_common::mailbox::buyer_receipt_seed_from_secret(
+                        &buyer.secret_for_test(),
+                    ),
+                )
+                .verifying_key()
+                .to_bytes();
+                assert_eq!(buyer_receipt_key, &Some(expected));
             }
             other => panic!("expected an order request, got {other:?}"),
         }

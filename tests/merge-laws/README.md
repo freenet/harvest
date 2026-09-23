@@ -49,7 +49,7 @@ that would re-key an artifact as a side effect of running the test tooling.
 
 The family names the generator takes (`store`, `claim`, `triad`, `triadcap`,
 `reputation`, `mailbox`, `review`, `rr`, `backing`, `review98`, `index`,
-`copies`, `retire98`) are not the same as the corpus names the runner takes; one
+`copies`, `retire98`, `fulfilment`) are not the same as the corpus names the runner takes; one
 family writes several corpora.
 
 ## Two ways this sweep has lied

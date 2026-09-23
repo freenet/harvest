@@ -468,6 +468,34 @@ pub fn order_binding_from_secret(conversation_secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("harvest/order-binding/v1", conversation_secret)
 }
 
+/// The Ed25519 SEED of the key a buyer signs with for orders in this
+/// conversation (harvest#53 Phase B): its verifying half goes into
+/// [`crate::payment::Order::buyer_receipt_key`], and the buyer signs a cancel
+/// of an unpaid order, and later a complaint, with it.
+///
+/// A secret, unlike [`order_binding_from_secret`]'s commitment: it signs for
+/// the buyer. It is derived under its own context string, so it reveals
+/// nothing about the conversation secret, the direction keys or the binding,
+/// and none of them reveals it.
+///
+/// # Why derived, and why here
+///
+/// Derived from the conversation secret so it exists wherever the
+/// conversation does, including after a reload, when the browser no longer
+/// holds the secret and the harvest delegate answers it from its stored copy
+/// (`RecalledConversation::buyer_receipt_seed`). No new secret has to be
+/// stored, backed up or migrated. In `harvest-common` for the same reason as
+/// the binding above: two derivations that disagree fail silently, so both
+/// sides call this one.
+///
+/// One key per CONVERSATION, as with the binding: two orders in one thread
+/// share it, which links them only as the binding already does. Every
+/// message it signs names the order id, so a signature for one order is not
+/// a signature for another.
+pub fn buyer_receipt_seed_from_secret(conversation_secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("harvest/buyer-receipt-key/v1", conversation_secret)
+}
+
 /// Which listing an order is for, as a published order carries it: a keyed
 /// digest only the order's two parties can compute or check (harvest#57).
 ///
@@ -1141,6 +1169,26 @@ mod tests {
         assert_eq!(
             order_binding_from_secret(&[7u8; 32]),
             hex_literal("481d7cec78bd2c8dd0f83bef532c333c639066576ff34e25fd564e2c38a7e260"),
+        );
+    }
+
+    /// **The buyer receipt key derivation is pinned** (harvest#53 Phase B).
+    ///
+    /// Expected value from `b3sum --derive-key "harvest/buyer-receipt-key/v1"`
+    /// over 32 bytes of `0x07`, not from this function. The browser derives it
+    /// from a fresh secret and the delegate from its stored copy, and a silent
+    /// disagreement would leave a buyer unable to cancel or complain after a
+    /// reload.
+    #[test]
+    fn the_buyer_receipt_seed_derivation_is_pinned() {
+        assert_eq!(
+            buyer_receipt_seed_from_secret(&[7u8; 32]),
+            hex_literal("7490743e62993475079e6791c61161a5c80ee70a7c60b1b5bef883c31e17e15a"),
+        );
+        assert_ne!(
+            buyer_receipt_seed_from_secret(&[7u8; 32]),
+            order_binding_from_secret(&[7u8; 32]),
+            "the signing seed must not be the published binding"
         );
     }
 

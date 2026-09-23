@@ -609,6 +609,11 @@ fn recall(record: &BuyerConversationRecord) -> Option<RecalledConversation> {
         // seller cannot compute it, and the shared secret is a value the
         // seller holds.
         order_binding: harvest_common::mailbox::order_binding_from_secret(&record.secret.0),
+        // From the stored secret too, for the same reason: a key the seller
+        // could derive would let the seller sign as the buyer.
+        buyer_receipt_seed: harvest_common::mailbox::buyer_receipt_seed_from_secret(
+            &record.secret.0,
+        ),
         created_at: record.created_at,
         imported: record.imported,
         backed_up: record.backed_up,
@@ -1420,6 +1425,29 @@ mod buyer_conversation_tests {
             harvest_common::mailbox::order_binding_from_secret(&shared),
             "the seller must not be able to compute a buyer's binding"
         );
+    }
+
+    /// **Recall answers the buyer's receipt seed from the stored secret**
+    /// (harvest#53 Phase B), the same derivation the browser runs when it
+    /// opens the conversation, and not one the seller can compute. A drift
+    /// here leaves a returning buyer unable to cancel or complain, silently.
+    #[test]
+    fn recall_answers_the_receipt_seed_the_shared_derivation_gives() {
+        let opened = open(12);
+        let back = recall(&opened.record).expect("a usable record recalls");
+        assert_eq!(
+            back.buyer_receipt_seed,
+            harvest_common::mailbox::buyer_receipt_seed_from_secret(&opened.record.secret.0)
+        );
+        let shared = StaticSecret::from(opened.record.secret.0)
+            .diffie_hellman(&PublicKey::from(opened.record.seller_public_key))
+            .to_bytes();
+        assert_ne!(
+            back.buyer_receipt_seed,
+            harvest_common::mailbox::buyer_receipt_seed_from_secret(&shared),
+            "the seller must not be able to compute a buyer's signing key"
+        );
+        assert_ne!(back.buyer_receipt_seed, back.order_binding);
     }
 
     /// **Two buyers of the same seller get different bindings.**

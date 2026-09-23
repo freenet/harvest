@@ -118,6 +118,27 @@ fn orders_delta_bytes(
     .map_err(|e| format!("serialize order delta: {e}"))
 }
 
+/// Bytes of a store-contract delta carrying one despatch AND the order it is
+/// for (harvest#53 Phase B).
+///
+/// The order rides along so a replica that has not yet seen it keeps the
+/// despatch: the store drops a despatch whose order it does not hold
+/// (`StoreStateV1::normalize_fulfilment`), and a despatch sent alone to such
+/// a replica would wait for the next summary exchange to come back.
+fn despatch_delta_bytes(
+    owner: ed25519_dalek::VerifyingKey,
+    order: harvest_common::payment::AuthorizedOrder,
+    despatch: harvest_common::fulfilment::AuthorizedDespatch,
+) -> Result<Vec<u8>, String> {
+    harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
+        orders: Some(vec![order]),
+        fulfilment: Some(vec![despatch]),
+        ..Default::default()
+    })
+    .map_err(|e| format!("serialize despatch delta: {e}"))
+}
+
 /// Bytes of a store-contract delta carrying only the store's own details.
 fn store_info_delta_bytes(
     owner: ed25519_dalek::VerifyingKey,
@@ -526,12 +547,70 @@ fn settlement_store_key(
     }
 }
 
-/// Publish a settled order -- the `Paid` transition -- to its store contract.
+/// Whether `order` may be published by a party that does not hold the store
+/// key: a `Paid` settlement (authorized by its evidence, harvest#75), or a
+/// `Cancelled` record the order's BUYER signed with their receipt key
+/// (harvest#53 Phase B). Anything else is refused before it is sent.
+///
+/// The buyer's cancel is checked in full against `owner`, the key the delta
+/// names, and refused unless it is the buyer's signature rather than the
+/// store key's: a seller's cancel is sent through [`submit_order_by_id`], so
+/// a store-key-signed record arriving here means a caller is on the wrong
+/// path, and saying so beats sending it quietly.
+pub(crate) fn keyless_publishable(
+    order: &harvest_common::payment::AuthorizedOrder,
+    owner: &ed25519_dalek::VerifyingKey,
+) -> Result<(), String> {
+    use harvest_common::payment::OrderStatus;
+    match order.status {
+        OrderStatus::Paid => Ok(()),
+        OrderStatus::Cancelled => {
+            order
+                .verify(owner)
+                .map_err(|e| format!("this cancellation would be refused: {e}"))?;
+            let buyer_signed = order.order.buyer_receipt_key.is_some_and(|key| {
+                let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key) else {
+                    return false;
+                };
+                let (Some(sp), Some(sig)) = (&order.status_scoped_payload, &order.status_signature)
+                else {
+                    return false;
+                };
+                harvest_common::listing::verify_scoped_signature(
+                    sp,
+                    sig,
+                    &key,
+                    &(order.order.id.clone(), OrderStatus::Cancelled),
+                )
+                .is_ok()
+            });
+            if buyer_signed {
+                Ok(())
+            } else {
+                Err(
+                    "only the buyer's own cancellation may be published without the \
+                     store's key"
+                        .to_string(),
+                )
+            }
+        }
+        OrderStatus::AwaitingPayment | OrderStatus::PaymentReversed => Err(format!(
+            "only a Paid settlement or the buyer's own cancellation may be published \
+             without the store's key; this record is {:?}",
+            order.status
+        )),
+    }
+}
+
+/// Publish a record a party without the store key may send -- a `Paid`
+/// settlement, or the buyer's own cancellation ([`keyless_publishable`]) --
+/// to its store contract.
 ///
 /// Separate from [`submit_order_by_id`] because it resolves the key through
 /// [`settlement_store_key`] rather than through ownership: the record is
-/// authorized by the evidence it carries, so a buyer may send it
-/// (harvest#75). Everything about the send itself is identical.
+/// authorized by the evidence or the buyer signature it carries, so a buyer
+/// may send it (harvest#75, harvest#53 Phase B). Everything about the send
+/// itself is identical.
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_settled_order_by_id(
     store_contract_id: &[u8],
@@ -546,20 +625,16 @@ pub async fn submit_settled_order_by_id(
     // the same argument `AuthorizedOrder::fields_used` makes for staying
     // exhaustive: nothing here should depend on a caller remembering.
     //
-    // Nothing else could reach this usefully today -- `Cancelled` needs the
-    // seller's status signature, `PaymentReversed` needs retraction
-    // evidence, and `AwaitingPayment` loses every merge at rank 0 -- so this
-    // guards the next caller, not this one. Raised by the authorization lens
-    // reviewing harvest#75.
-    if order.status != harvest_common::payment::OrderStatus::Paid {
-        return Err(format!(
-            "only a Paid settlement may be published without the store's key; \
-             this record is {:?}",
-            order.status
-        ));
-    }
-
+    // Since harvest#53 Phase B there is exactly one other record a party
+    // without the store key may publish: the BUYER's cancel of an unpaid
+    // order, authorized by the receipt key the seller signed into its terms.
+    // That is `keyless_publishable`, and it is decided on the record itself,
+    // against the owner key the delta will name, rather than on the caller.
+    // `PaymentReversed` needs retraction evidence and `AwaitingPayment`
+    // loses every merge at rank 0, so neither is sent from here. Raised by
+    // the authorization lens reviewing harvest#75.
     let (contract_key, origin, owner) = settlement_store_key(store_contract_id)?;
+    keyless_publishable(&order, &owner)?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -687,6 +762,48 @@ pub async fn submit_store_info_by_id(
     .await?;
 
     info!("Published store details for '{}'", name);
+    Ok(())
+}
+
+/// Publish the seller's despatch of one of their paid orders (harvest#53
+/// Phase B), with the order alongside (see [`despatch_delta_bytes`]).
+///
+/// Through [`owned_store_key`], like an invoice: only the store key signs a
+/// despatch, so only its holder has one to send.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_despatch_by_id(
+    store_contract_id: &[u8],
+    order: harvest_common::payment::AuthorizedOrder,
+    despatch: harvest_common::fulfilment::AuthorizedDespatch,
+) -> Result<(), String> {
+    use dioxus::logger::tracing::{info, warn};
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, origin, owner) =
+        owned_store_key(store_contract_id, "cannot record a despatch on it")?;
+    if origin == KeyOrigin::Reconstructed {
+        warn!("Store contract key rebuilt from the bundled store contract");
+    }
+    let id = order.order.id.short();
+    let delta_bytes = despatch_delta_bytes(owner, order, despatch)?;
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await
+    .map_err(|e| match origin {
+        KeyOrigin::Reconstructed => format!(
+            "{e} -- this store's contract key was rebuilt from the store \
+             contract this version of Harvest bundles. If the store was \
+             created with an older version, that key is wrong and the \
+             despatch cannot be recorded."
+        ),
+        KeyOrigin::Recorded => e,
+    })?;
+    info!(
+        "Published the despatch of order {} to its store contract",
+        id
+    );
     Ok(())
 }
 
@@ -939,6 +1056,7 @@ mod tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
         .with_derived_id();
@@ -994,6 +1112,161 @@ mod tests {
             Some(signing_key.verifying_key()),
             "the first signed update to a store claims it for the key it names (harvest#52)"
         );
+    }
+
+    /// A buyer-keyed order, signed by `seller` the way the store key signs,
+    /// for the Phase B tests below.
+    fn phase_b_order(
+        seller: &ed25519_dalek::SigningKey,
+        buyer: &ed25519_dalek::SigningKey,
+    ) -> harvest_common::payment::AuthorizedOrder {
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+        let order = Order {
+            id: OrderId([0u8; 32]),
+            buyer_fingerprint: String::new(),
+            seller_fingerprint: "seller-fp".to_string(),
+            amount_sats: 50_000,
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            payment_script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            payment_address: "tb1qexample".to_string(),
+            required_confirmations: 1,
+            payment_hash: None,
+            trusted_bridges: vec![freenet_bitcoin_common::BridgeId([3u8; 32])],
+            bitcoin_address_code_hash: Some([4u8; 32]),
+            anchor: None,
+            order_binding: None,
+            listing_tag: None,
+            buyer_receipt_key: Some(buyer.verifying_key().to_bytes()),
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = sign_as_store_key(seller, &order);
+        AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    fn sign_as_store_key<T: serde::Serialize>(
+        key: &ed25519_dalek::SigningKey,
+        value: &T,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer;
+        let envelope = harvest_common::backing::store_key_envelope(
+            harvest_common::to_cbor(value).expect("serialize"),
+        )
+        .expect("envelope");
+        let signature = key.sign(&envelope).to_bytes().to_vec();
+        (envelope, signature)
+    }
+
+    /// harvest#53 Phase B: the despatch delta, decoded from its wire bytes,
+    /// lands in the contract's state -- on a replica that already holds the
+    /// order AND on one that has never seen it, which is why the order rides
+    /// along.
+    #[test]
+    fn the_contract_accepts_a_despatch_delta_encoded_this_way() {
+        use freenet_scaffold::ComposableState;
+        use harvest_common::fulfilment::{AuthorizedDespatch, Despatch};
+        use harvest_common::store::StoreStateV1;
+
+        let seller = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let buyer = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let order = phase_b_order(&seller, &buyer);
+        let despatch = Despatch {
+            order_id: order.order.id.clone(),
+            anchor: freenet_bitcoin_common::BlockAnchor {
+                height: 900,
+                hash: freenet_bitcoin_common::BlockHash([9u8; 32]),
+            },
+        };
+        let (scoped_payload, signature) = sign_as_store_key(&seller, &despatch);
+        let despatch = AuthorizedDespatch {
+            despatch,
+            scoped_payload,
+            signature,
+        };
+        let bytes = despatch_delta_bytes(seller.verifying_key(), order.clone(), despatch)
+            .expect("serialize delta");
+        let delta: harvest_common::store::StoreStateV1Delta =
+            harvest_common::from_cbor(&bytes).expect("the contract must read its own delta");
+        let parameters = crate::migrate::store_params(&seller.verifying_key());
+
+        // A replica that has never seen the order.
+        let mut fresh = StoreStateV1::default();
+        fresh
+            .apply_delta(&fresh.clone(), &parameters, &Some(delta.clone()))
+            .expect("the store contract accepts the despatch");
+        assert!(fresh.fulfilment.records.len() == 1, "the despatch is kept");
+        fresh.verify(&fresh, &parameters).expect("and verifies");
+
+        // One that already holds it.
+        let mut holding = StoreStateV1::default();
+        holding
+            .apply_delta(
+                &holding.clone(),
+                &parameters,
+                &Some(
+                    harvest_common::from_cbor(
+                        &orders_delta_bytes(seller.verifying_key(), vec![order]).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        holding
+            .apply_delta(&holding.clone(), &parameters, &Some(delta))
+            .expect("applies over the held order");
+        assert_eq!(holding, fresh);
+    }
+
+    /// harvest#53 Phase B: the keyless path takes a Paid record and the
+    /// BUYER's cancellation, and refuses the store key's cancellation (that
+    /// goes through the owned path), an unsigned one, and anything else.
+    #[test]
+    fn only_a_settlement_or_the_buyers_own_cancel_is_published_without_the_store_key() {
+        use harvest_common::payment::OrderStatus;
+        let seller = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let buyer = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let owner = seller.verifying_key();
+        let base = phase_b_order(&seller, &buyer);
+        let cancelled_by = |key: &ed25519_dalek::SigningKey| {
+            let (sp, sig) =
+                sign_as_store_key(key, &(base.order.id.clone(), OrderStatus::Cancelled));
+            harvest_common::payment::AuthorizedOrder {
+                status: OrderStatus::Cancelled,
+                status_scoped_payload: Some(sp),
+                status_signature: Some(sig),
+                ..base.clone()
+            }
+        };
+
+        keyless_publishable(&cancelled_by(&buyer), &owner).expect("the buyer's own cancel");
+        // The buyer's signature is genuine, but the terms are not this
+        // store's: the whole record is checked, not just the buyer's half.
+        let other_store = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]).verifying_key();
+        assert!(keyless_publishable(&cancelled_by(&buyer), &other_store).is_err());
+        let by_seller = keyless_publishable(&cancelled_by(&seller), &owner)
+            .expect_err("the seller's cancel is not a keyless record");
+        assert!(by_seller.contains("buyer's own"), "{by_seller}");
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        assert!(keyless_publishable(&cancelled_by(&stranger), &owner).is_err());
+        assert!(
+            keyless_publishable(&base, &owner).is_err(),
+            "AwaitingPayment"
+        );
+        let mut reversed = base.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        assert!(keyless_publishable(&reversed, &owner).is_err());
+        // Paid passes this gate on its evidence; the contract checks that.
+        let mut paid = base.clone();
+        paid.status = OrderStatus::Paid;
+        keyless_publishable(&paid, &owner).expect("a settlement");
     }
 
     /// The whole point of the round-trip: the bytes we hand `SignMessage`

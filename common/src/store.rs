@@ -1044,6 +1044,19 @@ pub struct StoreStateV1 {
         skip_serializing_if = "SignedSetV1::<crate::custody::AuthorizedCopy>::is_empty"
     )]
     pub copies: crate::custody::CopiesV1,
+    /// The seller's despatch of each order, signed by the store key, one per
+    /// order the store still holds (harvest#53 Phase B). Outside the order
+    /// status lattice on purpose; see [`crate::fulfilment`]. A despatch is
+    /// kept only while its order is ([`StoreStateV1::normalize_fulfilment`]).
+    ///
+    /// `default` and skipped when empty, like the parts above, so a state
+    /// holding no despatch encodes exactly as it did before they existed and
+    /// every earlier generation's state decodes as it is.
+    #[serde(
+        default,
+        skip_serializing_if = "SignedSetV1::<crate::fulfilment::AuthorizedDespatch>::is_empty"
+    )]
+    pub fulfilment: crate::fulfilment::FulfilmentV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -1066,6 +1079,8 @@ pub struct StoreStateV1Summary {
     pub closed: <ClosedV1 as ComposableState>::Summary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copies: <crate::custody::CopiesV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fulfilment: <crate::fulfilment::FulfilmentV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -1095,6 +1110,8 @@ pub struct StoreStateV1Delta {
     pub closed: Option<<ClosedV1 as ComposableState>::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copies: Option<<crate::custody::CopiesV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfilment: Option<<crate::fulfilment::FulfilmentV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -1110,6 +1127,7 @@ impl StoreStateV1 {
             || !self.retirements.is_empty()
             || !self.closed.is_empty()
             || !self.copies.is_empty()
+            || !self.fulfilment.is_empty()
     }
 
     /// Apply the store-wide bound on backings and retirements (harvest#93
@@ -1238,6 +1256,40 @@ impl StoreStateV1 {
         }
     }
 
+    /// Keep a despatch only while the store holds its order (harvest#53
+    /// Phase B).
+    ///
+    /// The order cap (`enforce_order_cap`) drops the oldest orders; without
+    /// this, their despatches would stay behind as orphans no reader could
+    /// place, and the state would stop being canonical.
+    ///
+    /// # Why it obeys the merge laws, in any arrival order
+    ///
+    /// Every state this contract accepts is normalized (`verify` refuses an
+    /// orphan), so a despatch never arrives without its order in the same
+    /// state. The kept orders are the top `MAX_ORDERS` of the union by a
+    /// ranking the per-order merge cannot change (see `enforce_order_cap`),
+    /// so an order cut from one union is cut from every union containing it,
+    /// and its despatch with it; an order kept is kept everywhere, and so is
+    /// the merged despatch in its slot. The despatch set is therefore "every
+    /// despatch seen, restricted to the kept orders" whatever the grouping.
+    ///
+    /// A HAND-BUILT delta carrying a despatch but not its order, arriving at
+    /// a replica that does not yet hold the order, loses the despatch here.
+    /// Transient: the sender's summary still lists it, so the next exchange
+    /// sends it again with the order. The app sends the order alongside
+    /// (`ui/gateway/store_ops::despatch_delta_bytes`) so it does not rely on
+    /// that.
+    ///
+    /// Not a check on the order's STATUS: see [`crate::fulfilment`] for why
+    /// that would break convergence.
+    pub(crate) fn normalize_fulfilment(&mut self) {
+        let orders = &self.orders.orders;
+        self.fulfilment
+            .records
+            .retain(|slot, _| orders.contains_key(&OrderId(slot.0)));
+    }
+
     /// The parent the children are verified under. They read the owner and
     /// nothing else, so this is all of `self` they need -- and cloning a
     /// whole store, up to [`MAX_ORDERS`] orders with their payment proofs,
@@ -1271,7 +1323,10 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.closed)?;
         next.copies
             .apply_delta(&parent, parameters, &delta.copies)?;
+        next.fulfilment
+            .apply_delta(&parent, parameters, &delta.fulfilment)?;
         next.normalize_backings();
+        next.normalize_fulfilment();
         *self = next;
         Ok(())
     }
@@ -1352,7 +1407,21 @@ impl ComposableState for StoreStateV1 {
         self.copies.verify(&parent, parameters)?;
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
-        self.closed.verify(&parent, parameters)
+        self.closed.verify(&parent, parameters)?;
+        // A despatch only for an order the store holds: the state
+        // `normalize_fulfilment` keeps. One no merge produces is refused.
+        if let Some(slot) = self
+            .fulfilment
+            .records
+            .keys()
+            .find(|slot| !self.orders.orders.contains_key(&OrderId(slot.0)))
+        {
+            return Err(format!(
+                "a despatch names order {}, which this store does not hold",
+                OrderId(slot.0)
+            ));
+        }
+        self.fulfilment.verify(&parent, parameters)
     }
 
     fn summarize(
@@ -1370,6 +1439,7 @@ impl ComposableState for StoreStateV1 {
             retirements: self.retirements.summarize(&parent, parameters),
             closed: self.closed.summarize(&parent, parameters),
             copies: self.copies.summarize(&parent, parameters),
+            fulfilment: self.fulfilment.summarize(&parent, parameters),
         }
     }
 
@@ -1411,6 +1481,7 @@ impl ComposableState for StoreStateV1 {
                 .delta(&parent, parameters, &base.retirements),
             closed: self.closed.delta(&parent, parameters, &base.closed),
             copies: self.copies.delta(&parent, parameters, &base.copies),
+            fulfilment: self.fulfilment.delta(&parent, parameters, &base.fulfilment),
         };
         if delta.info.is_none()
             && delta.listings.is_none()
@@ -1419,6 +1490,7 @@ impl ComposableState for StoreStateV1 {
             && delta.retirements.is_none()
             && delta.closed.is_none()
             && delta.copies.is_none()
+            && delta.fulfilment.is_none()
         {
             None
         } else {
@@ -1557,6 +1629,7 @@ mod order_tests {
             }),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id()
@@ -3108,6 +3181,7 @@ mod order_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id();
@@ -4375,6 +4449,539 @@ mod order_tests {
                 .fold(StoreStateV1::default(), |acc, s| merged(&p, &acc, s));
             assert_eq!(all.owner, Some(pools[0].0.verifying_key()));
             all.verify(&all, &p).expect("the converged store verifies");
+        }
+    }
+
+    /// harvest#53 Phase B: the buyer's cancel and the seller's despatch.
+    mod fulfilment_tests {
+        use super::*;
+        use crate::fulfilment::{AuthorizedDespatch, Despatch};
+
+        fn buyer_key() -> SigningKey {
+            SigningKey::from_bytes(&[44u8; 32])
+        }
+
+        /// An order carrying the buyer's receipt key, as Phase B's buy flow
+        /// produces.
+        fn buyer_keyed_order(created_at_secs: i64) -> Order {
+            let mut order = make_order("", created_at_secs, &[0x00, 0x14, 0x07, 0x07]);
+            order.buyer_receipt_key = Some(buyer_key().verifying_key().to_bytes());
+            order.with_derived_id()
+        }
+
+        /// `order` cancelled by `signer` over `(id, Cancelled)`.
+        fn cancelled_by(
+            seller: &SigningKey,
+            order: &Order,
+            signer: &SigningKey,
+        ) -> AuthorizedOrder {
+            let mut record =
+                make_authorized_order(seller, order.clone(), OrderStatus::AwaitingPayment, None);
+            let (sp, sig) = sign_scoped(signer, &(order.id.clone(), OrderStatus::Cancelled));
+            record.status = OrderStatus::Cancelled;
+            record.status_scoped_payload = Some(sp);
+            record.status_signature = Some(sig);
+            record
+        }
+
+        fn despatch(order: &Order, height: u32, signer: &SigningKey) -> AuthorizedDespatch {
+            let despatch = Despatch {
+                order_id: order.id.clone(),
+                anchor: BlockAnchor {
+                    height,
+                    hash: BlockHash([height as u8; 32]),
+                },
+            };
+            let (scoped_payload, signature) = sign_scoped(signer, &despatch);
+            AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        }
+
+        fn store_with(orders: Vec<AuthorizedOrder>) -> StoreStateV1 {
+            let mut s = StoreStateV1 {
+                owner: Some(seller_key().verifying_key()),
+                ..Default::default()
+            };
+            for o in orders {
+                merge_order(&mut s.orders.orders, o);
+            }
+            s
+        }
+
+        fn delta_of(despatches: Vec<AuthorizedDespatch>) -> StoreStateV1Delta {
+            StoreStateV1Delta {
+                owner: Some(seller_key().verifying_key()),
+                fulfilment: Some(despatches),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn the_buyer_can_cancel_an_order_carrying_their_receipt_key() {
+            let seller = seller_key();
+            let order = buyer_keyed_order(1_700_000_000);
+            let record = cancelled_by(&seller, &order, &buyer_key());
+            record
+                .verify(&seller.verifying_key())
+                .expect("a cancel signed by the order's buyer receipt key verifies");
+            // The seller's cancel of the same order still verifies too.
+            cancelled_by(&seller, &order, &seller)
+                .verify(&seller.verifying_key())
+                .expect("the seller can still cancel");
+        }
+
+        #[test]
+        fn nobody_else_can_cancel_and_an_order_without_a_buyer_key_takes_only_the_sellers() {
+            let seller = seller_key();
+            let stranger = SigningKey::from_bytes(&[55u8; 32]);
+            let order = buyer_keyed_order(1_700_000_000);
+            let err = cancelled_by(&seller, &order, &stranger)
+                .verify(&seller.verifying_key())
+                .expect_err("a stranger's cancel is refused");
+            assert!(err.contains("neither the seller"), "{err}");
+
+            // Before Phase B an order carried no buyer key: only the seller
+            // can cancel it, whoever else signs.
+            let unkeyed = make_order("", 1_700_000_000, &[0x00, 0x14, 0x07, 0x07]);
+            assert!(cancelled_by(&seller, &unkeyed, &buyer_key())
+                .verify(&seller.verifying_key())
+                .is_err());
+        }
+
+        /// A small-order buyer key (here the identity point) accepts a
+        /// signature anyone can make, so an order naming one must not take a
+        /// "buyer" cancel at all: otherwise any stranger could sign as its
+        /// buyer, and in Phase C file its complaint.
+        #[test]
+        fn a_weak_buyer_key_takes_no_buyer_signature() {
+            let seller = seller_key();
+            let mut identity = [0u8; 32];
+            identity[0] = 1;
+            assert!(ed25519_dalek::VerifyingKey::from_bytes(&identity)
+                .expect("the identity point decodes")
+                .is_weak());
+            let mut order = make_order("", 1_700_000_000, &[0x00, 0x14, 0x07, 0x07]);
+            order.buyer_receipt_key = Some(identity);
+            let order = order.with_derived_id();
+
+            // The forgery: R = identity, s = 0, over the right message.
+            let mut record =
+                make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None);
+            let (sp, _) = sign_scoped(&seller, &(order.id.clone(), OrderStatus::Cancelled));
+            let mut forged = [0u8; 64];
+            forged[0] = 1;
+            record.status = OrderStatus::Cancelled;
+            record.status_scoped_payload = Some(sp);
+            record.status_signature = Some(forged.to_vec());
+            // The premise: the non-strict check really does accept this
+            // forgery under the weak key, so the refusal below is what stops
+            // it, not a signature that fails anyway.
+            {
+                use ed25519_dalek::Verifier;
+                let weak = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+                assert!(weak
+                    .verify(
+                        record.status_scoped_payload.as_ref().unwrap(),
+                        &ed25519_dalek::Signature::from_bytes(&forged)
+                    )
+                    .is_ok());
+            }
+            let err = record
+                .verify(&seller.verifying_key())
+                .expect_err("a signature anyone can make is not the buyer's");
+            assert!(err.contains("weak"), "{err}");
+        }
+
+        #[test]
+        fn a_buyers_cancel_of_one_order_is_not_a_cancel_of_another() {
+            let seller = seller_key();
+            let order = buyer_keyed_order(1_700_000_000);
+            let other = buyer_keyed_order(1_700_000_500);
+            assert_ne!(order.id, other.id);
+            // The buyer's signature over `order`'s id, stapled onto `other`.
+            let signed = cancelled_by(&seller, &order, &buyer_key());
+            let mut replayed = cancelled_by(&seller, &other, &buyer_key());
+            replayed.status_scoped_payload = signed.status_scoped_payload.clone();
+            replayed.status_signature = signed.status_signature.clone();
+            assert!(replayed.verify(&seller.verifying_key()).is_err());
+        }
+
+        #[test]
+        fn a_buyers_cancel_never_displaces_a_payment() {
+            let seller = seller_key();
+            let order = buyer_keyed_order(1_700_000_000);
+            let paid = make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(make_payment_proof(&order, &bridge_key(), 3)),
+            );
+            paid.verify(&seller.verifying_key()).expect("fixture paid");
+            let mut orders = BTreeMap::new();
+            merge_order(&mut orders, paid.clone());
+            merge_order(&mut orders, cancelled_by(&seller, &order, &buyer_key()));
+            assert_eq!(orders[&order.id].status, OrderStatus::Paid);
+        }
+
+        #[test]
+        fn the_store_key_can_despatch_any_order_it_holds_and_nobody_else_can() {
+            let seller = seller_key();
+            let p = params(&seller);
+            let order = buyer_keyed_order(1_700_000_000);
+            // Unpaid on purpose: the contract does not check the order's
+            // status (see `crate::fulfilment`); readers ignore it.
+            let base = store_with(vec![make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::AwaitingPayment,
+                None,
+            )]);
+
+            let mut kept = base.clone();
+            kept.apply_delta(
+                &base,
+                &p,
+                &Some(delta_of(vec![despatch(&order, 900, &seller)])),
+            )
+            .expect("the store key's despatch applies");
+            assert_eq!(kept.fulfilment.records.len(), 1);
+            kept.verify(&kept, &p).expect("and the result verifies");
+
+            let stranger = SigningKey::from_bytes(&[55u8; 32]);
+            let mut refused = base.clone();
+            assert!(refused
+                .apply_delta(
+                    &base,
+                    &p,
+                    &Some(delta_of(vec![despatch(&order, 900, &stranger)]))
+                )
+                .is_err());
+            assert_eq!(refused, base, "a refused delta changes nothing");
+            // Not even the buyer, whose key the order names.
+            assert!(refused
+                .apply_delta(
+                    &base,
+                    &p,
+                    &Some(delta_of(vec![despatch(&order, 900, &buyer_key())]))
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn a_despatch_for_an_order_the_store_does_not_hold_is_refused_or_dropped() {
+            let seller = seller_key();
+            let p = params(&seller);
+            let held = buyer_keyed_order(1_700_000_000);
+            let absent = buyer_keyed_order(1_700_000_900);
+            let base = store_with(vec![make_authorized_order(
+                &seller,
+                held.clone(),
+                OrderStatus::AwaitingPayment,
+                None,
+            )]);
+
+            // A state holding an orphan is one no merge produces.
+            let mut orphaned = base.clone();
+            let d = despatch(&absent, 900, &seller);
+            orphaned
+                .fulfilment
+                .records
+                .insert(crate::backing::SignedRecord::slot(&d), d.clone());
+            let err = orphaned
+                .verify(&orphaned, &p)
+                .expect_err("an orphan is refused");
+            assert!(err.contains("does not hold"), "{err}");
+
+            // A delta carrying one is applied and the orphan dropped.
+            let mut merged = base.clone();
+            merged
+                .apply_delta(&base, &p, &Some(delta_of(vec![d])))
+                .expect("a well-signed despatch is not an error");
+            assert!(merged.fulfilment.is_empty());
+            merged.verify(&merged, &p).expect("the result verifies");
+
+            // With its order alongside, it is kept.
+            let mut with_order = base.clone();
+            let mut delta = delta_of(vec![despatch(&absent, 900, &seller)]);
+            delta.orders = Some(vec![make_authorized_order(
+                &seller,
+                absent.clone(),
+                OrderStatus::AwaitingPayment,
+                None,
+            )]);
+            with_order
+                .apply_delta(&base, &p, &Some(delta))
+                .expect("applies");
+            assert_eq!(with_order.fulfilment.records.len(), 1);
+        }
+
+        /// A despatch whose order the cap drops goes with it, and the
+        /// despatch set obeys the merge laws at the cap. Structural, like the
+        /// other cap tests: the unsigned records never meet `verify`.
+        #[test]
+        fn a_despatch_goes_when_the_cap_drops_its_order_and_the_laws_hold_at_the_cap() {
+            type S = (
+                BTreeMap<OrderId, AuthorizedOrder>,
+                BTreeMap<Bytes32, AuthorizedDespatch>,
+            );
+            fn fake_despatch(id: &OrderId, height: u32) -> AuthorizedDespatch {
+                AuthorizedDespatch {
+                    despatch: Despatch {
+                        order_id: id.clone(),
+                        anchor: BlockAnchor {
+                            height,
+                            hash: BlockHash([0; 32]),
+                        },
+                    },
+                    scoped_payload: vec![],
+                    signature: vec![],
+                }
+            }
+            // What `StoreStateV1::apply_parts` does once everything has
+            // verified: merge orders and cap, union despatches keeping the
+            // smaller encoding, then `normalize_fulfilment`.
+            fn merge(a: &S, b: &S) -> S {
+                let mut state = StoreStateV1 {
+                    orders: OrdersV1 {
+                        orders: merge_maps(&a.0, &b.0),
+                    },
+                    ..Default::default()
+                };
+                let mut despatches = a.1.clone();
+                for (slot, d) in &b.1 {
+                    match despatches.get(slot) {
+                        Some(held)
+                            if crate::to_cbor(held).unwrap() <= crate::to_cbor(d).unwrap() => {}
+                        _ => {
+                            despatches.insert(*slot, d.clone());
+                        }
+                    }
+                }
+                state.fulfilment.records = despatches;
+                state.normalize_fulfilment();
+                (state.orders.orders, state.fulfilment.records)
+            }
+
+            let (old_id, old) = synthetic_order(250, 10, OrderStatus::Paid);
+            let (new_id, new) = synthetic_order(251, 9_000_000, OrderStatus::Paid);
+            let with =
+                |orders: BTreeMap<OrderId, AuthorizedOrder>, ds: &[AuthorizedDespatch]| -> S {
+                    let mut state = StoreStateV1 {
+                        orders: OrdersV1 { orders },
+                        ..Default::default()
+                    };
+                    for d in ds {
+                        state
+                            .fulfilment
+                            .records
+                            .insert(Bytes32(d.despatch.order_id.0), d.clone());
+                    }
+                    state.normalize_fulfilment();
+                    (state.orders.orders, state.fulfilment.records)
+                };
+            let small: S = with(
+                [(old_id.clone(), old.clone()), (new_id.clone(), new.clone())].into(),
+                &[fake_despatch(&old_id, 5), fake_despatch(&new_id, 7)],
+            );
+            assert_eq!(small.1.len(), 2, "both kept while both orders are");
+            let full: S = with(full_of_old_orders(), &[]);
+
+            let merged = merge(&small, &full);
+            assert!(
+                !merged.0.contains_key(&old_id),
+                "the cap drops the oldest order"
+            );
+            assert!(
+                !merged.1.contains_key(&Bytes32(old_id.0)),
+                "and its despatch with it"
+            );
+            assert!(
+                merged.1.contains_key(&Bytes32(new_id.0)),
+                "the newest keeps its despatch"
+            );
+
+            // The laws, over states holding the same orders' despatches at
+            // different anchors (a clash in one slot) around the cap.
+            let states: Vec<S> = vec![
+                small.clone(),
+                full.clone(),
+                with(
+                    [(old_id.clone(), old.clone())].into(),
+                    &[fake_despatch(&old_id, 3)],
+                ),
+                with(
+                    [(new_id.clone(), new.clone())].into(),
+                    &[fake_despatch(&new_id, 9)],
+                ),
+                with(BTreeMap::new(), &[]),
+            ];
+            let enc = |s: &S| crate::to_cbor(s).expect("encode");
+            for a in &states {
+                assert_eq!(enc(&merge(a, a)), enc(a), "idempotence");
+                for b in &states {
+                    assert_eq!(enc(&merge(a, b)), enc(&merge(b, a)), "commutativity");
+                    for c in &states {
+                        assert_eq!(
+                            enc(&merge(&merge(a, b), c)),
+                            enc(&merge(a, &merge(b, c))),
+                            "associativity"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// **Seeded random merge laws with both Phase B records**, through
+        /// the real `merge` (signatures verified): buyer and seller cancels
+        /// of one order, a payment over them, and despatches at two anchors
+        /// for one order.
+        #[test]
+        fn seeded_random_stores_with_cancels_and_despatches_obey_the_merge_laws() {
+            use crate::merge_laws::{assert_laws, Rng};
+            use freenet_scaffold::ComposableState;
+
+            let seller = seller_key();
+            let p = params(&seller);
+            let x = buyer_keyed_order(1_700_000_000);
+            let y = buyer_keyed_order(1_700_000_100);
+            let orders = vec![
+                make_authorized_order(&seller, x.clone(), OrderStatus::AwaitingPayment, None),
+                cancelled_by(&seller, &x, &seller),
+                cancelled_by(&seller, &x, &buyer_key()),
+                make_authorized_order(
+                    &seller,
+                    x.clone(),
+                    OrderStatus::Paid,
+                    Some(make_payment_proof(&x, &bridge_key(), 3)),
+                ),
+                make_authorized_order(&seller, y.clone(), OrderStatus::AwaitingPayment, None),
+                cancelled_by(&seller, &y, &buyer_key()),
+            ];
+            for o in &orders {
+                o.verify(&seller.verifying_key())
+                    .expect("fixture order verifies");
+            }
+            let despatches = vec![
+                despatch(&x, 900, &seller),
+                despatch(&x, 950, &seller),
+                despatch(&y, 901, &seller),
+            ];
+            let merge = |a: &StoreStateV1, b: &StoreStateV1| {
+                let mut out = a.clone();
+                out.merge(&a.clone(), &p, b).expect("merge");
+                out.listings.normalize();
+                out
+            };
+            let mut rng = Rng::new(0x5eed_0053);
+            let states: Vec<StoreStateV1> = (0..200)
+                .map(|_| {
+                    let mut s = StoreStateV1::default();
+                    for o in rng.subset(&orders, 3) {
+                        merge_order(&mut s.orders.orders, o);
+                    }
+                    for d in rng.subset(&despatches, 2) {
+                        let slot = crate::backing::SignedRecord::slot(&d);
+                        match s.fulfilment.records.get(&slot) {
+                            Some(held)
+                                if crate::to_cbor(held).unwrap() <= crate::to_cbor(&d).unwrap() => {
+                            }
+                            _ => {
+                                s.fulfilment.records.insert(slot, d);
+                            }
+                        }
+                    }
+                    s.normalize_fulfilment();
+                    if s.holds_signed_content() {
+                        s.owner = Some(seller.verifying_key());
+                    }
+                    s.verify(&s, &p).expect("fixture state verifies");
+                    s
+                })
+                .collect();
+            assert!(
+                states.iter().any(|s| !s.fulfilment.is_empty()),
+                "the corpus must actually hold despatches"
+            );
+            assert_laws(&states, 300, &mut rng, merge, |s| {
+                crate::to_cbor(s).expect("encode")
+            });
+        }
+
+        /// A despatch is exchanged exactly when the other side lacks it: a
+        /// holder's own summary asks for nothing, and a summary without the
+        /// despatch gets it (with its order, when that is missing too).
+        #[test]
+        fn a_despatch_travels_by_summary_and_delta_and_only_when_missing() {
+            use freenet_scaffold::ComposableState;
+            let seller = seller_key();
+            let p = params(&seller);
+            let order = buyer_keyed_order(1_700_000_000);
+            let record =
+                make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None);
+            let without = store_with(vec![record.clone()]);
+            let mut with = without.clone();
+            with.apply_delta(
+                &without,
+                &p,
+                &Some(delta_of(vec![despatch(&order, 900, &seller)])),
+            )
+            .expect("applies");
+
+            assert!(
+                with.delta(&with, &p, &with.summarize(&with, &p)).is_none(),
+                "nothing to send to a peer that already holds it"
+            );
+            let d = with
+                .delta(&with, &p, &without.summarize(&without, &p))
+                .expect("the despatch is missing there");
+            assert_eq!(d.fulfilment.as_ref().map(Vec::len), Some(1));
+            assert!(d.orders.is_none(), "the order is already held there");
+            let mut caught_up = without.clone();
+            caught_up
+                .apply_delta(&without, &p, &Some(d))
+                .expect("applies");
+            assert_eq!(caught_up, with);
+
+            let empty = StoreStateV1::default();
+            let d = with
+                .delta(&with, &p, &empty.summarize(&empty, &p))
+                .expect("everything is missing there");
+            assert!(d.orders.is_some() && d.fulfilment.is_some());
+            let mut fresh = empty.clone();
+            fresh.apply_delta(&empty, &p, &Some(d)).expect("applies");
+            assert_eq!(fresh, with);
+        }
+
+        /// A state holding no despatch encodes exactly as before the part
+        /// existed, so every earlier generation's state re-encodes to its own
+        /// bytes and its summary is unchanged.
+        #[test]
+        fn a_store_without_despatches_encodes_as_it_did() {
+            let seller = seller_key();
+            let p = params(&seller);
+            let s = store_with(vec![make_authorized_order(
+                &seller,
+                buyer_keyed_order(1_700_000_000),
+                OrderStatus::AwaitingPayment,
+                None,
+            )]);
+            let bytes = crate::to_cbor(&s).unwrap();
+            assert!(!contains(&bytes, b"fulfilment"));
+            let summary = crate::to_cbor(&s.summarize(&s, &p)).unwrap();
+            assert!(!contains(&summary, b"fulfilment"));
+            let delta = crate::to_cbor(&StoreStateV1Delta {
+                owner: s.owner,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(!contains(&delta, b"fulfilment"));
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
         }
     }
 }

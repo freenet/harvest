@@ -172,9 +172,15 @@ once its payment window closes unpaid, then despatch due, then the complaint
 window, then complete by silence. No contract reads a clock, so none of those
 windows is enforced by a contract and nothing is written when one passes.
 
-Still to come: a buyer-signed cancel and a recorded despatch (Phase B, a store
-and delegate re-key), and the receipted complaint (Phase C, a reputation
-re-key). `PaymentReversed` still has no producer anywhere.
+Since Phase B an order carries the buyer's receipt key (`Order::buyer_receipt_key`,
+derived from the conversation secret), so the buyer can cancel an unpaid order
+too, and a seller can record a despatch (`StoreStateV1::fulfilment`, outside the
+status lattice). A despatch window that closes with none recorded now reads as
+the seller's to act on. There is deliberately no "received" record: silence is
+success.
+
+Still to come: the receipted complaint (Phase C, a reputation re-key).
+`PaymentReversed` still has no producer anywhere.
 
 ## Smaller things found and fixed along the way
 

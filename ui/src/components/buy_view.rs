@@ -204,6 +204,7 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
             for purchase in purchases.iter() {
                 PurchaseCard {
                     key: "{purchase.order_id}",
+                    store_contract_id: store_contract_id.clone(),
                     purchase: purchase.clone(),
                     bitcoin: bitcoin.clone(),
                 }
@@ -213,12 +214,23 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
 }
 
 #[component]
-fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) -> Element {
+fn PurchaseCard(
+    store_contract_id: Vec<u8>,
+    purchase: BuyerPurchase,
+    bitcoin: crate::state::BitcoinState,
+) -> Element {
     let short = purchase.order_id.short();
+    let cancellable = purchase.cancellable();
     rsx! {
         div { class: "card", style: "margin-top: 0.5rem;",
             p { class: "text-muted", style: "font-size: 0.8rem;",
                 "Order {short}, from conversation {crate::state::short_conversation_tag(&purchase.conversation)}"
+            }
+            if cancellable {
+                CancelPurchase {
+                    store_contract_id: store_contract_id.clone(),
+                    purchase: purchase.clone(),
+                }
             }
             if let Some(settled) = purchase.settled() {
                 SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
@@ -252,15 +264,95 @@ fn PurchaseCard(purchase: BuyerPurchase, bitcoin: crate::state::BitcoinState) ->
                         match purchase.blockers.iter().map(remedy).max_by_key(|r| match r {
                             Remedy::Wait => 0,
                             Remedy::AskTheSeller => 1,
-                            Remedy::WalkAway => 2,
+                            // Above asking the seller: a new request gets a
+                            // new order, which puts right whatever else the
+                            // seller got wrong in this one.
+                            Remedy::AskAgain => 2,
+                            Remedy::WalkAway => 3,
                         }) {
                             Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
                             Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. The seller can fix it by issuing the order again.",
+                            Some(Remedy::AskAgain) => "No payment details are shown while that is true. Send your request to buy again from this device: a request from this version of Harvest carries your key, and the seller can answer it with an order you can pay.",
                             _ => "No payment details are shown while that is true. Look again in a moment.",
                         }
                     }
                 },
             }
+            }
+        }
+    }
+}
+
+/// The buyer's control to cancel one of their own unpaid purchases
+/// (harvest#53 Phase B). Two steps, because the record is public and
+/// permanent, and the confirmation says what a buyer might not expect: a
+/// payment already sent still counts.
+#[component]
+fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+    let order_id = purchase.order_id.clone();
+    let mut confirming = use_signal(|| false);
+    let mut problem = use_signal(|| Option::<String>::None);
+    let (sent, refusal) = {
+        let state = APP_STATE.read();
+        (
+            state.buyer_cancellations_sent.contains(&order_id),
+            state.buyer_cancel_refusal(&store_contract_id, &purchase),
+        )
+    };
+    let short = order_id.short();
+    if sent {
+        return rsx! {
+            p { class: "text-muted",
+                "Cancellation of order {short} sent. It shows here once the store has it."
+            }
+        };
+    }
+    // Said instead of a button that would refuse when pressed -- most often
+    // a payment already on its way, which settles the order anyway.
+    if let Some(why) = refusal {
+        return rsx! {
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "Order {short} cannot be cancelled right now: {why}"
+            }
+        };
+    }
+    rsx! {
+        if let Some(why) = problem() {
+            p { class: "text-warning", "{why}" }
+        }
+        if confirming() {
+            p { class: "text-warning",
+                "Cancel order {short}? This is public and cannot be undone. If you have already "
+                "paid, your payment still counts and the seller owes you the goods."
+            }
+            button {
+                class: "btn btn-sm btn-primary",
+                onclick: {
+                    let store_contract_id = store_contract_id.clone();
+                    let order_id = order_id.clone();
+                    move |_| {
+                        confirming.set(false);
+                        let result = APP_STATE
+                            .write()
+                            .buyer_cancel_order(&store_contract_id, &order_id);
+                        problem.set(result.err());
+                    }
+                },
+                "Yes, cancel it"
+            }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| confirming.set(false),
+                "Keep it"
+            }
+        } else {
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    problem.set(None);
+                    confirming.set(true);
+                },
+                "Cancel order"
             }
         }
     }
@@ -278,8 +370,11 @@ fn SettledPurchase(
         .tips
         .get(&order.order.network)
         .and_then(|tip| tip.tip_height);
-    let sight = APP_STATE.read().payment_sight(&order);
-    let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
+    let (sight, despatch) = {
+        let state = APP_STATE.read();
+        (state.payment_sight(&order), state.despatch_of(&order))
+    };
+    let stage = crate::fulfilment::order_stage(&order, despatch.as_ref(), tip_height, sight);
     // Every status that reaches here is past AwaitingPayment, and `describe`
     // has a sentence for each of those; the fallback is for safety only.
     let note = stage
@@ -311,6 +406,7 @@ pub fn AcceptRequest(
     /// cannot name is signing for something they cannot see.
     listing_title: String,
     order_binding: [u8; 32],
+    buyer_receipt_key: Option<[u8; 32]>,
     quantity: u32,
 ) -> Element {
     let mut amount = use_signal(String::new);
@@ -397,7 +493,10 @@ pub fn AcceptRequest(
                         &tag,
                         &listing_id,
                         listing_title.clone(),
-                        order_binding,
+                        BuyerValues {
+                            order_binding,
+                            buyer_receipt_key,
+                        },
                         amount_sats,
                         required_confirmations,
                     ) {
@@ -424,7 +523,7 @@ fn accept(
     tag: &[u8],
     listing_id: &ListingId,
     listing_title: String,
-    order_binding: [u8; 32],
+    buyer: BuyerValues,
     amount_sats: u64,
     required_confirmations: u32,
 ) -> Result<(), String> {
@@ -450,8 +549,19 @@ fn accept(
         reply_to: Some(reply_to),
         // The buyer's own value, carried from their request. Without it the
         // commitment matches nobody's check and the buyer will not pay it.
-        order_binding: Some(order_binding),
+        order_binding: Some(buyer.order_binding),
+        // Likewise the buyer's receipt key (harvest#53 Phase B): without it
+        // the buyer can neither cancel nor complain, and will not pay.
+        buyer_receipt_key: buyer.buyer_receipt_key,
     })
+}
+
+/// The two values a buyer's request asks the seller to sign into the
+/// commitment: they travel together from the request to the terms, so they
+/// are one argument rather than two a positional call could swap.
+struct BuyerValues {
+    order_binding: [u8; 32],
+    buyer_receipt_key: Option<[u8; 32]>,
 }
 
 /// What a buyer can actually DO about one blocker.
@@ -479,6 +589,11 @@ pub enum Remedy {
     Wait,
     /// The seller can put this right by issuing the order again.
     AskTheSeller,
+    /// Only a new request can put this right: the order answers a request
+    /// that did not carry what it lacks, and a seller reissuing it would copy
+    /// the same gap from the same request. Sending the request again from
+    /// this build carries it (round-3 review of harvest#136).
+    AskAgain,
     /// Nothing either party can do makes this order safe to pay.
     WalkAway,
 }
@@ -500,6 +615,12 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         | PaymentBlocker::DestinationUnreadable
         | PaymentBlocker::AnchorMissing
         | PaymentBlocker::AnchorStale { .. } => Remedy::AskTheSeller,
+        // The order carries no key for this buyer because the REQUEST it
+        // answers carried none (an earlier build), or carried another; the
+        // seller copies the key from the request, so only a new request
+        // fixes it. The seller's inbox offers a keyed request afresh even
+        // beside an unkeyed order (`message_view::unanswered_requests`).
+        PaymentBlocker::CommitmentLacksBuyerKey => Remedy::AskAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown

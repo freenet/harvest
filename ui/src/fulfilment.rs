@@ -13,8 +13,8 @@
 //! Silence is success and writes nothing. An order whose windows have all
 //! passed with no complaint reads as finished to everyone, whether or not
 //! either party ever opens Harvest again. Only what a STRANGER has to be able
-//! to read gets written: the payment, and (in later phases) the despatch and
-//! a complaint.
+//! to read gets written: the payment, the seller's despatch (Phase B), and (in
+//! a later phase) a complaint.
 //!
 //! # Why these live in the UI crate and not in `harvest-common`
 //!
@@ -23,6 +23,7 @@
 //! windows are read by clients only, so keeping them here means tuning a
 //! window can never re-key anything.
 
+use harvest_common::fulfilment::AuthorizedDespatch;
 use harvest_common::payment::{AuthorizedOrder, OrderPaymentProof, OrderStatus};
 
 /// How long after the payment confirmed the seller has to despatch: about a
@@ -101,7 +102,7 @@ pub enum OrderStage {
     /// Unpaid, no payment is in sight, and the last block at which one could
     /// still have been proven, `closed_at`, has passed.
     Lapsed { closed_at: u32 },
-    /// Cancelled by the seller. `settle_until` is `Some` while a payment made
+    /// Cancelled, by the seller or (harvest#53 Phase B) the buyer. `settle_until` is `Some` while a payment made
     /// in time could still settle it anyway -- `Paid` outranks `Cancelled` --
     /// and `payment_seen` says this reader can see one that would, at the
     /// address ([`PaymentSight::settles`]).
@@ -115,8 +116,15 @@ pub enum OrderStage {
     /// Paid, counting from `paid_at`; the seller is expected to despatch by
     /// `despatch_by`.
     AwaitingDespatch { paid_at: u32, despatch_by: u32 },
-    /// Paid, and the despatch window closed at `despatch_by`. The complaint
-    /// window runs until `complaint_until`.
+    /// Paid, and the seller recorded a despatch anchored at block
+    /// `despatched_at` (harvest#53 Phase B). The order counts as complete from
+    /// `complaint_until`.
+    Despatched {
+        despatched_at: u32,
+        complaint_until: u32,
+    },
+    /// Paid, no despatch recorded, and the despatch window closed at
+    /// `despatch_by`. The complaint window runs until `complaint_until`.
     DespatchWindowClosed {
         despatch_by: u32,
         complaint_until: u32,
@@ -229,6 +237,36 @@ fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
 /// open: a window cannot be said to be open by a reader who cannot see the
 /// chain.
 ///
+/// `despatch` is the seller's despatch of this order, if the store holds one
+/// (`AppState::despatch_of`). It counts only on a PAID order: the contract does
+/// not check status (see `harvest_common::fulfilment`), so a despatch on an
+/// unpaid, cancelled or reversed order is ignored here.
+///
+/// # A despatch never shortens the buyer's window
+///
+/// The complaint window closes [`COMPLAINT_WINDOW_BLOCKS`] after the LATER of
+/// the despatch deadline and the despatch's own anchor. A despatch's anchor is
+/// a lower bound the seller chooses, so a seller could backdate a late one;
+/// measuring from the deadline at least means that gains them nothing. A
+/// despatch recorded after the deadline moves the end later, which is the
+/// buyer's side.
+///
+/// A despatch anchored before the block the order counts as paid from still
+/// reads as a despatch, deliberately (round 4 of harvest#136). It is the
+/// seller's claim that the goods went, and hiding it would be worse than
+/// showing it: `paid_height` is per RECORD and can move later when a smaller
+/// valid `Paid` record wins the merge, the store keeps one despatch per order
+/// (the lower anchor wins), so a filter on it could hide an honest despatch
+/// for good and show the order as missed. The window is unaffected either
+/// way.
+///
+/// The guarantee is against the NO-DESPATCH baseline, not against a despatch
+/// this reader saw earlier: a store keeps the smaller encoding of two
+/// despatches for one order, so a seller who signed a late despatch and then
+/// a backdated one can pull the end back to `despatch_by +
+/// COMPLAINT_WINDOW_BLOCKS` -- never earlier. The app normally signs one
+/// despatch per order (a second only after a send it believed failed).
+///
 /// `sight` is what this reader's own view of the order's address shows (see
 /// `components::bitcoin_view::AddressReading::sight`). While it shows a
 /// payment covering the order inside its window, an unpaid order is not
@@ -237,6 +275,7 @@ fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
 /// address reading on the same card.
 pub fn order_stage(
     order: &AuthorizedOrder,
+    despatch: Option<&AuthorizedDespatch>,
     tip_height: Option<u32>,
     sight: PaymentSight,
 ) -> OrderStage {
@@ -272,7 +311,26 @@ pub fn order_stage(
                 return OrderStage::Unknown;
             };
             let despatch_by = paid_at.saturating_add(DESPATCH_WINDOW_BLOCKS);
-            let complaint_until = despatch_by.saturating_add(COMPLAINT_WINDOW_BLOCKS);
+            // Only a despatch of THIS order; the store already guarantees it,
+            // and checking again costs nothing.
+            let despatched_at = despatch
+                .filter(|d| d.despatch.order_id == order.order.id)
+                .map(|d| d.despatch.anchor.height);
+            let complaint_until = despatch_by
+                .max(despatched_at.unwrap_or(0))
+                .saturating_add(COMPLAINT_WINDOW_BLOCKS);
+            if let Some(despatched_at) = despatched_at {
+                return if tip <= complaint_until {
+                    OrderStage::Despatched {
+                        despatched_at,
+                        complaint_until,
+                    }
+                } else {
+                    OrderStage::Closed {
+                        closed_at: complaint_until,
+                    }
+                };
+            }
             if tip <= despatch_by {
                 OrderStage::AwaitingDespatch {
                     paid_at,
@@ -323,11 +381,10 @@ impl OrderStage {
     ///
     /// # What this build can and cannot record, said plainly
     ///
-    /// Nothing in this build records a despatch or takes a complaint, so no
-    /// sentence here claims either exists. The despatch window closing is
-    /// reported as a fact about the calendar, not as a seller's failure: a
-    /// seller who shipped on day one reads exactly the same, and styling it
-    /// as a warning would accuse every honest seller after a week.
+    /// A seller can record a despatch (harvest#53 Phase B), so a despatch
+    /// window that closes with none recorded is now a fact about the SELLER,
+    /// and is said and styled as one. Nothing in this build takes a complaint
+    /// yet, so no sentence here offers one.
     pub fn describe(self, tip_height: Option<u32>, status: OrderStatus) -> Option<String> {
         // " (about 3 days)", or nothing when this reader has no tip to count
         // from: a duration made up without one is a made-up number.
@@ -352,7 +409,7 @@ impl OrderStage {
             OrderStage::Cancelled {
                 payment_seen: true, ..
             } => Some(
-                "The seller cancelled this invoice, but a payment that settles it has been seen \
+                "This invoice was cancelled, but a payment that settles it has been seen \
                  at its address. A cancellation does not undo a payment: once it is recorded the \
                  order is paid, and the seller owes the goods."
                     .to_string(),
@@ -361,7 +418,7 @@ impl OrderStage {
                 payment_maybe: true,
                 ..
             } => Some(
-                "The seller cancelled this invoice. A payment at its address may be for this \
+                "This invoice was cancelled. A payment at its address may be for this \
                  invoice or for another one sharing the address; the seller has to confirm which. \
                  If it is this invoice's, the order is paid and the seller owes the goods."
                     .to_string(),
@@ -371,14 +428,14 @@ impl OrderStage {
                 payment_seen: false,
                 payment_maybe: false,
             } => Some(format!(
-                "The seller cancelled this invoice. A payment made in time still counts until \
+                "This invoice was cancelled. A payment made in time still counts until \
                  block {until}{}, and the seller would then owe the goods.",
                 left(until),
             )),
             OrderStage::Cancelled {
                 settle_until: None, ..
             } => Some(
-                "The seller cancelled this invoice, and no payment was recorded for it in time."
+                "This invoice was cancelled, and no payment was recorded for it in time."
                     .to_string(),
             ),
             OrderStage::AwaitingDespatch {
@@ -389,12 +446,22 @@ impl OrderStage {
                  block {despatch_by}{}.",
                 left(despatch_by)
             )),
+            OrderStage::Despatched {
+                despatched_at,
+                complaint_until,
+            } => Some(format!(
+                "Paid, and the seller says it was despatched (anchored at block \
+                 {despatched_at}). This order counts as complete from block \
+                 {complaint_until}{}.",
+                left(complaint_until)
+            )),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until,
             } => Some(format!(
-                "Paid. The despatch window closed at block {despatch_by}, and this order counts \
-                 as complete from block {complaint_until}{}.",
+                "Paid, but the seller has not recorded a despatch, and the despatch window \
+                 closed at block {despatch_by}. This order counts as complete from block \
+                 {complaint_until}{}.",
                 left(complaint_until)
             )),
             OrderStage::Closed { closed_at } => Some(format!(
@@ -411,11 +478,14 @@ impl OrderStage {
     /// Whether the note should read as a warning: something a party ought to
     /// act on, rather than a status.
     ///
-    /// Not the despatch window closing, deliberately -- see [`Self::describe`].
+    /// Including a despatch window that closed with no despatch recorded: a
+    /// seller can record one since harvest#53 Phase B, so its absence is
+    /// something the seller should act on and the buyer should know.
     pub fn needs_attention(self) -> bool {
         matches!(
             self,
             OrderStage::Reversed
+                | OrderStage::DespatchWindowClosed { .. }
                 | OrderStage::Cancelled {
                     payment_seen: true,
                     ..
@@ -563,6 +633,7 @@ mod tests {
             anchor: Some(anchor(ANCHOR)),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         }
         .with_derived_id();
@@ -681,7 +752,7 @@ mod tests {
         let complaint_until = despatch_by + COMPLAINT_WINDOW_BLOCKS;
 
         assert_eq!(
-            order_stage(&paid, Some(paid_at + 6), PaymentSight::default()),
+            order_stage(&paid, None, Some(paid_at + 6), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by
@@ -689,30 +760,155 @@ mod tests {
         );
         // The deadline block itself is still inside the window.
         assert_eq!(
-            order_stage(&paid, Some(despatch_by), PaymentSight::default()),
+            order_stage(&paid, None, Some(despatch_by), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(despatch_by + 1), PaymentSight::default()),
+            order_stage(&paid, None, Some(despatch_by + 1), PaymentSight::default()),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(complaint_until), PaymentSight::default()),
+            order_stage(&paid, None, Some(complaint_until), PaymentSight::default()),
             OrderStage::DespatchWindowClosed {
                 despatch_by,
                 complaint_until
             }
         );
         assert_eq!(
-            order_stage(&paid, Some(complaint_until + 1), PaymentSight::default()),
+            order_stage(
+                &paid,
+                None,
+                Some(complaint_until + 1),
+                PaymentSight::default()
+            ),
             OrderStage::Closed {
                 closed_at: complaint_until
+            }
+        );
+    }
+
+    /// A despatch of `order` anchored at `height`. Unsigned: the stage reads
+    /// only the record the store contract already accepted.
+    fn despatch_at(order: &AuthorizedOrder, height: u32) -> AuthorizedDespatch {
+        AuthorizedDespatch {
+            despatch: harvest_common::fulfilment::Despatch {
+                order_id: order.order.id.clone(),
+                anchor: anchor(height),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
+    /// harvest#53 Phase B: a recorded despatch reads as despatched until the
+    /// complaint window closes, then closed; and it never SHORTENS the
+    /// buyer's window, however early its anchor says it was.
+    #[test]
+    fn a_despatch_is_read_on_a_paid_order_and_never_shortens_the_window() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let despatch_by = paid_at + DESPATCH_WINDOW_BLOCKS;
+        let complaint_until = despatch_by + COMPLAINT_WINDOW_BLOCKS;
+
+        // On time, or backdated to before the payment: the window still runs
+        // from the despatch deadline.
+        for anchored in [paid_at + 10, paid_at - 50, 0] {
+            let d = despatch_at(&paid, anchored);
+            assert_eq!(
+                order_stage(&paid, Some(&d), Some(paid_at + 20), PaymentSight::default()),
+                OrderStage::Despatched {
+                    despatched_at: anchored,
+                    complaint_until
+                },
+                "anchored at {anchored}"
+            );
+            assert_eq!(
+                order_stage(
+                    &paid,
+                    Some(&d),
+                    Some(complaint_until),
+                    PaymentSight::default()
+                ),
+                OrderStage::Despatched {
+                    despatched_at: anchored,
+                    complaint_until
+                }
+            );
+            assert_eq!(
+                order_stage(
+                    &paid,
+                    Some(&d),
+                    Some(complaint_until + 1),
+                    PaymentSight::default()
+                ),
+                OrderStage::Closed {
+                    closed_at: complaint_until
+                }
+            );
+        }
+
+        // Late: recorded after the deadline, so the buyer's window runs from
+        // the despatch instead, and a late despatch reads as despatched.
+        let late_at = despatch_by + 500;
+        let late = despatch_at(&paid, late_at);
+        assert_eq!(
+            order_stage(
+                &paid,
+                Some(&late),
+                Some(late_at + 1),
+                PaymentSight::default()
+            ),
+            OrderStage::Despatched {
+                despatched_at: late_at,
+                complaint_until: late_at + COMPLAINT_WINDOW_BLOCKS
+            }
+        );
+    }
+
+    /// The contract accepts a despatch on any order it holds (a status check
+    /// there would break convergence), so the READER ignores one on an order
+    /// that is not paid, and one naming a different order.
+    #[test]
+    fn a_despatch_on_an_unpaid_order_or_another_order_is_ignored() {
+        let open = order(OrderStatus::AwaitingPayment, 10_000);
+        let d = despatch_at(&open, ANCHOR + 2);
+        let settle_until = ANCHOR + PAYMENT_WINDOW_BLOCKS;
+        assert_eq!(
+            order_stage(&open, Some(&d), Some(ANCHOR + 5), PaymentSight::default()),
+            OrderStage::AwaitingPayment { settle_until }
+        );
+        let mut cancelled = open.clone();
+        cancelled.status = OrderStatus::Cancelled;
+        assert!(matches!(
+            order_stage(
+                &cancelled,
+                Some(&d),
+                Some(ANCHOR + 5),
+                PaymentSight::default()
+            ),
+            OrderStage::Cancelled { .. }
+        ));
+
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let mut other = despatch_at(&paid, paid_at + 10);
+        other.despatch.order_id = harvest_common::payment::OrderId([0xee; 32]);
+        assert_eq!(
+            order_stage(
+                &paid,
+                Some(&other),
+                Some(paid_at + 20),
+                PaymentSight::default()
+            ),
+            OrderStage::AwaitingDespatch {
+                paid_at,
+                despatch_by: paid_at + DESPATCH_WINDOW_BLOCKS
             }
         );
     }
@@ -722,11 +918,11 @@ mod tests {
         let open = order(OrderStatus::AwaitingPayment, 10_000);
         let settle_until = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         assert_eq!(
-            order_stage(&open, Some(settle_until), PaymentSight::default()),
+            order_stage(&open, None, Some(settle_until), PaymentSight::default()),
             OrderStage::AwaitingPayment { settle_until }
         );
         assert_eq!(
-            order_stage(&open, Some(settle_until + 1), PaymentSight::default()),
+            order_stage(&open, None, Some(settle_until + 1), PaymentSight::default()),
             OrderStage::Lapsed {
                 closed_at: settle_until
             }
@@ -737,13 +933,13 @@ mod tests {
     fn no_window_is_judged_without_a_tip_or_a_paid_height() {
         let open = order(OrderStatus::AwaitingPayment, 10_000);
         assert_eq!(
-            order_stage(&open, None, PaymentSight::default()),
+            order_stage(&open, None, None, PaymentSight::default()),
             OrderStage::Unknown
         );
 
         let paid = paid_with(|o| vec![confirmed(o, 10_000, ANCHOR + 3, 1)]);
         assert_eq!(
-            order_stage(&paid, None, PaymentSight::default()),
+            order_stage(&paid, None, None, PaymentSight::default()),
             OrderStage::Unknown
         );
 
@@ -751,14 +947,14 @@ mod tests {
         // open despatch window measured from some default.
         let short = paid_with(|o| vec![confirmed(o, 9_999, ANCHOR + 3, 1)]);
         assert_eq!(
-            order_stage(&short, Some(ANCHOR + 10), PaymentSight::default()),
+            order_stage(&short, None, Some(ANCHOR + 10), PaymentSight::default()),
             OrderStage::Unknown
         );
 
         let mut unanchored = order(OrderStatus::AwaitingPayment, 10_000);
         unanchored.order.anchor = None;
         assert_eq!(
-            order_stage(&unanchored, Some(ANCHOR), PaymentSight::default()),
+            order_stage(&unanchored, None, Some(ANCHOR), PaymentSight::default()),
             OrderStage::Unknown
         );
     }
@@ -782,7 +978,7 @@ mod tests {
         // and the address must not come back with it.
         open.order.required_confirmations = 6;
         assert_eq!(
-            order_stage(&open, Some(window_end + 3), COVERED),
+            order_stage(&open, None, Some(window_end + 3), COVERED),
             OrderStage::AwaitingPayment {
                 settle_until: window_end + 5
             }
@@ -811,7 +1007,7 @@ mod tests {
         assert_eq!(paid_height(&paid), Some(ANCHOR + 3 + 1_499));
         let paid_at = ANCHOR + 3 + 1_499;
         assert_eq!(
-            order_stage(&paid, Some(paid_at), PaymentSight::default()),
+            order_stage(&paid, None, Some(paid_at), PaymentSight::default()),
             OrderStage::AwaitingDespatch {
                 paid_at,
                 despatch_by: paid_at + DESPATCH_WINDOW_BLOCKS
@@ -828,22 +1024,22 @@ mod tests {
         open.order.required_confirmations = 6;
         let last = ANCHOR + PAYMENT_WINDOW_BLOCKS + 5;
         assert_eq!(
-            order_stage(&open, Some(last), PaymentSight::default()),
+            order_stage(&open, None, Some(last), PaymentSight::default()),
             OrderStage::AwaitingPayment { settle_until: last }
         );
         assert_eq!(
-            order_stage(&open, Some(last + 1), PaymentSight::default()),
+            order_stage(&open, None, Some(last + 1), PaymentSight::default()),
             OrderStage::Lapsed { closed_at: last }
         );
         // A covering payment this reader can see is never called lapsed.
         assert_eq!(
-            order_stage(&open, Some(last + 1), COVERED),
+            order_stage(&open, None, Some(last + 1), COVERED),
             OrderStage::AwaitingPayment { settle_until: last }
         );
         // But a partial payment, dust, or something still in flight after
         // the window is not a payment that settles it (review round 2).
         assert_eq!(
-            order_stage(&open, Some(last + 1), PaymentSight::default()),
+            order_stage(&open, None, Some(last + 1), PaymentSight::default()),
             OrderStage::Lapsed { closed_at: last }
         );
     }
@@ -853,7 +1049,7 @@ mod tests {
         let cancelled = order(OrderStatus::Cancelled, 10_000);
         let last = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         assert_eq!(
-            order_stage(&cancelled, Some(last), COVERED),
+            order_stage(&cancelled, None, Some(last), COVERED),
             OrderStage::Cancelled {
                 settle_until: Some(last),
                 payment_seen: true,
@@ -861,7 +1057,7 @@ mod tests {
             }
         );
         assert_eq!(
-            order_stage(&cancelled, Some(last + 1), PaymentSight::default()),
+            order_stage(&cancelled, None, Some(last + 1), PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: None,
                 payment_seen: false,
@@ -870,7 +1066,7 @@ mod tests {
         );
         // No tip: it still might.
         assert_eq!(
-            order_stage(&cancelled, None, PaymentSight::default()),
+            order_stage(&cancelled, None, None, PaymentSight::default()),
             OrderStage::Cancelled {
                 settle_until: Some(last),
                 payment_seen: false,
@@ -880,7 +1076,7 @@ mod tests {
         // Review round 2: a covering payment past the cutoff is still seen,
         // and still reads as a warning, because publishing it has no
         // deadline and it will turn the order Paid.
-        let stage = order_stage(&cancelled, Some(last + 1), COVERED);
+        let stage = order_stage(&cancelled, None, Some(last + 1), COVERED);
         assert_eq!(
             stage,
             OrderStage::Cancelled {
@@ -905,12 +1101,12 @@ mod tests {
         let open = order(OrderStatus::AwaitingPayment, 10_000);
         let last = ANCHOR + PAYMENT_WINDOW_BLOCKS;
         assert_eq!(
-            order_stage(&open, Some(last + 500), AMBIGUOUS),
+            order_stage(&open, None, Some(last + 500), AMBIGUOUS),
             OrderStage::AwaitingPayment { settle_until: last }
         );
         assert!(!AMBIGUOUS.settles());
         let cancelled = order(OrderStatus::Cancelled, 10_000);
-        let stage = order_stage(&cancelled, Some(last + 500), AMBIGUOUS);
+        let stage = order_stage(&cancelled, None, Some(last + 500), AMBIGUOUS);
         assert!(stage.needs_attention());
         let said = stage
             .describe(Some(last + 500), OrderStatus::Cancelled)
@@ -938,7 +1134,7 @@ mod tests {
     }
 
     /// The card's sentences: each names the block it is about, and none
-    /// promises a despatch record or a complaint this build cannot make.
+    /// offers a complaint this build cannot take (Phase C adds it).
     #[test]
     fn each_stage_says_what_is_true_and_nothing_this_build_cannot_do() {
         let tip = Some(1_000);
@@ -1017,8 +1213,28 @@ mod tests {
             OrderStatus::Paid,
         )
         .expect("window closed");
-        for stage_text in [&despatch, &closed_window] {
-            for promise in ["complain", "overdue", "recorded"] {
+        assert!(closed_window.contains("block 900"), "{closed_window}");
+        assert!(
+            closed_window.contains("not recorded a despatch"),
+            "a closed window with no despatch says so, now a seller can record one: \
+             {closed_window}"
+        );
+        let despatched = say(
+            OrderStage::Despatched {
+                despatched_at: 995,
+                complaint_until: 3_014,
+            },
+            OrderStatus::Paid,
+        )
+        .expect("despatched");
+        assert!(despatched.contains("despatched"), "{despatched}");
+        assert!(despatched.contains("block 995"), "{despatched}");
+        assert!(despatched.contains("block 3014"), "{despatched}");
+        // "The seller says": a despatch is the seller's own statement, and
+        // the card must not present it as proof the goods arrived.
+        assert!(despatched.contains("seller says"), "{despatched}");
+        for stage_text in [&despatch, &closed_window, &despatched] {
+            for promise in ["complain", "delivered", "received"] {
                 assert!(
                     !stage_text.contains(promise),
                     "{stage_text:?} promises something this build cannot do ({promise})"
@@ -1036,8 +1252,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reversal_or_a_payment_on_a_cancelled_invoice_is_a_warning() {
+    fn only_a_reversal_a_missed_despatch_or_a_payment_on_a_cancelled_invoice_is_a_warning() {
         assert!(OrderStage::Reversed.needs_attention());
+        assert!(OrderStage::DespatchWindowClosed {
+            despatch_by: 1,
+            complaint_until: 2,
+        }
+        .needs_attention());
         for settle_until in [Some(1), None] {
             assert!(OrderStage::Cancelled {
                 settle_until,
@@ -1058,8 +1279,8 @@ mod tests {
                 paid_at: 1,
                 despatch_by: 2,
             },
-            OrderStage::DespatchWindowClosed {
-                despatch_by: 1,
+            OrderStage::Despatched {
+                despatched_at: 1,
                 complaint_until: 2,
             },
             OrderStage::Closed { closed_at: 1 },

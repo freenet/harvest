@@ -183,6 +183,7 @@ fn every_lineage_has_predecessors() {
         ("store", store_lineage().len()),
         ("reputation", reputation_lineage().len()),
         ("mailbox", mailbox_lineage().len()),
+        ("index", index_lineage().len()),
         ("delegate", delegate_lineage().len()),
     ] {
         assert!(
@@ -205,6 +206,7 @@ fn generations_are_unique_and_ascending() {
         ("store", store_lineage()),
         ("reputation", reputation_lineage()),
         ("mailbox", mailbox_lineage()),
+        ("index", index_lineage()),
     ] {
         let generations: Vec<u32> = entries.iter().map(|e| e.generation).collect();
         let unique: HashSet<u32> = generations.iter().copied().collect();
@@ -312,6 +314,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // store, and the state gained backings, retirements and the
                 // closed flag. The last generation owned by a Ghost Key.
                 "1e4eba431c84532ecc684d1d3d664f8d8cbde9156f7a4fcab2af0ca20fcbc79c",
+                // V19, from `git show 3f95eff:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#53 Phase B: the buyer's receipt key
+                // on an order, the buyer's cancel, and the despatch part.
+                "b5eddce776f5f38e47682e94ede5bbd7f4d12fb0acd23bc826dcbff81708737b",
             ],
         ),
         (
@@ -359,6 +365,11 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // 1a; this artifact moves only because `harvest-common` is
                 // compiled into it.
                 "bf1f3c47e6888c686ca9e6b74d9eee6692c94c9de6b3a7eed68a2a27e027a947",
+                // V14, from `git show 3f95eff:ui/public/contracts/\
+                // reputation_contract.wasm`. Superseded by harvest#53 Phase B;
+                // this artifact moves only because `harvest-common` is
+                // compiled into it.
+                "57af8e42fb73260f5b38e9fc27116eaa9e4183b464c8b921e971adfb4dff72db",
             ],
         ),
         (
@@ -402,15 +413,30 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#93 phase 1a; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "21b1bbedf8ce32df123a5b7af4b675654e47aceb017fee08c12d4e5c0fbedcc6",
+                // V14, from `git show 3f95eff:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#53 Phase B; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "fad8339c66fe289d07a7b651fef92f55aa36444862c59151523d0e68dac93cf2",
+            ],
+        ),
+        (
+            "index",
+            &[
+                // V1, from `git show 3f95eff:ui/public/contracts/index_contract.wasm`.
+                // The index's first generation (harvest#93 phase 1c),
+                // superseded by harvest#53 Phase B; this artifact moves only
+                // because `harvest-common` is compiled into it.
+                "0df754b5c0066bf4ed02b800a293b8eb219ff3c4178af1a0239a8cf7eec7faec",
             ],
         ),
     ];
 
-    for ((name, hashes), entries) in
-        expected
-            .iter()
-            .zip([store_lineage(), reputation_lineage(), mailbox_lineage()])
-    {
+    for ((name, hashes), entries) in expected.iter().zip([
+        store_lineage(),
+        reputation_lineage(),
+        mailbox_lineage(),
+        index_lineage(),
+    ]) {
         let recorded: Vec<String> = entries.iter().map(|e| hex::encode(e.code_hash)).collect();
         assert_eq!(
             recorded,
@@ -497,6 +523,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by harvest#138: `StoreList` gained `held_store_keys`,
             // so the UI can tell a carried registration from a held key.
             "29b781b43ee9ad30a0b151fd2db719cf909179994bb6ac577bdca6608005560d".to_string(),
+            // V20, from `git show 99bbd59:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#53 Phase B: it signs a despatch, and a
+            // recalled conversation carries the buyer's receipt seed.
+            "9917c1fbad0ed1754d25f318b8c3384db327d389219c2ed715bc5f7e4343b6c1".to_string(),
         ],
     );
 }
@@ -885,6 +915,10 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // the code is a prefix of, not the parameter encoding, so a Ghost
         // Key's own probe derives it exactly as it derives V17.
         (18, Code),
+        // V19: the phase-1 build published 2026-09-21 (through `3f95eff`),
+        // the first owned by a store key. Still the code, 29B; the code is
+        // now the store key's, and the probe derives it from that key.
+        (19, Code),
     ]
 };
 

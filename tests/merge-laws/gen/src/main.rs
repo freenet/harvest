@@ -105,8 +105,12 @@ struct ReplayBundle {
 }
 
 fn wasm(contract: &str) -> Vec<u8> {
+    // Defaults to THIS worktree's build, so a bundle names the WASM of the
+    // tree it was generated in. It used to default to one machine's fixed
+    // path, which silently bundled another checkout's bytes.
     let dir = std::env::var("HARVEST_WASM_DIR").unwrap_or_else(|_| {
-        "/home/ian/code/freenet/harvest-verify/target/wasm32-unknown-unknown/release".into()
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target/wasm32-unknown-unknown/release")
+            .into()
     });
     fs::read(format!("{dir}/{contract}.wasm")).expect("contract wasm (build it first)")
 }
@@ -306,6 +310,7 @@ impl StoreFx {
             anchor: Some(BlockAnchor { height: 90, hash: BlockHash([3u8; 32]) }),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts(created),
         }
         .with_derived_id()
@@ -1364,6 +1369,181 @@ fn main() {
     if want("retire98") {
         gen_retire98(&root);
     }
+    if want("fulfilment") {
+        gen_fulfilment(&root);
+    }
+}
+
+use harvest_common::fulfilment::{AuthorizedDespatch, Despatch};
+
+/// harvest#53 Phase B: the buyer's cancel (signed by the order's receipt key)
+/// racing the seller's, a payment over both, the seller's despatches (two
+/// anchors for one order, a clash in one slot), a despatch arriving with and
+/// without its order, and a despatched order pushed out by the order cap.
+fn gen_fulfilment(root: &Path) {
+    let fx = StoreFx::new();
+    let params = cbor(&fx.params);
+    let p = &fx.params;
+    let buyer = SigningKey::from_bytes(&[0xE7; 32]);
+    let stranger = SigningKey::from_bytes(&[0xE9; 32]);
+    let keyed = |who: &str, created: i64| {
+        let mut o = fx.order(who, created);
+        o.buyer_receipt_key = Some(buyer.verifying_key().to_bytes());
+        o.with_derived_id()
+    };
+    let x = keyed("buyer-x", 1_750_000_000);
+    let y = keyed("buyer-y", 1_750_000_100);
+    let cancelled_by = |o: &Order, signer: &SigningKey| {
+        let mut rec = fx.authorized(o, OrderStatus::AwaitingPayment, 0);
+        let (sp, sig) = sign_scoped(signer, &(o.id.clone(), OrderStatus::Cancelled));
+        rec.status = OrderStatus::Cancelled;
+        rec.status_scoped_payload = Some(sp);
+        rec.status_signature = Some(sig);
+        rec.verify(&fx.seller.verifying_key()).expect("fixture cancel verifies");
+        rec
+    };
+    let despatch_by = |o: &Order, height: u32, signer: &SigningKey| {
+        let despatch = Despatch {
+            order_id: o.id.clone(),
+            anchor: BlockAnchor { height, hash: BlockHash([height as u8; 32]) },
+        };
+        let (scoped_payload, signature) = sign_scoped(signer, &despatch);
+        AuthorizedDespatch { despatch, scoped_payload, signature }
+    };
+    let with = |orders: Vec<AuthorizedOrder>, ds: Vec<AuthorizedDespatch>| {
+        let mut s = StoreStateV1::default();
+        let delta = StoreStateV1Delta {
+            owner: Some(fx.seller.verifying_key()),
+            orders: (!orders.is_empty()).then_some(orders),
+            fulfilment: (!ds.is_empty()).then_some(ds),
+            ..Default::default()
+        };
+        s.apply_delta(&StoreStateV1::default(), p, &Some(delta)).unwrap();
+        fx.check(&s);
+        s
+    };
+    let xa = fx.authorized(&x, OrderStatus::AwaitingPayment, 0);
+    let xc_seller = cancelled_by(&x, &fx.seller);
+    let xc_buyer = cancelled_by(&x, &buyer);
+    let xp = fx.authorized(&x, OrderStatus::Paid, 3);
+    let ya = fx.authorized(&y, OrderStatus::AwaitingPayment, 0);
+    let yp = fx.authorized(&y, OrderStatus::Paid, 5);
+    let dx1 = despatch_by(&x, 150, &fx.seller);
+    let dx2 = despatch_by(&x, 160, &fx.seller);
+    let dy = despatch_by(&y, 151, &fx.seller);
+
+    let states: Vec<(&str, StoreStateV1)> = vec![
+        ("default", StoreStateV1::default()),
+        ("Xa", with(vec![xa.clone()], vec![])),
+        ("Xc_seller", with(vec![xc_seller.clone()], vec![])),
+        ("Xc_buyer", with(vec![xc_buyer.clone()], vec![])),
+        ("Xp", with(vec![xp.clone()], vec![])),
+        ("Xp_D1", with(vec![xp.clone()], vec![dx1.clone()])),
+        ("Xp_D2", with(vec![xp.clone()], vec![dx2.clone()])),
+        ("Xa_D1", with(vec![xa.clone()], vec![dx1.clone()])),
+        ("Xc_buyer_D2", with(vec![xc_buyer.clone()], vec![dx2.clone()])),
+        ("Ya_Xp_D1", with(vec![ya.clone(), xp.clone()], vec![dx1.clone()])),
+        ("Yp_Dy", with(vec![yp.clone()], vec![dy.clone()])),
+        ("Yp_Dy_Xc_seller", with(vec![yp.clone(), xc_seller.clone()], vec![dy.clone()])),
+    ];
+    native_laws_total("fulfilment", p, &states);
+
+    let pairs = [
+        ("Xc_seller", "Xc_buyer"), ("Xc_buyer", "Xc_seller"),
+        ("Xc_buyer", "Xp"), ("Xp", "Xc_buyer"),
+        ("Xp_D1", "Xp_D2"), ("Xp_D2", "Xp_D1"),
+        ("default", "Xp_D1"), ("Xa", "Xp_D1"), ("Xp_D1", "Xa"),
+        ("Xa_D1", "Xc_buyer_D2"), ("Xc_buyer_D2", "Xp"),
+        ("Ya_Xp_D1", "Yp_Dy"), ("Yp_Dy", "Ya_Xp_D1"),
+        ("Yp_Dy_Xc_seller", "Xp_D2"), ("Xp_D2", "Yp_Dy_Xc_seller"),
+    ];
+    let mut c = Corpus::new(root, "store-fulfilment", &params);
+    let mut all = states.clone();
+    let find = |all: &Vec<(&str, StoreStateV1)>, n: &str| all.iter().find(|(m, _)| *m == n).unwrap().1.clone();
+    let mut extra = vec![];
+    for (a, b) in pairs {
+        let r = fx.merged(&find(&all, a), &find(&all, b));
+        let name: &'static str = Box::leak(format!("m_{a}__{b}").into_boxed_str());
+        extra.push((a, name, r));
+    }
+    for (_, n, s) in &extra { all.push((n, s.clone())); }
+    let paid_over_cancels = find(&all, "m_Xc_buyer__Xp");
+    println!(
+        "fulfilment: a payment outranks the buyer's cancel? {}",
+        paid_over_cancels.orders.orders[&x.id].status == OrderStatus::Paid
+    );
+    for (n, s) in &all { c.state(n, &cbor(s)); }
+    for (a, n, _) in &extra { c.transition(a, n); }
+    for (a, b) in pairs {
+        let base = find(&all, a);
+        let tgt = find(&all, b);
+        let summ = base.summarize(&base, p);
+        let Some(d) = tgt.delta(&tgt, p, &summ) else { continue };
+        let mut r = base.clone();
+        r.apply_delta(&base.clone(), p, &Some(d.clone())).expect("a fulfilment delta applies");
+        fx.check(&r);
+        c.delta_step(&cbor(&base), &cbor(&summ), &cbor(&d), &cbor(&r));
+    }
+    c.finish();
+
+    // At the cap: an old despatched order pushed out by a full store of newer
+    // ones takes its despatch with it, in either grouping.
+    let old = keyed("buyer-old", 1_600_000_000);
+    let old_paid = fx.authorized(&old, OrderStatus::Paid, 7);
+    let d_old = despatch_by(&old, 140, &fx.seller);
+    let small = with(vec![old_paid.clone()], vec![d_old.clone()]);
+    let small_other = with(vec![old_paid.clone()], vec![despatch_by(&old, 141, &fx.seller)]);
+    let many: Vec<AuthorizedOrder> = (0..MAX_ORDERS)
+        .map(|i| {
+            let o = fx.order(&format!("bulk-{i}"), 1_700_000_000 + i as i64);
+            fx.authorized(&o, OrderStatus::AwaitingPayment, 0)
+        })
+        .collect();
+    let full = with(many, vec![]);
+    let mut c = Corpus::new(root, "store-fulfilment-cap", &params);
+    c.state("cap_old_despatched", &cbor(&small));
+    c.state("cap_old_despatched_other_anchor", &cbor(&small_other));
+    c.state("cap_full_newer", &cbor(&full));
+    let l = fx.merged(&fx.merged(&small, &small_other), &full);
+    let r = fx.merged(&small, &fx.merged(&small_other, &full));
+    println!(
+        "store-fulfilment-cap native: groupings agree? {}   despatch kept: {} / {}",
+        cbor(&l) == cbor(&r),
+        !l.fulfilment.is_empty(),
+        !r.fulfilment.is_empty()
+    );
+    c.finish();
+
+    // States the contract must refuse.
+    let base = with(vec![xp.clone()], vec![]);
+    let raw = |d: AuthorizedDespatch| {
+        let mut s = base.clone();
+        s.fulfilment.records.insert(harvest_common::store::Bytes32(d.despatch.order_id.0), d);
+        assert!(s.verify(&s, p).is_err(), "an invalid fixture must be one the contract refuses");
+        s
+    };
+    let mut stranger_cancel = cancelled_by(&x, &fx.seller);
+    let (sp, sig) = sign_scoped(&stranger, &(x.id.clone(), OrderStatus::Cancelled));
+    stranger_cancel.status_scoped_payload = Some(sp);
+    stranger_cancel.status_signature = Some(sig);
+    let mut bad_cancel = StoreStateV1 {
+        owner: Some(fx.seller.verifying_key()),
+        ..Default::default()
+    };
+    bad_cancel.orders.orders.insert(x.id.clone(), stranger_cancel);
+    assert!(bad_cancel.verify(&bad_cancel, p).is_err());
+    let bad: Vec<(&str, StoreStateV1)> = vec![
+        ("default", StoreStateV1::default()),
+        ("Xp", base.clone()),
+        ("Xp_D1", find(&all, "Xp_D1")),
+        ("bad_despatch_orphan", raw(despatch_by(&y, 150, &fx.seller))),
+        ("bad_despatch_by_stranger", raw(despatch_by(&x, 150, &stranger))),
+        ("bad_despatch_by_buyer", raw(despatch_by(&x, 150, &buyer))),
+        ("bad_cancel_by_stranger", bad_cancel),
+    ];
+    let mut c = Corpus::new(root, "store-fulfilment-bad", &params);
+    for (n, s) in &bad { c.state(n, &cbor(s)); }
+    c.finish();
 }
 
 
@@ -2082,6 +2262,7 @@ impl BackingFx {
             retirements: (!retirements.is_empty()).then_some(retirements),
             closed: (!closed.is_empty()).then_some(closed),
             copies: (!copies.is_empty()).then_some(copies),
+            fulfilment: None,
         };
         s.apply_delta(&StoreStateV1::default(), &self.fx.params, &Some(delta))
             .unwrap();
@@ -2486,6 +2667,7 @@ fn gen_retire98(root: &Path) {
         retirements: (!retirements.is_empty()).then_some(retirements),
         closed: (!cl.is_empty()).then_some(cl),
         copies: None,
+        fulfilment: None,
     };
     let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
         ("ret1", d(vec![], vec![r1.clone()], vec![], true)),

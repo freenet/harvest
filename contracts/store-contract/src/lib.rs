@@ -278,6 +278,7 @@ mod tests {
             }),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id()

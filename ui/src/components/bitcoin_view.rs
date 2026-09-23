@@ -471,6 +471,7 @@ pub(super) mod __address_check_test_support {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
         .with_derived_id()
@@ -566,8 +567,11 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     };
     // Where the order stands after the payment question (harvest#53):
     // reader-side windows against this reader's own tip.
-    let sight = APP_STATE.read().payment_sight(&order);
-    let stage = crate::fulfilment::order_stage(&order, tip_height, sight);
+    let (sight, despatch) = {
+        let state = APP_STATE.read();
+        (state.payment_sight(&order), state.despatch_of(&order))
+    };
+    let stage = crate::fulfilment::order_stage(&order, despatch.as_ref(), tip_height, sight);
     let stage_note = stage
         .describe(tip_height, order.status)
         .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height, sight));
@@ -933,6 +937,7 @@ mod payable_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id();
@@ -1005,6 +1010,7 @@ mod bridge_check_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id()
@@ -1539,6 +1545,7 @@ mod address_reading_tests {
             }),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time"),
         }
         .with_derived_id()

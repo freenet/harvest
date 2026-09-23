@@ -33,6 +33,7 @@ if [ ${#corpora[@]} -eq 0 ]; then
     store-rr store-triad store-triadcap store-v0
     store-backing store-backing-adv store-backing-bad
     store-copies store-copies-bad
+    store-fulfilment store-fulfilment-cap store-fulfilment-bad
     store-r98cap store-r98race store-r98retire
     reputation reputation-empty reputation-adv reputation-rr
     mailbox mailbox-empty mailbox-adv mailbox-cap mailbox-cap2 mailbox-cap3

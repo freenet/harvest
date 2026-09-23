@@ -197,7 +197,8 @@ pub enum OrderStatus {
     /// a peer's verdict changing under it, which is precisely what stops
     /// replicas converging.
     PaymentReversed,
-    /// Cancelled by the seller before payment.
+    /// Cancelled before payment, by the seller or (harvest#53 Phase B) by
+    /// the buyer's receipt key.
     Cancelled,
 }
 
@@ -224,7 +225,8 @@ impl OrderStatus {
     /// after payment, and a status that cannot survive its own merge is worse
     /// than no status.
     ///
-    /// `Cancelled` is seller-signed too, but it outranks only
+    /// `Cancelled` is signed too -- by the seller, or since harvest#53 Phase B
+    /// by the buyer's receipt key -- but it outranks only
     /// `AwaitingPayment` and is beaten by `Paid`, so a payment always
     /// overrides a cancellation. That is the right direction.
     pub fn rank(self) -> u8 {
@@ -527,10 +529,60 @@ pub struct Order {
     /// fields above: an order without it must encode exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_tag: Option<[u8; 32]>,
+    /// The Ed25519 verifying key the BUYER signs with for this order
+    /// (harvest#53 Phase B).
+    ///
+    /// The buyer has no identity, so without this nothing in the store could
+    /// check that a record came from them. With it, the seller's own signature
+    /// over these terms vouches for a key only the buyer holds, and the
+    /// contract can accept a buyer's signed act against it with no cross-
+    /// contract read: today the buyer's cancel of an unpaid order
+    /// ([`AuthorizedOrder::verify`]'s `Cancelled` arm), and the receipted
+    /// complaint after it.
+    ///
+    /// Derived from the conversation's secret via
+    /// [`crate::mailbox::buyer_receipt_seed_from_secret`], so it is per
+    /// conversation, unlinkable to anything else the buyer does, and
+    /// recoverable wherever the conversation is. The buyer sends it with the
+    /// request and refuses to pay a commitment that does not carry the key
+    /// their own node derives, for the reason [`Self::order_binding`] gives.
+    ///
+    /// `#[serde(default, skip_serializing_if)]` for the same signature reason
+    /// as the fields above: an order without it encodes exactly as before, so
+    /// every earlier signature still verifies. `None` means no buyer-signed
+    /// act is possible on that order, which is the safe direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_receipt_key: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Order {
+    /// The key the buyer signs with for this order, or `Ok(None)` when the
+    /// order names none (harvest#53 Phase B).
+    ///
+    /// The ONE place a buyer signature is checked against, so every buyer act
+    /// (today the cancel, from Phase C the complaint) refuses the same keys.
+    /// A key that does not decode is refused, and so is a small-order
+    /// ("weak") key: under the non-strict check `verify_scoped_signature`
+    /// uses, a weak key accepts a signature anyone can make (with the
+    /// identity point, R = identity and s = 0 verify over every message).
+    /// The seller signs whatever key the request carries, so without this a
+    /// requester could name a key that lets any stranger sign as the buyer.
+    /// An honest buyer's key is derived from a random seed and is never weak.
+    pub fn buyer_verifying_key(&self) -> Result<Option<VerifyingKey>, String> {
+        let Some(bytes) = self.buyer_receipt_key else {
+            return Ok(None);
+        };
+        let key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| format!("the order's buyer receipt key is not a key: {e}"))?;
+        if key.is_weak() {
+            return Err(
+                "the order's buyer receipt key is a weak key, which anyone can sign for".into(),
+            );
+        }
+        Ok(Some(key))
+    }
+
     /// Stamp this order with the id its own terms give.
     ///
     /// Every producer of an `Order` must go through this, because
@@ -1428,8 +1480,9 @@ pub struct AuthorizedOrder {
     pub status: OrderStatus,
     /// Evidence for `Paid` / `PaymentReversed`. Absent while awaiting payment.
     pub payment_proof: Option<OrderPaymentProof>,
-    /// Seller's signature over `(order.id, status)` for the transitions only
-    /// the seller may make -- today just `Cancelled`.
+    /// A party's signature over `(order.id, status)` for the transitions a
+    /// party asserts -- today just `Cancelled`, signed by the seller's store
+    /// key or by the order's `buyer_receipt_key`.
     pub status_scoped_payload: Option<Vec<u8>>,
     pub status_signature: Option<Vec<u8>>,
 }
@@ -1652,16 +1705,50 @@ impl AuthorizedOrder {
                 }
             }
             OrderStatus::Cancelled => {
+                // The seller's store key, OR the buyer's receipt key the
+                // seller signed into the terms (harvest#53 Phase B), over the
+                // same `(id, Cancelled)` message. Symmetric before payment,
+                // and impossible after: `Paid` outranks `Cancelled`, so a
+                // cancel, whoever signs it, never displaces a payment.
+                //
+                // Two valid cancels of one order (one from each party) differ
+                // only in their status signature, and `merge_order` keeps the
+                // smaller encoding, so replicas still converge on one of them.
                 let (sp, sig) = self
                     .status_scoped_payload
                     .as_ref()
                     .zip(self.status_signature.as_ref())
-                    .ok_or_else(|| format!("{:?} requires the seller's signature", self.status))?;
-                crate::listing::verify_scoped_signature(
-                    sp,
-                    sig,
-                    seller_key,
-                    &(self.order.id.clone(), self.status),
+                    .ok_or_else(|| {
+                        format!(
+                            "{:?} requires the seller's or the buyer's signature",
+                            self.status
+                        )
+                    })?;
+                let message = (self.order.id.clone(), self.status);
+                let by_seller =
+                    crate::listing::verify_scoped_signature(sp, sig, seller_key, &message);
+                if by_seller.is_ok() {
+                    return Ok(());
+                }
+                // Weak and malformed keys are refused by `buyer_verifying_key`.
+                let buyer_key = match self.order.buyer_verifying_key() {
+                    Ok(Some(key)) => key,
+                    Ok(None) => return by_seller,
+                    Err(why) => {
+                        return Err(format!(
+                            "cancellation is not signed by the seller ({}), and {why}",
+                            by_seller.unwrap_err()
+                        ))
+                    }
+                };
+                crate::listing::verify_scoped_signature(sp, sig, &buyer_key, &message).map_err(
+                    |by_buyer| {
+                        format!(
+                            "cancellation is signed by neither the seller ({}) nor the buyer \
+                             ({by_buyer})",
+                            by_seller.unwrap_err()
+                        )
+                    },
                 )
             }
         }
@@ -1677,8 +1764,9 @@ mod status_tests {
     enum Authority {
         /// The order's initial state; nobody asserts it.
         Initial,
-        /// A signature from the seller, and nothing else, makes it true.
-        SellerSignature,
+        /// A party's own signature (the seller's, or the buyer's receipt
+        /// key's), and nothing else, makes it true.
+        PartySignature,
         /// Bridge-signed Bitcoin observations make it true, and any peer can
         /// check them.
         BitcoinEvidence,
@@ -1692,7 +1780,7 @@ mod status_tests {
     fn authority(status: OrderStatus) -> Authority {
         match status {
             OrderStatus::AwaitingPayment => Authority::Initial,
-            OrderStatus::Cancelled => Authority::SellerSignature,
+            OrderStatus::Cancelled => Authority::PartySignature,
             OrderStatus::Paid | OrderStatus::PaymentReversed => Authority::BitcoinEvidence,
         }
     }
@@ -1715,10 +1803,10 @@ mod status_tests {
     /// status they issued themselves. It is deleted; this is what stops it
     /// (or anything like it) coming back.
     #[test]
-    fn no_seller_signed_status_outranks_a_bitcoin_evidenced_one() {
+    fn no_party_signed_status_outranks_a_bitcoin_evidenced_one() {
         for signed in ALL
             .iter()
-            .filter(|s| authority(**s) == Authority::SellerSignature)
+            .filter(|s| authority(**s) == Authority::PartySignature)
         {
             for evidenced in ALL
                 .iter()
@@ -1812,6 +1900,7 @@ mod lightning_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at: ts,
         }
         .with_derived_id()
@@ -2052,6 +2141,9 @@ mod order_wire_compat_tests {
         let order: Order = crate::from_cbor(ORDER_WITHOUT_OPTIONAL_FIELDS_CBOR).expect("decodes");
         assert_eq!(order.anchor, None);
         assert_eq!(order.order_binding, None);
+        // harvest#53 Phase B's field: absent from every order signed before
+        // it, so it must not encode when absent either.
+        assert_eq!(order.buyer_receipt_key, None);
         assert_eq!(order.amount_sats, 50_000);
         // And the id is the one these terms give, so the fixture is a record
         // the contract would actually accept rather than a plausible fiction.
@@ -2087,6 +2179,7 @@ mod order_identity_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
     }
@@ -2229,6 +2322,7 @@ mod order_identity_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         };
         assert_eq!(
@@ -2335,6 +2429,7 @@ mod address_instance_tests {
             anchor: None,
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
         .with_derived_id()
@@ -2433,6 +2528,7 @@ mod proof_assembly_tests {
             }),
             order_binding: None,
             listing_tag: None,
+            buyer_receipt_key: None,
             created_at,
         }
         .with_derived_id()

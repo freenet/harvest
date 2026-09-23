@@ -835,6 +835,25 @@ pub struct RecalledConversation {
     /// commitment in a check that exists for a dishonest one.
     #[serde(default)]
     pub order_binding: [u8; 32],
+    /// The seed of the key this buyer signs with for orders in this
+    /// conversation (harvest#53 Phase B): a buyer's cancel of an unpaid
+    /// order is checked against its verifying half in
+    /// [`crate::payment::Order::buyer_receipt_key`], and the receipted
+    /// complaint (Phase C) will be too.
+    ///
+    /// Derived by the delegate from the stored conversation secret via
+    /// [`crate::mailbox::buyer_receipt_seed_from_secret`]. Handed to the
+    /// browser for the same reason, and under the same trust, as the two
+    /// direction keys beside it: the browser acts for this buyer in this
+    /// conversation, and the secret it is derived from still never leaves the
+    /// delegate. A SECRET, so `Debug` redacts it.
+    ///
+    /// `serde(default)` so an answer from a delegate built before the field
+    /// existed decodes, as all-zeros. All-zeros is NOT a key and the reader
+    /// must treat it as absent (`BuyerConversation::receipt_signing_key`),
+    /// exactly as for `order_binding`.
+    #[serde(default)]
+    pub buyer_receipt_seed: [u8; 32],
     /// When the buyer opened it, in unix seconds, as they reported it.
     ///
     /// Carried back so a browser that recalls several conversations with one
@@ -1086,6 +1105,7 @@ impl core::fmt::Debug for RecalledConversation {
             .field("seller_to_buyer", &Redacted)
             // A commitment, safe to publish; see the field's docs.
             .field("order_binding", &self.order_binding)
+            .field("buyer_receipt_seed", &Redacted)
             .field("created_at", &self.created_at)
             .field("imported", &self.imported)
             .field("backed_up", &self.backed_up)
@@ -1417,6 +1437,7 @@ mod tests {
             buyer_to_seller: SECRET,
             seller_to_buyer: SECRET,
             order_binding: [4u8; 32],
+            buyer_receipt_seed: SECRET,
             created_at: 1_700_000_000,
             imported: false,
             backed_up: true,

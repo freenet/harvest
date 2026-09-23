@@ -19,6 +19,7 @@ pub mod bitcoin_delegate;
 pub mod custody;
 pub mod delegate;
 pub mod feedback;
+pub mod fulfilment;
 pub mod ghostkey_index;
 pub mod listing;
 pub mod mailbox;

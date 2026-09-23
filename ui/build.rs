@@ -40,11 +40,11 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
 ];
 
 /// Registries that may have no rows yet, and why. An artifact belongs here
-/// only while it genuinely has no predecessor generation: the Ghost Key index
-/// is new in harvest#93 phase 1c, so nothing was ever published at an
-/// earlier address. Its FIRST superseded generation must be recorded as a
-/// row, and this entry removed, in the change that supersedes it.
-const MAY_BE_EMPTY: &[&str] = &["index_contract.toml"];
+/// only while it genuinely has no predecessor generation (the Ghost Key index
+/// did, until harvest#53 Phase B recorded its first). A new artifact's FIRST
+/// superseded generation must be recorded as a row, and its entry removed,
+/// in the change that supersedes it.
+const MAY_BE_EMPTY: &[&str] = &[];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (
     "harvest_delegate.toml",
