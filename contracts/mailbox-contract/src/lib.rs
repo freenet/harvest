@@ -583,16 +583,14 @@ mod tests {
     ///
     /// # Waivers
     ///
-    /// There is one. The reputation contract used to carry five, for deciding
-    /// feedback identity by `token.nonce` while its signature covered the
-    /// token alone (issue #22). Its re-key closed that: the token's entry key
-    /// now signs every field, and the nonce must be DERIVED from that key, so
-    /// the nonce names a slot only the key's holder can fill. The one waiver
-    /// left is `FeedbackEntry::verify` checking that derivation, which
-    /// compares a nonce with a hash rather than deciding that two entries
-    /// are the same one. The count is still asserted, so a new site cannot
-    /// join quietly -- which is the whole difference between a documented gap
-    /// and a spreading one.
+    /// There are none. The reputation contract used to carry five, for
+    /// deciding feedback identity by `token.nonce` while its signature covered
+    /// the token alone (issue #22). Its re-key cut that to one --
+    /// `FeedbackEntry::verify` checking that the nonce was DERIVED from the
+    /// entry key -- and harvest#53 Phase C deleted feedback entries, tokens
+    /// and nonces altogether: a complaint's slot is its order id. The count
+    /// is still asserted, so a new site cannot join quietly -- which is the
+    /// whole difference between a documented gap and a spreading one.
     ///
     /// A waiver marks a LINE, not a function: it applies to the next line that
     /// is not blank or a comment. That is deliberate, so a waiver written for
@@ -654,7 +652,7 @@ mod tests {
         );
         assert_eq!(
             waived.len(),
-            1,
+            0,
             "the number of waived nonce-identity sites changed. A waiver parks the same \
              defect the mailbox re-key fixed; a new one must be a deliberate decision, not \
              a quiet addition:\n{}",

@@ -757,9 +757,9 @@ pub fn entry_digest(message: &EncryptedMessage) -> [u8; 32] {
 /// per-thread counter on every construction, and `summarize` below rebuilds
 /// the set with `collect()` on every call, so under a `HashSet` this encoded
 /// differently each time for the same messages. Pinned by
-/// `mailbox_summary_encoding_is_deterministic`. See
-/// [`crate::reputation::ReputationStateV1::used_nonces`] for why the mechanism
-/// is a counter rather than randomness, which is what it is on wasm32.
+/// `mailbox_summary_encoding_is_deterministic`. It is a counter, not
+/// randomness, so it bites on `wasm32-unknown-unknown` too, where there is
+/// no OS randomness to blame and the per-thread keys still move.
 pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 
 /// Delta: new messages to add. Unchanged in shape -- it always carried whole

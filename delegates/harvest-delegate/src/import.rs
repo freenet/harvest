@@ -393,7 +393,7 @@ fn rsa_public_of(sk_der: &[u8]) -> Option<Vec<u8>> {
 /// The two halves are separate secrets (`handle_init_reputation_keys` writes
 /// them one after the other), and importing each never-clobber on its own can
 /// leave a private key from one generation beside a public key from another:
-/// `GetRsaPublicKey` then advertises a key the blind signatures do not use.
+/// `GetRsaPublicKey` then advertises a key whose private half is not held.
 /// So a half is written only if this delegate holds the matching half or
 /// neither; a half that contradicts the one held is refused `Permanent` --
 /// the held key is authoritative, and the contradiction is a property of the

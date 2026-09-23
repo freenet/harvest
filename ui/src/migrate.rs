@@ -1014,21 +1014,13 @@ fn merge_reputation(
 
 /// [`merge_reputation`], saying whether it discarded the other side wholesale.
 ///
-/// # There is no per-entry exclusion to report any more
-///
-/// This used to report entries it could not carry because they shared a
-/// token with a DIFFERENT entry the successor held: the RSA signature covered
-/// the token alone, so both were validly signed, nothing could tell which was
-/// genuine, and whichever side the fold held won. harvest#22 closed that. The
-/// token's entry key now signs every field, so a third party cannot build a
-/// variant at all, and two entries the buyer signed for one token are
-/// resolved by a total order over their bytes -- the same survivor whichever
-/// side it is on, so nothing is excluded by the order of the fold.
-///
-/// One unverifiable entry still rejects the WHOLE delta, taking every
-/// verifiable entry with it; that is reported through `discarded`. Every
-/// generation before this one signed nothing but the token, so its entries
-/// all fail here -- see `legacy/reputation_contract.toml`.
+/// There is no per-complaint exclusion to report: two complaints for one
+/// order resolve by a total order over their bytes, the same survivor
+/// whichever side of the fold it is on. One unverifiable complaint still
+/// rejects the WHOLE other side, taking every verifiable one with it; that is
+/// reported through `discarded`. The RSA generations' records hold no
+/// complaints (they decode with an empty list), so from them only the
+/// certificate is carried, by `merge`'s back-fill.
 pub(crate) fn merge_reputation_reporting_discard(
     base: ReputationStateV1,
     other: &ReputationStateV1,

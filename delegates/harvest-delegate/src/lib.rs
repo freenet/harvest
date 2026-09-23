@@ -241,7 +241,7 @@ fn payload_shape(payload: &[u8]) -> String {
 /// Handle a contract state change notification.
 ///
 /// The delegate subscribes to mailbox and reputation contracts. When new
-/// messages or feedback entries arrive, this handler processes them.
+/// messages or complaints arrive, this handler processes them.
 fn handle_contract_notification(
     _ctx: &mut DelegateCtx,
     notification: &freenet_stdlib::prelude::ContractNotification,
@@ -251,7 +251,7 @@ fn handle_contract_notification(
     //
     // For now, forward the notification to the UI as an application message
     // so the UI can update its view. The delegate will eventually handle
-    // auto-responses (e.g., auto-signing feedback tokens) here.
+    // auto-responses (none are defined today) here.
 
     let notification_msg = HarvestDelegateResponse::ContractUpdate {
         contract_key: notification.contract_id.as_bytes().to_vec(),

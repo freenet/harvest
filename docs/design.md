@@ -14,7 +14,9 @@
 > [design/incentive-mechanism.md](design/incentive-mechanism.md), whose Part 3
 > shows that design fails in three independent ways, and which replaces it with
 > seller standing and complaints-as-withdrawals. GitHub issue #8 records the
-> superseded design too.
+> superseded design too. The code for the tokens was deleted in harvest#53 Phase C,
+> which replaced them with a buyer's complaint about a paid order, signed by
+> the order's receipt key.
 
 Harvest is a decentralized marketplace application for [Freenet](https://freenet.org), joining the family of Freenet apps alongside **River** (group chat) and **Delta** (wiki/CMS). It enables peer-to-peer commerce with anonymous, donation-backed identities and a novel accountability mechanism based on blind-signature feedback tokens.
 

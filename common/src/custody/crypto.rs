@@ -228,7 +228,7 @@ pub fn inbox_secret(store_sk: &SigningKey) -> x25519_dalek::StaticSecret {
     x25519_dalek::StaticSecret::from(*subkey_seed(store_sk, INBOX_INFO))
 }
 
-/// The 32-byte seed the record (blind-signing) key is generated from.
+/// The 32-byte seed the record (legacy RSA) key is generated from.
 pub fn record_key_seed(store_sk: &SigningKey) -> Zeroizing<[u8; 32]> {
     subkey_seed(store_sk, RECORD_INFO)
 }

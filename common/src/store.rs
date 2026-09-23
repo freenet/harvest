@@ -229,7 +229,7 @@ pub struct StoreInfoV1 {
     /// on 2026-09-05, `missing field `encryption_public_key``.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_public_key: Option<[u8; 32]>,
-    /// The store's record (blind-signing RSA) public key, PKCS#1 DER, derived
+    /// The store's record (legacy RSA) public key, PKCS#1 DER, derived
     /// from the store key (harvest#93 phase 1b,
     /// `custody::record_public_key_der`).
     ///

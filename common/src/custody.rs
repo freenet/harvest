@@ -24,7 +24,7 @@
 //!    ([`unwrap_store_key`]) the seed. Unwrap checks the recovered seed really
 //!    is the store's key. The UI never holds the seed.
 //!
-//! The store's inbox X25519 key and its record (blind-signing RSA) key derive
+//! The store's inbox X25519 key and its record (legacy RSA) key derive
 //! from the store key ([`inbox_secret`], [`record_rsa_key`]), so every device
 //! agrees on them.
 //!

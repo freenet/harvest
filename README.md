@@ -1,6 +1,6 @@
 # Harvest
 
-**Harvest** is a decentralized marketplace application for [Freenet](https://freenet.org). It enables peer-to-peer commerce with anonymous, donation-backed identities and a novel accountability mechanism based on blind-signature feedback tokens.
+**Harvest** is a decentralized marketplace application for [Freenet](https://freenet.org). It enables peer-to-peer commerce with anonymous, donation-backed identities and an accountability mechanism based on complaints that only a paying buyer can make.
 
 Harvest joins the family of Freenet apps alongside [River](https://github.com/freenet/river) (group chat) and [Delta](https://github.com/freenet/delta) (wiki/CMS).
 
@@ -13,7 +13,7 @@ Early design / scaffolding. The protocol is described in [`docs/design.md`](docs
 Harvest is built on two layers:
 
 1. **Ghostkeys** (via [`ghostkey-common`](https://crates.io/crates/ghostkey-common)) — anonymous identities backed by Freenet donations, providing Sybil-resistant pseudonyms with verifiable economic stake.
-2. **Harvest** — this repository. Stores, encrypted buyer-seller messaging, and a reputation contract with blind-signature feedback tokens.
+2. **Harvest** — this repository. Stores, encrypted buyer-seller messaging, and a reputation contract holding buyers' complaints about paid orders, each signed by the order's receipt key.
 
 ## Workspace layout
 
@@ -21,7 +21,7 @@ Harvest is built on two layers:
 harvest/
 ├── common/          # harvest-common: wire types shared across contracts, delegate, UI
 ├── contracts/       # Freenet contracts: store, mailbox, reputation
-├── delegates/       # Freenet delegates: harvest delegate (feedback-token RSA keypair, transaction state)
+├── delegates/       # Freenet delegates: harvest delegate (store keys, conversation keys, payment keys, registries)
 ├── ui/              # Dioxus web UI
 └── docs/
     └── design.md    # Full design document
