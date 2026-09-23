@@ -240,8 +240,10 @@ fn PurchaseCard(
             if let Some(paid) = purchase.paid.as_ref() {
                 SettledPurchase { order: paid.clone(), bitcoin: bitcoin.clone() }
                 FileComplaint {
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
+                    target: ComplaintTarget::AtStore {
+                        store_contract_id: store_contract_id.clone(),
+                        purchase: Box::new(purchase.clone()),
+                    },
                 }
             } else if let Some(settled) = purchase.settled() {
                 SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
@@ -459,9 +461,9 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
 /// Shown only when a complaint could be made; otherwise the reason, or the
 /// complaint already on record.
 #[component]
-fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+fn FileComplaint(target: ComplaintTarget) -> Element {
     use harvest_common::feedback::FeedbackCategory;
-    let order_id = purchase.order_id.clone();
+    let order_id = target.order_id();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
     // The refusal is read only when there is no complaint on record: it ends
@@ -469,10 +471,10 @@ fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element
     // P2-D), which a card with nothing to offer does not need.
     let (on_record, sent, refusal) = {
         let state = APP_STATE.read();
-        let on_record = state.complaint_on_record(&store_contract_id, &order_id);
+        let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
         let refusal = (on_record.is_none() && !sent)
-            .then(|| state.complaint_refusal(&store_contract_id, &purchase))
+            .then(|| target.refusal(&state))
             .flatten();
         (on_record, sent, refusal)
     };
@@ -514,15 +516,10 @@ fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element
                 button {
                     class: "btn btn-sm btn-primary",
                     onclick: {
-                        let store_contract_id = store_contract_id.clone();
-                        let order_id = order_id.clone();
+                        let target = target.clone();
                         move |_| {
                             chosen.set(None);
-                            let result = APP_STATE.write().file_complaint(
-                                &store_contract_id,
-                                &order_id,
-                                category.clone(),
-                            );
+                            let result = target.file(&mut APP_STATE.write(), category.clone());
                             problem.set(result.err());
                         }
                     },
@@ -555,6 +552,145 @@ fn FileComplaint(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element
                     }
                 }
             },
+        }
+    }
+}
+
+/// What a complaint control is about: a purchase on a loaded store's page,
+/// or a purchase this node keeps, judged from the kept record alone (review
+/// round 5 of #143, R5-B).
+#[derive(Clone, PartialEq)]
+enum ComplaintTarget {
+    AtStore {
+        store_contract_id: Vec<u8>,
+        purchase: Box<BuyerPurchase>,
+    },
+    Kept {
+        store_key: [u8; 32],
+        order_id: harvest_common::payment::OrderId,
+    },
+}
+
+impl ComplaintTarget {
+    fn order_id(&self) -> harvest_common::payment::OrderId {
+        match self {
+            Self::AtStore { purchase, .. } => purchase.order_id.clone(),
+            Self::Kept { order_id, .. } => order_id.clone(),
+        }
+    }
+
+    fn on_record(
+        &self,
+        state: &crate::state::AppState,
+    ) -> Option<harvest_common::reputation::Complaint> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.complaint_on_record(store_contract_id, &purchase.order_id),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.complaint_on_record_by_key(store_key, order_id),
+        }
+    }
+
+    fn refusal(&self, state: &crate::state::AppState) -> Option<String> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.complaint_refusal(store_contract_id, purchase),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.kept_complaint_refusal(store_key, order_id),
+        }
+    }
+
+    fn file(
+        &self,
+        state: &mut crate::state::AppState,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => state.file_complaint(store_contract_id, &purchase.order_id, category),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => state.file_kept_complaint(store_key, order_id, category),
+        }
+    }
+}
+
+/// Every purchase this node keeps, from the kept records alone, with no
+/// store loaded (review round 5 of #143, R5-B). A store re-keyed while its
+/// seller stays away, or one nobody hosts, still leaves the buyer the paid
+/// copy and the complaint control here.
+///
+/// No payment address, ever: the store page's purchase card is the one place
+/// a buyer is shown one (`docs/complaint-threat-model.md` section 3.1). An
+/// unpaid kept order is listed so the buyer knows it is held, and is paid
+/// from the store's page.
+#[component]
+pub fn KeptPurchases() -> Element {
+    let app_state = APP_STATE.read();
+    if app_state.kept_purchases.is_empty() {
+        return rsx! {};
+    }
+    let mut kept = app_state.kept_purchases.clone();
+    let bitcoin = app_state.bitcoin.clone();
+    drop(app_state);
+    // Newest first, as the orders list below.
+    kept.sort_by_key(|k| std::cmp::Reverse(k.order.order.created_at));
+    rsx! {
+        div { class: "card", style: "margin-top: 1rem;",
+            h3 { "Your purchases" }
+            p { class: "text-muted", style: "font-size: 0.85rem;",
+                "Every order your node keeps its own copy of. A complaint about a paid one "
+                "is made from that copy, so it does not need the seller's store to be "
+                "online or unchanged."
+            }
+            for purchase in kept.into_iter() {
+                KeptPurchaseRow {
+                    key: "{purchase.order.order.id}",
+                    purchase,
+                    bitcoin: bitcoin.clone(),
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn KeptPurchaseRow(
+    purchase: harvest_common::delegate::KeptPurchase,
+    bitcoin: crate::state::BitcoinState,
+) -> Element {
+    use harvest_common::payment::OrderStatus;
+    let short = purchase.order.order.id.short();
+    let paid = purchase.order.status == OrderStatus::Paid;
+    let amount = super::bitcoin_view::format_sats(purchase.order.order.amount_sats);
+    rsx! {
+        div { style: "margin-top: 0.5rem; border-top: 1px solid var(--border, #ddd); padding-top: 0.5rem;",
+            p { class: "text-muted", style: "font-size: 0.8rem;", "Order {short}" }
+            if paid {
+                SettledPurchase { order: purchase.order.clone(), bitcoin }
+                FileComplaint {
+                    target: ComplaintTarget::Kept {
+                        store_key: purchase.store_key,
+                        order_id: purchase.order.order.id.clone(),
+                    },
+                }
+            } else {
+                p { class: "text-muted",
+                    "{amount} \u{00b7} Not yet seen paid. Your node keeps this order and \
+                     watches for its payment; to pay it, open the seller's store."
+                }
+            }
         }
     }
 }

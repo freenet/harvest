@@ -8926,6 +8926,12 @@ impl AppState {
     /// complaint exactly as the reputation contract will (review round 2 of
     /// #143, P3), so the control is never offered for one the record would
     /// refuse.
+    ///
+    /// A purchase this node keeps is judged from the kept record alone
+    /// ([`Self::kept_complaint_checks`]), exactly as it is where no store is
+    /// loaded at all (review round 5, R5-B). Only a paid copy this node never
+    /// kept (model 3.3) needs the store: its owner key and the conversation's
+    /// receipt key come from there.
     fn complaint_checks(
         &self,
         store_contract_id: &[u8],
@@ -8945,28 +8951,65 @@ impl AppState {
             .get(store_contract_id)
             .ok_or("this store is not loaded")?;
         let owner = store.owner.ok_or("this store's key is not known here")?;
-        if store.complaints.iter().any(|c| c.order_id() == order_id) {
+        if let Some(kept) = self.kept_copy(&owner, order_id) {
+            return self.kept_complaint_checks(kept);
+        }
+        self.refuse_a_second_complaint(&owner, order_id)?;
+        let key = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)
+            .and_then(|c| c.receipt_signing_key())
+            .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        // The store's OWNER key: what the record is addressed by. Not
+        // `store_verifying_key`, which the seller can make `None` by
+        // retiring their backing (P1-1).
+        self.complaint_parts(order, key, &owner, purchase.conversation)
+    }
+
+    /// [`Self::complaint_checks`] for a purchase this node keeps, from the
+    /// kept record alone (review round 5 of #143, R5-B).
+    ///
+    /// The record holds everything a complaint is made of: the store key
+    /// (which addresses the reputation record, whatever build of the store
+    /// is current), the receipt seed, and the kept paid copy. So nothing here
+    /// reads `browsing_stores` except to see whether a loaded record already
+    /// holds a complaint, and to find a despatch, and neither is required: a
+    /// store re-keyed while the seller stays away, or one nobody hosts,
+    /// leaves the complaint where it was.
+    fn kept_complaint_checks(
+        &self,
+        kept: &harvest_common::delegate::KeptPurchase,
+    ) -> Result<ComplaintParts, String> {
+        use harvest_common::payment::OrderStatus;
+        let order_id = &kept.order.order.id;
+        if self
+            .complaint_on_record_by_key(&kept.store_key, order_id)
+            .is_some()
+        {
             return Err("your complaint about this order is already on the seller's record".into());
         }
-        let kept = self.kept_copy(&owner, order_id);
         // A kept copy still awaiting payment means its upgrade to `Paid` is
-        // on its way. The complaint must be about the copy the delegate
-        // will hold: built from a paid copy computed here, it could name a
-        // different paid height from the upgrade the delegate keeps, which
-        // would then refuse to keep the complaint, and the re-assert would
-        // never cover it. So the complaint waits for the upgrade.
-        if kept.is_some_and(|kept| kept.order.status != harvest_common::payment::OrderStatus::Paid)
-        {
-            return Err(
-                "your node is still keeping its proof of payment; the complaint can be made once \
-                 it has"
-                    .into(),
-            );
+        // on its way, if claims this node holds show it paid. The complaint
+        // must be about the copy the delegate will hold: built from a paid
+        // copy computed here, it could name a different paid height from the
+        // upgrade the delegate keeps, which would then refuse to keep the
+        // complaint, and the re-assert would never cover it. So the
+        // complaint waits for the upgrade.
+        if kept.order.status != OrderStatus::Paid {
+            return Err(if self
+                .proven_paid_copy(&kept.order, &kept.store_key)
+                .is_some()
+            {
+                "your node is still keeping its proof of payment; the complaint can be made \
+                     once it has"
+            } else {
+                "only a paid order of yours can be complained about"
+            }
+            .into());
         }
-        // The kept paid copy when there is one, so the complaint and the
-        // record the delegate holds are about the same evidence.
-        let order = kept.map(|kept| kept.order.clone()).unwrap_or(order);
-        if kept.is_some_and(|kept| kept.complaint.is_some()) {
+        if kept.complaint.is_some() {
             return Err(
                 "your complaint about this order is kept on this node, which puts it on the \
                  seller's record each time Harvest opens"
@@ -8977,28 +9020,53 @@ impl AppState {
             return Err("your complaint about this order is on its way".into());
         }
         // The kept record's own receipt seed, so forgetting the conversation
-        // does not lose the complaint (R2-5); the conversation's for a copy
-        // the delegate does not keep yet.
-        let key = match kept {
-            Some(kept) => Some(ed25519_dalek::SigningKey::from_bytes(&kept.receipt_seed)),
-            None => store
-                .conversations
-                .iter()
-                .find(|c| c.buyer_public_key == purchase.conversation)
-                .and_then(|c| c.receipt_signing_key()),
+        // does not lose the complaint (R2-5).
+        let key = Some(ed25519_dalek::SigningKey::from_bytes(&kept.receipt_seed))
+            .filter(|key| {
+                kept.order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes())
+            })
+            .ok_or("this node does not hold the key this order names for its buyer")?;
+        self.complaint_parts(kept.order.clone(), key, &kept.store_key, kept.conversation)
+    }
+
+    /// Refused when the record already holds this buyer's complaint about
+    /// `order_id`, or one is on its way.
+    fn refuse_a_second_complaint(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        if self
+            .complaint_on_record_by_key(store_key, order_id)
+            .is_some()
+        {
+            return Err("your complaint about this order is already on the seller's record".into());
         }
-        .filter(|key| order.order.buyer_receipt_key == Some(key.verifying_key().to_bytes()))
-        .ok_or("this node does not hold the key this order names for its buyer")?;
-        // The store's OWNER key: what the record is addressed by. Not
-        // `store_verifying_key`, which the seller can make `None` by
-        // retiring their backing (P1-1).
-        let store_key = ed25519_dalek::VerifyingKey::from_bytes(&owner)
+        if self.complaint_sent(order_id) {
+            return Err("your complaint about this order is on its way".into());
+        }
+        Ok(())
+    }
+
+    /// The part of the complaint checks that is the same for a kept copy and
+    /// a never-kept one: where the order stands against the chain, and a
+    /// trial complaint verified as the contract will.
+    fn complaint_parts(
+        &self,
+        order: AuthorizedOrder,
+        key: ed25519_dalek::SigningKey,
+        store_key: &[u8; 32],
+        conversation: [u8; 32],
+    ) -> Result<ComplaintParts, String> {
+        let store_key = ed25519_dalek::VerifyingKey::from_bytes(store_key)
             .map_err(|_| "this store's key is not usable".to_string())?;
         let tip_height = self
             .bitcoin
             .tips
             .get(&order.order.network)
             .and_then(|t| t.tip_height);
+        // Optional: read from any loaded store under this owner key. With
+        // none, the deadline decides.
         let despatch = self.despatch_of(&order);
         let stage = crate::fulfilment::order_stage(
             &order,
@@ -9042,7 +9110,7 @@ impl AppState {
             store_key,
             block_height,
             paid_height,
-            conversation: kept.map_or(purchase.conversation, |kept| kept.conversation),
+            conversation,
         };
         // The category is the buyer's choice and no part of what the
         // contract checks beyond its being signed, so any one stands in.
@@ -9082,6 +9150,20 @@ impl AppState {
         self.complaint_checks(store_contract_id, purchase).err()
     }
 
+    /// Why the buyer cannot complain about the purchase this node keeps
+    /// under `store_key` and `order_id`, or `None` when they can: the
+    /// store-independent list of kept purchases (R5-B).
+    pub fn kept_complaint_refusal(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<String> {
+        match self.kept_copy(store_key, order_id) {
+            Some(kept) => self.kept_complaint_checks(kept).err(),
+            None => Some("this node keeps no such purchase".into()),
+        }
+    }
+
     /// Whether the buyer's complaint about `order_id` is on its way to the
     /// delegate, which keeps it before it is put on the record.
     pub fn complaint_sent(&self, order_id: &harvest_common::payment::OrderId) -> bool {
@@ -9095,10 +9177,23 @@ impl AppState {
         store_contract_id: &[u8],
         order_id: &harvest_common::payment::OrderId,
     ) -> Option<Complaint> {
+        let owner = self.browsing_stores.get(store_contract_id)?.owner?;
+        self.complaint_on_record_by_key(&owner, order_id)
+    }
+
+    /// The buyer's complaint about `order_id`, if a loaded record of the
+    /// store with key `store_key` holds one. The record is addressed by the
+    /// store key alone, so every build of the store shares it; any loaded
+    /// store under that owner key carries it (R5-B).
+    pub fn complaint_on_record_by_key(
+        &self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<Complaint> {
         self.browsing_stores
-            .get(store_contract_id)?
-            .complaints
-            .iter()
+            .values()
+            .filter(|store| store.owner.as_ref() == Some(store_key))
+            .flat_map(|store| store.complaints.iter())
             .find(|c| c.order_id() == order_id)
             .cloned()
     }
@@ -9134,6 +9229,34 @@ impl AppState {
             .find(|p| &p.order_id == order_id)
             .ok_or("this order is not one of your purchases at this store")?;
         let parts = self.complaint_checks(store_contract_id, &purchase)?;
+        self.send_complaint(parts, category)
+    }
+
+    /// [`Self::file_complaint`] for a purchase this node keeps, from the
+    /// kept record alone, with no store loaded (review round 5 of #143,
+    /// R5-B): the control in the store-independent list of kept purchases.
+    pub fn file_kept_complaint(
+        &mut self,
+        store_key: &[u8; 32],
+        order_id: &harvest_common::payment::OrderId,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        let kept = self
+            .kept_copy(store_key, order_id)
+            .ok_or("this node keeps no such purchase")?
+            .clone();
+        let parts = self.kept_complaint_checks(&kept)?;
+        self.send_complaint(parts, category)
+    }
+
+    /// Sign the complaint `parts` describe and send it to the delegate to
+    /// keep; the re-assert puts it on the record once it is kept.
+    fn send_complaint(
+        &mut self,
+        parts: ComplaintParts,
+        category: harvest_common::feedback::FeedbackCategory,
+    ) -> Result<(), String> {
+        let order_id = parts.order.order.id.clone();
         let complaint = parts.sign(category)?;
         // Checked before sending, against the key the record is addressed
         // by: the contract refuses in silence otherwise.
@@ -26368,6 +26491,71 @@ mod buy_flow_tests {
             "{refused}"
         );
         assert!(state.complaint_on_record(STORE, &order.order.id).is_some());
+    }
+
+    /// **A kept paid purchase takes its complaint from the kept record
+    /// alone** (review round 5 of #143, R5-B). The store is re-keyed while
+    /// the seller stays away, so nothing answers at the address this build
+    /// loads, or nobody hosts it: no store is loaded at all, or one is
+    /// loaded with no state (no owner, no orders, no conversations). The
+    /// complaint is still offered, and what is filed verifies under the store
+    /// key the record is addressed by. Red if the kept path reads the store
+    /// again (its owner key, its conversations, its orders).
+    #[test]
+    fn a_kept_paid_purchase_takes_its_complaint_with_no_store() {
+        use crate::fulfilment::DESPATCH_WINDOW_BLOCKS;
+        use harvest_common::feedback::FeedbackCategory;
+        type Away = fn(&mut AppState);
+        let aways: [(&str, Away); 2] = [
+            ("no store loaded", |state| state.browsing_stores.clear()),
+            ("a store with no state", |state| {
+                let store = state.browsing_stores.get_mut(STORE).unwrap();
+                store.owner = None;
+                store.orders.clear();
+                store.conversations.clear();
+                store.mailbox_messages.clear();
+                store.despatches.clear();
+                store.store_verifying_key = None;
+                store.seller_verifying_key = None;
+            }),
+        ];
+        for (what, away) in aways {
+            let (mut state, order) = a_paid_purchase();
+            state.kept_purchases = vec![kept(&order)];
+            state.kept_purchases_loaded = true;
+            // No despatch can be read without the store: the deadline decides.
+            move_tip_to(&mut state, TIP_HEIGHT - 1 + DESPATCH_WINDOW_BLOCKS + 1);
+            away(&mut state);
+            let store_key = seller_signing_key().verifying_key().to_bytes();
+            assert_eq!(
+                state.kept_complaint_refusal(&store_key, &order.order.id),
+                None,
+                "{what}"
+            );
+            state
+                .file_kept_complaint(&store_key, &order.order.id, FeedbackCategory::NonDelivery)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let (key, complaint) = filed(&mut state);
+            assert_eq!(key.to_bytes(), store_key, "{what}: the owner's record");
+            assert_eq!(complaint.order, order, "{what}: the kept copy travels");
+            complaint
+                .verify(&key)
+                .unwrap_or_else(|e| panic!("{what}: the record accepts it: {e}"));
+            assert!(
+                state
+                    .file_kept_complaint(&store_key, &order.order.id, FeedbackCategory::Counterfeit)
+                    .is_err(),
+                "{what}: one per order"
+            );
+        }
+        // Nothing kept: nothing offered.
+        let (state, order) = a_paid_purchase();
+        assert!(state
+            .kept_complaint_refusal(
+                &seller_signing_key().verifying_key().to_bytes(),
+                &order.order.id
+            )
+            .is_some());
     }
 
     /// **A seller who has been paid cannot take the complaint away** (review
