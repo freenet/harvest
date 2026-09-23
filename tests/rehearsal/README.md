@@ -80,6 +80,28 @@ So: **verify what the node wrote, not what you passed it.** After startup,
   that failed silently -- is still unproven against a live node. Closing that
   gap needs the app in a browser.
 
+## The delegate secret migration: `delegate-rehearsal.sh`
+
+The walk in `ui/src/delegate_migrate.rs` runs in the browser, so its
+rehearsal loads the real app: `delegate-rehearsal.sh <newui-dir> <work-dir>`
+seeds a superseded delegate generation through its own handlers
+(`src/bin/delegate.rs seed`), loads the build under test in headless
+Chromium (`load-ui.js`), and asks the current delegate for every seeded
+secret (`check`). The script header says what `<newui-dir>` holds.
+
+**It runs a `freenet network` node, not `freenet local`, and that is the
+point of it.** A local node answers a message to a delegate it never
+registered with `DelegateError::Missing`; a network node answers the same
+message with an empty response. The first delegate rehearsals ran on
+`freenet local` and passed while every real walk stopped at the first
+generation its node never ran (harvest#150). The node is an isolated
+gateway (`--is-gateway --skip-load-from-network`), which never loads a
+gateway list, and the script fails if its log shows a peer connection.
+
+It fails on a walk that reports `stopped` or `current delegate unavailable`,
+not only on a missing secret: the newest-predecessor scenario imports every
+secret before it stops, so checking values alone passes a broken walk.
+
 ## Not wired into CI
 
 It needs a live node, which is a separate decision from running it.
