@@ -697,6 +697,18 @@ pub enum HarvestDelegateResponse {
     StoreList {
         ghostkey_fingerprint: String,
         stores: Vec<StoreRegistration>,
+        /// The store keys named in `stores` that this delegate HOLDS, and so
+        /// can sign for, wrap and derive from (harvest#138).
+        ///
+        /// A registration is not the key. A delegate re-key carries the
+        /// registrations forward (harvest#123) and never the keys
+        /// (`migration::WithoutStoreKeys`), so after one this device is
+        /// registered for a store it cannot sign for until custody recovers
+        /// the key. The UI decides wrap or recover on this, not on the
+        /// registration. `None` from a generation older than the field, which
+        /// the UI reads as "holds every key it names", as it always had.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_store_keys: Option<Vec<[u8; 32]>>,
     },
 
     /// Every store this node remembers, sorted by code, after whichever
@@ -1158,6 +1170,32 @@ pub struct TransactionRecord {
 mod tests {
     use super::*;
 
+    /// A `StoreList` from a generation older than `held_store_keys` still
+    /// decodes, and says nothing about which keys are held rather than "none"
+    /// (harvest#138): the migration walk's probe reads old generations'
+    /// answers, and "none held" would be a claim that generation never made.
+    #[test]
+    fn a_store_list_without_held_keys_decodes_as_unknown() {
+        #[derive(Serialize)]
+        enum Old {
+            StoreList {
+                ghostkey_fingerprint: String,
+                stores: Vec<StoreRegistration>,
+            },
+        }
+        let old = crate::to_cbor(&Old::StoreList {
+            ghostkey_fingerprint: "fp".into(),
+            stores: Vec::new(),
+        })
+        .expect("encode");
+        match crate::from_cbor::<HarvestDelegateResponse>(&old).expect("decodes") {
+            HarvestDelegateResponse::StoreList {
+                held_store_keys, ..
+            } => assert_eq!(held_store_keys, None),
+            other => panic!("expected a StoreList, got {other:?}"),
+        }
+    }
+
     /// **A conversation secret must not print itself.**
     ///
     /// It travels inside a `Debug`-deriving request enum, so any `{:?}` of
@@ -1493,6 +1531,7 @@ mod tests {
                     store_contract_key: None,
                     store_verifying_key: Some([17u8; 32]),
                 }],
+                held_store_keys: Some(vec![[17u8; 32]]),
             },
             R::RememberedStores {
                 stores: vec![RememberedStore {

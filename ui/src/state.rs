@@ -318,6 +318,17 @@ pub struct AppState {
     /// Store keys whose subkeys have been asked for this session.
     pub store_subkeys_requested: HashSet<[u8; 32]>,
 
+    /// Whether this device's Harvest delegate HOLDS each registered store
+    /// key, as its last `StoreList` answer said (harvest#138).
+    ///
+    /// A registration is not the key: a delegate re-key carries the
+    /// registrations forward and never the keys, so a device can be
+    /// registered for a store it cannot sign for. Custody decides wrap or
+    /// recover on this ([`AppState::holds_store_key`]). A key the delegate
+    /// has not said anything about is taken as held, which is what every
+    /// build before this one assumed of every registration.
+    pub store_keys_held: HashMap<[u8; 32], bool>,
+
     /// Custody requests waiting on the vault's wrap signature, by store key,
     /// and then on the Harvest delegate's answer. See `custody_flow`.
     pub pending_custody: std::collections::BTreeMap<[u8; 32], crate::custody_flow::CustodyRequest>,
@@ -6288,6 +6299,28 @@ impl AppState {
     /// `None` for a store that is not ours, and for one made before revision
     /// 2, which was owned by its Ghost Key and has no store key: this build
     /// cannot sign for it, and `crate::backing_flow` moves it to one.
+    /// Record which of `stores`' keys the delegate said it holds. An answer
+    /// that says nothing (a generation older than the field) changes nothing.
+    pub(crate) fn note_held_store_keys(
+        &mut self,
+        stores: &[StoreRegistration],
+        held: Option<&[[u8; 32]]>,
+    ) {
+        let Some(held) = held else {
+            return;
+        };
+        for key in stores.iter().filter_map(|s| s.store_verifying_key) {
+            self.store_keys_held.insert(key, held.contains(&key));
+        }
+    }
+
+    /// Whether this device's delegate holds the store key `store`, so can sign
+    /// for, wrap and derive from it (harvest#138). See
+    /// [`Self::store_keys_held`] for why this is not the registration.
+    pub fn holds_store_key(&self, store: &[u8; 32]) -> bool {
+        self.store_keys_held.get(store).copied().unwrap_or(true)
+    }
+
     pub fn store_owner_key(&self, store_contract_id: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
         let bytes = self
             .my_stores
@@ -7649,12 +7682,14 @@ impl AppState {
             HarvestDelegateResponse::StoreList {
                 ghostkey_fingerprint,
                 stores,
+                held_store_keys,
             } => {
                 info!(
                     "Delegate reports {} store(s) for {}",
                     stores.len(),
                     ghostkey_fingerprint
                 );
+                self.note_held_store_keys(&stores, held_store_keys.as_deref());
                 self.store_lists_answered
                     .insert(ghostkey_fingerprint.clone());
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
@@ -10046,6 +10081,7 @@ mod tests {
         HarvestDelegateResponse::StoreList {
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             stores,
+            held_store_keys: None,
         }
     }
 
@@ -15251,6 +15287,7 @@ mod delegate_correlation_tests {
                 store_contract_key: None,
                 store_verifying_key: Some(crate::state::test_store_key()),
             }],
+            held_store_keys: None,
         });
 
         assert_eq!(
@@ -18505,6 +18542,7 @@ mod buy_flow_tests {
         state.on_delegate_response(HarvestDelegateResponse::StoreList {
             ghostkey_fingerprint: "seller-fp".to_string(),
             stores: Vec::new(),
+            held_store_keys: None,
         });
         assert!(
             state.settlements_submitted.contains(&order.order.id),

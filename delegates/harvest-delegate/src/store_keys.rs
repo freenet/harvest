@@ -125,6 +125,12 @@ pub(crate) fn load<S: SecretStore>(secrets: &S, store: &VerifyingKey) -> Option<
     (key.verifying_key() == *store).then_some(key)
 }
 
+/// Whether this delegate holds the store key `store`: the seed is here and
+/// is that key's (harvest#138). Through [`load`], the family's only reader.
+pub(crate) fn holds<S: SecretStore>(secrets: &S, store: &[u8; 32]) -> bool {
+    VerifyingKey::from_bytes(store).is_ok_and(|store| load(secrets, &store).is_some())
+}
+
 /// Keep `key`, under its own verifying key. Whether the write landed.
 pub(crate) fn keep<S: SecretStore>(secrets: &mut S, key: &SigningKey) -> bool {
     secrets.set_secret(&store_key_secret(&key.verifying_key()), key.as_bytes())

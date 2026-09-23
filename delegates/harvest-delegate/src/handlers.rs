@@ -719,9 +719,19 @@ fn handle_list_stores<S: SecretStore>(
     ghostkey_fingerprint: &str,
 ) -> HarvestDelegateResponse {
     let stores = load_stores(store, ghostkey_fingerprint);
+    // Which of these keys this delegate can actually sign with (harvest#138).
+    // A re-key carries the registrations and never the keys, so a
+    // registration naming a key is not evidence of holding it, and the UI
+    // decides between wrapping a key and recovering it on this.
+    let held_store_keys = stores
+        .iter()
+        .filter_map(|s| s.store_verifying_key)
+        .filter(|key| crate::store_keys::holds(store, key))
+        .collect();
     HarvestDelegateResponse::StoreList {
         ghostkey_fingerprint: ghostkey_fingerprint.to_string(),
         stores,
+        held_store_keys: Some(held_store_keys),
     }
 }
 
@@ -850,6 +860,61 @@ mod origin_gating_tests {
             crate::store_keys::unfinished_creation(&store, FINGERPRINT).is_none(),
             "finished by the duplicate registration"
         );
+    }
+
+    /// A store list says which of the keys it names this delegate HOLDS, and
+    /// a registration that came across a re-key without its key is not one
+    /// of them (harvest#138). The UI decides wrap or recover on this; read
+    /// off the registration, a device whose delegate re-keyed wrapped a key
+    /// it did not have and never recovered it, so it could sign nothing.
+    ///
+    /// The unheld registration arrives the way a re-key delivers it: through
+    /// the import, from a predecessor's export, which never carries the key.
+    /// Mutated red by reporting every registered key as held.
+    #[test]
+    fn a_store_list_names_only_the_store_keys_it_holds() {
+        let mut store = MemSecrets::default();
+        let held = mint(&mut store, 1, false).unwrap();
+        register_as(&mut store, vec![7; 32], Some(held));
+        let carried = ed25519_dalek::SigningKey::from_bytes(&[0x2c; 32])
+            .verifying_key()
+            .to_bytes();
+        let predecessor_registry = to_cbor(&vec![StoreRegistration {
+            store_contract_id: vec![8; 32],
+            reputation_contract_id: vec![1],
+            mailbox_contract_id: vec![2],
+            store_contract_key: None,
+            store_verifying_key: Some(carried),
+        }])
+        .unwrap();
+        crate::import::import(
+            &mut store,
+            [0x99; 32],
+            stores_key(FINGERPRINT),
+            &predecessor_registry,
+        );
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            HarvestDelegateRequest::ListStores {
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+            },
+        ) {
+            HarvestDelegateResponse::StoreList {
+                stores,
+                held_store_keys,
+                ..
+            } => {
+                assert!(
+                    stores
+                        .iter()
+                        .any(|s| s.store_verifying_key == Some(carried)),
+                    "the carried registration is listed: {stores:?}"
+                );
+                assert_eq!(held_store_keys, Some(vec![held]));
+            }
+            other => panic!("expected a StoreList, got {other:?}"),
+        }
     }
 
     fn mint(store: &mut MemSecrets, id: u64, another_store: bool) -> Result<[u8; 32], String> {

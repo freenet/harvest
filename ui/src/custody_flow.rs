@@ -7,20 +7,29 @@
 //! one of three things, from the state alone and the Ghost Keys connected to
 //! this tab:
 //!
-//! * **Wrap.** The store is ours (registered, with its store key), its current
+//! * **Wrap.** The store is ours (registered, with its store key, and this
+//!   device's delegate HOLDS that key), its current
 //!   backing is a connected Ghost Key, and the store holds no wrapped copy for
 //!   that key under Harvest's current webapp scope. The UI asks the vault for
 //!   the Ghost Key's signature over `custody::wrap_message(store)`, hands it
 //!   to the Harvest delegate (`WrapStoreKeyFor`), which wraps the store key
 //!   and signs the copy, and publishes the copy. This covers a new store, a
 //!   store whose backing changed, and a change of webapp scope.
-//! * **Recover.** The store is NOT registered here with a store key, one of
-//!   its unretired backings is a connected Ghost Key, and it holds a copy for
-//!   that key under the current scope: this device lost the key (a delegate
-//!   re-key, which does not carry secrets across) or never had it (a second
-//!   device). The same vault signature goes to `UnwrapStoreKey`, which opens
-//!   the copy, checks the seed IS this store's key, and keeps it; the store
-//!   is then registered again, so it reappears in My Store.
+//! * **Recover.** This device's delegate does NOT hold the store's key, one
+//!   of its unretired backings is a connected Ghost Key, and it holds a copy
+//!   for that key under the current scope: this device lost the key or never
+//!   had it (a second device). The same vault signature goes to
+//!   `UnwrapStoreKey`, which opens the copy, checks the seed IS this store's
+//!   key, and keeps it; a store not registered here is then registered
+//!   again, so it reappears in My Store.
+//!
+//!   "Not held" is what the delegate's `StoreList` answer says
+//!   (`held_store_keys`), NOT the absence of a registration (harvest#138).
+//!   A delegate re-key carries the registrations forward (harvest#123) and
+//!   never the keys, which leave the delegate only wrapped, in custody. Read
+//!   off the registration, such a device chose Wrap, which the delegate
+//!   refuses for a key it lacks, and never recovered: it could sign nothing
+//!   for its own store (no despatch, cancel, invoice or listing).
 //! * Nothing, otherwise.
 //!
 //! Recovery can go through any backer whose backing is not retired, not only
@@ -353,7 +362,11 @@ impl AppState {
                 request_id: None,
             })
         };
-        if self.store_owner_key(store_contract_id) == Some(owner) {
+        // Ours AND held: the registration alone says the store is ours, not
+        // that this delegate can sign with its key (harvest#138).
+        if self.store_owner_key(store_contract_id) == Some(owner)
+            && self.holds_store_key(&owner.to_bytes())
+        {
             let backer = current?;
             if attempted(&backer) || copy_for(state, &backer, &scope).is_some() {
                 return None;
@@ -361,8 +374,9 @@ impl AppState {
             let fingerprint = self.connected_fingerprint(&backer.to_bytes())?;
             return request(&backer, fingerprint, CustodyPurpose::Wrap);
         }
-        // Not held: recover through any unretired backer this tab has, the
-        // current one first.
+        // Not held -- never registered here, or registered and the key lost
+        // to a delegate re-key: recover through any unretired backer this
+        // tab has, the current one first.
         let mut backers: Vec<ed25519_dalek::VerifyingKey> = state
             .backings
             .records
@@ -507,6 +521,21 @@ impl AppState {
             self.notifications.push(format!(
                 "Your store's key could not be recovered from your Ghost Key: {why}"
             ));
+            return;
+        }
+        self.store_keys_held.insert(store, true);
+        let registered = self
+            .store_owner_key(&pending.store_contract_id)
+            .is_some_and(|key| key.to_bytes() == store);
+        if registered {
+            // The registration came across a delegate re-key and only the key
+            // did not (harvest#138). It already names this store's own
+            // contracts, where a registration rebuilt here would derive the
+            // mailbox from the recovering backer (see
+            // `recovered_registration`), so it is kept as it is.
+            self.notifications
+                .push("Recovered your store's key from your Ghost Key.".into());
+            self.request_store_subkeys(store);
             return;
         }
         let Some(registration) = self.recovered_registration(&pending, store) else {
@@ -1210,6 +1239,7 @@ mod tests {
                 store_contract_key: None,
                 store_verifying_key: Some(store_vk().to_bytes()),
             }],
+            held_store_keys: Some(vec![store_vk().to_bytes()]),
         });
         assert_eq!(
             state
@@ -1218,6 +1248,127 @@ mod tests {
                 .map(|r| r.purpose.clone()),
             Some(CustodyPurpose::Wrap)
         );
+    }
+
+    /// The store list for a device whose delegate re-keyed: the registration
+    /// came across (harvest#123), the key did not, and the delegate says so.
+    fn store_list_holding(held: Vec<[u8; 32]>) -> HarvestDelegateResponse {
+        HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            stores: vec![StoreRegistration {
+                store_contract_id: vec![ID; 32],
+                reputation_contract_id: vec![ID + 1; 32],
+                mailbox_contract_id: vec![ID + 2; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_vk().to_bytes()),
+            }],
+            held_store_keys: Some(held),
+        }
+    }
+
+    /// harvest#138 F1: a store registered here whose key the delegate does
+    /// NOT hold is recovered from its copy, not wrapped. Deciding on the
+    /// registration, the device wrapped (refused: no key) or, with a copy
+    /// already published, did nothing, so it never recovered and could sign
+    /// nothing for its own store after a delegate re-key. Reproduced live
+    /// against the published main: `f1-repro-main.txt` in the PR.
+    ///
+    /// Mutated red by deciding on the registration alone again.
+    #[test]
+    fn a_registered_store_whose_key_is_not_held_is_recovered() {
+        // Copy published, key lost: recover it.
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        assert_eq!(state.store_owner_key(&[ID; 32]), Some(store_vk()));
+        assert_eq!(
+            state
+                .pending_custody
+                .get(&store_vk().to_bytes())
+                .map(|r| r.purpose.clone()),
+            Some(CustodyPurpose::Recover(wrapped()))
+        );
+
+        // No copy anywhere, key lost: nothing can be done, and wrapping a key
+        // the delegate lacks is not tried.
+        let mut state = backed_store();
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        assert!(state.pending_custody.is_empty());
+
+        // The same store list saying the key IS held, with the copy there:
+        // nothing to do, as before.
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(vec![store_vk().to_bytes()]));
+        assert!(state.pending_custody.is_empty());
+    }
+
+    /// A store list from a delegate that predates `held_store_keys` says
+    /// nothing about holding, and the registration is taken as held, which
+    /// is what every earlier build did (harvest#138). Mutated red by reading
+    /// the missing field as "none held".
+    #[test]
+    fn a_store_list_that_says_nothing_about_holding_leaves_the_key_held() {
+        let mut state = backed_store();
+        state.on_delegate_response(HarvestDelegateResponse::StoreList {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            stores: vec![StoreRegistration {
+                store_contract_id: vec![ID; 32],
+                reputation_contract_id: vec![ID + 1; 32],
+                mailbox_contract_id: vec![ID + 2; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(store_vk().to_bytes()),
+            }],
+            held_store_keys: None,
+        });
+        assert!(state.holds_store_key(&store_vk().to_bytes()));
+        assert_eq!(
+            state
+                .pending_custody
+                .get(&store_vk().to_bytes())
+                .map(|r| r.purpose.clone()),
+            Some(CustodyPurpose::Wrap)
+        );
+    }
+
+    /// Recovering the key of a store that is already registered here keeps
+    /// the registration it has (harvest#138): it names the store's real
+    /// mailbox, where a rebuilt one would derive it from the recovering
+    /// backer. The key is then held, so custody neither recovers nor wraps
+    /// again. Mutated red by rebuilding the registration and by not marking
+    /// the key held.
+    #[test]
+    fn recovering_a_registered_stores_key_keeps_its_registration() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.on_delegate_response(store_list_holding(Vec::new()));
+        let before = state.my_stores[FINGERPRINT].clone();
+        let request_id = state
+            .pending_custody
+            .get(&store_vk().to_bytes())
+            .expect("recovery started")
+            .request_id;
+        assert_eq!(request_id, None, "not sent yet");
+        sent_under(&mut state, store_vk().to_bytes(), 0);
+
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 0,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+
+        assert_eq!(state.my_stores[FINGERPRINT], before);
+        assert!(state.holds_store_key(&store_vk().to_bytes()));
+        assert!(state.pending_custody.is_empty());
+        state.custody_attempted.clear();
+        assert_eq!(
+            state.custody_needed(&[ID; 32]),
+            None,
+            "held, copy published"
+        );
+        assert!(state
+            .store_subkeys_requested
+            .contains(&store_vk().to_bytes()));
     }
 
     /// A custody request that nothing answers is given up after

@@ -206,6 +206,7 @@ impl DelegateCalls for Fake {
             &HarvestDelegateResponse::StoreList {
                 ghostkey_fingerprint: String::new(),
                 stores: Vec::new(),
+                held_store_keys: None,
             },
         )]))
     }
@@ -586,6 +587,7 @@ fn the_other_expectations_match_only_their_own_answer() {
         !Expect::Export.accepts_payload(&cbor(&HarvestDelegateResponse::StoreList {
             ghostkey_fingerprint: String::new(),
             stores: Vec::new(),
+            held_store_keys: None,
         }))
     );
 }
