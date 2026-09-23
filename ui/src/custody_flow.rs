@@ -371,16 +371,25 @@ impl AppState {
             })
             .copied()
             .collect();
+        let mut news = false;
         for store in &expired {
-            self.pending_custody.remove(store);
+            let request = self.pending_custody.remove(store);
             self.custody_started_ms.remove(store);
+            // A recovery whose key another attempt already recovered did not
+            // fail in any sense the seller needs to hear (harvest#138 review).
+            let already_recovered =
+                matches!(request.map(|r| r.purpose), Some(CustodyPurpose::Recover(_)))
+                    && self.store_keys_held.get(store) == Some(&true);
+            news |= !already_recovered;
         }
-        if !expired.is_empty() {
+        if news {
             self.notifications.push(
                 "Backing up or recovering your store's key did not finish: the Ghost Key vault \
                  or the Harvest delegate did not answer. Reload to try again."
                     .into(),
             );
+        }
+        if !expired.is_empty() {
             self.start_custody_where_needed();
         }
     }
@@ -614,9 +623,11 @@ impl AppState {
             return;
         };
         if let Err(why) = result {
-            // An attempt that failed after another already recovered the key
-            // is not news, and saying it would be false.
-            if self.store_keys_held.get(&store) != Some(&true) {
+            // An attempt that failed after another already recovered a
+            // registered store's key is not news, and saying it would be
+            // false. An unregistered store is still not this device's store
+            // (a late success rebuilds nothing), so its failure is said.
+            if !(registered && self.store_keys_held.get(&store) == Some(&true)) {
                 self.notifications.push(format!(
                     "Your store's key could not be recovered from your Ghost Key: {why}"
                 ));
@@ -1532,6 +1543,23 @@ mod tests {
             .notifications
             .iter()
             .any(|n| n.contains("could not be recovered")));
+        // A live attempt that then times out is not "did not finish" either.
+        state.pending_custody.insert(
+            store_vk().to_bytes(),
+            CustodyRequest {
+                store_contract_id: vec![ID; 32],
+                backer: backer_vk().to_bytes(),
+                fingerprint: FINGERPRINT.to_string(),
+                purpose: CustodyPurpose::Recover(wrapped()),
+                request_id: Some(9),
+            },
+        );
+        state.custody_started_ms.insert(store_vk().to_bytes(), 0);
+        state.expire_custody(CUSTODY_TIMEOUT_MS);
+        assert!(!state
+            .notifications
+            .iter()
+            .any(|n| n.contains("did not finish")));
         // A further success is not said twice.
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
             request_id: 6,
@@ -1539,6 +1567,31 @@ mod tests {
             result: Ok(()),
         });
         assert_eq!(recovered(&state), 1);
+    }
+
+    /// An UNREGISTERED store is not made this device's by a late success,
+    /// so a live attempt's failure afterwards is still said (round 5).
+    /// Mutated red by hiding every failure once the key is held.
+    #[test]
+    fn an_unregistered_stores_failure_is_said_after_a_late_success() {
+        let mut state = backed_store();
+        add_copy(&mut state, WrapScope::current());
+        state.start_custody_for(&[ID; 32]);
+        sent_under(&mut state, store_vk().to_bytes(), 5);
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 77,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Ok(()),
+        });
+        state.on_delegate_response(HarvestDelegateResponse::StoreKeyRecovered {
+            request_id: 5,
+            store_verifying_key: store_vk().to_bytes(),
+            result: Err("bad copy".into()),
+        });
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("could not be recovered")));
     }
 
     /// A recovery that was tried and failed, with the copy there and the

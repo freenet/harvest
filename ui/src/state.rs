@@ -4081,13 +4081,14 @@ impl AppState {
     /// An earlier id asked about BEFORE it was known to be one (a backup
     /// restored before its store was opened, harvest#138 review) had its
     /// answer filed under a placeholder entry of its own, and holds the
-    /// claim, so the store's recall would skip it. Drop both, so it is asked
-    /// again and filed with the store. A claim in flight is left to answer,
-    /// and its answer is now filed with the store.
+    /// claim, so the store's recall would skip it. Its conversations move to
+    /// the store and the claim is dropped, so it is asked again and filed
+    /// with the store; a claim in flight is left to answer, and its answer
+    /// is now filed with the store.
     ///
-    /// The entry itself is left alone: it may be more than a placeholder
-    /// (a store being browsed, a mailbox registered under that id), so only
-    /// its conversations move (harvest#138 review, round 2).
+    /// The entry is dropped only if nothing else is in it: it may be more
+    /// than a placeholder (a store being browsed, a mailbox registered under
+    /// that id), and then only its conversations move (harvest#138 review).
     fn adopt_placeholder_for(&mut self, earlier: &[u8]) {
         let current = self.recall_files_under(earlier);
         let moved: Vec<crate::messaging::BuyerConversation> = self
