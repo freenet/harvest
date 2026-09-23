@@ -103,6 +103,11 @@ pub struct ComplaintTerms {
     /// A recent Bitcoin block: the complaint was signed no earlier than it.
     /// A lower bound only, like a despatch's anchor (`fulfilment`): every
     /// past block hash is public, so a buyer can name an early one.
+    ///
+    /// Only the HEIGHT is read (the reader-side window). The hash is 32
+    /// bytes nobody checks against a chain; it is signed by the buyer and
+    /// fixed-size, so it carries nothing the buyer did not choose, and no
+    /// reader treats it as evidence.
     pub block_ref: BlockAnchor,
 }
 
@@ -111,14 +116,16 @@ pub struct ComplaintTerms {
 /// # Who can make a second, different complaint for one order
 ///
 /// * The buyer, by signing again with another category or block. Both are
-///   real; the slot keeps the smaller encoding, a total order over the
-///   complaints' own bytes, so which survives does not depend on arrival
-///   order.
+///   real; the slot keeps the one whose signed terms encode smaller (then
+///   the smaller signature), a total order over the buyer's own bytes, so
+///   which survives does not depend on arrival order -- and not on anything
+///   the seller or a third party can vary.
 /// * Anyone, by attaching different valid payment evidence for the same
 ///   order (evidence is signed by nobody), and the seller, by re-signing the
 ///   same terms. Neither can change what the buyer signed -- the order, the
-///   category and the block -- so any variant they can win the slot with
-///   says exactly what the buyer's did.
+///   category and the block -- and the tie-break ranks what the buyer signed
+///   first, so they choose only among copies of ONE buyer statement
+///   ([`Complaint::canonical_rank`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Complaint {
     /// The order, at `Paid`, with its seller-signed terms and its evidence.
@@ -159,6 +166,41 @@ impl Complaint {
                 "a complaint must name a paid order, and this one is {:?}",
                 self.order.status
             ));
+        }
+        // "Costs a real payment" by construction: an order for nothing, or an
+        // on-chain order that counts as paid before any confirmation, is not
+        // one (review round 1, nit). A Lightning order is final on the
+        // preimage and names no confirmations.
+        if self.order.order.amount_sats == 0 {
+            return Err("a complaint must name an order for a non-zero amount".into());
+        }
+        if self.order.order.payment_hash.is_none() && self.order.order.required_confirmations == 0
+        {
+            return Err(
+                "a complaint must name an on-chain order that needs at least one confirmation"
+                    .into(),
+            );
+        }
+        // Nothing rides along that nobody signed for (review round 1, P1-3).
+        // `verify_scoped_signature` below decodes each envelope and compares
+        // its payload, which tolerates bytes after the CBOR item and map keys
+        // the decoder skips; on a permanent, public record those are a
+        // free-text channel (section 7, decision 2) and a way to bloat it.
+        // So both signed envelopes must be byte for byte what their signed
+        // data gives.
+        let terms_bytes = crate::to_cbor(&self.terms())?;
+        if !crate::backing::is_exact_harvest_envelope(&self.scoped_payload, &terms_bytes) {
+            return Err(
+                "the complaint's signed payload is not exactly the envelope of its terms".into(),
+            );
+        }
+        let order_bytes = crate::to_cbor(&self.order.order)?;
+        if !crate::backing::is_exact_harvest_envelope(&self.order.scoped_payload, &order_bytes) {
+            return Err(
+                "the complained-about order's signed payload is not exactly the envelope of its \
+                 terms"
+                    .into(),
+            );
         }
         // Terms signed by the store key, the id the terms give, nothing
         // attached that the status does not use, and payment evidence that
@@ -201,10 +243,24 @@ impl Complaint {
         *hasher.finalize().as_bytes()
     }
 
-    /// The encoding the per-order tie-break compares. See
+    /// What the per-order tie-break compares, smallest first. See
     /// [`ReputationStateV1::apply_delta`].
-    fn canonical_rank(&self) -> Vec<u8> {
-        crate::to_cbor(self).expect("a complaint always serializes")
+    ///
+    /// What the BUYER signed comes first: the terms (order id, category,
+    /// block), then the buyer's signature over them. Only when those are
+    /// byte-identical -- one buyer statement -- does the rest decide, which
+    /// is the order's seller signature and the payment evidence. So the
+    /// seller, or anyone attaching other evidence, can only choose among
+    /// copies of one statement the buyer made, never between two different
+    /// statements (review round 1, P2-9: ranking on the whole encoding let
+    /// the seller's re-signed terms decide which of the buyer's complaints
+    /// survived).
+    fn canonical_rank(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            crate::to_cbor(&self.terms()).expect("complaint terms always serialize"),
+            self.buyer_signature.clone(),
+            crate::to_cbor(self).expect("a complaint always serializes"),
+        )
     }
 }
 
@@ -503,11 +559,18 @@ mod tests {
         let mut c = genuine.clone();
         c.block_ref = block(201);
         altered.push(("block_ref", c));
-        // Another paid order of the same buyer key would need that order to
-        // name the key; this one names buyer 2, so swap in order 2 but keep
-        // buyer 1's signature.
+        // Another paid order naming the SAME buyer key, so the only thing
+        // that can refuse the swap is that the buyer's signature names order
+        // 1's id (review round 1, testing #1: swapping in order 2, which
+        // names buyer 2, was refused for the wrong reason).
+        let mut other = order(2);
+        other.buyer_receipt_key = Some(buyer_key(1).verifying_key().to_bytes());
+        let other = authorized(&store_key(), other.with_derived_id(), OrderStatus::Paid);
+        complaint_by(&buyer_key(1), other.clone(), FeedbackCategory::NonDelivery, 200)
+            .verify(&owner())
+            .expect("precondition: buyer 1 can complain about that order");
         let mut c = genuine.clone();
-        c.order = paid(2);
+        c.order = other;
         altered.push(("order", c));
         for (field, c) in altered {
             assert!(
@@ -533,6 +596,150 @@ mod tests {
             ..genuine
         };
         assert!(replayed.verify(&owner()).is_err());
+    }
+
+    /// Re-sign `payload` (already an envelope) with `key`: what a signer who
+    /// wanted to smuggle bytes onto the record would publish.
+    fn resign(key: &SigningKey, payload: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer as _;
+        let signature = key.sign(&payload).to_bytes().to_vec();
+        (payload, signature)
+    }
+
+    /// **Nothing the buyer did not sign for rides on a complaint** (review
+    /// round 1, P1-3). The envelope decoder skips bytes after the CBOR item
+    /// and unknown map keys, so without the exact-envelope check a buyer
+    /// could append free text, re-sign, and the complaint verified: a
+    /// free-text channel on a permanent record. Red if
+    /// `is_exact_harvest_envelope` is dropped from `Complaint::verify`.
+    #[test]
+    fn a_complaint_envelope_carrying_extra_bytes_is_refused() {
+        let genuine = complaint(1);
+        let terms = crate::to_cbor(&genuine.terms()).unwrap();
+
+        // One byte after the CBOR item.
+        let mut trailing = genuine.scoped_payload.clone();
+        trailing.extend_from_slice(b"call me on 555-0100");
+        // A map key the decoder skips.
+        #[derive(serde::Serialize)]
+        struct WithNote {
+            requestor: crate::test_orders::TestRequestorForTests,
+            payload: Vec<u8>,
+            note: String,
+        }
+        let noted = crate::to_cbor(&WithNote {
+            requestor: crate::test_orders::harvest_requestor_for_tests(),
+            payload: terms,
+            note: "free text".into(),
+        })
+        .unwrap();
+
+        for (what, envelope) in [("trailing bytes", trailing), ("an extra key", noted)] {
+            let (scoped_payload, buyer_signature) = resign(&buyer_key(1), envelope);
+            let c = Complaint {
+                scoped_payload,
+                buyer_signature,
+                ..genuine.clone()
+            };
+            // The loose check alone accepts it: that is the hole.
+            crate::listing::verify_scoped_signature(
+                &c.scoped_payload,
+                &c.buyer_signature,
+                &buyer_key(1).verifying_key(),
+                &c.terms(),
+            )
+            .unwrap_or_else(|e| panic!("{what}: precondition, the loose check passes: {e}"));
+            let err = c.verify(&owner()).expect_err(what);
+            assert!(err.contains("not exactly the envelope"), "{what}: {err}");
+        }
+    }
+
+    /// The same for the ORDER's envelope, which the seller signs: a
+    /// self-dealing seller must not be able to carry text onto their own
+    /// record inside a complaint's order either. Red if the order half of
+    /// the exact-envelope check is dropped.
+    #[test]
+    fn a_complained_about_order_whose_envelope_carries_extra_bytes_is_refused() {
+        let mut order = paid(1);
+        let mut envelope = order.scoped_payload.clone();
+        envelope.push(0x00);
+        let (scoped_payload, signature) = resign(&store_key(), envelope);
+        order.scoped_payload = scoped_payload;
+        order.signature = signature;
+        order
+            .verify(&owner())
+            .expect("precondition: the store contract's own check accepts it");
+        let c = complaint_by(&buyer_key(1), order, FeedbackCategory::NonDelivery, 200);
+        let err = c.verify(&owner()).expect_err("an order envelope with extra bytes");
+        assert!(err.contains("order's signed payload"), "{err}");
+    }
+
+    /// An order for nothing, or an on-chain order paid at zero
+    /// confirmations, does not make "a complaint costs a real payment" true.
+    #[test]
+    fn a_complaint_about_a_free_or_unconfirmed_order_is_refused() {
+        let mut free = order(1);
+        free.amount_sats = 0;
+        let mut unconfirmed = order(1);
+        unconfirmed.required_confirmations = 0;
+        for (what, o, needle) in [
+            ("a zero amount", free, "non-zero amount"),
+            ("zero confirmations", unconfirmed, "at least one confirmation"),
+        ] {
+            let o = o.with_derived_id();
+            let c = complaint_by(
+                &buyer_key(1),
+                authorized(&store_key(), o, OrderStatus::Paid),
+                FeedbackCategory::NonDelivery,
+                200,
+            );
+            let err = c.verify(&owner()).expect_err(what);
+            assert!(err.contains(needle), "{what}: {err}");
+        }
+    }
+
+    /// **The seller cannot choose which of the buyer's statements survives**
+    /// (review round 1, P2-9). Two different buyer complaints for one order,
+    /// each with several equally valid evidence variants: the survivor is
+    /// always the one whose signed TERMS rank lower, whichever evidence is
+    /// attached. Red if the tie-break goes back to the whole encoding, where
+    /// the evidence (inside the order, encoded first) decides.
+    #[test]
+    fn the_tie_break_ranks_what_the_buyer_signed_first() {
+        let x = complaint_by(&buyer_key(1), paid(1), FeedbackCategory::NonDelivery, 200);
+        let y = complaint_by(&buyer_key(1), paid(1), FeedbackCategory::Counterfeit, 300);
+        let variants = |c: &Complaint| -> Vec<Complaint> {
+            (1u8..=6)
+                .map(|seed| {
+                    let mut v = c.clone();
+                    v.order.payment_proof = Some(proof(&order(1), seed));
+                    v.verify(&owner()).expect("valid evidence variant");
+                    v
+                })
+                .collect()
+        };
+        let lower_terms = std::cmp::min(
+            crate::to_cbor(&x.terms()).unwrap(),
+            crate::to_cbor(&y.terms()).unwrap(),
+        );
+        for a in variants(&x) {
+            for b in variants(&y) {
+                for (first, second) in [(&a, &b), (&b, &a)] {
+                    let mut state = ReputationStateV1::default();
+                    state
+                        .apply_delta(&params(), &Some(vec![first.clone()]))
+                        .unwrap();
+                    state
+                        .apply_delta(&params(), &Some(vec![second.clone()]))
+                        .unwrap();
+                    assert_eq!(
+                        crate::to_cbor(&state.complaints[0].terms()).unwrap(),
+                        lower_terms,
+                        "the evidence attached must not decide between two buyer statements"
+                    );
+                }
+            }
+        }
     }
 
     /// A delta is all-or-nothing.

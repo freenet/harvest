@@ -59,6 +59,17 @@ pub fn order(n: u8) -> Order {
     .with_derived_id()
 }
 
+/// The requestor half of a test envelope, for tests that build a
+/// deliberately malformed one.
+#[derive(serde::Serialize)]
+pub enum TestRequestorForTests {
+    WebApp([u8; 32]),
+}
+
+pub fn harvest_requestor_for_tests() -> TestRequestorForTests {
+    TestRequestorForTests::WebApp(harvest_requestor_bytes())
+}
+
 fn harvest_requestor_bytes() -> [u8; 32] {
     bs58::decode(crate::HARVEST_WEBAPP_CONTRACT_ID)
         .into_vec()

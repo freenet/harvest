@@ -660,6 +660,42 @@ pub fn store_key_envelope(payload: Vec<u8>) -> Result<Vec<u8>, String> {
     }
     #[cfg(not(feature = "ghostkey"))]
     {
+        envelope_with_requestor(crate::HARVEST_WEBAPP_CONTRACT_ID, payload)
+    }
+}
+
+/// Whether `scoped` is EXACTLY the envelope [`store_key_envelope`] builds
+/// around `payload`, for the canonical Harvest webapp id or a legacy one
+/// (`LEGACY_HARVEST_WEBAPP_CONTRACT_IDS`).
+///
+/// [`verify_scoped_signature`] decodes the envelope and compares the inner
+/// payload, which is the right check for a record whose envelope nobody
+/// keeps; it lets a signer append bytes after the CBOR item, or add a map
+/// key the decoder skips, and still verify. A record that is stored forever
+/// and must carry nothing but what it says (a complaint, harvest#53 Phase C,
+/// review round 1 P1-3) checks this as well: the signed bytes are then a
+/// function of the signed data, with no room for anything else.
+pub fn is_exact_harvest_envelope(scoped: &[u8], payload: &[u8]) -> bool {
+    std::iter::once(crate::HARVEST_WEBAPP_CONTRACT_ID)
+        .chain(crate::LEGACY_HARVEST_WEBAPP_CONTRACT_IDS.iter().copied())
+        .any(|id| envelope_with_requestor(id, payload.to_vec()).is_ok_and(|e| e == scoped))
+}
+
+/// The envelope around `payload` with the webapp contract `id` (base58) as
+/// requestor. [`store_key_envelope`] is this with the canonical id.
+fn envelope_with_requestor(id: &str, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "ghostkey")]
+    {
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let id = ContractInstanceId::from_base58(id)
+            .map_err(|e| format!("webapp id {id} does not parse: {e}"))?;
+        crate::to_cbor(&ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(id),
+            payload,
+        })
+    }
+    #[cfg(not(feature = "ghostkey"))]
+    {
         #[derive(Serialize)]
         struct ScopedPayload {
             requestor: Requestor,
@@ -669,11 +705,11 @@ pub fn store_key_envelope(payload: Vec<u8>) -> Result<Vec<u8>, String> {
         enum Requestor {
             WebApp([u8; 32]),
         }
-        let id: [u8; 32] = bs58::decode(crate::HARVEST_WEBAPP_CONTRACT_ID)
+        let id: [u8; 32] = bs58::decode(id)
             .into_vec()
-            .map_err(|e| format!("HARVEST_WEBAPP_CONTRACT_ID decode: {e}"))?
+            .map_err(|e| format!("webapp id {id} decode: {e}"))?
             .try_into()
-            .map_err(|_| "HARVEST_WEBAPP_CONTRACT_ID is not 32 bytes".to_string())?;
+            .map_err(|_| format!("webapp id {id} is not 32 bytes"))?;
         crate::to_cbor(&ScopedPayload {
             requestor: Requestor::WebApp(id),
             payload,
