@@ -84,6 +84,52 @@ pub fn put_response_evidence() -> ForwardPut {
     ForwardPut::AcknowledgedForInstance
 }
 
+/// How long a forward PUT is waited on before it is given up as unconfirmed.
+///
+/// **Not the probe's 12 s** (harvest#152). A GET of a predecessor is a read,
+/// usually served from the node's own copy; a PUT on a `freenet network` node
+/// is answered only after its remote hops, and the node tries peers one at a
+/// time, each for up to its own operation lifetime (60 s, freenet-core
+/// `config.rs` `OPERATION_TTL`). This used to reuse the probe's deadline, so
+/// a write that was slow but landed was discarded: nothing was adopted, and
+/// the successor mailbox, which is where buyers write, was not routed for
+/// that load -- harvest#148's symptom again, on exactly the loads the
+/// isolated rehearsal node (which answers a PUT at once) cannot produce.
+///
+/// Waiting longer costs nothing a seller sees. An answer still adopts the
+/// moment it arrives, however soon; the lineage stays held against a second
+/// walk meanwhile, exactly as it is once settled; and the give-up only ends
+/// the wait on a node that never answers, which then resolves as it always
+/// did, [`ForwardPut::Unconfirmed`] and walk again next load. What the wait
+/// does NOT change is what an answer is worth: see [`put_response_evidence`].
+pub const FORWARD_GIVE_UP_MS: u32 = 10 * 60 * 1000;
+
+/// When a forward PUT still unanswered is logged as slow. Logged only: it
+/// settles nothing (see [`forward_timer`]).
+pub const FORWARD_SLOW_NOTICE_MS: u32 = 12_000;
+
+/// What a forward PUT's timer means when it fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForwardTimer {
+    /// The node may still answer. Keep the forward outstanding, so an answer
+    /// that arrives later still adopts.
+    StillWaiting,
+    /// Past [`FORWARD_GIVE_UP_MS`]: settle it as [`ForwardPut::Unconfirmed`].
+    GiveUp,
+}
+
+/// What a timer fired `elapsed_ms` after the forward PUT was sent means.
+///
+/// The one place the wait is decided, so it can be tested off-target: the
+/// timers themselves are wasm-only (`migrate_ops::send_forward`).
+pub fn forward_timer(elapsed_ms: u32) -> ForwardTimer {
+    if elapsed_ms >= FORWARD_GIVE_UP_MS {
+        ForwardTimer::GiveUp
+    } else {
+        ForwardTimer::StillWaiting
+    }
+}
+
 /// The sealing rule, in one place.
 ///
 /// The marker is not a note about what happened; it is a claim that nothing
@@ -246,6 +292,41 @@ mod tests {
             ForwardPut::Acknowledged,
             "the client API carries nothing that attributes a PutResponse to a put"
         );
+    }
+
+    /// harvest#152. A forward PUT on a network node is answered only after
+    /// its remote hops, and the node tries peers one after another, each for
+    /// up to 60 s. The wait used to be the probe's 12 s, so an answer after
+    /// that found the forward already discarded, and a migrated seller's
+    /// successor mailbox went unrouted for the load. Red with the give-up put
+    /// back at the probe timeout, or with the slow notice settling.
+    #[test]
+    fn a_forward_answered_after_the_probe_timeout_is_still_waited_for() {
+        let probe_timeout = freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS as u32;
+        let several_node_attempts = 5 * 60_000;
+        for elapsed in [
+            probe_timeout,
+            FORWARD_SLOW_NOTICE_MS,
+            60_000,
+            several_node_attempts,
+            FORWARD_GIVE_UP_MS - 1,
+        ] {
+            assert_eq!(
+                forward_timer(elapsed),
+                ForwardTimer::StillWaiting,
+                "a forward unanswered after {elapsed} ms may still land"
+            );
+        }
+    }
+
+    /// The other half: a node that never answers does not hold the forward
+    /// for the rest of the session. It resolves as an unanswered forward
+    /// always has, unconfirmed, which discards.
+    #[test]
+    fn a_forward_nobody_answers_is_given_up_as_unconfirmed() {
+        assert_eq!(forward_timer(FORWARD_GIVE_UP_MS), ForwardTimer::GiveUp);
+        assert_eq!(forward_timer(u32::MAX), ForwardTimer::GiveUp);
+        const { assert!(FORWARD_SLOW_NOTICE_MS < FORWARD_GIVE_UP_MS) };
     }
 
     /// Stated as an implication over the whole input space rather than as

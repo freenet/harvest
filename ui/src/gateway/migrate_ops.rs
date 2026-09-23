@@ -697,15 +697,6 @@ fn deliver_unknown(id: ContractInstanceId) {
     pump(probe);
 }
 
-/// How long to wait for the node's `PutResponse` before giving up on a forward
-/// PUT.
-///
-/// The same length and the same reasoning as [`PROBE_TIMEOUT_MS`], and the
-/// same direction on expiry: a deadline establishes nothing. An expired
-/// forward is recorded as unconfirmed and seals nothing, so the lineage is
-/// walked again on the next load.
-const FORWARD_TIMEOUT_MS: u32 = PROBE_TIMEOUT_MS;
-
 /// A recovery that has been sent to the successor and is waiting for the node
 /// to say it landed.
 ///
@@ -935,14 +926,41 @@ fn send_forward(forwarded: Forwarded, params: Parameters<'static>, forward: Forw
         }
     });
 
-    // The deadline. An expired timer is `Unconfirmed`, never a confirmation: a
-    // send that was accepted by the WebSocket and never answered by the node
-    // establishes nothing about whether the state landed, and reading it as
-    // success is precisely what condition 1 exists to stop.
-    gloo_timers::callback::Timeout::new(FORWARD_TIMEOUT_MS, move || {
-        settle_forward(successor, Confirmation::Unconfirmed);
-    })
-    .forget();
+    // The deadlines. What each means is `migrate_seal::forward_timer`: the
+    // first only says the write is slow and keeps waiting, so an answer that
+    // arrives after it still adopts (harvest#152); the last gives up. An
+    // expired wait is `Unconfirmed`, never a confirmation: a send that was
+    // accepted by the WebSocket and never answered by the node establishes
+    // nothing about whether the state landed, and reading it as success is
+    // precisely what condition 1 exists to stop.
+    for fire_at in [
+        migrate_seal::FORWARD_SLOW_NOTICE_MS,
+        migrate_seal::FORWARD_GIVE_UP_MS,
+    ] {
+        gloo_timers::callback::Timeout::new(fire_at, move || {
+            match migrate_seal::forward_timer(fire_at) {
+                migrate_seal::ForwardTimer::StillWaiting => note_slow_forward(successor, fire_at),
+                migrate_seal::ForwardTimer::GiveUp => {
+                    settle_forward(successor, Confirmation::Unconfirmed)
+                }
+            }
+        })
+        .forget();
+    }
+}
+
+/// Say that a forward PUT is still unanswered, if it is, and keep waiting.
+///
+/// A log line and nothing else: the forward stays in [`FORWARDS`], so the
+/// node's answer, whenever it comes before the give-up, still adopts.
+fn note_slow_forward(successor: ContractInstanceId, elapsed_ms: u32) {
+    if let Some(artifact) = FORWARDS.with(|f| f.borrow().get(&successor).map(|fw| fw.artifact)) {
+        info!(
+            "migration: the recovered {} state sent to {successor} is not acknowledged after              {} s; still waiting for the node (a network PUT answers after its remote hops)",
+            artifact.as_str(),
+            elapsed_ms / 1000
+        );
+    }
 }
 
 /// How a forward PUT ended.
