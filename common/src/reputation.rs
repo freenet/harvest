@@ -1210,11 +1210,9 @@ mod tests {
     /// holds them all. Red if either check is removed.
     #[test]
     fn a_record_holds_at_most_max_complaints() {
-        assert!(
-            MAX_COMPLAINTS >= 100,
-            "{MAX_COMPLAINTS}: a flood's bound, not an honest one"
-        );
-        assert!(MAX_COMPLAINTS < usize::from(u8::MAX));
+        // A flood's bound, not an honest one; and the fixture numbers orders
+        // with a `u8`.
+        const _: () = assert!(MAX_COMPLAINTS >= 100 && MAX_COMPLAINTS < u8::MAX as usize);
         let all: Vec<Complaint> = (1u8..=(MAX_COMPLAINTS as u8 + 1))
             .map(|n| dated(n, 100 + u32::from(n)))
             .collect();
