@@ -627,16 +627,22 @@ impl ComplaintTarget {
 }
 
 /// The kept purchases to list, newest first: every one this node keeps except
-/// the orders in `shown`, which the same page already shows on a store's
-/// purchase card, so a paid order does not appear twice with two complaint
-/// controls (harvest#125 review).
+/// those in `shown`, `(store key, order id)` pairs a store's purchase card on
+/// the same page already shows from the same kept copy, so a paid order does
+/// not appear twice with two complaint controls (harvest#125 review). Matched
+/// on the pair, never the order id alone: another store's card naming the
+/// same id must not hide this one.
 pub(crate) fn kept_purchases_to_list(
     kept: &[harvest_common::delegate::KeptPurchase],
-    shown: &[harvest_common::payment::OrderId],
+    shown: &[([u8; 32], harvest_common::payment::OrderId)],
 ) -> Vec<harvest_common::delegate::KeptPurchase> {
     let mut kept: Vec<_> = kept
         .iter()
-        .filter(|k| !shown.contains(&k.order.order.id))
+        .filter(|k| {
+            !shown
+                .iter()
+                .any(|(store_key, id)| *store_key == k.store_key && *id == k.order.order.id)
+        })
         .cloned()
         .collect();
     kept.sort_by_key(|k| std::cmp::Reverse(k.order.order.created_at));
@@ -647,15 +653,15 @@ pub(crate) fn kept_purchases_to_list(
 /// store loaded (review round 5 of #143, R5-B). A store re-keyed while its
 /// seller stays away, or one nobody hosts, still leaves the buyer the paid
 /// copy and the complaint control here. Shown on My purchases, below the
-/// loaded stores' purchase cards; `shown` names the orders those cards
-/// already carry.
+/// loaded stores' purchase cards; `shown` names the kept purchases those
+/// cards already carry (`AppState::kept_purchases_shown_at`).
 ///
 /// No payment address, ever: the purchase card is the one component that
 /// shows a buyer one (`docs/complaint-threat-model.md` section 3.1). An
 /// unpaid kept order is listed so the buyer knows it is held, and is paid
 /// from its purchase card once its store is loaded.
 #[component]
-pub fn KeptPurchases(shown: Vec<harvest_common::payment::OrderId>) -> Element {
+pub fn KeptPurchases(shown: Vec<([u8; 32], harvest_common::payment::OrderId)>) -> Element {
     let app_state = APP_STATE.read();
     let kept = kept_purchases_to_list(&app_state.kept_purchases, &shown);
     if kept.is_empty() {

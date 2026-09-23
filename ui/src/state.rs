@@ -5739,6 +5739,31 @@ impl AppState {
 
     /// The delegate's copy of order `order_id` of the store with key
     /// `store_key`, if it keeps one.
+    /// The purchases a store's purchase cards show (`buyer_purchases`), as
+    /// `(store owner key, order id)`: the key a kept purchase is filed under.
+    /// A kept purchase matching one of these is judged by that card from the
+    /// same kept copy the kept list would use (`kept_copy`), so the card
+    /// offers the same complaint control. An acceptance naming an order kept
+    /// under ANOTHER store's key matches nothing, and a store whose owner is
+    /// not known yet shows nothing here, so neither hides a kept purchase
+    /// (harvest#125 review round 2).
+    pub(crate) fn kept_purchases_shown_at(
+        &self,
+        store_contract_id: &[u8],
+    ) -> Vec<([u8; 32], harvest_common::payment::OrderId)> {
+        let Some(owner) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+        else {
+            return Vec::new();
+        };
+        self.buyer_purchases(store_contract_id)
+            .into_iter()
+            .map(|purchase| (owner, purchase.order_id))
+            .collect()
+    }
+
     fn kept_copy(
         &self,
         store_key: &[u8; 32],
@@ -27830,32 +27855,61 @@ mod buy_flow_tests {
         assert_eq!(purchase.commitment.as_ref(), Some(&unpaid));
     }
 
-    /// **My purchases lists a kept purchase once** (harvest#125 review): an
-    /// order a loaded store's purchase card already shows is left out of the
-    /// kept list below it, so a paid order is not shown twice with two
-    /// complaint controls; a kept order no card shows stays listed. Red if
-    /// the kept list ignores `shown`, or `shown` misses the card's orders.
+    /// **My purchases lists a kept purchase once, and never hides one** (the
+    /// harvest#125 review, rounds 1 and 2): a kept order a loaded store's
+    /// card judges from the same kept copy is left out of the kept list below
+    /// it, so a paid order does not carry two complaint controls; but a card
+    /// naming an order that is kept under ANOTHER store's key (an acceptance
+    /// anyone in the conversation can send) hides nothing, and neither does a
+    /// store that is not loaded. Red if the kept list ignores `shown`, or
+    /// matches it on the order id alone.
     #[test]
     fn my_purchases_lists_a_kept_purchase_once() {
         let (mut state, unpaid, _, _) = an_unkept_purchase();
         state.on_kept_purchases(vec![kept(&unpaid)]);
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        let listed = |state: &AppState| {
+            let rows = crate::components::purchases_view::purchase_rows(state);
+            let shown = crate::components::purchases_view::shown_order_ids(state, &rows);
+            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown).len()
+        };
         let rows = crate::components::purchases_view::purchase_rows(&state);
-        let shown = crate::components::purchases_view::shown_order_ids(&state, &rows);
-        assert_eq!(shown, vec![unpaid.order.id.clone()], "the card shows it");
-        assert!(
-            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown)
-                .is_empty(),
-            "so the kept list does not"
+        assert_eq!(
+            crate::components::purchases_view::shown_order_ids(&state, &rows),
+            vec![(owner, unpaid.order.id.clone())],
+            "the card shows it"
         );
+        assert_eq!(listed(&state), 0, "so the kept list does not");
+
+        // The same order id kept under another store's key: this store's
+        // card names it (from an acceptance) but cannot offer its complaint,
+        // so the kept list still does.
+        let mut elsewhere = state.clone();
+        let mut other_store = elsewhere.kept_purchases[0].clone();
+        other_store.store_key = [0xAB; 32];
+        elsewhere.kept_purchases.push(other_store);
+        assert_eq!(
+            crate::components::buy_view::kept_purchases_to_list(
+                &elsewhere.kept_purchases,
+                &crate::components::purchases_view::shown_order_ids(
+                    &elsewhere,
+                    &crate::components::purchases_view::purchase_rows(&elsewhere)
+                ),
+            )
+            .iter()
+            .map(|k| k.store_key)
+            .collect::<Vec<_>>(),
+            vec![[0xAB; 32]],
+            "another store's card hides nothing"
+        );
+        // A store whose owner is not known yet names no kept purchase.
+        let mut ownerless = state.clone();
+        ownerless.browsing_stores.get_mut(STORE).unwrap().owner = None;
+        assert_eq!(listed(&ownerless), 1);
+
         // A store that is not loaded shows no card, so its kept order stays.
         state.browsing_stores.remove(STORE);
-        let rows = crate::components::purchases_view::purchase_rows(&state);
-        let shown = crate::components::purchases_view::shown_order_ids(&state, &rows);
-        assert_eq!(
-            crate::components::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown)
-                .len(),
-            1
-        );
+        assert_eq!(listed(&state), 1);
     }
 
     /// **No view offers a buyer a payment address while `PurchaseNotKept`

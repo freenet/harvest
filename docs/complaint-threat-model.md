@@ -775,7 +775,7 @@ is needed. "Residual" means section 7.
 | codex r4 P2 paid copies not watched after reload | Moot: a kept paid copy is frozen, so there is nothing to watch for (7.2). |
 | codex r4 P2 no parameters for current-generation ids | Code (3.2): resolved from kept orders under both builds. |
 | **R5-A** (P1) the seller alone registers the bridge watch | Residual (1, 7.4): blocks mainnet, not signet; buyer-side watch is Ian's call, no re-key needed. |
-| **R5-B** (P1) filing needs the store's current state | Code (3.6): kept purchases filed from the kept record; Payments-tab list. |
+| **R5-B** (P1) filing needs the store's current state | Code (3.6): kept purchases filed from the kept record; Payments-tab list (on My purchases since harvest#93 phase 2). |
 | **R5-C** (P1) the record filled with complaints that never count | Code (5.3): `MAX_COMPLAINTS`, nearest their payment kept; window stays reader-side. |
 | **R6-1** (P1) `MAX_COMPLAINT_BYTES` not a bound (unbounded tip) | Code (5.3): enforced in `Complaint::verify`. |
 | **R6-2** (P1) own-bridge reversals make distance-0 complaints count for nothing | Code (6): `reversal_stands` honours a reversal only when every bridge the order names is recognised. |

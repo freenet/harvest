@@ -126,15 +126,14 @@ pub fn MyPurchases() -> Element {
     }
 }
 
-/// Every order the store cards on this page show (`AppState::buyer_purchases`
-/// of each row's store).
+/// The kept purchases the store cards on this page already show, with their
+/// complaint control (`AppState::kept_purchases_shown_at` of each row).
 pub(crate) fn shown_order_ids(
     state: &AppState,
     rows: &[PurchaseRow],
-) -> Vec<harvest_common::payment::OrderId> {
+) -> Vec<([u8; 32], harvest_common::payment::OrderId)> {
     rows.iter()
-        .flat_map(|row| state.buyer_purchases(&row.store_contract_id))
-        .map(|purchase| purchase.order_id)
+        .flat_map(|row| state.kept_purchases_shown_at(&row.store_contract_id))
         .collect()
 }
 
