@@ -235,10 +235,9 @@ const _: () = assert!(REGISTRATION_WAIT_MS >= 15_000);
 /// [`REGISTRATION_WAIT_MS`] deadline running from NOW (gloo's `TimeoutFuture`
 /// sets its timer when it is created), so the waits for two delegates run
 /// side by side even when one is awaited after the other. Resolves `false` on
-/// the timeout. An answer that comes later still finds its waiter and is
-/// taken for what it is, rather than read as "not registered". Needs the
-/// response loop running, so it is awaited from a spawned task, never before
-/// the loop.
+/// the timeout; an answer that comes later is still taken as the
+/// acknowledgement, and changes nothing. Needs the response loop running, so
+/// it is awaited from a spawned task, never before the loop.
 #[cfg(target_arch = "wasm32")]
 pub fn registered(key: &DelegateKey) -> impl std::future::Future<Output = bool> {
     let rx = REGISTRATIONS.with(|r| r.borrow_mut().take(key));
@@ -410,7 +409,7 @@ mod registration_tests {
             "r.borrow_mut().take(key)",
             // The deadline is made before the returned future, so it runs
             // from the call, not from the first poll.
-            "TimeoutFuture::new(REGISTRATION_WAIT_MS)",
+            "let deadline = gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS);",
             "async move",
             "wait_for_answer(rx, deadline).await",
         ] {
@@ -442,7 +441,7 @@ mod registration_tests {
         let mut at = 0;
         for part in [
             timer,
-            "bitcoin.payment_xpub_loaded",
+            "if crate::gateway::APP_STATE.read().bitcoin.payment_xpub_loaded {\n            return;\n        }",
             "get_payment_xpub()",
             timer,
             "payment_key_answer_overdue()",

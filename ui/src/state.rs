@@ -1202,9 +1202,8 @@ pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Opt
 /// before asking again, and again before showing the form anyway
 /// (harvest#163).
 pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
-// Longer than a freshly registered delegate takes to answer its first
-// request (6.9 s measured while it compiled), short enough that "Checking"
-// does not look like a hang.
+// Longer than a delegate usually takes to answer (seconds, even on a loaded
+// node), short enough that "Checking" does not look like a hang.
 const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
 
 /// Why an invoice waits (harvest#164).
