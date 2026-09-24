@@ -1200,7 +1200,13 @@ pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Opt
 
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
-    of Harvest, and an invoice issued now could reuse a payment address. Try again in a moment.";
+    of Harvest, and an invoice issued now could reuse a payment address. Harvest moves it once \
+    the page has loaded; try again in a few minutes, and reload if this keeps happening.";
+
+/// Why a details edit waits (harvest#164).
+pub(crate) const STORE_DETAILS_MOVING: &str = "your store is still moving to this version of \
+    Harvest, and its details there have not loaded. Try again in a few minutes, and reload if \
+    this keeps happening.";
 
 /// The clock a store-details version is floored at: seconds, and 0 for a
 /// clock `u32` cannot hold, which floors nothing (held + 1 still holds).
@@ -3856,9 +3862,10 @@ impl AppState {
     /// (harvest#164).
     ///
     /// Work started under the earlier id (an edit parked on a certificate, a
-    /// despatch or cancel waiting on its signature, an invoice accepted from
-    /// a page opened before the move) finishes after the move, so the
-    /// lookups that finish such work resolve through here:
+    /// despatch or cancel waiting on its signature, a listing or status
+    /// waiting on its certificate, an invoice waiting on its address check)
+    /// finishes after the move, so the lookups that finish or sign such work
+    /// resolve through here:
     /// `store_write_target`, [`Self::work_store_key`],
     /// [`Self::work_store_fingerprint`]. Everything else asks
     /// `store_owner_key` / `store_owner_fingerprint`, which match the id the
@@ -8824,6 +8831,9 @@ impl AppState {
                 assumed_empty = true;
                 0
             }
+            // While moving, the edit goes to the current generation, whose
+            // details are not known here: the move brings them.
+            None if moving => return Err(STORE_DETAILS_MOVING.to_string()),
             // Since the version is floored at the clock (below), an edit from
             // a form that never loaded would no longer be dropped as stale:
             // it would overwrite the real details with empty ones. Refused
@@ -10194,7 +10204,7 @@ impl AppState {
     /// accept. Errors are
     /// returned rather than swallowed so the form can say why nothing
     /// happened.
-    pub fn issue_invoice(&mut self, invoice: PendingInvoice) -> Result<(), String> {
+    pub fn issue_invoice(&mut self, mut invoice: PendingInvoice) -> Result<(), String> {
         if invoice.amount_sats == 0 {
             return Err("an invoice needs an amount in satoshis".to_string());
         }
@@ -10222,17 +10232,24 @@ impl AppState {
         let owner = self
             .work_store_fingerprint(&invoice.store_contract_id)
             .ok_or("this store is not one of yours -- nothing to issue an invoice on")?;
-        // The address is derived past every script the SHOWN store has
-        // published, which until the move is the earlier generation: orders
-        // since written to the current one are not in it, and a device whose
+        // The address is derived past every script the store has published,
+        // read from the generation the registration names (harvest#164).
+        // Until the move that is the earlier generation, which lacks the
+        // orders written to the current one since, and a device whose
         // address counter restarted would hand one of their addresses out
-        // again (harvest#164). The move is seconds away on any load after the
-        // first.
-        if matches!(
-            self.store_write_target(&invoice.store_contract_id),
-            StoreWriteTarget::Moving { .. }
-        ) {
-            return Err(STORE_STILL_MOVING_INVOICE.to_string());
+        // again: refused. After it, an invoice from a page that still holds
+        // the earlier id is issued against the current generation, so the
+        // "has it loaded" gate below looks at the right one.
+        match self.store_write_target(&invoice.store_contract_id) {
+            StoreWriteTarget::Ready(id) => invoice.store_contract_id = id,
+            StoreWriteTarget::Moving { .. } => {
+                return Err(STORE_STILL_MOVING_INVOICE.to_string());
+            }
+            StoreWriteTarget::NotOurs => {
+                return Err(
+                    "this store is not one of yours -- nothing to issue an invoice on".into(),
+                );
+            }
         }
         if owner != invoice.seller_fingerprint {
             return Err(format!(
@@ -13678,11 +13695,11 @@ mod tests {
     /// read from (harvest#164).** Its version is above what the session
     /// shows and holds for the current generation, and never below the
     /// clock, so a migration forward carrying an older build's later edit
-    /// cannot outrank it. It is kept under the current generation, so a
-    /// second edit in the same second sees the first, before the move and
-    /// after it. Mutated red by dropping the clock floor, by dropping the
-    /// current generation's version, by keeping the edit under the earlier
-    /// id, and by reading the last queued version under the earlier id.
+    /// cannot outrank it. Its version bookkeeping is kept under the
+    /// generation written to, so a second edit in the same second sees the
+    /// first, before the move and after it. Mutated red by dropping the
+    /// clock floor, by dropping the current generation's version, and by
+    /// keeping the last queued version under the edit's own id.
     #[test]
     fn a_details_edit_outranks_every_generation() {
         let (earlier, current) = test_store_generations();
@@ -13882,9 +13899,10 @@ mod tests {
         theirs.store_contract_id = earlier.clone();
         state.merge_store_registrations(FINGERPRINT, vec![theirs]);
         state.store_state_unavailable.insert(earlier.clone());
-        assert!(state
-            .publish_store_details_at(&earlier, StoreDetails::default(), 1_790_000_000)
-            .is_err());
+        assert_eq!(
+            state.publish_store_details_at(&earlier, StoreDetails::default(), 1_790_000_000),
+            Err(STORE_DETAILS_MOVING.to_string())
+        );
         assert!(state.pending_store_edit.is_none());
     }
 
@@ -13926,6 +13944,50 @@ mod tests {
             .expect("queued here");
         assert!(refusal < derive, "refused before anything is queued");
         assert!(issue.contains("StoreWriteTarget::Moving { .. }"));
+    }
+
+    /// **Work that can finish after the move looks its owner up by any of
+    /// the store's ids (harvest#164)**, and custody, which acts on every
+    /// loaded store, does not treat the earlier generation as ours. Pinned
+    /// by source for the signing sites, whose flows need a vault to drive.
+    /// Mutated red by reverting any of them to `store_owner_key`.
+    #[test]
+    fn the_sites_that_finish_parked_work_resolve_superseded_ids() {
+        let body = |src: &'static str, name: &str| -> &'static str {
+            let start = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("fn {name}"));
+            let rest = &src[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        let state = include_str!("state.rs");
+        for name in [
+            "start_store_edit_if_ready",
+            "queue_store_info_signature",
+            "signing_store_key",
+            "on_despatch_signed",
+            "on_cancellation_signed",
+            "sign_checked_order",
+        ] {
+            let body = body(state, name);
+            assert!(body.contains("work_store_key("), "{name}");
+            assert!(!body.contains("store_owner_key("), "{name}");
+        }
+        for (src, name) in [
+            (include_str!("backing_flow.rs"), "request_listing_signature"),
+            (
+                include_str!("listing_status_flow.rs"),
+                "queue_listing_status_at",
+            ),
+            (
+                include_str!("custody_flow.rs"),
+                "release_waiters_on_subkeys",
+            ),
+        ] {
+            let body = body(src, name);
+            assert!(body.contains("work_store_key("), "{name}");
+            assert!(!body.contains("store_owner_key("), "{name}");
+        }
     }
 
     /// A version at the ceiling cannot be outranked, so an edit is refused
@@ -17619,6 +17681,51 @@ mod invoice_tests {
                 .any(|n| n.contains("had all been used before")),
             "the seller was not told: {:?}",
             state.notifications
+        );
+    }
+
+    /// **An invoice waits for the move, then goes to the current generation
+    /// (harvest#164).** Its address is derived past the scripts the store
+    /// has published, so while this session still reads an earlier
+    /// generation it is refused, and afterwards an invoice from a page that
+    /// still holds the earlier id is checked against the current
+    /// generation, not the stale earlier one. Mutated red by dropping the
+    /// refusal, and by keeping the earlier id.
+    #[test]
+    fn an_invoice_waits_for_the_move_and_then_goes_to_the_current_generation() {
+        let (earlier, current) = crate::state::test_store_generations();
+        let mut state = seller_with_a_store();
+        let loaded = state
+            .browsing_stores
+            .remove(STORE_ID.as_slice())
+            .expect("the seller's store is loaded");
+        state.my_stores.get_mut(SELLER).unwrap()[0].store_contract_id = earlier.clone();
+        state
+            .browsing_stores
+            .insert(earlier.clone(), loaded.clone());
+        let mut asked = invoice();
+        asked.store_contract_id = earlier.clone();
+
+        assert_eq!(
+            state.issue_invoice(asked.clone()),
+            Err(STORE_STILL_MOVING_INVOICE.to_string())
+        );
+        assert!(state.pending_invoices.is_empty());
+
+        state.adopt_migrated_contract_id(&earlier, current.clone());
+        let refused = state.issue_invoice(asked.clone()).unwrap_err();
+        assert!(refused.contains("has not loaded"), "{refused}");
+
+        state.browsing_stores.insert(current.clone(), loaded);
+        state.issue_invoice(asked).expect("accepted");
+        assert_eq!(
+            state
+                .pending_invoices
+                .values()
+                .next()
+                .unwrap()
+                .store_contract_id,
+            current
         );
     }
 

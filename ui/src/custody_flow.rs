@@ -431,6 +431,12 @@ impl AppState {
     /// first, then the others, since a device may hold an older backing
     /// Ghost Key and not the current one.
     pub(crate) fn custody_needed(&self, store_contract_id: &[u8]) -> Option<CustodyRequest> {
+        // A generation this session moved our store away from stays loaded,
+        // and its state lags the current one's: it is not a store to wrap or
+        // recover for (harvest#164).
+        if self.migrated_contract_ids.contains_key(store_contract_id) {
+            return None;
+        }
         let loaded = self.browsing_stores.get(store_contract_id)?;
         let state = &loaded.backing_state;
         let owner = state.owner?;
@@ -2186,6 +2192,25 @@ mod tests {
             state.pending_custody.contains_key(&second),
             "the deferred store's custody must start when the vault frees up"
         );
+    }
+
+    /// **Custody does not act on a generation this session moved our store
+    /// away from (harvest#164).** It stays loaded with stale state, and
+    /// asking the vault to wrap or recover for it would put up a prompt on
+    /// every load. Mutated red by dropping the check.
+    #[test]
+    fn custody_leaves_an_earlier_generation_alone() {
+        let mut state = backed_store();
+        register(&mut state);
+        assert!(
+            state.custody_needed(&[ID; 32]).is_some(),
+            "precondition: this store calls for custody"
+        );
+        // The session moved the store on; the earlier id stays loaded.
+        state
+            .migrated_contract_ids
+            .insert(vec![ID; 32], vec![0x77; 32]);
+        assert!(state.custody_needed(&[ID; 32]).is_none());
     }
 
     /// The same for an edit parked under the store's earlier id and failing
