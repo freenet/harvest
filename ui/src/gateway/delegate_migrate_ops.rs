@@ -57,14 +57,14 @@ const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
 
 /// How long a call to the CURRENT delegate may take.
 ///
-/// Node-local, and usually milliseconds. But after a re-key the first call
-/// to the new generation compiles its module, and a silence here STOPS the
-/// walk for this load, which also holds back the work the walk gates. One
-/// harvest#162 rehearsal run measured that first answer at 6.9 s on a loaded
-/// machine, past the 5 s this was, and the walk stopped at the generation
-/// holding the seller's secrets (one data point; two further runs answered in
-/// 2.2 to 4.4 s). So the same deadline as a predecessor call: it costs time
-/// only when the current delegate does not answer the call at all.
+/// Node-local, and usually milliseconds. But a silence here STOPS the walk
+/// for this load, which also holds back the work the walk gates, and after a
+/// re-key the node takes seconds to register the new generation (one
+/// harvest#162 rehearsal run: 6.9 s on a loaded machine, past the 5 s this
+/// was). The walk now starts only once the node has answered the
+/// registration (`delegate_api::registered`), which removes the race that
+/// caused it; this deadline is the backstop. It costs time only when the
+/// current delegate does not answer the call at all.
 const CURRENT_TIMEOUT_MS: u32 = PREDECESSOR_TIMEOUT_MS;
 // Not back under the measured first answer.
 const _: () = assert!(CURRENT_TIMEOUT_MS >= 10_000);

@@ -629,6 +629,11 @@ fn handle_delegate_response(
     // the delegate is not registered (harvest#150). If the migration walk is
     // waiting on that delegate, it is the walk's answer; otherwise there is
     // nothing in it to act on anyway.
+    // The first empty answer from a delegate being registered is the node
+    // saying it is registered (harvest#162), and releases what waits on it.
+    if values.is_empty() && super::delegate_api::acknowledge_registration(&key) {
+        return;
+    }
     #[cfg(target_arch = "wasm32")]
     if values.is_empty() && super::delegate_migrate_ops::offer_empty(&key) {
         return;

@@ -167,7 +167,85 @@ pub async fn put_contract(contract: ContractContainer, state: WrappedState) -> R
     }
 }
 
-/// Register a delegate with the Freenet node.
+/// Delegate registrations the node has not answered yet (harvest#162,
+/// harvest#163).
+///
+/// The node answers `RegisterDelegate` with an empty `DelegateResponse` only
+/// once the delegate is stored and its module compiled, and it runs each
+/// client request as its own task, so a message sent to the delegate before
+/// that answer can overtake the registration and be refused as
+/// `DelegateError::Missing`. That error carries no request id, so nothing
+/// retries the message: on the first load after a delegate re-key, the
+/// migration walk stopped ("current delegate unavailable") and a request the
+/// page waits on (the payment key) never got an answer. So what is sent to a
+/// delegate waits for this answer; see [`registered`].
+#[derive(Default)]
+pub struct RegistrationWaiters {
+    waiting: std::collections::HashMap<DelegateKey, futures::channel::oneshot::Sender<()>>,
+    receivers: std::collections::HashMap<DelegateKey, futures::channel::oneshot::Receiver<()>>,
+}
+
+impl RegistrationWaiters {
+    /// A registration of `key` is about to be sent.
+    pub fn expect(&mut self, key: DelegateKey) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.waiting.insert(key.clone(), tx);
+        self.receivers.insert(key, rx);
+    }
+
+    /// An empty answer from `key` arrived. `true` if it was the answer to a
+    /// registration of it, which nothing else may then act on; any later empty
+    /// answer is left to its usual reader (the migration walk's "not
+    /// registered", `delegate_migrate_ops::offer_empty`).
+    pub fn acknowledge(&mut self, key: &DelegateKey) -> bool {
+        match self.waiting.remove(key) {
+            Some(tx) => {
+                let _ = tx.send(());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What to wait on for `key`'s registration, once.
+    pub fn take(&mut self, key: &DelegateKey) -> Option<futures::channel::oneshot::Receiver<()>> {
+        self.receivers.remove(key)
+    }
+}
+
+thread_local! {
+    static REGISTRATIONS: std::cell::RefCell<RegistrationWaiters> =
+        std::cell::RefCell::default();
+}
+
+/// Called by the response handler for every empty delegate answer: see
+/// [`RegistrationWaiters::acknowledge`].
+pub fn acknowledge_registration(key: &DelegateKey) -> bool {
+    REGISTRATIONS.with(|r| r.borrow_mut().acknowledge(key))
+}
+
+/// How long [`registered`] waits for the node's answer before going ahead
+/// anyway, as it did before this wait existed.
+pub const REGISTRATION_WAIT_MS: u32 = 30_000;
+
+/// Wait until the node has answered the registration of `key`, or
+/// [`REGISTRATION_WAIT_MS`]. `false` on the timeout. Needs the response loop
+/// running, so it is awaited from a spawned task, never before the loop.
+#[cfg(target_arch = "wasm32")]
+pub async fn registered(key: &DelegateKey) -> bool {
+    let Some(rx) = REGISTRATIONS.with(|r| r.borrow_mut().take(key)) else {
+        return true;
+    };
+    let timeout = gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS);
+    futures::pin_mut!(timeout);
+    matches!(
+        futures::future::select(rx, timeout).await,
+        futures::future::Either::Left((Ok(()), _))
+    )
+}
+
+/// Register a delegate with the Freenet node. What is sent to it afterwards
+/// waits for [`registered`].
 pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, String> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -194,6 +272,8 @@ pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, Stri
             cipher: [0u8; 32],
             nonce: [0u8; 24],
         });
+        // Before the send: the answer can arrive as soon as it returns.
+        REGISTRATIONS.with(|r| r.borrow_mut().expect(key.clone()));
 
         let mut api = super::WEB_API.write();
         let web_api = api.as_mut().ok_or("not connected to gateway")?;
@@ -209,5 +289,76 @@ pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, Stri
     {
         let _ = delegate_wasm;
         Err("delegate registration requires WASM".into())
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    fn key(byte: u8) -> DelegateKey {
+        DelegateKey::new([byte; 32], CodeHash::new([byte; 32]))
+    }
+
+    /// The first empty answer from a delegate being registered is the
+    /// registration's, and releases whatever waits on it; one from any other
+    /// delegate, or a second one, is left to its usual reader (harvest#162).
+    #[test]
+    fn the_first_empty_answer_acknowledges_the_registration() {
+        let mut waiters = RegistrationWaiters::default();
+        waiters.expect(key(1));
+        let mut rx = waiters.take(&key(1)).expect("something to wait on");
+        assert!(!waiters.acknowledge(&key(2)));
+        assert_eq!(rx.try_recv(), Ok(None), "not yet");
+        assert!(waiters.acknowledge(&key(1)));
+        assert_eq!(rx.try_recv(), Ok(Some(())));
+        assert!(
+            !waiters.acknowledge(&key(1)),
+            "a later one is not the registration's"
+        );
+        assert!(waiters.take(&key(1)).is_none(), "waited on once");
+    }
+
+    /// Nothing is sent to either delegate, and neither key is published to
+    /// the rest of the app, before the node has answered its registration;
+    /// the migration walk starts only after the Harvest delegate's (harvest#162,
+    /// harvest#163). Pinned by source: the connect flow is wasm-only.
+    #[test]
+    fn the_app_waits_for_each_registration_before_using_the_delegate() {
+        let src = include_str!("../components/app.rs");
+        let harvest = &src[src.find("register_delegate(harvest_wasm)").unwrap()..];
+        let harvest = &harvest[..harvest.find("register_delegate(gk_wasm)").unwrap()];
+        let waited = harvest
+            .find("delegate_registered(&key).await")
+            .expect("waits");
+        let published = harvest
+            .find("harvest_delegate_key = Some(key)")
+            .expect("key set");
+        let first_send = harvest
+            .find("recall_conversations_for_known_stores")
+            .unwrap();
+        let walk = harvest
+            .find("delegate_migrate_ops::start()")
+            .expect("walk started");
+        assert!(waited < published && published < first_send && first_send < walk);
+
+        let ghostkey = &src[src.find("register_delegate(gk_wasm)").unwrap()..];
+        let waited = ghostkey
+            .find("delegate_registered(&key).await")
+            .expect("waits");
+        let published = ghostkey.find("ghostkey_delegate_key =").expect("key set");
+        let first_send = ghostkey.find("send_delegate_message(").unwrap();
+        assert!(waited < published && published < first_send);
+        assert_eq!(src.matches("delegate_migrate_ops::start()").count(), 1);
+
+        // And the answer reaches the waiters, before the walk's reader of
+        // empty answers can take it.
+        let handler = include_str!("response_handler.rs");
+        let handler = &handler[handler.find("fn handle_delegate_response(").unwrap()..];
+        let ack = handler
+            .find("values.is_empty() && super::delegate_api::acknowledge_registration(&key)")
+            .expect("acknowledged");
+        let empty = handler.find("offer_empty(&key)").expect("walk's reader");
+        assert!(ack < empty);
     }
 }

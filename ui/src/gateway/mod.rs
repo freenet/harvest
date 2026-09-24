@@ -41,6 +41,8 @@ pub mod response_handler;
 pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
+#[cfg(target_arch = "wasm32")]
+pub use delegate_api::registered as delegate_registered;
 pub use delegate_api::{
     arm_auto_invoice, get_contract, get_contract_by_id, put_contract, register_delegate,
     send_delegate_message,
