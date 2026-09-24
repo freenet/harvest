@@ -1245,6 +1245,8 @@ mod tests {
             );
         }
         assert!(body_of("submit_settled_order_by_id").contains("settlement_store_key("));
+        // One send per writer above: a new store write has to join the list.
+        assert_eq!(src.matches("super::update_contract(").count(), 7);
     }
 
     /// Each turn of a waiting write (harvest#164): a store on its current

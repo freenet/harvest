@@ -112,10 +112,10 @@ pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrd
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
         .iter()
-        // The generation the registration names, not every id our store is
-        // found by: after a move the earlier generation stays loaded and
-        // would list every order twice, one copy stale (harvest#164).
-        .filter(|(id, _)| app_state.is_registered_store_id(id))
+        // The generation the registration names: after a move the earlier
+        // generation stays loaded, and would list every order twice, one
+        // copy stale (harvest#164).
+        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
         .flat_map(|(_, s)| {
             s.orders
                 .iter()

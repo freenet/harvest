@@ -502,7 +502,7 @@ impl AppState {
         let store_key = pending
             .store_contract_id
             .as_deref()
-            .and_then(|id| self.store_owner_key(id))
+            .and_then(|id| self.work_store_key(id))
             .ok_or(crate::state::NO_STORE_KEY_MESSAGE)?;
         self.request_store_key_signature(PendingSignature::Listing(pending), store_key.to_bytes())
     }

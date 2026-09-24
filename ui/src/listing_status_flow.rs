@@ -199,7 +199,7 @@ impl AppState {
         now_ms: u64,
     ) -> Result<(), String> {
         let store_key = self
-            .store_owner_key(&store_contract_id)
+            .work_store_key(&store_contract_id)
             .ok_or(crate::state::NO_STORE_KEY_MESSAGE)?;
         let held = self.held_revision(&store_contract_id, &listing);
         // A second click before the first is signed must not reuse its

@@ -824,7 +824,7 @@ impl AppState {
             .map(|e| e.store_contract_id.clone());
         let edit_is_this_store = edit_id
             .as_deref()
-            .and_then(|id| self.store_owner_key(id))
+            .and_then(|id| self.work_store_key(id))
             .is_some_and(|key| key.to_bytes() == store);
         if edit_is_this_store {
             self.pending_store_edit = None;
@@ -2188,10 +2188,9 @@ mod tests {
         );
     }
 
-    /// The same for an edit parked while the store is still moving to its
-    /// current generation, which is kept under the current generation's id
-    /// (harvest#164): the release finds it by that id too. Mutated red by an
-    /// exact-id owner lookup.
+    /// The same for an edit parked under the store's earlier id and failing
+    /// after this session moved the store (harvest#164): the release finds
+    /// it by that id. Mutated red by an exact-id owner lookup.
     #[test]
     fn a_subkeys_failure_releases_an_edit_parked_while_moving() {
         let (earlier, current) = crate::state::test_store_generations();
@@ -2199,7 +2198,7 @@ mod tests {
         state.my_stores.insert(
             FINGERPRINT.to_string(),
             vec![harvest_common::StoreRegistration {
-                store_contract_id: earlier,
+                store_contract_id: earlier.clone(),
                 reputation_contract_id: vec![2; 32],
                 mailbox_contract_id: vec![3; 32],
                 store_contract_key: None,
@@ -2208,7 +2207,7 @@ mod tests {
         );
         state.pending_store_edit = Some(crate::state::PendingStoreEdit {
             ghostkey_fingerprint: FINGERPRINT.to_string(),
-            store_contract_id: current,
+            store_contract_id: earlier.clone(),
             reputation_contract_id: [2; 32],
             next_version: 4,
             details: Default::default(),
@@ -2216,6 +2215,7 @@ mod tests {
         state
             .store_subkeys_requested
             .insert(crate::state::test_store_key());
+        state.adopt_migrated_contract_id(&earlier, current);
         state.on_subkeys_request_failed(crate::state::test_store_key(), "no key here");
         assert!(state.pending_store_edit.is_none());
     }

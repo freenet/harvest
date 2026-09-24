@@ -126,8 +126,9 @@ pub const FORWARD_SLOW_NOTICE_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEO
 ///   5 min, until it does. A slow store forward therefore delays the move
 ///   rather than keeping the load on the predecessor, and this device's
 ///   writes and the reads it acts on follow one generation. (The earlier
-///   generation's subscription is not dropped on the move; what it brings is
-///   keyed by content and harmless.)
+///   generation's subscription is not dropped on the move; it is not taken
+///   for a second store of ours, since only the id a registration names
+///   counts as one.)
 /// * **A mailbox adopt** moves where the seller's replies and invoice accepts
 ///   are sent (`browsing_stores[..].mailbox_contract_id`). One sent to the
 ///   predecessor before a late adopt is not seen by a buyer on the current
