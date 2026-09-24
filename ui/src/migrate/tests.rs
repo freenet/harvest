@@ -589,6 +589,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // Superseded by instant checkout: the delegate answers instant
             // requests in the background.
             "9463b53b02e72c444935a024ad8b05268d21eb5c6a5ead049ad88ee456a24ea1".to_string(),
+            // V24, from `git show 4f040c6:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by harvest#162: arming reads the tip once.
+            "74cf700046aafc5af19bd69183b2b88f3d640ffd7dbb7817dc60084359eee04b".to_string(),
         ],
     );
 }

@@ -324,6 +324,17 @@ fn handle_get_contract_response(
     ctx: &mut DelegateCtx,
     response: &freenet_stdlib::prelude::GetContractResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // The tip read an arm asked for (harvest#162). Kept, and not forwarded:
+    // the arm's caller is told its status by the arm's own answer.
+    if let (Ok(contract_id), Some(state)) = (
+        <[u8; 32]>::try_from(response.contract_id.as_bytes()),
+        response.state.as_ref(),
+    ) {
+        if auto_invoice::on_tip_read(&mut CtxSecrets(ctx), &contract_id, state.as_ref(), now_ms()) {
+            return Ok(Vec::new());
+        }
+    }
+
     // The store read instant checkout asked for.
     if let Some(out) = auto_invoice::on_store_state(
         &mut CtxSecrets(ctx),
@@ -362,6 +373,28 @@ fn handle_get_contract_response(
 /// fixed was one of routing -- a request family reached a handler that had no
 /// way to check who sent it. What matters here is that no payload gets as far
 /// as being classified before the caller is.
+/// The tip read an arm asks for is taken before anything else looks at a GET
+/// answer (harvest#162). Pinned by source: the dispatcher's secrets are inert
+/// off the `wasm32` target, so the routing cannot be driven here; the
+/// handler it routes to is tested in `auto_invoice`.
+#[cfg(test)]
+mod tip_read_routing_tests {
+    #[test]
+    fn a_get_answer_for_an_armed_tip_is_kept_first() {
+        let src = include_str!("lib.rs");
+        let handler = &src[src.find("fn handle_get_contract_response(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        let tip = handler
+            .find("        if auto_invoice::on_tip_read(&mut CtxSecrets(ctx)")
+            .expect("routed, unconditionally");
+        let store = handler
+            .find("auto_invoice::on_store_state(")
+            .expect("store reads");
+        assert!(tip < store);
+        assert!(handler.contains("return Ok(Vec::new());"));
+    }
+}
+
 #[cfg(test)]
 mod boundary_tests {
     use super::*;

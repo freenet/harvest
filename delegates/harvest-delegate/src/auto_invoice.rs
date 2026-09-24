@@ -337,7 +337,10 @@ pub(crate) struct TipCache {
     /// The block header's own time, in seconds.
     pub block_time: u32,
     /// When a background run last saw the tip contract, by the node's clock.
-    pub seen_at_ms: u64,
+    /// `None` when the only tip seen was the one read when the seller armed,
+    /// which is not a background run (harvest#162).
+    #[serde(default)]
+    pub seen_at_ms: Option<u64>,
 }
 
 /// Carried through the store GET, so the answer knows which entries to
@@ -436,14 +439,22 @@ pub(crate) fn arm<S: SecretStore>(
     if !save(secrets, &arm_key(&arm.store_contract_id), &record) {
         return refuse("the node refused to store the arm".into());
     }
-    let subscribe = [store_id, arm.mailbox_contract_id, arm.tip_contract_id]
-        .into_iter()
-        .map(|id| {
-            OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
-                ContractInstanceId::new(id),
-            ))
-        })
-        .collect();
+    let mut subscribe: Vec<OutboundDelegateMsg> =
+        [store_id, arm.mailbox_contract_id, arm.tip_contract_id]
+            .into_iter()
+            .map(|id| {
+                OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
+                    ContractInstanceId::new(id),
+                ))
+            })
+            .collect();
+    // And read the tip now (harvest#162). A subscription delivers the next
+    // block, not the current one, so a node that had never seen the tip
+    // waited up to a block (about ten minutes on signet) before its first
+    // invoice. The answer is taken by `on_tip_read`.
+    subscribe.push(OutboundDelegateMsg::GetContractRequest(
+        GetContractRequest::new(ContractInstanceId::new(arm.tip_contract_id)),
+    ));
     (
         HarvestDelegateResponse::AutoInvoice {
             store_contract_id,
@@ -461,7 +472,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
         invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
-        last_background_run_ms: tip.as_ref().map(|t| t.seen_at_ms),
+        last_background_run_ms: tip.as_ref().and_then(|t| t.seen_at_ms),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
         oversold: ledger
             .oversold
@@ -701,7 +712,7 @@ pub(crate) fn on_notification<S: SecretStore>(
 ) -> Option<Vec<OutboundDelegateMsg>> {
     let all = arms(secrets);
     if let Some(record) = all.iter().find(|r| r.arm.tip_contract_id == *contract_id) {
-        note_tip(secrets, record.arm.network, state, now_ms);
+        note_tip(secrets, record.arm.network, state, now_ms, true);
         return Some(Vec::new());
     }
     if let Some(record) = all
@@ -873,7 +884,33 @@ pub(crate) fn settle(
         .collect()
 }
 
-fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u8], now_ms: u64) {
+/// The answer to the tip read an arm asks for (harvest#162), if `contract_id`
+/// is an armed tip contract. Kept like a notification's, but it is not a
+/// background run: the seller's own request caused it, and on a hosted
+/// gateway it may be answered where no background run ever happens.
+pub(crate) fn on_tip_read<S: SecretStore>(
+    secrets: &mut S,
+    contract_id: &[u8; 32],
+    state: &[u8],
+    now_ms: u64,
+) -> bool {
+    let Some(record) = arms(secrets)
+        .into_iter()
+        .find(|r| r.arm.tip_contract_id == *contract_id)
+    else {
+        return false;
+    };
+    note_tip(secrets, record.arm.network, state, now_ms, false);
+    true
+}
+
+fn note_tip<S: SecretStore>(
+    secrets: &mut S,
+    network: BitcoinNetwork,
+    state: &[u8],
+    now_ms: u64,
+    background: bool,
+) {
     let Ok(tip) = freenet_bitcoin_common::from_cbor::<BitcoinTipStateV1>(state) else {
         return;
     };
@@ -886,19 +923,24 @@ fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u
     let held: Option<TipCache> = load(secrets, &tip_key(network));
     // A copy that is behind never replaces a newer one (harvest#74), but it
     // still counts as a background run.
+    let seen_at_ms = if background {
+        Some(now_ms)
+    } else {
+        held.as_ref().and_then(|h| h.seen_at_ms)
+    };
     let anchor = match &held {
         Some(held) if held.anchor.height > newest.anchor.height => held.clone(),
         _ => TipCache {
             anchor: newest.anchor,
             block_time: newest.block_time,
-            seen_at_ms: now_ms,
+            seen_at_ms,
         },
     };
     save(
         secrets,
         &tip_key(network),
         &TipCache {
-            seen_at_ms: now_ms,
+            seen_at_ms,
             ..anchor
         },
     );
@@ -1659,7 +1701,7 @@ mod tests {
                     hash: freenet_bitcoin_common::BlockHash([7; 32]),
                 },
                 block_time: (NOW / 1000) as u32 - 600,
-                seen_at_ms: NOW - 600_000,
+                seen_at_ms: Some(NOW - 600_000),
             },
         );
         let listing = listing(Some(terms()));
@@ -2081,7 +2123,11 @@ mod tests {
             NOW + 5,
         );
         assert_eq!(cached(&f).anchor.height, 100, "an older block never wins");
-        assert_eq!(cached(&f).seen_at_ms, NOW + 5, "but it is a background run");
+        assert_eq!(
+            cached(&f).seen_at_ms,
+            Some(NOW + 5),
+            "but it is a background run"
+        );
         on_notification(
             &mut f.secrets,
             &[3; 32],
@@ -2846,7 +2892,8 @@ mod tests {
         assert!(subscriptions.is_empty());
     }
 
-    /// Arming stores the arm and subscribes to the three contracts.
+    /// Arming stores the arm, subscribes to the three contracts, and reads
+    /// the tip once (harvest#162).
     #[test]
     fn arming_subscribes_to_mailbox_store_and_tip() {
         let mut f = fixture();
@@ -2859,16 +2906,86 @@ mod tests {
         };
         assert_eq!(status.watched_remaining, 5);
         assert_eq!(status.paused, None);
-        let ids: Vec<[u8; 32]> = subscriptions
+        let ids: Vec<(&str, [u8; 32])> = subscriptions
             .iter()
             .map(|m| match m {
                 OutboundDelegateMsg::SubscribeContractRequest(r) => {
-                    r.contract_id.as_bytes().try_into().unwrap()
+                    ("subscribe", r.contract_id.as_bytes().try_into().unwrap())
+                }
+                OutboundDelegateMsg::GetContractRequest(r) => {
+                    ("get", r.contract_id.as_bytes().try_into().unwrap())
                 }
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(ids, vec![[1; 32], [2; 32], [3; 32]]);
+        assert_eq!(
+            ids,
+            vec![
+                ("subscribe", [1; 32]),
+                ("subscribe", [2; 32]),
+                ("subscribe", [3; 32]),
+                ("get", [3; 32]),
+            ]
+        );
+    }
+
+    /// **The tip read on arming turns instant checkout on at once
+    /// (harvest#162)**, instead of waiting for the next block's notification,
+    /// and it is not taken for a background run: the hosted-gateway notice
+    /// still rests on real ones. A tip read for a contract no arm names is
+    /// not taken. Mutated red by dropping the read from `arm`, by ignoring
+    /// its answer, and by counting it as a background run.
+    #[test]
+    fn the_tip_read_on_arming_is_kept_but_is_not_a_background_run() {
+        use freenet_bitcoin_common::{BlockHash, SignedTipEntry, TipEntryBody};
+        let bridge = SigningKey::from_bytes(&[0x77; 32]);
+        let entry = SignedTipEntry::sign(
+            &bridge,
+            &TipEntryBody {
+                network: BitcoinNetwork::Signet,
+                anchor: BlockAnchor {
+                    height: 2_000,
+                    hash: BlockHash([9; 32]),
+                },
+                prev_hash: BlockHash([0; 32]),
+                block_time: (NOW / 1000) as u32 - 300,
+                tx_count: 1,
+                median_time: (NOW / 1000) as u32 - 900,
+            },
+        )
+        .unwrap();
+        let mut tip = BitcoinTipStateV1::default();
+        tip.blocks.blocks.insert(2_000, entry);
+        let tip = freenet_bitcoin_common::to_cbor(&tip).unwrap();
+
+        let mut f = fixture();
+        crate::secrets::RemovableSecrets::remove_secret(
+            &mut f.secrets,
+            &tip_key(BitcoinNetwork::Signet),
+        );
+        let status = |f: &mut Fixture| {
+            let (response, _) = arm(&mut f.secrets, f.record.arm.clone(), NOW);
+            let HarvestDelegateResponse::AutoInvoice {
+                result: Ok(status), ..
+            } = response
+            else {
+                panic!("{response:?}")
+            };
+            status
+        };
+        assert!(status(&mut f).paused.is_some(), "no tip yet");
+
+        assert!(!on_tip_read(&mut f.secrets, &[0x44; 32], &tip, NOW));
+        assert!(on_tip_read(&mut f.secrets, &[3; 32], &tip, NOW));
+        let read = status(&mut f);
+        assert_eq!(read.paused, None, "on at once");
+        assert_eq!(read.last_background_run_ms, None, "not a background run");
+
+        on_notification(&mut f.secrets, &[3; 32], &tip, NOW + 5);
+        assert_eq!(status(&mut f).last_background_run_ms, Some(NOW + 5));
+        // A later read keeps the background run it had.
+        on_tip_read(&mut f.secrets, &[3; 32], &tip, NOW + 9);
+        assert_eq!(status(&mut f).last_background_run_ms, Some(NOW + 5));
     }
 
     /// The mailbox run batches only unseen instant requests within a day,
