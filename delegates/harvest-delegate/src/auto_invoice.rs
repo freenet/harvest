@@ -217,10 +217,22 @@ pub(crate) struct Ledger {
     #[serde(default)]
     pub settled: VecDeque<OrderId>,
     /// Instant orders paid when published stock could not cover them (see
-    /// `AutoInvoiceStatus::oversold`), until the seller has been shown them.
+    /// `AutoInvoiceStatus::oversold`), and when that was found. Shown to the
+    /// seller for [`OVERSOLD_SHOWN_MS`], then dropped.
     #[serde(default)]
-    pub oversold: Vec<OrderId>,
+    pub oversold: Vec<Oversold>,
 }
+
+/// An instant order paid when published stock could not cover it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub(crate) struct Oversold {
+    pub order: OrderId,
+    pub found_at_ms: u64,
+}
+
+/// How long an oversold order is shown to the seller: long enough to be seen
+/// on some visit, short enough that one already dealt with goes away.
+pub(crate) const OVERSOLD_SHOWN_MS: u64 = 14 * DAY_MS;
 
 /// One instant order for a counted listing.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -274,7 +286,13 @@ impl Ledger {
         }
         self.issued_at_ms
             .retain(|at| now_ms.saturating_sub(*at) < DAY_MS);
-        self.issued_at_ms.push(now_ms);
+        // One distinct time per invoice, so a migration merging these as a
+        // set keeps every one (several are issued in one run).
+        let mut at = now_ms;
+        while self.issued_at_ms.contains(&at) {
+            at += 1;
+        }
+        self.issued_at_ms.push(at);
     }
 
     /// Stock held for `listing` by unpaid instant orders ([`Sale::holds`]).
@@ -445,7 +463,12 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
         invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
         last_background_run_ms: tip.as_ref().map(|t| t.seen_at_ms),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
-        oversold: ledger.oversold.clone(),
+        oversold: ledger
+            .oversold
+            .iter()
+            .filter(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS)
+            .map(|o| o.order.clone())
+            .collect(),
         paused: global_refusal(secrets, record, tip.as_ref(), now_ms)
             .err()
             .map(|r| r.explain()),
@@ -490,13 +513,13 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     held.issued_at_ms.sort_unstable();
     let excess = held.issued_at_ms.len().saturating_sub(2 * MAX_PER_DAY);
     held.issued_at_ms.drain(..excess);
-    for order in incoming.settled {
-        held.settle(order);
-    }
-    for order in incoming.oversold {
-        if !held.oversold.contains(&order) {
-            held.oversold.push(order);
+    for oversold in incoming.oversold {
+        if !held.oversold.iter().any(|o| o.order == oversold.order) {
+            held.oversold.push(oversold);
         }
+    }
+    while held.oversold.len() > STATUSES_CAP {
+        held.oversold.remove(0);
     }
     for status in incoming.statuses {
         match held.statuses.iter().find(|s| s.listing == status.listing) {
@@ -504,8 +527,11 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
             _ => held.signed(status),
         }
     }
+    // Sales first, skipping any either side has settled, and only then the
+    // tombstones: merged first, the incoming ones could push this
+    // delegate's own out of the capped list and let a settled sale back in.
     for sale in incoming.sales {
-        if held.settled.contains(&sale.order) {
+        if held.settled.contains(&sale.order) || incoming.settled.contains(&sale.order) {
             continue;
         }
         match held.sales.iter_mut().find(|s| s.order == sale.order) {
@@ -517,11 +543,17 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
             None => held.sales.push(sale),
         }
     }
-    held.sales.retain(|s| !held.settled.contains(&s.order));
+    held.sales
+        .retain(|s| !held.settled.contains(&s.order) && !incoming.settled.contains(&s.order));
+    for order in incoming.settled {
+        if !held.settled.contains(&order) && held.settled.len() < ANSWERED_CAP {
+            held.settled.push_back(order);
+        }
+    }
     if held.sales.len() > SALES_CAP {
         // Keep the undecremented and the newest: a dropped sale is one whose
-        // payment would never come off the stock.
-        // Dropped first: the decremented, then the oldest.
+        // payment would never come off the stock. Dropped first: the
+        // decremented, then the oldest.
         held.sales
             .sort_by_key(|s| (s.decremented.is_none(), s.issued_at_ms));
         let excess = held.sales.len() - SALES_CAP;
@@ -756,6 +788,12 @@ pub(crate) fn settle(
             .get(&harvest_common::store::Bytes32(listing.0))
             .map(|s| s.status.revision)
     };
+    ledger
+        .oversold
+        .retain(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS);
+    while ledger.oversold.len() > STATUSES_CAP {
+        ledger.oversold.remove(0);
+    }
     // Our own statuses the store now shows, or has moved past, are done.
     ledger
         .statuses
@@ -777,11 +815,11 @@ pub(crate) fn settle(
                     ListingAvailability::Available { quantity: None } => true,
                     ListingAvailability::SoldOut | ListingAvailability::Withdrawn => false,
                 };
-                if !covered && !ledger.oversold.contains(&sale.order) {
-                    ledger.oversold.push(sale.order.clone());
-                    while ledger.oversold.len() > STATUSES_CAP {
-                        ledger.oversold.remove(0);
-                    }
+                if !covered && !ledger.oversold.iter().any(|o| o.order == sale.order) {
+                    ledger.oversold.push(Oversold {
+                        order: sale.order.clone(),
+                        found_at_ms: now_ms,
+                    });
                 }
                 sale.decremented = Some(match availability {
                     ListingAvailability::Available {
@@ -2398,7 +2436,10 @@ mod tests {
                 availability: ListingAvailability::SoldOut,
             }],
             settled: [OrderId([3; 32])].into(),
-            oversold: vec![OrderId([4; 32])],
+            oversold: vec![Oversold {
+                order: OrderId([4; 32]),
+                found_at_ms: NOW,
+            }],
         };
         assert!(merge_ledgers(&mut held, incoming.clone()));
         assert_eq!(
@@ -2497,7 +2538,14 @@ mod tests {
         with_status(&mut f, &a, OrderStatus::Paid);
         store_change(&mut f);
         let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
-        assert_eq!(ledger.oversold, vec![a]);
+        assert_eq!(
+            ledger
+                .oversold
+                .iter()
+                .map(|o| o.order.clone())
+                .collect::<Vec<_>>(),
+            vec![a]
+        );
         let (response, _) = arm(&mut f.secrets, f.record.arm.clone(), NOW);
         let HarvestDelegateResponse::AutoInvoice {
             result: Ok(status), ..
@@ -2506,6 +2554,74 @@ mod tests {
             panic!("{response:?}")
         };
         assert_eq!(status.oversold.len(), 1);
+        // Shown for two weeks, then gone.
+        let (response, _) = arm(
+            &mut f.secrets,
+            f.record.arm.clone(),
+            NOW + OVERSOLD_SHOWN_MS,
+        );
+        let HarvestDelegateResponse::AutoInvoice {
+            result: Ok(status), ..
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert!(status.oversold.is_empty());
+    }
+
+    /// Invoices issued in one run are each counted after a migration: they
+    /// get distinct times, so the set-merge keeps every one. Mutated red by
+    /// stamping every invoice of a run with the same time.
+    #[test]
+    fn a_runs_invoices_all_count_after_a_migration() {
+        let mut f = fixture();
+        f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        let decided = run(
+            &mut f,
+            &[
+                Buyer::new(40).request_at(&jam(), 1, 1, 12_000, NOW - 3_000),
+                Buyer::new(41).request_at(&jam(), 1, 1, 12_000, NOW - 2_000),
+                Buyer::new(42).request_at(&jam(), 1, 1, 12_000, NOW - 1_000),
+            ],
+        );
+        assert_eq!(decided.orders.len(), 3);
+        let old = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        let mut successor = Ledger::default();
+        merge_ledgers(&mut successor, old);
+        assert_eq!(successor.issued_last_day(NOW), 3);
+    }
+
+    /// A predecessor's full list of tombstones, merged again after this
+    /// delegate settled more, does not push this delegate's own out and
+    /// revive a sale. Mutated red by merging tombstones before sales.
+    #[test]
+    fn a_re_import_at_the_tombstone_cap_revives_nothing() {
+        let sale = Sale {
+            order: OrderId([0xee; 32]),
+            listing: jam().id,
+            quantity: 1,
+            issued_at_ms: NOW,
+            anchor_height: 1_000,
+            decremented: None,
+        };
+        let predecessor = Ledger {
+            settled: (0..ANSWERED_CAP as u32)
+                .map(|n| {
+                    let mut id = [0; 32];
+                    id[..4].copy_from_slice(&n.to_le_bytes());
+                    OrderId(id)
+                })
+                .collect(),
+            sales: vec![sale.clone()],
+            ..Default::default()
+        };
+        let mut held = Ledger::default();
+        merge_ledgers(&mut held, predecessor.clone());
+        // This delegate settles the carried sale.
+        held.sales.clear();
+        held.settle(sale.order.clone());
+        merge_ledgers(&mut held, predecessor);
+        assert!(held.sales.is_empty(), "the settled sale stays settled");
     }
 
     /// A sale is forgotten once its payment is reversed, or its payment

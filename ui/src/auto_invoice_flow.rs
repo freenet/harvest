@@ -412,8 +412,9 @@ pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> 
     }
     let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
     format!(
-        "Paid after the item had already gone to another buyer: {}. Refund or fulfil these \
-         by hand; the listing's count did not cover them. {line}",
+        "Paid when the listing's count no longer covered them (the item went to another \
+         buyer, or you marked it sold out or took it down): {}. Refund or fulfil these by \
+         hand. {line}",
         orders.join(", ")
     )
 }

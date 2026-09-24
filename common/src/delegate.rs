@@ -578,7 +578,9 @@ pub struct AutoInvoiceStatus {
     /// could no longer cover them: sold more than the seller had. Possible
     /// because an unpaid invoice stops holding stock once its buyer cancels
     /// or can no longer start paying, while a payment can still arrive after
-    /// that. The seller refunds or fulfils these by hand.
+    /// that, or because the seller marked the listing sold out or took it
+    /// down meanwhile. The seller refunds or fulfils these by hand. Each is
+    /// listed for two weeks from when it was found.
     #[serde(default)]
     pub oversold: Vec<crate::payment::OrderId>,
     /// Why the next request would wait for the seller, if it would.
