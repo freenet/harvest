@@ -117,6 +117,9 @@ pub struct Publishing {
     pub title: String,
     /// The notice shown while it is on its way, taken down when it ends.
     pub notice: String,
+    /// A refusal was reported against it; it waits on, in case the refusal
+    /// was about another write ([`AppState::on_update_refused`]).
+    pub refused: bool,
 }
 
 impl AppState {
@@ -258,6 +261,8 @@ impl AppState {
             listing,
             availability,
         )?;
+        // The same terms published again: one notice, not an orphaned one.
+        self.end_publishing(&id);
         let notice = format!("Publishing \u{201c}{title}\u{201d}\u{2026}");
         self.notifications.push(notice.clone());
         self.publishing_listings.insert(
@@ -266,6 +271,7 @@ impl AppState {
                 store_contract_id,
                 title,
                 notice,
+                refused: false,
             },
         );
         Ok(())
@@ -323,14 +329,19 @@ impl AppState {
     /// The node refused an update to `contract_id` (harvest#161). Its error
     /// names the contract only in its text and carries no request id, so it
     /// cannot be matched to one write. Every new listing waiting on that
-    /// store is reported as not published, and keeps waiting: one that lands
-    /// after all takes the report down again ([`Self::settle_publishing`]).
-    /// With none waiting, the refusal is said for a store of ours.
+    /// store, and not already reported, is reported as not published, and
+    /// keeps waiting: one that lands after all takes the report down again
+    /// ([`Self::settle_publishing`]). With none waiting, the refusal is said
+    /// for a store of ours.
     pub(crate) fn on_update_refused(&mut self, contract_id: &[u8], reason: &str) {
+        // One already reported is not taken to be the subject of every later
+        // refusal: that would hide each of those behind its report.
         let waiting: Vec<ListingId> = self
             .publishing_listings
             .iter()
-            .filter(|(_, p)| self.current_generation_of(&p.store_contract_id) == contract_id)
+            .filter(|(_, p)| {
+                !p.refused && self.current_generation_of(&p.store_contract_id) == contract_id
+            })
             .map(|(id, _)| id.clone())
             .collect();
         if waiting.is_empty() {
@@ -350,6 +361,7 @@ impl AppState {
                  it ({reason}).",
                 publishing.title
             );
+            publishing.refused = true;
             let old = std::mem::replace(&mut publishing.notice, report.clone());
             match self.notifications.iter().position(|n| *n == old) {
                 Some(at) => self.notifications[at] = report,
@@ -812,6 +824,21 @@ mod tests {
         assert_eq!(publishing_notices(&state), 0);
     }
 
+    /// The same terms published again leave one notice, not an orphan that
+    /// nothing takes down. Mutated red by dropping the `end_publishing`
+    /// before the insert.
+    #[test]
+    fn publishing_the_same_terms_again_leaves_one_notice() {
+        let mut state = seller_state();
+        let mugs = listing("Mugs");
+        for _ in 0..2 {
+            state
+                .publish_new_listing(STORE.to_vec(), FINGERPRINT.into(), mugs.clone(), None)
+                .expect("queued");
+        }
+        assert_eq!(publishing_notices(&state), 1);
+    }
+
     /// Two listings with one title each have a notice, and one landing takes
     /// down only its own.
     #[test]
@@ -838,9 +865,9 @@ mod tests {
     /// contract and the page said "Publishing" forever. A refusal cannot be
     /// tied to one write, so a listing it was wrongly taken to be about
     /// takes the report down when it lands. A refusal no listing is waiting
-    /// on is still said, for a store of ours, including on its current
-    /// generation before the session moves there. Mutated red by ignoring
-    /// the refusal.
+    /// on (including one already reported) is still said, for a store of
+    /// ours. Mutated red by ignoring the refusal, and by attributing later
+    /// refusals to an already-reported listing.
     #[test]
     fn a_refused_listing_is_reported() {
         let (mut state, earlier, current) = moving_seller();
@@ -872,6 +899,53 @@ mod tests {
         assert_eq!(state.notifications.len(), before + 1);
         state.on_update_refused(&[0x44; 32], "not ours");
         assert_eq!(state.notifications.len(), before + 1);
+
+        // A listing already reported is not the subject of every later
+        // refusal: the next one is said as itself.
+        let (mut state, earlier, current) = moving_seller();
+        state.adopt_migrated_contract_id(&earlier, current.clone());
+        state
+            .publish_new_listing(current.clone(), FINGERPRINT.into(), listing("Bowls"), None)
+            .expect("queued");
+        state.on_update_refused(&current, "the listing is not valid");
+        state.on_update_refused(&current, "the invoice is not valid");
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("Bowls") && n.contains("the listing is not valid")));
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n
+                == "A change to your store was refused by the network: the invoice is not valid"));
+    }
+
+    /// **"Publishing" comes down through the real arrival path (harvest#161)**,
+    /// not only when `settle_publishing` is called directly: a store state
+    /// holding the listing, delivered to `on_contract_state`. Mutated red by
+    /// removing the call from the store arm, and by moving it above the
+    /// listings being stored.
+    #[test]
+    fn a_store_state_holding_the_listing_ends_its_notice() {
+        let current = crate::state::test_store_generations().1;
+        let mut state = seller_state();
+        state.my_stores.get_mut(FINGERPRINT).unwrap()[0].store_contract_id = current.clone();
+        let mugs = listing("Mugs");
+        state
+            .publish_new_listing(current.clone(), FINGERPRINT.into(), mugs.clone(), None)
+            .expect("queued");
+        let mut store = harvest_common::store::StoreStateV1::default();
+        store
+            .listings
+            .listings
+            .push(harvest_common::listing::AuthorizedListing {
+                listing: mugs,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            });
+        state.on_contract_state(current, harvest_common::to_cbor(&store).unwrap());
+        assert_eq!(publishing_notices(&state), 0);
     }
 
     /// A publish that fails before it is sent, or is dropped before it is

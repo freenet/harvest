@@ -91,7 +91,7 @@ impl AppState {
                 }
                 // The delegate writes its orders to the store the arm names,
                 // so never an earlier generation (harvest#164). Armed once
-                // this session's migration walk adopts the current one.
+                // this session has moved to the current one.
                 if !matches!(
                     self.store_write_target(&registration.store_contract_id),
                     crate::state::StoreWriteTarget::Ready(_)

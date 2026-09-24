@@ -94,9 +94,8 @@ pub enum KeyOrigin {
     /// Rebuilt from the store contract this build bundles. Correct only if
     /// the store was published with the same contract build.
     Reconstructed,
-    /// The store's current generation, derived from its store key while the
-    /// registration still names an earlier one (harvest#164). The bundled
-    /// contract is that generation's, so this is always correct.
+    /// Rebuilt for the generation whose contract this build bundles, which
+    /// the registration names (harvest#164): correct by construction.
     Current,
 }
 
@@ -235,10 +234,10 @@ pub fn store_contract_key(
 /// `my_stores`, which is what lets a BUYER address a seller's store contract
 /// (harvest#75) -- a store nobody on this device has a registration for.
 ///
-/// It carries the same limit [`store_contract_key`] records: a store
-/// published under an OLDER store contract has a different code hash, so the
-/// rebuilt key names a contract that does not exist. That is why every caller
-/// is told its key was reconstructed and says so when a send fails.
+/// It carries the same limit [`store_contract_key`] records: for a store
+/// published under an OLDER store contract, the rebuilt key pairs that
+/// instance with the wrong code, and the node runs the older contract. That is
+/// why a caller is told how its key was found and says so when a send fails.
 pub fn reconstruct_store_key(store_contract_id: &[u8]) -> Result<ContractKey, String> {
     let instance_id: [u8; 32] = store_contract_id.try_into().map_err(|_| {
         format!(
@@ -606,6 +605,31 @@ async fn current_store_write(store_contract_id: &[u8]) -> Result<Option<Vec<u8>>
             }
         }
     }
+}
+
+/// Keep asking for our store's current generation until this session has
+/// moved there (harvest#164), backing off from 15 s to 5 min.
+///
+/// The walk's forward creates the current generation on a first load, but a
+/// store forward stops being waited on after 12 s
+/// (`migrate_seal::forward_give_up_ms`), and a forward PUT does not
+/// subscribe, so its landing may never reach this session on its own. Until
+/// it does, reads stay on the earlier generation and instant checkout is off.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_move_to_current(current: Vec<u8>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::ReadableExt;
+        let mut wait_ms: u32 = 15_000;
+        loop {
+            let moving = super::APP_STATE.read().is_moving_to(&current);
+            if !moving {
+                return;
+            }
+            probe_current_generation(&current).await;
+            gloo_timers::future::TimeoutFuture::new(wait_ms).await;
+            wait_ms = (wait_ms * 2).min(300_000);
+        }
+    });
 }
 
 /// Ask the node for our store's current generation, at most once per
@@ -1186,7 +1210,7 @@ mod tests {
             "a store write looked a registration up by id itself"
         );
         let wait = body_of("current_store_write");
-        assert_eq!(wait.matches("return Ok(Some(").count(), 1);
+        assert_eq!(wait.matches("Ok(Some(").count(), 1);
         assert!(wait.contains("WriteStep::Send(id) => return Ok(Some(id)),"));
         // And every owner write goes through one of the two.
         for writer in [

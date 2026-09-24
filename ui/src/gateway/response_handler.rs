@@ -35,9 +35,7 @@ pub fn handle_response(response: Result<HostResponse, String>) {
         }
         Err(e) => {
             error!("Gateway error: {}", e);
-            if refused_update(&e).is_some() {
-                apply_gateway_error(&mut APP_STATE.write(), &e);
-            }
+            apply_gateway_error(&mut APP_STATE.write(), &e);
         }
     }
 }
