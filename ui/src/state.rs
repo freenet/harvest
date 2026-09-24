@@ -3863,9 +3863,8 @@ impl AppState {
     ///
     /// Work started under the earlier id (an edit parked on a certificate, a
     /// despatch or cancel waiting on its signature, a listing or status
-    /// waiting on its certificate, an invoice waiting on its address check)
-    /// finishes after the move, so the lookups that finish or sign such work
-    /// resolve through here:
+    /// waiting on its certificate) finishes after the move, so the lookups
+    /// that finish or sign such work resolve through here:
     /// `store_write_target`, [`Self::work_store_key`],
     /// [`Self::work_store_fingerprint`]. Everything else asks
     /// `store_owner_key` / `store_owner_fingerprint`, which match the id the
@@ -10445,8 +10444,23 @@ impl AppState {
     /// contract's payment window behind it.
     pub fn published_payment_scripts(&self) -> Vec<Vec<u8>> {
         let mut scripts = std::collections::BTreeSet::new();
-        for registration in self.my_stores.values().flatten() {
-            let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
+        // Every generation of our stores this session has loaded: after a
+        // move the earlier one can still hold orders the current one has not
+        // been sent yet (an older build's, until this load's forward lands),
+        // and a script missed here is one the counter may hand out again
+        // (harvest#164). An extra script only moves the counter on.
+        let registered = self
+            .my_stores
+            .values()
+            .flatten()
+            .map(|r| r.store_contract_id.as_slice());
+        let superseded = self
+            .migrated_contract_ids
+            .iter()
+            .filter(|(_, to)| self.is_registered_store_id(to))
+            .map(|(from, _)| from.as_slice());
+        for id in registered.chain(superseded) {
+            let Some(store) = self.browsing_stores.get(id) else {
                 continue;
             };
             for record in &store.orders {
@@ -10456,6 +10470,14 @@ impl AppState {
             }
         }
         scripts.into_iter().collect()
+    }
+
+    /// Whether `id` is the id a registration of ours names now.
+    fn is_registered_store_id(&self, id: &[u8]) -> bool {
+        self.my_stores
+            .values()
+            .flatten()
+            .any(|s| s.store_contract_id == id)
     }
 
     /// Turn a freshly-derived address into a signed, published invoice.
@@ -13840,8 +13862,7 @@ mod tests {
 
     /// **Work started under an earlier id finishes after the move
     /// (harvest#164)**: an edit parked on its certificate, a despatch or
-    /// cancel waiting on its signature, an invoice accepted from a page
-    /// opened before the move. Its owner is found by the id it holds, before
+    /// cancel waiting on its signature. Its owner is found by the id it holds, before
     /// and after the move, while what LISTS our stores takes only the id the
     /// registration names, so the earlier generation, which stays loaded, is
     /// not a second store of ours. Mutated red by dropping the resolve
@@ -14009,13 +14030,16 @@ mod tests {
         let mut theirs = registration(1, None);
         theirs.store_contract_id = earlier.clone();
         state.merge_store_registrations(FINGERPRINT, vec![theirs]);
-        state.browsing_stores.insert(earlier, loaded_store("Jam"));
+        state
+            .browsing_stores
+            .insert(earlier.clone(), loaded_store("Jam"));
         let mut top = loaded_store("Jam");
         top.info.as_mut().unwrap().version = u32::MAX;
         state.browsing_stores.insert(current.clone(), top);
         assert!(state
-            .publish_store_details_at(&current, StoreDetails::default(), 5)
-            .is_err());
+            .publish_store_details_at(&earlier, StoreDetails::default(), 5)
+            .unwrap_err()
+            .contains("highest version"));
     }
 
     /// The move happens before anything else in the arrival reads the
@@ -17681,6 +17705,49 @@ mod invoice_tests {
                 .any(|n| n.contains("had all been used before")),
             "the seller was not told: {:?}",
             state.notifications
+        );
+    }
+
+    /// After the move, the address floor still counts what the earlier
+    /// generation holds: orders an older build wrote there reach the current
+    /// one only when this load's forward lands (harvest#164). Mutated red by
+    /// reading registered ids only.
+    #[test]
+    fn the_address_floor_counts_an_earlier_generation_still_loaded() {
+        let (earlier, current) = crate::state::test_store_generations();
+        let mut state = seller_with_a_store();
+        let mut loaded = state
+            .browsing_stores
+            .remove(STORE_ID.as_slice())
+            .expect("the seller's store is loaded");
+        state.my_stores.get_mut(SELLER).unwrap()[0].store_contract_id = earlier.clone();
+        let mut old = loaded.clone();
+        let mut order = harvest_common::payment::AuthorizedOrder {
+            order: crate::components::bitcoin_view::__address_check_test_support::order_paying(
+                "tb1q",
+                vec![0x00, 0x14, 0xEE],
+            ),
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        old.orders.push(order.clone());
+        order.order.payment_script_pubkey = vec![0x00, 0x14, 0xDD];
+        loaded.orders.push(order);
+        state.browsing_stores.insert(earlier.clone(), old);
+        state.browsing_stores.insert(current.clone(), loaded);
+        state.adopt_migrated_contract_id(&earlier, current);
+        let scripts = state.published_payment_scripts();
+        assert!(
+            scripts.contains(&vec![0x00, 0x14, 0xEE]),
+            "the earlier generation's"
+        );
+        assert!(
+            scripts.contains(&vec![0x00, 0x14, 0xDD]),
+            "the current generation's"
         );
     }
 

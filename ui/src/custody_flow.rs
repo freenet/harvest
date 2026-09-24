@@ -2195,22 +2195,25 @@ mod tests {
     }
 
     /// **Custody does not act on a generation this session moved our store
-    /// away from (harvest#164).** It stays loaded with stale state, and
-    /// asking the vault to wrap or recover for it would put up a prompt on
-    /// every load. Mutated red by dropping the check.
+    /// away from (harvest#164)**, while it still acts on the current one. The
+    /// earlier generation stays loaded with stale state; it is no longer the
+    /// id the registration names, so without this custody would take it for
+    /// a store we do not hold and ask the vault to recover its key on every
+    /// load. Mutated red by dropping the check, and by widening it to the
+    /// current generation.
     #[test]
     fn custody_leaves_an_earlier_generation_alone() {
         let mut state = backed_store();
         register(&mut state);
-        assert!(
-            state.custody_needed(&[ID; 32]).is_some(),
-            "precondition: this store calls for custody"
-        );
-        // The session moved the store on; the earlier id stays loaded.
-        state
-            .migrated_contract_ids
-            .insert(vec![ID; 32], vec![0x77; 32]);
+        // The current generation, loaded without a copy, so it calls for a
+        // wrap; the earlier one holds a copy it could "recover" from.
+        let fresh = state.browsing_stores[&vec![ID; 32]].clone();
+        add_copy(&mut state, WrapScope::current());
+        state.adopt_migrated_contract_id(&[ID; 32], vec![0x77; 32]);
+        state.browsing_stores.insert(vec![0x77; 32], fresh);
+
         assert!(state.custody_needed(&[ID; 32]).is_none());
+        assert!(state.custody_needed(&[0x77; 32]).is_some());
     }
 
     /// The same for an edit parked under the store's earlier id and failing
