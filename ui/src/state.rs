@@ -30571,8 +30571,13 @@ mod buy_flow_tests {
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(hosted.contains("try.freenet.org"), "{hosted}");
+        // Ready before any background run (the tip read on arming,
+        // harvest#162): starting, not on, since a hosted gateway gets here
+        // too. On once a background run is seen.
         let early = instant_checkout_status_text(&status(None, None), 1);
-        assert!(early.contains("is on"), "{early}");
+        assert!(early.contains("is starting"), "{early}");
+        let on = instant_checkout_status_text(&status(Some(1), None), 1);
+        assert!(on.contains("is on"), "{on}");
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
         assert!(paused.contains("paused: no recent block"), "{paused}");
         let mut oversold = status(Some(1), None);
