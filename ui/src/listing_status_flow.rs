@@ -322,7 +322,7 @@ impl AppState {
     /// published.
     pub(crate) fn on_update_refused(&mut self, contract_id: &[u8], reason: &str) {
         // A details edit waiting on that store is over too (harvest#166).
-        self.end_details_publishing(contract_id);
+        self.end_sent_details_publishing(contract_id);
         let waiting: Vec<ListingId> = self
             .publishing_listings
             .iter()
