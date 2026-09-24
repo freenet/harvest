@@ -131,8 +131,16 @@ pub fn App() -> Element {
                 // delegate usable. Spawned, because the answers are read by the
                 // response loop below.
                 wasm_bindgen_futures::spawn_local(async move {
-                    if let Some(key) = harvest_key {
-                        if !crate::gateway::delegate_registered(&key).await {
+                    // Both deadlines start now, so a slow Harvest answer does
+                    // not push the ghostkey's back.
+                    let harvest_wait = harvest_key
+                        .clone()
+                        .map(|key| (crate::gateway::delegate_registered(&key), key));
+                    let ghostkey_wait = ghostkey_key
+                        .clone()
+                        .map(|key| (crate::gateway::delegate_registered(&key), key));
+                    if let Some((harvest_wait, key)) = harvest_wait {
+                        if !harvest_wait.await {
                             dioxus::logger::tracing::warn!(
                                 "The node did not confirm the Harvest delegate's registration; \
                                  going ahead"
@@ -141,8 +149,8 @@ pub fn App() -> Element {
                         crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
                         harvest_delegate_ready().await;
                     }
-                    if let Some(key) = ghostkey_key {
-                        if !crate::gateway::delegate_registered(&key).await {
+                    if let Some((ghostkey_wait, key)) = ghostkey_wait {
+                        if !ghostkey_wait.await {
                             dioxus::logger::tracing::warn!(
                                 "The node did not confirm the ghostkey delegate's registration; \
                                  going ahead"
@@ -312,7 +320,15 @@ async fn harvest_delegate_ready() {
     }
     // And never wait on its answer forever (harvest#163): an answer can
     // still be lost, and the page would sit on "Checking your payment key".
+    // Asked once more, then the form is shown.
     wasm_bindgen_futures::spawn_local(async {
+        gloo_timers::future::TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS).await;
+        if crate::gateway::APP_STATE.read().bitcoin.payment_xpub_loaded {
+            return;
+        }
+        if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+            dioxus::logger::tracing::error!("Failed to fetch payment key again: {e}");
+        }
         gloo_timers::future::TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS).await;
         crate::gateway::APP_STATE
             .write()

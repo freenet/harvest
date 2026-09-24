@@ -207,6 +207,12 @@ impl RegistrationWaiters {
         }
     }
 
+    /// The answer to `key`'s registration is no longer expected.
+    pub fn forget(&mut self, key: &DelegateKey) {
+        self.waiting.remove(key);
+        self.receivers.remove(key);
+    }
+
     /// What to wait on for `key`'s registration, once.
     pub fn take(&mut self, key: &DelegateKey) -> Option<futures::channel::oneshot::Receiver<()>> {
         self.receivers.remove(key)
@@ -231,17 +237,25 @@ pub const REGISTRATION_WAIT_MS: u32 = 30_000;
 // rehearsal): a wait that gives up first is no wait at all.
 const _: () = assert!(REGISTRATION_WAIT_MS >= 15_000);
 
-/// Wait until the node has answered the registration of `key`, or
-/// [`REGISTRATION_WAIT_MS`]. `false` on the timeout. Needs the response loop
-/// running, so it is awaited from a spawned task, never before the loop.
+/// A wait for the node's answer to the registration of `key`, with its
+/// [`REGISTRATION_WAIT_MS`] deadline running from NOW, so the waits for two
+/// delegates run side by side even when one is awaited after the other.
+/// Resolves `false` on the timeout, and then stops expecting the answer, so a
+/// registration the node refused does not leave a later empty answer from
+/// that key taken for it. Needs the response loop running, so it is awaited
+/// from a spawned task, never before the loop.
 #[cfg(target_arch = "wasm32")]
-pub async fn registered(key: &DelegateKey) -> bool {
+pub fn registered(key: &DelegateKey) -> impl std::future::Future<Output = bool> {
     let rx = REGISTRATIONS.with(|r| r.borrow_mut().take(key));
-    wait_for_answer(
-        rx,
-        gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS),
-    )
-    .await
+    let deadline = gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS);
+    let key = key.clone();
+    async move {
+        let answered = wait_for_answer(rx, deadline).await;
+        if !answered {
+            REGISTRATIONS.with(|r| r.borrow_mut().forget(&key));
+        }
+        answered
+    }
 }
 
 /// `true` once `answer` arrives, `false` if `deadline` comes first. A
@@ -348,6 +362,9 @@ mod registration_tests {
         waiters.expect(key(2));
         let rx = waiters.take(&key(2));
         assert!(!block_on(wait_for_answer(rx, futures::future::ready(()))));
+        // Given up on: a later empty answer is not taken for it.
+        waiters.forget(&key(2));
+        assert!(!waiters.acknowledge(&key(2)));
     }
 
     /// Nothing is sent to either delegate, and neither key is published to
@@ -363,34 +380,51 @@ mod registration_tests {
         let task = &task[task
             .find("wasm_bindgen_futures::spawn_local(async move {")
             .expect("spawned")..];
+        // The task alone, to its closing brace.
+        let task = &task[..task
+            .find("\n                });\n")
+            .expect("the task's end")];
         let order = [
-            "delegate_registered(&key).await",
+            "let harvest_wait = harvest_key",
+            "let ghostkey_wait = ghostkey_key",
+            "harvest_wait.await",
             "harvest_delegate_key = Some(key)",
             "harvest_delegate_ready().await",
-            "delegate_registered(&key).await",
+            "ghostkey_wait.await",
             "ghostkey_delegate_key =",
             "ghostkey_delegate_ready(key).await",
-            "delegate_migrate_ops::start()",
+            "crate::gateway::delegate_migrate_ops::start();",
         ];
         let mut at = 0;
         for step in order {
             at += task[at..]
                 .find(step)
-                .unwrap_or_else(|| panic!("{step}, in order"))
+                .unwrap_or_else(|| panic!("{step}, in order, inside the task"))
                 + step.len();
         }
+        // Both deadlines start together, before either is awaited.
+        assert_eq!(task.matches("delegate_registered(").count(), 2);
         // Set nowhere else, and the walk started nowhere else.
         assert_eq!(src.matches("harvest_delegate_key =").count(), 1);
         assert_eq!(src.matches("ghostkey_delegate_key =").count(), 1);
         assert_eq!(src.matches("delegate_migrate_ops::start()").count(), 1);
 
-        let register = include_str!("delegate_api.rs");
-        let register = &register[register.find("pub async fn register_delegate(").unwrap()..];
+        let this = include_str!("delegate_api.rs");
+        let register = &this[this.find("pub async fn register_delegate(").unwrap()..];
         let expect = register
             .find("r.borrow_mut().expect(key.clone())")
             .expect("recorded");
         let send = register.find(".send(request)").expect("sent");
         assert!(expect < send, "recorded before it is sent");
+        let wait = &this[this.find("pub fn registered(").unwrap()..];
+        let wait = &wait[..wait.find("\n}\n").unwrap()];
+        for part in [
+            "r.borrow_mut().take(key)",
+            "TimeoutFuture::new(REGISTRATION_WAIT_MS)",
+            "wait_for_answer(rx, deadline).await",
+        ] {
+            assert!(wait.contains(part), "registered() {part}");
+        }
 
         // And the answer reaches the waiters, before the walk's reader of
         // empty answers can take it.
@@ -401,5 +435,17 @@ mod registration_tests {
             .expect("acknowledged");
         let empty = handler.find("offer_empty(&key)").expect("walk's reader");
         assert!(ack < empty);
+
+        // And the payment key's answer is not waited on forever (harvest#163).
+        let ready = &src[src.find("async fn harvest_delegate_ready()").unwrap()..];
+        let ready = &ready[..ready.find("\n}\n").unwrap()];
+        let asked = ready.find("get_payment_xpub()").expect("asked");
+        let timer = ready
+            .find("TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS)")
+            .expect("a deadline");
+        let overdue = ready
+            .find("payment_key_answer_overdue()")
+            .expect("then shown");
+        assert!(asked < timer && timer < overdue);
     }
 }

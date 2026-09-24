@@ -1199,8 +1199,12 @@ pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Opt
 }
 
 /// How long the page waits for the delegate's answer about the payment key
-/// before showing the form anyway (harvest#163).
-pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 30_000;
+/// before asking again, and again before showing the form anyway
+/// (harvest#163).
+pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
+// Longer than a registration takes to be answered (up to 7.1 s measured),
+// short enough that "Checking" does not look like a hang.
+const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
 
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
@@ -3899,8 +3903,8 @@ impl AppState {
         }
     }
 
-    /// The delegate has not answered about the payment key in
-    /// [`PAYMENT_KEY_ANSWER_WAIT_MS`] (harvest#163). Show the form rather than
+    /// The delegate has not answered about the payment key, asked twice
+    /// [`PAYMENT_KEY_ANSWER_WAIT_MS`] apart (harvest#163). Show the form rather than
     /// "Checking" for the rest of the session: setting the key again is
     /// harmless (the delegate keeps its counter), being unable to set it at
     /// all is not. Returns whether it was still waiting.
@@ -30606,6 +30610,9 @@ mod buy_flow_tests {
             hosted.starts_with("Instant checkout is not running on this node"),
             "{hosted}"
         );
+        // A node that did run is not told it does not, however long ago it armed.
+        let ran = instant_checkout_status_text(&status(Some(1), None), NO_BACKGROUND_RUN_AFTER_MS);
+        assert!(ran.starts_with("Instant checkout is on"), "{ran}");
         // Ready before any background run (the tip read on arming,
         // harvest#162): starting, not on, since a hosted gateway gets here
         // too. On once a background run is seen.
