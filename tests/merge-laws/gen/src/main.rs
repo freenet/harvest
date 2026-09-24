@@ -1595,6 +1595,9 @@ fn main() {
     if want("status") {
         gen_status(&root);
     }
+    if want("request") {
+        gen_request(&root);
+    }
 }
 
 use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
@@ -1718,6 +1721,87 @@ fn gen_status(root: &Path) {
     ];
     let mut c = Corpus::new(root, "store-status-bad", &params);
     for (n, s) in &bad { c.state(n, &cbor(s)); }
+    c.finish();
+}
+
+
+/// Instant checkout: orders answering a buyer request take their id from the
+/// request, so two answers to one request (two devices, a retry, a manual
+/// answer racing the delegate) are ONE map entry, resolved by status rank,
+/// then the larger amount, then the smaller encoding. Every tie-break in
+/// both arrival orders, beside ordinary orders.
+fn gen_request(root: &Path) {
+    let fx = StoreFx::new();
+    let params = cbor(&fx.params);
+    let p = &fx.params;
+    let answer = |req: u8, script: u8, amount: u64, created: i64| {
+        let mut o = fx.order("", created);
+        o.request_id = Some([req; 32]);
+        o.payment_script_pubkey = vec![0x00, 0x14, script, 0xcc];
+        o.amount_sats = amount;
+        o.with_derived_id()
+    };
+    let a1 = fx.authorized(&answer(1, 1, 50_000, 1_700_000_100), OrderStatus::AwaitingPayment, 1);
+    let a1_other = fx.authorized(&answer(1, 2, 50_000, 1_700_000_101), OrderStatus::AwaitingPayment, 1);
+    let a1_paid = fx.authorized(&answer(1, 2, 50_000, 1_700_000_101), OrderStatus::Paid, 2);
+    let a1_cheap_paid = fx.authorized(&answer(1, 3, 1, 1_700_000_102), OrderStatus::Paid, 3);
+    let a1_dearer = fx.authorized(&answer(1, 4, 60_000, 1_700_000_103), OrderStatus::AwaitingPayment, 1);
+    let a1_cancelled = fx.authorized(&answer(1, 1, 50_000, 1_700_000_100), OrderStatus::Cancelled, 1);
+    let a2 = fx.authorized(&answer(2, 5, 50_000, 1_700_000_104), OrderStatus::AwaitingPayment, 1);
+    let plain = fx.authorized(&fx.order("plain", 1_700_000_105), OrderStatus::AwaitingPayment, 1);
+    assert_eq!(a1.order.id, a1_other.order.id, "one request, one id");
+    let one = |o: &AuthorizedOrder| fx.build(None, vec![], vec![o.clone()]);
+    let states: Vec<(&str, StoreStateV1)> = vec![
+        ("default", StoreStateV1::default()),
+        ("A1", one(&a1)),
+        ("A1_other", one(&a1_other)),
+        ("A1_paid", one(&a1_paid)),
+        ("A1_cheap_paid", one(&a1_cheap_paid)),
+        ("A1_dearer", one(&a1_dearer)),
+        ("A1_cancelled", one(&a1_cancelled)),
+        ("A1_A2", fx.build(None, vec![], vec![a1.clone(), a2.clone()])),
+        ("A1other_plain", fx.build(None, vec![], vec![a1_other.clone(), plain.clone()])),
+        ("A2_plain", fx.build(None, vec![], vec![a2.clone(), plain.clone()])),
+    ];
+    native_laws_total("request", p, &states);
+
+    let pairs = [
+        ("A1", "A1_other"), ("A1_other", "A1"),
+        ("A1", "A1_paid"), ("A1_paid", "A1"),
+        ("A1_paid", "A1_cheap_paid"), ("A1_cheap_paid", "A1_paid"),
+        ("A1_dearer", "A1"), ("A1", "A1_dearer"),
+        ("A1_dearer", "A1_paid"), ("A1_cancelled", "A1_other"),
+        ("A1_other", "A1_cancelled"), ("A1_cancelled", "A1_paid"),
+        ("A1_A2", "A1other_plain"), ("A1other_plain", "A1_A2"),
+        ("default", "A1_A2"), ("A2_plain", "A1_cheap_paid"),
+    ];
+    let mut c = Corpus::new(root, "store-request", &params);
+    let mut all = states.clone();
+    let find = |all: &Vec<(&str, StoreStateV1)>, n: &str| all.iter().find(|(m, _)| *m == n).unwrap().1.clone();
+    let mut extra = vec![];
+    for (a, b) in pairs {
+        let r = fx.merged(&find(&all, a), &find(&all, b));
+        let name: &'static str = Box::leak(format!("m_{a}__{b}").into_boxed_str());
+        extra.push((a, name, r));
+    }
+    for (_, n, s) in &extra { all.push((n, s.clone())); }
+    let kept = find(&all, "m_A1_paid__A1_cheap_paid");
+    println!(
+        "request: a cheap paid answer displaces the real one? {}",
+        kept.orders.orders.values().any(|o| o.order.amount_sats == 1)
+    );
+    for (n, s) in &all { c.state(n, &cbor(s)); }
+    for (a, n, _) in &extra { c.transition(a, n); }
+    for (a, b) in pairs {
+        let base = find(&all, a);
+        let tgt = find(&all, b);
+        let summ = base.summarize(&base, p);
+        let Some(d) = tgt.delta(&tgt, p, &summ) else { continue };
+        let mut r = base.clone();
+        r.apply_delta(&base.clone(), p, &Some(d.clone())).expect("a request delta applies");
+        fx.check(&r);
+        c.delta_step(&cbor(&base), &cbor(&summ), &cbor(&d), &cbor(&r));
+    }
     c.finish();
 }
 
