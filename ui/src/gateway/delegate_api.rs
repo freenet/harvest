@@ -207,12 +207,6 @@ impl RegistrationWaiters {
         }
     }
 
-    /// The answer to `key`'s registration is no longer expected.
-    pub fn forget(&mut self, key: &DelegateKey) {
-        self.waiting.remove(key);
-        self.receivers.remove(key);
-    }
-
     /// What to wait on for `key`'s registration, once.
     pub fn take(&mut self, key: &DelegateKey) -> Option<futures::channel::oneshot::Receiver<()>> {
         self.receivers.remove(key)
@@ -238,24 +232,18 @@ pub const REGISTRATION_WAIT_MS: u32 = 30_000;
 const _: () = assert!(REGISTRATION_WAIT_MS >= 15_000);
 
 /// A wait for the node's answer to the registration of `key`, with its
-/// [`REGISTRATION_WAIT_MS`] deadline running from NOW, so the waits for two
-/// delegates run side by side even when one is awaited after the other.
-/// Resolves `false` on the timeout, and then stops expecting the answer, so a
-/// registration the node refused does not leave a later empty answer from
-/// that key taken for it. Needs the response loop running, so it is awaited
-/// from a spawned task, never before the loop.
+/// [`REGISTRATION_WAIT_MS`] deadline running from NOW (gloo's `TimeoutFuture`
+/// sets its timer when it is created), so the waits for two delegates run
+/// side by side even when one is awaited after the other. Resolves `false` on
+/// the timeout. An answer that comes later still finds its waiter and is
+/// taken for what it is, rather than read as "not registered". Needs the
+/// response loop running, so it is awaited from a spawned task, never before
+/// the loop.
 #[cfg(target_arch = "wasm32")]
 pub fn registered(key: &DelegateKey) -> impl std::future::Future<Output = bool> {
     let rx = REGISTRATIONS.with(|r| r.borrow_mut().take(key));
     let deadline = gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS);
-    let key = key.clone();
-    async move {
-        let answered = wait_for_answer(rx, deadline).await;
-        if !answered {
-            REGISTRATIONS.with(|r| r.borrow_mut().forget(&key));
-        }
-        answered
-    }
+    async move { wait_for_answer(rx, deadline).await }
 }
 
 /// `true` once `answer` arrives, `false` if `deadline` comes first. A
@@ -362,9 +350,8 @@ mod registration_tests {
         waiters.expect(key(2));
         let rx = waiters.take(&key(2));
         assert!(!block_on(wait_for_answer(rx, futures::future::ready(()))));
-        // Given up on: a later empty answer is not taken for it.
-        waiters.forget(&key(2));
-        assert!(!waiters.acknowledge(&key(2)));
+        // Given up on, the answer is still taken for what it is when it comes.
+        assert!(waiters.acknowledge(&key(2)));
     }
 
     /// Nothing is sent to either delegate, and neither key is published to
@@ -418,12 +405,19 @@ mod registration_tests {
         assert!(expect < send, "recorded before it is sent");
         let wait = &this[this.find("pub fn registered(").unwrap()..];
         let wait = &wait[..wait.find("\n}\n").unwrap()];
+        let mut at = 0;
         for part in [
             "r.borrow_mut().take(key)",
+            // The deadline is made before the returned future, so it runs
+            // from the call, not from the first poll.
             "TimeoutFuture::new(REGISTRATION_WAIT_MS)",
+            "async move",
             "wait_for_answer(rx, deadline).await",
         ] {
-            assert!(wait.contains(part), "registered() {part}");
+            at += wait[at..]
+                .find(part)
+                .unwrap_or_else(|| panic!("registered(): {part}, in order"))
+                + part.len();
         }
 
         // And the answer reaches the waiters, before the walk's reader of
@@ -436,16 +430,28 @@ mod registration_tests {
         let empty = handler.find("offer_empty(&key)").expect("walk's reader");
         assert!(ack < empty);
 
-        // And the payment key's answer is not waited on forever (harvest#163).
+        // And the payment key's answer is not waited on forever (harvest#163):
+        // after the ask, a deadline, a second ask unless answered, a second
+        // deadline, then the form.
         let ready = &src[src.find("async fn harvest_delegate_ready()").unwrap()..];
         let ready = &ready[..ready.find("\n}\n").unwrap()];
         let asked = ready.find("get_payment_xpub()").expect("asked");
-        let timer = ready
-            .find("TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS)")
-            .expect("a deadline");
-        let overdue = ready
-            .find("payment_key_answer_overdue()")
-            .expect("then shown");
-        assert!(asked < timer && timer < overdue);
+        let retry = &ready[asked..];
+        let retry = &retry[retry.find("spawn_local(async {").expect("the retry task")..];
+        let timer = "TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS)";
+        let mut at = 0;
+        for part in [
+            timer,
+            "bitcoin.payment_xpub_loaded",
+            "get_payment_xpub()",
+            timer,
+            "payment_key_answer_overdue()",
+        ] {
+            at += retry[at..]
+                .find(part)
+                .unwrap_or_else(|| panic!("payment-key retry: {part}, in order"))
+                + part.len();
+        }
+        assert_eq!(retry.matches(timer).count(), 2);
     }
 }
