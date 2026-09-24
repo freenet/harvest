@@ -671,6 +671,10 @@ pub struct AppState {
     pub publishing_listings:
         HashMap<harvest_common::listing::ListingId, crate::listing_status_flow::Publishing>,
 
+    /// Store-details edits on their way, keyed by the store generation each
+    /// is written to (harvest#166). See [`AppState::progress_notices`].
+    pub publishing_details: HashMap<Vec<u8>, DetailsPublishing>,
+
     /// An edited listing's predecessor, to take down once the replacement
     /// has published, keyed by the replacement's id (harvest#70). See
     /// `AppState::on_listing_published`.
@@ -1173,6 +1177,20 @@ pub struct StoreDetails {
     pub store_name: String,
     pub description: String,
 }
+
+/// A store-details edit on its way (harvest#166).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetailsPublishing {
+    /// The version it is published at; state at this version or later is it
+    /// landed (or outranked).
+    pub version: u32,
+    /// Signed and handed to the node. Before that it is under way only while
+    /// the edit or its signature is ([`AppState::store_publish_in_flight`]).
+    pub sent: bool,
+}
+
+/// What the notification bar says while a details edit is under way.
+pub(crate) const PUBLISHING_DETAILS: &str = "Publishing your store's details\u{2026}";
 
 /// Where a write to one of our own stores may go: see
 /// [`AppState::store_write_target`].
@@ -4633,6 +4651,7 @@ impl AppState {
                     self.refresh_backing_verdicts();
                     // A new listing this state holds is published (harvest#161).
                     self.settle_publishing(&contract_id);
+                    self.settle_details_publishing(&contract_id);
 
                     // Keep this store's key recoverable from its backing Ghost
                     // Key, or recover it here if this device has lost it
@@ -8667,6 +8686,61 @@ impl AppState {
             .retain(|pending| !pending.signed_bytes().is_ok_and(|queued| queued == bytes));
     }
 
+    /// The notices that last only while something is under way: one
+    /// "Publishing your store's details…" per store whose details edit is
+    /// waiting on a signature, or was sent and has not yet shown up in the
+    /// store's state (harvest#166). Derived rather than pushed, so an edit
+    /// abandoned on any of its many failure paths (each of which says why)
+    /// simply stops being shown; an edit sent and not seen is ended by its
+    /// landing ([`Self::settle_details_publishing`]), its refusal, or its
+    /// send failing ([`Self::end_details_publishing`]).
+    pub fn progress_notices(&self) -> Vec<String> {
+        let under_way = self
+            .publishing_details
+            .iter()
+            .any(|(store, p)| p.sent || self.store_publish_in_flight(store));
+        if under_way {
+            vec![PUBLISHING_DETAILS.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The details edit for `store_contract_id` has been signed and sent.
+    pub(crate) fn details_sent(&mut self, store_contract_id: &[u8]) {
+        let key = self.write_generation(store_contract_id);
+        if let Some(p) = self.publishing_details.get_mut(&key) {
+            p.sent = true;
+        }
+    }
+
+    /// The details edit for `store_contract_id` is over: refused, or its send
+    /// failed. What went wrong is said where it went wrong.
+    pub(crate) fn end_details_publishing(&mut self, store_contract_id: &[u8]) {
+        let key = self.write_generation(store_contract_id);
+        self.publishing_details.remove(&key);
+    }
+
+    /// A store's state arrived: a details edit it holds, at its version or a
+    /// later one, is over.
+    pub(crate) fn settle_details_publishing(&mut self, contract_id: &[u8]) {
+        let Some(held) = self
+            .browsing_stores
+            .get(contract_id)
+            .and_then(|store| store.info.as_ref())
+            .map(|info| info.version)
+        else {
+            return;
+        };
+        if self
+            .publishing_details
+            .get(contract_id)
+            .is_some_and(|p| held >= p.version)
+        {
+            self.publishing_details.remove(contract_id);
+        }
+    }
+
     /// Whether a publish for this store is waiting on its certificate or on
     /// the ghostkey delegate's `SignResult` -- the certificate/sign phase
     /// only, NOT the whole publish.
@@ -8916,6 +8990,13 @@ impl AppState {
             next_version,
             details,
         });
+        self.publishing_details.insert(
+            written_to.clone(),
+            DetailsPublishing {
+                version: next_version,
+                sent: false,
+            },
+        );
 
         if !self.start_store_edit_if_ready() {
             // The certificate has to be inside the record before it is
@@ -11343,6 +11424,7 @@ impl AppState {
                 self.on_listing_status_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
+                self.details_sent(&pending.store_contract_id);
                 let authorized = harvest_common::store::AuthorizedStoreInfoV1 {
                     info: pending.info,
                     scoped_payload,
@@ -11366,13 +11448,12 @@ impl AppState {
                                 "Failed to publish store details: {}",
                                 e
                             );
-                            crate::gateway::APP_STATE
-                                .write()
-                                .notifications
-                                .push(format!(
-                                    "Your store's name and description could not be \
+                            let mut app = crate::gateway::APP_STATE.write();
+                            app.end_details_publishing(&store_id);
+                            app.notifications.push(format!(
+                                "Your store's name and description could not be \
                                  published: {e}"
-                                ));
+                            ));
                         }
                     });
                 }
@@ -15222,6 +15303,91 @@ mod tests {
             "{:?}",
             state.notifications
         );
+    }
+
+    /// **"Publishing your store's details…" ends (harvest#166).** It shows
+    /// while the edit waits on its signature or has been sent and not yet
+    /// seen, and not once the store's state holds it at its version, once
+    /// the node refuses it or its send fails, or once the edit is abandoned
+    /// before it was sent (every such path says why on its own). Mutated red
+    /// by never ending it on landing, by showing it for an abandoned edit,
+    /// and by not ending it on a refusal.
+    #[test]
+    fn the_details_publishing_notice_ends() {
+        let shown =
+            |state: &AppState| state.progress_notices() == vec![PUBLISHING_DETAILS.to_string()];
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        assert!(shown(&state), "waiting on its signature");
+
+        // Signed and sent; the store still shows the old version.
+        state.details_sent(&STORE_ID);
+        state.pending_signatures.clear();
+        assert!(shown(&state), "sent, not yet seen");
+        state.settle_details_publishing(&STORE_ID);
+        assert!(shown(&state), "the old version is not it");
+
+        // The store's state holds it.
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .unwrap()
+            .info
+            .as_mut()
+            .unwrap()
+            .version = 4;
+        state.settle_details_publishing(&STORE_ID);
+        assert!(state.progress_notices().is_empty(), "landed");
+
+        // Abandoned before it was sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        assert!(shown(&state));
+        state.pending_signatures.clear();
+        state.pending_store_edit = None;
+        assert!(state.progress_notices().is_empty(), "abandoned");
+
+        // Sent, then refused by the node.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&STORE_ID);
+        state.pending_signatures.clear();
+        state.on_update_refused(&STORE_ID, "invalid");
+        assert!(state.progress_notices().is_empty(), "refused");
+
+        // Sent, then the send failed.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        state.details_sent(&STORE_ID);
+        state.pending_signatures.clear();
+        state.end_details_publishing(&STORE_ID);
+        assert!(state.progress_notices().is_empty(), "send failed");
+    }
+
+    /// The notice is the state's, and the signed handler marks the edit
+    /// sent before it is sent; the send failure ends it. Pinned by source:
+    /// both are in wasm-only code.
+    #[test]
+    fn the_details_notice_is_wired() {
+        let src = include_str!("state.rs");
+        let signed = &src[src.find("Some(PendingSignature::StoreInfo(pending)) => {\n                self.details_sent(").expect("marked sent")..];
+        let signed = &signed[..signed.find("Constructed AuthorizedStoreInfoV1").unwrap()];
+        assert!(signed.contains("self.details_sent(&pending.store_contract_id);"));
+        let failed = &src[src.find("\"Failed to publish store details: {}\"").unwrap()..];
+        let failed = &failed[..failed.find("could not be").unwrap()];
+        assert!(failed.contains("app.end_details_publishing(&store_id);"));
+        let bar = include_str!("components/app.rs");
+        assert!(bar.contains("app_state.progress_notices()"));
+        let my_store = include_str!("components/my_store.rs");
+        assert!(!my_store.contains("Publishing your store's details"));
     }
 
     /// `registration(1, ..)` files the store's reputation contract under this.

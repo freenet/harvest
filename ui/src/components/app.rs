@@ -376,13 +376,16 @@ fn format_build_time() -> String {
 
 fn notification_bar() -> Element {
     let app_state = crate::gateway::APP_STATE.read();
-    if app_state.notifications.is_empty() {
+    // Notices that last only while something is under way (harvest#166)
+    // come after the ones that stay.
+    let progress = app_state.progress_notices();
+    if app_state.notifications.is_empty() && progress.is_empty() {
         return rsx! {};
     }
 
     rsx! {
         div { class: "notification-bar",
-            for notification in &app_state.notifications {
+            for notification in app_state.notifications.iter().chain(progress.iter()) {
                 p { "{notification}" }
             }
         }

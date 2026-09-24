@@ -1103,11 +1103,9 @@ fn publish_store_details(store_contract_id: Vec<u8>, details: StoreDetails) {
     let outcome = APP_STATE
         .write()
         .publish_store_details(&store_contract_id, details);
+    // Its "Publishing" notice is the state's to show and end (harvest#166).
     match outcome {
-        Ok(()) => APP_STATE
-            .write()
-            .notifications
-            .push("Publishing your store's details…".into()),
+        Ok(()) => {}
         Err(e) => {
             dioxus::logger::tracing::error!("Could not publish store details: {e}");
             APP_STATE
