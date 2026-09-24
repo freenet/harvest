@@ -55,11 +55,17 @@ use crate::delegate_migrate::{self, CallError, DelegateCalls, Expect, Reply, Set
 /// [`offer_empty`]).
 const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
 
-/// How long a call to the CURRENT delegate may take: node-local, loaded,
-/// answering in milliseconds. An import that times out is retried next load
-/// and does not stop the walk, so a long deadline here would only make a
-/// load's walk slower.
-const CURRENT_TIMEOUT_MS: u32 = 5_000;
+/// How long a call to the CURRENT delegate may take.
+///
+/// Node-local, and usually milliseconds. But after a re-key the first call
+/// to the new generation compiles its module, and a silence here STOPS the
+/// walk for this load (the next predecessor is refused as
+/// `WriterUnavailable`), which also holds back the work the walk gates. The
+/// harvest#162 rehearsal measured that first answer at 6.9 s on a loaded
+/// machine, past the 5 s this was, and the walk stopped at the generation
+/// holding the seller's secrets. So the same deadline as a predecessor call:
+/// it costs time only when the current delegate never answers at all.
+const CURRENT_TIMEOUT_MS: u32 = PREDECESSOR_TIMEOUT_MS;
 
 struct Waiter {
     delegate: DelegateKey,
