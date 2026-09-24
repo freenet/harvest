@@ -865,8 +865,8 @@ pub(crate) fn decide<S: SecretStore>(
                 status,
                 reply,
             }) => {
-                issued_now.push(order.clone());
-                decided.orders.push(order);
+                issued_now.push((*order).clone());
+                decided.orders.push(*order);
                 decided.statuses.extend(status);
                 decided.replies.push(reply);
                 ledger.saw(digest);
@@ -892,7 +892,7 @@ pub(crate) fn decide<S: SecretStore>(
 
 enum Answer {
     Invoice {
-        order: AuthorizedOrder,
+        order: Box<AuthorizedOrder>,
         status: Option<AuthorizedListingStatus>,
         reply: EncryptedMessage,
     },
@@ -1086,7 +1086,7 @@ fn decide_one<S: SecretStore>(
     })?;
     ledger.answer(request_id, now_ms);
     Ok(Answer::Invoice {
-        order: signed,
+        order: Box::new(signed),
         status,
         reply,
     })
@@ -1484,7 +1484,7 @@ mod tests {
         let mut f = fixture();
         let buyer = Buyer::new(40);
         let first = buyer.request(&jam(), 1, 1, 12_000);
-        let decided = run(&mut f, &[first.clone()]);
+        let decided = run(&mut f, std::slice::from_ref(&first));
         assert_eq!(decided.orders.len(), 1);
         publish(&mut f, &decided);
 
@@ -1498,7 +1498,7 @@ mod tests {
         // Another device answered this one; this device's ledger never saw it.
         let mut g = fixture();
         let other = buyer.request(&jam(), 1, 7, 12_000);
-        let elsewhere = run(&mut fixture(), &[other.clone()]);
+        let elsewhere = run(&mut fixture(), std::slice::from_ref(&other));
         publish(&mut g, &elsewhere);
         let here = run(&mut g, &[other]);
         assert!(here.orders.is_empty());
@@ -1561,21 +1561,21 @@ mod tests {
         let mut f = fixture();
         f.record.arm.watched_scripts = vec![script_at(1)];
         let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
-        let decided = run(&mut f, &[entry.clone()]);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
         assert!(decided.orders.is_empty());
         assert_eq!(decided.refused[0].1, Refusal::NoWatchedAddress);
         assert_eq!(counter(&f), 0, "nothing spent");
 
         let mut f = fixture();
         f.record.arm.watched_until_ms = NOW;
-        let decided = run(&mut f, &[entry.clone()]);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
         assert_eq!(decided.refused[0].1, Refusal::WatchLapsed);
 
         // A store-wide refusal leaves the request unseen, so a later arm
         // can still answer it.
         let mut f = fixture();
         f.record.arm.watched_scripts.clear();
-        run(&mut f, &[entry.clone()]);
+        run(&mut f, std::slice::from_ref(&entry));
         f.record.arm.watched_scripts = vec![script_at(0)];
         assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
     }
@@ -1663,8 +1663,10 @@ mod tests {
 
         // Per day.
         let mut f = fixture();
-        let mut ledger = Ledger::default();
-        ledger.issued_at_ms = vec![NOW - 1_000; MAX_PER_DAY];
+        let ledger = Ledger {
+            issued_at_ms: vec![NOW - 1_000; MAX_PER_DAY],
+            ..Default::default()
+        };
         save(
             &mut f.secrets,
             &ledger_key(&f.record.arm.store_contract_id),
@@ -1686,7 +1688,7 @@ mod tests {
     /// binding already published for another conversation all fall back.
     #[test]
     fn doubtful_inputs_fall_back() {
-        let entry = |f: &Fixture| Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let entry = |_: &Fixture| Buyer::new(40).request(&jam(), 1, 1, 12_000);
 
         let mut f = fixture();
         let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();

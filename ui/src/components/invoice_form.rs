@@ -701,6 +701,7 @@ fn InvoiceForm(
                             // no buyer asked, so nobody can cancel it but the
                             // seller or complain about it.
                             buyer_receipt_key: None,
+                            request_id: None,
                         });
                         amount.set(String::new());
                         buyer.set(String::new());

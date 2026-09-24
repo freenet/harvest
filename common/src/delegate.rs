@@ -1541,9 +1541,10 @@ mod tests {
             // Each kept purchase's receipt seed.
             R::KeptPurchases { .. } => (27, true),
             R::KeepPurchaseRefused { .. } => (28, false),
+            R::AutoInvoice { .. } => (29, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 29;
+    const RESPONSE_VARIANTS: usize = 30;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1581,9 +1582,12 @@ mod tests {
             Q::ImportMigratedSecret { .. } => (24, true),
             Q::KeepPurchase { .. } => (25, false),
             Q::ListKeptPurchases => (26, false),
+            // Public payment scripts and contract ids.
+            Q::ArmAutoInvoice { .. } => (27, false),
+            Q::GetAutoInvoiceStatus { .. } => (28, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 27;
+    const REQUEST_VARIANTS: usize = 29;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1791,6 +1795,17 @@ mod tests {
                 order_id: crate::payment::OrderId([3u8; 32]),
                 reason: "refused".into(),
             },
+            R::AutoInvoice {
+                store_contract_id: vec![3u8; 32],
+                result: Ok(AutoInvoiceStatus {
+                    armed_at_ms: 1,
+                    watched_remaining: 2,
+                    watched_until_ms: 3,
+                    last_background_run_ms: Some(4),
+                    issued_last_day: 5,
+                    paused: None,
+                }),
+            },
         ]
     }
 
@@ -1940,6 +1955,23 @@ mod tests {
                 keep: Box::new(purchase_to_keep()),
             },
             Q::ListKeptPurchases,
+            Q::ArmAutoInvoice {
+                arm: Box::new(AutoInvoiceArm {
+                    store_contract_id: store(),
+                    store_verifying_key: [5u8; 32],
+                    mailbox_contract_id: [6u8; 32],
+                    seller_fingerprint: fp(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    tip_contract_id: [7u8; 32],
+                    trusted_bridges: vec![],
+                    address_code_hash: [8u8; 32],
+                    watched_scripts: vec![vec![0u8, 20]],
+                    watched_until_ms: 9,
+                }),
+            },
+            Q::GetAutoInvoiceStatus {
+                store_contract_id: store(),
+            },
         ]
     }
 
@@ -2066,9 +2098,10 @@ mod tests {
             B::PaymentXpubSet { .. } => (6, true),
             B::PaymentXpub { .. } => (7, true),
             B::OrderAddress { .. } => (8, false),
+            B::UpcomingAddresses { .. } => (9, false),
         }
     }
-    const BITCOIN_RESPONSE_VARIANTS: usize = 9;
+    const BITCOIN_RESPONSE_VARIANTS: usize = 10;
 
     /// Every Bitcoin-surface request variant, as for [`classify_response`].
     fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
@@ -2084,9 +2117,10 @@ mod tests {
             B::SetPaymentXpub { .. } => (6, true),
             B::GetPaymentXpub => (7, false),
             B::DeriveOrderAddress { .. } => (8, false),
+            B::PeekOrderAddresses { .. } => (9, false),
         }
     }
-    const BITCOIN_REQUEST_VARIANTS: usize = 9;
+    const BITCOIN_REQUEST_VARIANTS: usize = 10;
 
     fn watch() -> crate::WatchedPayment {
         crate::WatchedPayment {
@@ -2160,6 +2194,10 @@ mod tests {
                 }),
                 matched_scripts: vec![],
             },
+            B::UpcomingAddresses {
+                request_id: 42,
+                result: Ok(vec![]),
+            },
         ]
     }
 
@@ -2203,6 +2241,10 @@ mod tests {
             B::DeriveOrderAddress {
                 request_id: 42,
                 published_scripts: vec![],
+            },
+            B::PeekOrderAddresses {
+                request_id: 42,
+                count: 10,
             },
         ]
     }

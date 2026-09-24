@@ -432,19 +432,23 @@ impl BuyerConversation {
     /// taking keys: the request and the ordinary message must travel in the
     /// same thread, under the same tag, or the seller's acceptance comes back
     /// where the buyer is not reading.
+    ///
+    /// `instant` is the buyer's instant-checkout selection, or `None` for a
+    /// quote request.
     pub fn request_order(
         &self,
         listing_id: &harvest_common::listing::ListingId,
         quantity: u32,
         shipping: String,
         note: String,
+        instant: Option<InstantSelection>,
     ) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
             &self.buyer_public_key,
             &self.conversation_id,
             MessageContent::OrderRequest {
-                instant: None,
+                instant,
                 listing_id: listing_id.clone(),
                 quantity,
                 shipping,
@@ -690,6 +694,11 @@ pub(crate) fn seal_for_test(
 /// to a key this seller no longer holds. Silently hiding them would leave the
 /// seller with a count that never matches what they see and no way to tell
 /// "nobody wrote to me" from "I cannot read what they wrote".
+///
+/// `Readable` is the larger variant by the size of an instant-checkout
+/// selection. One is built per mailbox message on each read, at most
+/// `MAX_MESSAGES` of them, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum MailboxEntry {
     /// Decrypted successfully. The AES-GCM tag verified, so these bytes were
@@ -1719,7 +1728,13 @@ mod buy_flow_tests {
         let listing = ListingId([7u8; 32]);
 
         let sealed = buyer
-            .request_order(&listing, 3, "12 Example St".into(), "no chilli".into())
+            .request_order(
+                &listing,
+                3,
+                "12 Example St".into(),
+                "no chilli".into(),
+                None,
+            )
             .expect("seal the request");
 
         let inbox = seller.inbox(&[sealed]);
@@ -1757,6 +1772,39 @@ mod buy_flow_tests {
                 .to_bytes();
                 assert_eq!(buyer_receipt_key, &Some(expected));
             }
+            other => panic!("expected an order request, got {other:?}"),
+        }
+    }
+
+    /// An instant-checkout selection reaches the seller as it was picked, so
+    /// the seller's delegate prices the same region, choices and total the
+    /// buyer was shown.
+    #[test]
+    fn an_instant_selection_reaches_the_seller_intact() {
+        let seller = Seller::new(33);
+        let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
+        let selection = InstantSelection {
+            nonce: [5u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Fig".into(), "Large".into()],
+            expected_total_sats: 12_000,
+        };
+
+        let sealed = buyer
+            .request_order(
+                &ListingId([7u8; 32]),
+                2,
+                "12 Example St".into(),
+                String::new(),
+                Some(selection.clone()),
+            )
+            .expect("seal the request");
+
+        match &seller.inbox(&[sealed])[0] {
+            MailboxEntry::Readable {
+                content: MessageContent::OrderRequest { instant, .. },
+                ..
+            } => assert_eq!(instant, &Some(selection)),
             other => panic!("expected an order request, got {other:?}"),
         }
     }

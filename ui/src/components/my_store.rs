@@ -612,6 +612,10 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
     let setup_done = details_done && has_wallet && store.listings > 0;
     let mut go = move |t: Tab| tab.set(t);
 
+    let instant_checkout = APP_STATE
+        .read()
+        .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
+
     let needs: bool = store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
         || !store.certificate.is_verified()
@@ -672,6 +676,13 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
             if !needs && store.details_resolved {
                 p { class: "text-muted", "Nothing needs you right now." }
+            }
+        }
+
+        if let Some(notice) = instant_checkout {
+            section { class: "card",
+                h3 { "Instant checkout" }
+                p { class: "text-muted", "{notice}" }
             }
         }
 

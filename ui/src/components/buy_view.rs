@@ -36,37 +36,101 @@
 //!   Recorded in `docs/untested-invariants.md`.
 
 use dioxus::prelude::*;
-use harvest_common::listing::ListingId;
+use harvest_common::listing::{
+    DeliveryPrice, FixedCheckout, Listing, ListingId, MAX_INSTANT_QUANTITY,
+};
+
+use crate::messaging::{Addressing, InstantSelection, MessageContent};
 
 use crate::gateway::APP_STATE;
 use crate::state::{BuyerPurchase, PaymentBlocker};
 
 /// The form a buyer fills in to ask for a listing.
 ///
-/// Quantity and destination and nothing else. There is no price arithmetic
-/// here on purpose: a listing's price is free text in a currency of the
-/// seller's choosing (`harvest_common::listing::PriceInfo`), so any number
-/// this form computed would be a guess presented as a total. The seller names
-/// the amount when they accept, and the buyer sees THAT amount, from the
+/// For a quote-only listing: quantity, destination and a note, and no price
+/// arithmetic. A listing's price is free text in a currency of the seller's
+/// choosing (`harvest_common::listing::PriceInfo`), so any number this form
+/// computed would be a guess presented as a total. The seller names the
+/// amount when they accept, and the buyer sees THAT amount, from the
 /// published commitment, before paying.
+///
+/// For a listing with instant checkout ([`Listing::offers_instant_checkout`])
+/// the total is not a guess: it comes from the listing's fixed terms through
+/// [`Listing::instant_total`], the same function the seller's delegate uses
+/// to check it. The buyer still pays only against the published commitment,
+/// exactly as for a quote.
 #[component]
 pub fn BuyForm(
     store_contract_id: Vec<u8>,
-    listing_id: ListingId,
-    listing_title: String,
+    listing: Listing,
     seller_encryption_key: [u8; 32],
     seller_verifying_key: [u8; 32],
 ) -> Element {
     let mut quantity = use_signal(|| "1".to_string());
     let mut shipping = use_signal(String::new);
     let mut note = use_signal(String::new);
+    let mut region = use_signal(String::new);
+    let choice_count = listing.choices.len();
+    let mut picks = use_signal(move || vec![String::new(); choice_count]);
     let mut problem = use_signal(|| Option::<String>::None);
+    let mut quote_instead = use_signal(|| false);
+    // When an instant request was sent, and how many seller answers the
+    // thread already held then; `None` for a quote request or none yet.
+    let mut sent = use_signal(|| Option::<Sent>::None);
     let mut asked = use_signal(|| false);
+    // Bumped by the 30-second timer so the form re-renders when it fires.
+    let now_ms = use_signal(unix_millis);
+
+    let instant = listing.offers_instant_checkout() && !quote_instead();
+    let listing_title = listing.title.clone();
+    let by_region = match &listing.checkout {
+        Some(FixedCheckout {
+            delivery: DeliveryPrice::ByRegion(rows),
+            ..
+        }) => rows.iter().map(|row| row.region.clone()).collect(),
+        _ => Vec::<String>::new(),
+    };
 
     let parsed_quantity = quantity().trim().parse::<u32>().ok().filter(|n| *n > 0);
-    let ready = parsed_quantity.is_some() && !shipping().trim().is_empty();
+    let picked_all = picks().iter().all(|p| !p.is_empty());
+    let total = if instant {
+        parsed_quantity.and_then(|q| {
+            let region = region();
+            let region = (!region.is_empty()).then_some(region);
+            listing.instant_total(q, region.as_deref(), &picks()).ok()
+        })
+    } else {
+        None
+    };
+    let ready = parsed_quantity.is_some()
+        && !shipping().trim().is_empty()
+        && picked_all
+        && (!instant || total.is_some());
 
     if asked() {
+        if let Some(sent) = sent() {
+            let answers = seller_answers(&APP_STATE.read().conversation_thread(&store_contract_id));
+            let _ = now_ms();
+            return match instant_wait(sent.at_ms, unix_millis(), answers > sent.answers_before) {
+                InstantWait::Answered => rsx! {
+                    p { class: "text-muted",
+                        "The seller's store has answered. Their reply is under \"Your conversation\", "
+                        "and an accepted order appears under \"Your purchases\" below."
+                    }
+                },
+                InstantWait::Waiting => rsx! {
+                    p { class: "text-muted",
+                        "Your order for {listing_title} has been sent. Waiting for the seller's store "
+                        "to answer; this usually takes a few seconds."
+                    }
+                },
+                InstantWait::NotResponding => rsx! {
+                    p { class: "text-muted",
+                        "The seller's store isn't responding right now. Your request is saved and they'll see it when they're back."
+                    }
+                },
+            };
+        }
         return rsx! {
             p { class: "text-muted",
                 "Your request for {listing_title} has been handed to your Freenet node. "
@@ -81,18 +145,63 @@ pub fn BuyForm(
     rsx! {
         div { style: "margin-top: 0.75rem;",
             p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Your address is encrypted to this seller before it leaves your browser and is "
-                "not part of anything they publish. Sending this commits you to nothing: the "
-                "seller decides whether to accept, and you decide whether to pay."
+                if instant {
+                    "Your address is encrypted to this seller before it leaves your browser and is "
+                    "not part of anything they publish. Buying commits you to nothing until you pay: "
+                    "the seller's store issues the order, and you decide whether to pay it."
+                } else {
+                    "Your address is encrypted to this seller before it leaves your browser and is "
+                    "not part of anything they publish. Sending this commits you to nothing: the "
+                    "seller decides whether to accept, and you decide whether to pay."
+                }
+            }
+            if instant && !by_region.is_empty() {
+                div { class: "form-group",
+                    label { class: "form-label", "Deliver to" }
+                    select {
+                        class: "form-select",
+                        value: "{region}",
+                        onchange: move |event| region.set(event.value()),
+                        option { value: "", "Choose a region" }
+                        for name in by_region.iter() {
+                            option { key: "{name}", value: "{name}", "{name}" }
+                        }
+                    }
+                }
+            }
+            for (i, group) in listing.choices.iter().enumerate() {
+                div { key: "{group.name}", class: "form-group",
+                    label { class: "form-label", "{group.name}" }
+                    select {
+                        class: "form-select",
+                        value: "{picks()[i]}",
+                        onchange: move |event| picks.with_mut(|p| p[i] = event.value()),
+                        option { value: "", "Choose one" }
+                        for option_name in group.options.iter() {
+                            option { key: "{option_name}", value: "{option_name}", "{option_name}" }
+                        }
+                    }
+                }
             }
             div { class: "form-group",
                 label { class: "form-label", "How many" }
-                input {
-                    class: "form-input",
-                    r#type: "number",
-                    min: "1",
-                    value: "{quantity}",
-                    oninput: move |event| quantity.set(event.value()),
+                if instant {
+                    select {
+                        class: "form-select",
+                        value: "{quantity}",
+                        onchange: move |event| quantity.set(event.value()),
+                        for n in 1..=MAX_INSTANT_QUANTITY {
+                            option { key: "{n}", value: "{n}", "{n}" }
+                        }
+                    }
+                } else {
+                    input {
+                        class: "form-input",
+                        r#type: "number",
+                        min: "1",
+                        value: "{quantity}",
+                        oninput: move |event| quantity.set(event.value()),
+                    }
                 }
             }
             div { class: "form-group",
@@ -109,8 +218,13 @@ pub fn BuyForm(
                 textarea {
                     class: "form-textarea",
                     value: "{note}",
-                    placeholder: "Size, colour, delivery date...",
+                    placeholder: "Delivery date, gift message...",
                     oninput: move |event| note.set(event.value()),
+                }
+            }
+            if let Some(total) = total {
+                p { class: "listing-price",
+                    "Total: {total} sats ({super::bitcoin_view::format_sats(total)})"
                 }
             }
             if let Some(message) = problem() {
@@ -119,36 +233,183 @@ pub fn BuyForm(
             button {
                 class: "btn btn-primary",
                 disabled: !ready,
-                onclick: move |_| {
-                    let Some(quantity_wanted) = parsed_quantity else {
-                        return;
-                    };
-                    match request(
-                        &store_contract_id,
-                        &seller_encryption_key,
-                        &seller_verifying_key,
-                        &listing_id,
-                        quantity_wanted,
-                        shipping().trim().to_string(),
-                        note().trim().to_string(),
-                    ) {
-                        Ok(()) => {
-                            problem.set(None);
-                            asked.set(true);
+                onclick: {
+                    let listing = listing.clone();
+                    let store_contract_id = store_contract_id.clone();
+                    move |_| {
+                        let Some(quantity_wanted) = parsed_quantity else {
+                            return;
+                        };
+                        let picked = picks();
+                        let selection = if instant {
+                            let Some(total) = total else {
+                                return;
+                            };
+                            let region = region();
+                            Some(InstantSelection {
+                                nonce: fresh_nonce(),
+                                region: (!region.is_empty()).then_some(region),
+                                choices: picked.clone(),
+                                expected_total_sats: total,
+                            })
+                        } else {
+                            None
+                        };
+                        // A quote request carries the picks in its note: the
+                        // seller reads the note, and the request has no other
+                        // place for them.
+                        let note_text = if instant {
+                            note().trim().to_string()
+                        } else {
+                            note_with_picks(&listing, &picked, note().trim())
+                        };
+                        let answers_before = seller_answers(
+                            &APP_STATE.read().conversation_thread(&store_contract_id),
+                        );
+                        let was_instant = selection.is_some();
+                        match request(
+                            &store_contract_id,
+                            &seller_encryption_key,
+                            &seller_verifying_key,
+                            &listing.id,
+                            quantity_wanted,
+                            shipping().trim().to_string(),
+                            note_text,
+                            selection,
+                        ) {
+                            Ok(()) => {
+                                problem.set(None);
+                                if was_instant {
+                                    sent.set(Some(Sent {
+                                        at_ms: unix_millis(),
+                                        answers_before,
+                                    }));
+                                    wake_after_wait(now_ms);
+                                }
+                                asked.set(true);
+                            }
+                            Err(e) => problem.set(Some(e)),
                         }
-                        Err(e) => problem.set(Some(e)),
                     }
                 },
-                "Send this request"
+                if instant { "Buy now" } else { "Send this request" }
+            }
+            if instant {
+                p { class: "text-muted small",
+                    "Another region, or more than {MAX_INSTANT_QUANTITY}? "
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: move |_| quote_instead.set(true),
+                        "Ask the seller for a total instead"
+                    }
+                }
             }
         }
     }
 }
 
+/// An instant request that was sent: when, and how many seller answers the
+/// thread held at that moment.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Sent {
+    at_ms: u64,
+    answers_before: usize,
+}
+
+/// How long a buyer waits for the seller's store before being told it is
+/// not answering. The seller's delegate answers within seconds when their
+/// node is running, so this is long enough to cover a slow network and short
+/// enough that a buyer is not left looking at a spinner.
+const INSTANT_WAIT_MS: u64 = 30_000;
+
+/// Where an instant request stands, as the buyer is told.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InstantWait {
+    Waiting,
+    Answered,
+    /// Nothing yet after [`INSTANT_WAIT_MS`]. The request is still valid and
+    /// an answer arriving later is still shown: `Answered` wins whenever it
+    /// comes.
+    NotResponding,
+}
+
+fn instant_wait(sent_at_ms: u64, now_ms: u64, answered: bool) -> InstantWait {
+    if answered {
+        InstantWait::Answered
+    } else if now_ms.saturating_sub(sent_at_ms) >= INSTANT_WAIT_MS {
+        InstantWait::NotResponding
+    } else {
+        InstantWait::Waiting
+    }
+}
+
+/// How many answers from the seller (an accepted order or a decline) the
+/// buyer's thread with this store holds. Compared before and after a
+/// request, so it does not depend on the seller's clock.
+fn seller_answers(thread: &[crate::messaging::ConversationMessage]) -> usize {
+    thread
+        .iter()
+        .filter(|message| message.addressing == Addressing::ToBuyer)
+        .filter(|message| {
+            matches!(
+                message.content,
+                MessageContent::OrderAccepted { .. } | MessageContent::Decline { .. }
+            )
+        })
+        .count()
+}
+
+/// The buyer's note, with the choices they picked in front of it, one per
+/// line ("Flavour: Fig").
+fn note_with_picks(listing: &Listing, picks: &[String], note: &str) -> String {
+    let mut lines: Vec<String> = listing
+        .choices
+        .iter()
+        .zip(picks)
+        .map(|(group, pick)| format!("{}: {pick}", group.name))
+        .collect();
+    if !note.is_empty() {
+        lines.push(note.to_string());
+    }
+    lines.join("\n")
+}
+
+/// A fresh request nonce. Only the buyer's own resends reuse one, and this
+/// form never resends.
+fn fresh_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).expect("the browser's random source");
+    nonce
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unix_millis() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_millis() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// Re-render the form once the wait is over, so "not responding" appears
+/// without the buyer touching anything.
+#[cfg(target_arch = "wasm32")]
+fn wake_after_wait(mut now_ms: Signal<u64>) {
+    spawn(async move {
+        gloo_timers::future::TimeoutFuture::new(INSTANT_WAIT_MS as u32).await;
+        now_ms.set(unix_millis());
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wake_after_wait(_now_ms: Signal<u64>) {}
+
 /// Seal a buyer's request and hand it to the local node.
 ///
 /// Errors are returned rather than notified, so the form can say what went
 /// wrong beside the box the buyer just filled in.
+#[allow(clippy::too_many_arguments)]
 fn request(
     store_contract_id: &[u8],
     seller_encryption_key: &[u8; 32],
@@ -157,10 +418,18 @@ fn request(
     quantity: u32,
     shipping: String,
     note: String,
+    instant: Option<InstantSelection>,
 ) -> Result<(), String> {
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
+    let record_as = match &instant {
+        Some(selection) => format!(
+            "Asked to buy {quantity} with instant checkout, {} sats.",
+            selection.expected_total_sats
+        ),
+        None => format!("Asked to buy {quantity}."),
+    };
     let sealed = APP_STATE.write().request_order(
         store_contract_id,
         seller_encryption_key,
@@ -168,14 +437,10 @@ fn request(
         quantity,
         shipping,
         note,
+        instant,
     )?;
 
-    super::message_view::deliver_to_seller(
-        store_contract_id,
-        seller,
-        format!("Asked to buy {quantity}."),
-        sealed,
-    )
+    super::message_view::deliver_to_seller(store_contract_id, seller, record_as, sealed)
 }
 
 /// What this buyer has been accepted for at one store, and whether each is
@@ -792,8 +1057,16 @@ pub fn AcceptRequest(
     order_binding: [u8; 32],
     buyer_receipt_key: Option<[u8; 32]>,
     quantity: u32,
+    /// Set for an instant-checkout request: the amount starts at the total
+    /// the buyer was shown, and the order carries the request id.
+    #[props(default)]
+    instant: Option<super::message_view::InstantAnswer>,
 ) -> Element {
-    let mut amount = use_signal(String::new);
+    let mut amount = use_signal(|| {
+        instant
+            .map(|i| i.total_sats.to_string())
+            .unwrap_or_default()
+    });
     let mut confirmations = use_signal(|| "1".to_string());
     let mut problem = use_signal(|| Option::<String>::None);
     let mut accepted = use_signal(|| false);
@@ -882,6 +1155,7 @@ pub fn AcceptRequest(
                         BuyerValues {
                             order_binding,
                             buyer_receipt_key,
+                            request_id: instant.map(|i| i.request_id),
                         },
                         amount_sats,
                         required_confirmations,
@@ -939,6 +1213,7 @@ fn accept(
         // Likewise the buyer's receipt key (harvest#53 Phase B): without it
         // the buyer can neither cancel nor complain, and will not pay.
         buyer_receipt_key: buyer.buyer_receipt_key,
+        request_id: buyer.request_id,
     })
 }
 
@@ -948,6 +1223,8 @@ fn accept(
 struct BuyerValues {
     order_binding: [u8; 32],
     buyer_receipt_key: Option<[u8; 32]>,
+    /// The instant-checkout request this answers, if it was one.
+    request_id: Option<[u8; 32]>,
 }
 
 /// What a buyer can actually DO about one blocker.
@@ -1029,5 +1306,99 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         | PaymentBlocker::CommitmentNotRequested
         | PaymentBlocker::NotAwaitingPayment(_)
         | PaymentBlocker::AnchorOffChain => Remedy::WalkAway,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Waiting until the limit, "not responding" after it, and an answer
+    /// shown whenever it comes, including after the limit.
+    #[test]
+    fn an_instant_request_waits_thirty_seconds_and_an_answer_always_wins() {
+        let sent = 1_000_000;
+        assert_eq!(instant_wait(sent, sent, false), InstantWait::Waiting);
+        assert_eq!(
+            instant_wait(sent, sent + INSTANT_WAIT_MS - 1, false),
+            InstantWait::Waiting
+        );
+        assert_eq!(
+            instant_wait(sent, sent + INSTANT_WAIT_MS, false),
+            InstantWait::NotResponding
+        );
+        assert_eq!(instant_wait(sent, sent + 5, true), InstantWait::Answered);
+        assert_eq!(
+            instant_wait(sent, sent + 10 * INSTANT_WAIT_MS, true),
+            InstantWait::Answered
+        );
+        // A clock that went backwards is still waiting, not a panic.
+        assert_eq!(instant_wait(sent, sent - 1, false), InstantWait::Waiting);
+    }
+
+    fn message(
+        addressing: Addressing,
+        content: MessageContent,
+    ) -> crate::messaging::ConversationMessage {
+        crate::messaging::ConversationMessage {
+            addressing,
+            timestamp: chrono::Utc::now(),
+            nonce: [0u8; 24],
+            digest: [0u8; 32],
+            content,
+        }
+    }
+
+    /// Only an acceptance or a decline addressed to the buyer is an answer:
+    /// the buyer's own messages, and plain text from the seller, are not.
+    #[test]
+    fn only_the_sellers_acceptance_or_decline_counts_as_an_answer() {
+        let accepted = MessageContent::OrderAccepted {
+            order_id: harvest_common::payment::OrderId([1u8; 32]),
+        };
+        let thread = vec![
+            message(Addressing::ToBuyer, accepted.clone()),
+            message(
+                Addressing::ToBuyer,
+                MessageContent::Decline {
+                    reason: "Sold out".into(),
+                },
+            ),
+            message(Addressing::ToBuyer, MessageContent::Text("Hello".into())),
+            message(Addressing::ToSeller, accepted),
+        ];
+        assert_eq!(seller_answers(&thread), 2);
+    }
+
+    #[test]
+    fn a_quote_request_carries_the_picks_in_its_note() {
+        let listing = Listing {
+            id: ListingId([0u8; 32]),
+            title: "Jam".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            checkout: None,
+            choices: vec![
+                harvest_common::listing::ChoiceGroup {
+                    name: "Flavour".into(),
+                    options: vec!["Fig".into(), "Plum".into()],
+                },
+                harvest_common::listing::ChoiceGroup {
+                    name: "Size".into(),
+                    options: vec!["Small".into()],
+                },
+            ],
+        };
+        let picks = vec!["Fig".to_string(), "Small".to_string()];
+        assert_eq!(
+            note_with_picks(&listing, &picks, "By Friday"),
+            "Flavour: Fig\nSize: Small\nBy Friday"
+        );
+        assert_eq!(
+            note_with_picks(&listing, &picks, ""),
+            "Flavour: Fig\nSize: Small"
+        );
     }
 }

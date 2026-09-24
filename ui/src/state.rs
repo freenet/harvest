@@ -715,6 +715,9 @@ pub struct AppState {
     /// Bitcoin/Payments state: bridge config, private watch list, and live
     /// on-chain data mirrored from subscribed Bitcoin contracts.
     pub bitcoin: BitcoinState,
+
+    /// Instant checkout, the seller's side (`crate::auto_invoice_flow`).
+    pub auto_invoice: crate::auto_invoice_flow::AutoInvoiceUi,
 }
 
 /// Details for a store being created, waiting on the two delegate responses
@@ -1553,6 +1556,11 @@ pub struct PendingInvoice {
     /// `order_binding`: `None` for an unprompted invoice, which no buyer will
     /// pay through the buy flow ([`PaymentBlocker::CommitmentLacksBuyerKey`]).
     pub buyer_receipt_key: Option<[u8; 32]>,
+    /// The instant-checkout request this answers
+    /// ([`harvest_common::payment::Order::request_id`]), when the seller
+    /// answers one by hand. It makes this order and any the seller's
+    /// delegate issued for the same request one order in the store.
+    pub request_id: Option<[u8; 32]>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -1691,7 +1699,7 @@ pub fn order_for_invoice(
          data to load and issue it again.",
     )?;
     Ok(Order {
-        request_id: None,
+        request_id: pending.request_id,
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
@@ -4732,6 +4740,7 @@ impl AppState {
     ///
     /// Returns the sealed message for the caller to dispatch; the dispatch
     /// needs a browser and this does not.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_order(
         &mut self,
         store_contract_id: &[u8],
@@ -4740,6 +4749,7 @@ impl AppState {
         quantity: u32,
         shipping: String,
         note: String,
+        instant: Option<crate::messaging::InstantSelection>,
     ) -> Result<harvest_common::mailbox::EncryptedMessage, String> {
         // Refused before anything is opened or sealed, so a rejected request
         // leaves no conversation behind for the delegate to keep and no
@@ -4757,7 +4767,7 @@ impl AppState {
         }
         let sealed = self
             .conversation_with(store_contract_id, seller_encryption_key)?
-            .request_order(listing_id, quantity, shipping, note)?;
+            .request_order(listing_id, quantity, shipping, note, instant)?;
         self.keep_this_conversation(store_contract_id, seller_encryption_key);
         Ok(sealed)
     }
@@ -10477,6 +10487,11 @@ impl AppState {
                 self.on_keep_refused(&order_id, reason)
             }
 
+            HarvestDelegateResponse::AutoInvoice {
+                store_contract_id,
+                result,
+            } => self.on_auto_invoice_status(store_contract_id, result),
+
             // A conversation the delegate did not keep dies with the tab, and
             // the buyer has already been told their message was sent -- so
             // this is said out loud rather than logged. After orders exist it
@@ -11547,6 +11562,11 @@ impl AppState {
                 self.bitcoin.payment_xpub_loaded = true;
             }
 
+            BitcoinDelegateResponse::UpcomingAddresses { result, .. } => {
+                self.on_upcoming_addresses(result, now_ms());
+                self.send_due_watch_requests();
+            }
+
             BitcoinDelegateResponse::OrderAddress {
                 request_id,
                 result,
@@ -12212,6 +12232,28 @@ impl AppState {
             }
             *wanted = kept;
             wanted.truncate(WATCHES_PER_GHOSTKEY);
+        }
+        // Instant checkout's next addresses, watched before any order names
+        // them (`crate::auto_invoice_flow`). After the truncation, so they
+        // never push out an order that is waiting for payment; the cap has
+        // room for them.
+        if let Some((fingerprint, ghostkey, prewatch)) = self.prewatch_wanted(bridge) {
+            match groups
+                .iter_mut()
+                .find(|(f, g, _): &&mut (String, _, Vec<_>)| *f == fingerprint && *g == ghostkey)
+            {
+                Some((_, _, wanted)) => {
+                    for w in prewatch {
+                        if !wanted
+                            .iter()
+                            .any(|held| held.network == w.network && held.script == w.script)
+                        {
+                            wanted.push(w);
+                        }
+                    }
+                }
+                None => groups.push((fingerprint, ghostkey, prewatch)),
+            }
         }
         groups
     }
@@ -15806,6 +15848,7 @@ mod invoice_tests {
 
     fn invoice() -> PendingInvoice {
         PendingInvoice {
+            request_id: None,
             store_contract_id: STORE_ID.to_vec(),
             seller_fingerprint: SELLER.to_string(),
             listing_id: listing_id(),
@@ -20583,6 +20626,7 @@ mod buy_flow_tests {
                 2,
                 "12 Example St".into(),
                 String::new(),
+                None,
             )
             .expect("seal the request");
 
@@ -20599,6 +20643,7 @@ mod buy_flow_tests {
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
         PendingInvoice {
+            request_id: None,
             store_contract_id: STORE.to_vec(),
             seller_fingerprint: "seller-fp".to_string(),
             listing_id: ListingId([3u8; 32]),
@@ -20791,6 +20836,7 @@ mod buy_flow_tests {
                 2,
                 "12 Example St".to_string(),
                 String::new(),
+                None,
             )
             .expect("a request should be sealable");
 
@@ -20859,6 +20905,7 @@ mod buy_flow_tests {
                 1,
                 "12 Example St".to_string(),
                 String::new(),
+                None,
             )
             .expect("request");
 
@@ -20887,6 +20934,7 @@ mod buy_flow_tests {
             0,
             "12 Example St".to_string(),
             String::new(),
+            None,
         );
         assert!(none.is_err(), "a quantity of zero is not an order");
 
@@ -20897,6 +20945,7 @@ mod buy_flow_tests {
             1,
             "   ".to_string(),
             String::new(),
+            None,
         );
         assert!(nowhere.is_err(), "an order has to go somewhere");
 
@@ -23900,7 +23949,7 @@ mod buy_flow_tests {
         // listing than the one the seller committed to.
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&asked_for, 1, "12 Example St".into(), String::new())
+            .request_order(&asked_for, 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23931,7 +23980,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23960,7 +24009,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -23988,7 +24037,7 @@ mod buy_flow_tests {
         let (mut state, _) = buyer_after_acceptance(&published);
         let conversation = state.browsing_stores[STORE].conversations[0].clone();
         let request = conversation
-            .request_order(&widget(), 1, "12 Example St".into(), String::new())
+            .request_order(&widget(), 1, "12 Example St".into(), String::new(), None)
             .expect("seal the request");
         state
             .browsing_stores
@@ -29182,6 +29231,199 @@ mod buy_flow_tests {
         let (state, _) = buyer_after_acceptance(&unpaid);
         let purchase = purchases(&state).remove(0);
         assert!(state.complaint_refusal(STORE, &purchase).is_some());
+    }
+
+    // --- Instant checkout, the seller's side (`crate::auto_invoice_flow`) ---
+
+    /// A seller selling one instant-checkout listing, with a payment key,
+    /// the delegate's next three addresses known, the tip contract and the
+    /// address generation resolved.
+    fn an_instant_seller(gk: &freenet_bitcoin_inbox::test_support::TestGhostkey) -> AppState {
+        let mut state = a_seller_selling(Vec::new(), gk.id().0);
+        // Instant checkout watches through the bridge its orders will name,
+        // which is the production one; the inbox is still the test one.
+        let bridge =
+            crate::gateway::bitcoin_config::default_trusted_bridges(BitcoinNetwork::Signet)
+                .expect("signet settles")[0];
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            inbox::inbox_key(),
+        ));
+        let listing = harvest_common::listing::Listing {
+            id: harvest_common::listing::ListingId([0; 32]),
+            title: "Jam".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout: Some(harvest_common::listing::FixedCheckout {
+                unit_sats: 1_000,
+                delivery: harvest_common::listing::DeliveryPrice::Included,
+            }),
+            choices: Vec::new(),
+        }
+        .with_derived_id();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .listings
+            .push(AuthorizedListing {
+                listing,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            });
+        state.bitcoin.payment_xpub = Some(harvest_common::PaymentXpubStatus {
+            xpub: "vpub-placeholder".into(),
+            network: BitcoinNetwork::Signet,
+            next_index: 4,
+        });
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([0xc2; 32]);
+        state
+            .bitcoin
+            .tip_contract_network
+            .insert(vec![0x7a; 32], BitcoinNetwork::Signet);
+        state.on_upcoming_addresses(
+            Ok((4..7)
+                .map(|i| harvest_common::DerivedAddress {
+                    index: i,
+                    network: BitcoinNetwork::Signet,
+                    script_pubkey: vec![0x00, 0x14, i as u8],
+                    address: format!("tb1q{i}"),
+                })
+                .collect()),
+            1,
+        );
+        state
+    }
+
+    /// The delegate's next addresses are asked to be watched with the
+    /// seller's Ghost Key, before any order names them. Mutated red by
+    /// dropping the `prewatch_wanted` merge from `watches_wanted`.
+    #[test]
+    fn a_seller_with_instant_checkout_has_the_next_addresses_watched() {
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        serve_inbox(&mut state, &inbox::open_inbox());
+        let queued = queued_watch_requests(&state);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].scripts,
+            (4..7u8).map(|i| vec![0x00, 0x14, i]).collect::<Vec<_>>()
+        );
+    }
+
+    /// The arm names only addresses the bridge has READ a request for, in
+    /// order from the next one, and the watch lapses a day after the earliest
+    /// of those requests, less the margin. Mutated red by dropping the
+    /// `filter(|s| s.read)`.
+    #[test]
+    fn an_arm_names_only_watched_addresses() {
+        use crate::auto_invoice_flow::{WATCH_LIFETIME_MS, WATCH_MARGIN_MS};
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let registration = state.my_stores["seller-fp"][0].clone();
+        // Nothing sent yet: an arm, but with nothing it may use.
+        let arm = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert!(arm.watched_scripts.is_empty());
+        assert_eq!(arm.watched_until_ms, 0);
+
+        let key = |i: u8| (BitcoinNetwork::Signet, vec![0x00, 0x14, i]);
+        let sent = |at: u64, read: bool| crate::bitcoin_inbox::SentWatch {
+            sent_at_ms: at,
+            entry_key: Default::default(),
+            mainnet_height: 0,
+            ghostkey: gk.id(),
+            read,
+            unread_since_ms: at,
+        };
+        let inbox = state.bitcoin.inbox.as_mut().unwrap();
+        inbox.sent.insert(key(4), sent(1_000, true));
+        inbox.sent.insert(key(5), sent(500, true));
+        inbox.sent.insert(key(6), sent(2_000, false));
+        let arm = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert_eq!(
+            arm.watched_scripts,
+            vec![vec![0x00, 0x14, 4], vec![0x00, 0x14, 5]]
+        );
+        assert_eq!(
+            arm.watched_until_ms,
+            500 + WATCH_LIFETIME_MS - WATCH_MARGIN_MS
+        );
+        assert_eq!(arm.tip_contract_id, [0x7a; 32]);
+        assert_eq!(arm.mailbox_contract_id, [11; 32]);
+
+        // Once the watch has lapsed, nothing may be used.
+        let late = 500 + WATCH_LIFETIME_MS;
+        let arm = state
+            .auto_invoice_arm("seller-fp", &registration, late)
+            .expect("an arm");
+        assert!(arm.watched_scripts.is_empty());
+    }
+
+    /// An arm is sent once, then again only when it changes or is old; the
+    /// addresses are read again when this tab's counter passes them.
+    #[test]
+    fn arms_are_resent_only_when_due() {
+        use crate::auto_invoice_flow::REARM_EVERY_MS;
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let first = state.queue_auto_invoice(10);
+        assert_eq!(first.arms.len(), 1);
+        assert!(!first.peek, "the addresses are current");
+        assert!(state.queue_auto_invoice(20).arms.is_empty());
+        // An unchanged arm goes again once it is old (and the addresses are
+        // read again then too).
+        let again = state.queue_auto_invoice(10 + REARM_EVERY_MS);
+        assert_eq!(again.arms.len(), 1);
+        assert!(again.peek);
+
+        // This tab spent an address: no arm names it until the addresses
+        // are read again, and they are.
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 5;
+        let t = 10 + 2 * REARM_EVERY_MS;
+        let spent = state.queue_auto_invoice(t);
+        assert!(spent.peek);
+        assert!(spent.arms.is_empty());
+        assert!(
+            !state.queue_auto_invoice(t + 1).peek,
+            "not again while asked"
+        );
+    }
+
+    /// What the store page says. A delegate that never ran in the background
+    /// long after arming is the hosted case, and is said plainly.
+    #[test]
+    fn the_store_page_says_how_instant_checkout_stands() {
+        use crate::auto_invoice_flow::{instant_checkout_status_text, NO_BACKGROUND_RUN_AFTER_MS};
+        let status = |last_run, paused: Option<&str>| harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 7,
+            watched_until_ms: 5 * 60 * 60 * 1000,
+            last_background_run_ms: last_run,
+            issued_last_day: 0,
+            paused: paused.map(str::to_string),
+        };
+        let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
+        assert!(hosted.contains("try.freenet.org"), "{hosted}");
+        let early = instant_checkout_status_text(&status(None, None), 1);
+        assert!(early.contains("is on"), "{early}");
+        let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
+        assert!(paused.contains("paused: no recent block"), "{paused}");
+
+        let gk = inbox::authority().mint();
+        let state = an_instant_seller(&gk);
+        assert!(state
+            .instant_checkout_notice(STORE, 1)
+            .unwrap()
+            .contains("starting"));
+        assert!(state.instant_checkout_notice(&[0xee; 32], 1).is_none());
     }
 }
 

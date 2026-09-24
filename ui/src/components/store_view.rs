@@ -566,6 +566,9 @@ fn ListingCard(
                 if let Some(ref price) = l.price {
                     span { class: "listing-price", "{price.amount} {price.currency}" }
                 }
+                if let Some(checkout) = l.checkout.as_ref().filter(|_| l.offers_instant_checkout()) {
+                    span { class: "listing-price", "{checkout.unit_sats} sats, instant checkout" }
+                }
                 if let Some(ref stock) = stock {
                     span { class: "listing-stock", "{stock}" }
                 }
@@ -579,8 +582,7 @@ fn ListingCard(
             match buyable {
                 Some(buyable) => rsx! {
                     BuyControl {
-                        listing_id: l.id.clone(),
-                        listing_title: l.title.clone(),
+                        listing: l.clone(),
                         buyable: buyable,
                     }
                 },
@@ -600,11 +602,7 @@ fn ListingCard(
 /// under every listing would turn a page of things to look at into a page of
 /// things to fill in.
 #[component]
-fn BuyControl(
-    listing_id: harvest_common::listing::ListingId,
-    listing_title: String,
-    buyable: Buyable,
-) -> Element {
+fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> Element {
     let mut open = use_signal(|| false);
 
     rsx! {
@@ -617,8 +615,7 @@ fn BuyControl(
             if open() {
                 super::buy_view::BuyForm {
                     store_contract_id: buyable.store_contract_id.clone(),
-                    listing_id: listing_id.clone(),
-                    listing_title: listing_title.clone(),
+                    listing: listing.clone(),
                     seller_encryption_key: buyable.seller_encryption_key,
                     seller_verifying_key: buyable.seller_verifying_key,
                 }

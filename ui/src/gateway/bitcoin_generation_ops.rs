@@ -96,6 +96,15 @@ pub fn start() {
                 if could_act {
                     APP_STATE.write().send_due_watch_requests();
                 }
+                // Instant checkout: the next addresses and the arms. Cheap to
+                // ask about; takes the state for writing only when it sends.
+                let auto_invoice_due = {
+                    use dioxus::prelude::ReadableExt;
+                    APP_STATE.peek().auto_invoice_due(crate::state::now_ms())
+                };
+                if auto_invoice_due {
+                    APP_STATE.write().send_due_auto_invoice();
+                }
                 // The kept purchases, asked again until the delegate answers
                 // (review round 2 of #143, P3): the payment details wait on
                 // that list, so a lost answer would hide them all session.

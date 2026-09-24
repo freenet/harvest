@@ -41,6 +41,30 @@ pub async fn send_delegate_message(
     }
 }
 
+/// Arm the Harvest delegate to answer instant-checkout requests for one store
+/// (`crate::auto_invoice_flow`).
+pub async fn arm_auto_invoice(arm: harvest_common::delegate::AutoInvoiceArm) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let delegate_key = super::APP_STATE
+            .read()
+            .harvest_delegate_key
+            .clone()
+            .ok_or("harvest delegate not yet registered")?;
+        let payload =
+            harvest_common::to_cbor(&harvest_common::HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(arm),
+            })
+            .map_err(|e| format!("serialize ArmAutoInvoice: {e}"))?;
+        send_delegate_message(&delegate_key, payload).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = arm;
+        Err("delegate messaging requires WASM".into())
+    }
+}
+
 /// GET a contract's state, optionally subscribing to updates.
 pub async fn get_contract(
     contract_key: &ContractInstanceId,

@@ -42,7 +42,8 @@ pub mod store_ops;
 
 pub use connection::{connect, ConnectionStatus};
 pub use delegate_api::{
-    get_contract, get_contract_by_id, put_contract, register_delegate, send_delegate_message,
+    arm_auto_invoice, get_contract, get_contract_by_id, put_contract, register_delegate,
+    send_delegate_message,
 };
 pub use prime::update_contract;
 

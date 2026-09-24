@@ -236,6 +236,26 @@ pub async fn derive_order_address(_request_id: u64) -> Result<(), String> {
     Err("bitcoin operations require WASM".into())
 }
 
+/// Ask for the delegate's next payment addresses without spending them, for
+/// instant checkout to have watched ahead of use (`crate::auto_invoice_flow`).
+#[cfg(target_arch = "wasm32")]
+pub async fn peek_order_addresses() -> Result<(), String> {
+    let (delegate_key, request_id) = {
+        let mut state = APP_STATE.write();
+        let key = state
+            .harvest_delegate_key
+            .clone()
+            .ok_or("harvest delegate not yet registered")?;
+        (key, state.bitcoin.next_request_id())
+    };
+    let payload = to_cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
+        request_id,
+        count: harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
+    })
+    .map_err(|e| format!("serialize PeekOrderAddresses: {e}"))?;
+    super::send_delegate_message(&delegate_key, payload).await
+}
+
 /// GET-and-subscribe a Bitcoin contract (tip or address) by its raw 32-byte
 /// instance id. Realtime updates then arrive as `UpdateNotification`s routed
 /// through the normal response handler, exactly like any other contract.

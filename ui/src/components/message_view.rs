@@ -925,6 +925,7 @@ fn Conversation(
                         order_binding: request.order_binding,
                         buyer_receipt_key: request.buyer_receipt_key,
                         quantity: request.quantity,
+                        instant: request.instant,
                     }
                 }
             }
@@ -1060,10 +1061,12 @@ fn unanswered_requests(
                     quantity,
                     order_binding,
                     buyer_receipt_key,
+                    instant,
                     ..
                 },
             digest,
             timestamp,
+            conversation,
             ..
         } = entry
         else {
@@ -1153,6 +1156,13 @@ fn unanswered_requests(
             order_binding: *order_binding,
             buyer_receipt_key: *buyer_receipt_key,
             digest: *digest,
+            instant: instant.as_ref().and_then(|selection| {
+                let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                Some(InstantAnswer {
+                    request_id: harvest_common::payment::request_id(&tag, &selection.nonce),
+                    total_sats: selection.expected_total_sats,
+                })
+            }),
         });
     }
     // An unkeyed request with a keyed twin (same listing, quantity and
@@ -1205,6 +1215,18 @@ struct PendingRequest {
     /// Used to order the controls deterministically without consulting a
     /// timestamp the sender chose, and to key the rendered list.
     digest: [u8; 32],
+    /// Set when the buyer sent this with instant checkout.
+    instant: Option<InstantAnswer>,
+}
+
+/// What a seller answering an instant-checkout request by hand carries over
+/// from it: the request id, so their order and any the delegate issued for
+/// the same request are one order in the store (`Order::request_id`), and the
+/// total the buyer was shown, to start the amount from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InstantAnswer {
+    pub request_id: [u8; 32],
+    pub total_sats: u64,
 }
 
 /// Enough of a conversation tag to tell two apart on screen, and no more --
@@ -1302,9 +1324,25 @@ fn describe(content: &MessageContent) -> String {
             quantity,
             shipping,
             note,
+            instant,
             ..
         } => {
             let mut described = format!("Wants to buy {quantity}.\n\nShip to:\n{shipping}");
+            // The buyer's instant-checkout picks, so a seller answering the
+            // request by hand invoices the same terms their store would have.
+            if let Some(selection) = instant {
+                described.push('\n');
+                if let Some(region) = &selection.region {
+                    described.push_str(&format!("\nDelivery region: {region}"));
+                }
+                if !selection.choices.is_empty() {
+                    described.push_str(&format!("\nChoices: {}", selection.choices.join(", ")));
+                }
+                described.push_str(&format!(
+                    "\nInstant checkout total: {} sats",
+                    selection.expected_total_sats
+                ));
+            }
             if !note.trim().is_empty() {
                 described.push_str(&format!("\n\n{note}"));
             }
@@ -1896,5 +1934,36 @@ mod inbox_tests {
         let found =
             unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[], Some(&keys()));
         assert_eq!(found.len(), 1);
+    }
+
+    /// A seller reading an instant request sees the region, the picks and the
+    /// total the buyer was shown; a quote request shows none of them.
+    #[test]
+    fn an_instant_request_shows_its_terms_to_the_seller() {
+        let request = |instant| MessageContent::OrderRequest {
+            instant,
+            listing_id: ListingId([9u8; 32]),
+            quantity: 2,
+            shipping: "12 Example St".into(),
+            note: "Thanks".into(),
+            order_binding: BINDING,
+            buyer_receipt_key: None,
+        };
+        let shown = describe(&request(Some(crate::messaging::InstantSelection {
+            nonce: [1u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Fig".into(), "Large".into()],
+            expected_total_sats: 25_000,
+        })));
+        assert!(shown.contains("Delivery region: EU"), "{shown}");
+        assert!(shown.contains("Choices: Fig, Large"), "{shown}");
+        assert!(
+            shown.contains("Instant checkout total: 25000 sats"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("Thanks"), "{shown}");
+
+        let quote = describe(&request(None));
+        assert!(!quote.contains("Instant checkout"), "{quote}");
     }
 }
