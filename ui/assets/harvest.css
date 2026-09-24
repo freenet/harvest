@@ -187,8 +187,11 @@ body::before {
   margin-top: var(--space-md);
 }
 
-/* 3. Buttons and link-buttons side by side on one line. */
+/* 3. Buttons and link-buttons side by side on one line. The top margin
+      changes nothing while they share a line, and keeps them apart if a
+      narrow screen wraps the second onto the next. */
 :where(.btn, .link-btn) + :where(.btn, .link-btn) {
+  margin-top: var(--space-sm);
   margin-left: var(--space-sm);
 }
 

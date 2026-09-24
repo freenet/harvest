@@ -30,10 +30,12 @@ mod css_spacing_tests {
         let mut rest = css;
         while let Some(start) = rest.find("/*") {
             out.push_str(&rest[..start]);
-            rest = match rest[start + 2..].find("*/") {
-                Some(end) => &rest[start + 2 + end + 2..],
-                None => "",
-            };
+            // An unterminated comment would silently drop the rest of the
+            // file, and every container in it, from the check.
+            let end = rest[start + 2..]
+                .find("*/")
+                .expect("unterminated /* comment in harvest.css");
+            rest = &rest[start + 2 + end + 2..];
         }
         out.push_str(rest);
         out
@@ -114,11 +116,14 @@ mod css_spacing_tests {
         let mut missing = Vec::new();
         for (prelude, body) in &rules {
             let is_container = body.split(';').any(|decl| {
-                let decl = normalise(decl);
-                decl.starts_with("display:")
-                    && ["flex", "grid", "inline-flex", "inline-grid"]
-                        .iter()
-                        .any(|v| decl == format!("display: {v}"))
+                // `display:flex`, `display : flex !important` and the like
+                // all count.
+                let Some((property, value)) = decl.split_once(':') else {
+                    return false;
+                };
+                let value = value.replace("!important", "");
+                property.trim() == "display"
+                    && ["flex", "grid", "inline-flex", "inline-grid"].contains(&value.trim())
             });
             if !is_container {
                 continue;
@@ -132,6 +137,57 @@ mod css_spacing_tests {
         assert!(
             missing.is_empty(),
             "flex/grid containers not in harvest.css's sibling-margin opt-out: {missing:?}"
+        );
+    }
+
+    /// A container made flex or grid by an inline `style:` in the markup is
+    /// invisible to the check above, and its children would get the sibling
+    /// margins on top of its gap. Use a class (`form-actions`, `row-between`,
+    /// ...) instead.
+    #[test]
+    fn no_markup_makes_a_flex_or_grid_container_inline() {
+        // Every component file, read at test time so a new one is covered.
+        // This file is skipped: its own needles would match.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/components");
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("components dir") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.ends_with(".rs") && name != "mod.rs" {
+                sources.push((
+                    name,
+                    std::fs::read_to_string(&path).expect("read component"),
+                ));
+            }
+        }
+        assert!(
+            sources.len() >= 10,
+            "found only {} component files",
+            sources.len()
+        );
+        let mut offending = Vec::new();
+        for (file, source) in &sources {
+            for (n, line) in source.lines().enumerate() {
+                let Some(at) = line.find("style:") else {
+                    continue;
+                };
+                let compact: String = line[at..].chars().filter(|c| !c.is_whitespace()).collect();
+                if [
+                    "display:flex",
+                    "display:grid",
+                    "display:inline-flex",
+                    "display:inline-grid",
+                ]
+                .iter()
+                .any(|d| compact.contains(d))
+                {
+                    offending.push(format!("{file}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "inline flex/grid containers (give them a class in harvest.css instead): {offending:?}"
         );
     }
 

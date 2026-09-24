@@ -1397,7 +1397,7 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
                 "just proves you've supported the network -- a bridge learns nothing else "
                 "about you. No bridge is asked anything today; see the note above the form."
             }
-            div { style: "margin-top: 12px; display: flex; gap: 8px; align-items: center;",
+            div { class: "form-actions",
                 button {
                     class: "btn btn-primary",
                     onclick: move |_| super::my_store::connect_ghostkey(),
