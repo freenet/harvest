@@ -134,7 +134,7 @@ fn StoreList() -> Element {
                 p { class: "text-muted text-italic", "Stores you open are listed here." }
             }
             for row in rows {
-                div { class: "store-share-row", key: "{row.code}",
+                div { class: "form-actions", key: "{row.code}",
                     button {
                         class: "btn btn-sm btn-outline",
                         onclick: {
