@@ -189,9 +189,15 @@ body::before {
 .harvest-nav {
   display: flex;
   gap: var(--space-lg);
-  border-bottom: 1px solid var(--border);
+  /* The rule is an inset shadow, not a border, so the active tab's
+     underline can sit on it without overflowing the box. With a border
+     the tab needed `margin-bottom: -1px`, which made the content 1px
+     taller than the bar; `overflow-x: auto` turns overflow-y to auto as
+     well, so browsers drew a tiny vertical scrollbar at the right. */
+  box-shadow: inset 0 -1px 0 var(--border);
   margin-bottom: var(--space-xl);
   overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .harvest-status {
@@ -212,7 +218,6 @@ body::before {
   font-size: 0.95rem;
   font-weight: 500;
   padding: 0.5rem 0 0.6rem;
-  margin-bottom: -1px;
   cursor: pointer;
   border: none;
   border-bottom: 2px solid transparent;
@@ -1050,9 +1055,11 @@ h4 {
 .tabs {
   display: flex;
   gap: var(--space-lg);
-  border-bottom: 1px solid var(--border);
+  /* Same as .harvest-nav: a shadow rule, so no vertical scrollbar. */
+  box-shadow: inset 0 -1px 0 var(--border);
   margin-bottom: var(--space-lg);
   overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .tab {
