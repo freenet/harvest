@@ -789,7 +789,6 @@ mod tests {
         AuthorizedOrder {
             order: Order {
                 request_id: None,
-                derivation: None,
                 id: OrderId([0u8; 32]),
                 buyer_fingerprint: "buyer".to_string(),
                 seller_fingerprint: seller.to_string(),
@@ -884,6 +883,8 @@ mod issuable_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([n; 32]),
                 title: format!("Item {n}"),
                 description: String::new(),

@@ -1167,7 +1167,6 @@ mod tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer-fp".to_string(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -1249,7 +1248,6 @@ mod tests {
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),

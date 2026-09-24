@@ -583,29 +583,7 @@ pub struct Order {
     /// every earlier id still verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<[u8; 32]>,
-    /// Where this order's payment address came from in the seller's wallet:
-    /// which account key and which index on its receive chain.
-    ///
-    /// Public so any device holding the same payment key can move its
-    /// address counter past every index a published order already names,
-    /// exactly, instead of scanning scripts (harvest#77). The address itself
-    /// is public anyway; the index says only how many addresses the seller
-    /// has handed out, which the order count already shows.
-    ///
-    /// Skipped when absent, for the signature reason above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derivation: Option<AddressDerivation>,
     pub created_at: DateTime<Utc>,
-}
-
-/// Which wallet key and index an order's payment address was derived from.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub struct AddressDerivation {
-    /// The account key's BIP-32 fingerprint: the first four bytes of
-    /// HASH160 of its public key.
-    pub account: [u8; 4],
-    /// The index on the account's receive chain (`m/0/index` below it).
-    pub index: u32,
 }
 
 /// The request id of one buyer request: see [`Order::request_id`].
@@ -2358,7 +2336,6 @@ mod lightning_tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".into(),
             seller_fingerprint: "seller".into(),
@@ -2643,7 +2620,6 @@ mod order_identity_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2788,7 +2764,6 @@ mod order_identity_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2897,7 +2872,6 @@ mod address_instance_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),
@@ -2993,7 +2967,6 @@ mod proof_assembly_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: "seller-fp".to_string(),

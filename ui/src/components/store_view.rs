@@ -854,6 +854,8 @@ mod availability_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                checkout: None,
+                choices: Vec::new(),
                 id: ListingId([n; 32]),
                 title: format!("Item {n}"),
                 description: String::new(),

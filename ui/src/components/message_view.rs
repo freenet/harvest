@@ -1423,6 +1423,7 @@ mod inbox_tests {
     fn request(listing_id: ListingId, quantity: u32, digest: [u8; 32]) -> MailboxEntry {
         readable(
             MessageContent::OrderRequest {
+                instant: None,
                 listing_id,
                 quantity,
                 shipping: "12 Example St".into(),
@@ -1446,7 +1447,6 @@ mod inbox_tests {
         harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
                 request_id: None,
-                derivation: None,
                 id: harvest_common::payment::OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "seller-fp".to_string(),
@@ -1639,6 +1639,7 @@ mod inbox_tests {
         let keyed = |digest: [u8; 32]| {
             readable(
                 MessageContent::OrderRequest {
+                    instant: None,
                     listing_id: id.clone(),
                     quantity: 1,
                     shipping: "12 Example St".into(),
@@ -1710,6 +1711,7 @@ mod inbox_tests {
         let ask = |quantity: u32, digest: u8, when: i64| {
             let mut entry = readable(
                 MessageContent::OrderRequest {
+                    instant: None,
                     listing_id: id.clone(),
                     quantity,
                     shipping: "12 Example St".into(),

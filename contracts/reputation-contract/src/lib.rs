@@ -361,7 +361,6 @@ mod tests {
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([n; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: String::new(),

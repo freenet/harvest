@@ -260,7 +260,6 @@ mod tests {
         let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer-fp".into(),
             seller_fingerprint: "seller-fp".into(),

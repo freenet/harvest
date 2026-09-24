@@ -2332,7 +2332,6 @@ fn dummy_complaint() -> Complaint {
         order: AuthorizedOrder {
             order: Order {
                 request_id: None,
-                derivation: None,
                 id: OrderId([4u8; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: String::new(),

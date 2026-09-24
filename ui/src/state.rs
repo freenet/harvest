@@ -1692,7 +1692,6 @@ pub fn order_for_invoice(
     )?;
     Ok(Order {
         request_id: None,
-        derivation: None,
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
@@ -16086,7 +16085,6 @@ mod invoice_tests {
     fn with_script(script: &[u8]) -> harvest_common::payment::AuthorizedOrder {
         let order = harvest_common::payment::Order {
             request_id: None,
-            derivation: None,
             id: harvest_common::payment::OrderId([0u8; 32]),
             buyer_fingerprint: String::new(),
             seller_fingerprint: SELLER.to_string(),
@@ -17349,7 +17347,6 @@ mod authorized_order_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: "buyer".to_string(),
             seller_fingerprint: "seller".to_string(),
@@ -20337,7 +20334,6 @@ mod buy_flow_tests {
             chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).expect("timestamp");
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             // Empty, and that is the point: a buyer has no identity to name.
             buyer_fingerprint: String::new(),
@@ -21006,6 +21002,7 @@ mod buy_flow_tests {
             &tag,
             &conversation_id,
             crate::messaging::MessageContent::OrderRequest {
+                instant: None,
                 listing_id: widget(),
                 quantity: 1,
                 shipping: "anywhere".into(),

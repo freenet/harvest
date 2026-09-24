@@ -526,7 +526,6 @@ impl ComplaintFx {
     fn order(&self, n: u8) -> Order {
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: format!("complainer-{n}"),
             seller_fingerprint: "throwaway-seller-fp".into(),

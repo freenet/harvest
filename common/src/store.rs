@@ -1692,7 +1692,6 @@ mod order_tests {
         let ts = timestamp(created_at_secs);
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: buyer_fp.into(),
             seller_fingerprint: seller_fp.into(),
@@ -3251,7 +3250,6 @@ mod order_tests {
         let ts = timestamp(created_at_secs);
         let order = Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: format!("buyer-{seed}"),
             seller_fingerprint: "seller".into(),

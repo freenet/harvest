@@ -260,6 +260,8 @@ pub(crate) fn same_terms(
         kind: original_kind,
         price: original_price,
         created_at: _,
+        checkout: _,
+        choices: _,
     } = original;
     let normalised = |p: &Option<PriceInfo>, k: &ListingKind| match (k, p) {
         (ListingKind::Sale, Some(p)) if !p.amount.trim().is_empty() => Some(PriceInfo {
@@ -297,6 +299,8 @@ mod tests {
 
     fn original() -> Listing {
         Listing {
+            checkout: None,
+            choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Mug ".into(),
             description: "Blue".into(),

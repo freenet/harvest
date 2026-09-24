@@ -2172,7 +2172,6 @@ mod uncarried_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let order = Order {
             request_id: None,
-            derivation: None,
             // Not `with_derived_id`, for the same reason as the listing above.
             id: OrderId([0xCD; 32]),
             buyer_fingerprint: String::new(),

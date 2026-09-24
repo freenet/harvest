@@ -50,12 +50,17 @@ ghostkey = ["dep:ghostkey-common"]
 # record keys. Enabled by the delegate and the UI; never by a contract.
 custody = [
     "ghostkey",
+    "sealed",
     "dep:hkdf",
     "dep:aes-gcm",
     "dep:x25519-dalek",
     "dep:zeroize",
     "dep:rand_chacha",
 ]
+# Sealing and opening buyer-seller messages (`sealed.rs`): the UI and the
+# delegate, never a contract, which only stores the ciphertext. Implied by
+# `custody`, which both of those enable.
+sealed = ["dep:aes-gcm"]
 # The contract-address guard: fixed placeholder parameter values and the
 # `harvest-addresses` binary that turns them into addresses. OFF by default and
 # never enabled by a contract build. This crate is compiled into all three

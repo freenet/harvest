@@ -26,6 +26,8 @@ pub mod mailbox;
 pub mod migration;
 pub mod payment;
 pub mod reputation;
+#[cfg(feature = "sealed")]
+pub mod sealed;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_orders;

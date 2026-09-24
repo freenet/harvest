@@ -304,7 +304,6 @@ impl StoreFx {
     fn order(&self, buyer: &str, created: i64) -> Order {
         Order {
             request_id: None,
-            derivation: None,
             id: OrderId([0u8; 32]),
             buyer_fingerprint: buyer.into(),
             seller_fingerprint: "throwaway-seller-fp".into(),

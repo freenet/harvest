@@ -399,7 +399,6 @@ mod boundary_tests {
             order: AuthorizedOrder {
                 order: Order {
                     request_id: None,
-                    derivation: None,
                     id: OrderId([0u8; 32]),
                     buyer_fingerprint: String::new(),
                     seller_fingerprint: String::new(),
