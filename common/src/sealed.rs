@@ -137,10 +137,12 @@ pub enum MessageContent {
     /// message alone would be paying on the strength of a message it could
     /// have written itself.
     ///
-    /// The id has to be told rather than derived:
+    /// For a quote request the id has to be told rather than derived:
     /// `crate::payment::OrderId::from_terms` hashes terms the seller
     /// chooses, including a `created_at` they stamp, so a buyer cannot
-    /// compute it.
+    /// compute it. An instant request's answer is the exception: its id comes
+    /// from the request (`OrderId::for_request`), so the buyer finds it even
+    /// if this message is lost.
     OrderAccepted { order_id: crate::payment::OrderId },
 }
 

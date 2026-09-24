@@ -37,33 +37,6 @@ use freenet_migrate::{ExportRequest, ExportScope, OriginPolicy, SecretStore};
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError, MessageOrigin, OutboundDelegateMsg};
 use harvest_common::migration::{HarvestMigrationRequest, SECRET_KEY_PREFIX};
 
-/// `freenet-migrate`'s storage abstraction over the delegate host's own secret
-/// API. A thin pass-through -- the host already offers exactly these four
-/// operations, enumeration included.
-struct CtxStore<'a>(&'a DelegateCtx);
-
-impl SecretStore for CtxStore<'_> {
-    fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
-        self.0.list_secrets(prefix)
-    }
-
-    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get_secret(key)
-    }
-
-    fn has_secret(&self, key: &[u8]) -> bool {
-        self.0.has_secret(key)
-    }
-
-    fn set_secret(&mut self, _key: &[u8], _value: &[u8]) -> bool {
-        // Export is read-only. A successor imports through its own per-family
-        // rules (`crate::import`), not by having these bytes written in
-        // behind them: a list must be merged, a keypair kept a pair, a cap
-        // respected, none of which a raw key/value copy would do.
-        false
-    }
-}
-
 /// Who this delegate will export to.
 ///
 /// The crate-wide policy from [`crate::origin`], unchanged: `SameWebApp` pinned
@@ -132,32 +105,41 @@ impl<S: SecretStore> SecretStore for WithoutStoreKeys<'_, S> {
 
 /// Export this generation's secrets to `origin`, if it may have them. The one
 /// path an export takes, so the tests drive exactly what `handle` does.
-fn export<S: SecretStore>(
-    store: &S,
+///
+/// A successful export also disarms instant checkout here
+/// (`auto_invoice::disarm_all`): the successor is about to run with a copy of
+/// this generation's address counter, and two delegates answering the same
+/// store from two counters could hand one address to two buyers.
+fn export<S: SecretStore + crate::secrets::RemovableSecrets>(
+    store: &mut S,
     origin: Option<&MessageOrigin>,
     source_generation: u32,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let policy = origin_policy()?;
-    freenet_migrate::handle_export_request(
-        &WithoutStoreKeys(store),
+    let out = freenet_migrate::handle_export_request(
+        &WithoutStoreKeys(&*store),
         origin,
         &policy,
         &export_scope(),
         &ExportRequest { source_generation },
     )
-    .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))
+    .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))?;
+    crate::auto_invoice::disarm_all(store);
+    Ok(out)
 }
 
 /// Handle a migration request from a successor generation.
 pub fn handle(
-    ctx: &DelegateCtx,
+    ctx: &mut DelegateCtx,
     origin: Option<&MessageOrigin>,
     request: HarvestMigrationRequest,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     match request {
-        HarvestMigrationRequest::ExportSecrets { source_generation } => {
-            export(&CtxStore(ctx), origin, source_generation)
-        }
+        HarvestMigrationRequest::ExportSecrets { source_generation } => export(
+            &mut crate::secrets::CtxSecrets(ctx),
+            origin,
+            source_generation,
+        ),
         // `HarvestMigrationRequest` is `#[non_exhaustive]`, and a variant this
         // build does not know about must be refused rather than absorbed: an
         // unrecognised migration request answered with success is a migration
@@ -196,6 +178,13 @@ mod tests {
         }
         fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
             self.0.insert(key.to_vec(), value.to_vec());
+            true
+        }
+    }
+
+    impl crate::secrets::RemovableSecrets for MemStore {
+        fn remove_secret(&mut self, key: &[u8]) -> bool {
+            self.0.remove(key);
             true
         }
     }
@@ -267,7 +256,7 @@ mod tests {
     fn a_store_key_is_never_exported() {
         let mut s = store();
         s.set_secret(b"harvest:store_sk:3Bn8xWqLd6Tz9Kf2", b"seed");
-        let msgs = export(&s, Some(&harvest_origin()), 4).expect("authorized");
+        let msgs = export(&mut s, Some(&harvest_origin()), 4).expect("authorized");
         let keys: Vec<Vec<u8>> = exported(&msgs)
             .secrets
             .into_iter()
@@ -278,6 +267,18 @@ mod tests {
             keys.iter().any(|k| k == b"harvest:rsa_sk:fp1"),
             "and everything else still goes"
         );
+    }
+
+    /// Exporting to a successor disarms instant checkout here, and never
+    /// carries an arm. Mutated red by dropping the `disarm_all` call.
+    #[test]
+    fn an_export_disarms_instant_checkout() {
+        let mut s = store();
+        let arm = crate::auto_invoice::arm_key(&[5u8; 32]);
+        s.set_secret(&arm, b"an arm");
+        let msgs = export(&mut s, Some(&harvest_origin()), 4).expect("authorized");
+        assert!(exported(&msgs).secrets.iter().all(|(k, _)| *k != arm));
+        assert!(!s.has_secret(&arm), "the arm is gone");
     }
 
     /// The prefix scope is load-bearing, not decoration.

@@ -122,16 +122,33 @@ pub(crate) const MAX_TRAILING_UNPAID: u32 = 15;
 pub(crate) const MAX_BATCH: usize = 16;
 /// Every instant invoice asks one confirmation (harvest#155).
 pub(crate) const REQUIRED_CONFIRMATIONS: u32 = 1;
+/// How long the bridge must still be watching when an instant invoice goes
+/// out: a buyer may start paying until the anchor is
+/// [`MAX_ANCHOR_AGE_BLOCKS`] behind (about ten minutes a block), and the
+/// payment then needs time to confirm. A payment the bridge was not watching
+/// for when it was mined is never seen (freenet-bitcoin#7), so an invoice
+/// whose watch could lapse inside this is not issued.
+pub(crate) const WATCH_NEEDED_MS: u64 =
+    MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 2 * 60 * 60 * 1000;
+/// A reservation whose order has not appeared in the store after this long
+/// is taken to have never landed (a refused update), and released.
+pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
 const SEEN_CAP: usize = 1024;
 const ANSWERED_CAP: usize = 1024;
 const STATUSES_CAP: usize = 64;
+/// At most the open orders the store cap allows, twice over.
+const RESERVATIONS_CAP: usize = 2 * MAX_OPEN_PER_STORE;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// An arm as stored.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct ArmRecord {
     pub arm: AutoInvoiceArm,
+    /// When this store was first armed here, kept across re-arms.
     pub armed_at_ms: u64,
+    /// When the watch on `arm.watched_scripts` lapses, by this node's clock:
+    /// the time of the latest arm plus its `watch_left_ms`.
+    pub watched_until_ms: u64,
 }
 
 /// What this delegate remembers about one store's instant checkout.
@@ -146,6 +163,21 @@ pub(crate) struct Ledger {
     /// The last status this delegate signed per listing, so a run that read
     /// the store before an earlier run's decrement landed still counts it.
     pub statuses: Vec<ListingStatus>,
+    /// Stock held by instant invoices not yet paid. Published stock changes
+    /// only when an order is PAID ([`settle`]); an unpaid invoice holds its
+    /// quantity here until it is paid, cancelled, expires, or never lands.
+    /// So nobody can empty a listing by asking for invoices they never pay.
+    #[serde(default)]
+    pub reservations: Vec<Reservation>,
+}
+
+/// Stock one unpaid instant invoice holds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub(crate) struct Reservation {
+    pub order: OrderId,
+    pub listing: ListingId,
+    pub quantity: u32,
+    pub issued_at_ms: u64,
 }
 
 impl Ledger {
@@ -163,7 +195,17 @@ impl Ledger {
         while self.answered.len() > ANSWERED_CAP {
             self.answered.pop_front();
         }
+        self.issued_at_ms
+            .retain(|at| now_ms.saturating_sub(*at) < DAY_MS);
         self.issued_at_ms.push(now_ms);
+    }
+
+    fn reserved(&self, listing: &ListingId) -> u32 {
+        self.reservations
+            .iter()
+            .filter(|r| r.listing == *listing)
+            .map(|r| r.quantity)
+            .sum()
     }
 
     fn issued_last_day(&self, now_ms: u64) -> usize {
@@ -273,8 +315,10 @@ pub(crate) fn arm<S: SecretStore>(
         ));
     }
     let record = ArmRecord {
+        armed_at_ms: load_arm(secrets, &arm.store_contract_id)
+            .map_or(now_ms, |held| held.armed_at_ms),
+        watched_until_ms: now_ms.saturating_add(arm.watch_left_ms),
         arm: arm.clone(),
-        armed_at_ms: now_ms,
     };
     if !save(secrets, &arm_key(&arm.store_contract_id), &record) {
         return refuse("the node refused to store the arm".into());
@@ -296,21 +340,6 @@ pub(crate) fn arm<S: SecretStore>(
     )
 }
 
-/// The status of one store's arm, or why there is none.
-pub(crate) fn status<S: SecretStore>(
-    secrets: &S,
-    store_contract_id: Vec<u8>,
-    now_ms: u64,
-) -> HarvestDelegateResponse {
-    let result = load_arm(secrets, &store_contract_id)
-        .map(|record| status_of(secrets, &record, now_ms))
-        .ok_or_else(|| "instant checkout is not armed for that store on this device".to_string());
-    HarvestDelegateResponse::AutoInvoice {
-        store_contract_id,
-        result,
-    }
-}
-
 fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> AutoInvoiceStatus {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let ledger = load_ledger(secrets, &record.arm.store_contract_id);
@@ -318,12 +347,21 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
     AutoInvoiceStatus {
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
-        watched_until_ms: record.arm.watched_until_ms,
+        invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
         last_background_run_ms: tip.as_ref().map(|t| t.seen_at_ms),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
         paused: global_refusal(secrets, record, tip.as_ref(), now_ms)
             .err()
             .map(|r| r.explain()),
+    }
+}
+
+/// Remove every arm, so no background run here invoices again until the UI
+/// arms this delegate afresh. The ledgers stay: they only ever stop a
+/// request being answered twice.
+pub(crate) fn disarm_all<S: SecretStore + crate::secrets::RemovableSecrets>(secrets: &mut S) {
+    for key in secrets.list_secrets(format!("{AUTO_PREFIX}arm:").as_bytes()) {
+        secrets.remove_secret(&key);
     }
 }
 
@@ -373,6 +411,10 @@ pub(crate) enum Refusal {
     NoBuyerKey,
     NoListing,
     Withdrawn,
+    /// Enough is published, but not once unpaid instant invoices' holds are
+    /// counted. Left for the seller rather than declined: those invoices may
+    /// never be paid.
+    Reserved,
     TotalMismatch,
     BindingElsewhere,
     StoreCap,
@@ -401,8 +443,8 @@ impl Refusal {
     pub(crate) fn explain(&self) -> String {
         match self {
             Refusal::WatchLapsed => {
-                "the payment addresses it may use are no longer watched; open Harvest to renew \
-                 them"
+                "the watch on its payment addresses would lapse before a buyer could pay; open \
+                 Harvest to renew it"
                     .into()
             }
             Refusal::NoStoreKey => "this device does not hold the store's key".into(),
@@ -435,7 +477,7 @@ fn global_refusal<S: SecretStore>(
     now_ms: u64,
 ) -> Result<BlockAnchor, Refusal> {
     let arm = &record.arm;
-    if now_ms >= arm.watched_until_ms {
+    if now_ms.saturating_add(WATCH_NEEDED_MS) >= record.watched_until_ms {
         return Err(Refusal::WatchLapsed);
     }
     if store_key(secrets, &arm.store_verifying_key).is_none() {
@@ -471,14 +513,119 @@ pub(crate) fn on_notification<S: SecretStore>(
     {
         return Some(on_mailbox(secrets, record, state, now_ms));
     }
-    if all
+    if let Some(record) = all
         .iter()
-        .any(|r| r.arm.store_contract_id.as_slice() == contract_id.as_slice())
+        .find(|r| r.arm.store_contract_id.as_slice() == contract_id.as_slice())
     {
-        // Our own writes come back as store changes; nothing to do.
-        return Some(Vec::new());
+        // A store change may be a payment: release or settle what unpaid
+        // instant invoices hold. Our own writes come back here too, and find
+        // nothing left to do.
+        return Some(on_store_change(secrets, record, state, now_ms));
     }
     None
+}
+
+fn on_store_change<S: SecretStore>(
+    secrets: &mut S,
+    record: &ArmRecord,
+    state: &[u8],
+    now_ms: u64,
+) -> Vec<OutboundDelegateMsg> {
+    let Some(store_sk) = store_key(secrets, &record.arm.store_verifying_key) else {
+        return Vec::new();
+    };
+    let Ok(store) = from_cbor::<StoreStateV1>(state) else {
+        return Vec::new();
+    };
+    if store.owner != Some(store_sk.verifying_key()) {
+        return Vec::new();
+    }
+    let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
+    let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
+    if ledger.reservations.is_empty() {
+        return Vec::new();
+    }
+    let statuses = settle(
+        &mut ledger,
+        &store,
+        tip.map(|t| t.anchor.height),
+        &store_sk,
+        now_ms,
+    );
+    save(secrets, &ledger_key(&record.arm.store_contract_id), &ledger);
+    Decided {
+        statuses,
+        owner: Some(store_sk.verifying_key()),
+        ..Default::default()
+    }
+    .into_messages(&record.arm)
+}
+
+/// Settle the ledger's reservations against the store: a PAID order's
+/// quantity comes off the published stock (a signed status returned for
+/// publishing), and a reservation whose order was cancelled or reversed,
+/// expired unpaid, or never landed is released. What is left holds stock.
+pub(crate) fn settle(
+    ledger: &mut Ledger,
+    store: &StoreStateV1,
+    tip_height: Option<u32>,
+    store_sk: &SigningKey,
+    now_ms: u64,
+) -> Vec<AuthorizedListingStatus> {
+    let mut statuses = Vec::new();
+    let reservations = std::mem::take(&mut ledger.reservations);
+    for reservation in reservations {
+        let keep = match store.orders.orders.get(&reservation.order) {
+            None => now_ms.saturating_sub(reservation.issued_at_ms) < NOT_LANDED_MS,
+            Some(order) => match order.status {
+                OrderStatus::Paid => {
+                    let (revision, availability) =
+                        effective_status(store, ledger, &reservation.listing);
+                    if let ListingAvailability::Available {
+                        quantity: Some(left),
+                    } = availability
+                    {
+                        let remaining = left.saturating_sub(reservation.quantity);
+                        let status = ListingStatus {
+                            listing: reservation.listing.clone(),
+                            revision: revision.saturating_add(1).max(now_ms),
+                            availability: if remaining == 0 {
+                                ListingAvailability::SoldOut
+                            } else {
+                                ListingAvailability::Available {
+                                    quantity: Some(remaining),
+                                }
+                            },
+                        };
+                        if let Ok(signed) = sign_status(store_sk, status.clone()) {
+                            ledger.signed(status);
+                            statuses.retain(|s: &AuthorizedListingStatus| {
+                                s.status.listing != reservation.listing
+                            });
+                            statuses.push(signed);
+                        }
+                    }
+                    false
+                }
+                OrderStatus::AwaitingPayment => {
+                    // Unpaid, and still payable while its anchor is young
+                    // enough for a buyer to start paying. With no tip, keep.
+                    match (tip_height, order.order.anchor) {
+                        (Some(tip), Some(anchor)) => {
+                            tip.saturating_sub(anchor.height) <= MAX_ANCHOR_AGE_BLOCKS
+                        }
+                        (None, _) => true,
+                        (_, None) => false,
+                    }
+                }
+                OrderStatus::Cancelled | OrderStatus::PaymentReversed => false,
+            },
+        };
+        if keep {
+            ledger.reservations.push(reservation);
+        }
+    }
+    statuses
 }
 
 fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u8], now_ms: u64) {
@@ -601,13 +748,22 @@ fn on_mailbox<S: SecretStore>(
     let mut entries: Vec<&EncryptedMessage> = mailbox.messages.iter().collect();
     entries.sort_by_key(|m| (m.timestamp, entry_digest(m)));
     let mut ledger_changed = false;
+    // What the context can carry, less room for its own framing.
+    let budget = DelegateContext::MAX_SIZE - 1024;
+    let mut used = 0usize;
     for message in entries {
         let digest = entry_digest(message);
         if ledger.seen.contains(&digest) || !within_age(message, now_ms) {
             continue;
         }
         if open_instant(&store_sk, message).is_some() {
-            if batch.len() < MAX_BATCH {
+            let size = to_cbor(message).map_or(usize::MAX, |b| b.len());
+            if size > budget {
+                // Can never be carried; the seller answers it.
+                ledger.saw(digest);
+                ledger_changed = true;
+            } else if batch.len() < MAX_BATCH && used + size <= budget {
+                used += size;
                 batch.push(message.clone());
             }
         } else {
@@ -834,6 +990,7 @@ pub(crate) fn decide<S: SecretStore>(
     }
 
     let mut ledger = load_ledger(secrets, &arm.store_contract_id);
+    decided.statuses = settle(&mut ledger, store, Some(anchor.height), &store_sk, now_ms);
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
     let tip_height = anchor.height;
 
@@ -858,14 +1015,9 @@ pub(crate) fn decide<S: SecretStore>(
             now_ms,
         );
         match outcome {
-            Ok(Answer::Invoice {
-                order,
-                status,
-                reply,
-            }) => {
+            Ok(Answer::Invoice { order, reply }) => {
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
-                decided.statuses.extend(status);
                 decided.replies.push(reply);
                 ledger.saw(digest);
             }
@@ -891,7 +1043,6 @@ pub(crate) fn decide<S: SecretStore>(
 enum Answer {
     Invoice {
         order: Box<AuthorizedOrder>,
-        status: Option<AuthorizedListingStatus>,
         reply: EncryptedMessage,
     },
     Decline(EncryptedMessage),
@@ -953,9 +1104,10 @@ fn decide_one<S: SecretStore>(
         return Err(Refusal::TotalMismatch);
     }
 
-    // Stock (I3). The ledger holds every status this delegate signed,
-    // earlier in this run included, so it is the running count.
-    let (revision, availability) = effective_status(store, ledger, &listing.id);
+    // Stock (I3). Published stock is what the seller has; the ledger's
+    // reservations are what unpaid instant invoices, this run's included,
+    // hold of it.
+    let (_, availability) = effective_status(store, ledger, &listing.id);
     let left = match &availability {
         ListingAvailability::Withdrawn => return Err(Refusal::Withdrawn),
         ListingAvailability::SoldOut => Some(0),
@@ -969,6 +1121,13 @@ fn decide_one<S: SecretStore>(
                 format!("Only {left} left")
             };
             return seal(MessageContent::Decline { reason }).map(Answer::Decline);
+        }
+        if left
+            < ledger
+                .reserved(&listing.id)
+                .saturating_add(request.quantity)
+        {
+            return Err(Refusal::Reserved);
         }
     }
 
@@ -1017,6 +1176,11 @@ fn decide_one<S: SecretStore>(
     if ledger.issued_last_day(now_ms) >= MAX_PER_DAY {
         return Err(Refusal::DailyCap);
     }
+    // A reservation must be recordable, or the stock it holds would not be
+    // counted: past this many held at once, the seller answers.
+    if left.is_some() && ledger.reservations.len() >= RESERVATIONS_CAP {
+        return Err(Refusal::StoreCap);
+    }
     if trailing_unpaid(xpub, &all_orders) >= MAX_TRAILING_UNPAID {
         return Err(Refusal::TrailingUnpaid);
     }
@@ -1055,32 +1219,20 @@ fn decide_one<S: SecretStore>(
     .with_derived_id();
     let signed = sign_order(store_sk, order)?;
 
-    let status = match left {
-        None => None,
-        Some(left) => {
-            let remaining = left - request.quantity;
-            let status = ListingStatus {
-                listing: listing.id.clone(),
-                revision: revision.saturating_add(1).max(now_ms),
-                availability: if remaining == 0 {
-                    ListingAvailability::SoldOut
-                } else {
-                    ListingAvailability::Available {
-                        quantity: Some(remaining),
-                    }
-                },
-            };
-            ledger.signed(status.clone());
-            Some(sign_status(store_sk, status)?)
-        }
-    };
     let reply = seal(MessageContent::OrderAccepted {
         order_id: signed.order.id.clone(),
     })?;
+    if left.is_some() {
+        ledger.reservations.push(Reservation {
+            order: signed.order.id.clone(),
+            listing: listing.id.clone(),
+            quantity: request.quantity,
+            issued_at_ms: now_ms,
+        });
+    }
     ledger.answer(request_id, now_ms);
     Ok(Answer::Invoice {
         order: Box::new(signed),
-        status,
         reply,
     })
 }
@@ -1274,9 +1426,10 @@ mod tests {
                 trusted_bridges: vec![freenet_bitcoin_common::BridgeId([4; 32])],
                 address_code_hash: [5; 32],
                 watched_scripts: (0..5).map(script_at).collect(),
-                watched_until_ms: NOW + 3_600_000,
+                watch_left_ms: WATCH_NEEDED_MS + 3_600_000,
             },
             armed_at_ms: NOW - 1_000,
+            watched_until_ms: NOW + WATCH_NEEDED_MS + 3_600_000,
         };
         save(
             &mut secrets,
@@ -1499,6 +1652,171 @@ mod tests {
         assert_eq!(counter(&g), 0);
     }
 
+    /// I1, the ledger alone: a resend before the first answer has reached the
+    /// store, and one nonce twice in one run. Mutated red by dropping
+    /// `ledger.answered.contains` (the resend) and the `issued_now` check (the
+    /// same run).
+    #[test]
+    fn a_request_is_answered_once_before_the_store_shows_it() {
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let first = run(&mut f, &[buyer.request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(first.orders.len(), 1);
+        // Not published: the store read is stale.
+        let resend = buyer.request_at(&jam(), 1, 1, 12_000, NOW - 1_000);
+        let again = run(&mut f, &[resend]);
+        assert_eq!(again.refused[0].1, Refusal::AlreadyAnswered);
+        assert_eq!(counter(&f), 1);
+
+        let mut g = fixture();
+        let twice = run(
+            &mut g,
+            &[
+                buyer.request_at(&jam(), 1, 9, 12_000, NOW - 3_000),
+                buyer.request_at(&jam(), 1, 9, 12_000, NOW - 2_000),
+            ],
+        );
+        assert_eq!(twice.orders.len(), 1);
+        assert_eq!(twice.refused[0].1, Refusal::AlreadyAnswered);
+        assert_eq!(counter(&g), 1);
+    }
+
+    /// The daily count forgets what is over a day old, so the ledger stays
+    /// small.
+    #[test]
+    fn the_daily_count_is_pruned() {
+        let mut ledger = Ledger {
+            issued_at_ms: vec![NOW - DAY_MS - 1; 500],
+            ..Default::default()
+        };
+        ledger.answer([1; 32], NOW);
+        assert_eq!(ledger.issued_at_ms, vec![NOW]);
+    }
+
+    /// Re-arming keeps the first arm time, so a device that never runs in the
+    /// background is recognised however often the UI re-arms. Mutated red by
+    /// stamping `now_ms` on every arm.
+    #[test]
+    fn re_arming_keeps_the_first_arm_time() {
+        let mut secrets = MemSecrets::default();
+        crate::store_keys::keep(&mut secrets, &store_sk());
+        let f = fixture();
+        arm(&mut secrets, f.record.arm.clone(), NOW);
+        let (response, _) = arm(&mut secrets, f.record.arm.clone(), NOW + 3_600_000);
+        let HarvestDelegateResponse::AutoInvoice {
+            result: Ok(status), ..
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(status.armed_at_ms, NOW);
+        assert_eq!(status.last_background_run_ms, None);
+    }
+
+    /// The newest block is kept, an older one never replaces it, a tip for
+    /// another network is ignored, and every tip counts as a background run.
+    /// Mutated red by dropping the height comparison.
+    #[test]
+    fn the_tip_cache_keeps_the_newest_block() {
+        use freenet_bitcoin_common::{BlockHash, SignedTipEntry, TipEntryBody};
+        let bridge = SigningKey::from_bytes(&[0x77; 32]);
+        let tip_state = |network: BitcoinNetwork, height: u32| {
+            let entry = SignedTipEntry::sign(
+                &bridge,
+                &TipEntryBody {
+                    network,
+                    anchor: BlockAnchor {
+                        height,
+                        hash: BlockHash([height as u8; 32]),
+                    },
+                    prev_hash: BlockHash([0; 32]),
+                    block_time: 1_700_000_000 + height,
+                    tx_count: 1,
+                    median_time: 1_700_000_000,
+                },
+            )
+            .unwrap();
+            let mut state = BitcoinTipStateV1::default();
+            state.blocks.blocks.insert(height, entry);
+            freenet_bitcoin_common::to_cbor(&state).unwrap()
+        };
+        let mut f = fixture();
+        crate::secrets::RemovableSecrets::remove_secret(
+            &mut f.secrets,
+            &tip_key(BitcoinNetwork::Signet),
+        );
+        let cached = |f: &Fixture| -> TipCache {
+            load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap()
+        };
+        on_notification(
+            &mut f.secrets,
+            &[3; 32],
+            &tip_state(BitcoinNetwork::Signet, 100),
+            NOW,
+        );
+        assert_eq!(cached(&f).anchor.height, 100);
+        on_notification(
+            &mut f.secrets,
+            &[3; 32],
+            &tip_state(BitcoinNetwork::Signet, 99),
+            NOW + 5,
+        );
+        assert_eq!(cached(&f).anchor.height, 100, "an older block never wins");
+        assert_eq!(cached(&f).seen_at_ms, NOW + 5, "but it is a background run");
+        on_notification(
+            &mut f.secrets,
+            &[3; 32],
+            &tip_state(BitcoinNetwork::Bitcoin, 500),
+            NOW + 9,
+        );
+        assert_eq!(
+            cached(&f).anchor.height,
+            100,
+            "another network's tip is ignored"
+        );
+    }
+
+    /// Entries are batched while the context can carry them; one that never
+    /// could is left for the seller rather than stalling every later run.
+    #[test]
+    fn a_batch_never_outgrows_the_context() {
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let big = |nonce: u8| {
+            harvest_common::sealed::seal(
+                &buyer.keys().0,
+                &buyer.tag(),
+                &buyer.conversation,
+                MessageContent::OrderRequest {
+                    listing_id: jam().id,
+                    quantity: 1,
+                    shipping: "x".repeat(40_000),
+                    note: String::new(),
+                    order_binding: buyer.binding(),
+                    buyer_receipt_key: Some([9; 32]),
+                    instant: Some(InstantSelection {
+                        nonce: [nonce; 16],
+                        region: Some("UK".into()),
+                        choices: vec!["Fig".into()],
+                        expected_total_sats: 12_000,
+                    }),
+                },
+                chrono::DateTime::from_timestamp_millis((NOW - 60_000 + u64::from(nonce)) as i64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let messages: Vec<EncryptedMessage> = (1..=12).map(big).collect();
+        let state = to_cbor(&MailboxStateV1 { messages }).unwrap();
+        let out = on_notification(&mut f.secrets, &[2; 32], &state, NOW).unwrap();
+        let [OutboundDelegateMsg::GetContractRequest(get)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        assert!(get.context.as_ref().len() < DelegateContext::MAX_SIZE);
+        let batch: PendingBatch = from_cbor(get.context.as_ref()).unwrap();
+        assert!(!batch.entries.is_empty() && batch.entries.len() < 12);
+    }
+
     /// I2 and I5. A request that fails any check spends no address. Mutated
     /// red by moving the derivation above the total check.
     #[test]
@@ -1560,7 +1878,8 @@ mod tests {
         assert_eq!(counter(&f), 0, "nothing spent");
 
         let mut f = fixture();
-        f.record.arm.watched_until_ms = NOW;
+        // A watch lapsing before a buyer invoiced now could finish paying.
+        f.record.watched_until_ms = NOW + WATCH_NEEDED_MS;
         let decided = run(&mut f, std::slice::from_ref(&entry));
         assert_eq!(decided.refused[0].1, Refusal::WatchLapsed);
 
@@ -1573,11 +1892,12 @@ mod tests {
         assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
     }
 
-    /// I3. Two requests for the last item in one run: one invoice, one
-    /// decline, and the listing sold out. Mutated red by not updating
-    /// `Ledger::signed` after an invoice.
+    /// I3. Two requests for the last item in one run: one invoice, and the
+    /// other left for the seller (the first may never be paid), with
+    /// published stock untouched until a payment. Mutated red by dropping
+    /// the reservation push.
     #[test]
-    fn the_last_item_is_sold_once() {
+    fn the_last_item_is_invoiced_once() {
         let mut f = fixture();
         counted(&mut f, 1);
         let (a, b) = (Buyer::new(40), Buyer::new(41));
@@ -1590,37 +1910,117 @@ mod tests {
         );
         assert_eq!(decided.orders.len(), 1);
         assert_eq!(decided.orders[0].order.order_binding, Some(a.binding()));
-        assert_eq!(decided.statuses.len(), 1);
-        assert_eq!(
-            decided.statuses[0].status.availability,
-            ListingAvailability::SoldOut
+        assert!(decided.statuses.is_empty(), "nothing published until paid");
+        assert_eq!(decided.refused.len(), 1);
+        assert_eq!(decided.refused[0].1, Refusal::Reserved);
+        assert!(
+            b.read(&decided.replies).is_empty(),
+            "no decline: may free up"
         );
-        assert!(decided.statuses[0].status.revision > 5);
-        decided.statuses[0]
-            .verify(&store_sk().verifying_key())
-            .expect("signed");
-        assert_eq!(
-            b.read(&decided.replies),
-            vec![MessageContent::Decline {
-                reason: "Sold out".into()
-            }]
-        );
+        assert_eq!(counter(&f), 1);
+
+        // And in a later run that reads the same store.
+        let later = run(&mut f, &[Buyer::new(42).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(later.refused[0].1, Refusal::Reserved);
         assert_eq!(counter(&f), 1);
     }
 
-    /// I3 across runs: a run that read the store before an earlier run's
-    /// decrement landed counts from this delegate's own last status.
-    /// Mutated red by making `effective_status` ignore the ledger.
+    /// Published stock that is genuinely short is declined, not left.
     #[test]
-    fn a_stale_store_read_still_counts_the_last_sale() {
+    fn a_real_shortage_is_declined() {
+        let mut f = fixture();
+        counted(&mut f, 1);
+        let b = Buyer::new(41);
+        let decided = run(&mut f, &[b.request(&jam(), 2, 1, 22_000)]);
+        assert!(decided.orders.is_empty());
+        assert_eq!(
+            b.read(&decided.replies),
+            vec![MessageContent::Decline {
+                reason: "Only 1 left".into()
+            }]
+        );
+        assert_eq!(counter(&f), 0);
+    }
+
+    /// Requests nobody pays cannot empty a listing: published stock does not
+    /// move, and once their invoices expire the stock is offered again.
+    /// Mutated red by keeping expired reservations in `settle`.
+    #[test]
+    fn unpaid_invoices_do_not_drain_stock() {
+        let mut f = fixture();
+        counted(&mut f, 2);
+        f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        for seed in 40..42 {
+            let d = run(&mut f, &[Buyer::new(seed).request(&jam(), 1, 1, 12_000)]);
+            assert_eq!(d.orders.len(), 1);
+            publish(&mut f, &d);
+        }
+        let held = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(held.refused[0].1, Refusal::Reserved);
+        assert_eq!(
+            f.store.listing_availability(&jam().id),
+            ListingAvailability::Available { quantity: Some(2) },
+            "published stock untouched"
+        );
+        // The chain moves past the unpaid invoices' payable window.
+        let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + 1;
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
+        let again = run(&mut f, &[Buyer::new(51).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
+    }
+
+    /// A paid instant order takes its quantity off the published stock,
+    /// once, when the store shows it paid. Mutated red by not signing the
+    /// decrement in `settle`.
+    #[test]
+    fn a_paid_order_takes_its_quantity_off_published_stock() {
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let d = run(&mut f, &[Buyer::new(40).request(&jam(), 2, 1, 22_000)]);
+        let mut paid = d.orders[0].clone();
+        paid.status = OrderStatus::Paid;
+        f.store.orders.orders.insert(paid.order.id.clone(), paid);
+        let state = to_cbor(&f.store).unwrap();
+        let out = on_notification(&mut f.secrets, &[1; 32], &state, NOW).unwrap();
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let UpdateData::Delta(delta) = &update.update else {
+            panic!("a delta")
+        };
+        let delta: StoreStateV1Delta = from_cbor(delta.as_ref()).unwrap();
+        let statuses = delta.listing_statuses.unwrap();
+        assert_eq!(
+            statuses[0].status.availability,
+            ListingAvailability::Available { quantity: Some(1) }
+        );
+        statuses[0]
+            .verify(&store_sk().verifying_key())
+            .expect("signed by the store key");
+        // Settled once: the same state again changes nothing.
+        assert!(on_notification(&mut f.secrets, &[1; 32], &state, NOW)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A store update that never landed releases its hold after a while.
+    #[test]
+    fn a_reservation_whose_order_never_landed_is_released() {
         let mut f = fixture();
         counted(&mut f, 1);
         let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(first.orders.len(), 1);
-        // The store is NOT updated with `first`: the next read is stale.
-        let second = run(&mut f, &[Buyer::new(41).request(&jam(), 1, 1, 12_000)]);
-        assert!(second.orders.is_empty());
-        assert_eq!(counter(&f), 1);
+        let mut ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        let released = settle(
+            &mut ledger,
+            &f.store,
+            Some(1_000),
+            &store_sk(),
+            NOW + NOT_LANDED_MS,
+        );
+        assert!(released.is_empty());
+        assert!(ledger.reservations.is_empty());
     }
 
     /// I4. Past each cap the request is left for the seller. Mutated red by

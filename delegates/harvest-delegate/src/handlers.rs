@@ -378,12 +378,10 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
 
         // Instant checkout. Arming also subscribes, which a
         // `HarvestDelegateResponse` cannot carry, so `lib.rs` answers it
-        // before this match is reached; `arm_auto_invoice` is that path.
+        // before this match is reached; this arm is for a caller that
+        // reaches the handler another way, and drops the subscriptions.
         HarvestDelegateRequest::ArmAutoInvoice { arm } => {
             crate::auto_invoice::arm(store, *arm, crate::now_ms()).0
-        }
-        HarvestDelegateRequest::GetAutoInvoiceStatus { store_contract_id } => {
-            crate::auto_invoice::status(store, store_contract_id, crate::now_ms())
         }
 
         _ => HarvestDelegateResponse::Error {

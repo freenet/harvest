@@ -505,10 +505,6 @@ pub enum HarvestDelegateRequest {
     /// re-sending it is harmless: the UI sends it on every open. Answered
     /// with [`HarvestDelegateResponse::AutoInvoice`].
     ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
-
-    /// How auto-invoicing stands for one store, without changing anything.
-    /// Answered with [`HarvestDelegateResponse::AutoInvoice`].
-    GetAutoInvoiceStatus { store_contract_id: Vec<u8> },
 }
 
 /// Everything the Harvest delegate needs to issue an instant-checkout invoice
@@ -522,10 +518,11 @@ pub enum HarvestDelegateRequest {
 /// delegate running in the background cannot reach. So the UI asks while the
 /// seller is present, for the next few addresses the delegate will hand out,
 /// and names them here once the bridge has read the request. The delegate
-/// invoices only on an address in [`Self::watched_scripts`], and only until
-/// [`Self::watched_until_ms`], after which the bridge lets the watch lapse
-/// unless the seller's UI renews it. Past either, a request waits for the
-/// seller, as every request did before instant checkout.
+/// invoices only on an address in [`Self::watched_scripts`], and only while
+/// the watch will outlast the invoice's payment window (see
+/// [`Self::watch_left_ms`]); the bridge lets a watch lapse unless the
+/// seller's UI renews it. Past either, a request waits for the seller, as
+/// every request did before instant checkout.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AutoInvoiceArm {
     /// The store contract's instance id.
@@ -549,20 +546,26 @@ pub struct AutoInvoiceArm {
     /// Payment scripts the bridge has read a watch request for, from the
     /// addresses the delegate will hand out next.
     pub watched_scripts: Vec<Vec<u8>>,
-    /// When the earliest of those watches lapses, less a margin, by the UI's
-    /// clock.
-    pub watched_until_ms: u64,
+    /// How long the earliest of those watches has left before the bridge
+    /// lets it lapse, less a margin. A duration rather than a time, so the
+    /// browser's clock and the node's never have to agree: the delegate adds
+    /// it to its own clock when it is armed.
+    pub watch_left_ms: u64,
 }
 
 /// How auto-invoicing stands for one store: see
 /// [`HarvestDelegateRequest::ArmAutoInvoice`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AutoInvoiceStatus {
-    /// When the store was last armed, by the node's clock.
+    /// When this store was first armed on this device, by the node's clock.
+    /// Re-arming keeps it, so "armed long ago and never run in the
+    /// background" can be told apart from "just armed".
     pub armed_at_ms: u64,
-    /// Watched addresses still unused, and until when they are watched.
+    /// Watched addresses still unused, and until when a new instant invoice
+    /// may go out (the watch must outlast its payment window), by the node's
+    /// clock.
     pub watched_remaining: u32,
-    pub watched_until_ms: u64,
+    pub invoicing_until_ms: u64,
     /// When the delegate last heard from the chain-tip contract while running
     /// on its own, by the node's clock. `None` means it has not run in the
     /// background here, which is what a hosted gateway such as
@@ -982,7 +985,7 @@ pub enum HarvestDelegateResponse {
         message: String,
     },
 
-    /// Answer to `ArmAutoInvoice` and `GetAutoInvoiceStatus`.
+    /// Answer to `ArmAutoInvoice`.
     AutoInvoice {
         store_contract_id: Vec<u8>,
         result: Result<AutoInvoiceStatus, String>,
@@ -1584,10 +1587,9 @@ mod tests {
             Q::ListKeptPurchases => (26, false),
             // Public payment scripts and contract ids.
             Q::ArmAutoInvoice { .. } => (27, false),
-            Q::GetAutoInvoiceStatus { .. } => (28, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 29;
+    const REQUEST_VARIANTS: usize = 28;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1800,7 +1802,7 @@ mod tests {
                 result: Ok(AutoInvoiceStatus {
                     armed_at_ms: 1,
                     watched_remaining: 2,
-                    watched_until_ms: 3,
+                    invoicing_until_ms: 3,
                     last_background_run_ms: Some(4),
                     issued_last_day: 5,
                     paused: None,
@@ -1966,11 +1968,8 @@ mod tests {
                     trusted_bridges: vec![],
                     address_code_hash: [8u8; 32],
                     watched_scripts: vec![vec![0u8, 20]],
-                    watched_until_ms: 9,
+                    watch_left_ms: 9,
                 }),
-            },
-            Q::GetAutoInvoiceStatus {
-                store_contract_id: store(),
             },
         ]
     }

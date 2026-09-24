@@ -576,6 +576,30 @@ mod boundary_tests {
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ListKeptPurchases).expect("cbor"),
+            // Instant checkout. Arming lets the delegate sign orders and
+            // spend addresses unattended, and is dispatched in `lib.rs`
+            // itself, never reaching `handlers::handle`'s second check; the
+            // peek reads the seller's next payment addresses.
+            to_cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(harvest_common::delegate::AutoInvoiceArm {
+                    store_contract_id: vec![3u8; 32],
+                    store_verifying_key: [5u8; 32],
+                    mailbox_contract_id: [6u8; 32],
+                    seller_fingerprint: "fp".into(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    tip_contract_id: [7u8; 32],
+                    trusted_bridges: vec![],
+                    address_code_hash: [8u8; 32],
+                    watched_scripts: vec![],
+                    watch_left_ms: 1,
+                }),
+            })
+            .expect("cbor"),
+            to_cbor(&BtcReq::PeekOrderAddresses {
+                request_id: 1,
+                count: 10,
+            })
+            .expect("cbor"),
         ];
         for payload in payloads {
             assert!(refusal(&payload, Some(&a_different_web_app())).contains("Harvest web app"));

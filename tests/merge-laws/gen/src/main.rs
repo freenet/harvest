@@ -1786,9 +1786,9 @@ fn gen_request(root: &Path) {
     }
     for (_, n, s) in &extra { all.push((n, s.clone())); }
     let kept = find(&all, "m_A1_paid__A1_cheap_paid");
-    println!(
-        "request: a cheap paid answer displaces the real one? {}",
-        kept.orders.orders.values().any(|o| o.order.amount_sats == 1)
+    assert!(
+        !kept.orders.orders.values().any(|o| o.order.amount_sats == 1),
+        "a cheap paid answer displaced the real one"
     );
     for (n, s) in &all { c.state(n, &cbor(s)); }
     for (a, n, _) in &extra { c.transition(a, n); }
@@ -1802,6 +1802,30 @@ fn gen_request(root: &Path) {
         fx.check(&r);
         c.delta_step(&cbor(&base), &cbor(&summ), &cbor(&d), &cbor(&r));
     }
+    c.finish();
+
+    // At the order cap: two answers to one request that differ in
+    // `created_at`, P newest and Q oldest with the larger amount, and R a
+    // full cap dated between them. Under a cap keyed on `created_at` the two
+    // groupings disagree (PR #159 review, round 1).
+    let mut c = Corpus::new(root, "store-request-cap", &params);
+    let p_ans = fx.authorized(&answer(9, 6, 50_000, 1_900_000_000), OrderStatus::AwaitingPayment, 1);
+    let q_ans = fx.authorized(&answer(9, 7, 60_000, 1_600_000_000), OrderStatus::AwaitingPayment, 1);
+    let p_s = fx.build(None, vec![], vec![p_ans]);
+    let q_s = fx.build(None, vec![], vec![q_ans]);
+    let many: Vec<AuthorizedOrder> = (0..MAX_ORDERS)
+        .map(|i| {
+            let o = fx.order(&format!("rq-bulk-{i}"), 1_700_000_000 + i as i64);
+            fx.authorized(&o, OrderStatus::AwaitingPayment, 0)
+        })
+        .collect();
+    let r_s = fx.build(None, vec![], many);
+    let pq_r = fx.merged(&fx.merged(&p_s, &q_s), &r_s);
+    let p_qr = fx.merged(&p_s, &fx.merged(&q_s, &r_s));
+    assert_eq!(cbor(&pq_r), cbor(&p_qr), "the cap is associative for one request's answers");
+    c.state("rq_cap_P_newest", &cbor(&p_s));
+    c.state("rq_cap_Q_oldest_dearer", &cbor(&q_s));
+    c.state("rq_cap_R_full", &cbor(&r_s));
     c.finish();
 }
 

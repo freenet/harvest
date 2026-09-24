@@ -19,8 +19,11 @@
 //!    and when the watch lapses ([`AppState::auto_invoice_arm`]).
 //!
 //! A bridge lets a watch lapse about a day after the request that last asked
-//! for it. So instant checkout keeps working for about a day after the seller
-//! last had Harvest open, and then requests wait for them again.
+//! for it, and an invoice must stay watched through its whole payment window
+//! (about ten hours: the delegate's `WATCH_NEEDED_MS`). While Harvest is open
+//! the watch is renewed every twelve hours, so instant checkout keeps working
+//! for roughly half a day after the seller last had Harvest open, and then
+//! requests wait for them again.
 
 use std::collections::HashMap;
 
@@ -36,13 +39,14 @@ pub const REARM_EVERY_MS: u64 = 10 * 60 * 1000;
 /// How long to wait for an answer to `PeekOrderAddresses` before asking again.
 pub const PEEK_RETRY_MS: u64 = 60 * 1000;
 /// How long a bridge keeps watching after the request that last asked, and
-/// the margin kept below it.
+/// the margin kept below it (a request dated by this tab's clock and read by
+/// the bridge a little later).
 pub const WATCH_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 pub const WATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
-/// How long after arming a delegate that has never run in the background is
-/// taken to be unable to: a new block arrives about every ten minutes, and
-/// each one runs it.
-pub const NO_BACKGROUND_RUN_AFTER_MS: u64 = 40 * 60 * 1000;
+/// How long after the first arm a delegate that has never run in the
+/// background is taken to be unable to: a new block arrives about every ten
+/// minutes, and each one runs it.
+pub const NO_BACKGROUND_RUN_AFTER_MS: u64 = 30 * 60 * 1000;
 
 /// What the seller's side of instant checkout holds.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -56,8 +60,9 @@ pub struct AutoInvoiceUi {
     pub upcoming_for: Option<(String, u64)>,
     /// When `PeekOrderAddresses` was last sent.
     pub peek_sent_ms: Option<u64>,
-    /// The last arm sent for each store, and when.
-    pub sent: HashMap<Vec<u8>, (AutoInvoiceArm, u64)>,
+    /// The last arm sent for each store (with `watch_left_ms` zeroed, since
+    /// it shrinks with the clock), when its watch lapses, and when it went.
+    pub sent: HashMap<Vec<u8>, (AutoInvoiceArm, u64, u64)>,
     /// What the delegate last said about each store.
     pub status: HashMap<Vec<u8>, Result<AutoInvoiceStatus, String>>,
 }
@@ -178,14 +183,15 @@ impl AppState {
             })
     }
 
-    /// The arm for one store, as things stand: `None` until everything it
-    /// names is known.
+    /// The arm for one store, as things stand, and when its watch lapses by
+    /// this tab's clock (0 when nothing is watched): `None` until everything
+    /// it names is known.
     pub(crate) fn auto_invoice_arm(
         &self,
         fingerprint: &str,
         registration: &harvest_common::delegate::StoreRegistration,
         now_ms: u64,
-    ) -> Option<AutoInvoiceArm> {
+    ) -> Option<(AutoInvoiceArm, u64)> {
         let store_verifying_key = registration.store_verifying_key?;
         let mailbox_contract_id: [u8; 32] = registration
             .mailbox_contract_id
@@ -220,14 +226,14 @@ impl AppState {
             watched_scripts.push(address.script_pubkey.clone());
             earliest = Some(earliest.map_or(sent.sent_at_ms, |e| e.min(sent.sent_at_ms)));
         }
-        let watched_until_ms = earliest
+        let lapses_at_ms = earliest
             .map(|at| at + WATCH_LIFETIME_MS - WATCH_MARGIN_MS)
             .filter(|until| *until > now_ms)
             .unwrap_or(0);
-        if watched_until_ms == 0 {
+        if lapses_at_ms == 0 {
             watched_scripts.clear();
         }
-        Some(AutoInvoiceArm {
+        let arm = AutoInvoiceArm {
             store_contract_id: registration.store_contract_id.clone(),
             store_verifying_key,
             mailbox_contract_id,
@@ -237,8 +243,9 @@ impl AppState {
             trusted_bridges,
             address_code_hash,
             watched_scripts,
-            watched_until_ms,
-        })
+            watch_left_ms: lapses_at_ms.saturating_sub(now_ms),
+        };
+        Some((arm, lapses_at_ms))
     }
 
     /// What is due to be sent now. Changes nothing, so the minute timer can
@@ -251,11 +258,16 @@ impl AppState {
         }
         work.peek = self.peek_due(now_ms);
         for (fingerprint, registration) in stores {
-            let Some(arm) = self.auto_invoice_arm(&fingerprint, &registration, now_ms) else {
+            let Some((arm, lapses_at)) = self.auto_invoice_arm(&fingerprint, &registration, now_ms)
+            else {
                 continue;
             };
             let due = match self.auto_invoice.sent.get(&registration.store_contract_id) {
-                Some((sent, at)) => *sent != arm || now_ms.saturating_sub(*at) >= REARM_EVERY_MS,
+                Some((sent, sent_lapses_at, at)) => {
+                    *sent != without_left(&arm)
+                        || *sent_lapses_at != lapses_at
+                        || now_ms.saturating_sub(*at) >= REARM_EVERY_MS
+                }
                 None => true,
             };
             if due {
@@ -277,9 +289,20 @@ impl AppState {
             self.auto_invoice.peek_sent_ms = Some(now_ms);
         }
         for arm in &work.arms {
-            self.auto_invoice
-                .sent
-                .insert(arm.store_contract_id.clone(), (arm.clone(), now_ms));
+            self.auto_invoice.sent.insert(
+                arm.store_contract_id.clone(),
+                (
+                    without_left(arm),
+                    // As `auto_invoice_arm` gives it: 0 when nothing is
+                    // watched.
+                    if arm.watch_left_ms == 0 {
+                        0
+                    } else {
+                        now_ms.saturating_add(arm.watch_left_ms)
+                    },
+                    now_ms,
+                ),
+            );
         }
         work
     }
@@ -328,7 +351,7 @@ impl AppState {
         }
     }
 
-    /// The delegate's answer to `ArmAutoInvoice` or `GetAutoInvoiceStatus`.
+    /// The delegate's answer to `ArmAutoInvoice`.
     pub(crate) fn on_auto_invoice_status(
         &mut self,
         store_contract_id: Vec<u8>,
@@ -362,6 +385,15 @@ impl AppState {
     }
 }
 
+/// `arm` with its shrinking duration zeroed, for telling whether anything
+/// else about it changed.
+fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
+    AutoInvoiceArm {
+        watch_left_ms: 0,
+        ..arm.clone()
+    }
+}
+
 /// The store page's line for an armed store.
 pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     if status.last_background_run_ms.is_none()
@@ -376,7 +408,7 @@ pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> 
     if let Some(why) = &status.paused {
         return format!("Instant checkout is paused: {why}. Buyers send you a request instead.");
     }
-    let hours = status.watched_until_ms.saturating_sub(now_ms) / (60 * 60 * 1000);
+    let hours = status.invoicing_until_ms.saturating_sub(now_ms) / (60 * 60 * 1000);
     format!(
         "Instant checkout is on. This device invoices buyers for you for about {hours} more \
          hours, up to {} more orders, and renews that whenever Harvest is open.",

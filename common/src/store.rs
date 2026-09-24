@@ -658,8 +658,12 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
             // amount wins before the encoding does, so a seller cannot
             // replace a paid order with a cheaper one of their own, paid
             // with a token amount, to shrink what their store shows it took.
-            // For every other order one id means one set of terms, so the
-            // amounts are equal and this changes nothing.
+            // It does NOT stop the opposite: a seller can publish a larger
+            // version, paid to themselves, over the one a buyer paid. What
+            // protects that buyer is their kept copy of the order and the
+            // complaint it supports, which verify on their own, not this
+            // store's record. For every other order one id means one set of
+            // terms, so the amounts are equal and this changes nothing.
             match incoming.order.amount_sats.cmp(&existing.order.amount_sats) {
                 std::cmp::Ordering::Greater => {
                     orders.insert(id, incoming);
@@ -685,6 +689,13 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// id as a tie-break so the order is total. Both come from the order's signed
 /// TERMS, which `OrderId` is derived from, so every version of one order ranks
 /// the same however far its status has moved.
+///
+/// Except an order answering a request (`Order::request_id`): its id comes
+/// from the request alone, so two versions of it can carry different terms,
+/// `created_at` included, and a key that differed between them would make the
+/// cap non-associative (the harvest#85 shape below, with the version rather
+/// than the status changing the rank). So such an order ranks by its id alone,
+/// above every dated order: [`order_cap_key`].
 ///
 /// # Why status takes no part (harvest#85)
 ///
@@ -716,13 +727,24 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     }
     let mut ranked: Vec<(i64, OrderId)> = orders
         .iter()
-        .map(|(id, record)| (record.order.created_at.timestamp_millis(), id.clone()))
+        .map(|(id, record)| (order_cap_key(&record.order), id.clone()))
         .collect();
     // Ascending, so the oldest come first and are the ones dropped below.
     ranked.sort();
     let excess = orders.len() - MAX_ORDERS;
     for (_, id) in ranked.into_iter().take(excess) {
         orders.remove(&id);
+    }
+}
+
+/// The date part of an order's rank under the cap: its `created_at`, or, for
+/// an order answering a request, a value every version of it shares. See
+/// [`enforce_order_cap`].
+fn order_cap_key(order: &crate::payment::Order) -> i64 {
+    if order.request_id.is_some() {
+        i64::MAX
+    } else {
+        order.created_at.timestamp_millis()
     }
 }
 
@@ -3420,6 +3442,40 @@ mod order_tests {
                 }
             }
         }
+    }
+
+    /// **The cap stays associative for two versions of one request's
+    /// answer** that differ in `created_at` (instant checkout). With the cap
+    /// keyed on `created_at`, P = {x newest}, Q = {x oldest, larger amount}
+    /// and R = a full cap dated between them gave `(P+Q)+R` = R (the larger,
+    /// oldest version wins, then is cut) but `P+(Q+R)` = x plus most of R.
+    /// Mutated red by making `order_cap_key` return `created_at` for every
+    /// order.
+    #[test]
+    fn the_order_cap_is_associative_for_two_answers_to_one_request() {
+        let answer = |seed: u8, secs: i64, amount: u64| {
+            let (_, mut record) = synthetic_order(seed, secs, OrderStatus::AwaitingPayment);
+            record.order.request_id = Some([0x42; 32]);
+            record.order.amount_sats = amount;
+            record.order.id = OrderId::for_request(&[0x42; 32]);
+            (record.order.id.clone(), record)
+        };
+        let (id, newest) = answer(7, 9_000_000, 50_000);
+        let (_, oldest) = answer(8, 10, 60_000);
+        let p: BTreeMap<OrderId, AuthorizedOrder> = [(id.clone(), newest)].into();
+        let q: BTreeMap<OrderId, AuthorizedOrder> = [(id, oldest)].into();
+        let r = full_of_old_orders();
+        let enc = |m: &BTreeMap<OrderId, AuthorizedOrder>| crate::to_cbor(m).expect("encode");
+        assert_eq!(
+            enc(&merge_maps(&merge_maps(&p, &q), &r)),
+            enc(&merge_maps(&p, &merge_maps(&q, &r))),
+            "associativity"
+        );
+        assert_eq!(
+            enc(&merge_maps(&merge_maps(&q, &p), &r)),
+            enc(&merge_maps(&q, &merge_maps(&p, &r))),
+            "associativity, the other way round"
+        );
     }
 
     /// The summary names an order's content by the full 32-byte BLAKE3 of

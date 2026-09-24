@@ -1195,6 +1195,22 @@ fn accept(
     let seller_fingerprint = state
         .store_owner_fingerprint(store_contract_id)
         .ok_or("this store is not one of yours")?;
+    // Answered already (by this device's delegate, or another of the
+    // seller's devices): a second answer would be the same order id with a
+    // different address, and the buyer could pay the one the store drops.
+    if let Some(request_id) = buyer.request_id {
+        let id = harvest_common::payment::OrderId::for_request(&request_id);
+        if state
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.orders.iter().any(|order| order.order.id == id))
+        {
+            return Err(
+                "this request has already been answered with an order; it is under Orders"
+                    .to_string(),
+            );
+        }
+    }
     state.issue_invoice(crate::state::PendingInvoice {
         store_contract_id: store_contract_id.to_vec(),
         seller_fingerprint,
