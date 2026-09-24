@@ -64,92 +64,19 @@ pub fn App() -> Element {
                 crate::store_link::open_store_from_url();
 
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
-                match crate::gateway::register_delegate(harvest_wasm).await {
+                let harvest_key = match crate::gateway::register_delegate(harvest_wasm).await {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Harvest delegate registered: {:?}", key);
-                        // Nothing talks to the delegate until the node says the
-                        // registration is done (harvest#162, harvest#163): sent
-                        // earlier, a message can overtake the registration and be
-                        // refused as a missing delegate, with nothing to retry it.
-                        // The key is what everything else checks before sending,
-                        // so it is set only then. Spawned, because the answer is
-                        // read by the response loop below.
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if !crate::gateway::delegate_registered(&key).await {
-                                dioxus::logger::tracing::warn!(
-                                    "The node did not confirm the Harvest delegate's registration; \
-                                     going ahead"
-                                );
-                            }
-                            crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
-
-                            // A store link opened above may already have brought
-                            // its state back, and a store whose state arrived
-                            // before this point was deliberately not asked about
-                            // -- see `AppState::buyer_conversations_to_recall`.
-                            // Without this a returning buyer holds keys, on this
-                            // machine, to a reply they never fetch.
-                            crate::gateway::APP_STATE
-                                .write()
-                                .recall_conversations_for_known_stores();
-
-                            // And the stores this node remembers, remembering
-                            // first whatever a link opened before the delegate
-                            // existed (harvest#52).
-                            crate::gateway::APP_STATE.write().sync_remembered_stores();
-
-                            // And this buyer's kept purchases: what the payment
-                            // details wait on, and what a complaint rests on
-                            // (harvest#53 Phase C). Asked again on the watch
-                            // timer until an answer arrives.
-                            crate::gateway::APP_STATE.write().sync_kept_purchases();
-
-                            // Kick off the Bitcoin surface: bridge config (needed
-                            // for the first-run status panel, no credential
-                            // required) and the private watch list. Each of
-                            // these subscribes to whatever Bitcoin contracts it
-                            // learns about as its response arrives -- see
-                            // `AppState::on_bitcoin_delegate_response`.
-                            if let Err(e) = crate::gateway::bitcoin_ops::get_bridge().await {
-                                dioxus::logger::tracing::error!(
-                                    "Failed to fetch bridge config: {e}"
-                                );
-                            }
-                            if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
-                                dioxus::logger::tracing::error!("Failed to fetch watch list: {e}");
-                            }
-                            // And the seller's payment key, so "My Store" knows
-                            // whether it can offer to issue an invoice at all
-                            // rather than prompting for a key that is already set.
-                            if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
-                                dioxus::logger::tracing::error!("Failed to fetch payment key: {e}");
-                                // Nothing will answer, so mark it answered. Left
-                                // false, `PaymentKeyPanel` sits on "Checking your
-                                // payment key…" for the rest of the session and
-                                // the seller can never reach the form to set one.
-                                // Showing the form when we do not know is the safe
-                                // direction: setting the key again is harmless
-                                // (the counter is preserved -- see the delegate's
-                                // `apply_set_payment_xpub`), being unable to set
-                                // it at all is not.
-                                crate::gateway::APP_STATE
-                                    .write()
-                                    .bitcoin
-                                    .payment_xpub_loaded = true;
-                            }
-                            // Carry the harvest delegate's secrets over from its earlier
-                            // generations (harvest#123), now that the delegate is registered
-                            // and the loop that reads the answers is running.
-                            crate::gateway::delegate_migrate_ops::start();
-                        });
+                        Some(key)
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
                             "Failed to register harvest delegate: {}",
                             e
                         );
+                        None
                     }
-                }
+                };
 
                 // Step 3: Register the ghostkey delegate, then ASK IT WHAT WE
                 // ALREADY HAVE.
@@ -179,51 +106,56 @@ pub fn App() -> Element {
                 // want to know what you already have. Ask first, prompt only if
                 // the answer is empty.
                 let gk_wasm = include_bytes!("../../public/contracts/ghostkey_delegate.wasm");
-                match crate::gateway::register_delegate(gk_wasm).await {
+                let ghostkey_key = match crate::gateway::register_delegate(gk_wasm).await {
                     Ok(key) => {
                         dioxus::logger::tracing::info!("Ghostkey delegate registered: {:?}", key);
-                        // Asked once the node says the registration is done:
-                        // see the harvest delegate above (harvest#162).
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if !crate::gateway::delegate_registered(&key).await {
-                                dioxus::logger::tracing::warn!(
-                                    "The node did not confirm the ghostkey delegate's \
-                                     registration; going ahead"
-                                );
-                            }
-                            crate::gateway::APP_STATE.write().ghostkey_delegate_key =
-                                Some(key.clone());
-
-                            // Restore any identity already shared with this app.
-                            // Failure is not user-facing: an empty or failed list
-                            // leaves the My Store empty state offering "Connect a
-                            // ghostkey", which is the same place the user would
-                            // have started anyway.
-                            match ghostkey_common::to_cbor(
-                                &ghostkey_common::GhostkeyRequest::ListGhostKeys,
-                            ) {
-                                Ok(payload) => {
-                                    if let Err(e) =
-                                        crate::gateway::send_delegate_message(&key, payload).await
-                                    {
-                                        dioxus::logger::tracing::warn!(
-                                            "Could not ask the vault for already-shared identities: {e}"
-                                        );
-                                    }
-                                }
-                                Err(e) => dioxus::logger::tracing::error!(
-                                    "Failed to encode ListGhostKeys: {e}"
-                                ),
-                            }
-                        });
+                        Some(key)
                     }
                     Err(e) => {
                         dioxus::logger::tracing::error!(
                             "Failed to register ghostkey delegate: {}",
                             e
                         );
+                        None
                     }
-                }
+                };
+
+                // Nothing talks to either delegate until the node says its
+                // registration is done (harvest#162, harvest#163): sent earlier,
+                // a message can overtake the registration and be refused as a
+                // missing delegate, with nothing to retry it. A delegate's key
+                // is what everything else checks before sending, so it is set
+                // only then. In one task and in this order, Harvest first: the
+                // ghostkey's answers (the shared identities) start Harvest work
+                // (the store list, the migrations), which must find the Harvest
+                // delegate usable. Spawned, because the answers are read by the
+                // response loop below.
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Some(key) = harvest_key {
+                        if !crate::gateway::delegate_registered(&key).await {
+                            dioxus::logger::tracing::warn!(
+                                "The node did not confirm the Harvest delegate's registration; \
+                                 going ahead"
+                            );
+                        }
+                        crate::gateway::APP_STATE.write().harvest_delegate_key = Some(key);
+                        harvest_delegate_ready().await;
+                    }
+                    if let Some(key) = ghostkey_key {
+                        if !crate::gateway::delegate_registered(&key).await {
+                            dioxus::logger::tracing::warn!(
+                                "The node did not confirm the ghostkey delegate's registration; \
+                                 going ahead"
+                            );
+                        }
+                        crate::gateway::APP_STATE.write().ghostkey_delegate_key = Some(key.clone());
+                        ghostkey_delegate_ready(key).await;
+                    }
+                    // Carry the harvest delegate's secrets over from its earlier
+                    // generations (harvest#123), now that the delegates are
+                    // registered and the loop that reads the answers is running.
+                    crate::gateway::delegate_migrate_ops::start();
+                });
 
                 // Find out which generation of the bridge's address contract,
                 // request inbox and tip to use. Needs only the websocket, and no
@@ -321,6 +253,92 @@ pub fn App() -> Element {
 }
 
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO");
+
+/// What the Harvest delegate is asked once the node has registered it: see
+/// the connect flow in [`App`].
+#[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
+async fn harvest_delegate_ready() {
+    // A store link opened above may already have brought
+    // its state back, and a store whose state arrived
+    // before this point was deliberately not asked about
+    // -- see `AppState::buyer_conversations_to_recall`.
+    // Without this a returning buyer holds keys, on this
+    // machine, to a reply they never fetch.
+    crate::gateway::APP_STATE
+        .write()
+        .recall_conversations_for_known_stores();
+
+    // And the stores this node remembers, remembering
+    // first whatever a link opened before the delegate
+    // existed (harvest#52).
+    crate::gateway::APP_STATE.write().sync_remembered_stores();
+
+    // And this buyer's kept purchases: what the payment
+    // details wait on, and what a complaint rests on
+    // (harvest#53 Phase C). Asked again on the watch
+    // timer until an answer arrives.
+    crate::gateway::APP_STATE.write().sync_kept_purchases();
+
+    // Kick off the Bitcoin surface: bridge config (needed
+    // for the first-run status panel, no credential
+    // required) and the private watch list. Each of
+    // these subscribes to whatever Bitcoin contracts it
+    // learns about as its response arrives -- see
+    // `AppState::on_bitcoin_delegate_response`.
+    if let Err(e) = crate::gateway::bitcoin_ops::get_bridge().await {
+        dioxus::logger::tracing::error!("Failed to fetch bridge config: {e}");
+    }
+    if let Err(e) = crate::gateway::bitcoin_ops::list_watched().await {
+        dioxus::logger::tracing::error!("Failed to fetch watch list: {e}");
+    }
+    // And the seller's payment key, so "My Store" knows
+    // whether it can offer to issue an invoice at all
+    // rather than prompting for a key that is already set.
+    if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+        dioxus::logger::tracing::error!("Failed to fetch payment key: {e}");
+        // Nothing will answer, so mark it answered. Left
+        // false, `PaymentKeyPanel` sits on "Checking your
+        // payment key…" for the rest of the session and
+        // the seller can never reach the form to set one.
+        // Showing the form when we do not know is the safe
+        // direction: setting the key again is harmless
+        // (the counter is preserved -- see the delegate's
+        // `apply_set_payment_xpub`), being unable to set
+        // it at all is not.
+        crate::gateway::APP_STATE
+            .write()
+            .bitcoin
+            .payment_xpub_loaded = true;
+    }
+    // And never wait on its answer forever (harvest#163): an answer can
+    // still be lost, and the page would sit on "Checking your payment key".
+    wasm_bindgen_futures::spawn_local(async {
+        gloo_timers::future::TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .payment_key_answer_overdue();
+    });
+}
+
+/// What the ghostkey delegate is asked once the node has registered it.
+#[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
+async fn ghostkey_delegate_ready(key: freenet_stdlib::prelude::DelegateKey) {
+    // Restore any identity already shared with this app.
+    // Failure is not user-facing: an empty or failed list
+    // leaves the My Store empty state offering "Connect a
+    // ghostkey", which is the same place the user would
+    // have started anyway.
+    match ghostkey_common::to_cbor(&ghostkey_common::GhostkeyRequest::ListGhostKeys) {
+        Ok(payload) => {
+            if let Err(e) = crate::gateway::send_delegate_message(&key, payload).await {
+                dioxus::logger::tracing::warn!(
+                    "Could not ask the vault for already-shared identities: {e}"
+                );
+            }
+        }
+        Err(e) => dioxus::logger::tracing::error!("Failed to encode ListGhostKeys: {e}"),
+    }
+}
 
 fn format_build_time() -> String {
     #[cfg(target_arch = "wasm32")]

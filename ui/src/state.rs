@@ -1198,6 +1198,10 @@ pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Opt
         .map(|id| id.as_bytes().to_vec())
 }
 
+/// How long the page waits for the delegate's answer about the payment key
+/// before showing the form anyway (harvest#163).
+pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 30_000;
+
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
     of Harvest, and an invoice issued now could reuse a payment address. Harvest moves it once \
@@ -3893,6 +3897,20 @@ impl AppState {
             StoreWriteTarget::Moving { current, .. } => current,
             StoreWriteTarget::NotOurs => id.to_vec(),
         }
+    }
+
+    /// The delegate has not answered about the payment key in
+    /// [`PAYMENT_KEY_ANSWER_WAIT_MS`] (harvest#163). Show the form rather than
+    /// "Checking" for the rest of the session: setting the key again is
+    /// harmless (the delegate keeps its counter), being unable to set it at
+    /// all is not. Returns whether it was still waiting.
+    pub(crate) fn payment_key_answer_overdue(&mut self) -> bool {
+        if self.bitcoin.payment_xpub_loaded {
+            return false;
+        }
+        warn!("no answer about the payment key; showing the form");
+        self.bitcoin.payment_xpub_loaded = true;
+        true
     }
 
     /// Whether a store of ours is still on an earlier generation whose
@@ -14009,6 +14027,20 @@ mod tests {
             assert!(body.contains("work_store_key("), "{name}");
             assert!(!body.contains("store_owner_key("), "{name}");
         }
+    }
+
+    /// **The page does not wait on the payment key forever (harvest#163).**
+    /// Mutated red by leaving it waiting.
+    #[test]
+    fn an_unanswered_payment_key_check_shows_the_form() {
+        let mut state = AppState::default();
+        assert!(!state.bitcoin.payment_xpub_loaded);
+        assert!(state.payment_key_answer_overdue());
+        assert!(state.bitcoin.payment_xpub_loaded);
+        assert!(
+            !state.payment_key_answer_overdue(),
+            "an answer already in is left alone"
+        );
     }
 
     /// A version at the ceiling cannot be outranked, so an edit is refused
@@ -30570,7 +30602,10 @@ mod buy_flow_tests {
             paused: paused.map(str::to_string),
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
-        assert!(hosted.contains("try.freenet.org"), "{hosted}");
+        assert!(
+            hosted.starts_with("Instant checkout is not running on this node"),
+            "{hosted}"
+        );
         // Ready before any background run (the tip read on arming,
         // harvest#162): starting, not on, since a hosted gateway gets here
         // too. On once a background run is seen.

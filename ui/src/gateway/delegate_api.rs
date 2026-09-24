@@ -227,19 +227,35 @@ pub fn acknowledge_registration(key: &DelegateKey) -> bool {
 /// How long [`registered`] waits for the node's answer before going ahead
 /// anyway, as it did before this wait existed.
 pub const REGISTRATION_WAIT_MS: u32 = 30_000;
+// Well above the slowest answer measured (7.1 s in the harvest#162
+// rehearsal): a wait that gives up first is no wait at all.
+const _: () = assert!(REGISTRATION_WAIT_MS >= 15_000);
 
 /// Wait until the node has answered the registration of `key`, or
 /// [`REGISTRATION_WAIT_MS`]. `false` on the timeout. Needs the response loop
 /// running, so it is awaited from a spawned task, never before the loop.
 #[cfg(target_arch = "wasm32")]
 pub async fn registered(key: &DelegateKey) -> bool {
-    let Some(rx) = REGISTRATIONS.with(|r| r.borrow_mut().take(key)) else {
+    let rx = REGISTRATIONS.with(|r| r.borrow_mut().take(key));
+    wait_for_answer(
+        rx,
+        gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS),
+    )
+    .await
+}
+
+/// `true` once `answer` arrives, `false` if `deadline` comes first. A
+/// registration nothing recorded (`None`) has nothing to wait for.
+pub async fn wait_for_answer(
+    answer: Option<futures::channel::oneshot::Receiver<()>>,
+    deadline: impl std::future::Future<Output = ()>,
+) -> bool {
+    let Some(answer) = answer else {
         return true;
     };
-    let timeout = gloo_timers::future::TimeoutFuture::new(REGISTRATION_WAIT_MS);
-    futures::pin_mut!(timeout);
+    futures::pin_mut!(deadline);
     matches!(
-        futures::future::select(rx, timeout).await,
+        futures::future::select(answer, deadline).await,
         futures::future::Either::Left((Ok(()), _))
     )
 }
@@ -319,37 +335,62 @@ mod registration_tests {
         assert!(waiters.take(&key(1)).is_none(), "waited on once");
     }
 
+    /// The wait returns when the answer comes, and gives up at the deadline.
+    #[test]
+    fn a_registration_wait_ends_with_its_answer_or_its_deadline() {
+        use futures::executor::block_on;
+        let mut waiters = RegistrationWaiters::default();
+        waiters.expect(key(1));
+        let rx = waiters.take(&key(1));
+        assert!(waiters.acknowledge(&key(1)));
+        assert!(block_on(wait_for_answer(rx, futures::future::pending())));
+
+        waiters.expect(key(2));
+        let rx = waiters.take(&key(2));
+        assert!(!block_on(wait_for_answer(rx, futures::future::ready(()))));
+    }
+
     /// Nothing is sent to either delegate, and neither key is published to
     /// the rest of the app, before the node has answered its registration;
-    /// the migration walk starts only after the Harvest delegate's (harvest#162,
-    /// harvest#163). Pinned by source: the connect flow is wasm-only.
+    /// Harvest's first, since the ghostkey's answers start Harvest work; the
+    /// migration walk after both (harvest#162, harvest#163). The waiter is
+    /// recorded before the registration is sent. Pinned by source: the
+    /// connect flow is wasm-only.
     #[test]
     fn the_app_waits_for_each_registration_before_using_the_delegate() {
         let src = include_str!("../components/app.rs");
-        let harvest = &src[src.find("register_delegate(harvest_wasm)").unwrap()..];
-        let harvest = &harvest[..harvest.find("register_delegate(gk_wasm)").unwrap()];
-        let waited = harvest
-            .find("delegate_registered(&key).await")
-            .expect("waits");
-        let published = harvest
-            .find("harvest_delegate_key = Some(key)")
-            .expect("key set");
-        let first_send = harvest
-            .find("recall_conversations_for_known_stores")
-            .unwrap();
-        let walk = harvest
-            .find("delegate_migrate_ops::start()")
-            .expect("walk started");
-        assert!(waited < published && published < first_send && first_send < walk);
-
-        let ghostkey = &src[src.find("register_delegate(gk_wasm)").unwrap()..];
-        let waited = ghostkey
-            .find("delegate_registered(&key).await")
-            .expect("waits");
-        let published = ghostkey.find("ghostkey_delegate_key =").expect("key set");
-        let first_send = ghostkey.find("send_delegate_message(").unwrap();
-        assert!(waited < published && published < first_send);
+        let task = &src[src.find("let ghostkey_key = match").unwrap()..];
+        let task = &task[task
+            .find("wasm_bindgen_futures::spawn_local(async move {")
+            .expect("spawned")..];
+        let order = [
+            "delegate_registered(&key).await",
+            "harvest_delegate_key = Some(key)",
+            "harvest_delegate_ready().await",
+            "delegate_registered(&key).await",
+            "ghostkey_delegate_key =",
+            "ghostkey_delegate_ready(key).await",
+            "delegate_migrate_ops::start()",
+        ];
+        let mut at = 0;
+        for step in order {
+            at += task[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step}, in order"))
+                + step.len();
+        }
+        // Set nowhere else, and the walk started nowhere else.
+        assert_eq!(src.matches("harvest_delegate_key =").count(), 1);
+        assert_eq!(src.matches("ghostkey_delegate_key =").count(), 1);
         assert_eq!(src.matches("delegate_migrate_ops::start()").count(), 1);
+
+        let register = include_str!("delegate_api.rs");
+        let register = &register[register.find("pub async fn register_delegate(").unwrap()..];
+        let expect = register
+            .find("r.borrow_mut().expect(key.clone())")
+            .expect("recorded");
+        let send = register.find(".send(request)").expect("sent");
+        assert!(expect < send, "recorded before it is sent");
 
         // And the answer reaches the waiters, before the walk's reader of
         // empty answers can take it.

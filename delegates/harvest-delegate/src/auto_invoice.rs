@@ -3078,7 +3078,37 @@ mod tests {
         other.store_contract_id = vec![9; 32];
         arm(&mut f.secrets, other, NOW);
         let both = on_get_answer(&mut f.secrets, &[3; 32], Some(&tip), &[], NOW + 11).unwrap();
-        assert_eq!(both.len(), 2);
+        let mut stores: Vec<Vec<u8>> = both
+            .iter()
+            .map(|m| {
+                let OutboundDelegateMsg::ApplicationMessage(m) = m else {
+                    panic!("{m:?}")
+                };
+                let HarvestDelegateResponse::AutoInvoice {
+                    store_contract_id, ..
+                } = from_cbor(&m.payload).unwrap()
+                else {
+                    panic!()
+                };
+                store_contract_id
+            })
+            .collect();
+        stores.sort();
+        assert_eq!(
+            stores,
+            vec![vec![1; 32], vec![9; 32]],
+            "each told for its own"
+        );
+
+        // A store change the delegate acts on is a background run too.
+        crate::secrets::RemovableSecrets::remove_secret(&mut f.secrets, RAN_KEY);
+        on_notification(
+            &mut f.secrets,
+            &[1; 32],
+            &to_cbor(&f.store).unwrap(),
+            NOW + 13,
+        );
+        assert_eq!(load::<_, u64>(&f.secrets, RAN_KEY), Some(NOW + 13));
     }
 
     /// The mailbox run batches only unseen instant requests within a day,

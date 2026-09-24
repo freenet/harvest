@@ -222,9 +222,10 @@ fn settle(complete: bool) {
     }
 }
 
-/// Start the walk, once per session. Called after the current delegate is
-/// registered and just before the response loop starts, so no call's deadline
-/// runs while nothing is reading answers.
+/// Start the walk, once per session. Called once the node has answered the
+/// current delegate's registration, from a task spawned beside the response
+/// loop, so no call can overtake the registration and no call's deadline runs
+/// while nothing is reading answers (harvest#162).
 pub fn start() {
     if STARTED.with(|s| s.replace(true)) {
         return;
