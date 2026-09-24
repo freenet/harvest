@@ -276,11 +276,20 @@ impl AppState {
     /// left up reads as a publish that never finished.
     fn end_publishing(&mut self, listing: &ListingId) -> Option<Publishing> {
         let publishing = self.publishing_listings.remove(listing)?;
-        self.notifications.retain(|n| *n != publishing.notice);
+        // One: another listing with the same title has a notice of its own.
+        if let Some(at) = self
+            .notifications
+            .iter()
+            .position(|n| *n == publishing.notice)
+        {
+            self.notifications.remove(at);
+        }
         Some(publishing)
     }
 
-    /// A store's state arrived: every new listing it now holds is published.
+    /// A store's state arrived: every new listing it now holds is published,
+    /// including one a refusal was wrongly taken to be about, whose "not
+    /// published" notice comes down with it (see [`Self::on_update_refused`]).
     ///
     /// Only the state of the generation the listing was written to counts
     /// (harvest#164): an earlier generation can hold the same terms.
@@ -313,9 +322,10 @@ impl AppState {
 
     /// The node refused an update to `contract_id` (harvest#161). Its error
     /// names the contract only in its text and carries no request id, so it
-    /// cannot be matched to one write: every new listing waiting on that
-    /// store is reported as not published, and a refusal matching none of
-    /// them is still said, if the store is one of ours.
+    /// cannot be matched to one write. Every new listing waiting on that
+    /// store is reported as not published, and keeps waiting: one that lands
+    /// after all takes the report down again ([`Self::settle_publishing`]).
+    /// With none waiting, the refusal is said for a store of ours.
     pub(crate) fn on_update_refused(&mut self, contract_id: &[u8], reason: &str) {
         let waiting: Vec<ListingId> = self
             .publishing_listings
@@ -332,12 +342,18 @@ impl AppState {
             return;
         }
         for id in waiting {
-            if let Some(publishing) = self.end_publishing(&id) {
-                self.notifications.push(format!(
-                    "Your listing \u{201c}{}\u{201d} was not published: the network refused \
-                     it ({reason}).",
-                    publishing.title
-                ));
+            let Some(publishing) = self.publishing_listings.get_mut(&id) else {
+                continue;
+            };
+            let report = format!(
+                "Your listing \u{201c}{}\u{201d} was not published: the network refused \
+                 it ({reason}).",
+                publishing.title
+            );
+            let old = std::mem::replace(&mut publishing.notice, report.clone());
+            match self.notifications.iter().position(|n| *n == old) {
+                Some(at) => self.notifications[at] = report,
+                None => self.notifications.push(report),
             }
         }
     }
@@ -712,13 +728,15 @@ mod tests {
         assert_eq!(state.pending_signatures.len(), 1);
     }
 
-    fn current_generation() -> Vec<u8> {
-        crate::gateway::store_ops::store_instance_id(&harvest_common::store::StoreParameters::new(
-            ed25519_dalek::VerifyingKey::from_bytes(&test_store_key()).unwrap(),
-        ))
-        .unwrap()
-        .as_bytes()
-        .to_vec()
+    /// A seller whose registry still names the store's newest earlier
+    /// generation, and the store's current one (harvest#164).
+    fn moving_seller() -> (AppState, Vec<u8>, Vec<u8>) {
+        let (earlier, current) = crate::state::test_store_generations();
+        let mut state = seller_state();
+        state.my_stores.get_mut(FINGERPRINT).unwrap()[0].store_contract_id = earlier.clone();
+        let store = state.browsing_stores.remove(STORE.as_slice()).unwrap();
+        state.browsing_stores.insert(earlier.clone(), store);
+        (state, earlier, current)
     }
 
     fn holding(state: &mut AppState, store: Vec<u8>, listing: &Listing) {
@@ -735,67 +753,129 @@ mod tests {
             });
     }
 
+    fn publishing_notices(state: &AppState) -> usize {
+        state
+            .notifications
+            .iter()
+            .filter(|n| n.starts_with("Publishing"))
+            .count()
+    }
+
     /// **"Publishing" comes down once the listing is in the store it was
     /// written to (harvest#161).** Notices stay for the session, so the E2E
-    /// seller saw "Publishing" for a listing that was live. An EARLIER
-    /// generation holding the same terms does not count (harvest#164): the
-    /// write went to the current one. Mutated red by never ending it, and by
-    /// dropping the generation check.
+    /// seller saw "Publishing" for a listing that was live. On a store still
+    /// on an earlier generation, that generation holding the same terms does
+    /// not count (harvest#164); the current one does, before and after the
+    /// session moves there. Mutated red by never ending it, by dropping the
+    /// generation check, and by breaking either arm of
+    /// `current_generation_of`.
     #[test]
     fn the_publishing_notice_ends_when_the_listing_lands() {
+        // A store on its current generation.
+        let current = crate::state::test_store_generations().1;
         let mut state = seller_state();
+        state.my_stores.get_mut(FINGERPRINT).unwrap()[0].store_contract_id = current.clone();
         let mugs = listing("Mugs");
         state
-            .publish_new_listing(STORE.to_vec(), FINGERPRINT.into(), mugs.clone(), None)
+            .publish_new_listing(current.clone(), FINGERPRINT.into(), mugs.clone(), None)
             .expect("queued");
-        let notice = "Publishing \u{201c}Mugs\u{201d}\u{2026}".to_string();
-        assert!(state.notifications.contains(&notice));
+        assert_eq!(publishing_notices(&state), 1);
+        holding(&mut state, current.clone(), &mugs);
+        state.settle_publishing(&current);
+        assert_eq!(publishing_notices(&state), 0);
+        assert!(state.publishing_listings.is_empty());
 
-        holding(&mut state, STORE.to_vec(), &mugs);
-        state.settle_publishing(&STORE);
-        assert!(
-            state.notifications.contains(&notice),
+        // Still on an earlier generation.
+        let (mut state, earlier, current) = moving_seller();
+        state
+            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), mugs.clone(), None)
+            .expect("queued");
+        holding(&mut state, earlier.clone(), &mugs);
+        state.settle_publishing(&earlier);
+        assert_eq!(
+            publishing_notices(&state),
+            1,
             "an earlier generation holding it is not the publish"
         );
+        holding(&mut state, current.clone(), &mugs);
+        state.settle_publishing(&current);
+        assert_eq!(publishing_notices(&state), 0);
 
-        holding(&mut state, current_generation(), &mugs);
-        state.settle_publishing(&current_generation());
-        assert!(!state.notifications.contains(&notice));
-        assert!(state.publishing_listings.is_empty());
+        // Published while on the earlier generation, landing after the move.
+        let (mut state, earlier, current) = moving_seller();
+        state
+            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), mugs.clone(), None)
+            .expect("queued");
+        state.adopt_migrated_contract_id(&earlier, current.clone());
+        holding(&mut state, current.clone(), &mugs);
+        state.settle_publishing(&current);
+        assert_eq!(publishing_notices(&state), 0);
+    }
+
+    /// Two listings with one title each have a notice, and one landing takes
+    /// down only its own.
+    #[test]
+    fn a_landing_ends_only_its_own_notice() {
+        let mut state = seller_state();
+        let current = crate::state::test_store_generations().1;
+        state.my_stores.get_mut(FINGERPRINT).unwrap()[0].store_contract_id = current.clone();
+        let first = listing("Mugs");
+        let mut second = listing("Mugs");
+        second.description = "blue".into();
+        let second = second.with_derived_id();
+        for l in [&first, &second] {
+            state
+                .publish_new_listing(current.clone(), FINGERPRINT.into(), l.clone(), None)
+                .expect("queued");
+        }
+        holding(&mut state, current.clone(), &first);
+        state.settle_publishing(&current);
+        assert_eq!(publishing_notices(&state), 1);
     }
 
     /// **A refused publish is said, and "Publishing" comes down
     /// (harvest#161).** The E2E seller's listing was refused by the store
-    /// contract and the page said "Publishing" forever. Mutated red by
-    /// ignoring the refusal.
+    /// contract and the page said "Publishing" forever. A refusal cannot be
+    /// tied to one write, so a listing it was wrongly taken to be about
+    /// takes the report down when it lands. A refusal no listing is waiting
+    /// on is still said, for a store of ours, including on its current
+    /// generation before the session moves there. Mutated red by ignoring
+    /// the refusal.
     #[test]
     fn a_refused_listing_is_reported() {
-        let mut state = seller_state();
+        let (mut state, earlier, current) = moving_seller();
+        let mugs = listing("Mugs");
         state
-            .publish_new_listing(STORE.to_vec(), FINGERPRINT.into(), listing("Mugs"), None)
+            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), mugs.clone(), None)
             .expect("queued");
-        state.on_update_refused(&current_generation(), "the listing is not valid");
-        assert!(!state
-            .notifications
-            .iter()
-            .any(|n| n.starts_with("Publishing")));
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n.contains("\u{201c}Mugs\u{201d} was not published")
-                && n.contains("the listing is not valid")));
+        state.on_update_refused(&current, "the listing is not valid");
+        assert_eq!(publishing_notices(&state), 0);
+        let report = |state: &AppState| {
+            state
+                .notifications
+                .iter()
+                .filter(|n| {
+                    n.contains("\u{201c}Mugs\u{201d} was not published")
+                        && n.contains("the listing is not valid")
+                })
+                .count()
+        };
+        assert_eq!(report(&state), 1);
+        // It was about something else after all.
+        holding(&mut state, current.clone(), &mugs);
+        state.settle_publishing(&current);
+        assert_eq!(report(&state), 0);
         assert!(state.publishing_listings.is_empty());
 
-        // A refusal no new listing is waiting on is still said, for a store
-        // of ours, and not for anyone else's.
         let before = state.notifications.len();
-        state.on_update_refused(&STORE, "an order is not valid");
+        state.on_update_refused(&earlier, "an order is not valid");
         assert_eq!(state.notifications.len(), before + 1);
         state.on_update_refused(&[0x44; 32], "not ours");
         assert_eq!(state.notifications.len(), before + 1);
     }
 
-    /// A publish that fails before it is sent ends its notice too.
+    /// A publish that fails before it is sent, or is dropped before it is
+    /// signed, ends its notice too.
     #[test]
     fn a_failed_send_ends_the_publishing_notice() {
         let mut state = seller_state();
@@ -804,10 +884,14 @@ mod tests {
             .publish_new_listing(STORE.to_vec(), FINGERPRINT.into(), mugs.clone(), None)
             .expect("queued");
         state.on_listing_published(&mugs.id, false);
-        assert!(!state
-            .notifications
-            .iter()
-            .any(|n| n.starts_with("Publishing")));
+        assert_eq!(publishing_notices(&state), 0);
+
+        let mut state = seller_state();
+        state
+            .publish_new_listing(STORE.to_vec(), FINGERPRINT.into(), mugs.clone(), None)
+            .expect("queued");
+        state.listing_dropped(&mugs.id, "no key".into());
+        assert_eq!(publishing_notices(&state), 0);
     }
 
     /// Editing the terms publishes the new listing, and takes the old one

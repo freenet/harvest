@@ -118,9 +118,12 @@ pub const FORWARD_SLOW_NOTICE_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEO
 ///   then outside everything that watches, re-reads and settles this seller's
 ///   orders for the rest of the session, and a write waiting on a signature
 ///   fails with "not one of yours" (#154 review round 1). A payment to that
-///   invoice can be missed for good. So these keep the probe's deadline: a
-///   slow load stays on the predecessor throughout, consistently, and the
-///   next load's walk folds in whatever it wrote.
+///   invoice can be missed for good. So these keep the probe's deadline.
+///   Since harvest#164 a slow store forward no longer keeps the load on the
+///   predecessor store: no write goes to an earlier generation, and state for
+///   the current one moves the session there whenever it arrives
+///   (`AppState::adopt_if_current_generation`), so reads and writes stay on
+///   one generation either way.
 /// * **A mailbox adopt** moves where the seller's replies and invoice accepts
 ///   are sent (`browsing_stores[..].mailbox_contract_id`). One sent to the
 ///   predecessor before a late adopt is not seen by a buyer on the current

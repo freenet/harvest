@@ -62,6 +62,12 @@ pub(crate) fn refused_update(error: &str) -> Option<(Vec<u8>, &str)> {
     const MARKER: &str = "update error for contract ";
     let rest = &error[error.find(MARKER)? + MARKER.len()..];
     let (id, rest) = rest.split_once(", reason: ")?;
+    // Only the contract's own verdict. The same wording carries conditions a
+    // retry clears (the node not holding the contract yet, a storage budget),
+    // which are not a refusal of what was sent.
+    if !rest.contains("invalid contract update") {
+        return None;
+    }
     let id = bs58::decode(id.trim()).into_vec().ok()?;
     if id.len() != 32 {
         return None;
@@ -268,7 +274,17 @@ mod tests {
         );
         assert_eq!(refused_update("GET failed: contract not found"), None);
         assert_eq!(
-            refused_update("update error for contract notbase58!, reason: x"),
+            refused_update(
+                "update error for contract notbase58!, reason: invalid contract update, reason: x"
+            ),
+            None
+        );
+        // A condition a retry clears is not a refusal.
+        assert_eq!(
+            refused_update(
+                "update error for contract 2xaQ7k6oGhns9MTKjbTzA3GaZH8PfeCft85FzK7srwRf, \
+                 reason: missing contract parameters"
+            ),
             None
         );
     }
@@ -291,7 +307,8 @@ mod tests {
             }],
         );
         let error = format!(
-            "UPDATE failed: update error for contract {}, reason: the order is not valid",
+            "UPDATE failed: update error for contract {}, reason: execution error: invalid \
+             contract update, reason: the order is not valid",
             bs58::encode(store).into_string()
         );
         apply_gateway_error(&mut state, &error);

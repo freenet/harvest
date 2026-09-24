@@ -1042,6 +1042,17 @@ fn spawn_store_key_signature(request_id: u64, store_verifying_key: [u8; 32], pay
 /// The store key test fixtures register their stores under: a store this
 /// device can sign for (harvest#93). A test about a store made before
 /// revision 2 registers `None` instead.
+/// The test store key's store at the newest generation this build
+/// supersedes, and at its current one (harvest#164).
+#[cfg(test)]
+pub(crate) fn test_store_generations() -> (Vec<u8>, Vec<u8>) {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&test_store_key()).unwrap();
+    let earlier = crate::migrate::store_candidate_ids(&key).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+    (earlier, current_store_generation(&key).unwrap())
+}
+
 #[cfg(test)]
 pub(crate) fn test_store_key() -> [u8; 32] {
     ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
@@ -1178,6 +1189,19 @@ pub enum StoreWriteTarget {
     },
     /// No registration on this device names the store.
     NotOurs,
+}
+
+/// The id of `key`'s store at the generation this build bundles.
+pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Option<Vec<u8>> {
+    crate::gateway::store_ops::store_instance_id(&crate::migrate::store_params(key))
+        .ok()
+        .map(|id| id.as_bytes().to_vec())
+}
+
+/// Whether `id` is one of `key`'s store generations this build supersedes.
+fn is_earlier_store_generation(key: &ed25519_dalek::VerifyingKey, id: &[u8]) -> bool {
+    crate::migrate::store_candidate_ids(key)
+        .is_ok_and(|ids| ids.iter().any(|earlier| earlier.as_bytes() == id))
 }
 
 /// Why a store the seller owns needs its details published.
@@ -3769,21 +3793,27 @@ impl AppState {
     /// The delegate's registry names the generation a store was created
     /// under, and nothing repoints it (see
     /// `migrate_ops::successor_reference_is_durable`). So after every load,
-    /// until this session's migration walk forwards the store and adopts the
-    /// successor (about two minutes on a live node), the registration names
-    /// an EARLIER generation. A write sent there lands where buyers do not
-    /// look, or is refused outright by an older contract that does not know a
-    /// newer field. Both were seen live.
+    /// until this session moves to the current generation, the registration
+    /// names an EARLIER one. On the E2E node every write in that window went
+    /// there: the older contract refused a listing with instant-checkout
+    /// terms, and took a plain one onto a generation buyers do not open.
     ///
-    /// A store with a store key has one current generation, and it is
-    /// derived from the key alone, so an earlier one is recognisable without
-    /// asking anyone. `id` may be one this session has seen superseded: it is
-    /// resolved through the adopted mappings first, because a page opened
-    /// before the walk finished still holds the old id.
+    /// A store with a store key has one current generation, derived from the
+    /// key alone, so an earlier one is recognisable without asking anyone.
+    /// Only a generation this build knows to be EARLIER counts
+    /// (`migrate::store_candidate_ids`): a tab running an older build than
+    /// the one that registered the store must not route its writes backwards.
+    /// `id` may be one this session has seen superseded: it is resolved
+    /// through the adopted mappings first, because a page opened before the
+    /// move still holds the old id.
     ///
     /// A store made before revision 2 has no store key and its generation
     /// cannot be derived; it is `Ready` under the id the registry gives, as
     /// before.
+    ///
+    /// `Moving` ends when this session adopts the current generation: the
+    /// migration walk's forward, or any state for the current generation
+    /// arriving (`adopt_if_current_generation`), whichever is first.
     pub fn store_write_target(&self, id: &[u8]) -> StoreWriteTarget {
         let id = self
             .migrated_contract_ids
@@ -3798,19 +3828,86 @@ impl AppState {
         else {
             return StoreWriteTarget::NotOurs;
         };
-        let Some(key) = registration
+        match registration
             .store_verifying_key
             .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
-        else {
-            return StoreWriteTarget::Ready(id.to_vec());
-        };
-        match crate::gateway::store_ops::store_instance_id(&StoreParameters::new(key)) {
-            Ok(current) if current.as_bytes() != id => StoreWriteTarget::Moving {
-                registered: id.to_vec(),
-                current: current.as_bytes().to_vec(),
-            },
+            .and_then(|key| Some((current_store_generation(&key)?, key)))
+        {
+            Some((current, key)) if current != id && is_earlier_store_generation(&key, id) => {
+                StoreWriteTarget::Moving {
+                    registered: id.to_vec(),
+                    current,
+                }
+            }
             _ => StoreWriteTarget::Ready(id.to_vec()),
         }
+    }
+
+    /// Whether `id` is the current generation of one of our stores that
+    /// this session still knows by an earlier one, and if so, move there
+    /// (harvest#164).
+    ///
+    /// Called with every store state that arrives, before anything reads it.
+    /// State for the current generation proves the node holds it, so reads,
+    /// watches and writes can all move to it now rather than when the
+    /// migration walk's forward is acknowledged, which a slow network misses
+    /// for the whole load (`migrate_seal::forward_give_up_ms`). Anything only
+    /// the earlier generation holds still arrives: the walk's forward is a
+    /// PUT the current generation merges, and this session is subscribed to
+    /// it from here on.
+    pub(crate) fn adopt_if_current_generation(&mut self, id: &[u8]) {
+        let moving: Vec<Vec<u8>> = self
+            .my_stores
+            .values()
+            .flatten()
+            .filter_map(|r| match self.store_write_target(&r.store_contract_id) {
+                StoreWriteTarget::Moving {
+                    registered,
+                    current,
+                } if current == id => Some(registered),
+                _ => None,
+            })
+            .collect();
+        for registered in moving {
+            info!(
+                "store {} is on its current generation {}; moving to it",
+                bs58::encode(&registered).into_string(),
+                bs58::encode(id).into_string()
+            );
+            self.adopt_migrated_contract_id(&registered, id.to_vec());
+        }
+    }
+
+    /// The contract key a write to our store `registered` (a `Ready` id)
+    /// is sent with, and how it was found.
+    pub fn owned_write_key(
+        &self,
+        registered: &[u8],
+    ) -> Result<
+        (
+            freenet_stdlib::prelude::ContractKey,
+            crate::gateway::store_ops::KeyOrigin,
+        ),
+        String,
+    > {
+        use crate::gateway::store_ops::{store_contract_key, KeyOrigin};
+        let registration = self
+            .my_stores
+            .values()
+            .flatten()
+            .find(|s| s.store_contract_id == registered)
+            .ok_or("this store is no longer registered on this device")?;
+        let (key, origin) = store_contract_key(registration)?;
+        let current = registration
+            .store_verifying_key
+            .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+            .and_then(|k| current_store_generation(&k));
+        // A rebuilt key is right, not a guess, for the generation this build
+        // bundles the contract of.
+        if origin == KeyOrigin::Reconstructed && current.as_deref() == Some(registered) {
+            return Ok((key, KeyOrigin::Current));
+        }
+        Ok((key, origin))
     }
 
     /// Fold the delegate's answer to `ListStores` into what we already know,
@@ -4335,6 +4432,10 @@ impl AppState {
             match harvest_common::from_cbor::<harvest_common::store::StoreStateV1>(&state_bytes) {
                 Err(e) => e,
                 Ok(mut store_state) => {
+                    // Before anything reads it: our store's current
+                    // generation moves this session there (harvest#164).
+                    self.adopt_if_current_generation(&contract_id);
+
                     // Version 0 is "no details published". Nothing signs it,
                     // so nothing in it may be believed: until the PR #82
                     // re-review the contract accepted ANY content at version
@@ -10741,6 +10842,25 @@ impl AppState {
                             }
                         });
                     }
+                    // A store the registry names at an earlier generation
+                    // moves to its current one as soon as the node answers
+                    // for it (harvest#164), which after an earlier load is at
+                    // once, long before the walk's forward.
+                    let currents: Vec<Vec<u8>> = self
+                        .my_stores
+                        .get(&ghostkey_fingerprint)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| match self.store_write_target(&s.store_contract_id) {
+                            StoreWriteTarget::Moving { current, .. } => Some(current),
+                            _ => None,
+                        })
+                        .collect();
+                    for current in currents {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            crate::gateway::store_ops::probe_current_generation(&current).await;
+                        });
+                    }
                 }
             }
 
@@ -11044,8 +11164,8 @@ impl AppState {
                                 .write()
                                 .notifications
                                 .push(format!(
-                                    "Store created, but its name and description could not \
-                                 be published: {e}"
+                                    "Your store's name and description could not be \
+                                 published: {e}"
                                 ));
                         }
                     });
@@ -13266,27 +13386,23 @@ mod tests {
 
     /// **A write never goes to an earlier generation of our store
     /// (harvest#164).** After every load the delegate's registry names the
-    /// generation the store was created under, until the migration walk
-    /// adopts the current one about two minutes in. The E2E seller's listings
-    /// all went to that earlier generation in the meantime. Mutated red by
-    /// returning `Ready` for any registration, and by dropping the resolve
-    /// through the adopted mappings.
+    /// generation the store was created under, until this session moves to
+    /// the current one. The E2E seller's listings all went to that earlier
+    /// generation in the meantime. Mutated red by returning `Ready` for any
+    /// registration, and by dropping the resolve through the adopted
+    /// mappings.
     #[test]
     fn a_store_on_an_earlier_generation_is_not_written_to() {
+        let (earlier, current) = test_store_generations();
         let mut state = AppState::default();
-        state.merge_store_registrations(FINGERPRINT, vec![registration(1, None)]);
-        let current = crate::gateway::store_ops::store_instance_id(&StoreParameters::new(
-            ed25519_dalek::VerifyingKey::from_bytes(&test_store_key()).unwrap(),
-        ))
-        .unwrap()
-        .as_bytes()
-        .to_vec();
-        assert_ne!(current, vec![1u8; 32]);
+        let mut registration = registration(1, None);
+        registration.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![registration]);
 
         assert_eq!(
-            state.store_write_target(&[1u8; 32]),
+            state.store_write_target(&earlier),
             StoreWriteTarget::Moving {
-                registered: vec![1u8; 32],
+                registered: earlier.clone(),
                 current: current.clone(),
             }
         );
@@ -13295,17 +13411,91 @@ mod tests {
             StoreWriteTarget::NotOurs
         );
 
-        // The walk adopts the successor. A page that still holds the old id
-        // follows the store rather than losing it.
-        state.adopt_migrated_contract_id(&[1u8; 32], current.clone());
+        // The session moves. A page that still holds the old id follows the
+        // store rather than losing it.
+        state.adopt_migrated_contract_id(&earlier, current.clone());
         assert_eq!(
             state.store_write_target(&current),
             StoreWriteTarget::Ready(current.clone())
         );
         assert_eq!(
-            state.store_write_target(&[1u8; 32]),
+            state.store_write_target(&earlier),
             StoreWriteTarget::Ready(current)
         );
+    }
+
+    /// Only a generation this build supersedes is "earlier". A tab running an
+    /// older build than the one that registered the store would otherwise
+    /// send its writes backwards. Mutated red by dropping
+    /// `is_earlier_store_generation`.
+    #[test]
+    fn a_generation_this_build_does_not_know_is_written_where_it_is() {
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, None)]);
+        assert_eq!(
+            state.store_write_target(&[1u8; 32]),
+            StoreWriteTarget::Ready(vec![1u8; 32])
+        );
+    }
+
+    /// A store created by this build is on its current generation: derived
+    /// here the way `create_store_contracts` derives it, from the bundled
+    /// WASM and the encoded parameters, not by the expression under test.
+    #[test]
+    fn a_store_created_by_this_build_is_ready() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&test_store_key()).unwrap();
+        let params = harvest_common::to_cbor(&crate::migrate::store_params(&key)).unwrap();
+        let created = *WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(
+                crate::gateway::store_ops::STORE_CONTRACT_WASM.to_vec(),
+            )),
+            Parameters::from(params),
+        )
+        .key()
+        .id();
+        let mut state = AppState::default();
+        let mut registration = registration(1, None);
+        registration.store_contract_id = created.as_bytes().to_vec();
+        state.merge_store_registrations(FINGERPRINT, vec![registration]);
+        assert_eq!(
+            state.store_write_target(created.as_bytes()),
+            StoreWriteTarget::Ready(created.as_bytes().to_vec())
+        );
+    }
+
+    /// **State for our store's current generation moves the session there
+    /// (harvest#164)**, before the walk's forward is acknowledged, which a
+    /// slow network misses for the whole load; reads, watches and writes then
+    /// all follow one generation. A write key for it is `Current`, not a
+    /// guess. Mutated red by dropping the call from `on_contract_state`.
+    #[test]
+    fn state_for_the_current_generation_moves_the_store_there() {
+        let (earlier, current) = test_store_generations();
+        let mut state = AppState::default();
+        let mut registration = registration(1, None);
+        registration.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![registration]);
+
+        // A state for some other store moves nothing.
+        state.on_contract_state(
+            vec![0x66; 32],
+            harvest_common::to_cbor(&harvest_common::store::StoreStateV1::default()).unwrap(),
+        );
+        assert_eq!(state.my_stores[FINGERPRINT][0].store_contract_id, earlier);
+
+        state.on_contract_state(
+            current.clone(),
+            harvest_common::to_cbor(&harvest_common::store::StoreStateV1::default()).unwrap(),
+        );
+        assert_eq!(state.my_stores[FINGERPRINT][0].store_contract_id, current);
+        assert_eq!(
+            state.store_write_target(&earlier),
+            StoreWriteTarget::Ready(current.clone())
+        );
+        let (key, origin) = state.owned_write_key(&current).unwrap();
+        assert_eq!(key.id().as_bytes(), current.as_slice());
+        assert_eq!(origin, crate::gateway::store_ops::KeyOrigin::Current);
     }
 
     /// A store from before revision 2 has no store key, so its current
@@ -29474,20 +29664,15 @@ mod buy_flow_tests {
 
     // --- Instant checkout, the seller's side (`crate::auto_invoice_flow`) ---
 
-    /// A seller selling one instant-checkout listing, with a payment key,
-    /// the delegate's next three addresses known, the tip contract and the
-    /// address generation resolved.
     /// The current generation of the test store key's store: instant
     /// checkout arms nothing else (harvest#164).
     fn instant_store() -> Vec<u8> {
-        crate::gateway::store_ops::store_instance_id(&StoreParameters::new(
-            ed25519_dalek::VerifyingKey::from_bytes(&crate::state::test_store_key()).unwrap(),
-        ))
-        .unwrap()
-        .as_bytes()
-        .to_vec()
+        crate::state::test_store_generations().1
     }
 
+    /// A seller selling one instant-checkout listing, with a payment key,
+    /// the delegate's next three addresses known, the tip contract and the
+    /// address generation resolved.
     fn an_instant_seller(gk: &freenet_bitcoin_inbox::test_support::TestGhostkey) -> AppState {
         let mut state = a_seller_selling(Vec::new(), gk.id().0);
         // `a_seller_selling`'s store is on an arbitrary id; this one has to be
@@ -29564,9 +29749,10 @@ mod buy_flow_tests {
         let gk = inbox::authority().mint();
         let mut state = an_instant_seller(&gk);
         assert_eq!(state.instant_checkout_stores().len(), 1);
+        let (earlier, _) = crate::state::test_store_generations();
         let store = state.browsing_stores.remove(&instant_store()).unwrap();
-        state.browsing_stores.insert(STORE.to_vec(), store);
-        state.my_stores.get_mut("seller-fp").unwrap()[0].store_contract_id = STORE.to_vec();
+        state.browsing_stores.insert(earlier.clone(), store);
+        state.my_stores.get_mut("seller-fp").unwrap()[0].store_contract_id = earlier;
         assert!(state.instant_checkout_stores().is_empty());
     }
 
