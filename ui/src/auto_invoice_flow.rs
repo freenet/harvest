@@ -89,6 +89,15 @@ impl AppState {
                 if registration.store_verifying_key.is_none() {
                     continue;
                 }
+                // The delegate writes its orders to the store the arm names,
+                // so never an earlier generation (harvest#164). Armed once
+                // this session's migration walk adopts the current one.
+                if !matches!(
+                    self.store_write_target(&registration.store_contract_id),
+                    crate::state::StoreWriteTarget::Ready(_)
+                ) {
+                    continue;
+                }
                 let Some(store) = self.browsing_stores.get(&registration.store_contract_id) else {
                     continue;
                 };

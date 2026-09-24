@@ -35,8 +35,40 @@ pub fn handle_response(response: Result<HostResponse, String>) {
         }
         Err(e) => {
             error!("Gateway error: {}", e);
+            if refused_update(&e).is_some() {
+                apply_gateway_error(&mut APP_STATE.write(), &e);
+            }
         }
     }
+}
+
+/// What a gateway error changes in the app: a refused update is said
+/// (harvest#161). Split from `handle_response`, whose `APP_STATE` needs a
+/// Dioxus runtime, so it can be driven on the host.
+pub(crate) fn apply_gateway_error(state: &mut crate::state::AppState, error: &str) {
+    if let Some((contract_id, reason)) = refused_update(error) {
+        state.on_update_refused(&contract_id, reason);
+    }
+}
+
+/// The contract an UPDATE refusal names, and the node's reason (harvest#161).
+///
+/// freenet-core reports a refused update as an error that names the contract
+/// only in its English text ("update error for contract <id>, reason: ...")
+/// and carries no request id; see `prime`'s module docs for the same limit.
+/// Anything not in that shape is `None`, so a change of wording loses the
+/// notice, never mis-attributes it.
+pub(crate) fn refused_update(error: &str) -> Option<(Vec<u8>, &str)> {
+    const MARKER: &str = "update error for contract ";
+    let rest = &error[error.find(MARKER)? + MARKER.len()..];
+    let (id, rest) = rest.split_once(", reason: ")?;
+    let id = bs58::decode(id.trim()).into_vec().ok()?;
+    if id.len() != 32 {
+        return None;
+    }
+    // The node nests its reasons; the innermost is the one a person can act on.
+    let reason = rest.rsplit("reason: ").next().unwrap_or(rest).trim();
+    Some((id, reason))
 }
 
 fn handle_contract_response(response: ContractResponse) {
@@ -213,6 +245,66 @@ fn check_for_reputation_link(state_bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal the E2E seller's page never showed (harvest#161), in the
+    /// node's own words.
+    #[test]
+    fn a_refused_update_names_its_contract_and_reason() {
+        let seen = "client error: error while executing operation in the network: UPDATE \
+                    failed: update error for contract \
+                    2xaQ7k6oGhns9MTKjbTzA3GaZH8PfeCft85FzK7srwRf, reason: execution error: \
+                    invalid contract update, reason: scoped payload content does not match \
+                    expected data";
+        let (id, reason) = refused_update(seen).expect("parsed");
+        assert_eq!(
+            id,
+            bs58::decode("2xaQ7k6oGhns9MTKjbTzA3GaZH8PfeCft85FzK7srwRf")
+                .into_vec()
+                .unwrap()
+        );
+        assert_eq!(
+            reason,
+            "scoped payload content does not match expected data"
+        );
+        assert_eq!(refused_update("GET failed: contract not found"), None);
+        assert_eq!(
+            refused_update("update error for contract notbase58!, reason: x"),
+            None
+        );
+    }
+
+    /// A refusal naming one of our stores is said; `handle_response` hands
+    /// every gateway error that is one to `apply_gateway_error`. Mutated red
+    /// by dropping either.
+    #[test]
+    fn a_refused_update_to_our_store_is_said() {
+        let store = [0x31u8; 32];
+        let mut state = crate::state::AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: store.to_vec(),
+                reputation_contract_id: vec![0x32; 32],
+                mailbox_contract_id: vec![0x33; 32],
+                store_contract_key: None,
+                store_verifying_key: None,
+            }],
+        );
+        let error = format!(
+            "UPDATE failed: update error for contract {}, reason: the order is not valid",
+            bs58::encode(store).into_string()
+        );
+        apply_gateway_error(&mut state, &error);
+        assert_eq!(
+            state.notifications,
+            vec!["A change to your store was refused by the network: the order is not valid"]
+        );
+
+        let src = include_str!("response_handler.rs");
+        let handler = &src[src.find("pub fn handle_response(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        assert!(handler.contains("apply_gateway_error(&mut APP_STATE.write(), &e)"));
+    }
 
     /// **An undecodable payload's error quotes nothing from it** (review of
     /// harvest#96). Where serde's visitor sees a string it did not expect --

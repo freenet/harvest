@@ -1144,7 +1144,9 @@ fn adopt_and_announce(forwarded: &Forwarded, successor: ContractInstanceId) {
 ///
 /// So nothing seals. The migration re-runs on every load, re-PUTs a state the
 /// contracts merge idempotently, and re-adopts in memory; the seller's store
-/// works, at the cost of a lineage walk per load.
+/// works, at the cost of a lineage walk per load. Until the walk re-adopts,
+/// the registration names an earlier generation, so a write to the store
+/// waits for the current one (`store_ops::current_store_write`, harvest#164).
 ///
 /// **In-session adoption sticking does NOT satisfy this.**
 /// `AppState::adopt_migrated_contract_id` now keeps a `ListStores` answer from

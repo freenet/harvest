@@ -94,6 +94,10 @@ pub enum KeyOrigin {
     /// Rebuilt from the store contract this build bundles. Correct only if
     /// the store was published with the same contract build.
     Reconstructed,
+    /// The store's current generation, derived from its store key while the
+    /// registration still names an earlier one (harvest#164). The bundled
+    /// contract is that generation's, so this is always correct.
+    Current,
 }
 
 /// Bytes of a store-contract delta carrying only listings.
@@ -199,11 +203,14 @@ fn store_info_delta_bytes(
 /// because they are already folded into the instance id.
 ///
 /// The one case this does not fix: a store published with an *older* store
-/// contract has a different code hash, so the rebuilt key names a contract
-/// that does not exist and the update will fail. That store is already broken
-/// today, with no key at all, so this is never a regression -- but it is not
-/// a fix for every store either, which is why the caller is told which of the
-/// two it got and can say so.
+/// contract has a different code hash, so the rebuilt key pairs that older
+/// instance with the wrong code. The node addresses by instance and runs the
+/// older contract, so the update is refused, or accepted where no buyer reads
+/// (harvest#164). A write to our own store therefore never reaches here while
+/// the registration names an earlier generation of a store with a store key:
+/// see [`current_store_write`]. What still can is a store from before revision
+/// 2, whose generation cannot be derived, which is why the caller is told
+/// which of the two it got and can say so.
 pub fn store_contract_key(
     registration: &StoreRegistration,
 ) -> Result<(ContractKey, KeyOrigin), String> {
@@ -497,25 +504,135 @@ pub async fn create_store_contracts(
 /// what lets an open legacy invoice still be published as Paid, which needs
 /// no signature (harvest#93 review, Should Fix 6); anything that does need
 /// one is refused earlier, where it would have been signed.
+///
+/// Never the key of an EARLIER generation (harvest#164): see
+/// [`current_store_write`], which this waits on.
 #[cfg(target_arch = "wasm32")]
-fn owned_store_key(
+async fn owned_store_key(
     store_contract_id: &[u8],
     whats_missing: &str,
 ) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
     use dioxus::prelude::ReadableExt;
 
-    let state = super::APP_STATE.read();
-    let registration = state
-        .my_stores
-        .values()
-        .flat_map(|stores| stores.iter())
-        .find(|s| s.store_contract_id == store_contract_id)
+    let write = current_store_write(store_contract_id)
+        .await?
         .ok_or_else(|| format!("this store is not one of yours -- {whats_missing}"))?;
-    let owner = state
-        .delta_owner_key(store_contract_id)
+    let owner = super::APP_STATE
+        .read()
+        .delta_owner_key(&write.registered)
         .ok_or_else(|| format!("{} -- {whats_missing}", crate::state::NO_STORE_KEY_MESSAGE))?;
-    let (key, origin) = store_contract_key(registration)?;
+    let (key, origin) = write.contract_key()?;
     Ok((key, origin, owner))
+}
+
+/// How long a write to one of our stores waits for the store to reach its
+/// current generation before it is refused (harvest#164).
+///
+/// A migration walk forwarded a live store in a little over two minutes,
+/// twice, on the E2E node; this allows about twice that.
+pub const STORE_MOVE_WAIT_MS: f64 = 300_000.0;
+
+/// How often a waiting write looks again.
+#[cfg(target_arch = "wasm32")]
+const STORE_MOVE_POLL_MS: u32 = 5_000;
+
+/// Said when a write to a store still on an earlier generation gives up.
+pub const STORE_STILL_MOVING: &str = "your store is still being moved to this version of \
+    Harvest, so nothing was sent to it; try again in a few minutes";
+
+/// Where a write to one of our stores goes, once it may go anywhere.
+#[cfg(target_arch = "wasm32")]
+struct OwnedWrite {
+    /// The id this device's registration holds, which is what the owner key
+    /// and a recorded contract key are looked up by.
+    registered: Vec<u8>,
+    /// The generation the write is sent to, when that is not `registered`.
+    current: Option<Vec<u8>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl OwnedWrite {
+    fn contract_key(&self) -> Result<(ContractKey, KeyOrigin), String> {
+        use dioxus::prelude::ReadableExt;
+
+        if let Some(current) = &self.current {
+            // The bundled contract IS the current generation's, so the
+            // rebuilt key is the right one rather than a guess.
+            return Ok((reconstruct_store_key(current)?, KeyOrigin::Current));
+        }
+        let state = super::APP_STATE.read();
+        let registration = state
+            .my_stores
+            .values()
+            .flatten()
+            .find(|s| s.store_contract_id == self.registered)
+            .ok_or("this store is no longer registered on this device")?;
+        store_contract_key(registration)
+    }
+}
+
+/// Wait until a write to one of our stores can go to the store's CURRENT
+/// generation, never an earlier one (harvest#164). `None` when no
+/// registration on this device names the store.
+///
+/// While the registration still names an earlier generation
+/// (`StoreWriteTarget::Moving`), the write goes out as soon as either:
+///
+/// * this session's migration walk adopts the successor, which repoints the
+///   registration; or
+/// * the node answers a GET for the current generation with state, which an
+///   earlier session's walk will usually have put there. Writing to it before
+///   this session's forward lands is safe: the forward is a PUT, which the
+///   contract merges with whatever the write added.
+///
+/// Neither within [`STORE_MOVE_WAIT_MS`] is refused with
+/// [`STORE_STILL_MOVING`]. It is never sent to the earlier generation: an
+/// older contract refuses a field it does not know, and one that accepts the
+/// write holds it where no buyer reads.
+#[cfg(target_arch = "wasm32")]
+async fn current_store_write(store_contract_id: &[u8]) -> Result<Option<OwnedWrite>, String> {
+    use crate::state::StoreWriteTarget;
+    use dioxus::prelude::ReadableExt;
+
+    let started = js_sys::Date::now();
+    loop {
+        let target = super::APP_STATE
+            .read()
+            .store_write_target(store_contract_id);
+        let (registered, current) = match target {
+            StoreWriteTarget::NotOurs => return Ok(None),
+            StoreWriteTarget::Ready(id) => {
+                return Ok(Some(OwnedWrite {
+                    registered: id,
+                    current: None,
+                }))
+            }
+            StoreWriteTarget::Moving {
+                registered,
+                current,
+            } => (registered, current),
+        };
+        let instance: [u8; 32] = current
+            .as_slice()
+            .try_into()
+            .map_err(|_| "a store id is not 32 bytes".to_string())?;
+        if super::prime::reread(ContractInstanceId::new(instance)).await
+            == super::prime::Primed::Held
+        {
+            return Ok(Some(OwnedWrite {
+                registered,
+                current: Some(current),
+            }));
+        }
+        if js_sys::Date::now() - started >= STORE_MOVE_WAIT_MS {
+            return Err(STORE_STILL_MOVING.to_string());
+        }
+        dioxus::logger::tracing::info!(
+            "a write to store {} waits for it to reach its current generation",
+            bs58::encode(&registered).into_string()
+        );
+        gloo_timers::future::TimeoutFuture::new(STORE_MOVE_POLL_MS).await;
+    }
 }
 
 /// The contract key of ANY store a settlement may be published to, ours or
@@ -550,23 +667,20 @@ fn owned_store_key(
 /// reconstruction is right only for a store published under the store
 /// contract this build bundles, and the recorded key is right for any.
 #[cfg(target_arch = "wasm32")]
-fn settlement_store_key(
+async fn settlement_store_key(
     store_contract_id: &[u8],
 ) -> Result<(ContractKey, KeyOrigin, ed25519_dalek::VerifyingKey), String> {
     use dioxus::prelude::ReadableExt;
 
-    let state = super::APP_STATE.read();
-    let owner = state
+    let owner = super::APP_STATE
+        .read()
         .settlement_owner_key(store_contract_id)
         .ok_or("this store's owner key is not known here, so a settlement cannot name it")?;
-    match state
-        .my_stores
-        .values()
-        .flat_map(|stores| stores.iter())
-        .find(|s| s.store_contract_id == store_contract_id)
-    {
-        Some(registration) => {
-            let (key, origin) = store_contract_key(registration)?;
+    // One of ours goes where every other write to it goes: its current
+    // generation, never an earlier one (harvest#164).
+    match current_store_write(store_contract_id).await? {
+        Some(write) => {
+            let (key, origin) = write.contract_key()?;
             Ok((key, origin, owner))
         }
         None => Ok((
@@ -663,7 +777,7 @@ pub async fn submit_settled_order_by_id(
     // `PaymentReversed` needs retraction evidence and `AwaitingPayment`
     // loses every merge at rank 0, so neither is sent from here. Raised by
     // the authorization lens reviewing harvest#75.
-    let (contract_key, origin, owner) = settlement_store_key(store_contract_id)?;
+    let (contract_key, origin, owner) = settlement_store_key(store_contract_id).await?;
     keyless_publishable(&order, &owner)?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
@@ -684,7 +798,7 @@ pub async fn submit_settled_order_by_id(
              created with an older version, that key is wrong and the \
              settlement cannot be published."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Published the settled order {} to its store contract", id);
@@ -704,7 +818,7 @@ pub async fn submit_listing_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "nothing to add a listing to")?;
+        owned_store_key(store_contract_id, "nothing to add a listing to").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -728,7 +842,7 @@ pub async fn submit_listing_by_id(
              created with an older version, that key is wrong and the \
              listing cannot be submitted."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Submitted listing '{}' to store contract", title);
@@ -748,7 +862,7 @@ pub async fn submit_listing_status_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, _origin, owner) =
-        owned_store_key(store_contract_id, "nothing to update a listing in")?;
+        owned_store_key(store_contract_id, "nothing to update a listing in").await?;
     let delta_bytes = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
         owner: Some(owner),
         listing_statuses: Some(vec![status]),
@@ -781,7 +895,7 @@ pub fn spawn_publish_copy(
         use freenet_stdlib::prelude::*;
         let result = async {
             let (contract_key, _origin, owner) =
-                owned_store_key(&store_contract_id, "cannot back its key up")?;
+                owned_store_key(&store_contract_id, "cannot back its key up").await?;
             let delta = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
                 owner: Some(owner),
                 copies: Some(vec![copy]),
@@ -808,7 +922,7 @@ pub async fn submit_store_info_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, _origin, owner) =
-        owned_store_key(store_contract_id, "cannot publish its details")?;
+        owned_store_key(store_contract_id, "cannot publish its details").await?;
 
     let name = info.info.store_name.clone();
     let delta_bytes = store_info_delta_bytes(owner, info)?;
@@ -837,7 +951,7 @@ pub async fn submit_despatch_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "cannot record a despatch on it")?;
+        owned_store_key(store_contract_id, "cannot record a despatch on it").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -855,7 +969,7 @@ pub async fn submit_despatch_by_id(
              created with an older version, that key is wrong and the \
              despatch cannot be recorded."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
     info!(
         "Published the despatch of order {} to its store contract",
@@ -946,7 +1060,7 @@ pub async fn submit_order_by_id(
     use freenet_stdlib::prelude::*;
 
     let (contract_key, origin, owner) =
-        owned_store_key(store_contract_id, "cannot issue an invoice on it")?;
+        owned_store_key(store_contract_id, "cannot issue an invoice on it").await?;
     if origin == KeyOrigin::Reconstructed {
         warn!("Store contract key rebuilt from the bundled store contract");
     }
@@ -966,7 +1080,7 @@ pub async fn submit_order_by_id(
              created with an older version, that key is wrong and the \
              invoice cannot be published."
         ),
-        KeyOrigin::Recorded => e,
+        KeyOrigin::Recorded | KeyOrigin::Current => e,
     })?;
 
     info!("Published invoice {} to store contract", id);
@@ -1022,6 +1136,68 @@ mod tests {
             store_contract_key,
             store_verifying_key: None,
         }
+    }
+
+    /// The body of one `fn` in this file's non-test source, by name.
+    fn body_of(name: &str) -> &'static str {
+        let src = include_str!("store_ops.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |e| e + 3);
+        &rest[..end]
+    }
+
+    /// **No write to one of our stores is keyed off the registration's id
+    /// directly (harvest#164).** The registration names the generation the
+    /// store was created under until this session's migration walk adopts
+    /// the successor, so a lookup by it sent listings, invoices and
+    /// despatches to an earlier generation on every load: refused by an
+    /// older contract, or kept where no buyer reads. Every owner write and
+    /// every settlement to a store of ours must go through
+    /// `current_store_write`, and the one lookup by registered id left is the
+    /// recorded-key read in `OwnedWrite::contract_key`, which is only reached
+    /// once the registration names the current generation.
+    ///
+    /// Mutated red by resolving `owned_store_key` straight from `my_stores`
+    /// again, and by dropping `current_store_write` from
+    /// `settlement_store_key`.
+    #[test]
+    fn every_write_to_our_store_goes_to_its_current_generation() {
+        for name in ["owned_store_key", "settlement_store_key"] {
+            assert!(
+                body_of(name).contains("current_store_write(store_contract_id)"),
+                "{name} must resolve through current_store_write"
+            );
+        }
+        let src = include_str!("store_ops.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let lookups = src.matches(".store_contract_id ==").count();
+        assert_eq!(
+            lookups,
+            body_of("contract_key")
+                .matches(".store_contract_id ==")
+                .count(),
+            "a store write looked a registration up by id outside OwnedWrite::contract_key"
+        );
+        assert_eq!(lookups, 1);
+        // And every owner write goes through one of the two.
+        for writer in [
+            "submit_listing_by_id",
+            "submit_listing_status_by_id",
+            "spawn_publish_copy",
+            "submit_store_info_by_id",
+            "submit_despatch_by_id",
+            "submit_order_by_id",
+        ] {
+            assert!(
+                body_of(writer).contains("owned_store_key("),
+                "{writer} must resolve its key through owned_store_key"
+            );
+        }
+        assert!(body_of("submit_settled_order_by_id").contains("settlement_store_key("));
     }
 
     /// The reload path: after a refresh there is no local state at all, and

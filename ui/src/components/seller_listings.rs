@@ -133,11 +133,9 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                         let fp = fingerprint.clone();
                         move |(listing, quantity): (Listing, Option<u32>)| {
                             adding.set(false);
-                            let title = listing.title.clone();
                             let mut state = APP_STATE.write();
-                            match state.publish_new_listing(store.clone(), fp.clone(), listing, quantity) {
-                                Ok(()) => state.notifications.push(format!("Publishing \u{201c}{title}\u{201d}\u{2026}")),
-                                Err(e) => state.notifications.push(format!("Cannot add the listing: {e}")),
+                            if let Err(e) = state.publish_new_listing(store.clone(), fp.clone(), listing, quantity) {
+                                state.notifications.push(format!("Cannot add the listing: {e}"));
                             }
                         }
                     },
