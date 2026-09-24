@@ -672,8 +672,11 @@ mod get_answer_routing_tests {
         let routed = handler
             .find("auto_invoice::on_get_answer(")
             .expect("routed");
+        let returned = handler
+            .find("return Ok(out);")
+            .expect("its answer returned");
         let forwarded = handler.find("ContractState {").expect("forwarded");
-        assert!(routed < forwarded);
+        assert!(routed < returned && returned < forwarded);
         assert!(
             !handler.contains("on_store_state("),
             "one route, the tested one"

@@ -30575,9 +30575,12 @@ mod buy_flow_tests {
         // harvest#162): starting, not on, since a hosted gateway gets here
         // too. On once a background run is seen.
         let early = instant_checkout_status_text(&status(None, None), 1);
-        assert!(early.contains("is starting"), "{early}");
+        assert!(early.starts_with("Instant checkout is starting"), "{early}");
         let on = instant_checkout_status_text(&status(Some(1), None), 1);
-        assert!(on.contains("is on"), "{on}");
+        assert!(on.starts_with("Instant checkout is on"), "{on}");
+        // Paused before any background run says why it is paused.
+        let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
+        assert!(waiting.contains("paused: no recent block"), "{waiting}");
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
         assert!(paused.contains("paused: no recent block"), "{paused}");
         let mut oversold = status(Some(1), None);

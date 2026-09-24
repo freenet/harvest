@@ -59,13 +59,15 @@ const PREDECESSOR_TIMEOUT_MS: u32 = 20_000;
 ///
 /// Node-local, and usually milliseconds. But after a re-key the first call
 /// to the new generation compiles its module, and a silence here STOPS the
-/// walk for this load (the next predecessor is refused as
-/// `WriterUnavailable`), which also holds back the work the walk gates. The
-/// harvest#162 rehearsal measured that first answer at 6.9 s on a loaded
+/// walk for this load, which also holds back the work the walk gates. One
+/// harvest#162 rehearsal run measured that first answer at 6.9 s on a loaded
 /// machine, past the 5 s this was, and the walk stopped at the generation
-/// holding the seller's secrets. So the same deadline as a predecessor call:
-/// it costs time only when the current delegate never answers at all.
+/// holding the seller's secrets (one data point; two further runs answered in
+/// 2.2 to 4.4 s). So the same deadline as a predecessor call: it costs time
+/// only when the current delegate does not answer the call at all.
 const CURRENT_TIMEOUT_MS: u32 = PREDECESSOR_TIMEOUT_MS;
+// Not back under the measured first answer.
+const _: () = assert!(CURRENT_TIMEOUT_MS >= 10_000);
 
 struct Waiter {
     delegate: DelegateKey,

@@ -213,7 +213,7 @@ delegate_key = "af634007ba8ddbde2a72d152ae027a8c09f20e3b783cdd6970d398f42e858aa8
 
 [[entry]]
 version = "V24"
-description = "Superseded by harvest#162: arming instant checkout now also reads the Bitcoin tip contract once (`auto_invoice::arm` sends a `GetContractRequest` for it; `on_get_answer` keeps the answer and tells the arm its new status), so a node that had never seen the tip no longer waits up to a block for its first invoice. Every GET answer now goes through `auto_invoice::on_get_answer`. The tip cache's `seen_at_ms` became optional, because a tip read on arming is not a background run. The cache is not exported, so no import family changed. The parameters are unchanged (empty). The generation instant checkout shipped (`4f040c6`, #159)."
+description = "Superseded by harvest#162: arming instant checkout now also reads the Bitcoin tip contract once (`auto_invoice::arm` sends a `GetContractRequest` for it; `on_get_answer` keeps the answer and tells the arm its new status), so a node that had never seen the tip no longer waits up to a block for its first invoice. Every GET answer now goes through `auto_invoice::on_get_answer`. The evidence that instant checkout runs in the background moved from the tip cache's `seen_at_ms` to its own key (`harvest:auto:ran`), set by any notification an arm acts on and not by the tip read on arming. The cache is not exported, so no import family changed. The parameters are unchanged (empty). The generation instant checkout shipped (`4f040c6`, #159)."
 date = "2026-09-24"
 code_hash = "74cf700046aafc5af19bd69183b2b88f3d640ffd7dbb7817dc60084359eee04b"
 delegate_key = "0a32a41f9f1ac13d780841acefa62cbae6e1e0cd34eb0d32dd1050d6ca298f95"

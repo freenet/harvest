@@ -443,10 +443,11 @@ fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> Strin
     }
     // Ready, but this node has not yet shown it runs in the background: the
     // tip read on arming (harvest#162) is answered even on a hosted gateway,
-    // where nothing ever runs. The next block is the first proof.
+    // where nothing ever runs. The next block or buyer request is the proof.
     if status.last_background_run_ms.is_none() {
-        return "Instant checkout is starting. It is on once this node shows it runs in the \
-                background, at the next Bitcoin block, within about ten minutes."
+        return "Instant checkout is starting: it is on once this node has run it in the \
+                background, at the next Bitcoin block or buyer request. On a hosted service \
+                such as try.freenet.org that never happens."
             .into();
     }
     let hours = status.invoicing_until_ms.saturating_sub(now_ms) / (60 * 60 * 1000);
