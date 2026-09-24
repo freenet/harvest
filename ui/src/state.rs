@@ -1174,10 +1174,6 @@ pub struct StoreDetails {
     pub description: String,
 }
 
-/// Why a store's details cannot be edited yet (harvest#164).
-pub(crate) const STORE_DETAILS_WAIT: &str = "your store is still moving to this version of \
-    Harvest, and its details there may be newer than the ones shown. Try again in a moment.";
-
 /// Where a write to one of our own stores may go: see
 /// [`AppState::store_write_target`].
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -8686,15 +8682,25 @@ impl AppState {
         store_contract_id: &[u8],
         details: StoreDetails,
     ) -> Result<(), String> {
-        // The version below is read from the store's state, so it has to be
-        // the state of the generation the details are written to: the
-        // current one (harvest#164). While this session still reads an
-        // earlier generation, the current one may hold newer details, and a
-        // version one past the earlier generation's would be dropped there
-        // as stale, silently.
-        let store_contract_id = match self.store_write_target(store_contract_id) {
-            StoreWriteTarget::Ready(id) => id,
-            StoreWriteTarget::Moving { .. } => return Err(STORE_DETAILS_WAIT.to_string()),
+        let now_secs = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(u32::MAX);
+        self.publish_store_details_at(store_contract_id, details, now_secs)
+    }
+
+    /// [`Self::publish_store_details`] with the clock given.
+    pub(crate) fn publish_store_details_at(
+        &mut self,
+        store_contract_id: &[u8],
+        details: StoreDetails,
+        now_secs: u32,
+    ) -> Result<(), String> {
+        // Resolved: a page opened before this session moved to the store's
+        // current generation still holds the earlier id (harvest#164).
+        let (store_contract_id, also_held) = match self.store_write_target(store_contract_id) {
+            StoreWriteTarget::Ready(id) => (id, None),
+            StoreWriteTarget::Moving {
+                registered,
+                current,
+            } => (registered, Some(current)),
             StoreWriteTarget::NotOurs => {
                 return Err(
                     "this store is not one of yours -- nothing to publish details for".to_string(),
@@ -8761,14 +8767,31 @@ impl AppState {
         // A second edit submitted before the first round-trips would
         // otherwise recompute the same version and lose to it, since local
         // state only catches up when the update comes back.
+        //
+        // And never below the clock, in seconds (harvest#164), as listing
+        // statuses are (`listing_status_flow::next_revision`). A store's
+        // generations hold details independently until a migration forward
+        // folds one into another, which can land at any time after this edit
+        // and carry a higher version than anything shown here: an edit an
+        // older build made to an earlier generation, or one this session
+        // cannot see yet. A version one past what is shown would then be
+        // dropped as stale, with no error. Every version published before
+        // this was a small count, so the clock dominates them all; `u32`
+        // seconds last until 2106.
+        let seen_elsewhere = also_held
+            .and_then(|current| self.browsing_stores.get(&current))
+            .and_then(|store| store.info.as_ref())
+            .map_or(0, |info| info.version);
         let next_version = published_version
+            .max(seen_elsewhere)
             .max(
                 self.last_queued_store_version
                     .get(store_contract_id)
                     .copied()
                     .unwrap_or(0),
             )
-            .saturating_add(1);
+            .saturating_add(1)
+            .max(now_secs);
 
         self.pending_store_edit = Some(PendingStoreEdit {
             ghostkey_fingerprint: ghostkey_fingerprint.clone(),
@@ -13559,31 +13582,49 @@ mod tests {
         );
     }
 
-    /// **A store's details are not edited while this session still reads an
-    /// earlier generation (harvest#164).** Their version is one past what
-    /// the shown state holds, and the current generation may hold newer
-    /// details, where that version would be dropped as stale without an
-    /// error. Mutated red by dropping the `Moving` refusal.
+    /// **A details edit is never dropped as stale by a generation it was not
+    /// read from (harvest#164).** Its version is above what every
+    /// generation this session holds shows, and never below the clock, so a
+    /// migration forward carrying an older build's later edit cannot outrank
+    /// it. Mutated red by dropping the clock floor, and by dropping the
+    /// current generation's version while moving.
     #[test]
-    fn store_details_wait_for_the_current_generation() {
+    fn a_details_edit_outranks_every_generation() {
         let (earlier, current) = test_store_generations();
         let mut state = AppState::default();
         let mut registration = registration(1, None);
         registration.store_contract_id = earlier.clone();
         state.merge_store_registrations(FINGERPRINT, vec![registration]);
+        let held = |version: u32| {
+            let mut store = loaded_store("Jam");
+            store.info.as_mut().unwrap().version = version;
+            store
+        };
+        state.browsing_stores.insert(earlier.clone(), held(3));
+        state.browsing_stores.insert(current.clone(), held(7));
         let details = StoreDetails {
             store_name: "Jam".into(),
             ..Default::default()
         };
-        assert_eq!(
-            state.publish_store_details(&earlier, details.clone()),
-            Err(STORE_DETAILS_WAIT.to_string())
-        );
+
+        // Still on the earlier generation: above what the current one holds.
+        state
+            .publish_store_details_at(&earlier, details.clone(), 0)
+            .expect("queued");
+        let edit = state.pending_store_edit.take().expect("pending");
+        assert_eq!(edit.store_contract_id, earlier);
+        assert_eq!(edit.next_version, 8);
+
+        // Moved, and asked by the old id: the current generation's edit, and
+        // never below the clock.
         state.adopt_migrated_contract_id(&earlier, current.clone());
-        assert_ne!(
-            state.publish_store_details(&earlier, details),
-            Err(STORE_DETAILS_WAIT.to_string())
-        );
+        state.last_queued_store_version.clear();
+        state
+            .publish_store_details_at(&earlier, details, 1_790_000_000)
+            .expect("queued");
+        let edit = state.pending_store_edit.take().expect("pending");
+        assert_eq!(edit.store_contract_id, current);
+        assert_eq!(edit.next_version, 1_790_000_000);
     }
 
     /// The move happens before anything else in the arrival reads the
@@ -14895,7 +14936,7 @@ mod tests {
             .insert(FINGERPRINT.to_string(), "-----BEGIN CERT-----".to_string());
 
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
 
         let info = queued_store_info(&state).expect("details queued for signing");
@@ -14916,7 +14957,7 @@ mod tests {
             .insert(FINGERPRINT.to_string(), "cert".to_string());
 
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
 
         let info = queued_store_info(&state).expect("details queued for signing");
@@ -14939,7 +14980,7 @@ mod tests {
         assert!(state.note_store_state_unavailable(&STORE_ID));
 
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
 
         assert_eq!(
@@ -15263,7 +15304,7 @@ mod tests {
             .insert(FINGERPRINT.to_string(), "cert".to_string());
 
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
 
         assert_eq!(
@@ -15453,10 +15494,10 @@ mod tests {
             .insert(FINGERPRINT.to_string(), "cert".to_string());
 
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
         state
-            .publish_store_details(&STORE_ID, typed_details())
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
             .expect("the seller owns this store");
 
         let versions: Vec<u32> = state

@@ -208,8 +208,9 @@ fn store_info_delta_bytes(
 /// (harvest#164). A write to our own store therefore never reaches here while
 /// the registration names an earlier generation of a store with a store key:
 /// see [`current_store_write`]. What still can is a store from before revision
-/// 2, whose generation cannot be derived, which is why the caller is told
-/// which of the two it got and can say so.
+/// 2, whose generation cannot be derived, and one registered by a NEWER build
+/// than this tab's, which this build cannot know is current; that is why the
+/// caller is told how its key was found and can say so.
 pub fn store_contract_key(
     registration: &StoreRegistration,
 ) -> Result<(ContractKey, KeyOrigin), String> {
@@ -615,20 +616,27 @@ async fn current_store_write(store_contract_id: &[u8]) -> Result<Option<Vec<u8>>
 /// (`migrate_seal::forward_give_up_ms`), and a forward PUT does not
 /// subscribe, so its landing may never reach this session on its own. Until
 /// it does, reads stay on the earlier generation and instant checkout is off.
+///
+/// One per store: every `StoreList` answer asks, and a store already being
+/// asked about is not asked about twice.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn spawn_move_to_current(current: Vec<u8>) {
+    thread_local! {
+        static ASKING: std::cell::RefCell<std::collections::HashSet<Vec<u8>>> =
+            std::cell::RefCell::default();
+    }
+    if !ASKING.with(|asking| asking.borrow_mut().insert(current.clone())) {
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::ReadableExt;
         let mut wait_ms: u32 = 15_000;
-        loop {
-            let moving = super::APP_STATE.read().is_moving_to(&current);
-            if !moving {
-                return;
-            }
+        while super::APP_STATE.read().is_moving_to(&current) {
             probe_current_generation(&current).await;
             gloo_timers::future::TimeoutFuture::new(wait_ms).await;
             wait_ms = (wait_ms * 2).min(300_000);
         }
+        ASKING.with(|asking| asking.borrow_mut().remove(&current));
     });
 }
 
@@ -1194,8 +1202,9 @@ mod tests {
         for name in ["owned_store_key", "settlement_store_key"] {
             let body = body_of(name);
             assert!(
-                body.contains("current_store_write(store_contract_id)"),
-                "{name} must resolve through current_store_write"
+                body.contains("current_store_write(store_contract_id)\n        .await?")
+                    || body.contains("current_store_write(store_contract_id).await?"),
+                "{name} must resolve through current_store_write, and fail when it does"
             );
             assert!(
                 body.contains("owned_write_key(&registered)"),
@@ -1211,7 +1220,8 @@ mod tests {
         );
         let wait = body_of("current_store_write");
         assert_eq!(wait.matches("Ok(Some(").count(), 1);
-        assert!(wait.contains("WriteStep::Send(id) => return Ok(Some(id)),"));
+        assert!(wait.contains("\n            WriteStep::Send(id) => return Ok(Some(id)),\n"));
+        assert!(wait.contains(".store_write_target(store_contract_id);"));
         // And every owner write goes through one of the two.
         for writer in [
             "submit_listing_by_id",

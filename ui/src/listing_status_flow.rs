@@ -117,9 +117,6 @@ pub struct Publishing {
     pub title: String,
     /// The notice shown while it is on its way, taken down when it ends.
     pub notice: String,
-    /// A refusal was reported against it; it waits on, in case the refusal
-    /// was about another write ([`AppState::on_update_refused`]).
-    pub refused: bool,
 }
 
 impl AppState {
@@ -271,7 +268,6 @@ impl AppState {
                 store_contract_id,
                 title,
                 notice,
-                refused: false,
             },
         );
         Ok(())
@@ -293,9 +289,7 @@ impl AppState {
         Some(publishing)
     }
 
-    /// A store's state arrived: every new listing it now holds is published,
-    /// including one a refusal was wrongly taken to be about, whose "not
-    /// published" notice comes down with it (see [`Self::on_update_refused`]).
+    /// A store's state arrived: every new listing it now holds is published.
     ///
     /// Only the state of the generation the listing was written to counts
     /// (harvest#164): an earlier generation can hold the same terms.
@@ -326,48 +320,33 @@ impl AppState {
         }
     }
 
-    /// The node refused an update to `contract_id` (harvest#161). Its error
-    /// names the contract only in its text and carries no request id, so it
-    /// cannot be matched to one write. Every new listing waiting on that
-    /// store, and not already reported, is reported as not published, and
-    /// keeps waiting: one that lands after all takes the report down again
-    /// ([`Self::settle_publishing`]). With none waiting, the refusal is said
-    /// for a store of ours.
+    /// The node refused an update to `contract_id` (harvest#161), for a
+    /// store of ours: say so, with the node's reason, and take down every
+    /// "Publishing" notice waiting on that store.
+    ///
+    /// The node's error names the contract only in its text and carries no
+    /// request id, so it cannot be tied to one write, and it is not: the
+    /// message names no listing. A waiting listing that did land shows in the
+    /// store as usual; one that did not is not there to be mistaken for
+    /// published.
     pub(crate) fn on_update_refused(&mut self, contract_id: &[u8], reason: &str) {
-        // One already reported is not taken to be the subject of every later
-        // refusal: that would hide each of those behind its report.
         let waiting: Vec<ListingId> = self
             .publishing_listings
             .iter()
-            .filter(|(_, p)| {
-                !p.refused && self.current_generation_of(&p.store_contract_id) == contract_id
-            })
+            .filter(|(_, p)| self.current_generation_of(&p.store_contract_id) == contract_id)
             .map(|(id, _)| id.clone())
             .collect();
-        if waiting.is_empty() {
-            if self.store_write_target(contract_id) != crate::state::StoreWriteTarget::NotOurs {
-                self.notifications.push(format!(
-                    "A change to your store was refused by the network: {reason}"
-                ));
-            }
+        let ours = self.store_write_target(contract_id) != crate::state::StoreWriteTarget::NotOurs;
+        if waiting.is_empty() && !ours {
             return;
         }
         for id in waiting {
-            let Some(publishing) = self.publishing_listings.get_mut(&id) else {
-                continue;
-            };
-            let report = format!(
-                "Your listing \u{201c}{}\u{201d} was not published: the network refused \
-                 it ({reason}).",
-                publishing.title
-            );
-            publishing.refused = true;
-            let old = std::mem::replace(&mut publishing.notice, report.clone());
-            match self.notifications.iter().position(|n| *n == old) {
-                Some(at) => self.notifications[at] = report,
-                None => self.notifications.push(report),
-            }
+            self.end_publishing(&id);
         }
+        self.notifications.push(format!(
+            "A change to your store was refused by the network: {reason}. Check that your \
+             latest changes show on your store."
+        ));
     }
 
     fn publish_listing_as(
@@ -860,64 +839,40 @@ mod tests {
         assert_eq!(publishing_notices(&state), 1);
     }
 
-    /// **A refused publish is said, and "Publishing" comes down
+    /// **A refused update is said, and "Publishing" comes down
     /// (harvest#161).** The E2E seller's listing was refused by the store
-    /// contract and the page said "Publishing" forever. A refusal cannot be
-    /// tied to one write, so a listing it was wrongly taken to be about
-    /// takes the report down when it lands. A refusal no listing is waiting
-    /// on (including one already reported) is still said, for a store of
-    /// ours. Mutated red by ignoring the refusal, and by attributing later
-    /// refusals to an already-reported listing.
+    /// contract and the page said "Publishing" forever. Each refusal is said
+    /// once, as itself, for a store of ours and for no one else's. Mutated
+    /// red by ignoring the refusal, and by leaving the notices up.
     #[test]
-    fn a_refused_listing_is_reported() {
-        let (mut state, earlier, current) = moving_seller();
-        let mugs = listing("Mugs");
-        state
-            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), mugs.clone(), None)
-            .expect("queued");
-        state.on_update_refused(&current, "the listing is not valid");
-        assert_eq!(publishing_notices(&state), 0);
-        let report = |state: &AppState| {
+    fn a_refused_update_is_reported() {
+        let refusals = |state: &AppState| {
             state
                 .notifications
                 .iter()
-                .filter(|n| {
-                    n.contains("\u{201c}Mugs\u{201d} was not published")
-                        && n.contains("the listing is not valid")
-                })
-                .count()
+                .filter(|n| n.starts_with("A change to your store was refused"))
+                .cloned()
+                .collect::<Vec<_>>()
         };
-        assert_eq!(report(&state), 1);
-        // It was about something else after all.
-        holding(&mut state, current.clone(), &mugs);
-        state.settle_publishing(&current);
-        assert_eq!(report(&state), 0);
-        assert!(state.publishing_listings.is_empty());
-
-        let before = state.notifications.len();
-        state.on_update_refused(&earlier, "an order is not valid");
-        assert_eq!(state.notifications.len(), before + 1);
-        state.on_update_refused(&[0x44; 32], "not ours");
-        assert_eq!(state.notifications.len(), before + 1);
-
-        // A listing already reported is not the subject of every later
-        // refusal: the next one is said as itself.
         let (mut state, earlier, current) = moving_seller();
-        state.adopt_migrated_contract_id(&earlier, current.clone());
         state
-            .publish_new_listing(current.clone(), FINGERPRINT.into(), listing("Bowls"), None)
+            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), listing("Mugs"), None)
             .expect("queued");
+        state
+            .publish_new_listing(earlier.clone(), FINGERPRINT.into(), listing("Bowls"), None)
+            .expect("queued");
+        state.adopt_migrated_contract_id(&earlier, current.clone());
         state.on_update_refused(&current, "the listing is not valid");
+        assert_eq!(publishing_notices(&state), 0);
+        assert!(state.publishing_listings.is_empty());
         state.on_update_refused(&current, "the invoice is not valid");
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n.contains("Bowls") && n.contains("the listing is not valid")));
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n
-                == "A change to your store was refused by the network: the invoice is not valid"));
+        let said = refusals(&state);
+        assert_eq!(said.len(), 2);
+        assert!(said[0].contains("the listing is not valid"));
+        assert!(said[1].contains("the invoice is not valid"));
+
+        state.on_update_refused(&[0x44; 32], "not ours");
+        assert_eq!(refusals(&state).len(), 2);
     }
 
     /// **"Publishing" comes down through the real arrival path (harvest#161)**,

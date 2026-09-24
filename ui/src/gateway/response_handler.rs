@@ -35,7 +35,11 @@ pub fn handle_response(response: Result<HostResponse, String>) {
         }
         Err(e) => {
             error!("Gateway error: {}", e);
-            apply_gateway_error(&mut APP_STATE.write(), &e);
+            // Parsed first: a write to `APP_STATE` re-renders the app, and
+            // most gateway errors change nothing in it.
+            if refused_update(&e).is_some() {
+                apply_gateway_error(&mut APP_STATE.write(), &e);
+            }
         }
     }
 }
@@ -310,15 +314,18 @@ mod tests {
             bs58::encode(store).into_string()
         );
         apply_gateway_error(&mut state, &error);
-        assert_eq!(
-            state.notifications,
-            vec!["A change to your store was refused by the network: the order is not valid"]
-        );
+        assert_eq!(state.notifications.len(), 1);
+        assert!(state.notifications[0].starts_with(
+            "A change to your store was refused by the network: the order is not valid"
+        ));
 
         let src = include_str!("response_handler.rs");
         let handler = &src[src.find("pub fn handle_response(").unwrap()..];
-        let handler = &handler[..handler.find("\n}\n").unwrap()];
-        assert!(handler.contains("apply_gateway_error(&mut APP_STATE.write(), &e)"));
+        let err_arm = &handler[handler.find("Err(e) => {").unwrap()..];
+        let err_arm = &err_arm[..err_arm.find("\n        }\n").unwrap()];
+        assert!(err_arm.contains(
+            "if refused_update(&e).is_some() {\n                apply_gateway_error(&mut APP_STATE.write(), &e);"
+        ));
     }
 
     /// **An undecodable payload's error quotes nothing from it** (review of
