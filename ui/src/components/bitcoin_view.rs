@@ -112,7 +112,10 @@ pub(crate) fn my_orders(app_state: &crate::state::AppState) -> Vec<AuthorizedOrd
     let mut orders: Vec<AuthorizedOrder> = app_state
         .browsing_stores
         .iter()
-        .filter(|(id, _)| app_state.store_owner_fingerprint(id).is_some())
+        // The generation the registration names, not every id our store is
+        // found by: after a move the earlier generation stays loaded and
+        // would list every order twice, one copy stale (harvest#164).
+        .filter(|(id, _)| app_state.is_registered_store_id(id))
         .flat_map(|(_, s)| {
             s.orders
                 .iter()
@@ -515,7 +518,7 @@ fn address_matches_script(order: &harvest_common::payment::Order) -> Option<bool
 /// module itself, because the test lives in a sibling module and needs to see
 /// it.
 #[cfg(test)]
-pub(super) mod __address_check_test_support {
+pub(crate) mod __address_check_test_support {
     use harvest_common::listing::ListingId;
     use harvest_common::payment::{Order, OrderId};
 

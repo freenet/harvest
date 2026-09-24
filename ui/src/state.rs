@@ -1198,6 +1198,16 @@ pub(crate) fn current_store_generation(key: &ed25519_dalek::VerifyingKey) -> Opt
         .map(|id| id.as_bytes().to_vec())
 }
 
+/// The clock a store-details version is floored at: seconds, and 0 for a
+/// clock `u32` cannot hold, which floors nothing (held + 1 still holds).
+/// Never `u32::MAX`: a version there can never be outranked (harvest#164).
+pub(crate) fn details_clock_floor(unix_secs: i64) -> u32 {
+    u32::try_from(unix_secs)
+        .ok()
+        .filter(|secs| *secs < u32::MAX)
+        .unwrap_or(0)
+}
+
 /// The current generation of a registration that still names an earlier
 /// one, if it does (harvest#164).
 fn moving_to(registration: &StoreRegistration) -> Option<Vec<u8>> {
@@ -3846,7 +3856,10 @@ impl AppState {
     /// earlier generation, the current generation's. Work started under one
     /// of them (an edit parked on a certificate, a despatch waiting on its
     /// signature) finishes under whichever the registration names by then,
-    /// so every lookup of our store by id goes through here.
+    /// so the lookups that finish such work go through here:
+    /// `store_owner_key`, `store_owner_fingerprint`, `store_write_target`,
+    /// `issue_invoice`. What LISTS our stores' contents must not, or a moved
+    /// store is listed twice: see [`Self::is_registered_store_id`].
     pub(crate) fn our_registration(&self, id: &[u8]) -> Option<(&String, &StoreRegistration)> {
         let id = self
             .migrated_contract_ids
@@ -3861,6 +3874,15 @@ impl AppState {
         all()
             .find(|(_, s)| s.store_contract_id == id)
             .or_else(|| all().find(|(_, s)| moving_to(s).as_deref() == Some(id)))
+    }
+
+    /// Whether `id` is the id a registration of ours names now: one entry
+    /// per store, for anything that lists our stores' contents.
+    pub(crate) fn is_registered_store_id(&self, id: &[u8]) -> bool {
+        self.my_stores
+            .values()
+            .flatten()
+            .any(|s| s.store_contract_id == id)
     }
 
     /// The generation a write to our store `id` goes to: its current one,
@@ -8705,9 +8727,11 @@ impl AppState {
         store_contract_id: &[u8],
         details: StoreDetails,
     ) -> Result<(), String> {
-        // A clock this cannot represent floors nothing; held + 1 still holds.
-        let now_secs = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-        self.publish_store_details_at(store_contract_id, details, now_secs)
+        self.publish_store_details_at(
+            store_contract_id,
+            details,
+            details_clock_floor(chrono::Utc::now().timestamp()),
+        )
     }
 
     /// [`Self::publish_store_details`] with the clock given.
@@ -8764,15 +8788,21 @@ impl AppState {
         // network holds, with `return Ok(())` and no error anywhere. The UI
         // said "Publishing your store's details…" and the edit was gone.
         // Retrying recomputed 1 and lost again.
+        // Whether the version below rests on a GET that gave up rather than
+        // on state that arrived.
+        let mut assumed_empty = false;
         let published_version = match self
             .browsing_stores
             .get(&shown)
             .and_then(|store| store.info.as_ref())
         {
             Some(info) => info.version,
-            // The GET gave up, so there is nothing published to be stale
-            // against. This is the store stranded mid-creation.
-            None if self.store_state_unavailable.contains(&shown) => 0,
+            // The GET gave up, so there is taken to be nothing published to be
+            // stale against. This is the store stranded mid-creation.
+            None if self.store_state_unavailable.contains(&shown) => {
+                assumed_empty = true;
+                0
+            }
             // Since the version is floored at the clock (below), an edit from
             // a form that never loaded would no longer be dropped as stale:
             // it would overwrite the real details with empty ones. Refused
@@ -8820,7 +8850,12 @@ impl AppState {
                     .to_string(),
             );
         }
-        let next_version = (base + 1).max(now_secs);
+        // Not over an assumption: a GET that gave up does not show that
+        // nothing is published, and a version at the clock would overwrite
+        // whatever is with what this form holds. Held + 1 is dropped as stale
+        // instead, which is where this was before harvest#164.
+        let floor = if assumed_empty { 0 } else { now_secs };
+        let next_version = (base + 1).max(floor);
 
         self.pending_store_edit = Some(PendingStoreEdit {
             ghostkey_fingerprint: ghostkey_fingerprint.clone(),
@@ -10162,14 +10197,7 @@ impl AppState {
         // order against `StoreParameters::seller_verifying_key`, so an invoice
         // signed by any other identity is rejected with nothing to say why.
         let owner = self
-            .my_stores
-            .iter()
-            .find(|(_, stores)| {
-                stores
-                    .iter()
-                    .any(|s| s.store_contract_id == invoice.store_contract_id)
-            })
-            .map(|(fingerprint, _)| fingerprint.clone())
+            .store_owner_fingerprint(&invoice.store_contract_id)
             .ok_or("this store is not one of yours -- nothing to issue an invoice on")?;
         if owner != invoice.seller_fingerprint {
             return Err(format!(
@@ -13616,16 +13644,27 @@ mod tests {
     /// shows and holds for the current generation, and never below the
     /// clock, so a migration forward carrying an older build's later edit
     /// cannot outrank it. It is kept under the current generation, so a
-    /// second edit after the move sees the first. Mutated red by dropping
-    /// the clock floor, by dropping the current generation's version, and by
-    /// keeping the edit under the earlier id.
+    /// second edit in the same second sees the first, before the move and
+    /// after it. Mutated red by dropping the clock floor, by dropping the
+    /// current generation's version, by keeping the edit under the earlier
+    /// id, and by reading the last queued version under the earlier id.
     #[test]
     fn a_details_edit_outranks_every_generation() {
         let (earlier, current) = test_store_generations();
         let mut state = AppState::default();
-        let mut registration = registration(1, None);
-        registration.store_contract_id = earlier.clone();
-        state.merge_store_registrations(FINGERPRINT, vec![registration]);
+        let mut theirs = registration(1, None);
+        theirs.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![theirs]);
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+        state.store_subkeys.insert(
+            test_store_key(),
+            harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: STORE_INBOX_KEY,
+                record_public_key: STORE_RECORD_KEY.to_vec(),
+            },
+        );
         let held = |version: u32| {
             let mut store = loaded_store("Jam");
             store.info.as_mut().unwrap().version = version;
@@ -13637,37 +13676,100 @@ mod tests {
             ..Default::default()
         };
         const NOW: u32 = 1_790_000_000;
+        let queued = |state: &AppState| -> Vec<(Vec<u8>, u32)> {
+            state
+                .pending_signatures
+                .iter()
+                .filter_map(|p| match p {
+                    PendingSignature::StoreInfo(info) => {
+                        Some((info.store_contract_id.clone(), info.info.version))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
 
-        // Still moving, nothing known of the current generation: the clock.
-        state
-            .publish_store_details_at(&earlier, details.clone(), NOW)
-            .expect("queued");
-        let first = state.pending_store_edit.take().expect("pending");
-        assert_eq!(first.store_contract_id, current);
-        assert_eq!(first.next_version, NOW);
-        state.last_queued_store_version.insert(current.clone(), NOW);
+        // Still moving, nothing known of the current generation: the clock,
+        // then past it in the same second.
+        for _ in 0..2 {
+            state
+                .publish_store_details_at(&earlier, details.clone(), NOW)
+                .expect("queued");
+        }
+        assert_eq!(
+            queued(&state),
+            vec![(current.clone(), NOW), (current.clone(), NOW + 1)]
+        );
 
         // The current generation holds a higher version than shown: above it.
         state.browsing_stores.insert(current.clone(), held(NOW + 7));
         state
             .publish_store_details_at(&earlier, details.clone(), NOW)
             .expect("queued");
-        assert_eq!(
-            state.pending_store_edit.take().unwrap().next_version,
-            NOW + 8
-        );
-        state.browsing_stores.remove(&current);
+        assert_eq!(queued(&state).last().unwrap().1, NOW + 8);
 
-        // Moved, asked by the old id, in the same second as the first edit:
-        // past the first, not tied with it.
+        // Moved, asked by the old id, in the same second: past all of them.
         state.adopt_migrated_contract_id(&earlier, current.clone());
-        state.browsing_stores.insert(current.clone(), held(3));
         state
             .publish_store_details_at(&earlier, details, NOW)
             .expect("queued");
-        let second = state.pending_store_edit.take().expect("pending");
-        assert_eq!(second.store_contract_id, current);
-        assert_eq!(second.next_version, NOW + 1);
+        assert_eq!(*queued(&state).last().unwrap(), (current, NOW + 9));
+    }
+
+    /// A GET that gave up does not show that nothing is published, so an
+    /// edit resting on it is not floored at the clock: at the clock it would
+    /// overwrite whatever is there with what the form holds. Mutated red by
+    /// flooring it anyway.
+    #[test]
+    fn an_edit_over_a_store_that_did_not_answer_is_not_floored() {
+        let mut state = AppState::default();
+        state.merge_store_registrations(FINGERPRINT, vec![registration(1, None)]);
+        state.store_state_unavailable.insert(vec![1u8; 32]);
+        state
+            .publish_store_details_at(&[1u8; 32], StoreDetails::default(), 1_790_000_000)
+            .expect("queued");
+        assert_eq!(state.pending_store_edit.unwrap().next_version, 1);
+    }
+
+    /// The floor is seconds, and a clock `u32` cannot hold floors nothing
+    /// rather than pinning a version no edit can pass.
+    #[test]
+    fn the_details_clock_floor_is_seconds_and_never_the_ceiling() {
+        assert_eq!(details_clock_floor(1_790_000_000), 1_790_000_000);
+        assert_eq!(details_clock_floor(-5), 0);
+        assert_eq!(details_clock_floor(i64::from(u32::MAX)), 0);
+        assert_eq!(details_clock_floor(i64::MAX), 0);
+    }
+
+    /// **A moved store's orders are listed once (harvest#164)**: the earlier
+    /// generation stays loaded after the move and holds a stale copy of the
+    /// same orders. Mutated red by listing every id our store is found by.
+    #[test]
+    fn a_moved_stores_orders_are_listed_once() {
+        let (earlier, current) = test_store_generations();
+        let mut state = AppState::default();
+        let mut theirs = registration(1, None);
+        theirs.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![theirs]);
+        let order = harvest_common::payment::AuthorizedOrder {
+            order: crate::components::bitcoin_view::__address_check_test_support::order_paying(
+                "tb1q",
+                vec![0x00, 0x14],
+            ),
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::Paid,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        for id in [&earlier, &current] {
+            let mut store = loaded_store("Jam");
+            store.orders = vec![order.clone()];
+            state.browsing_stores.insert(id.clone(), store);
+        }
+        state.adopt_migrated_contract_id(&earlier, current);
+        assert_eq!(crate::components::bitcoin_view::my_orders(&state).len(), 1);
     }
 
     /// **Work started under an earlier id finishes after the move
@@ -13708,6 +13810,8 @@ mod tests {
         state
             .publish_store_details_at(&earlier, StoreDetails::default(), 0)
             .expect("queued");
+        assert!(state.store_publish_in_flight(&earlier), "before the move");
+        assert!(state.store_publish_in_flight(&current), "before the move");
         state.adopt_migrated_contract_id(&earlier, current.clone());
         assert!(state.store_publish_in_flight(&current));
         assert!(state.store_publish_in_flight(&earlier));
@@ -13725,7 +13829,9 @@ mod tests {
         state
             .publish_store_details(&[1u8; 32], StoreDetails::default())
             .expect("queued");
-        assert!(state.pending_store_edit.unwrap().next_version >= 1_790_000_000);
+        let version = state.pending_store_edit.unwrap().next_version;
+        let now = u32::try_from(chrono::Utc::now().timestamp()).unwrap();
+        assert!((1_790_000_000..=now).contains(&version), "{version}");
     }
 
     /// A version at the ceiling cannot be outranked, so an edit is refused
@@ -13739,6 +13845,20 @@ mod tests {
         state.browsing_stores.insert(vec![1u8; 32], store);
         assert!(state
             .publish_store_details_at(&[1u8; 32], StoreDetails::default(), 5)
+            .is_err());
+
+        // And at the ceiling on the current generation while moving.
+        let (earlier, current) = test_store_generations();
+        let mut state = AppState::default();
+        let mut theirs = registration(1, None);
+        theirs.store_contract_id = earlier.clone();
+        state.merge_store_registrations(FINGERPRINT, vec![theirs]);
+        state.browsing_stores.insert(earlier, loaded_store("Jam"));
+        let mut top = loaded_store("Jam");
+        top.info.as_mut().unwrap().version = u32::MAX;
+        state.browsing_stores.insert(current.clone(), top);
+        assert!(state
+            .publish_store_details_at(&current, StoreDetails::default(), 5)
             .is_err());
     }
 

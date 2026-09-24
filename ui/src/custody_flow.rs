@@ -2188,6 +2188,38 @@ mod tests {
         );
     }
 
+    /// The same for an edit parked while the store is still moving to its
+    /// current generation, which is kept under the current generation's id
+    /// (harvest#164): the release finds it by that id too. Mutated red by an
+    /// exact-id owner lookup.
+    #[test]
+    fn a_subkeys_failure_releases_an_edit_parked_while_moving() {
+        let (earlier, current) = crate::state::test_store_generations();
+        let mut state = crate::state::AppState::default();
+        state.my_stores.insert(
+            FINGERPRINT.to_string(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: earlier,
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        state.pending_store_edit = Some(crate::state::PendingStoreEdit {
+            ghostkey_fingerprint: FINGERPRINT.to_string(),
+            store_contract_id: current,
+            reputation_contract_id: [2; 32],
+            next_version: 4,
+            details: Default::default(),
+        });
+        state
+            .store_subkeys_requested
+            .insert(crate::state::test_store_key());
+        state.on_subkeys_request_failed(crate::state::test_store_key(), "no key here");
+        assert!(state.pending_store_edit.is_none());
+    }
+
     /// A subkeys failure releases a parked EDIT, not just a creation (#101
     /// re-review, lens B).
     ///
