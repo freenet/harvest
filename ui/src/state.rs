@@ -14022,7 +14022,8 @@ mod tests {
         state.browsing_stores.insert(vec![1u8; 32], store);
         assert!(state
             .publish_store_details_at(&[1u8; 32], StoreDetails::default(), 5)
-            .is_err());
+            .unwrap_err()
+            .contains("highest version"));
 
         // And at the ceiling on the current generation while moving.
         let (earlier, current) = test_store_generations();
@@ -17740,6 +17741,14 @@ mod invoice_tests {
         state.browsing_stores.insert(earlier.clone(), old);
         state.browsing_stores.insert(current.clone(), loaded);
         state.adopt_migrated_contract_id(&earlier, current);
+        // A migration of something that is not a store of ours (a mailbox)
+        // whose old id happens to be loaded with orders adds nothing.
+        let mut other = state.browsing_stores[&earlier].clone();
+        other.orders[0].order.payment_script_pubkey = vec![0x00, 0x14, 0xCC];
+        state.browsing_stores.insert(vec![0x51; 32], other);
+        state
+            .migrated_contract_ids
+            .insert(vec![0x51; 32], vec![0x52; 32]);
         let scripts = state.published_payment_scripts();
         assert!(
             scripts.contains(&vec![0x00, 0x14, 0xEE]),
@@ -17749,6 +17758,7 @@ mod invoice_tests {
             scripts.contains(&vec![0x00, 0x14, 0xDD]),
             "the current generation's"
         );
+        assert!(!scripts.contains(&vec![0x00, 0x14, 0xCC]), "not ours");
     }
 
     /// **An invoice waits for the move, then goes to the current generation
