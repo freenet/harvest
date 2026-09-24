@@ -144,6 +144,54 @@ mod css_spacing_tests {
     /// invisible to the check above, and its children would get the sibling
     /// margins on top of its gap. Use a class (`form-actions`, `row-between`,
     /// ...) instead.
+    /// The 1-based lines of every `style:` attribute whose string makes its
+    /// element a flex or grid container. Reads the whole string literal
+    /// after `style:`, which may span lines.
+    fn inline_flex_or_grid_lines(source: &str) -> Vec<usize> {
+        let mut lines = Vec::new();
+        for (at, _) in source.match_indices("style:") {
+            let rest = &source[at..];
+            let Some(open) = rest.find('"') else { continue };
+            let body = &rest[open + 1..];
+            let mut end = body.len();
+            let mut escaped = false;
+            for (i, c) in body.char_indices() {
+                match c {
+                    '\\' if !escaped => escaped = true,
+                    '"' if !escaped => {
+                        end = i;
+                        break;
+                    }
+                    _ => escaped = false,
+                }
+            }
+            let value: String = body[..end].chars().filter(|c| !c.is_whitespace()).collect();
+            if value.split(';').any(|decl| {
+                decl.split_once(':').is_some_and(|(property, v)| {
+                    property == "display"
+                        && ["flex", "grid", "inline-flex", "inline-grid"]
+                            .contains(&v.replace("!important", "").as_str())
+                })
+            }) {
+                lines.push(1 + source[..at].matches('\n').count());
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn the_inline_detector_fires_on_what_it_is_meant_to_catch() {
+        // Guards the guard below, which has nothing live to fire on.
+        let caught = "div { style: \"display: flex; gap: 8px;\",\n\
+                      div { style: \"margin-top: 12px;\n   display:grid !important;\",\n\
+                      div { style: format!(\"color: red; display: inline-flex\"),";
+        // The second attribute's string spans two lines, so the third is on line 4.
+        assert_eq!(inline_flex_or_grid_lines(caught), vec![1, 2, 4]);
+        let ignored = "div { style: \"display: block; font-display: flex;\",\n\
+                       p { style: \"font-size: 0.8rem;\", \"display: flex\" }";
+        assert!(inline_flex_or_grid_lines(ignored).is_empty());
+    }
+
     #[test]
     fn no_markup_makes_a_flex_or_grid_container_inline() {
         // Every component file, read at test time so a new one is covered.
@@ -167,22 +215,8 @@ mod css_spacing_tests {
         );
         let mut offending = Vec::new();
         for (file, source) in &sources {
-            for (n, line) in source.lines().enumerate() {
-                let Some(at) = line.find("style:") else {
-                    continue;
-                };
-                let compact: String = line[at..].chars().filter(|c| !c.is_whitespace()).collect();
-                if [
-                    "display:flex",
-                    "display:grid",
-                    "display:inline-flex",
-                    "display:inline-grid",
-                ]
-                .iter()
-                .any(|d| compact.contains(d))
-                {
-                    offending.push(format!("{file}:{}", n + 1));
-                }
+            for line in inline_flex_or_grid_lines(source) {
+                offending.push(format!("{file}:{line}"));
             }
         }
         assert!(
