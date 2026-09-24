@@ -9024,11 +9024,19 @@ impl AppState {
             details,
         });
         // An earlier edit this one replaced before it was signed is no
-        // longer under way; drop it so the list only holds live edits.
+        // longer under way; drop it so the list only holds live edits. The
+        // (store, version) pair about to be pushed below is excluded
+        // outright: `pending_store_edit` above already points at THIS edit,
+        // so if an older, unsent entry happens to share that exact pair (a
+        // same-second resubmission), it would otherwise read as still
+        // in-flight and survive alongside the fresh push.
         let edits = std::mem::take(&mut self.publishing_details);
         self.publishing_details = edits
             .into_iter()
-            .filter(|p| p.sent || self.details_edit_in_flight(&p.store, p.version))
+            .filter(|p| {
+                !(p.store == written_to && p.version == next_version)
+                    && (p.sent || self.details_edit_in_flight(&p.store, p.version))
+            })
             .collect();
         self.publishing_details.push(DetailsPublishing {
             store: written_to.clone(),
@@ -15536,6 +15544,109 @@ mod tests {
             state.progress_notices().is_empty(),
             "{:?}",
             state.publishing_details
+        );
+    }
+
+    /// **A refusal ends every SENT edit for the store, and only those
+    /// (harvest#166).** The node's refusal names no request, so
+    /// `end_sent_details_publishing` cannot tell which edit it was about and
+    /// takes down every edit already handed to the node -- here, two of
+    /// them -- but an edit still waiting on its signature has not been
+    /// handed to anything yet, so a refusal of an unrelated write must leave
+    /// it alone. Mutated red by dropping the `p.sent` guard (which would
+    /// also end the still-queued edit) and by ending only the first sent
+    /// match instead of every one (which would leave the second sent edit's
+    /// notice stuck up).
+    #[test]
+    fn a_refusal_ends_every_sent_edit_and_only_those() {
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        state
+            .certificates
+            .insert(FINGERPRINT.to_string(), "CERT".to_string());
+
+        // Two edits, both sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let a = queued_version(&state);
+        state.details_sent(&STORE_ID, a);
+        state.pending_signatures.clear();
+
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let b = queued_version(&state);
+        assert!(b > a);
+        state.details_sent(&STORE_ID, b);
+        state.pending_signatures.clear();
+
+        // A third, still waiting on its signature -- never sent.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let c = queued_version(&state);
+        assert!(c > b);
+
+        assert_eq!(
+            state.publishing_details.len(),
+            3,
+            "{:?}",
+            state.publishing_details
+        );
+
+        state.on_update_refused(&STORE_ID, "invalid");
+
+        assert_eq!(
+            state.publishing_details,
+            vec![DetailsPublishing {
+                store: STORE_ID.to_vec(),
+                version: c,
+                sent: false,
+            }],
+            "both sent edits end, the queued one stays"
+        );
+        assert!(
+            !state.progress_notices().is_empty(),
+            "the still-queued edit keeps the notice up"
+        );
+    }
+
+    /// **A same-second resubmission while waiting on the certificate does
+    /// not duplicate the edit (harvest#166).** Before the certificate
+    /// arrives, `last_queued_store_version` is never bumped (it is only
+    /// touched once an edit actually reaches signing), so a second
+    /// submission at the same clock second computes the SAME version as the
+    /// first -- and the stale first entry, still keyed by that version, must
+    /// not survive the pre-push filter alongside the fresh one it collides
+    /// with. Mutated red by letting the filter keep the (store, version)
+    /// pair the push is about to add.
+    #[test]
+    fn a_same_second_resubmission_does_not_duplicate_the_edit() {
+        let mut state = seller_with_store(Some(published_info(3, "Bean Shop", REPUTATION_ID)));
+        // No certificate: the edit is stuck waiting, so a resubmission at
+        // the same clock second collides on version with the first.
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let first_version = state.pending_store_edit.as_ref().unwrap().next_version;
+
+        state
+            .publish_store_details_at(&STORE_ID, typed_details(), 0)
+            .expect("queued");
+        let second_version = state.pending_store_edit.as_ref().unwrap().next_version;
+        assert_eq!(
+            second_version, first_version,
+            "the collision this test needs"
+        );
+
+        assert_eq!(
+            state.publishing_details,
+            vec![DetailsPublishing {
+                store: STORE_ID.to_vec(),
+                version: first_version,
+                sent: false,
+            }],
+            "one entry, not two"
         );
     }
 
