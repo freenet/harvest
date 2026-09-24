@@ -1199,15 +1199,22 @@ mod tests {
     /// and by sending on anything but `Send`.
     #[test]
     fn every_write_to_our_store_goes_to_its_current_generation() {
+        let squash = |body: &str| body.split_whitespace().collect::<String>();
+        assert!(
+            squash(body_of("owned_store_key"))
+                .contains("letregistered=current_store_write(store_contract_id).await?"),
+            "owned_store_key must write to the id current_store_write returned, and fail with it"
+        );
+        let settlement = squash(body_of("settlement_store_key"));
+        assert!(
+            settlement.contains("letours=current_store_write(store_contract_id).await?;"),
+            "settlement_store_key must fail when the wait does"
+        );
+        assert!(settlement
+            .contains("Some(registered)=>{let(key,origin)=state.owned_write_key(&registered)?;"));
         for name in ["owned_store_key", "settlement_store_key"] {
-            let body = body_of(name);
             assert!(
-                body.contains("current_store_write(store_contract_id)\n        .await?")
-                    || body.contains("current_store_write(store_contract_id).await?"),
-                "{name} must resolve through current_store_write, and fail when it does"
-            );
-            assert!(
-                body.contains("owned_write_key(&registered)"),
+                body_of(name).contains("owned_write_key(&registered)"),
                 "{name} must key the write by the id current_store_write returned"
             );
         }
@@ -1222,6 +1229,7 @@ mod tests {
         assert_eq!(wait.matches("Ok(Some(").count(), 1);
         assert!(wait.contains("\n            WriteStep::Send(id) => return Ok(Some(id)),\n"));
         assert!(wait.contains(".store_write_target(store_contract_id);"));
+        assert!(wait.contains("write_step(target, js_sys::Date::now() - started)"));
         // And every owner write goes through one of the two.
         for writer in [
             "submit_listing_by_id",

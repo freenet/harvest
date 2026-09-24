@@ -124,8 +124,10 @@ pub const FORWARD_SLOW_NOTICE_MS: u32 = freenet_migrate::RECOMMENDED_PROBE_TIMEO
 ///   (`AppState::adopt_if_current_generation`), which
 ///   `store_ops::spawn_move_to_current` keeps asking for, backing off to
 ///   5 min, until it does. A slow store forward therefore delays the move
-///   rather than keeping the load on the predecessor, and reads and writes
-///   stay on one generation throughout.
+///   rather than keeping the load on the predecessor, and this device's
+///   writes and the reads it acts on follow one generation. (The earlier
+///   generation's subscription is not dropped on the move; what it brings is
+///   keyed by content and harmless.)
 /// * **A mailbox adopt** moves where the seller's replies and invoice accepts
 ///   are sent (`browsing_stores[..].mailbox_contract_id`). One sent to the
 ///   predecessor before a late adopt is not seen by a buyer on the current

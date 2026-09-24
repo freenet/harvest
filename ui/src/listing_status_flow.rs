@@ -301,22 +301,13 @@ impl AppState {
             .publishing_listings
             .iter()
             .filter(|(id, p)| {
-                self.current_generation_of(&p.store_contract_id) == contract_id
+                self.write_generation(&p.store_contract_id) == contract_id
                     && store.listings.iter().any(|l| &l.listing.id == *id)
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in landed {
             self.end_publishing(&id);
-        }
-    }
-
-    /// The generation a write to `store_contract_id` goes to.
-    fn current_generation_of(&self, store_contract_id: &[u8]) -> Vec<u8> {
-        match self.store_write_target(store_contract_id) {
-            crate::state::StoreWriteTarget::Ready(id) => id,
-            crate::state::StoreWriteTarget::Moving { current, .. } => current,
-            crate::state::StoreWriteTarget::NotOurs => store_contract_id.to_vec(),
         }
     }
 
@@ -333,7 +324,7 @@ impl AppState {
         let waiting: Vec<ListingId> = self
             .publishing_listings
             .iter()
-            .filter(|(_, p)| self.current_generation_of(&p.store_contract_id) == contract_id)
+            .filter(|(_, p)| self.write_generation(&p.store_contract_id) == contract_id)
             .map(|(id, _)| id.clone())
             .collect();
         let ours = self.store_write_target(contract_id) != crate::state::StoreWriteTarget::NotOurs;
@@ -759,7 +750,7 @@ mod tests {
     /// not count (harvest#164); the current one does, before and after the
     /// session moves there. Mutated red by never ending it, by dropping the
     /// generation check, and by breaking either arm of
-    /// `current_generation_of`.
+    /// `write_generation`.
     #[test]
     fn the_publishing_notice_ends_when_the_listing_lands() {
         // A store on its current generation.
@@ -873,6 +864,21 @@ mod tests {
 
         state.on_update_refused(&[0x44; 32], "not ours");
         assert_eq!(refusals(&state).len(), 2);
+
+        // Another store of ours keeps its notice.
+        let (mut state, earlier, current) = moving_seller();
+        state.adopt_migrated_contract_id(&earlier, current.clone());
+        let mut other = state.my_stores[FINGERPRINT][0].clone();
+        other.store_contract_id = vec![0x55; 32];
+        state.my_stores.get_mut(FINGERPRINT).unwrap().push(other);
+        state
+            .browsing_stores
+            .insert(vec![0x55; 32], BrowsingStore::default());
+        state
+            .publish_new_listing(vec![0x55; 32], FINGERPRINT.into(), listing("Cups"), None)
+            .expect("queued");
+        state.on_update_refused(&current, "the listing is not valid");
+        assert_eq!(publishing_notices(&state), 1);
     }
 
     /// **"Publishing" comes down through the real arrival path (harvest#161)**,
