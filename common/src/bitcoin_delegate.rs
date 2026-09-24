@@ -247,7 +247,18 @@ pub enum BitcoinDelegateRequest {
         #[serde(default)]
         published_scripts: Vec<Vec<u8>>,
     },
+
+    /// The next `count` addresses `DeriveOrderAddress` will hand out, WITHOUT
+    /// consuming them: what the seller's UI asks the bridge to watch before
+    /// the delegate may put one on an instant-checkout invoice (see
+    /// `delegate::AutoInvoiceArm`). Capped at [`MAX_UPCOMING_ADDRESSES`].
+    PeekOrderAddresses { request_id: u64, count: u32 },
 }
+
+/// The most addresses one `PeekOrderAddresses` answers. Also the most
+/// instant-checkout invoices a store can issue between two visits by its
+/// seller, since only a watched address may go on one.
+pub const MAX_UPCOMING_ADDRESSES: u32 = 10;
 
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -297,6 +308,12 @@ pub enum BitcoinDelegateResponse {
         /// counter, or past the scan's gap, and the UI may offer it again.
         #[serde(default)]
         matched_scripts: Vec<Vec<u8>>,
+    },
+    /// Answer to `PeekOrderAddresses`: the addresses from the counter on, in
+    /// index order. Nothing was consumed.
+    UpcomingAddresses {
+        request_id: u64,
+        result: Result<Vec<DerivedAddress>, String>,
     },
 }
 
@@ -378,6 +395,11 @@ impl core::fmt::Debug for BitcoinDelegateRequest {
                 .debug_struct("DeriveOrderAddress")
                 .field("request_id", request_id)
                 .field("published_scripts", published_scripts)
+                .finish(),
+            Self::PeekOrderAddresses { request_id, count } => f
+                .debug_struct("PeekOrderAddresses")
+                .field("request_id", request_id)
+                .field("count", count)
                 .finish(),
         }
     }

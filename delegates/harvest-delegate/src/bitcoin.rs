@@ -47,7 +47,7 @@ use freenet_stdlib::prelude::{DelegateError, MessageOrigin};
 
 use harvest_common::bitcoin_delegate::{
     BitcoinDelegateRequest, BitcoinDelegateResponse, BridgeEndpoint, DerivedAddress,
-    PaymentXpubStatus, WatchedPayment,
+    PaymentXpubStatus, WatchedPayment, MAX_UPCOMING_ADDRESSES,
 };
 use harvest_common::{from_cbor, to_cbor, OrderId};
 
@@ -132,7 +132,7 @@ fn save_bridge<S: SecretStore>(store: &mut S, endpoint: &BridgeEndpoint) {
     }
 }
 
-fn load_payment_xpub<S: SecretStore>(store: &S) -> Option<PaymentXpubStatus> {
+pub(crate) fn load_payment_xpub<S: SecretStore>(store: &S) -> Option<PaymentXpubStatus> {
     store
         .get_secret(BITCOIN_PAYMENT_XPUB_KEY)
         .and_then(|bytes| from_cbor::<Option<PaymentXpubStatus>>(&bytes).ok())
@@ -154,7 +154,7 @@ fn load_payment_xpub<S: SecretStore>(store: &S) -> Option<PaymentXpubStatus> {
 /// `set_secret` always answers `false` off the `wasm32` target, which is why
 /// these handlers take a store rather than a `DelegateCtx` -- see
 /// [`crate::secrets`].
-fn save_payment_xpub<S: SecretStore>(
+pub(crate) fn save_payment_xpub<S: SecretStore>(
     store: &mut S,
     status: &PaymentXpubStatus,
 ) -> Result<(), String> {
@@ -327,7 +327,7 @@ fn apply_published_floor(
 /// beyond the gap, and only the last kind can ever matter again; the UI
 /// offers unmatched scripts again once the counter has moved on, which is
 /// when a beyond-gap one can come into reach.
-fn published_floor_matches(
+pub(crate) fn published_floor_matches(
     status: &mut PaymentXpubStatus,
     published: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -363,7 +363,9 @@ fn published_floor_matches(
 /// (harmless, and bounded by the wallet's gap limit), whereas advancing only
 /// on success would re-issue an address that had already been shown to a
 /// buyer.
-fn apply_derive_order_address(status: &mut PaymentXpubStatus) -> Result<DerivedAddress, String> {
+pub(crate) fn apply_derive_order_address(
+    status: &mut PaymentXpubStatus,
+) -> Result<DerivedAddress, String> {
     if status.next_index > MAX_ORDER_INDEX {
         return Err(
             "this account key has handed out every address it can. Set a fresh account \
@@ -381,6 +383,29 @@ fn apply_derive_order_address(status: &mut PaymentXpubStatus) -> Result<DerivedA
         script_pubkey,
         address,
     })
+}
+
+/// The next `count` addresses [`apply_derive_order_address`] would hand out,
+/// from the counter on, without moving it. At most
+/// [`MAX_UPCOMING_ADDRESSES`], and never past [`MAX_ORDER_INDEX`].
+pub(crate) fn upcoming_addresses(
+    status: &PaymentXpubStatus,
+    count: u32,
+) -> Result<Vec<DerivedAddress>, String> {
+    let account = AccountXpub::parse(&status.xpub)?;
+    let mut out = Vec::new();
+    let mut index = status.next_index;
+    while out.len() < count.min(MAX_UPCOMING_ADDRESSES) as usize && index <= MAX_ORDER_INDEX {
+        let (script_pubkey, address) = account.order_address(index, status.network)?;
+        out.push(DerivedAddress {
+            index,
+            network: status.network,
+            script_pubkey,
+            address,
+        });
+        index += 1;
+    }
+    Ok(out)
 }
 
 /// Add or refresh a watch because a Harvest order now has a Bitcoin payment
@@ -599,6 +624,16 @@ pub fn handle<S: SecretStore>(
                 request_id,
                 result,
                 matched_scripts,
+            }
+        }
+
+        BitcoinDelegateRequest::PeekOrderAddresses { request_id, count } => {
+            BitcoinDelegateResponse::UpcomingAddresses {
+                request_id,
+                result: match load_payment_xpub(store) {
+                    None => Err("no payment key is set yet".to_string()),
+                    Some(status) => upcoming_addresses(&status, count),
+                },
             }
         }
 

@@ -263,6 +263,7 @@ pub(crate) fn family(key: &[u8]) -> Family {
     use harvest_common::migration::SECRET_KEY_PREFIX;
     if !key.starts_with(SECRET_KEY_PREFIX)
         || key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
+        || key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
     {
         // An export covers `harvest:` only, so a foreign key is not something
         // any predecessor sends, and it could name anything in this
@@ -949,6 +950,9 @@ mod tests {
             Family::Standalone, // unfinished store creation
             Family::Folded,     // travelling "folded into" record
             Family::KeptPurchase,
+            Family::Refused, // instant-checkout arm
+            Family::Refused, // instant-checkout ledger
+            Family::Refused, // instant-checkout tip
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(

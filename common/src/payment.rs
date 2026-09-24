@@ -153,6 +153,17 @@ use serde::{Deserialize, Serialize};
 pub struct OrderId(pub [u8; 32]);
 
 impl OrderId {
+    /// The id of the order answering request `request` (see
+    /// [`Order::request_id`]): the request alone decides it, so anyone who
+    /// knows the request, the buyer included, can find its answer in the
+    /// store.
+    pub fn for_request(request: &[u8; 32]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"harvest/order-id/request/v1");
+        h.update(request);
+        Self(*h.finalize().as_bytes())
+    }
+
     /// The id these terms give.
     ///
     /// Idempotent: the id field is blanked before hashing, so computing this
@@ -162,10 +173,7 @@ impl OrderId {
         // An order that answers a request is identified by the request, so
         // a store can hold only one answer to it. See [`Order::request_id`].
         if let Some(request) = order.request_id {
-            let mut h = blake3::Hasher::new();
-            h.update(b"harvest/order-id/request/v1");
-            h.update(&request);
-            return Self(*h.finalize().as_bytes());
+            return Self::for_request(&request);
         }
         let mut probe = order.clone();
         probe.id = Self([0u8; 32]);

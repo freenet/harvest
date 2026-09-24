@@ -54,6 +54,9 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::store_keys::creation_secret(fp),
         crate::import::folded_key(&[7u8; 32]),
         crate::kept_purchases::kept_purchase_key(&[8u8; 32]),
+        crate::auto_invoice::arm_key(&[9u8; 32]),
+        crate::auto_invoice::ledger_key(&[9u8; 32]),
+        crate::auto_invoice::tip_key(freenet_bitcoin_common::BitcoinNetwork::Signet),
     ]
 }
 
@@ -372,6 +375,16 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::KeepPurchase { keep } => crate::kept_purchases::keep(store, *keep),
 
         HarvestDelegateRequest::ListKeptPurchases => crate::kept_purchases::list(store),
+
+        // Instant checkout. Arming also subscribes, which a
+        // `HarvestDelegateResponse` cannot carry, so `lib.rs` answers it
+        // before this match is reached; `arm_auto_invoice` is that path.
+        HarvestDelegateRequest::ArmAutoInvoice { arm } => {
+            crate::auto_invoice::arm(store, *arm, crate::now_ms()).0
+        }
+        HarvestDelegateRequest::GetAutoInvoiceStatus { store_contract_id } => {
+            crate::auto_invoice::status(store, store_contract_id, crate::now_ms())
+        }
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),

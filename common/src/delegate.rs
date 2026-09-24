@@ -498,6 +498,81 @@ pub enum HarvestDelegateRequest {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
     },
+
+    /// Let this delegate answer instant-checkout requests for one store while
+    /// the seller is away (see [`AutoInvoiceArm`]). Rewrites the store's arm
+    /// and subscribes to its mailbox, its store contract and the chain tip, so
+    /// re-sending it is harmless: the UI sends it on every open. Answered
+    /// with [`HarvestDelegateResponse::AutoInvoice`].
+    ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
+
+    /// How auto-invoicing stands for one store, without changing anything.
+    /// Answered with [`HarvestDelegateResponse::AutoInvoice`].
+    GetAutoInvoiceStatus { store_contract_id: Vec<u8> },
+}
+
+/// Everything the Harvest delegate needs to issue an instant-checkout invoice
+/// on its own, as the seller's UI knows it when it is open.
+///
+/// # The watched addresses are the whole safety argument
+///
+/// A payment is only ever seen if the Bitcoin bridge was asked to watch its
+/// address before it was paid (the bridge does not look back:
+/// freenet-bitcoin#7), and asking takes the seller's Ghost Key, which a
+/// delegate running in the background cannot reach. So the UI asks while the
+/// seller is present, for the next few addresses the delegate will hand out,
+/// and names them here once the bridge has read the request. The delegate
+/// invoices only on an address in [`Self::watched_scripts`], and only until
+/// [`Self::watched_until_ms`], after which the bridge lets the watch lapse
+/// unless the seller's UI renews it. Past either, a request waits for the
+/// seller, as every request did before instant checkout.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AutoInvoiceArm {
+    /// The store contract's instance id.
+    pub store_contract_id: Vec<u8>,
+    /// The store key: what signs the order and derives the inbox key that
+    /// opens the requests. The delegate must hold it.
+    pub store_verifying_key: [u8; 32],
+    /// The store's mailbox contract's instance id.
+    pub mailbox_contract_id: [u8; 32],
+    /// The Ghost Key fingerprint the store's orders are issued under
+    /// ([`crate::payment::Order::seller_fingerprint`]).
+    pub seller_fingerprint: String,
+    /// The network invoices are on, and its chain-tip contract, whose newest
+    /// block anchors each order.
+    pub network: freenet_bitcoin_common::BitcoinNetwork,
+    pub tip_contract_id: [u8; 32],
+    /// Copied onto each order exactly as the UI's own invoices carry them
+    /// (`order_for_invoice`).
+    pub trusted_bridges: Vec<freenet_bitcoin_common::BridgeId>,
+    pub address_code_hash: [u8; 32],
+    /// Payment scripts the bridge has read a watch request for, from the
+    /// addresses the delegate will hand out next.
+    pub watched_scripts: Vec<Vec<u8>>,
+    /// When the earliest of those watches lapses, less a margin, by the UI's
+    /// clock.
+    pub watched_until_ms: u64,
+}
+
+/// How auto-invoicing stands for one store: see
+/// [`HarvestDelegateRequest::ArmAutoInvoice`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AutoInvoiceStatus {
+    /// When the store was last armed, by the node's clock.
+    pub armed_at_ms: u64,
+    /// Watched addresses still unused, and until when they are watched.
+    pub watched_remaining: u32,
+    pub watched_until_ms: u64,
+    /// When the delegate last heard from the chain-tip contract while running
+    /// on its own, by the node's clock. `None` means it has not run in the
+    /// background here, which is what a hosted gateway such as
+    /// try.freenet.org looks like: its background runs cannot read the
+    /// seller's arm.
+    pub last_background_run_ms: Option<u64>,
+    /// Instant-checkout invoices issued in the last 24 hours.
+    pub issued_last_day: u32,
+    /// Why the next request would wait for the seller, if it would.
+    pub paused: Option<String>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -905,6 +980,12 @@ pub enum HarvestDelegateResponse {
 
     Error {
         message: String,
+    },
+
+    /// Answer to `ArmAutoInvoice` and `GetAutoInvoiceStatus`.
+    AutoInvoice {
+        store_contract_id: Vec<u8>,
+        result: Result<AutoInvoiceStatus, String>,
     },
 }
 

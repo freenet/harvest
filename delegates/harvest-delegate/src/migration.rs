@@ -99,8 +99,12 @@ fn export_scope() -> ExportScope {
 /// export can reach.
 struct WithoutStoreKeys<'a, S>(&'a S);
 
+/// Store keys, which custody recovers, and instant checkout's arms and
+/// ledgers, which describe this node's own subscriptions and counter and are
+/// rebuilt by the UI re-arming.
 fn is_store_key(key: &[u8]) -> bool {
     key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
+        || key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
 }
 
 impl<S: SecretStore> SecretStore for WithoutStoreKeys<'_, S> {
