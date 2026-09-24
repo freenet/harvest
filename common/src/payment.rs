@@ -583,11 +583,14 @@ pub struct Order {
     ///
     /// **It is what the order's id is derived from** when present, with
     /// `created_at`, which must be the buyer's `requested_at` (see
-    /// [`OrderId::for_request`]), so a store holds at most ONE order per
+    /// [`OrderId::for_request`]). Every answerer that dates its order at the
+    /// buyer's `requested_at`, as the seller's delegate and the manual answer
+    /// both do, publishes the same id, so a store holds at most ONE order per
     /// request: two answers to one request -- a retry, a replayed request,
     /// or two of the seller's devices both answering -- are one map entry,
-    /// and the existing per-id merge (higher status rank, then the smaller
-    /// encoding) picks the same one on every replica. A payment always
+    /// and the existing per-id merge (higher status rank, then the larger
+    /// amount, then the smaller encoding) picks the same one on every
+    /// replica. A payment always
     /// wins that merge, so the one a buyer paid is the one that stays.
     ///
     /// Derived rather than chosen by the buyer so a third party cannot

@@ -988,6 +988,7 @@ mod tests {
         let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
         let ledger = |order: u8| crate::auto_invoice::Ledger {
             answered: [[order; 32]].into(),
+            issued_at_ms: vec![u64::from(order)],
             ..Default::default()
         };
         let mut store = MemSecrets::default();

@@ -1111,6 +1111,13 @@ pub fn AcceptRequest(
                 "(though an amount matching a unique price can give that away), who asked, or "
                 "where they want it sent -- those stay in this conversation."
             }
+            if instant.is_some() {
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "The buyer used instant checkout. Your device's instant checkout does not "
+                    "count an order you answer here: if you count this listing, lower the count "
+                    "yourself once it is paid."
+                }
+            }
             div { class: "form-group",
                 label { class: "form-label",
                     "Amount for {quantity} x {listing_title} (satoshis)"
@@ -1196,20 +1203,14 @@ fn accept(
     let seller_fingerprint = state
         .store_owner_fingerprint(store_contract_id)
         .ok_or("this store is not one of yours")?;
-    // Answered already (by this device's delegate, or another of the
-    // seller's devices): a second answer would be the same order id with a
-    // different address, and the buyer could pay the one the store drops.
     if let Some(request) = buyer.request {
-        let id = request.order_id();
-        if state
+        let published = state
             .browsing_stores
             .get(store_contract_id)
-            .is_some_and(|store| store.orders.iter().any(|order| order.order.id == id))
-        {
-            return Err(
-                "this request has already been answered with an order; it is under Orders"
-                    .to_string(),
-            );
+            .map(|store| store.orders.as_slice())
+            .unwrap_or_default();
+        if let Some(why) = manual_answer_refusal(published, &request, crate::state::now_ms()) {
+            return Err(why);
         }
     }
     state.issue_invoice(crate::state::PendingInvoice {
@@ -1232,6 +1233,36 @@ fn accept(
         buyer_receipt_key: buyer.buyer_receipt_key,
         answers_request: buyer.request,
     })
+}
+
+/// Why a seller may not answer instant request `request` by hand, if they
+/// may not:
+/// - it is answered already (by this device's delegate, or another of the
+///   seller's devices): a second answer would be the same order id with a
+///   different address, and the buyer could pay the one the store drops;
+/// - the buyer's clock put it more than a day from this one: the order is
+///   dated at the request, and a date far off would rank it wrongly among
+///   the store's orders for good. The delegate refuses the same.
+fn manual_answer_refusal(
+    published: &[harvest_common::payment::AuthorizedOrder],
+    request: &harvest_common::payment::AnsweredRequest,
+    now_ms: u64,
+) -> Option<String> {
+    let id = request.order_id();
+    if published.iter().any(|order| order.order.id == id) {
+        return Some(
+            "this request has already been answered with an order; it is under Orders".into(),
+        );
+    }
+    let at = request.requested_at.timestamp_millis();
+    if at < 0 || now_ms.abs_diff(at as u64) > 24 * 60 * 60 * 1000 {
+        return Some(
+            "this request is dated more than a day from now by the buyer's clock; ask them to \
+             send it again"
+                .into(),
+        );
+    }
+    None
 }
 
 /// The two values a buyer's request asks the seller to sign into the
@@ -1329,6 +1360,51 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seller answers an instant request by hand only when no order for it
+    /// is published and the buyer dated it within a day of now. Mutated red
+    /// by dropping each check.
+    #[test]
+    fn a_manual_answer_is_refused_when_answered_or_far_dated() {
+        let now = 1_800_000_000_000u64;
+        let request = |at: i64| harvest_common::payment::AnsweredRequest {
+            request_id: [4; 32],
+            requested_at: chrono::DateTime::from_timestamp_millis(at).unwrap(),
+        };
+        let fresh = request(now as i64 - 60_000);
+        assert_eq!(manual_answer_refusal(&[], &fresh, now), None);
+        let answered = harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: Some([4; 32]),
+                id: fresh.order_id(),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: fresh.requested_at,
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        assert!(manual_answer_refusal(&[answered], &fresh, now).is_some());
+        let day = 24 * 60 * 60 * 1000;
+        assert!(manual_answer_refusal(&[], &request(now as i64 - 2 * day), now).is_some());
+        assert!(manual_answer_refusal(&[], &request(now as i64 + 2 * day), now).is_some());
+    }
 
     /// Waiting until the limit, "not responding" after it, and an answer
     /// shown whenever it comes, including after the limit.

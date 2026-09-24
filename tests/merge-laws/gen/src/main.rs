@@ -1807,7 +1807,8 @@ fn gen_request(root: &Path) {
     c.finish();
 
     // At the order cap: two answers to one request (so one date), P and Q
-    // with the larger amount, dated just above the oldest of R, a full cap:
+    // with the larger amount, dated the same as the oldest of R (a tie the id
+    // breaks), and R a full cap:
     // the versions of one id rank the same, so the groupings agree. And two
     // requests dated either side of R's range, the shape that broke the cap
     // when a request's answer could carry any date (PR #159 review, round 1).

@@ -76,10 +76,11 @@ use harvest_common::sealed::{decrypt_message, InstantSelection, MessageContent};
 use harvest_common::store::{StoreStateV1, StoreStateV1Delta};
 use harvest_common::{from_cbor, to_cbor};
 
-/// Every secret this module writes starts with this. Under `harvest:` so the
-/// migration tests hold it to the export prefix, but NOT exported
-/// (`migration::is_not_exported`): an arm describes this node's subscriptions
-/// and this delegate's own address counter, and the UI re-arms on every open.
+/// Every secret this module writes starts with this, under `harvest:` so the
+/// migration tests hold it to the export prefix. Only the ledgers are
+/// exported ([`is_ledger_key`], `migration::is_store_key`): an arm describes
+/// this node's subscriptions and the UI re-arms on every open, and the tip
+/// cache and exported marker describe this node alone.
 pub(crate) const AUTO_PREFIX: &str = "harvest:auto:";
 
 pub(crate) fn arm_key(store_contract_id: &[u8]) -> Vec<u8> {
@@ -211,6 +212,14 @@ pub(crate) struct Ledger {
     /// or after the buyer cancelled (Paid outranks Cancelled).
     #[serde(default)]
     pub sales: Vec<Sale>,
+    /// Orders whose sale is settled and forgotten, so a predecessor's ledger
+    /// merged in again cannot bring one back to be decremented twice.
+    #[serde(default)]
+    pub settled: VecDeque<OrderId>,
+    /// Instant orders paid when published stock could not cover them (see
+    /// `AutoInvoiceStatus::oversold`), until the seller has been shown them.
+    #[serde(default)]
+    pub oversold: Vec<OrderId>,
 }
 
 /// One instant order for a counted listing.
@@ -276,6 +285,15 @@ impl Ledger {
             .filter(|s| s.holds(store.orders.orders.get(&s.order), tip_height, now_ms))
             .map(|s| s.quantity)
             .sum()
+    }
+
+    fn settle(&mut self, order: OrderId) {
+        if !self.settled.contains(&order) {
+            self.settled.push_back(order);
+            while self.settled.len() > ANSWERED_CAP {
+                self.settled.pop_front();
+            }
+        }
     }
 
     fn issued_last_day(&self, now_ms: u64) -> usize {
@@ -427,6 +445,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
         invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
         last_background_run_ms: tip.as_ref().map(|t| t.seen_at_ms),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
+        oversold: ledger.oversold.clone(),
         paused: global_refusal(secrets, record, tip.as_ref(), now_ms)
             .err()
             .map(|r| r.explain()),
@@ -462,8 +481,22 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     while held.answered.len() > ANSWERED_CAP {
         held.answered.pop_front();
     }
+    // A set: the same ledger merged twice adds nothing.
     for at in incoming.issued_at_ms {
-        held.issued_at_ms.push(at);
+        if !held.issued_at_ms.contains(&at) {
+            held.issued_at_ms.push(at);
+        }
+    }
+    held.issued_at_ms.sort_unstable();
+    let excess = held.issued_at_ms.len().saturating_sub(2 * MAX_PER_DAY);
+    held.issued_at_ms.drain(..excess);
+    for order in incoming.settled {
+        held.settle(order);
+    }
+    for order in incoming.oversold {
+        if !held.oversold.contains(&order) {
+            held.oversold.push(order);
+        }
     }
     for status in incoming.statuses {
         match held.statuses.iter().find(|s| s.listing == status.listing) {
@@ -472,6 +505,9 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
         }
     }
     for sale in incoming.sales {
+        if held.settled.contains(&sale.order) {
+            continue;
+        }
         match held.sales.iter_mut().find(|s| s.order == sale.order) {
             Some(own) => {
                 if own.decremented.is_none() {
@@ -481,7 +517,16 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
             None => held.sales.push(sale),
         }
     }
-    held.sales.truncate(SALES_CAP);
+    held.sales.retain(|s| !held.settled.contains(&s.order));
+    if held.sales.len() > SALES_CAP {
+        // Keep the undecremented and the newest: a dropped sale is one whose
+        // payment would never come off the stock.
+        // Dropped first: the decremented, then the oldest.
+        held.sales
+            .sort_by_key(|s| (s.decremented.is_none(), s.issued_at_ms));
+        let excess = held.sales.len() - SALES_CAP;
+        held.sales.drain(..excess);
+    }
     *held != before
 }
 
@@ -722,6 +767,22 @@ pub(crate) fn settle(
         if let (Some(order), None) = (order, sale.decremented) {
             if order.status == OrderStatus::Paid {
                 let (revision, availability) = effective_status(store, ledger, &sale.listing);
+                // Paid when published stock could not cover it: its hold ended
+                // (a cancel, or a buyer past the time to start paying) and the
+                // unit went to someone else. Sold anyway; the seller is told.
+                let covered = match &availability {
+                    ListingAvailability::Available {
+                        quantity: Some(left),
+                    } => *left >= sale.quantity,
+                    ListingAvailability::Available { quantity: None } => true,
+                    ListingAvailability::SoldOut | ListingAvailability::Withdrawn => false,
+                };
+                if !covered && !ledger.oversold.contains(&sale.order) {
+                    ledger.oversold.push(sale.order.clone());
+                    while ledger.oversold.len() > STATUSES_CAP {
+                        ledger.oversold.remove(0);
+                    }
+                }
                 sale.decremented = Some(match availability {
                     ListingAvailability::Available {
                         quantity: Some(left),
@@ -757,7 +818,9 @@ pub(crate) fn settle(
             (None, None) => now_ms.saturating_sub(sale.issued_at_ms) >= NOT_LANDED_MS,
             _ => window_closed,
         };
-        if !done {
+        if done {
+            ledger.settle(sale.order);
+        } else {
             ledger.sales.push(sale);
         }
     }
@@ -1180,7 +1243,12 @@ pub(crate) fn decide<S: SecretStore>(
             }
         }
     }
-    save(secrets, &ledger_key(&arm.store_contract_id), &ledger);
+    // Recorded before anything is published, as in `on_store_change`: an
+    // order or decrement sent but not recorded would lose its hold, or be
+    // decremented again.
+    if !save(secrets, &ledger_key(&arm.store_contract_id), &ledger) {
+        return Decided::default();
+    }
     decided
 }
 
@@ -1809,8 +1877,7 @@ mod tests {
 
     /// I1, the ledger alone: a resend before the first answer has reached the
     /// store, and one nonce twice in one run. Mutated red by dropping
-    /// `ledger.answered.contains` (the resend) and the `issued_now` check (the
-    /// same run).
+    /// `ledger.answered.contains`, which covers both.
     #[test]
     fn a_request_is_answered_once_before_the_store_shows_it() {
         let mut f = fixture();
@@ -1865,6 +1932,32 @@ mod tests {
         .unwrap();
         let decided = run(&mut f, &[stale]);
         assert!(decided.orders.is_empty());
+        assert_eq!(decided.refused[0].1, Refusal::NotInstant);
+        assert_eq!(counter(&f), 0);
+
+        // And two days ahead, which would otherwise rank the order newest of
+        // all under the store's cap.
+        let mut ahead = decrypt_message(
+            &buyer.request_at(&jam(), 1, 2, 12_000, NOW - 1_000),
+            &to_seller,
+        )
+        .unwrap();
+        if let MessageContent::OrderRequest {
+            instant: Some(selection),
+            ..
+        } = &mut ahead.content
+        {
+            selection.requested_at_ms = (NOW + 2 * DAY_MS) as i64;
+        }
+        let ahead = harvest_common::sealed::seal(
+            &to_seller,
+            &buyer.tag(),
+            &buyer.conversation,
+            ahead.content,
+            chrono::DateTime::from_timestamp_millis((NOW - 1_000) as i64).unwrap(),
+        )
+        .unwrap();
+        let decided = run(&mut f, &[ahead]);
         assert_eq!(decided.refused[0].1, Refusal::NotInstant);
         assert_eq!(counter(&f), 0);
     }
@@ -2081,7 +2174,7 @@ mod tests {
         assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
     }
 
-    /// I3. Two requests for the last item in one run: one invoice, and the
+    /// S2. Two requests for the last item in one run: one invoice, and the
     /// other left for the seller (the first may never be paid), with
     /// published stock untouched until a payment. Mutated red by dropping
     /// the reservation push.
@@ -2295,16 +2388,174 @@ mod tests {
             ..Default::default()
         };
         let incoming = Ledger {
-            sales: vec![sale(1, Some(9)), sale(2, None)],
+            sales: vec![sale(1, Some(9)), sale(2, None), sale(3, None)],
             answered: [[5; 32]].into(),
-            ..Default::default()
+            issued_at_ms: vec![NOW - 5, NOW - 4],
+            seen: [[6; 32]].into(),
+            statuses: vec![ListingStatus {
+                listing: jam().id,
+                revision: 7,
+                availability: ListingAvailability::SoldOut,
+            }],
+            settled: [OrderId([3; 32])].into(),
+            oversold: vec![OrderId([4; 32])],
         };
         assert!(merge_ledgers(&mut held, incoming.clone()));
-        assert_eq!(held.sales, vec![sale(1, Some(9)), sale(2, None)]);
+        assert_eq!(
+            held.sales,
+            vec![sale(1, Some(9)), sale(2, None)],
+            "a sale the predecessor had settled does not come back"
+        );
         assert!(held.answered.contains(&[5; 32]));
+        // Idempotent with every field populated: the same ledger twice adds
+        // nothing, and the daily count is not doubled.
         assert!(
             !merge_ledgers(&mut held, incoming),
             "nothing new the second time"
+        );
+        assert_eq!(held.issued_at_ms, vec![NOW - 5, NOW - 4]);
+    }
+
+    /// A sale this delegate settled and forgot stays forgotten when the
+    /// predecessor's frozen ledger is merged again. Mutated red by not
+    /// skipping settled orders in `merge_ledgers`.
+    #[test]
+    fn a_settled_sale_is_not_revived_by_a_re_import() {
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        let frozen = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        let sent = store_change(&mut f);
+        f.store
+            .listing_statuses
+            .records
+            .insert(harvest_common::store::Bytes32(jam().id.0), sent[0].clone());
+        assert!(store_change(&mut f).is_empty(), "landed, forgotten");
+        let mut ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        merge_ledgers(&mut ledger, frozen);
+        save(
+            &mut f.secrets,
+            &ledger_key(&f.record.arm.store_contract_id),
+            &ledger,
+        );
+        assert!(store_change(&mut f).is_empty(), "no second decrement");
+    }
+
+    /// Past the sales cap a merge drops what matters least: decremented
+    /// sales, then the oldest; never a newer undecremented one.
+    #[test]
+    fn a_full_merge_keeps_undecremented_sales() {
+        let sale = |n: u16, decremented: Option<u64>| Sale {
+            order: OrderId({
+                let mut id = [0; 32];
+                id[..2].copy_from_slice(&n.to_le_bytes());
+                id
+            }),
+            listing: jam().id,
+            quantity: 1,
+            issued_at_ms: NOW + u64::from(n),
+            anchor_height: 1_000,
+            decremented,
+        };
+        let mut held = Ledger {
+            sales: (0..SALES_CAP as u16).map(|n| sale(n, Some(1))).collect(),
+            ..Default::default()
+        };
+        let incoming = Ledger {
+            sales: vec![sale(9_000, None)],
+            ..Default::default()
+        };
+        merge_ledgers(&mut held, incoming);
+        assert_eq!(held.sales.len(), SALES_CAP);
+        assert!(held.sales.contains(&sale(9_000, None)));
+    }
+
+    /// S1 as the threat model now states it: a payment that arrives after
+    /// its hold ended and the unit was resold is sold anyway, published stock
+    /// ends at zero, and the seller is told. Mutated red by not recording it.
+    #[test]
+    fn a_sale_paid_after_its_unit_was_resold_is_reported() {
+        let mut f = fixture();
+        counted(&mut f, 1);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        let a = first.orders[0].order.id.clone();
+        with_status(&mut f, &a, OrderStatus::Cancelled);
+        let second = run(&mut f, &[Buyer::new(41).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(second.orders.len(), 1, "the unit was free again");
+        publish(&mut f, &second);
+        let b = second.orders[0].order.id.clone();
+        with_status(&mut f, &b, OrderStatus::Paid);
+        let sold = store_change(&mut f);
+        f.store
+            .listing_statuses
+            .records
+            .insert(harvest_common::store::Bytes32(jam().id.0), sold[0].clone());
+        // The cancelled buyer pays anyway.
+        with_status(&mut f, &a, OrderStatus::Paid);
+        store_change(&mut f);
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert_eq!(ledger.oversold, vec![a]);
+        let (response, _) = arm(&mut f.secrets, f.record.arm.clone(), NOW);
+        let HarvestDelegateResponse::AutoInvoice {
+            result: Ok(status), ..
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(status.oversold.len(), 1);
+    }
+
+    /// A sale is forgotten once its payment is reversed, or its payment
+    /// window closes unpaid. Mutated red by keeping either.
+    #[test]
+    fn a_reversed_or_expired_sale_is_forgotten() {
+        for (status, blocks) in [
+            (OrderStatus::PaymentReversed, 0),
+            (
+                OrderStatus::AwaitingPayment,
+                harvest_common::payment::PAYMENT_WINDOW_BLOCKS + 1,
+            ),
+        ] {
+            let mut f = fixture();
+            counted(&mut f, 2);
+            let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+            publish(&mut f, &first);
+            with_status(&mut f, &first.orders[0].order.id, status);
+            let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+            tip.anchor.height += blocks;
+            save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
+            store_change(&mut f);
+            let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+            assert!(ledger.sales.is_empty(), "{status:?}");
+        }
+    }
+
+    /// S1 across a migration: a sale issued by the predecessor, carried in
+    /// its ledger, comes off the stock when it is paid after the upgrade.
+    #[test]
+    fn a_sale_carried_by_a_migration_is_decremented_when_paid() {
+        let mut old = fixture();
+        counted(&mut old, 3);
+        let first = run(&mut old, &[Buyer::new(40).request(&jam(), 2, 1, 22_000)]);
+        let exported = to_cbor(&load_ledger(
+            &old.secrets,
+            &old.record.arm.store_contract_id,
+        ))
+        .unwrap();
+        let mut new = fixture();
+        counted(&mut new, 3);
+        let key = ledger_key(&new.record.arm.store_contract_id);
+        let merged = merge_ledger_bytes(None, &exported).unwrap().unwrap();
+        new.secrets.set_secret(&key, &merged);
+        publish(&mut new, &first);
+        with_status(&mut new, &first.orders[0].order.id, OrderStatus::Paid);
+        let sent = store_change(&mut new);
+        assert_eq!(
+            sent[0].status.availability,
+            ListingAvailability::Available { quantity: Some(1) }
         );
     }
 

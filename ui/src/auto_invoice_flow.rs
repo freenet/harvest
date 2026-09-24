@@ -403,8 +403,22 @@ fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
     }
 }
 
-/// The store page's line for an armed store.
+/// The store page's line for an armed store, led by any order that was paid
+/// after its item had gone to another buyer.
 pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+    let line = instant_checkout_state_text(status, now_ms);
+    if status.oversold.is_empty() {
+        return line;
+    }
+    let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
+    format!(
+        "Paid after the item had already gone to another buyer: {}. Refund or fulfil these \
+         by hand; the listing's count did not cover them. {line}",
+        orders.join(", ")
+    )
+}
+
+fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {

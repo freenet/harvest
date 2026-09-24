@@ -718,7 +718,10 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 ///
 /// What it costs: an old `Paid` order can now be dropped before a newer
 /// `Cancelled` one. Only the seller can sign an order, so only the seller can
-/// push old orders out, by creating more than `MAX_ORDERS` new ones.
+/// push old orders out, by creating more than `MAX_ORDERS` new ones. An
+/// instant-checkout answer is dated by its buyer's `requested_at`; the
+/// seller's delegate answers only one within a day of its own clock, and a
+/// seller answering by hand is refused one further off.
 fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     if orders.len() <= MAX_ORDERS {
         return;
@@ -3449,12 +3452,8 @@ mod order_tests {
         };
         let (newest_id, newest) = answer(7, 9_000_000, 50_000);
         let (oldest_id, oldest) = answer(8, 10, 60_000);
-        assert_ne!(
-            newest_id, oldest_id,
-            "a different date is a different order"
-        );
-        let p: BTreeMap<OrderId, AuthorizedOrder> = [(newest_id, newest)].into();
-        let q: BTreeMap<OrderId, AuthorizedOrder> = [(oldest_id, oldest)].into();
+        let p: BTreeMap<OrderId, AuthorizedOrder> = [(newest_id.clone(), newest)].into();
+        let q: BTreeMap<OrderId, AuthorizedOrder> = [(oldest_id.clone(), oldest)].into();
         let r = full_of_old_orders();
         let enc = |m: &BTreeMap<OrderId, AuthorizedOrder>| crate::to_cbor(m).expect("encode");
         assert_eq!(
@@ -3467,6 +3466,26 @@ mod order_tests {
             enc(&merge_maps(&q, &merge_maps(&p, &r))),
             "associativity, the other way round"
         );
+        assert_ne!(
+            newest_id, oldest_id,
+            "a different date is a different order"
+        );
+    }
+
+    /// An answer re-dated under the id of the original is refused: the id
+    /// is re-derived from the terms, date included, so a version of one id
+    /// with another `created_at` does not verify. Mutated red by dropping
+    /// the date from `OrderId::for_request`.
+    #[test]
+    fn a_re_dated_answer_under_the_original_id_is_refused() {
+        use crate::test_orders::{authorized, order, store_key};
+        let mut original = order(1);
+        original.request_id = Some([0x42; 32]);
+        let original = original.with_derived_id();
+        let mut re_dated = original.clone();
+        re_dated.created_at += chrono::Duration::days(365);
+        let forged = authorized(&store_key(), re_dated, OrderStatus::AwaitingPayment);
+        assert!(forged.verify_terms(&store_key().verifying_key()).is_err());
     }
 
     /// The summary names an order's content by the full 32-byte BLAKE3 of

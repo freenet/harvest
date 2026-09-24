@@ -574,6 +574,13 @@ pub struct AutoInvoiceStatus {
     pub last_background_run_ms: Option<u64>,
     /// Instant-checkout invoices issued in the last 24 hours.
     pub issued_last_day: u32,
+    /// Instant orders that were paid when the listing's published stock
+    /// could no longer cover them: sold more than the seller had. Possible
+    /// because an unpaid invoice stops holding stock once its buyer cancels
+    /// or can no longer start paying, while a payment can still arrive after
+    /// that. The seller refunds or fulfils these by hand.
+    #[serde(default)]
+    pub oversold: Vec<crate::payment::OrderId>,
     /// Why the next request would wait for the seller, if it would.
     pub paused: Option<String>,
 }
@@ -1805,6 +1812,7 @@ mod tests {
                     invoicing_until_ms: 3,
                     last_background_run_ms: Some(4),
                     issued_last_day: 5,
+                    oversold: vec![],
                     paused: None,
                 }),
             },

@@ -1539,7 +1539,7 @@ pub struct PendingInvoice {
     /// store's published commitments is theirs, and for a quote request
     /// cannot work it out for themselves: `OrderId::from_terms` hashes terms
     /// the seller chooses, including a `created_at` they stamp. (An instant
-    /// request's answer is found by `request_id` below.)
+    /// request's answer is found by `answers_request` below.)
     /// So this travels with the invoice all the way to the signature, and the
     /// acceptance is sent from the same place the commitment is published --
     /// not left to a second action the seller has to remember.
@@ -29423,8 +29423,9 @@ mod buy_flow_tests {
 
     /// The arm names only addresses the bridge has READ a request for, in
     /// order from the next one, and the watch lapses a day after the earliest
-    /// of those requests, less the margin. Mutated red by dropping the
-    /// `filter(|s| s.read)`.
+    /// of those requests, less the margin; a renewal not yet read keeps the
+    /// lease of the one before it. Mutated red by using the latest send
+    /// whether read or not.
     #[test]
     fn an_arm_names_only_watched_addresses() {
         use crate::auto_invoice_flow::{WATCH_LIFETIME_MS, WATCH_MARGIN_MS};
@@ -29518,6 +29519,7 @@ mod buy_flow_tests {
             invoicing_until_ms: 5 * 60 * 60 * 1000,
             last_background_run_ms: last_run,
             issued_last_day: 0,
+            oversold: vec![],
             paused: paused.map(str::to_string),
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
@@ -29526,6 +29528,10 @@ mod buy_flow_tests {
         assert!(early.contains("is on"), "{early}");
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
         assert!(paused.contains("paused: no recent block"), "{paused}");
+        let mut oversold = status(Some(1), None);
+        oversold.oversold = vec![OrderId([7; 32])];
+        let told = instant_checkout_status_text(&oversold, 1);
+        assert!(told.contains(&OrderId([7; 32]).short()), "{told}");
 
         let gk = inbox::authority().mint();
         let state = an_instant_seller(&gk);
