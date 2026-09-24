@@ -63,7 +63,7 @@ bs58 = "0.5"
 # RSA blind signatures for feedback tokens (RFC 9474)
 rsa = "0.9"
 sha2 = "0.10"
-x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets", "getrandom"] }
 aes-gcm = "0.10"
 # Store-key custody (harvest#93 phase 1b): HKDF over the vault's wrap
 # signature, zeroing for the secrets derived from it, a seeded RNG so the
