@@ -1225,6 +1225,36 @@ each.
 | A replacement's carried-over status fails while the replacement publishes | The original is taken down on the listing's own publish, so an edited sold-out or counted listing reads as on sale with no count. | **Residual, told.** The failure says so and tells the seller to set it again (`LISTING_STATUS_NOT_SAVED`, on both the signing and the publish failure path). |
 | An edit in flight | The original shows "Saving" until its replacement lands or is dropped (a certificate failure, #118, a store-key refusal, or an empty certificate), so a second edit cannot publish a second replacement; every drop path forgets the pending withdrawal. | **Yes** -- `an_edit_in_flight_holds_the_original_until_it_lands_or_is_dropped`; red with the replacing term dropped and with the drop path's call removed. A replacement's own status is published independently, so a replacement that is dropped leaves a status for an id never published: harmless, readers ignore it. |
 
+### Instant checkout: auto-invoicing in the background (added 2026-09-23)
+
+A listing may carry fixed terms (`Listing::checkout`, `Listing::choices`). A
+buyer's request against them names the total, and the seller's Harvest
+delegate answers it with an order while the seller is away
+(`delegates/harvest-delegate/src/auto_invoice.rs`), on an address the
+seller's UI has had the bridge watch ahead of use
+(`ui/src/auto_invoice_flow.rs`). Mutation results below were each observed
+red with the named guard removed or inverted, original file restored after
+each.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `common/src/payment.rs::OrderId::from_terms` / `for_request` | An order answering a request takes its id from the request alone, so a store holds one answer per request whatever is published (two devices, a retry, a manual answer racing the delegate). | **Yes** -- `two_answers_to_one_request_are_one_order_in_either_order`; red with the request branch dropped. |
+| `common/src/store.rs::merge_order` | At equal status the larger amount wins before the encoding, so a seller cannot replace a paid order with a cheaper paid one under the same request. | **Yes** -- `a_cheaper_order_cannot_displace_a_paid_one`; red with the amount comparison dropped. |
+| `common/src/payment.rs::request_id` | Derived from the conversation's routing tag and the buyer's nonce, so a request id copied into another conversation is a different request. | **Yes** -- `different_requests_are_different_orders`. |
+| `common/src/listing.rs::instant_total` | The one total: the buyer shows it and sends it; the delegate recomputes it and does not invoice on a mismatch. | **Yes** -- `instant_terms_tests`; and in the delegate `a_refused_request_spends_no_address`, red with the mismatch check dropped. |
+| `auto_invoice::decide_one`, I1 | A request already answered (this delegate's ledger, or an order for it in the store, or earlier in the same run) derives nothing. | **Yes** -- `a_request_is_answered_at_most_once`; red with the ledger and store checks dropped. |
+| `auto_invoice::decide`, I2 | The counter moves past every script the store has published before deriving, and a refused request spends no address. | **Yes** -- `the_counter_moves_past_published_addresses` (red without the floor raise), `a_refused_request_spends_no_address` (red with an address burned before the checks). |
+| `auto_invoice::decide_one`, I7 | Only an address the seller's UI had the bridge READ a watch for, and only until that watch lapses. A store-wide refusal leaves the request unseen so a later arm can answer it. | **Yes** -- `only_a_watched_address_is_used`; red with the script check dropped and with the lapse check dropped. UI side: `an_arm_names_only_watched_addresses`, red with the `read` filter dropped; `a_seller_with_instant_checkout_has_the_next_addresses_watched`, red with the pre-watch merge dropped. |
+| `auto_invoice::effective_status` + `Ledger::signed`, I3 | The last item goes to one request: requests are decided in one order against the newer of the store's status and the one this delegate last signed, including a later run that read the store before the earlier decrement landed. | **Yes** -- `the_last_item_is_sold_once` (red without `Ledger::signed`), `a_stale_store_read_still_counts_the_last_sale` (red with the ledger ignored in `effective_status`). |
+| `auto_invoice::decide_one`, I4 | At most 15 open unpaid instant invoices per store, 2 per conversation, 30 a day, and none while the 15 addresses below the counter are all unpaid. | **Yes** -- `exposure_is_capped`; red with each cap's check dropped in turn. |
+| `auto_invoice::decide_one`, I5 | A stale tip, a store not owned by this key, a closed store, a quote-only or unknown listing, a total mismatch, or a binding already on another conversation's order falls back to the seller. | **Yes** -- `doubtful_inputs_fall_back`, `a_refused_request_spends_no_address`; red with the tip and binding checks dropped. A closed store is not separately tested. |
+| `auto_invoice::on_notification`, I6 | Only contracts named in an arm are acted on; an arm needs the store key; arming comes only from the Harvest web app. | **Yes** -- `only_armed_contracts_are_acted_on` (red returning `Some` for any id); the origin gate is the existing `every_request_family_is_refused_for_a_foreign_web_app` dispatcher test. |
+| `auto_invoice::on_store_updated` | The buyer is pointed at an order only after the store took it. | **Yes** -- `replies_wait_for_the_store_update`; red with the result ignored. |
+| Two concurrent background runs | Derivation and the counter write happen in one `process()` call, so no index is handed out twice PROVIDED the node never runs two `process()` calls of one delegate at once. | **Not verified.** If the node can, two runs could read the counter before either writes. The UI's own `DeriveOrderAddress` from two tabs has the same exposure today; the twin-address settlement hold (`SettlementHold::Twins`) is what catches a reused address. |
+| Two armed devices for one store | Each can answer; the contract keeps ONE order per request, but the two can split a counted listing's last item. | **Residual, documented.** |
+| The core behaviour the whole path rests on | A notification run's GET/UPDATE/SUBSCRIBE requests are executed and their responses carry the delegate's context back. | **Not tested in this repo.** Verified against freenet-core source; exercised by the live E2E recorded on the PR. |
+| Hosted gateways | A background run reads the node's local secrets, so on try.freenet.org the arm is invisible to it and nothing is auto-invoiced; the store page says so once no background run has been seen 40 minutes after arming. | **Yes** for the wording (`the_store_page_says_how_instant_checkout_stands`); the hosted scope itself is not reproducible here. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

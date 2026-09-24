@@ -50,7 +50,7 @@
 //! [`harvest_common::delegate::AutoInvoiceStatus::last_background_run_ms`]
 //! is how the UI tells.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_bitcoin_common::{BitcoinNetwork, BitcoinTipStateV1, BlockAnchor};
@@ -834,7 +834,6 @@ pub(crate) fn decide<S: SecretStore>(
     }
 
     let mut ledger = load_ledger(secrets, &arm.store_contract_id);
-    let mut running: BTreeMap<[u8; 32], (u64, ListingAvailability)> = BTreeMap::new();
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
     let tip_height = anchor.height;
 
@@ -854,7 +853,6 @@ pub(crate) fn decide<S: SecretStore>(
             &anchor,
             tip_height,
             &mut ledger,
-            &mut running,
             &issued_now,
             message,
             now_ms,
@@ -909,7 +907,6 @@ fn decide_one<S: SecretStore>(
     anchor: &BlockAnchor,
     tip_height: u32,
     ledger: &mut Ledger,
-    running: &mut BTreeMap<[u8; 32], (u64, ListingAvailability)>,
     issued_now: &[AuthorizedOrder],
     message: &EncryptedMessage,
     now_ms: u64,
@@ -956,12 +953,9 @@ fn decide_one<S: SecretStore>(
         return Err(Refusal::TotalMismatch);
     }
 
-    // Stock (I3), against the running count.
-    let slot = listing.id.0;
-    let (revision, availability) = running
-        .get(&slot)
-        .cloned()
-        .unwrap_or_else(|| effective_status(store, ledger, &listing.id));
+    // Stock (I3). The ledger holds every status this delegate signed,
+    // earlier in this run included, so it is the running count.
+    let (revision, availability) = effective_status(store, ledger, &listing.id);
     let left = match &availability {
         ListingAvailability::Withdrawn => return Err(Refusal::Withdrawn),
         ListingAvailability::SoldOut => Some(0),
@@ -1076,7 +1070,6 @@ fn decide_one<S: SecretStore>(
                     }
                 },
             };
-            running.insert(slot, (status.revision, status.availability.clone()));
             ledger.signed(status.clone());
             Some(sign_status(store_sk, status)?)
         }
@@ -1582,7 +1575,7 @@ mod tests {
 
     /// I3. Two requests for the last item in one run: one invoice, one
     /// decline, and the listing sold out. Mutated red by not updating
-    /// `running` after an invoice.
+    /// `Ledger::signed` after an invoice.
     #[test]
     fn the_last_item_is_sold_once() {
         let mut f = fixture();

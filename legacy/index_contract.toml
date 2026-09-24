@@ -34,3 +34,9 @@ version = "V3"
 description = "Superseded by harvest#70 (listing availability): `StoreStateV1` gained `listing_statuses`, one store-key-signed `ListingStatus` per listing id (`{listing, revision, availability: Available { quantity } | SoldOut | Withdrawn}`), merged per listing by the HIGHEST revision and then the smaller encoding (`SignedRecord::rank`, which every other signed record leaves at zero, so their merge is unchanged), and `classify_store_key_message` gained `ListingStatus`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not, and `IndexParameters` is unchanged. The generation harvest#53 Phase C shipped (`52afb47`, #143)."
 date = "2026-09-23"
 code_hash = "0a21fecfdd702dea40d5ccd51d6b7ecc095e101d1c8a8801a5594c4368d60361"
+
+[[entry]]
+version = "V4"
+description = "Superseded by instant checkout, which changed `harvest-common`: `Listing` gained `checkout` (fixed sats price and delivery) and `choices`, both `#[serde(default, skip_serializing_if)]` so every earlier listing encodes, and so is identified and signed, exactly as before; `Order` gained `request_id` (skipped when absent), and an order carrying one takes its id from the request alone (`OrderId::for_request`); `merge_order` breaks an equal-status tie by the larger amount before the encoding (a change only for two orders under one id, which only a shared `request_id` produces); and `delegate.rs` / `bitcoin_delegate.rs` gained the auto-invoice arm and `PeekOrderAddresses`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not; its parameters are unchanged. The generation harvest#125 shipped (`f9558cd`)."
+date = "2026-09-23"
+code_hash = "e23c43c86fa12acfbed7778b8c15b22d4af87c8c0d6c673f47a5d606d9cca9e5"

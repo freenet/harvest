@@ -124,3 +124,9 @@ version = "V15"
 description = "Superseded by harvest#53 Phase C (the receipted complaint), which changed `harvest-common`: `reputation.rs` replaced `FeedbackEntry` with `Complaint` (a buyer-signed complaint about one PAID order of the store) and `ReputationParameters` lost its RSA key, `FeedbackCategory` lost `Other`, and `delegate.rs` lost the blind-signature and transaction requests (`InitReputationKeys`, `BlindSignFeedbackToken`, `BeginTransaction`, `RecordBlindSignature`, `ListTransactions`, `TransactionRecord`). `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not, and `MailboxParameters` is unchanged."
 date = "2026-09-23"
 code_hash = "397f30059eea7a5d8cc4fa4a7f364c772cbfda15ce2b62bb65db1c048b0f1d43"
+
+[[entry]]
+version = "V16"
+description = "Superseded by instant checkout, which changed `harvest-common`: `Listing` gained `checkout` (fixed sats price and delivery) and `choices`, both `#[serde(default, skip_serializing_if)]` so every earlier listing encodes, and so is identified and signed, exactly as before; `Order` gained `request_id` (skipped when absent), and an order carrying one takes its id from the request alone (`OrderId::for_request`); `merge_order` breaks an equal-status tie by the larger amount before the encoding (a change only for two orders under one id, which only a shared `request_id` produces); and `delegate.rs` / `bitcoin_delegate.rs` gained the auto-invoice arm and `PeekOrderAddresses`. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This contract's did not: it stores ciphertext and never compiles the new `sealed` module. Its parameters are unchanged. The generation harvest#53 Phase C shipped (`52afb47`), unchanged by #125."
+date = "2026-09-23"
+code_hash = "4b02a3f41d494efa2570c75fc3044f091775858566569c115a219091346087d4"
