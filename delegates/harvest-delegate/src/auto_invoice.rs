@@ -1836,6 +1836,39 @@ mod tests {
         assert_eq!(counter(&g), 1);
     }
 
+    /// A request dated more than a day from this node's clock is left for
+    /// the seller: its date becomes the order's, and part of its id. Mutated
+    /// red by dropping the bound.
+    #[test]
+    fn a_request_dated_far_from_now_is_left_for_the_seller() {
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let mut stale = buyer.request(&jam(), 1, 1, 12_000);
+        // Re-seal with an envelope time of now but a requested_at two days
+        // back.
+        let (to_seller, _) = buyer.keys();
+        let mut plaintext = decrypt_message(&stale, &to_seller).unwrap();
+        if let MessageContent::OrderRequest {
+            instant: Some(selection),
+            ..
+        } = &mut plaintext.content
+        {
+            selection.requested_at_ms = (NOW - 2 * DAY_MS) as i64;
+        }
+        stale = harvest_common::sealed::seal(
+            &to_seller,
+            &buyer.tag(),
+            &buyer.conversation,
+            plaintext.content,
+            chrono::DateTime::from_timestamp_millis((NOW - 1_000) as i64).unwrap(),
+        )
+        .unwrap();
+        let decided = run(&mut f, &[stale]);
+        assert!(decided.orders.is_empty());
+        assert_eq!(decided.refused[0].1, Refusal::NotInstant);
+        assert_eq!(counter(&f), 0);
+    }
+
     /// The daily count forgets what is over a day old, so the ledger stays
     /// small.
     #[test]
