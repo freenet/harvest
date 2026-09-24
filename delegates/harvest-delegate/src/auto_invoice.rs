@@ -1078,10 +1078,10 @@ fn decide_one<S: SecretStore>(
     // I1: one order per request, checked before anything is spent.
     let request_id = request_id(&tag, &request.instant.nonce);
     let order_id = OrderId::for_request(&request_id);
-    if ledger.answered.contains(&request_id)
-        || store.orders.orders.contains_key(&order_id)
-        || issued_now.iter().any(|o| o.order.id == order_id)
-    {
+    // The ledger records a request as answered the moment its order is
+    // built, so it covers a second entry for the same request later in this
+    // run too.
+    if ledger.answered.contains(&request_id) || store.orders.orders.contains_key(&order_id) {
         return Err(Refusal::AlreadyAnswered);
     }
     let buyer_receipt_key = request.buyer_receipt_key.ok_or(Refusal::NoBuyerKey)?;
