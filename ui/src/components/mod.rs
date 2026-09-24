@@ -150,9 +150,16 @@ mod css_spacing_tests {
     fn inline_flex_or_grid_lines(source: &str) -> Vec<usize> {
         let mut lines = Vec::new();
         for (at, _) in source.match_indices("style:") {
-            let rest = &source[at..];
-            let Some(open) = rest.find('"') else { continue };
-            let body = &rest[open + 1..];
+            // Only a literal value: `style: "..."` or `style: format!("...")`.
+            // Anything else (a variable, a call) is skipped rather than read
+            // from whatever string happens to come next in the file.
+            let rest = source[at + "style:".len()..].trim_start();
+            let Some(body) = rest
+                .strip_prefix('"')
+                .or_else(|| rest.strip_prefix("format!(\""))
+            else {
+                continue;
+            };
             let mut end = body.len();
             let mut escaped = false;
             for (i, c) in body.char_indices() {
@@ -188,7 +195,8 @@ mod css_spacing_tests {
         // The second attribute's string spans two lines, so the third is on line 4.
         assert_eq!(inline_flex_or_grid_lines(caught), vec![1, 2, 4]);
         let ignored = "div { style: \"display: block; font-display: flex;\",\n\
-                       p { style: \"font-size: 0.8rem;\", \"display: flex\" }";
+                       p { style: \"font-size: 0.8rem;\", \"display: flex\" }\n\
+                       div { style: computed_style, \"display: flex\" }";
         assert!(inline_flex_or_grid_lines(ignored).is_empty());
     }
 
