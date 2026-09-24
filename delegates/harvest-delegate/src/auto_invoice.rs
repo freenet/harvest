@@ -98,6 +98,32 @@ pub(crate) fn ledger_key(store_contract_id: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Whether `key` is one of the ledgers ([`ledger_key`]): the one part of
+/// instant checkout's state that moves to a successor generation.
+pub(crate) fn is_ledger_key(key: &[u8]) -> bool {
+    key.starts_with(format!("{AUTO_PREFIX}ledger:").as_bytes())
+}
+
+/// Fold a predecessor's encoded ledger into what `held` encodes (a
+/// migration import). `Err` when the predecessor's does not decode.
+pub(crate) fn merge_ledger_bytes(
+    held: Option<&[u8]>,
+    incoming: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    let incoming: Ledger =
+        from_cbor(incoming).map_err(|_| "the ledger did not decode".to_string())?;
+    let mut ledger: Ledger = match held {
+        None => Ledger::default(),
+        Some(bytes) => {
+            from_cbor(bytes).map_err(|_| "this delegate's own ledger did not decode".to_string())?
+        }
+    };
+    if !merge_ledgers(&mut ledger, incoming) {
+        return Ok(None);
+    }
+    to_cbor(&ledger).map(Some).map_err(|e| e.to_string())
+}
+
 pub(crate) fn tip_key(network: BitcoinNetwork) -> Vec<u8> {
     format!("{AUTO_PREFIX}tip:{}", network.as_str()).into_bytes()
 }
@@ -124,21 +150,33 @@ pub(crate) const MAX_BATCH: usize = 16;
 pub(crate) const REQUIRED_CONFIRMATIONS: u32 = 1;
 /// How long the bridge must still be watching when an instant invoice goes
 /// out: a buyer may start paying until the anchor is
-/// [`MAX_ANCHOR_AGE_BLOCKS`] behind (about ten minutes a block), and the
-/// payment then needs time to confirm. A payment the bridge was not watching
-/// for when it was mined is never seen (freenet-bitcoin#7), so an invoice
-/// whose watch could lapse inside this is not issued.
+/// [`MAX_ANCHOR_AGE_BLOCKS`] behind (about eight hours at ten minutes a
+/// block, and longer about one time in twenty), and the payment then needs
+/// time to confirm. A payment the bridge was not watching for when it was
+/// mined is never seen (freenet-bitcoin#7), so an invoice whose watch could
+/// lapse inside this is not issued. A payment that takes longer than this to
+/// confirm can still be missed if the seller stays away: a residual.
 pub(crate) const WATCH_NEEDED_MS: u64 =
-    MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 2 * 60 * 60 * 1000;
-/// A reservation whose order has not appeared in the store after this long
-/// is taken to have never landed (a refused update), and released.
+    MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 3 * 60 * 60 * 1000;
+/// A sale whose order has not appeared in the store after this long is
+/// taken to have never landed (a refused update), and forgotten.
 pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
+/// Blocks past the age at which a buyer may still START paying during which
+/// an unpaid sale still holds its stock: time for a payment made at the last
+/// moment to confirm.
+pub(crate) const HOLD_MARGIN_BLOCKS: u32 = 12;
 const SEEN_CAP: usize = 1024;
 const ANSWERED_CAP: usize = 1024;
 const STATUSES_CAP: usize = 64;
-/// At most the open orders the store cap allows, twice over.
-const RESERVATIONS_CAP: usize = 2 * MAX_OPEN_PER_STORE;
+/// Sales are kept for a whole payment window (about two weeks), at most
+/// [`MAX_PER_DAY`] a day, with room to spare. Past it no new instant invoice
+/// is issued, rather than one whose sale could not be recorded.
+const SALES_CAP: usize = 512;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// Written when this generation's secrets are exported to a successor: from
+/// then on it arms nothing, so an old tab cannot put it back to work beside
+/// the successor, from a counter the successor has also copied.
+pub(crate) const EXPORTED_KEY: &[u8] = b"harvest:auto:exported";
 
 /// An arm as stored.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -160,24 +198,54 @@ pub(crate) struct Ledger {
     pub answered: VecDeque<[u8; 32]>,
     /// When each instant invoice of the last day was issued.
     pub issued_at_ms: Vec<u64>,
-    /// The last status this delegate signed per listing, so a run that read
-    /// the store before an earlier run's decrement landed still counts it.
+    /// The last status this delegate signed per listing, until the store
+    /// shows it (or something newer): a run that read the store before it
+    /// landed still counts it, and a store change re-sends one that has not
+    /// landed.
     pub statuses: Vec<ListingStatus>,
-    /// Stock held by instant invoices not yet paid. Published stock changes
-    /// only when an order is PAID ([`settle`]); an unpaid invoice holds its
-    /// quantity here until it is paid, cancelled, expires, or never lands.
-    /// So nobody can empty a listing by asking for invoices they never pay.
+    /// Every instant order this delegate issued for a counted listing, until
+    /// its outcome is settled ([`settle`]). Published stock changes only when
+    /// one is PAID, once; an unpaid one holds its quantity only while its
+    /// buyer can still start paying ([`Sale::holds`]). Kept past that, for
+    /// the whole payment window, because a payment may still confirm late,
+    /// or after the buyer cancelled (Paid outranks Cancelled).
     #[serde(default)]
-    pub reservations: Vec<Reservation>,
+    pub sales: Vec<Sale>,
 }
 
-/// Stock one unpaid instant invoice holds.
+/// One instant order for a counted listing.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub(crate) struct Reservation {
+pub(crate) struct Sale {
     pub order: OrderId,
     pub listing: ListingId,
     pub quantity: u32,
     pub issued_at_ms: u64,
+    pub anchor_height: u32,
+    /// The revision of the status that took this sale off published stock,
+    /// once the order was seen Paid. Kept until the store shows it.
+    #[serde(default)]
+    pub decremented: Option<u64>,
+}
+
+impl Sale {
+    /// Whether this sale still holds its quantity against new instant
+    /// invoices, given the order as the store has it and the chain tip.
+    fn holds(&self, order: Option<&AuthorizedOrder>, tip_height: u32, now_ms: u64) -> bool {
+        if self.decremented.is_some() {
+            // Already off published stock.
+            return false;
+        }
+        match order.map(|o| o.status) {
+            // Paid and not yet decremented: the decrement is about to go out.
+            Some(OrderStatus::Paid) => true,
+            Some(OrderStatus::Cancelled) | Some(OrderStatus::PaymentReversed) => false,
+            Some(OrderStatus::AwaitingPayment) | None => {
+                (order.is_some() || now_ms.saturating_sub(self.issued_at_ms) < NOT_LANDED_MS)
+                    && tip_height.saturating_sub(self.anchor_height)
+                        <= MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS
+            }
+        }
+    }
 }
 
 impl Ledger {
@@ -200,11 +268,13 @@ impl Ledger {
         self.issued_at_ms.push(now_ms);
     }
 
-    fn reserved(&self, listing: &ListingId) -> u32 {
-        self.reservations
+    /// Stock held for `listing` by unpaid instant orders ([`Sale::holds`]).
+    fn held(&self, listing: &ListingId, store: &StoreStateV1, tip_height: u32, now_ms: u64) -> u32 {
+        self.sales
             .iter()
-            .filter(|r| r.listing == *listing)
-            .map(|r| r.quantity)
+            .filter(|s| s.listing == *listing)
+            .filter(|s| s.holds(store.orders.orders.get(&s.order), tip_height, now_ms))
+            .map(|s| s.quantity)
             .sum()
     }
 
@@ -301,6 +371,13 @@ pub(crate) fn arm<S: SecretStore>(
     let Ok(store_id) = <[u8; 32]>::try_from(arm.store_contract_id.as_slice()) else {
         return refuse("a store contract id is 32 bytes".into());
     };
+    if secrets.has_secret(EXPORTED_KEY) {
+        return refuse(
+            "this generation of the Harvest delegate has handed its keys to a newer one; \
+             reload Harvest to use it"
+                .into(),
+        );
+    }
     if arm.watched_scripts.len() > harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES as usize
     {
         return refuse("too many watched addresses".into());
@@ -356,13 +433,56 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
     }
 }
 
-/// Remove every arm, so no background run here invoices again until the UI
-/// arms this delegate afresh. The ledgers stay: they only ever stop a
-/// request being answered twice.
+/// Stop this generation for good: remove every arm, so no background run
+/// here invoices again, and mark it exported, so no arm is taken again (an
+/// old tab left open would otherwise put it back to work beside its
+/// successor). The ledgers go to the successor with the export.
 pub(crate) fn disarm_all<S: SecretStore + crate::secrets::RemovableSecrets>(secrets: &mut S) {
+    secrets.set_secret(EXPORTED_KEY, b"1");
     for key in secrets.list_secrets(format!("{AUTO_PREFIX}arm:").as_bytes()) {
         secrets.remove_secret(&key);
     }
+}
+
+/// Fold a predecessor's ledger into this delegate's (a migration import):
+/// the union of what each has seen, answered and issued, the newer of each
+/// listing's status, and every sale once, preferring the record that has
+/// already decremented. Both are lists this delegate only ever grows or
+/// settles, so a union loses nothing either side knew.
+pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
+    let before = held.clone();
+    for digest in incoming.seen {
+        held.saw(digest);
+    }
+    for request in incoming.answered {
+        if !held.answered.contains(&request) {
+            held.answered.push_back(request);
+        }
+    }
+    while held.answered.len() > ANSWERED_CAP {
+        held.answered.pop_front();
+    }
+    for at in incoming.issued_at_ms {
+        held.issued_at_ms.push(at);
+    }
+    for status in incoming.statuses {
+        match held.statuses.iter().find(|s| s.listing == status.listing) {
+            Some(own) if own.revision >= status.revision => {}
+            _ => held.signed(status),
+        }
+    }
+    for sale in incoming.sales {
+        match held.sales.iter_mut().find(|s| s.order == sale.order) {
+            Some(own) => {
+                if own.decremented.is_none() {
+                    own.decremented = sale.decremented;
+                }
+            }
+            None => held.sales.push(sale),
+        }
+    }
+    held.sales.truncate(SALES_CAP);
+    *held != before
 }
 
 /// How many watched scripts are at or after the counter.
@@ -542,7 +662,7 @@ fn on_store_change<S: SecretStore>(
     }
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
-    if ledger.reservations.is_empty() {
+    if ledger.sales.is_empty() && ledger.statuses.is_empty() {
         return Vec::new();
     }
     let statuses = settle(
@@ -552,7 +672,11 @@ fn on_store_change<S: SecretStore>(
         &store_sk,
         now_ms,
     );
-    save(secrets, &ledger_key(&record.arm.store_contract_id), &ledger);
+    // Recorded before anything is published: a decrement sent but not
+    // recorded would be sent again on the next change, twice off the stock.
+    if !save(secrets, &ledger_key(&record.arm.store_contract_id), &ledger) {
+        return Vec::new();
+    }
     Decided {
         statuses,
         owner: Some(store_sk.verifying_key()),
@@ -561,10 +685,18 @@ fn on_store_change<S: SecretStore>(
     .into_messages(&record.arm)
 }
 
-/// Settle the ledger's reservations against the store: a PAID order's
-/// quantity comes off the published stock (a signed status returned for
-/// publishing), and a reservation whose order was cancelled or reversed,
-/// expired unpaid, or never landed is released. What is left holds stock.
+/// Settle the ledger's sales against the store, and return the statuses to
+/// publish.
+///
+/// - A sale whose order is PAID comes off published stock once: a status
+///   one revision above the one it is counted from, recorded as
+///   `decremented` and in `ledger.statuses`.
+/// - A status this delegate signed that the store does not show yet is
+///   returned again (a lost update is re-sent on the next change), and one
+///   the store shows, or has moved past, is forgotten.
+/// - A sale is forgotten once its outcome cannot change any more: its
+///   decrement landed, its payment was reversed, it never landed, or its
+///   payment window closed. Until then a late payment still decrements.
 pub(crate) fn settle(
     ledger: &mut Ledger,
     store: &StoreStateV1,
@@ -572,60 +704,72 @@ pub(crate) fn settle(
     store_sk: &SigningKey,
     now_ms: u64,
 ) -> Vec<AuthorizedListingStatus> {
-    let mut statuses = Vec::new();
-    let reservations = std::mem::take(&mut ledger.reservations);
-    for reservation in reservations {
-        let keep = match store.orders.orders.get(&reservation.order) {
-            None => now_ms.saturating_sub(reservation.issued_at_ms) < NOT_LANDED_MS,
-            Some(order) => match order.status {
-                OrderStatus::Paid => {
-                    let (revision, availability) =
-                        effective_status(store, ledger, &reservation.listing);
-                    if let ListingAvailability::Available {
+    let held_revision = |listing: &ListingId| {
+        store
+            .listing_statuses
+            .records
+            .get(&harvest_common::store::Bytes32(listing.0))
+            .map(|s| s.status.revision)
+    };
+    // Our own statuses the store now shows, or has moved past, are done.
+    ledger
+        .statuses
+        .retain(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision));
+
+    let sales = std::mem::take(&mut ledger.sales);
+    for mut sale in sales {
+        let order = store.orders.orders.get(&sale.order);
+        if let (Some(order), None) = (order, sale.decremented) {
+            if order.status == OrderStatus::Paid {
+                let (revision, availability) = effective_status(store, ledger, &sale.listing);
+                sale.decremented = Some(match availability {
+                    ListingAvailability::Available {
                         quantity: Some(left),
-                    } = availability
-                    {
-                        let remaining = left.saturating_sub(reservation.quantity);
+                    } => {
                         let status = ListingStatus {
-                            listing: reservation.listing.clone(),
-                            revision: revision.saturating_add(1).max(now_ms),
-                            availability: if remaining == 0 {
-                                ListingAvailability::SoldOut
-                            } else {
-                                ListingAvailability::Available {
+                            listing: sale.listing.clone(),
+                            revision: revision.saturating_add(1),
+                            availability: match left.saturating_sub(sale.quantity) {
+                                0 => ListingAvailability::SoldOut,
+                                remaining => ListingAvailability::Available {
                                     quantity: Some(remaining),
-                                }
+                                },
                             },
                         };
-                        if let Ok(signed) = sign_status(store_sk, status.clone()) {
-                            ledger.signed(status);
-                            statuses.retain(|s: &AuthorizedListingStatus| {
-                                s.status.listing != reservation.listing
-                            });
-                            statuses.push(signed);
-                        }
+                        let revision = status.revision;
+                        ledger.signed(status);
+                        revision
                     }
-                    false
-                }
-                OrderStatus::AwaitingPayment => {
-                    // Unpaid, and still payable while its anchor is young
-                    // enough for a buyer to start paying. With no tip, keep.
-                    match (tip_height, order.order.anchor) {
-                        (Some(tip), Some(anchor)) => {
-                            tip.saturating_sub(anchor.height) <= MAX_ANCHOR_AGE_BLOCKS
-                        }
-                        (None, _) => true,
-                        (_, None) => false,
-                    }
-                }
-                OrderStatus::Cancelled | OrderStatus::PaymentReversed => false,
-            },
+                    // Sold out, taken down or no longer counted: nothing to
+                    // take off.
+                    _ => 0,
+                });
+            }
+        }
+        let window_closed = tip_height.is_some_and(|tip| {
+            tip.saturating_sub(sale.anchor_height) > harvest_common::payment::PAYMENT_WINDOW_BLOCKS
+        });
+        let done = match (order.map(|o| o.status), sale.decremented) {
+            (_, Some(revision)) => {
+                revision == 0 || held_revision(&sale.listing).is_some_and(|held| held >= revision)
+            }
+            (Some(OrderStatus::PaymentReversed), None) => true,
+            (None, None) => now_ms.saturating_sub(sale.issued_at_ms) >= NOT_LANDED_MS,
+            _ => window_closed,
         };
-        if keep {
-            ledger.reservations.push(reservation);
+        if !done {
+            ledger.sales.push(sale);
         }
     }
-    statuses
+
+    // Every own status the store does not show yet goes out: the ones just
+    // signed, and any whose earlier update was lost.
+    ledger
+        .statuses
+        .iter()
+        .filter(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision))
+        .filter_map(|own| sign_status(store_sk, own.clone()).ok())
+        .collect()
 }
 
 fn note_tip<S: SecretStore>(secrets: &mut S, network: BitcoinNetwork, state: &[u8], now_ms: u64) {
@@ -1075,9 +1219,18 @@ fn decide_one<S: SecretStore>(
         .map_err(Refusal::Signing)
     };
 
+    // The buyer's `requested_at` becomes the order's `created_at` and part
+    // of its id; one far from this node's clock is left for the seller.
+    let requested_at = chrono::DateTime::from_timestamp_millis(request.instant.requested_at_ms)
+        .filter(|at| {
+            at.timestamp_millis() >= 0
+                && now_ms.abs_diff(at.timestamp_millis() as u64) <= REQUEST_MAX_AGE_MS
+        })
+        .ok_or(Refusal::NotInstant)?;
+
     // I1: one order per request, checked before anything is spent.
     let request_id = request_id(&tag, &request.instant.nonce);
-    let order_id = OrderId::for_request(&request_id);
+    let order_id = OrderId::for_request(&request_id, &requested_at);
     // The ledger records a request as answered the moment its order is
     // built, so it covers a second entry for the same request later in this
     // run too.
@@ -1104,9 +1257,8 @@ fn decide_one<S: SecretStore>(
         return Err(Refusal::TotalMismatch);
     }
 
-    // Stock (I3). Published stock is what the seller has; the ledger's
-    // reservations are what unpaid instant invoices, this run's included,
-    // hold of it.
+    // Stock (I3). Published stock is what the seller has; the ledger's sales
+    // are what unpaid instant invoices, this run's included, hold of it.
     let (_, availability) = effective_status(store, ledger, &listing.id);
     let left = match &availability {
         ListingAvailability::Withdrawn => return Err(Refusal::Withdrawn),
@@ -1124,7 +1276,7 @@ fn decide_one<S: SecretStore>(
         }
         if left
             < ledger
-                .reserved(&listing.id)
+                .held(&listing.id, store, tip_height, now_ms)
                 .saturating_add(request.quantity)
         {
             return Err(Refusal::Reserved);
@@ -1176,9 +1328,9 @@ fn decide_one<S: SecretStore>(
     if ledger.issued_last_day(now_ms) >= MAX_PER_DAY {
         return Err(Refusal::DailyCap);
     }
-    // A reservation must be recordable, or the stock it holds would not be
-    // counted: past this many held at once, the seller answers.
-    if left.is_some() && ledger.reservations.len() >= RESERVATIONS_CAP {
+    // A sale must be recordable, or the stock it takes would not be
+    // counted: past this many kept at once, the seller answers.
+    if left.is_some() && ledger.sales.len() >= SALES_CAP {
         return Err(Refusal::StoreCap);
     }
     if trailing_unpaid(xpub, &all_orders) >= MAX_TRAILING_UNPAID {
@@ -1214,7 +1366,7 @@ fn decide_one<S: SecretStore>(
         listing_tag: Some(listing_tag(&from_seller, &listing.id)),
         buyer_receipt_key: Some(buyer_receipt_key),
         request_id: Some(request_id),
-        created_at: chrono::DateTime::from_timestamp_millis(now_ms as i64).unwrap_or_default(),
+        created_at: requested_at,
     }
     .with_derived_id();
     let signed = sign_order(store_sk, order)?;
@@ -1223,11 +1375,13 @@ fn decide_one<S: SecretStore>(
         order_id: signed.order.id.clone(),
     })?;
     if left.is_some() {
-        ledger.reservations.push(Reservation {
+        ledger.sales.push(Sale {
             order: signed.order.id.clone(),
             listing: listing.id.clone(),
             quantity: request.quantity,
             issued_at_ms: now_ms,
+            anchor_height: anchor.height,
+            decremented: None,
         });
     }
     ledger.answer(request_id, now_ms);
@@ -1509,6 +1663,7 @@ mod tests {
                         region: Some("UK".into()),
                         choices: vec!["Fig".into()],
                         expected_total_sats: total,
+                        requested_at_ms: at_ms as i64,
                     }),
                 },
                 chrono::DateTime::from_timestamp_millis(at_ms as i64).unwrap(),
@@ -1799,6 +1954,7 @@ mod tests {
                         region: Some("UK".into()),
                         choices: vec!["Fig".into()],
                         expected_total_sats: 12_000,
+                        requested_at_ms: (NOW - 60_000) as i64,
                     }),
                 },
                 chrono::DateTime::from_timestamp_millis((NOW - 60_000 + u64::from(nonce)) as i64)
@@ -1962,9 +2118,10 @@ mod tests {
             ListingAvailability::Available { quantity: Some(2) },
             "published stock untouched"
         );
-        // The chain moves past the unpaid invoices' payable window.
+        // The chain moves past the age at which their buyers could still
+        // start paying, and the margin for a last-moment payment to confirm.
         let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
-        tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + 1;
+        tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS + 1;
         save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
         let again = run(&mut f, &[Buyer::new(51).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
@@ -1998,10 +2155,170 @@ mod tests {
         statuses[0]
             .verify(&store_sk().verifying_key())
             .expect("signed by the store key");
-        // Settled once: the same state again changes nothing.
-        assert!(on_notification(&mut f.secrets, &[1; 32], &state, NOW)
-            .unwrap()
+        // Taken off once: the same state again (the update not landed yet)
+        // sends the same status, not a second decrement.
+        let again = on_notification(&mut f.secrets, &[1; 32], &state, NOW).unwrap();
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = again.as_slice() else {
+            panic!("{again:?}")
+        };
+        let UpdateData::Delta(delta) = &update.update else {
+            panic!("a delta")
+        };
+        let delta: StoreStateV1Delta = from_cbor(delta.as_ref()).unwrap();
+        assert_eq!(delta.listing_statuses.unwrap(), statuses);
+    }
+
+    /// The store as the delegate would see it after a store change, with
+    /// one order's status set.
+    fn with_status(f: &mut Fixture, id: &OrderId, status: OrderStatus) {
+        f.store.orders.orders.get_mut(id).expect("published").status = status;
+    }
+
+    fn store_change(f: &mut Fixture) -> Vec<AuthorizedListingStatus> {
+        let state = to_cbor(&f.store).unwrap();
+        let out = on_notification(&mut f.secrets, &[1; 32], &state, NOW).unwrap();
+        out.iter()
+            .flat_map(|m| match m {
+                OutboundDelegateMsg::UpdateContractRequest(update) => {
+                    let UpdateData::Delta(delta) = &update.update else {
+                        panic!("a delta")
+                    };
+                    let delta: StoreStateV1Delta = from_cbor(delta.as_ref()).unwrap();
+                    delta.listing_statuses.unwrap_or_default()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// S1: a payment that confirms after the hold ended, or after the buyer
+    /// cancelled (Paid outranks Cancelled), still comes off the stock, once.
+    /// Mutated red by forgetting a sale when its hold ends.
+    #[test]
+    fn a_late_or_post_cancel_payment_still_comes_off_the_stock() {
+        for late in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+            let mut f = fixture();
+            counted(&mut f, 1);
+            let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+            publish(&mut f, &first);
+            let id = first.orders[0].order.id.clone();
+            with_status(&mut f, &id, late);
+            let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+            tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS + 1;
+            save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
+            assert!(store_change(&mut f).is_empty(), "nothing paid yet");
+            with_status(&mut f, &id, OrderStatus::Paid);
+            let statuses = store_change(&mut f);
+            assert_eq!(statuses.len(), 1, "{late:?}");
+            assert_eq!(
+                statuses[0].status.availability,
+                ListingAvailability::SoldOut
+            );
+            assert_eq!(statuses[0].status.revision, 6, "one above the store's");
+        }
+    }
+
+    /// A decrement whose update was lost goes out again on the next change,
+    /// and stops once the store shows it. Mutated red by returning only the
+    /// statuses signed in this call.
+    #[test]
+    fn a_lost_decrement_is_sent_again() {
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        let sent = store_change(&mut f);
+        assert_eq!(sent.len(), 1);
+        // Lost: the store still shows the old count.
+        let again = store_change(&mut f);
+        assert_eq!(again, sent);
+        // Landed.
+        f.store
+            .listing_statuses
+            .records
+            .insert(harvest_common::store::Bytes32(jam().id.0), sent[0].clone());
+        assert!(store_change(&mut f).is_empty());
+        assert!(load_ledger(&f.secrets, &f.record.arm.store_contract_id)
+            .sales
             .is_empty());
+    }
+
+    /// A migration keeps every sale: the predecessor's ledger is folded
+    /// into the successor's by order id. Mutated red by dropping incoming
+    /// sales in `merge_ledgers`.
+    #[test]
+    fn a_migrated_ledger_keeps_its_sales() {
+        let sale = |n: u8, decremented| Sale {
+            order: OrderId([n; 32]),
+            listing: jam().id,
+            quantity: 1,
+            issued_at_ms: NOW,
+            anchor_height: 1_000,
+            decremented,
+        };
+        let mut held = Ledger {
+            sales: vec![sale(1, None)],
+            ..Default::default()
+        };
+        let incoming = Ledger {
+            sales: vec![sale(1, Some(9)), sale(2, None)],
+            answered: [[5; 32]].into(),
+            ..Default::default()
+        };
+        assert!(merge_ledgers(&mut held, incoming.clone()));
+        assert_eq!(held.sales, vec![sale(1, Some(9)), sale(2, None)]);
+        assert!(held.answered.contains(&[5; 32]));
+        assert!(
+            !merge_ledgers(&mut held, incoming),
+            "nothing new the second time"
+        );
+    }
+
+    /// Once exported, a generation takes no arm again. Mutated red by
+    /// dropping the tombstone check in `arm`.
+    #[test]
+    fn an_exported_generation_takes_no_arm() {
+        let mut f = fixture();
+        disarm_all(&mut f.secrets);
+        let (response, subscriptions) = arm(&mut f.secrets, f.record.arm.clone(), NOW);
+        assert!(matches!(
+            response,
+            HarvestDelegateResponse::AutoInvoice { result: Err(_), .. }
+        ));
+        assert!(subscriptions.is_empty());
+        assert!(load_arm(&f.secrets, &f.record.arm.store_contract_id).is_none());
+    }
+
+    /// The store read the mailbox run asked for comes back and is decided:
+    /// the context carries the batch through, and the answer is one store
+    /// update holding the replies for after it lands.
+    #[test]
+    fn the_store_read_is_decided_and_answered() {
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let state = to_cbor(&MailboxStateV1 {
+            messages: vec![buyer.request(&jam(), 1, 1, 12_000)],
+        })
+        .unwrap();
+        let out = on_notification(&mut f.secrets, &[2; 32], &state, NOW).unwrap();
+        let [OutboundDelegateMsg::GetContractRequest(get)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let store = to_cbor(&f.store).unwrap();
+        let answer =
+            on_store_state(&mut f.secrets, Some(&store), get.context.as_ref(), NOW).unwrap();
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = answer.as_slice() else {
+            panic!("{answer:?}")
+        };
+        let UpdateData::Delta(delta) = &update.update else {
+            panic!("a delta")
+        };
+        let delta: StoreStateV1Delta = from_cbor(delta.as_ref()).unwrap();
+        assert_eq!(delta.orders.unwrap().len(), 1);
+        let replies: PendingReplies = from_cbor(update.context.as_ref()).unwrap();
+        assert_eq!(buyer.read(&replies.replies).len(), 1);
+        assert!(on_store_state(&mut f.secrets, Some(&store), b"not ours", NOW).is_none());
     }
 
     /// A store update that never landed releases its hold after a while.
@@ -2020,7 +2337,7 @@ mod tests {
             NOW + NOT_LANDED_MS,
         );
         assert!(released.is_empty());
-        assert!(ledger.reservations.is_empty());
+        assert!(ledger.sales.is_empty());
     }
 
     /// I4. Past each cap the request is left for the seller. Mutated red by

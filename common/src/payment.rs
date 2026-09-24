@@ -153,14 +153,22 @@ use serde::{Deserialize, Serialize};
 pub struct OrderId(pub [u8; 32]);
 
 impl OrderId {
-    /// The id of the order answering request `request` (see
-    /// [`Order::request_id`]): the request alone decides it, so anyone who
-    /// knows the request, the buyer included, can find its answer in the
-    /// store.
-    pub fn for_request(request: &[u8; 32]) -> Self {
+    /// The id of the order answering request `request`, made at
+    /// `requested_at` (see [`Order::request_id`]): the request decides it, so
+    /// anyone who knows the request, the buyer included, can find its answer
+    /// in the store.
+    ///
+    /// `requested_at` is the buyer's `InstantSelection::requested_at_ms`, and
+    /// the order's `created_at` must equal it for the id to verify
+    /// (`AuthorizedOrder::verify_terms` re-derives the id from the terms). So
+    /// every version of one id shares its `created_at`, which is what the
+    /// order cap ranks by: two versions ranking differently would make the
+    /// cap non-associative (the harvest#85 shape).
+    pub fn for_request(request: &[u8; 32], requested_at: &DateTime<Utc>) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(b"harvest/order-id/request/v1");
         h.update(request);
+        h.update(&requested_at.timestamp_millis().to_le_bytes());
         Self(*h.finalize().as_bytes())
     }
 
@@ -173,7 +181,7 @@ impl OrderId {
         // An order that answers a request is identified by the request, so
         // a store can hold only one answer to it. See [`Order::request_id`].
         if let Some(request) = order.request_id {
-            return Self::for_request(&request);
+            return Self::for_request(&request, &order.created_at);
         }
         let mut probe = order.clone();
         probe.id = Self([0u8; 32]);
@@ -573,8 +581,9 @@ pub struct Order {
     /// instant checkout: [`request_id`] over the conversation's routing tag
     /// and the nonce the buyer sent.
     ///
-    /// **It is what the order's id is derived from** when present (see
-    /// [`OrderId::from_terms`]), so a store holds at most ONE order per
+    /// **It is what the order's id is derived from** when present, with
+    /// `created_at`, which must be the buyer's `requested_at` (see
+    /// [`OrderId::for_request`]), so a store holds at most ONE order per
     /// request: two answers to one request -- a retry, a replayed request,
     /// or two of the seller's devices both answering -- are one map entry,
     /// and the existing per-id merge (higher status rank, then the smaller
@@ -592,6 +601,23 @@ pub struct Order {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<[u8; 32]>,
     pub created_at: DateTime<Utc>,
+}
+
+/// One instant-checkout request, as an order answering it names it: the
+/// request id and the buyer's `requested_at`, which together decide the
+/// answer's id ([`OrderId::for_request`]). One value rather than two fields,
+/// because an answer carrying one without the other would not be the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnsweredRequest {
+    pub request_id: [u8; 32],
+    pub requested_at: DateTime<Utc>,
+}
+
+impl AnsweredRequest {
+    /// The id of the order answering this request.
+    pub fn order_id(&self) -> OrderId {
+        OrderId::for_request(&self.request_id, &self.requested_at)
+    }
 }
 
 /// The request id of one buyer request: see [`Order::request_id`].

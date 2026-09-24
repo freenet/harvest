@@ -251,6 +251,7 @@ pub fn BuyForm(
                                 region: (!region.is_empty()).then_some(region),
                                 choices: picked.clone(),
                                 expected_total_sats: total,
+                                requested_at_ms: unix_millis() as i64,
                             })
                         } else {
                             None
@@ -1155,7 +1156,7 @@ pub fn AcceptRequest(
                         BuyerValues {
                             order_binding,
                             buyer_receipt_key,
-                            request_id: instant.map(|i| i.request_id),
+                            request: instant.map(|i| i.request),
                         },
                         amount_sats,
                         required_confirmations,
@@ -1198,8 +1199,8 @@ fn accept(
     // Answered already (by this device's delegate, or another of the
     // seller's devices): a second answer would be the same order id with a
     // different address, and the buyer could pay the one the store drops.
-    if let Some(request_id) = buyer.request_id {
-        let id = harvest_common::payment::OrderId::for_request(&request_id);
+    if let Some(request) = buyer.request {
+        let id = request.order_id();
         if state
             .browsing_stores
             .get(store_contract_id)
@@ -1229,7 +1230,7 @@ fn accept(
         // Likewise the buyer's receipt key (harvest#53 Phase B): without it
         // the buyer can neither cancel nor complain, and will not pay.
         buyer_receipt_key: buyer.buyer_receipt_key,
-        request_id: buyer.request_id,
+        answers_request: buyer.request,
     })
 }
 
@@ -1240,7 +1241,7 @@ struct BuyerValues {
     order_binding: [u8; 32],
     buyer_receipt_key: Option<[u8; 32]>,
     /// The instant-checkout request this answers, if it was one.
-    request_id: Option<[u8; 32]>,
+    request: Option<harvest_common::payment::AnsweredRequest>,
 }
 
 /// What a buyer can actually DO about one blocker.

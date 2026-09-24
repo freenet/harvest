@@ -1734,6 +1734,8 @@ fn gen_request(root: &Path) {
     let fx = StoreFx::new();
     let params = cbor(&fx.params);
     let p = &fx.params;
+    // Every answer to one request is dated at the buyer's request, which is
+    // part of its id: `created` is that date.
     let answer = |req: u8, script: u8, amount: u64, created: i64| {
         let mut o = fx.order("", created);
         o.request_id = Some([req; 32]);
@@ -1742,10 +1744,10 @@ fn gen_request(root: &Path) {
         o.with_derived_id()
     };
     let a1 = fx.authorized(&answer(1, 1, 50_000, 1_700_000_100), OrderStatus::AwaitingPayment, 1);
-    let a1_other = fx.authorized(&answer(1, 2, 50_000, 1_700_000_101), OrderStatus::AwaitingPayment, 1);
-    let a1_paid = fx.authorized(&answer(1, 2, 50_000, 1_700_000_101), OrderStatus::Paid, 2);
-    let a1_cheap_paid = fx.authorized(&answer(1, 3, 1, 1_700_000_102), OrderStatus::Paid, 3);
-    let a1_dearer = fx.authorized(&answer(1, 4, 60_000, 1_700_000_103), OrderStatus::AwaitingPayment, 1);
+    let a1_other = fx.authorized(&answer(1, 2, 50_000, 1_700_000_100), OrderStatus::AwaitingPayment, 1);
+    let a1_paid = fx.authorized(&answer(1, 2, 50_000, 1_700_000_100), OrderStatus::Paid, 2);
+    let a1_cheap_paid = fx.authorized(&answer(1, 3, 1, 1_700_000_100), OrderStatus::Paid, 3);
+    let a1_dearer = fx.authorized(&answer(1, 4, 60_000, 1_700_000_100), OrderStatus::AwaitingPayment, 1);
     let a1_cancelled = fx.authorized(&answer(1, 1, 50_000, 1_700_000_100), OrderStatus::Cancelled, 1);
     let a2 = fx.authorized(&answer(2, 5, 50_000, 1_700_000_104), OrderStatus::AwaitingPayment, 1);
     let plain = fx.authorized(&fx.order("plain", 1_700_000_105), OrderStatus::AwaitingPayment, 1);
@@ -1804,13 +1806,17 @@ fn gen_request(root: &Path) {
     }
     c.finish();
 
-    // At the order cap: two answers to one request that differ in
-    // `created_at`, P newest and Q oldest with the larger amount, and R a
-    // full cap dated between them. Under a cap keyed on `created_at` the two
-    // groupings disagree (PR #159 review, round 1).
+    // At the order cap: two answers to one request (so one date), P and Q
+    // with the larger amount, dated just above the oldest of R, a full cap:
+    // the versions of one id rank the same, so the groupings agree. And two
+    // requests dated either side of R's range, the shape that broke the cap
+    // when a request's answer could carry any date (PR #159 review, round 1).
     let mut c = Corpus::new(root, "store-request-cap", &params);
-    let p_ans = fx.authorized(&answer(9, 6, 50_000, 1_900_000_000), OrderStatus::AwaitingPayment, 1);
-    let q_ans = fx.authorized(&answer(9, 7, 60_000, 1_600_000_000), OrderStatus::AwaitingPayment, 1);
+    let p_ans = fx.authorized(&answer(9, 6, 50_000, 1_700_000_000), OrderStatus::AwaitingPayment, 1);
+    let q_ans = fx.authorized(&answer(9, 7, 60_000, 1_700_000_000), OrderStatus::AwaitingPayment, 1);
+    assert_eq!(p_ans.order.id, q_ans.order.id);
+    let early = fx.authorized(&answer(10, 8, 50_000, 1_600_000_000), OrderStatus::AwaitingPayment, 1);
+    let late = fx.authorized(&answer(11, 9, 50_000, 1_900_000_000), OrderStatus::AwaitingPayment, 1);
     let p_s = fx.build(None, vec![], vec![p_ans]);
     let q_s = fx.build(None, vec![], vec![q_ans]);
     let many: Vec<AuthorizedOrder> = (0..MAX_ORDERS)
@@ -1823,9 +1829,14 @@ fn gen_request(root: &Path) {
     let pq_r = fx.merged(&fx.merged(&p_s, &q_s), &r_s);
     let p_qr = fx.merged(&p_s, &fx.merged(&q_s, &r_s));
     assert_eq!(cbor(&pq_r), cbor(&p_qr), "the cap is associative for one request's answers");
-    c.state("rq_cap_P_newest", &cbor(&p_s));
-    c.state("rq_cap_Q_oldest_dearer", &cbor(&q_s));
+    let e_s = fx.build(None, vec![], vec![early, late]);
+    let e_r = fx.merged(&fx.merged(&e_s, &p_s), &r_s);
+    let r_e = fx.merged(&e_s, &fx.merged(&p_s, &r_s));
+    assert_eq!(cbor(&e_r), cbor(&r_e), "and for requests either side of the cap's range");
+    c.state("rq_cap_P", &cbor(&p_s));
+    c.state("rq_cap_Q_dearer", &cbor(&q_s));
     c.state("rq_cap_R_full", &cbor(&r_s));
+    c.state("rq_cap_early_and_late", &cbor(&e_s));
     c.finish();
 }
 

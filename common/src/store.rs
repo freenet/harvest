@@ -690,12 +690,10 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// TERMS, which `OrderId` is derived from, so every version of one order ranks
 /// the same however far its status has moved.
 ///
-/// Except an order answering a request (`Order::request_id`): its id comes
-/// from the request alone, so two versions of it can carry different terms,
-/// `created_at` included, and a key that differed between them would make the
-/// cap non-associative (the harvest#85 shape below, with the version rather
-/// than the status changing the rank). So such an order ranks by its id alone,
-/// above every dated order: [`order_cap_key`].
+/// An order answering a request (`Order::request_id`) can have versions with
+/// different terms under one id, but never a different `created_at`: the id is
+/// derived from the request AND `created_at` (`OrderId::for_request`), so the
+/// rank holds for it too.
 ///
 /// # Why status takes no part (harvest#85)
 ///
@@ -727,24 +725,13 @@ fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     }
     let mut ranked: Vec<(i64, OrderId)> = orders
         .iter()
-        .map(|(id, record)| (order_cap_key(&record.order), id.clone()))
+        .map(|(id, record)| (record.order.created_at.timestamp_millis(), id.clone()))
         .collect();
     // Ascending, so the oldest come first and are the ones dropped below.
     ranked.sort();
     let excess = orders.len() - MAX_ORDERS;
     for (_, id) in ranked.into_iter().take(excess) {
         orders.remove(&id);
-    }
-}
-
-/// The date part of an order's rank under the cap: its `created_at`, or, for
-/// an order answering a request, a value every version of it shares. See
-/// [`enforce_order_cap`].
-fn order_cap_key(order: &crate::payment::Order) -> i64 {
-    if order.request_id.is_some() {
-        i64::MAX
-    } else {
-        order.created_at.timestamp_millis()
     }
 }
 
@@ -3444,26 +3431,30 @@ mod order_tests {
         }
     }
 
-    /// **The cap stays associative for two versions of one request's
-    /// answer** that differ in `created_at` (instant checkout). With the cap
-    /// keyed on `created_at`, P = {x newest}, Q = {x oldest, larger amount}
-    /// and R = a full cap dated between them gave `(P+Q)+R` = R (the larger,
-    /// oldest version wins, then is cut) but `P+(Q+R)` = x plus most of R.
-    /// Mutated red by making `order_cap_key` return `created_at` for every
-    /// order.
+    /// **Every version of a request's answer ranks the same under the cap.**
+    /// Two answers to one request can differ in their terms, amount
+    /// included, but not in `created_at`: the id binds it. So answers made at
+    /// different times are different orders, and the cap stays associative
+    /// at the boundary for versions of one. Mutated red by dropping
+    /// `created_at` from `OrderId::for_request` (the two dates are then one
+    /// id, and the groupings disagree).
     #[test]
     fn the_order_cap_is_associative_for_two_answers_to_one_request() {
         let answer = |seed: u8, secs: i64, amount: u64| {
             let (_, mut record) = synthetic_order(seed, secs, OrderStatus::AwaitingPayment);
             record.order.request_id = Some([0x42; 32]);
             record.order.amount_sats = amount;
-            record.order.id = OrderId::for_request(&[0x42; 32]);
+            record.order.id = OrderId::from_terms(&record.order);
             (record.order.id.clone(), record)
         };
-        let (id, newest) = answer(7, 9_000_000, 50_000);
-        let (_, oldest) = answer(8, 10, 60_000);
-        let p: BTreeMap<OrderId, AuthorizedOrder> = [(id.clone(), newest)].into();
-        let q: BTreeMap<OrderId, AuthorizedOrder> = [(id, oldest)].into();
+        let (newest_id, newest) = answer(7, 9_000_000, 50_000);
+        let (oldest_id, oldest) = answer(8, 10, 60_000);
+        assert_ne!(
+            newest_id, oldest_id,
+            "a different date is a different order"
+        );
+        let p: BTreeMap<OrderId, AuthorizedOrder> = [(newest_id, newest)].into();
+        let q: BTreeMap<OrderId, AuthorizedOrder> = [(oldest_id, oldest)].into();
         let r = full_of_old_orders();
         let enc = |m: &BTreeMap<OrderId, AuthorizedOrder>| crate::to_cbor(m).expect("encode");
         assert_eq!(
@@ -5721,10 +5712,13 @@ mod one_order_per_request_tests {
         }
     }
 
+    /// An answer to `request`: every answer carries the buyer's
+    /// `requested_at`, so they share `created_at`.
     fn answering(n: u8, request: [u8; 32], amount_sats: u64) -> Order {
         let mut o = order(n);
         o.request_id = Some(request);
         o.amount_sats = amount_sats;
+        o.created_at = chrono::DateTime::from_timestamp(1_750_000_000, 0).expect("time");
         o.with_derived_id()
     }
 

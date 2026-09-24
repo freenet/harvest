@@ -1566,9 +1566,10 @@ pub struct PendingInvoice {
     pub buyer_receipt_key: Option<[u8; 32]>,
     /// The instant-checkout request this answers
     /// ([`harvest_common::payment::Order::request_id`]), when the seller
-    /// answers one by hand. It makes this order and any the seller's
-    /// delegate issued for the same request one order in the store.
-    pub request_id: Option<[u8; 32]>,
+    /// answers one by hand. The order carries its id and takes the buyer's
+    /// `requested_at` as `created_at`, which makes it and any order the
+    /// seller's delegate issued for the same request one order in the store.
+    pub answers_request: Option<harvest_common::payment::AnsweredRequest>,
 }
 
 /// A fully-formed invoice awaiting the seller's signature.
@@ -1707,7 +1708,7 @@ pub fn order_for_invoice(
          data to load and issue it again.",
     )?;
     Ok(Order {
-        request_id: pending.request_id,
+        request_id: pending.answers_request.map(|r| r.request_id),
         // Stamped by `with_derived_id` below, out of the finished terms. A
         // literal here would be a second place deciding an order's identity.
         id: harvest_common::payment::OrderId([0u8; 32]),
@@ -1730,7 +1731,11 @@ pub fn order_for_invoice(
         listing_tag,
         // Copied from the request verbatim too (harvest#53 Phase B).
         buyer_receipt_key: pending.buyer_receipt_key,
-        created_at,
+        // An answer to an instant request is dated at the buyer's request:
+        // the date is part of its id (`OrderId::for_request`).
+        created_at: pending
+            .answers_request
+            .map_or(created_at, |r| r.requested_at),
     }
     .with_derived_id())
 }
@@ -5667,12 +5672,12 @@ impl AppState {
                         instant: Some(selection),
                         ..
                     } if message.addressing == Addressing::ToSeller => {
-                        let id = harvest_common::payment::OrderId::for_request(
-                            &harvest_common::payment::request_id(
-                                &conversation.buyer_public_key,
-                                &selection.nonce,
-                            ),
-                        );
+                        let Some(request) =
+                            selection.answered_request(&conversation.buyer_public_key)
+                        else {
+                            continue;
+                        };
+                        let id = request.order_id();
                         if !store.orders.iter().any(|order| order.order.id == id) {
                             continue;
                         }
@@ -12217,6 +12222,7 @@ impl AppState {
                 let wanted: Vec<crate::bitcoin_inbox::WatchWanted> = orders
                     .into_iter()
                     .map(|o| crate::bitcoin_inbox::WatchWanted {
+                        renew_after_ms: crate::bitcoin_inbox::RENEW_AFTER_MS,
                         network: o.order.network,
                         script: o.order.payment_script_pubkey.clone(),
                         anchor_height: o.order.anchor.map(|a| a.height),
@@ -15884,7 +15890,7 @@ mod invoice_tests {
 
     fn invoice() -> PendingInvoice {
         PendingInvoice {
-            request_id: None,
+            answers_request: None,
             store_contract_id: STORE_ID.to_vec(),
             seller_fingerprint: SELLER.to_string(),
             listing_id: listing_id(),
@@ -20679,7 +20685,7 @@ mod buy_flow_tests {
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
         PendingInvoice {
-            request_id: None,
+            answers_request: None,
             store_contract_id: STORE.to_vec(),
             seller_fingerprint: "seller-fp".to_string(),
             listing_id: ListingId([3u8; 32]),
@@ -29288,13 +29294,19 @@ mod buy_flow_tests {
             Some(anchor(TIP_HEIGHT - 1)),
             OrderStatus::AwaitingPayment,
         );
+        // The delegate's order: the UI's fields (an empty buyer
+        // fingerprint, one confirmation, this conversation's binding, tag and
+        // receipt key) plus the request id, dated at the buyer's request.
+        let requested_at_ms = 1_700_000_000_000;
+        let request = harvest_common::payment::AnsweredRequest {
+            request_id: harvest_common::payment::request_id(&tag, &nonce),
+            requested_at: chrono::DateTime::from_timestamp_millis(requested_at_ms).unwrap(),
+        };
         let mut instant = ordinary.clone();
-        instant.order.request_id = Some(harvest_common::payment::request_id(&tag, &nonce));
+        instant.order.request_id = Some(request.request_id);
+        instant.order.created_at = request.requested_at;
         let instant = resigned(instant, &seller_signing_key());
-        assert_eq!(
-            instant.order.id,
-            OrderId::for_request(&harvest_common::payment::request_id(&tag, &nonce))
-        );
+        assert_eq!(instant.order.id, request.order_id());
 
         let (baseline, _) = buyer_after_acceptance(&ordinary);
         let expected = purchases(&baseline).remove(0).blockers;
@@ -29308,6 +29320,7 @@ mod buy_flow_tests {
                 "1 Lane".into(),
                 String::new(),
                 Some(crate::messaging::InstantSelection {
+                    requested_at_ms,
                     nonce,
                     region: None,
                     choices: vec![],
@@ -29426,18 +29439,23 @@ mod buy_flow_tests {
         assert_eq!((arm.watch_left_ms, lapses_at), (0, 0));
 
         let key = |i: u8| (BitcoinNetwork::Signet, vec![0x00, 0x14, i]);
-        let sent = |at: u64, read: bool| crate::bitcoin_inbox::SentWatch {
-            sent_at_ms: at,
-            entry_key: Default::default(),
-            mainnet_height: 0,
-            ghostkey: gk.id(),
-            read,
-            unread_since_ms: at,
-        };
+        let sent =
+            |at: u64, read: bool, read_lease_ms: Option<u64>| crate::bitcoin_inbox::SentWatch {
+                sent_at_ms: at,
+                entry_key: Default::default(),
+                mainnet_height: 0,
+                ghostkey: gk.id(),
+                read,
+                unread_since_ms: at,
+                read_lease_ms,
+            };
         let inbox = state.bitcoin.inbox.as_mut().unwrap();
-        inbox.sent.insert(key(4), sent(1_000, true));
-        inbox.sent.insert(key(5), sent(500, true));
-        inbox.sent.insert(key(6), sent(2_000, false));
+        inbox.sent.insert(key(4), sent(1_000, true, Some(1_000)));
+        // A renewal not yet read: the watch its predecessor started still
+        // runs, from when that was sent.
+        inbox.sent.insert(key(5), sent(3_000, false, Some(500)));
+        // Never read at all: ends the usable run.
+        inbox.sent.insert(key(6), sent(2_000, false, None));
         let (arm, lapses_at) = state
             .auto_invoice_arm("seller-fp", &registration, 10)
             .expect("an arm");

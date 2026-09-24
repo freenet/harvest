@@ -1083,17 +1083,17 @@ fn unanswered_requests(
         // binding-and-tag rule below would also count any other order in the
         // conversation for the same listing, and so hide a second instant
         // request the delegate left for the seller.
-        let request_id = instant.as_ref().and_then(|selection| {
+        let request = instant.as_ref().and_then(|selection| {
             let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-            Some(harvest_common::payment::request_id(&tag, &selection.nonce))
+            selection.answered_request(&tag)
         });
-        if let Some(request_id) = request_id {
-            let id = harvest_common::payment::OrderId::for_request(&request_id);
+        if let Some(request) = request {
+            let id = request.order_id();
             if published.iter().any(|order| order.order.id == id) {
                 continue;
             }
         }
-        let answered = request_id.is_none()
+        let answered = request.is_none()
             && keys.is_some_and(|keys| {
                 let tag = keys.listing_tag(listing_id);
                 let answers: Vec<&harvest_common::payment::AuthorizedOrder> = published
@@ -1158,7 +1158,7 @@ fn unanswered_requests(
             held.listing_id == *listing_id
                 && held.quantity == *quantity
                 && held.buyer_receipt_key == *buyer_receipt_key
-                && held.instant.map(|i| i.request_id) == request_id
+                && held.instant.map(|i| i.request) == request
         }) {
             continue;
         }
@@ -1175,9 +1175,9 @@ fn unanswered_requests(
             digest: *digest,
             instant: instant
                 .as_ref()
-                .zip(request_id)
-                .map(|(selection, request_id)| InstantAnswer {
-                    request_id,
+                .zip(request)
+                .map(|(selection, request)| InstantAnswer {
+                    request,
                     total_sats: selection.expected_total_sats,
                 }),
         });
@@ -1242,7 +1242,7 @@ struct PendingRequest {
 /// total the buyer was shown, to start the amount from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InstantAnswer {
-    pub request_id: [u8; 32],
+    pub request: harvest_common::payment::AnsweredRequest,
     pub total_sats: u64,
 }
 
@@ -1542,6 +1542,7 @@ mod inbox_tests {
             readable(
                 MessageContent::OrderRequest {
                     instant: Some(crate::messaging::InstantSelection {
+                        requested_at_ms: 1_700_000_000_000,
                         nonce: [nonce; 16],
                         region: None,
                         choices: vec![],
@@ -1557,16 +1558,19 @@ mod inbox_tests {
                 [digest; 32],
             )
         };
-        let request_id = |nonce: u8| harvest_common::payment::request_id(&[1u8; 32], &[nonce; 16]);
+        let request = |nonce: u8| harvest_common::payment::AnsweredRequest {
+            request_id: harvest_common::payment::request_id(&[1u8; 32], &[nonce; 16]),
+            requested_at: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+        };
         let entries = vec![instant(1, 1), instant(2, 2)];
         let found = unanswered_requests(&entries, &listings, &[], Some(&keys()));
         assert_eq!(found.len(), 2, "two asks");
         assert_eq!(
             found
                 .iter()
-                .map(|r| r.instant.unwrap().request_id)
+                .map(|r| r.instant.unwrap().request.request_id)
                 .collect::<std::collections::BTreeSet<_>>(),
-            [request_id(1), request_id(2)].into()
+            [request(1).request_id, request(2).request_id].into()
         );
         assert!(found
             .iter()
@@ -1575,10 +1579,10 @@ mod inbox_tests {
         // The first ask answered by its own order; an unrelated order in the
         // same conversation for the same listing answers nothing.
         let mut answer = published(1, Some(BINDING), Some(keys().listing_tag(&id)));
-        answer.order.id = harvest_common::payment::OrderId::for_request(&request_id(1));
+        answer.order.id = request(1).order_id();
         let found = unanswered_requests(&entries, &listings, &[answer], Some(&keys()));
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].instant.unwrap().request_id, request_id(2));
+        assert_eq!(found[0].instant.unwrap().request, request(2));
     }
 
     /// The count beside Orders is the number of accept controls the inbox
@@ -2020,6 +2024,7 @@ mod inbox_tests {
             buyer_receipt_key: None,
         };
         let shown = describe(&request(Some(crate::messaging::InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
             nonce: [1u8; 16],
             region: Some("EU".into()),
             choices: vec!["Fig".into(), "Large".into()],

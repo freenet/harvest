@@ -254,6 +254,9 @@ pub(crate) enum Family {
     /// A travelling "folded into" record: staged until the predecessor
     /// carrying it is sealed.
     Folded,
+    /// An instant-checkout ledger: merged by order id and request id, so the
+    /// sales a predecessor issued still come off the stock when paid.
+    AutoLedger,
     /// Everything else: written only if absent.
     Standalone,
 }
@@ -261,7 +264,9 @@ pub(crate) enum Family {
 /// The rule for `key`.
 pub(crate) fn family(key: &[u8]) -> Family {
     use harvest_common::migration::SECRET_KEY_PREFIX;
-    if !key.starts_with(SECRET_KEY_PREFIX)
+    if crate::auto_invoice::is_ledger_key(key) {
+        Family::AutoLedger
+    } else if !key.starts_with(SECRET_KEY_PREFIX)
         || key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
         || key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
     {
@@ -319,6 +324,15 @@ pub(crate) fn import_secret<S: SecretStore>(
 ) -> SecretImport {
     match family(key) {
         Family::Refused => SecretImport::Permanent("not an importable Harvest secret".into()),
+        Family::AutoLedger => {
+            let held = store.get_secret(key);
+            match crate::auto_invoice::merge_ledger_bytes(held.as_deref(), value) {
+                Ok(None) => SecretImport::AlreadyAuthoritative,
+                Ok(Some(bytes)) => written(store.set_secret(key, &bytes)),
+                Err(why) if held.is_some() && why.contains("own") => SecretImport::Retryable(why),
+                Err(why) => SecretImport::Permanent(why),
+            }
+        }
         Family::StoreRegistry => merge_list(
             store,
             key,
@@ -950,9 +964,10 @@ mod tests {
             Family::Standalone, // unfinished store creation
             Family::Folded,     // travelling "folded into" record
             Family::KeptPurchase,
-            Family::Refused, // instant-checkout arm
-            Family::Refused, // instant-checkout ledger
-            Family::Refused, // instant-checkout tip
+            Family::Refused,    // instant-checkout arm
+            Family::AutoLedger, // instant-checkout ledger
+            Family::Refused,    // instant-checkout tip
+            Family::Refused,    // instant-checkout exported marker
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(
@@ -963,6 +978,31 @@ mod tests {
         for (shape, want) in shapes.iter().zip(expected) {
             assert_eq!(family(shape), want, "{}", String::from_utf8_lossy(shape));
         }
+    }
+
+    /// A predecessor's instant-checkout ledger is merged into this
+    /// delegate's, never written over it. Mutated red by importing ledgers
+    /// as `Standalone` (the held sale would stay, the incoming one lost).
+    #[test]
+    fn an_instant_checkout_ledger_is_merged() {
+        let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
+        let ledger = |order: u8| crate::auto_invoice::Ledger {
+            answered: [[order; 32]].into(),
+            ..Default::default()
+        };
+        let mut store = MemSecrets::default();
+        store.set_secret(&key, &cbor(&ledger(1)));
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&ledger(2))),
+            SecretImport::Written
+        ));
+        let held: crate::auto_invoice::Ledger =
+            from_cbor(&store.get_secret(&key).unwrap()).unwrap();
+        assert!(held.answered.contains(&[1; 32]) && held.answered.contains(&[2; 32]));
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&ledger(2))),
+            SecretImport::AlreadyAuthoritative
+        ));
     }
 
     /// A predecessor list that does not decode is refused; this delegate's

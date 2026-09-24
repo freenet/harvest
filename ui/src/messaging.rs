@@ -1784,6 +1784,7 @@ mod buy_flow_tests {
         let seller = Seller::new(33);
         let buyer = BuyerConversation::open(&seller.public_key()).expect("open");
         let selection = InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
             nonce: [5u8; 16],
             region: Some("EU".into()),
             choices: vec!["Fig".into(), "Large".into()],

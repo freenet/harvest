@@ -72,12 +72,15 @@ fn export_scope() -> ExportScope {
 /// export can reach.
 struct WithoutStoreKeys<'a, S>(&'a S);
 
-/// Store keys, which custody recovers, and instant checkout's arms and
-/// ledgers, which describe this node's own subscriptions and counter and are
-/// rebuilt by the UI re-arming.
+/// Store keys, which custody recovers, and instant checkout's state that
+/// describes only this node (its arms, which the UI re-arms, its tip cache and
+/// its exported marker). Instant checkout's LEDGERS do go: they hold the
+/// sales whose payments are still to come off the stock
+/// (`auto_invoice::Ledger::sales`).
 fn is_store_key(key: &[u8]) -> bool {
     key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
-        || key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
+        || (key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
+            && !crate::auto_invoice::is_ledger_key(key))
 }
 
 impl<S: SecretStore> SecretStore for WithoutStoreKeys<'_, S> {
@@ -275,10 +278,25 @@ mod tests {
     fn an_export_disarms_instant_checkout() {
         let mut s = store();
         let arm = crate::auto_invoice::arm_key(&[5u8; 32]);
+        let ledger = crate::auto_invoice::ledger_key(&[5u8; 32]);
         s.set_secret(&arm, b"an arm");
+        s.set_secret(&ledger, b"a ledger");
         let msgs = export(&mut s, Some(&harvest_origin()), 4).expect("authorized");
-        assert!(exported(&msgs).secrets.iter().all(|(k, _)| *k != arm));
+        let keys: Vec<Vec<u8>> = exported(&msgs)
+            .secrets
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!keys.contains(&arm), "the arm stays behind");
+        assert!(
+            keys.contains(&ledger),
+            "the ledger's sales go to the successor"
+        );
         assert!(!s.has_secret(&arm), "the arm is gone");
+        assert!(
+            s.has_secret(crate::auto_invoice::EXPORTED_KEY),
+            "and none is taken again"
+        );
     }
 
     /// The prefix scope is load-bearing, not decoration.

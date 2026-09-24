@@ -20,10 +20,11 @@
 //!
 //! A bridge lets a watch lapse about a day after the request that last asked
 //! for it, and an invoice must stay watched through its whole payment window
-//! (about ten hours: the delegate's `WATCH_NEEDED_MS`). While Harvest is open
-//! the watch is renewed every twelve hours, so instant checkout keeps working
-//! for roughly half a day after the seller last had Harvest open, and then
-//! requests wait for them again.
+//! (about eleven hours: the delegate's `WATCH_NEEDED_MS`). While Harvest is open
+//! the watch on those addresses is renewed every four hours, so instant
+//! checkout stays on while Harvest is open, and for seven to eleven hours
+//! after the seller closes it; then requests wait for them again. A longer
+//! bridge watch (freenet-bitcoin#26) is what would stretch that.
 
 use std::collections::HashMap;
 
@@ -39,10 +40,10 @@ pub const REARM_EVERY_MS: u64 = 10 * 60 * 1000;
 /// How long to wait for an answer to `PeekOrderAddresses` before asking again.
 pub const PEEK_RETRY_MS: u64 = 60 * 1000;
 /// How long a bridge keeps watching after the request that last asked, and
-/// the margin kept below it (a request dated by this tab's clock and read by
-/// the bridge a little later).
+/// the margin kept below it: the bridge ends a watch by block time, and a
+/// block may be dated up to two hours ahead.
 pub const WATCH_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
-pub const WATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
+pub const WATCH_MARGIN_MS: u64 = 2 * 60 * 60 * 1000;
 /// How long after the first arm a delegate that has never run in the
 /// background is taken to be unable to: a new block arrives about every ten
 /// minutes, and each one runs it.
@@ -174,6 +175,7 @@ impl AppState {
                     upcoming
                         .iter()
                         .map(|a| crate::bitcoin_inbox::WatchWanted {
+                            renew_after_ms: crate::bitcoin_inbox::PREWATCH_RENEW_AFTER_MS,
                             network,
                             script: a.script_pubkey.clone(),
                             anchor_height: tip_height,
@@ -209,22 +211,29 @@ impl AppState {
             crate::gateway::bitcoin_config::default_trusted_bridges(network).ok()?;
         let address_code_hash = self.bitcoin.address_generation.0.clone().ok()?;
         // Only what the bridge has READ a request for, and the watch is
-        // counted from the earliest of those requests.
+        // counted from the earliest of those requests. A renewal not yet read
+        // does not end the watch the last read request started.
         let inbox = self.bitcoin.inbox.as_ref()?;
         let mut watched_scripts = Vec::new();
         let mut earliest: Option<u64> = None;
         for address in upcoming {
-            let Some(sent) = inbox
+            let Some(read_at) = inbox
                 .sent
                 .get(&(network, address.script_pubkey.clone()))
-                .filter(|s| s.read)
+                .and_then(|s| {
+                    if s.read {
+                        Some(s.sent_at_ms)
+                    } else {
+                        s.read_lease_ms
+                    }
+                })
             else {
                 // The delegate hands addresses out in order, so one not
                 // watched ends the usable run.
                 break;
             };
             watched_scripts.push(address.script_pubkey.clone());
-            earliest = Some(earliest.map_or(sent.sent_at_ms, |e| e.min(sent.sent_at_ms)));
+            earliest = Some(earliest.map_or(read_at, |e| e.min(read_at)));
         }
         let lapses_at_ms = earliest
             .map(|at| at + WATCH_LIFETIME_MS - WATCH_MARGIN_MS)

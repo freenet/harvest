@@ -169,6 +169,23 @@ pub struct InstantSelection {
     /// recomputes it and does not invoice when the two differ, so a listing
     /// changed after the buyer read it never yields a total they did not see.
     pub expected_total_sats: u64,
+    /// When the buyer asked, by their clock, in milliseconds. It becomes the
+    /// answering order's `created_at` and is part of its id
+    /// ([`crate::payment::OrderId::for_request`]), so every answer to this
+    /// request, from any of the seller's devices, is one order. The seller's
+    /// delegate answers only a request within a day of its own clock.
+    pub requested_at_ms: i64,
+}
+
+impl InstantSelection {
+    /// The request this selection makes, in the conversation whose routing
+    /// tag is `tag`; `None` when `requested_at_ms` is not a time.
+    pub fn answered_request(&self, tag: &[u8; 32]) -> Option<crate::payment::AnsweredRequest> {
+        Some(crate::payment::AnsweredRequest {
+            request_id: crate::payment::request_id(tag, &self.nonce),
+            requested_at: chrono::DateTime::from_timestamp_millis(self.requested_at_ms)?,
+        })
+    }
 }
 
 /// Seal `content` into a mailbox entry, refusing one the mailbox contract

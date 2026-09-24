@@ -146,6 +146,14 @@ pub fn submission_bytes(floor: &SignedFloor, entry: WireEntry) -> Result<Vec<u8>
 /// renews with half a day to spare.
 pub const RENEW_AFTER_MS: u64 = 12 * 60 * 60 * 1000;
 
+/// How long after a watch request for one of instant checkout's next
+/// addresses it is renewed. Sooner than an order's: the seller's delegate
+/// may invoice on such an address only while the watch will outlast a whole
+/// payment window (`harvest-delegate`'s `WATCH_NEEDED_MS`), so a watch kept
+/// fresh keeps instant checkout on for as long as Harvest is open, and for
+/// most of a working day after.
+pub const PREWATCH_RENEW_AFTER_MS: u64 = 4 * 60 * 60 * 1000;
+
 /// How long a just-sent request is given to land in the inbox before its
 /// absence is read as its having been dropped.
 pub const LAND_GRACE_MS: u64 = 2 * 60 * 1000;
@@ -175,6 +183,9 @@ pub struct SentWatch {
     /// to read it: the first of a run of requests that each went unread. See
     /// [`InboxTracker::request_long_unread`].
     pub unread_since_ms: u64,
+    /// When the latest request the bridge WAS seen to read was sent: the
+    /// watch that is certainly running while a renewal waits to be read.
+    pub read_lease_ms: Option<u64>,
 }
 
 impl SentWatch {
@@ -187,6 +198,7 @@ impl SentWatch {
             ghostkey: entry.entry.ghostkey,
             read: false,
             unread_since_ms: now_ms,
+            read_lease_ms: None,
         }
     }
 
@@ -194,6 +206,7 @@ impl SentWatch {
     pub fn observe(&mut self, inbox: &InboxStateV1) {
         if inbox.is_removed(&self.entry_key, self.mainnet_height) {
             self.read = true;
+            self.read_lease_ms = Some(self.sent_at_ms);
         }
     }
 }
@@ -218,11 +231,22 @@ pub fn watch_due(
     state_received_ms: u64,
     now_ms: u64,
 ) -> bool {
+    watch_due_after(sent, inbox, state_received_ms, now_ms, RENEW_AFTER_MS)
+}
+
+/// [`watch_due`] with the renewal interval of the caller's choosing.
+pub fn watch_due_after(
+    sent: Option<&SentWatch>,
+    inbox: &InboxStateV1,
+    state_received_ms: u64,
+    now_ms: u64,
+    renew_after_ms: u64,
+) -> bool {
     let Some(sent) = sent else {
         return true;
     };
     let age = now_ms.saturating_sub(sent.sent_at_ms);
-    if age >= RENEW_AFTER_MS {
+    if age >= renew_after_ms {
         return true;
     }
     if sent.read || inbox.is_removed(&sent.entry_key, sent.mainnet_height) {
@@ -249,6 +273,10 @@ pub struct WatchWanted {
     /// new watch at its next scan (freenet-bitcoin#7), so a payment mined
     /// before the bridge reads the request is not found.
     pub anchor_height: Option<u32>,
+    /// How long after it was last sent it is sent again: [`RENEW_AFTER_MS`]
+    /// for an order's, [`PREWATCH_RENEW_AFTER_MS`] for instant checkout's
+    /// next addresses.
+    pub renew_after_ms: u64,
 }
 
 /// A request prepared and handed to the ghostkey delegate, waiting on its
@@ -553,7 +581,16 @@ impl InboxTracker {
             let repeated = due
                 .iter()
                 .any(|d| d.network == w.network && d.script == w.script);
-            if !signing && !repeated && watch_due(self.sent.get(&key), state, received_ms, now_ms) {
+            if !signing
+                && !repeated
+                && watch_due_after(
+                    self.sent.get(&key),
+                    state,
+                    received_ms,
+                    now_ms,
+                    w.renew_after_ms,
+                )
+            {
                 due.push(w);
             }
         }
@@ -602,6 +639,15 @@ impl InboxTracker {
             if let Some(previous) = self.sent.get(&key).filter(|p| !p.read) {
                 this.unread_since_ms = previous.unread_since_ms;
             }
+            // The watch the last read request started runs on until the new
+            // one is read.
+            this.read_lease_ms = self.sent.get(&key).and_then(|p| {
+                if p.read {
+                    Some(p.sent_at_ms)
+                } else {
+                    p.read_lease_ms
+                }
+            });
             self.sent.insert(key, this);
         }
     }
@@ -1048,6 +1094,7 @@ mod tests {
 
     fn wanted(network: BitcoinNetwork, n: u8, anchor: u32) -> WatchWanted {
         WatchWanted {
+            renew_after_ms: RENEW_AFTER_MS,
             network,
             script: vec![0x00, 0x14, n],
             anchor_height: Some(anchor),
@@ -1238,6 +1285,49 @@ mod tests {
             !plan[0].scripts.contains(&ByteBuf(w[0].script.clone())),
             "the landing script is not asked for again"
         );
+    }
+
+    /// Instant checkout's next addresses are renewed on their own, shorter
+    /// interval, and a renewal the bridge has not read yet keeps the lease of
+    /// the one it did read. Mutated red by not carrying the lease in
+    /// `record_sent`.
+    #[test]
+    fn a_pre_watch_renews_sooner_and_keeps_its_read_lease() {
+        let gk = authority().mint();
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let mut w = wanted(BitcoinNetwork::Signet, 7, 1);
+        w.renew_after_ms = PREWATCH_RENEW_AFTER_MS;
+        let key = (w.network, w.script.clone());
+        let first = t.plan(gk.id(), std::slice::from_ref(&w), &[], T0);
+        let entry = send(&mut t, &mut inbox, &gk, &first[0], T0);
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone(), T0 + 1);
+        assert_eq!(t.sent[&key].read_lease_ms, Some(T0));
+
+        // Not due before the shorter interval, due at it, and an order's
+        // watch is not due then.
+        let before = T0 + PREWATCH_RENEW_AFTER_MS - 1;
+        t.on_state(inbox.clone(), before);
+        assert!(t
+            .plan(gk.id(), std::slice::from_ref(&w), &[], before)
+            .is_empty());
+        let at = T0 + PREWATCH_RENEW_AFTER_MS;
+        t.on_state(inbox.clone(), at);
+        let renewal = t.plan(gk.id(), std::slice::from_ref(&w), &[], at);
+        assert_eq!(renewal.len(), 1);
+        assert!(!watch_due_after(
+            t.sent.get(&key),
+            &inbox,
+            at,
+            at,
+            RENEW_AFTER_MS
+        ));
+
+        // Sent, not yet read: the lease of the first request still holds.
+        send(&mut t, &mut inbox, &gk, &renewal[0], at);
+        assert!(!t.sent[&key].read);
+        assert_eq!(t.sent[&key].read_lease_ms, Some(T0));
     }
 
     #[test]
