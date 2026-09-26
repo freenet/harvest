@@ -31142,24 +31142,27 @@ mod buy_flow_tests {
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
-            hosted.starts_with("Instant checkout is not running on this node"),
+            hosted.starts_with("Your store can't take orders on this node"),
             "{hosted}"
         );
         // A node that did run is not told it does not, however long ago it armed.
         let ran = instant_checkout_status_text(&status(Some(1), None), NO_BACKGROUND_RUN_AFTER_MS);
-        assert!(ran.starts_with("Instant checkout is on"), "{ran}");
+        assert!(ran.starts_with("Your store is taking orders"), "{ran}");
         // Ready before any background run (the tip read on arming,
         // harvest#162): starting, not on, since a hosted gateway gets here
         // too. On once a background run is seen.
         let early = instant_checkout_status_text(&status(None, None), 1);
-        assert!(early.starts_with("Instant checkout is starting"), "{early}");
+        assert!(
+            early.starts_with("Your store is starting to take orders"),
+            "{early}"
+        );
         let on = instant_checkout_status_text(&status(Some(1), None), 1);
-        assert!(on.starts_with("Instant checkout is on"), "{on}");
+        assert!(on.starts_with("Your store is taking orders"), "{on}");
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
-        assert!(waiting.contains("paused: no recent block"), "{waiting}");
+        assert!(waiting.contains("taking orders right now: no recent block"), "{waiting}");
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
-        assert!(paused.contains("paused: no recent block"), "{paused}");
+        assert!(paused.contains("taking orders right now: no recent block"), "{paused}");
         let mut oversold = status(Some(1), None);
         oversold.oversold = vec![OrderId([7; 32])];
         let told = instant_checkout_status_text(&oversold, 1);

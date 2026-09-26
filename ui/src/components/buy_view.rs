@@ -470,6 +470,9 @@ fn PurchaseCard(
     let cancellable = purchase.cancellable();
     rsx! {
         div { class: "card", style: "margin-top: 0.5rem;",
+            if let Some(headline) = purchase_headline(&purchase) {
+                p { strong { "{headline}" } }
+            }
             p { class: "text-muted", style: "font-size: 0.8rem;",
                 "Order {short}, from conversation {crate::state::short_conversation_tag(&purchase.conversation)}"
             }
@@ -559,6 +562,25 @@ fn PurchaseCard(
             }
         }
     }
+}
+
+/// The one line a buyer reads first about a purchase: placed and waiting
+/// for their payment, or paid (Ian, 2026-09-26). `None` for anything else
+/// (settled otherwise, or a record the app cannot confirm), whose card says
+/// what happened in its own words.
+fn purchase_headline(purchase: &BuyerPurchase) -> Option<&'static str> {
+    use harvest_common::payment::OrderStatus;
+    if purchase.paid.is_some() {
+        return Some("Paid.");
+    }
+    if purchase.settled().is_some() || purchase.unconfirmed_paid() {
+        return None;
+    }
+    purchase
+        .commitment
+        .as_ref()
+        .filter(|c| c.status == OrderStatus::AwaitingPayment)
+        .map(|_| "Order placed, waiting for your payment.")
 }
 
 /// "Pay this order": ask this node's delegate to keep the seller-signed terms
@@ -1094,9 +1116,9 @@ pub fn AcceptRequest(
             }
             if instant.is_some() {
                 p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "The buyer used instant checkout. Your device's instant checkout does not "
-                    "count an order you answer here: if you count this listing, lower the count "
-                    "yourself once it is paid."
+                    "The buyer pressed Buy now while your store couldn't answer. An order you answer "
+                    "here shows under your orders once it is paid, and is not taken off your count "
+                    "for you: if you count this listing, lower the count yourself once it is paid."
                 }
             }
             div { class: "form-group",
@@ -1442,6 +1464,110 @@ mod tests {
             message(Addressing::ToSeller, accepted),
         ];
         assert_eq!(seller_answers(&thread), 2);
+    }
+
+    fn order(
+        status: harvest_common::payment::OrderStatus,
+        buy_now: bool,
+    ) -> harvest_common::payment::AuthorizedOrder {
+        harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: buy_now.then_some([4; 32]),
+                id: harvest_common::payment::OrderId([1; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    fn purchase(
+        commitment: Option<harvest_common::payment::AuthorizedOrder>,
+        blockers: Vec<PaymentBlocker>,
+    ) -> BuyerPurchase {
+        BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([1; 32]),
+            conversation: [2; 32],
+            commitment,
+            blockers,
+            paid: None,
+        }
+    }
+
+    /// The buyer's cap is counted the way the seller's store counts it:
+    /// unpaid Buy now orders still open. Paid, cancelled, too old to pay, and
+    /// orders the seller issued by hand do not count. Mutated red by dropping
+    /// each filter in turn.
+    #[test]
+    fn a_buyers_unpaid_orders_are_counted_like_the_stores_cap() {
+        use harvest_common::payment::OrderStatus;
+        let open = purchase(Some(order(OrderStatus::AwaitingPayment, true)), vec![]);
+        let mut paid = purchase(Some(order(OrderStatus::Paid, true)), vec![]);
+        paid.paid = Some(order(OrderStatus::Paid, true));
+        let cancelled = purchase(
+            Some(order(OrderStatus::Cancelled, true)),
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled)],
+        );
+        let stale = purchase(
+            Some(order(OrderStatus::AwaitingPayment, true)),
+            vec![PaymentBlocker::AnchorStale {
+                anchor_height: 1,
+                tip_height: 100,
+            }],
+        );
+        let by_hand = purchase(Some(order(OrderStatus::AwaitingPayment, false)), vec![]);
+        let unpublished = purchase(None, vec![PaymentBlocker::CommitmentNotPublished]);
+        assert_eq!(open_unpaid_orders(&[open.clone()]), 1);
+        assert_eq!(
+            open_unpaid_orders(&[paid, cancelled, stale, by_hand, unpublished]),
+            0
+        );
+        let at_cap = vec![open; harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER];
+        assert_eq!(
+            open_unpaid_orders(&at_cap),
+            harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
+        );
+    }
+
+    /// Placed and waiting, then paid; nothing for a settled order, whose card
+    /// says what happened. Mutated red by swapping the two lines.
+    #[test]
+    fn a_purchase_reads_placed_then_paid() {
+        use harvest_common::payment::OrderStatus;
+        let waiting = purchase(Some(order(OrderStatus::AwaitingPayment, true)), vec![]);
+        assert_eq!(
+            purchase_headline(&waiting),
+            Some("Order placed, waiting for your payment.")
+        );
+        let mut paid = purchase(
+            Some(order(OrderStatus::Paid, true)),
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)],
+        );
+        paid.paid = Some(order(OrderStatus::Paid, true));
+        assert_eq!(purchase_headline(&paid), Some("Paid."));
+        let cancelled = purchase(
+            Some(order(OrderStatus::Cancelled, true)),
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled)],
+        );
+        assert_eq!(purchase_headline(&cancelled), None);
     }
 
     /// The newest answer after the ones already there when the order went

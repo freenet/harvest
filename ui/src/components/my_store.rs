@@ -729,7 +729,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
 
         if let Some(notice) = instant_checkout {
             section { class: "card",
-                h3 { "Instant checkout" }
+                h3 { "Taking orders" }
                 p { class: "text-muted", "{notice}" }
             }
         }
