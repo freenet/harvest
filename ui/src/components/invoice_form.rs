@@ -394,7 +394,9 @@ fn sold_out_ids(store: &crate::state::BrowsingStore) -> Vec<ListingId> {
         .collect()
 }
 
-/// The invoices on a store that THIS seller issued, newest first.
+/// The invoices on a store that THIS seller issued, newest first, less the
+/// Buy now orders nobody has paid ([`crate::fulfilment::is_unpaid_buy_now`]):
+/// the seller hears of a Buy now once it is paid.
 ///
 /// A store contract carries every order, and the seller's panel is about
 /// their own. The filter is on `seller_fingerprint` rather than on ownership
@@ -409,6 +411,7 @@ fn invoices_issued_by(
     let mut mine: Vec<_> = orders
         .iter()
         .filter(|o| o.order.seller_fingerprint == seller_fingerprint)
+        .filter(|o| !crate::fulfilment::is_unpaid_buy_now(o))
         .cloned()
         .collect();
     mine.sort_by_key(|o| std::cmp::Reverse(o.order.created_at));
@@ -846,6 +849,33 @@ mod tests {
             addresses,
             vec!["tb1qexample3", "tb1qexample2", "tb1qexample1"]
         );
+    }
+
+    /// An unpaid Buy now is not an order, as the seller sees it: left out
+    /// while it awaits payment, and when it was cancelled unpaid. Once paid it
+    /// is listed. An invoice the seller issued by hand (no request id) is
+    /// always listed. Mutated red by dropping the `is_unpaid_buy_now` filter,
+    /// and by widening it to every `AwaitingPayment` order.
+    #[test]
+    fn an_unpaid_buy_now_is_not_on_the_sellers_list() {
+        let buy_now = |minutes: i64, status: OrderStatus| {
+            let mut o = order("me", minutes);
+            o.order.request_id = Some([minutes as u8; 32]);
+            o.status = status;
+            o
+        };
+        let orders = vec![
+            order("me", 1),
+            buy_now(2, OrderStatus::AwaitingPayment),
+            buy_now(3, OrderStatus::Cancelled),
+            buy_now(4, OrderStatus::Paid),
+            buy_now(5, OrderStatus::PaymentReversed),
+        ];
+        let shown: Vec<i64> = invoices_issued_by(&orders, "me")
+            .iter()
+            .map(|o| o.order.payment_script_pubkey[2] as i64)
+            .collect();
+        assert_eq!(shown, vec![5, 4, 1]);
     }
 
     #[test]

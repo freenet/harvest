@@ -141,9 +141,16 @@ pub(crate) const REQUEST_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 /// [`MAX_ANCHOR_AGE_BLOCKS`] behind their tip, so an anchor from a stalled
 /// feed would publish an invoice nobody can pay.
 pub(crate) const TIP_MAX_AGE_MS: u64 = 3 * 60 * 60 * 1000;
+// I4's caps are invisible and generous (Ian, 2026-09-26): no genuine buyer
+// should reach one, and sellers are not told about them. The per-buyer one is
+// shared with the buyer's app, which says so before sending
+// (`harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER`). The trailing
+// one cannot be raised the same way: it is the seller's wallet's gap limit
+// (see `trailing_unpaid`), not a matter of generosity.
 pub(crate) const MAX_OPEN_PER_STORE: usize = 15;
-pub(crate) const MAX_OPEN_PER_CONVERSATION: usize = 2;
-pub(crate) const MAX_PER_DAY: usize = 30;
+pub(crate) const MAX_OPEN_PER_CONVERSATION: usize =
+    harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER;
+pub(crate) const MAX_PER_DAY: usize = 60;
 pub(crate) const MAX_TRAILING_UNPAID: u32 = 15;
 /// Requests answered in one run; the rest wait for the next change.
 pub(crate) const MAX_BATCH: usize = 16;
@@ -162,17 +169,19 @@ pub(crate) const WATCH_NEEDED_MS: u64 =
 /// A sale whose order has not appeared in the store after this long is
 /// taken to have never landed (a refused update), and forgotten.
 pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
-/// Blocks past the age at which a buyer may still START paying during which
-/// an unpaid sale still holds its stock: time for a payment made at the last
-/// moment to confirm.
-pub(crate) const HOLD_MARGIN_BLOCKS: u32 = 12;
+/// How long an unpaid instant order holds its stock (Ian, 2026-09-26: about
+/// an hour, not the whole payment window). The invoice stays payable after
+/// it; a payment that arrives once the item has sold to someone else goes
+/// through the oversold path (`AutoInvoiceStatus::oversold`), which tells the
+/// seller.
+pub(crate) const HOLD_MS: u64 = 60 * 60 * 1000;
 const SEEN_CAP: usize = 1024;
 const ANSWERED_CAP: usize = 1024;
 const STATUSES_CAP: usize = 64;
 /// Sales are kept for a whole payment window (about two weeks), at most
-/// [`MAX_PER_DAY`] a day, with room to spare. Past it no new instant invoice
-/// is issued, rather than one whose sale could not be recorded.
-const SALES_CAP: usize = 512;
+/// [`MAX_PER_DAY`] a day. Past it no new instant invoice is issued, rather
+/// than one whose sale could not be recorded.
+const SALES_CAP: usize = 1024;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Written when this generation's secrets are exported to a successor: from
 /// then on it arms nothing, so an old tab cannot put it back to work beside
@@ -206,8 +215,8 @@ pub(crate) struct Ledger {
     pub statuses: Vec<ListingStatus>,
     /// Every instant order this delegate issued for a counted listing, until
     /// its outcome is settled ([`settle`]). Published stock changes only when
-    /// one is PAID, once; an unpaid one holds its quantity only while its
-    /// buyer can still start paying ([`Sale::holds`]). Kept past that, for
+    /// one is PAID, once; an unpaid one holds its quantity only for
+    /// [`HOLD_MS`] ([`Sale::holds`]). Kept past that, for
     /// the whole payment window, because a payment may still confirm late,
     /// or after the buyer cancelled (Paid outranks Cancelled).
     #[serde(default)]
@@ -250,21 +259,23 @@ pub(crate) struct Sale {
 
 impl Sale {
     /// Whether this sale still holds its quantity against new instant
-    /// invoices, given the order as the store has it and the chain tip.
-    fn holds(&self, order: Option<&AuthorizedOrder>, tip_height: u32, now_ms: u64) -> bool {
+    /// invoices, given the order as the store has it.
+    ///
+    /// An unpaid one holds for [`HOLD_MS`] from when it was issued, and no
+    /// longer: its invoice stays payable for hours after that, and a payment
+    /// arriving once the stock is gone is the oversold path's to report.
+    fn holds(&self, order: Option<&AuthorizedOrder>, now_ms: u64) -> bool {
         if self.decremented.is_some() {
             // Already off published stock.
             return false;
         }
+        let age = now_ms.saturating_sub(self.issued_at_ms);
         match order.map(|o| o.status) {
             // Paid and not yet decremented: the decrement is about to go out.
             Some(OrderStatus::Paid) => true,
             Some(OrderStatus::Cancelled) | Some(OrderStatus::PaymentReversed) => false,
-            Some(OrderStatus::AwaitingPayment) | None => {
-                (order.is_some() || now_ms.saturating_sub(self.issued_at_ms) < NOT_LANDED_MS)
-                    && tip_height.saturating_sub(self.anchor_height)
-                        <= MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS
-            }
+            Some(OrderStatus::AwaitingPayment) => age < HOLD_MS,
+            None => age < NOT_LANDED_MS,
         }
     }
 }
@@ -296,11 +307,11 @@ impl Ledger {
     }
 
     /// Stock held for `listing` by unpaid instant orders ([`Sale::holds`]).
-    fn held(&self, listing: &ListingId, store: &StoreStateV1, tip_height: u32, now_ms: u64) -> u32 {
+    fn held(&self, listing: &ListingId, store: &StoreStateV1, now_ms: u64) -> u32 {
         self.sales
             .iter()
             .filter(|s| s.listing == *listing)
-            .filter(|s| s.holds(store.orders.orders.get(&s.order), tip_height, now_ms))
+            .filter(|s| s.holds(store.orders.orders.get(&s.order), now_ms))
             .map(|s| s.quantity)
             .sum()
     }
@@ -631,7 +642,6 @@ pub(crate) enum Refusal {
     TotalMismatch,
     BindingElsewhere,
     StoreCap,
-    ConversationCap,
     DailyCap,
     TrailingUnpaid,
     Signing(String),
@@ -1457,7 +1467,7 @@ fn decide_one<S: SecretStore>(
         }
         if left
             < ledger
-                .held(&listing.id, store, tip_height, now_ms)
+                .held(&listing.id, store, now_ms)
                 .saturating_add(request.quantity)
         {
             return Err(Refusal::Reserved);
@@ -1504,7 +1514,14 @@ fn decide_one<S: SecretStore>(
         .count()
         >= MAX_OPEN_PER_CONVERSATION
     {
-        return Err(Refusal::ConversationCap);
+        // Declined in so many words rather than left unanswered: the buyer
+        // can put this right themselves, by paying or cancelling one. Their
+        // own app says the same before sending, so a genuine buyer normally
+        // never gets here. Nothing is derived or spent before this point.
+        return seal(MessageContent::Decline {
+            reason: harvest_common::delegate::TOO_MANY_UNPAID.into(),
+        })
+        .map(Answer::Decline);
     }
     if ledger.issued_last_day(now_ms) >= MAX_PER_DAY {
         return Err(Refusal::DailyCap);
@@ -2342,8 +2359,10 @@ mod tests {
     }
 
     /// Requests nobody pays cannot empty a listing: published stock does not
-    /// move, and once their invoices expire the stock is offered again.
-    /// Mutated red by keeping expired reservations in `settle`.
+    /// move, and an hour after each unpaid invoice went out its stock is
+    /// offered again, though the invoice is still payable. Mutated red by
+    /// holding for the whole payment window (the old rule) and by dropping
+    /// the hold altogether.
     #[test]
     fn unpaid_invoices_do_not_drain_stock() {
         let mut f = fixture();
@@ -2361,12 +2380,26 @@ mod tests {
             ListingAvailability::Available { quantity: Some(2) },
             "published stock untouched"
         );
-        // The chain moves past the age at which their buyers could still
-        // start paying, and the margin for a last-moment payment to confirm.
-        let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
-        tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS + 1;
-        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
-        let again = run(&mut f, &[Buyer::new(51).request(&jam(), 1, 1, 12_000)]);
+        // The seller's tab keeps the watch renewed meanwhile.
+        f.record.watched_until_ms += HOLD_MS;
+        // Just short of the hour, still held.
+        let still = decide(
+            &mut f.secrets,
+            &f.record,
+            &f.store,
+            &[Buyer::new(51).request(&jam(), 1, 1, 12_000)],
+            NOW + HOLD_MS - 1,
+        );
+        assert_eq!(still.refused[0].1, Refusal::Reserved);
+        // An hour on, with the chain where it was: the invoices are still
+        // payable, and their stock is offered again.
+        let again = decide(
+            &mut f.secrets,
+            &f.record,
+            &f.store,
+            &[Buyer::new(52).request(&jam(), 1, 1, 12_000)],
+            NOW + HOLD_MS,
+        );
         assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
     }
 
@@ -2418,8 +2451,12 @@ mod tests {
     }
 
     fn store_change(f: &mut Fixture) -> Vec<AuthorizedListingStatus> {
+        store_change_at(f, NOW)
+    }
+
+    fn store_change_at(f: &mut Fixture, now_ms: u64) -> Vec<AuthorizedListingStatus> {
         let state = to_cbor(&f.store).unwrap();
-        let out = on_notification(&mut f.secrets, &[1; 32], &state, NOW).unwrap();
+        let out = on_notification(&mut f.secrets, &[1; 32], &state, now_ms).unwrap();
         out.iter()
             .flat_map(|m| match m {
                 OutboundDelegateMsg::UpdateContractRequest(update) => {
@@ -2446,12 +2483,13 @@ mod tests {
             publish(&mut f, &first);
             let id = first.orders[0].order.id.clone();
             with_status(&mut f, &id, late);
-            let mut tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
-            tip.anchor.height += MAX_ANCHOR_AGE_BLOCKS + HOLD_MARGIN_BLOCKS + 1;
-            save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
-            assert!(store_change(&mut f).is_empty(), "nothing paid yet");
+            let after_hold = NOW + HOLD_MS + 1;
+            assert!(
+                store_change_at(&mut f, after_hold).is_empty(),
+                "nothing paid yet"
+            );
             with_status(&mut f, &id, OrderStatus::Paid);
-            let statuses = store_change(&mut f);
+            let statuses = store_change_at(&mut f, after_hold);
             assert_eq!(statuses.len(), 1, "{late:?}");
             assert_eq!(
                 statuses[0].status.availability,
@@ -2832,21 +2870,36 @@ mod tests {
         assert!(ledger.sales.is_empty());
     }
 
-    /// I4. Past each cap the request is left for the seller. Mutated red by
-    /// removing each cap's check in turn.
+    /// I4. Past the per-buyer cap the buyer is told, in the words their own
+    /// app uses; past each other cap the request is left for the seller.
+    /// Mutated red by removing each cap's check in turn.
     #[test]
     fn exposure_is_capped() {
-        // Per conversation.
+        // Per conversation: declined in so many words, nothing spent.
         let mut f = fixture();
         f.record.arm.watched_scripts = (0..10).map(script_at).collect();
         let buyer = Buyer::new(40);
-        for nonce in 1..=2 {
+        for nonce in 1..=MAX_OPEN_PER_CONVERSATION as u8 {
             let d = run(&mut f, &[buyer.request(&jam(), 1, nonce, 12_000)]);
             assert_eq!(d.orders.len(), 1);
             publish(&mut f, &d);
         }
-        let third = run(&mut f, &[buyer.request(&jam(), 1, 3, 12_000)]);
-        assert_eq!(third.refused[0].1, Refusal::ConversationCap);
+        let spent = counter(&f);
+        let over = run(
+            &mut f,
+            &[buyer.request(&jam(), 1, MAX_OPEN_PER_CONVERSATION as u8 + 1, 12_000)],
+        );
+        assert!(over.orders.is_empty());
+        assert_eq!(
+            buyer.read(&over.replies),
+            vec![MessageContent::Decline {
+                reason: harvest_common::delegate::TOO_MANY_UNPAID.into()
+            }]
+        );
+        assert_eq!(counter(&f), spent, "no address spent on a decline");
+        // Another buyer is not held to this one's orders.
+        let other = run(&mut f, &[Buyer::new(41).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(other.orders.len(), 1, "{:?}", other.refused);
 
         // Per store.
         let mut f = fixture();

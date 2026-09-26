@@ -507,6 +507,19 @@ pub enum HarvestDelegateRequest {
     ArmAutoInvoice { arm: Box<AutoInvoiceArm> },
 }
 
+/// The most unpaid instant orders one buyer conversation may hold at a
+/// store at once. The seller's delegate refuses a Buy now past it, and the
+/// buyer's app says so before sending. Generous on purpose (Ian, 2026-09-26):
+/// no genuine buyer should reach it, and sellers are not told about it. It
+/// bounds how many payment addresses one buyer can make a store hand out
+/// without paying.
+pub const MAX_UNPAID_INSTANT_PER_BUYER: usize = 5;
+
+/// What a buyer at [`MAX_UNPAID_INSTANT_PER_BUYER`] is told, by their own app
+/// before sending and by the seller's store if one gets through anyway.
+pub const TOO_MANY_UNPAID: &str =
+    "You have too many unpaid orders at this store. Pay or cancel one to continue.";
+
 /// Everything the Harvest delegate needs to issue an instant-checkout invoice
 /// on its own, as the seller's UI knows it when it is open.
 ///

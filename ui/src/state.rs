@@ -8654,7 +8654,15 @@ impl AppState {
                 .collect();
         }
         if store.payable() {
-            store.orders.clone()
+            // Less the Buy now orders nobody has paid: not orders, as the
+            // seller sees them (`fulfilment::is_unpaid_buy_now`). Their
+            // buyers see them on their own purchase cards.
+            store
+                .orders
+                .iter()
+                .filter(|order| !crate::fulfilment::is_unpaid_buy_now(order))
+                .cloned()
+                .collect()
         } else {
             // A closed or unbacked store of the viewer's own: its settled
             // history, as everyone else sees it (review round 5, P3).

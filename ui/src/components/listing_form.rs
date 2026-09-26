@@ -5,6 +5,16 @@ use harvest_common::listing::{
     RegionPrice,
 };
 
+/// What every listing this form publishes is: a sale at a fixed price, with
+/// fixed delivery (Ian, 2026-09-26). There is no free-text price, no gift or
+/// wanted listing, and no "ask the seller for a total": a buyer can always
+/// press Buy now, and the seller's store answers with the total at once.
+///
+/// A listing published before this (a quote-only one, or a gift or request)
+/// is still read, and editing it here gives it a price: the edit publishes a
+/// new listing and takes the old one down, like any change of terms.
+const KIND: ListingKind = ListingKind::Sale;
+
 /// The form a seller fills in to publish a listing.
 ///
 /// # It no longer takes the seller's fingerprint, and that is not a loss
@@ -53,26 +63,6 @@ pub fn ListingForm(
             .map(|l| l.description.clone())
             .unwrap_or_default()
     });
-    let mut kind = use_signal(|| {
-        editing
-            .as_ref()
-            .map(|l| l.kind.clone())
-            .unwrap_or(ListingKind::Sale)
-    });
-    let mut price_amount = use_signal(|| {
-        editing
-            .as_ref()
-            .and_then(|l| l.price.as_ref())
-            .map(|p| p.amount.clone())
-            .unwrap_or_default()
-    });
-    let mut price_currency = use_signal(|| {
-        editing
-            .as_ref()
-            .and_then(|l| l.price.as_ref())
-            .map(|p| p.currency.clone())
-            .unwrap_or_else(|| "BTC".to_string())
-    });
     let mut quantity = use_signal(|| initial_quantity.map(|q| q.to_string()).unwrap_or_default());
     let quantity_error = parse_quantity(&quantity()).is_err();
     let mut terms = use_signal(|| {
@@ -81,7 +71,7 @@ pub fn ListingForm(
             .map(TermsForm::from_listing)
             .unwrap_or_default()
     });
-    let built_terms = terms().build(&kind());
+    let built_terms = terms().build();
     let terms_error = built_terms.as_ref().err().cloned();
 
     rsx! {
@@ -109,51 +99,9 @@ pub fn ListingForm(
                 }
             }
 
-            div { class: "form-group",
-                label { class: "form-label", "Type" }
-                select {
-                    class: "form-select",
-                    value: kind_value(&kind()),
-                    onchange: move |e| {
-                        kind.set(match e.value().as_str() {
-                            "gift" => ListingKind::Gift,
-                            "request" => ListingKind::Request,
-                            _ => ListingKind::Sale,
-                        });
-                    },
-                    option { value: "sale", "For Sale" }
-                    option { value: "gift", "Gift / Free" }
-                    option { value: "request", "Request / Wanted" }
-                }
-            }
-
-            if matches!(kind(), ListingKind::Sale) {
-                div { class: "form-group form-row",
-                    div {
-                        label { class: "form-label", "Price" }
-                        input {
-                            class: "form-input",
-                            r#type: "text",
-                            placeholder: "0.001",
-                            value: "{price_amount}",
-                            oninput: move |e| price_amount.set(e.value()),
-                        }
-                    }
-                    div { class: "form-narrow",
-                        label { class: "form-label", "Currency" }
-                        input {
-                            class: "form-input",
-                            r#type: "text",
-                            placeholder: "BTC",
-                            value: "{price_currency}",
-                            oninput: move |e| price_currency.set(e.value()),
-                        }
-                    }
-                }
-                TermsEditor { terms }
-                if let Some(problem) = terms_error.clone() {
-                    p { class: "text-warning", "{problem}" }
-                }
+            TermsEditor { terms }
+            if let Some(problem) = terms_error.clone() {
+                p { class: "text-warning", "{problem}" }
             }
 
             div { class: "form-group",
@@ -191,19 +139,12 @@ pub fn ListingForm(
                         let Ok(count) = parse_quantity(&quantity()) else {
                             return;
                         };
-                        let Ok((checkout, choices)) = terms().build(&kind()) else {
+                        let Ok((checkout, choices)) = terms().build() else {
                             return;
                         };
-                        let price = if matches!(kind(), ListingKind::Sale)
-                            && !price_amount().trim().is_empty()
-                        {
-                            Some(PriceInfo {
-                                amount: price_amount().trim().to_string(),
-                                currency: price_currency().trim().to_string(),
-                            })
-                        } else {
-                            None
-                        };
+                        // The price is the sats price in `checkout`; the old
+                        // free-text one is never written again.
+                        let price: Option<PriceInfo> = None;
                         // Only the count changed: submit the original, so its
                         // id, and the listing buyers hold, stays the same.
                         if let Some(original) = editing.as_ref() {
@@ -211,8 +152,7 @@ pub fn ListingForm(
                                 original,
                                 &title(),
                                 &description(),
-                                &kind(),
-                                &price,
+                                &KIND,
                                 &checkout,
                                 &choices,
                             ) {
@@ -233,7 +173,7 @@ pub fn ListingForm(
                             id: ListingId([0u8; 32]),
                             title: listing_title,
                             description: description().trim().to_string(),
-                            kind: kind(),
+                            kind: KIND,
                             price,
                             created_at: now,
                         }
@@ -241,7 +181,6 @@ pub fn ListingForm(
 
                         title.set(String::new());
                         description.set(String::new());
-                        price_amount.set(String::new());
                         quantity.set(String::new());
                         terms.set(TermsForm::default());
 
@@ -257,8 +196,8 @@ pub fn ListingForm(
             }
             if initial.is_some() {
                 p { class: "text-muted small",
-                    "Changing the title, description, type, price or choices publishes a new listing and "
-                    "takes this one down. A buyer who already asked about this one can still see it."
+                    "Changing the title, description, price, delivery or choices publishes a new listing and "
+                    "takes this one down. A buyer who already ordered this one can still see it."
                 }
             }
         }
@@ -266,13 +205,16 @@ pub fn ListingForm(
 }
 
 /// Whether what the form holds is the listing it was opened on, term for
-/// term, compared the way the form would build a new one (trimmed text, no
-/// price unless it is a sale). A mismatch that is only formatting would
-/// otherwise turn a count change into a take-down and a new id.
+/// term, compared the way the form would build a new one (trimmed text). A
+/// mismatch that is only formatting would otherwise turn a count change into
+/// a take-down and a new id.
 ///
-/// Every term of `Listing` except `id` and `created_at` is compared, so a
-/// field added to `Listing` must be added here, or an edit of it alone would
-/// keep the old id.
+/// Every term of `Listing` except `id`, `created_at` and `price` is
+/// compared, so a field added to `Listing` must be added here, or an edit of
+/// it alone would keep the old id. `price` is the free-text price listings
+/// carried before every listing had a sats price: the form no longer shows
+/// or writes it, so it is not a term the seller can change here, and a
+/// count-only edit of an old listing keeps it (and its id) as it was.
 ///
 /// `checkout` and `choices` are compared as [`TermsForm::build`] gives them,
 /// which is already the form the new listing would carry.
@@ -281,7 +223,6 @@ pub(crate) fn same_terms(
     title: &str,
     description: &str,
     kind: &ListingKind,
-    price: &Option<PriceInfo>,
     checkout: &Option<FixedCheckout>,
     choices: &[ChoiceGroup],
 ) -> bool {
@@ -290,22 +231,14 @@ pub(crate) fn same_terms(
         title: original_title,
         description: original_description,
         kind: original_kind,
-        price: original_price,
+        price: _,
         created_at: _,
         checkout: original_checkout,
         choices: original_choices,
     } = original;
-    let normalised = |p: &Option<PriceInfo>, k: &ListingKind| match (k, p) {
-        (ListingKind::Sale, Some(p)) if !p.amount.trim().is_empty() => Some(PriceInfo {
-            amount: p.amount.trim().to_string(),
-            currency: p.currency.trim().to_string(),
-        }),
-        _ => None,
-    };
     original_title.trim() == title.trim()
         && original_description.trim() == description.trim()
         && original_kind == kind
-        && normalised(original_price, original_kind) == normalised(price, kind)
         && original_checkout == checkout
         && original_choices.as_slice() == choices
 }
@@ -319,20 +252,10 @@ fn parse_quantity(typed: &str) -> Result<Option<u32>, ()> {
     typed.parse::<u32>().map(Some).map_err(|_| ())
 }
 
-fn kind_value(kind: &ListingKind) -> &'static str {
-    match kind {
-        ListingKind::Sale => "sale",
-        ListingKind::Gift => "gift",
-        ListingKind::Request => "request",
-    }
-}
-
-/// What the seller has typed for instant checkout and choices, before it is
-/// parsed. Kept as text so a half-typed number is shown back as typed.
+/// What the seller has typed for the price, delivery and choices, before it
+/// is parsed. Kept as text so a half-typed number is shown back as typed.
 #[derive(Clone, PartialEq, Default, Debug)]
 pub(crate) struct TermsForm {
-    /// Whether the seller offers instant checkout at all.
-    pub instant: bool,
     /// The price of one, in sats.
     pub unit_sats: String,
     /// Delivery priced per region, rather than included.
@@ -355,7 +278,6 @@ impl TermsForm {
             ..TermsForm::default()
         };
         if let Some(checkout) = &listing.checkout {
-            form.instant = true;
             form.unit_sats = checkout.unit_sats.to_string();
             if let DeliveryPrice::ByRegion(rows) = &checkout.delivery {
                 form.by_region = true;
@@ -368,21 +290,18 @@ impl TermsForm {
         form
     }
 
-    /// The `checkout` and `choices` a listing of `kind` built from this form
-    /// carries, or what is wrong with them.
+    /// The `checkout` and `choices` a listing built from this form carries,
+    /// or what is wrong with them.
     ///
-    /// Only a sale carries either. Rows left entirely blank are ignored, so an
+    /// The checkout is never `None`: every listing has a sats price and fixed
+    /// delivery, so a blank price is refused rather than published as a
+    /// listing nobody can buy. Rows left entirely blank are ignored, so an
     /// added row the seller did not fill in does not block publishing. The
     /// result is checked with the same `checkout_problem` and
-    /// `choices_problem` every reader applies, so the form refuses exactly
-    /// what a buyer's app would treat as quote-only.
-    pub(crate) fn build(
-        &self,
-        kind: &ListingKind,
-    ) -> Result<(Option<FixedCheckout>, Vec<ChoiceGroup>), String> {
-        if *kind != ListingKind::Sale {
-            return Ok((None, Vec::new()));
-        }
+    /// `choices_problem` every reader applies, and with
+    /// `offers_instant_checkout`, so the form refuses exactly what a buyer's
+    /// app would not let them buy.
+    pub(crate) fn build(&self) -> Result<(Option<FixedCheckout>, Vec<ChoiceGroup>), String> {
         let choices: Vec<ChoiceGroup> = self
             .choices
             .iter()
@@ -397,9 +316,15 @@ impl TermsForm {
                     .collect(),
             })
             .collect();
-        let checkout = if self.instant {
+        let checkout = {
+            if self.unit_sats.trim().is_empty() {
+                return Err("Give a price.".into());
+            }
             let unit_sats = parse_sats(&self.unit_sats)
-                .ok_or("Give the instant checkout price as a whole number of sats.")?;
+                .ok_or("Give the price as a whole number of sats, like 25000.")?;
+            if unit_sats == 0 {
+                return Err("The price has to be more than zero.".into());
+            }
             let delivery = if self.by_region {
                 let mut rows = Vec::new();
                 for (region, sats) in self
@@ -423,14 +348,12 @@ impl TermsForm {
                 unit_sats,
                 delivery,
             })
-        } else {
-            None
         };
         let probe = Listing {
             id: ListingId([0u8; 32]),
             title: String::new(),
             description: String::new(),
-            kind: kind.clone(),
+            kind: KIND,
             price: None,
             created_at: chrono::DateTime::UNIX_EPOCH,
             checkout,
@@ -438,6 +361,11 @@ impl TermsForm {
         };
         if let Some(problem) = probe.checkout_problem().or_else(|| probe.choices_problem()) {
             return Err(sentence(&problem));
+        }
+        // Belt and braces: whatever the checks above let through has to be
+        // something a buyer can actually buy.
+        if !probe.offers_instant_checkout() {
+            return Err("Give a price.".into());
         }
         Ok((probe.checkout, probe.choices))
     }
@@ -468,78 +396,62 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
     let form = terms();
     rsx! {
         div { class: "form-group",
-            label { class: "form-label",
-                input {
-                    r#type: "checkbox",
-                    checked: form.instant,
-                    onchange: move |e| terms.with_mut(|t| t.instant = e.checked()),
-                }
-                " Instant checkout"
-            }
-            p { class: "text-muted small",
-                "Buyers see a total in sats and can buy without waiting for you to name a price. "
-                "Without it, buyers send a request and you reply with a total."
+            label { class: "form-label", r#for: "listing-unit-sats", "Price, in sats" }
+            input {
+                id: "listing-unit-sats",
+                class: "form-input form-input-short",
+                r#type: "text",
+                inputmode: "numeric",
+                placeholder: "10000",
+                value: "{form.unit_sats}",
+                oninput: move |e| terms.with_mut(|t| t.unit_sats = e.value()),
             }
         }
-        if form.instant {
-            div { class: "form-group",
-                label { class: "form-label", r#for: "listing-unit-sats", "Price of one, in sats" }
-                input {
-                    id: "listing-unit-sats",
-                    class: "form-input form-input-short",
-                    r#type: "text",
-                    inputmode: "numeric",
-                    placeholder: "10000",
-                    value: "{form.unit_sats}",
-                    oninput: move |e| terms.with_mut(|t| t.unit_sats = e.value()),
-                }
+        div { class: "form-group",
+            label { class: "form-label", "Delivery" }
+            select {
+                class: "form-select",
+                value: if form.by_region { "regions" } else { "included" },
+                onchange: move |e| terms.with_mut(|t| t.by_region = e.value() == "regions"),
+                option { value: "included", "Included in the price" }
+                option { value: "regions", "A price per region" }
             }
+        }
+        if form.by_region {
             div { class: "form-group",
-                label { class: "form-label", "Delivery" }
-                select {
-                    class: "form-select",
-                    value: if form.by_region { "regions" } else { "included" },
-                    onchange: move |e| terms.with_mut(|t| t.by_region = e.value() == "regions"),
-                    option { value: "included", "Included in the price" }
-                    option { value: "regions", "A price per region" }
+                p { class: "text-muted small",
+                    "One delivery price per order, not per item. Buyers elsewhere can\u{2019}t buy this."
                 }
-            }
-            if form.by_region {
-                div { class: "form-group",
-                    p { class: "text-muted small",
-                        "One price per order, not per item. Buyers outside these regions can still send a request."
-                    }
-                    for (i, (region, sats)) in form.regions.iter().cloned().enumerate() {
-                        div { key: "region-{i}", class: "form-row",
-                            input {
-                                class: "form-input",
-                                r#type: "text",
-                                placeholder: "Region, like US or EU",
-                                value: "{region}",
-                                oninput: move |e| terms.with_mut(|t| t.regions[i].0 = e.value()),
-                            }
-                            input {
-                                class: "form-input form-narrow",
-                                r#type: "text",
-                                inputmode: "numeric",
-                                placeholder: "sats",
-                                value: "{sats}",
-                                oninput: move |e| terms.with_mut(|t| t.regions[i].1 = e.value()),
-                            }
-                            button {
-                                class: "btn btn-sm btn-outline",
-                                onclick: move |_| terms.with_mut(|t| {
-                                    t.regions.remove(i);
-                                }),
-                                "Remove"
-                            }
+                for (i, (region, sats)) in form.regions.iter().cloned().enumerate() {
+                    div { key: "region-{i}", class: "form-row",
+                        input {
+                            class: "form-input",
+                            r#type: "text",
+                            placeholder: "Region, like US or EU",
+                            value: "{region}",
+                            oninput: move |e| terms.with_mut(|t| t.regions[i].0 = e.value()),
+                        }
+                        input {
+                            class: "form-input form-narrow",
+                            r#type: "text",
+                            inputmode: "numeric",
+                            placeholder: "sats",
+                            value: "{sats}",
+                            oninput: move |e| terms.with_mut(|t| t.regions[i].1 = e.value()),
+                        }
+                        button {
+                            class: "btn btn-sm btn-outline",
+                            onclick: move |_| terms.with_mut(|t| {
+                                t.regions.remove(i);
+                            }),
+                            "Remove"
                         }
                     }
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: move |_| terms.with_mut(|t| t.regions.push(Default::default())),
-                        "Add region"
-                    }
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| terms.with_mut(|t| t.regions.push(Default::default())),
+                    "Add region"
                 }
             }
         }
@@ -588,16 +500,16 @@ mod tests {
 
     fn original() -> Listing {
         Listing {
-            checkout: None,
+            checkout: Some(FixedCheckout {
+                unit_sats: 10_000,
+                delivery: DeliveryPrice::Included,
+            }),
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
             title: "Mug ".into(),
             description: "Blue".into(),
             kind: ListingKind::Sale,
-            price: Some(PriceInfo {
-                amount: "0.001".into(),
-                currency: "BTC".into(),
-            }),
+            price: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         }
     }
@@ -607,140 +519,118 @@ mod tests {
     #[test]
     fn same_terms_notices_each_term_and_ignores_formatting() {
         let o = original();
-        let price = o.price.clone();
-        assert!(same_terms(
-            &o,
+        let same = |title: &str,
+                    description: &str,
+                    kind: &ListingKind,
+                    checkout,
+                    choices: &[ChoiceGroup]| {
+            same_terms(&o, title, description, kind, checkout, choices)
+        };
+        assert!(same(
             "Mug",
             " Blue ",
             &ListingKind::Sale,
-            &price,
             &o.checkout,
             &o.choices
         ));
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Cup",
             "Blue",
             &ListingKind::Sale,
-            &price,
             &o.checkout,
             &o.choices
         ));
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Mug",
             "Red",
             &ListingKind::Sale,
-            &price,
             &o.checkout,
             &o.choices
         ));
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Mug",
             "Blue",
             &ListingKind::Gift,
-            &None,
             &o.checkout,
             &o.choices
         ));
-        let dearer = Some(PriceInfo {
-            amount: "0.002".into(),
-            currency: "BTC".into(),
+        // The price changed, or delivery priced by region, is a different
+        // listing.
+        let dearer = Some(FixedCheckout {
+            unit_sats: 12_000,
+            delivery: DeliveryPrice::Included,
         });
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Mug",
             "Blue",
             &ListingKind::Sale,
             &dearer,
-            &o.checkout,
             &o.choices
         ));
-        // The kind alone, with no price either side.
-        let mut unpriced = o.clone();
-        unpriced.price = None;
-        assert!(!same_terms(
-            &unpriced,
-            "Mug",
-            "Blue",
-            &ListingKind::Gift,
-            &None,
-            &unpriced.checkout,
-            &unpriced.choices
-        ));
-        assert!(same_terms(
-            &unpriced,
-            "Mug",
-            "Blue",
-            &ListingKind::Sale,
-            &None,
-            &unpriced.checkout,
-            &unpriced.choices
-        ));
-        // Instant checkout added, or its price changed, is a different listing.
-        let checkout = Some(FixedCheckout {
+        let by_region = Some(FixedCheckout {
             unit_sats: 10_000,
-            delivery: DeliveryPrice::Included,
+            delivery: DeliveryPrice::ByRegion(vec![RegionPrice {
+                region: "US".into(),
+                sats: 0,
+            }]),
         });
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Mug",
             "Blue",
             &ListingKind::Sale,
-            &price,
-            &checkout,
+            &by_region,
             &o.choices
-        ));
-        let mut instant = o.clone();
-        instant.checkout = checkout.clone();
-        let dearer_checkout = Some(FixedCheckout {
-            unit_sats: 12_000,
-            delivery: DeliveryPrice::Included,
-        });
-        assert!(same_terms(
-            &instant,
-            "Mug",
-            "Blue",
-            &ListingKind::Sale,
-            &price,
-            &checkout,
-            &[]
-        ));
-        assert!(!same_terms(
-            &instant,
-            "Mug",
-            "Blue",
-            &ListingKind::Sale,
-            &price,
-            &dearer_checkout,
-            &[]
         ));
         // So is a choice added.
         let sizes = vec![ChoiceGroup {
             name: "Size".into(),
             options: vec!["S".into(), "M".into()],
         }];
-        assert!(!same_terms(
-            &o,
+        assert!(!same(
             "Mug",
             "Blue",
             &ListingKind::Sale,
-            &price,
-            &None,
+            &o.checkout,
             &sizes
         ));
-        // A gift carrying a stale price is the same gift without one.
-        let mut gift = o.clone();
-        gift.kind = ListingKind::Gift;
+    }
+
+    /// An old listing's free-text price is not a term the form can change:
+    /// a count-only edit of a listing that carries one keeps it, and its id.
+    /// And an old quote-only listing is a different listing from the priced
+    /// one its edit publishes, which is the whole migration: the edit takes
+    /// the old one down and publishes the priced one.
+    #[test]
+    fn an_old_free_text_price_is_not_a_term_and_a_quote_only_listing_moves_on_edit() {
+        let mut old = original();
+        old.price = Some(PriceInfo {
+            amount: "0.001".into(),
+            currency: "BTC".into(),
+        });
         assert!(same_terms(
-            &gift,
+            &old,
             "Mug",
             "Blue",
-            &ListingKind::Gift,
-            &None,
-            &gift.checkout,
-            &gift.choices
+            &ListingKind::Sale,
+            &old.checkout,
+            &[]
+        ));
+
+        let mut quote_only = old.clone();
+        quote_only.checkout = None;
+        let reopened = TermsForm::from_listing(&quote_only);
+        // The form opens with no price, and will not publish without one.
+        assert_eq!(reopened.build(), Err("Give a price.".into()));
+        let mut priced = reopened.clone();
+        priced.unit_sats = "10000".into();
+        let (checkout, choices) = priced.build().expect("valid");
+        assert!(!same_terms(
+            &quote_only,
+            "Mug",
+            "Blue",
+            &ListingKind::Sale,
+            &checkout,
+            &choices
         ));
     }
 
@@ -757,7 +647,6 @@ mod tests {
 
     fn form() -> TermsForm {
         TermsForm {
-            instant: true,
             unit_sats: " 10000 ".into(),
             by_region: true,
             regions: vec![
@@ -776,7 +665,7 @@ mod tests {
     /// unchanged when the listing is edited.
     #[test]
     fn the_terms_form_builds_trimmed_terms_and_round_trips() {
-        let (checkout, choices) = form().build(&ListingKind::Sale).expect("valid");
+        let (checkout, choices) = form().build().expect("valid");
         assert_eq!(
             checkout,
             Some(FixedCheckout {
@@ -805,43 +694,60 @@ mod tests {
         listing.checkout = checkout.clone();
         listing.choices = choices.clone();
         let reopened = TermsForm::from_listing(&listing);
-        assert_eq!(reopened.build(&ListingKind::Sale), Ok((checkout, choices)));
-        // Only a sale carries them.
-        assert_eq!(form().build(&ListingKind::Gift), Ok((None, Vec::new())));
+        assert_eq!(reopened.build(), Ok((checkout, choices)));
+
+        // Delivery included is the default.
+        let mut included = form();
+        included.by_region = false;
+        let (checkout, _) = included.build().expect("valid");
+        assert_eq!(
+            checkout,
+            Some(FixedCheckout {
+                unit_sats: 10_000,
+                delivery: DeliveryPrice::Included,
+            })
+        );
     }
 
-    /// What the form refuses: bad numbers here, and whatever the common
-    /// checks refuse.
+    /// What the form refuses: no price, bad numbers here, and whatever the
+    /// common checks refuse. Every listing it builds is one a buyer can buy
+    /// at once. Mutated red by letting a blank price through as `None`.
     #[test]
     fn the_terms_form_refuses_unusable_terms() {
+        let mut blank = form();
+        blank.unit_sats = "  ".into();
+        assert_eq!(blank.build(), Err("Give a price.".into()));
+
         let mut junk = form();
         junk.unit_sats = "0.5".into();
-        assert!(junk.build(&ListingKind::Sale).is_err());
+        assert!(junk.build().is_err());
 
         let mut zero = form();
         zero.unit_sats = "0".into();
         assert_eq!(
-            zero.build(&ListingKind::Sale),
-            Err("An instant-checkout price must be more than zero.".into())
+            zero.build(),
+            Err("The price has to be more than zero.".into())
         );
 
         let mut no_regions = form();
         no_regions.regions.clear();
-        assert!(no_regions.build(&ListingKind::Sale).is_err());
+        assert!(no_regions.build().is_err());
 
         let mut twice = form();
         twice.regions[1].0 = "us".into();
-        assert!(twice.build(&ListingKind::Sale).is_err());
+        assert!(twice.build().is_err());
 
         let mut no_options = form();
         no_options.choices[0].1 = " , ".into();
-        assert!(no_options.build(&ListingKind::Sale).is_err());
+        assert!(no_options.build().is_err());
 
-        // Choices without instant checkout are fine: a quote-only listing.
-        let mut quote = form();
-        quote.instant = false;
-        let (checkout, choices) = quote.build(&ListingKind::Sale).expect("valid");
-        assert_eq!(checkout, None);
-        assert_eq!(choices.len(), 1);
+        // Everything it does build offers instant checkout.
+        let (checkout, choices) = form().build().expect("valid");
+        let listing = Listing {
+            checkout,
+            choices,
+            ..original()
+        };
+        assert!(listing.offers_instant_checkout());
     }
 }

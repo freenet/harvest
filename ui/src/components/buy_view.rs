@@ -45,20 +45,14 @@ use crate::messaging::{Addressing, InstantSelection, MessageContent};
 use crate::gateway::APP_STATE;
 use crate::state::{BuyerPurchase, PaymentBlocker};
 
-/// The form a buyer fills in to ask for a listing.
+/// The form a buyer fills in to buy a listing.
 ///
-/// For a quote-only listing: quantity, destination and a note, and no price
-/// arithmetic. A listing's price is free text in a currency of the seller's
-/// choosing (`harvest_common::listing::PriceInfo`), so any number this form
-/// computed would be a guess presented as a total. The seller names the
-/// amount when they accept, and the buyer sees THAT amount, from the
-/// published commitment, before paying.
-///
-/// For a listing with instant checkout ([`Listing::offers_instant_checkout`])
-/// the total is not a guess: it comes from the listing's fixed terms through
-/// [`Listing::instant_total`], the same function the seller's delegate uses
-/// to check it. The buyer still pays only against the published commitment,
-/// exactly as for a quote.
+/// Every listing it is offered for has a sats price and fixed delivery
+/// ([`Listing::offers_instant_checkout`]), so the total is not a guess: it
+/// comes from the listing's fixed terms through [`Listing::instant_total`],
+/// the same function the seller's delegate uses to check it. There is no
+/// "ask the seller for a total" any more (Ian, 2026-09-26). The buyer still
+/// pays only against the order the seller's store publishes.
 #[component]
 pub fn BuyForm(
     store_contract_id: Vec<u8>,
@@ -73,15 +67,12 @@ pub fn BuyForm(
     let choice_count = listing.choices.len();
     let mut picks = use_signal(move || vec![String::new(); choice_count]);
     let mut problem = use_signal(|| Option::<String>::None);
-    let mut quote_instead = use_signal(|| false);
-    // When an instant request was sent, and how many seller answers the
-    // thread already held then; `None` for a quote request or none yet.
+    // When the order was sent, and how many seller answers the thread
+    // already held then.
     let mut sent = use_signal(|| Option::<Sent>::None);
-    let mut asked = use_signal(|| false);
     // Bumped by the 30-second timer so the form re-renders when it fires.
     let now_ms = use_signal(unix_millis);
 
-    let instant = listing.offers_instant_checkout() && !quote_instead();
     let listing_title = listing.title.clone();
     let by_region = match &listing.checkout {
         Some(FixedCheckout {
@@ -92,70 +83,54 @@ pub fn BuyForm(
     };
 
     let parsed_quantity = quantity().trim().parse::<u32>().ok().filter(|n| *n > 0);
-    let picked_all = picks().iter().all(|p| !p.is_empty());
-    let total = if instant {
-        parsed_quantity.and_then(|q| {
-            let region = region();
-            let region = (!region.is_empty()).then_some(region);
-            listing.instant_total(q, region.as_deref(), &picks()).ok()
-        })
-    } else {
-        None
-    };
-    let ready = parsed_quantity.is_some()
-        && !shipping().trim().is_empty()
-        && picked_all
-        && (!instant || total.is_some());
+    let total = parsed_quantity.and_then(|q| {
+        let region = region();
+        let region = (!region.is_empty()).then_some(region);
+        listing.instant_total(q, region.as_deref(), &picks()).ok()
+    });
+    // The buyer's own unpaid orders here, counted the way the seller's store
+    // counts them. Said before sending rather than after a wait.
+    let too_many_unpaid = open_unpaid_orders(&APP_STATE.read().buyer_purchases(&store_contract_id))
+        >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER;
+    let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid;
 
-    if asked() {
-        if let Some(sent) = sent() {
-            let answers = seller_answers(&APP_STATE.read().conversation_thread(&store_contract_id));
-            let _ = now_ms();
-            return match instant_wait(sent.at_ms, unix_millis(), answers > sent.answers_before) {
-                InstantWait::Answered => rsx! {
+    if let Some(sent) = sent() {
+        let thread = APP_STATE.read().conversation_thread(&store_contract_id);
+        let answer = latest_answer(&thread, sent.answers_before);
+        let _ = now_ms();
+        return match instant_wait(sent.at_ms, unix_millis(), answer.is_some()) {
+            InstantWait::Answered => match answer {
+                Some(Answer::Declined(reason)) => rsx! {
+                    p { class: "text-warning", "The seller\u{2019}s store couldn\u{2019}t take this order: {reason}" }
+                    p { class: "text-muted small", "You haven\u{2019}t been charged anything." }
+                },
+                _ => rsx! {
+                    p { strong { "Order placed, waiting for your payment." } }
                     p { class: "text-muted",
-                        "The seller's store has answered. Their reply is under \"Your conversation\", "
-                        "and an accepted order appears under \"Your purchases\" below."
+                        "The payment details are under \u{201c}Your purchases\u{201d} below. "
+                        "Your order is kept for you for about an hour; pay within that time to be sure of it."
                     }
                 },
-                InstantWait::Waiting => rsx! {
-                    p { class: "text-muted",
-                        "Your order for {listing_title} has been sent. Waiting for the seller's store "
-                        "to answer; this usually takes a few seconds."
-                    }
-                },
-                InstantWait::NotResponding => rsx! {
-                    p { class: "text-muted",
-                        "The seller's store isn't responding right now. Your request is saved and they'll see it when they're back."
-                    }
-                },
-            };
-        }
-        return rsx! {
-            p { class: "text-muted",
-                "Your request for {listing_title} has been handed to your Freenet node. "
-                "Harvest checks that it shows up in the seller's mailbox, and says so under "
-                "\"Your conversation\" if it does not. "
-                "The seller has to publish the order publicly before you can pay for it, and "
-                "it will appear under \"Your purchases\" below when they do."
-            }
+            },
+            InstantWait::Waiting => rsx! {
+                p { strong { "Order placed." } }
+                p { class: "text-muted",
+                    "Getting the payment details for {listing_title} from the seller\u{2019}s store. "
+                    "This usually takes a few seconds."
+                }
+            },
+            InstantWait::NotResponding => rsx! {
+                p { class: "text-muted",
+                    "The seller\u{2019}s store hasn\u{2019}t answered yet. You haven\u{2019}t been charged "
+                    "anything. If it answers later, your order appears under \u{201c}Your purchases\u{201d} below."
+                }
+            },
         };
     }
 
     rsx! {
         div { style: "margin-top: 0.75rem;",
-            p { class: "text-muted", style: "font-size: 0.85rem;",
-                if instant {
-                    "Your address is encrypted to this seller before it leaves your browser and is "
-                    "not part of anything they publish. Buying commits you to nothing until you pay: "
-                    "the seller's store issues the order, and you decide whether to pay it."
-                } else {
-                    "Your address is encrypted to this seller before it leaves your browser and is "
-                    "not part of anything they publish. Sending this commits you to nothing: the "
-                    "seller decides whether to accept, and you decide whether to pay."
-                }
-            }
-            if instant && !by_region.is_empty() {
+            if !by_region.is_empty() {
                 div { class: "form-group",
                     label { class: "form-label", "Deliver to" }
                     select {
@@ -185,22 +160,12 @@ pub fn BuyForm(
             }
             div { class: "form-group",
                 label { class: "form-label", "How many" }
-                if instant {
-                    select {
-                        class: "form-select",
-                        value: "{quantity}",
-                        onchange: move |event| quantity.set(event.value()),
-                        for n in 1..=MAX_INSTANT_QUANTITY {
-                            option { key: "{n}", value: "{n}", "{n}" }
-                        }
-                    }
-                } else {
-                    input {
-                        class: "form-input",
-                        r#type: "number",
-                        min: "1",
-                        value: "{quantity}",
-                        oninput: move |event| quantity.set(event.value()),
+                select {
+                    class: "form-select",
+                    value: "{quantity}",
+                    onchange: move |event| quantity.set(event.value()),
+                    for n in 1..=MAX_INSTANT_QUANTITY {
+                        option { key: "{n}", value: "{n}", "{n}" }
                     }
                 }
             }
@@ -212,9 +177,13 @@ pub fn BuyForm(
                     placeholder: "Name and postal address, or whatever this seller needs.",
                     oninput: move |event| shipping.set(event.value()),
                 }
+                p { class: "text-muted small",
+                    "Only this seller can read it. It is locked to them before it leaves your "
+                    "browser, and it is never published."
+                }
             }
             div { class: "form-group",
-                label { class: "form-label", "Anything else (optional)" }
+                label { class: "form-label", "Note for the seller (optional)" }
                 textarea {
                     class: "form-textarea",
                     value: "{note}",
@@ -224,8 +193,11 @@ pub fn BuyForm(
             }
             if let Some(total) = total {
                 p { class: "listing-price",
-                    "Total: {total} sats ({super::bitcoin_view::format_sats(total)})"
+                    "Total: {super::store_view::sats_text(total)} ({super::bitcoin_view::format_sats(total)})"
                 }
+            }
+            if too_many_unpaid {
+                p { class: "text-warning", "{harvest_common::delegate::TOO_MANY_UNPAID}" }
             }
             if let Some(message) = problem() {
                 p { class: "text-warning", "{message}" }
@@ -237,37 +209,23 @@ pub fn BuyForm(
                     let listing = listing.clone();
                     let store_contract_id = store_contract_id.clone();
                     move |_| {
-                        let Some(quantity_wanted) = parsed_quantity else {
+                        let (Some(quantity_wanted), Some(total)) = (parsed_quantity, total) else {
                             return;
                         };
-                        let picked = picks();
-                        let selection = if instant {
-                            let Some(total) = total else {
-                                return;
-                            };
-                            let region = region();
-                            Some(InstantSelection {
-                                nonce: fresh_nonce(),
-                                region: (!region.is_empty()).then_some(region),
-                                choices: picked.clone(),
-                                expected_total_sats: total,
-                                requested_at_ms: unix_millis() as i64,
-                            })
-                        } else {
-                            None
-                        };
-                        // A quote request carries the picks in its note: the
-                        // seller reads the note, and the request has no other
-                        // place for them.
-                        let note_text = if instant {
-                            note().trim().to_string()
-                        } else {
-                            note_with_picks(&listing, &picked, note().trim())
+                        if too_many_unpaid {
+                            return;
+                        }
+                        let region = region();
+                        let selection = InstantSelection {
+                            nonce: fresh_nonce(),
+                            region: (!region.is_empty()).then_some(region),
+                            choices: picks(),
+                            expected_total_sats: total,
+                            requested_at_ms: unix_millis() as i64,
                         };
                         let answers_before = seller_answers(
                             &APP_STATE.read().conversation_thread(&store_contract_id),
                         );
-                        let was_instant = selection.is_some();
                         match request(
                             &store_contract_id,
                             &seller_encryption_key,
@@ -275,38 +233,52 @@ pub fn BuyForm(
                             &listing.id,
                             quantity_wanted,
                             shipping().trim().to_string(),
-                            note_text,
+                            note().trim().to_string(),
                             selection,
                         ) {
                             Ok(()) => {
                                 problem.set(None);
-                                if was_instant {
-                                    sent.set(Some(Sent {
-                                        at_ms: unix_millis(),
-                                        answers_before,
-                                    }));
-                                    wake_after_wait(now_ms);
-                                }
-                                asked.set(true);
+                                sent.set(Some(Sent {
+                                    at_ms: unix_millis(),
+                                    answers_before,
+                                }));
+                                wake_after_wait(now_ms);
                             }
                             Err(e) => problem.set(Some(e)),
                         }
                     }
                 },
-                if instant { "Buy now" } else { "Send this request" }
+                "Buy now"
             }
-            if instant {
-                p { class: "text-muted small",
-                    "Another region, or more than {MAX_INSTANT_QUANTITY}? "
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: move |_| quote_instead.set(true),
-                        "Ask the seller for a total instead"
-                    }
-                }
+            p { class: "text-muted small",
+                "Nothing is charged when you press Buy now. The seller\u{2019}s store sends the "
+                "payment details, and you pay from your own wallet."
             }
         }
     }
+}
+
+/// How many of this buyer's orders at a store are Buy now orders still
+/// waiting for payment: published, unpaid, and not yet too old to pay. The
+/// same count the seller's store caps at
+/// [`harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER`], so a buyer at
+/// the cap is told before sending rather than left waiting.
+fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
+    purchases
+        .iter()
+        .filter(|p| p.paid.is_none())
+        .filter(|p| {
+            p.commitment.as_ref().is_some_and(|c| {
+                c.order.request_id.is_some()
+                    && c.status == harvest_common::payment::OrderStatus::AwaitingPayment
+            })
+        })
+        .filter(|p| {
+            !p.blockers
+                .iter()
+                .any(|b| matches!(b, PaymentBlocker::AnchorStale { .. }))
+        })
+        .count()
 }
 
 /// An instant request that was sent: when, and how many seller answers the
@@ -360,19 +332,31 @@ fn seller_answers(thread: &[crate::messaging::ConversationMessage]) -> usize {
         .count()
 }
 
-/// The buyer's note, with the choices they picked in front of it, one per
-/// line ("Flavour: Fig").
-fn note_with_picks(listing: &Listing, picks: &[String], note: &str) -> String {
-    let mut lines: Vec<String> = listing
-        .choices
+/// The seller's store's answer to an order: an acceptance (the order is
+/// published and can be paid) or a decline, with its reason.
+#[derive(Clone, PartialEq, Debug)]
+enum Answer {
+    Accepted,
+    Declined(String),
+}
+
+/// The newest seller answer in the thread past the first `answers_before`,
+/// counted as [`seller_answers`] counts them, or `None` when there is none
+/// yet.
+fn latest_answer(
+    thread: &[crate::messaging::ConversationMessage],
+    answers_before: usize,
+) -> Option<Answer> {
+    thread
         .iter()
-        .zip(picks)
-        .map(|(group, pick)| format!("{}: {pick}", group.name))
-        .collect();
-    if !note.is_empty() {
-        lines.push(note.to_string());
-    }
-    lines.join("\n")
+        .filter(|message| message.addressing == Addressing::ToBuyer)
+        .filter_map(|message| match &message.content {
+            MessageContent::OrderAccepted { .. } => Some(Answer::Accepted),
+            MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
+            _ => None,
+        })
+        .skip(answers_before)
+        .last()
 }
 
 /// A fresh request nonce. Only the buyer's own resends reuse one, and this
@@ -419,18 +403,15 @@ fn request(
     quantity: u32,
     shipping: String,
     note: String,
-    instant: Option<InstantSelection>,
+    instant: InstantSelection,
 ) -> Result<(), String> {
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
-    let record_as = match &instant {
-        Some(selection) => format!(
-            "Asked to buy {quantity} with instant checkout, {} sats.",
-            selection.expected_total_sats
-        ),
-        None => format!("Asked to buy {quantity}."),
-    };
+    let record_as = format!(
+        "Ordered {quantity}, {} in all.",
+        super::store_view::sats_text(instant.expected_total_sats)
+    );
     let sealed = APP_STATE.write().request_order(
         store_contract_id,
         seller_encryption_key,
@@ -438,7 +419,7 @@ fn request(
         quantity,
         shipping,
         note,
-        instant,
+        Some(instant),
     )?;
 
     super::message_view::deliver_to_seller(store_contract_id, seller, record_as, sealed)
@@ -1463,35 +1444,37 @@ mod tests {
         assert_eq!(seller_answers(&thread), 2);
     }
 
+    /// The newest answer after the ones already there when the order went
+    /// out: nothing yet, then a decline with its reason, or an acceptance.
+    /// An answer that was already in the thread is not mistaken for this
+    /// order's. Mutated red by dropping the `skip`.
     #[test]
-    fn a_quote_request_carries_the_picks_in_its_note() {
-        let listing = Listing {
-            id: ListingId([0u8; 32]),
-            title: "Jam".into(),
-            description: String::new(),
-            kind: harvest_common::listing::ListingKind::Sale,
-            price: None,
-            created_at: chrono::DateTime::UNIX_EPOCH,
-            checkout: None,
-            choices: vec![
-                harvest_common::listing::ChoiceGroup {
-                    name: "Flavour".into(),
-                    options: vec!["Fig".into(), "Plum".into()],
-                },
-                harvest_common::listing::ChoiceGroup {
-                    name: "Size".into(),
-                    options: vec!["Small".into()],
-                },
-            ],
+    fn the_answer_shown_is_the_newest_one_after_the_order_went_out() {
+        let accepted = MessageContent::OrderAccepted {
+            order_id: harvest_common::payment::OrderId([1u8; 32]),
         };
-        let picks = vec!["Fig".to_string(), "Small".to_string()];
+        let mut thread = vec![message(Addressing::ToBuyer, accepted.clone())];
+        let before = seller_answers(&thread);
+        assert_eq!(latest_answer(&thread, before), None);
+        thread.push(message(Addressing::ToSeller, accepted.clone()));
+        thread.push(message(
+            Addressing::ToBuyer,
+            MessageContent::Text("Hi".into()),
+        ));
+        assert_eq!(latest_answer(&thread, before), None);
+        thread.push(message(
+            Addressing::ToBuyer,
+            MessageContent::Decline {
+                reason: harvest_common::delegate::TOO_MANY_UNPAID.into(),
+            },
+        ));
         assert_eq!(
-            note_with_picks(&listing, &picks, "By Friday"),
-            "Flavour: Fig\nSize: Small\nBy Friday"
+            latest_answer(&thread, before),
+            Some(Answer::Declined(
+                harvest_common::delegate::TOO_MANY_UNPAID.into()
+            ))
         );
-        assert_eq!(
-            note_with_picks(&listing, &picks, ""),
-            "Flavour: Fig\nSize: Small"
-        );
+        thread.push(message(Addressing::ToBuyer, accepted));
+        assert_eq!(latest_answer(&thread, before), Some(Answer::Accepted));
     }
 }

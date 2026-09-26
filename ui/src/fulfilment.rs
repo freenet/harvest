@@ -199,6 +199,28 @@ pub(crate) fn last_settling_block(order: &AuthorizedOrder) -> Option<u32> {
     Some(window.end().saturating_add(extra_confirmations(order)))
 }
 
+/// Whether `order` is a Buy now its buyer has not paid: an order answering a
+/// buyer's instant request ([`harvest_common::payment::Order::request_id`])
+/// that is still awaiting payment, or was cancelled before any payment.
+///
+/// **Not an order, as the seller sees it** (Ian, 2026-09-26). The seller is
+/// told about a Buy now once its payment is seen, and not before: an unpaid
+/// one is left out of their order list and of what needs them, and one that
+/// is never paid goes away without their ever seeing it. The record itself is
+/// still on the store contract, still settled by the seller's tab when a
+/// payment arrives, and still shown to its buyer; this decides only what the
+/// seller is shown.
+///
+/// An order the seller issued by hand for a quote request carries no
+/// `request_id` and is always shown: they made it.
+pub fn is_unpaid_buy_now(order: &AuthorizedOrder) -> bool {
+    order.order.request_id.is_some()
+        && matches!(
+            order.status,
+            OrderStatus::AwaitingPayment | OrderStatus::Cancelled
+        )
+}
+
 /// Where `order` stands against a chain tip at `tip_height`.
 ///
 /// `tip_height` is `None` when this reader has no tip for the order's

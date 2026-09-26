@@ -1425,6 +1425,12 @@ fn count_unanswered<'a>(
         .map(|(tag, group)| {
             unanswered_requests(group, listings, published, keys_for(tag))
                 .iter()
+                // Not a Buy now: an unpaid one is not an order and does not
+                // need the seller (Ian, 2026-09-26), even one their store
+                // could not answer. The store answers it the next time it
+                // runs, within a day of the request; the inbox still offers
+                // the seller the control to answer it by hand.
+                .filter(|request| request.instant.is_none())
                 .filter(|request| {
                     listings.iter().any(|l| l.listing.id == request.listing_id)
                         && on_sale(&request.listing_id)
@@ -1630,6 +1636,44 @@ mod inbox_tests {
             0
         );
         assert_eq!(count_unanswered(entries, &[], &[], keys_for, |_| true), 0);
+    }
+
+    /// A Buy now the store did not answer is left out of the count: an
+    /// unpaid Buy now is not an order and does not need the seller. It is
+    /// still in the inbox, where the seller can answer it by hand. Mutated
+    /// red by dropping the `instant.is_none()` filter.
+    #[test]
+    fn an_unanswered_buy_now_does_not_need_the_seller() {
+        let id = ListingId([9u8; 32]);
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let buy_now = readable(
+            MessageContent::OrderRequest {
+                instant: Some(crate::messaging::InstantSelection {
+                    requested_at_ms: 1_700_000_000_000,
+                    nonce: [1; 16],
+                    region: None,
+                    choices: vec![],
+                    expected_total_sats: 12_000,
+                }),
+                listing_id: id.clone(),
+                quantity: 1,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+                order_binding: BINDING,
+                buyer_receipt_key: None,
+            },
+            [1u8; 32],
+        );
+        let k = keys();
+        assert_eq!(
+            unanswered_requests(std::slice::from_ref(&buy_now), &listings, &[], Some(&k)).len(),
+            1,
+            "still offered in the inbox"
+        );
+        assert_eq!(
+            count_unanswered(vec![buy_now], &listings, &[], |_| Some(&k), |_| true),
+            0
+        );
     }
 
     /// **The seller is offered an Accept only when there is a request.**

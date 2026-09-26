@@ -331,7 +331,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // and a mismatched listing is a per-listing fact.
                         // And for a listing its seller has marked sold out
                         // (harvest#70): shown, never offered.
-                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing.id, availability),
+                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability),
                     }
                 }
             }
@@ -368,18 +368,20 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 
 /// The Buy control for one listing: what [`buyable`] allows for the store,
 /// less a listing whose own certificate did not verify, less one its seller
-/// marked sold out (harvest#70). The component renders exactly this, so the
-/// tests assert what the screen does.
+/// marked sold out (harvest#70), less one with no sats price to buy it at.
+/// The component renders exactly this, so the tests assert what the screen
+/// does.
 fn offered_buy(
     store: &crate::state::BrowsingStore,
     contract_id: &[u8],
     owned: bool,
-    listing: &harvest_common::listing::ListingId,
+    listing: &harvest_common::listing::Listing,
     availability: &ListingAvailability,
 ) -> Option<Buyable> {
     buyable(store, contract_id, owned)
-        .filter(|_| !store.unverified_listings.contains(listing))
+        .filter(|_| !store.unverified_listings.contains(&listing.id))
         .filter(|_| availability.is_buyable())
+        .filter(|_| listing.offers_instant_checkout())
 }
 
 /// The listings a buyer sees, with each one's availability: every listing
@@ -563,11 +565,9 @@ fn ListingCard(
                 class: "listing-desc",
             }
             div { class: "listing-footer",
-                if let Some(ref price) = l.price {
-                    span { class: "listing-price", "{price.amount} {price.currency}" }
-                }
-                if let Some(checkout) = l.checkout.as_ref().filter(|_| l.offers_instant_checkout()) {
-                    span { class: "listing-price", "{checkout.unit_sats} sats, instant checkout" }
+                if let Some((price, delivery)) = price_lines(l) {
+                    span { class: "listing-price", "{price}" }
+                    span { class: "listing-delivery", "{delivery}" }
                 }
                 if let Some(ref stock) = stock {
                     span { class: "listing-stock", "{stock}" }
@@ -578,6 +578,13 @@ fn ListingCard(
                         span { class: "listing-date", "Listed {date}" }
                     }
                 }
+            }
+            // A listing from before every listing had a sats price (a
+            // quote-only one, a gift or a request) cannot be bought: there is
+            // no longer a way to ask the seller for a total. Said, so a buyer
+            // is not left looking for a button.
+            if !l.offers_instant_checkout() {
+                p { class: "text-muted small", "{NOT_PRICED}" }
             }
             match buyable {
                 Some(buyable) => rsx! {
@@ -596,6 +603,54 @@ fn ListingCard(
     }
 }
 
+/// What a buyer is told about a listing that has no sats price.
+pub(crate) const NOT_PRICED: &str =
+    "Not for sale right now: the seller hasn\u{2019}t given this a price yet.";
+
+/// The price and delivery lines a buyer reads on a listing, or `None` for a
+/// listing that has no usable sats price (`Listing::offers_instant_checkout`).
+///
+/// Only the sats price: the free-text price some older listings carry is not
+/// shown, because it is not what a buyer would pay.
+pub(crate) fn price_lines(listing: &harvest_common::listing::Listing) -> Option<(String, String)> {
+    use harvest_common::listing::DeliveryPrice;
+    let checkout = listing
+        .checkout
+        .as_ref()
+        .filter(|_| listing.offers_instant_checkout())?;
+    let price = sats_text(checkout.unit_sats);
+    let delivery = match &checkout.delivery {
+        DeliveryPrice::Included => "Delivery included".to_string(),
+        DeliveryPrice::ByRegion(rows) => {
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    if row.sats == 0 {
+                        format!("{} free", row.region)
+                    } else {
+                        format!("{} {}", row.region, sats_text(row.sats))
+                    }
+                })
+                .collect();
+            format!("Delivery: {}", rows.join(", "))
+        }
+    };
+    Some((price, delivery))
+}
+
+/// "25,000 sats".
+pub(crate) fn sats_text(sats: u64) -> String {
+    let digits = sats.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{out} sats")
+}
+
 /// The Buy button, and the form it opens.
 ///
 /// Collapsed by default. A storefront is something people read, and a form
@@ -610,7 +665,7 @@ fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> El
             button {
                 class: if open() { "btn btn-sm btn-outline" } else { "btn btn-primary btn-sm" },
                 onclick: move |_| open.toggle(),
-                if open() { "Cancel" } else { "Buy this" }
+                if open() { "Cancel" } else { "Buy now" }
             }
             if open() {
                 super::buy_view::BuyForm {
@@ -909,7 +964,7 @@ mod availability_tests {
     /// expression the component renders. Mutated red by dropping the
     /// `is_buyable` filter.
     #[test]
-    fn only_a_listing_on_sale_offers_buy() {
+    fn only_a_priced_listing_on_sale_offers_buy() {
         let store = crate::state::BrowsingStore {
             info: Some(harvest_common::store::StoreInfoV1 {
                 version: 1,
@@ -924,15 +979,9 @@ mod availability_tests {
             seller_verifying_key: Some([2u8; 32]),
             ..Default::default()
         };
+        let priced = priced_listing(9).listing;
         let offered = |availability: &ListingAvailability| {
-            offered_buy(
-                &store,
-                &[4u8; 32],
-                false,
-                &ListingId([9u8; 32]),
-                availability,
-            )
-            .is_some()
+            offered_buy(&store, &[4u8; 32], false, &priced, availability).is_some()
         };
         assert!(offered(&ListingAvailability::Available { quantity: None }));
         assert!(offered(&ListingAvailability::Available {
@@ -943,5 +992,68 @@ mod availability_tests {
         }));
         assert!(!offered(&ListingAvailability::SoldOut));
         assert!(!offered(&ListingAvailability::Withdrawn));
+        // A listing with no sats price (quote-only, from before every
+        // listing had one) is shown and never offered: there is no way left
+        // to ask the seller for a total. Mutated red by dropping the filter.
+        let quote_only = listing(9).listing;
+        assert!(offered_buy(
+            &store,
+            &[4u8; 32],
+            false,
+            &quote_only,
+            &ListingAvailability::Available { quantity: None }
+        )
+        .is_none());
+    }
+
+    fn priced_listing(n: u8) -> AuthorizedListing {
+        let mut l = listing(n);
+        l.listing.checkout = Some(harvest_common::listing::FixedCheckout {
+            unit_sats: 25_000,
+            delivery: harvest_common::listing::DeliveryPrice::Included,
+        });
+        l
+    }
+
+    /// What a buyer reads under a listing: the sats price and the delivery,
+    /// never the old free-text price, and nothing for a listing with no
+    /// sats price.
+    #[test]
+    fn a_listing_shows_its_sats_price_and_delivery() {
+        use harvest_common::listing::{DeliveryPrice, FixedCheckout, PriceInfo, RegionPrice};
+        let mut l = priced_listing(1).listing;
+        l.price = Some(PriceInfo {
+            amount: "9".into(),
+            currency: "USD".into(),
+        });
+        assert_eq!(
+            price_lines(&l),
+            Some(("25,000 sats".to_string(), "Delivery included".to_string()))
+        );
+        l.checkout = Some(FixedCheckout {
+            unit_sats: 1_000_000,
+            delivery: DeliveryPrice::ByRegion(vec![
+                RegionPrice {
+                    region: "US".into(),
+                    sats: 0,
+                },
+                RegionPrice {
+                    region: "EU".into(),
+                    sats: 5_000,
+                },
+            ]),
+        });
+        assert_eq!(
+            price_lines(&l),
+            Some((
+                "1,000,000 sats".to_string(),
+                "Delivery: US free, EU 5,000 sats".to_string()
+            ))
+        );
+        l.checkout = None;
+        assert_eq!(price_lines(&l), None);
+        assert_eq!(sats_text(0), "0 sats");
+        assert_eq!(sats_text(999), "999 sats");
+        assert_eq!(sats_text(1_000), "1,000 sats");
     }
 }

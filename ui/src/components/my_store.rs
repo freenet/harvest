@@ -61,14 +61,22 @@ pub(crate) struct SellerStore {
     /// way the store page counts them.
     pub record: String,
     /// Invoices this seller issued, unpaid and still open, whose anchor is
-    /// too old for a buyer to start paying.
+    /// too old for a buyer to start paying. Never a Buy now: one nobody paid
+    /// just goes away (`fulfilment::is_unpaid_buy_now`).
     pub expired_invoices: usize,
+    /// Paid orders waiting to be sent: the moment a Buy now first needs the
+    /// seller.
+    pub to_send: usize,
 }
 
-/// Requests waiting for an invoice across every store this device manages:
-/// the number beside "My store" in the navigation.
+/// What needs the seller across every store this device manages: requests
+/// waiting for an invoice, and paid orders waiting to be sent. The number
+/// beside "My store" in the navigation.
 pub(crate) fn requests_needing_seller(state: &AppState) -> usize {
-    seller_stores(state).iter().map(|s| s.requests).sum()
+    seller_stores(state)
+        .iter()
+        .map(|s| s.requests + s.to_send)
+        .sum()
 }
 
 /// Every store this device can manage, by name.
@@ -104,6 +112,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     b.orders
                         .iter()
                         .filter(|o| o.order.seller_fingerprint == *fingerprint)
+                        .filter(|o| !crate::fulfilment::is_unpaid_buy_now(o))
                         .filter(|o| state.needs_reissue(o))
                         // Only while it is still open (harvest#53): once its
                         // window has closed it has lapsed, which needs nothing
@@ -122,6 +131,30 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                                     state.payment_sight(o),
                                 ),
                                 crate::fulfilment::OrderStage::AwaitingPayment { .. }
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let to_send = browsing
+                .map(|b| {
+                    b.orders
+                        .iter()
+                        .filter(|o| o.order.seller_fingerprint == *fingerprint)
+                        .filter(|o| {
+                            let tip = state
+                                .bitcoin
+                                .tips
+                                .get(&o.order.network)
+                                .and_then(|tip| tip.tip_height);
+                            matches!(
+                                crate::fulfilment::order_stage(
+                                    o,
+                                    state.despatch_of(o).as_ref(),
+                                    tip,
+                                    state.payment_sight(o),
+                                ),
+                                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
                             )
                         })
                         .count()
@@ -171,6 +204,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     .map(|b| b.record.badge(b.counted_complaints()).1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
                 expired_invoices,
+                to_send,
             })
         })
         .collect();
@@ -503,8 +537,9 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
         .unwrap_or_else(|| stores[0].clone());
 
     // Counts what needs the seller, not everything there is: a request
-    // waiting for an invoice.
-    let orders_label = match store.requests {
+    // waiting for an invoice, or a paid order waiting to be sent. Never an
+    // unpaid Buy now.
+    let orders_label = match store.requests + store.to_send {
         0 => "Orders".to_string(),
         n => format!("Orders ({n})"),
     };
@@ -620,7 +655,8 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         || (store.details_resolved && store.gap.is_some())
         || !store.certificate.is_verified()
         || store.expired_invoices > 0
-        || store.requests > 0;
+        || store.requests > 0
+        || store.to_send > 0;
 
     rsx! {
         section { class: "card",
@@ -648,6 +684,18 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     if let Some(why) = store.certificate.detail() {
                         " ({why})"
                     }
+                }
+            }
+            if store.to_send > 0 {
+                div { class: "need row-between",
+                    strong {
+                        if store.to_send == 1 {
+                            "1 paid order to send."
+                        } else {
+                            "{store.to_send} paid orders to send."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
                 }
             }
             if store.requests > 0 {

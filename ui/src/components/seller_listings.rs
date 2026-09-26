@@ -220,6 +220,10 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
     }
 }
 
+/// What a seller is told about one of their listings with no sats price.
+pub(crate) const NEEDS_PRICE: &str =
+    "Buyers can\u{2019}t buy this until it has a price. Use Edit to give it one.";
+
 #[component]
 fn SellerListingRow(
     store_contract_id: Vec<u8>,
@@ -244,8 +248,10 @@ fn SellerListingRow(
             div { class: "seller-listing-main",
                 h4 { class: "seller-listing-title", "{l.title}" }
                 p { class: "seller-listing-meta",
-                    if let Some(ref price) = l.price {
-                        span { class: "listing-price", "{price.amount} {price.currency}" }
+                    if let Some((price, delivery)) = super::store_view::price_lines(l) {
+                        span { class: "listing-price", "{price}" }
+                        span { class: "sep", " · " }
+                        span { "{delivery}" }
                         span { class: "sep", " · " }
                     }
                     span { class: if buyable { "status-on" } else { "status-off" },
@@ -253,6 +259,12 @@ fn SellerListingRow(
                     }
                     span { class: "sep", " · " }
                     span { "Listed {date}" }
+                }
+                // A listing from before every listing had a sats price. It
+                // stays readable, but nobody can buy it until it has one;
+                // Edit publishes the priced listing and takes this one down.
+                if !taken_down && !l.offers_instant_checkout() {
+                    p { class: "text-warning small", "{NEEDS_PRICE}" }
                 }
             }
             div { class: "seller-listing-actions",
