@@ -1423,6 +1423,36 @@ impl BrowsingStore {
             .count()
     }
 
+    /// How many complaints on this store's record are about orders paid,
+    /// per a bridge this reader does not recognise (harvest#144): listed
+    /// apart, never counted.
+    pub fn complaints_under_unrecognised_bridges(&self) -> usize {
+        self.complaint_standings()
+            .filter(|(_, standing)| {
+                *standing == crate::fulfilment::ComplaintStanding::BridgeNotRecognised
+            })
+            .count()
+    }
+
+    /// The store's badge: its load state and counted complaints, except
+    /// that a FULL record never reads "Clean record" (harvest#144).
+    ///
+    /// A full record keeps the complaints dated nearest their payments
+    /// (`reputation::MAX_COMPLAINTS`), and a seller's complaints on its own
+    /// orders, paid through a bridge it runs, can all be dated at their
+    /// payment. Those are not counted, so a record full of them would
+    /// otherwise read clean while every genuine complaint had been pushed
+    /// out. Ranking recognised-bridge complaints first would need a
+    /// reputation-contract change (`docs/complaint-threat-model.md`
+    /// section 6), so the reader is told instead.
+    pub fn record_badge(&self) -> (&'static str, String) {
+        let counted = self.counted_complaints();
+        if self.record_full() && counted == 0 {
+            return ("text-warning", "Record full, none counted".into());
+        }
+        self.record.badge(counted)
+    }
+
     /// A listing's availability: the status the store holds for it, or on
     /// sale and uncounted when it holds none (harvest#70).
     pub fn availability(

@@ -168,7 +168,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     .unwrap_or(0),
                 requests: super::message_view::requests_awaiting_invoice(state, id),
                 record: browsing
-                    .map(|b| b.record.badge(b.counted_complaints()).1)
+                    .map(|b| b.record_badge().1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
                 expired_invoices,
             })

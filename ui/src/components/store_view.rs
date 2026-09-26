@@ -189,8 +189,8 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     // Counted the way the store's record (`StoreRecord`) counts them
     // (`BrowsingStore::complaint_standings`), so the badge and the record
     // agree, and neither reads the store's status.
-    let counted_complaints = store.counted_complaints();
-    let (record_class, record_text) = store.record.badge(counted_complaints);
+    let (record_class, record_text) = store.record_badge();
+    let unrecognised_complaints = store.complaints_under_unrecognised_bridges();
     let mut show_messages = use_signal(|| false);
     let mut show_record = use_signal(|| false);
     // A listing its seller took down is not shown to buyers at all
@@ -256,6 +256,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                          complaints, the most a record can. A new complaint is kept only in place of \
                          one dated farther from its payment, so the count here may be less than \
                          every complaint ever made."
+                    }
+                    // harvest#144: uncounted complaints can still take a
+                    // full record's places, so say how many do.
+                    if unrecognised_complaints > 0 {
+                        p { class: "text-warning",
+                            "{unrecognised_complaints} of them are about orders paid through a Bitcoin \
+                             bridge this app does not recognise, so they are not counted. Anyone can \
+                             run a bridge, the seller included, so those complaints may have pushed \
+                             genuine ones off the record."
+                        }
                     }
                 }
 

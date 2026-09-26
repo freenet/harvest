@@ -345,6 +345,10 @@ pub enum ComplaintStanding {
     /// The store records the order's payment as reversed. Shown as such, and
     /// counted only if [`complaint_against_reversed_payment_counts`] says so.
     PaymentReversed,
+    /// The order's payment was attested by a bridge this reader does not
+    /// recognise ([`payment_attested_by_recognised_bridges`], harvest#144).
+    /// Listed apart from the rest of the record, never counted.
+    BridgeNotRecognised,
 }
 
 impl ComplaintStanding {
@@ -353,8 +357,54 @@ impl ComplaintStanding {
             ComplaintStanding::Counts => true,
             ComplaintStanding::Late { .. } => false,
             ComplaintStanding::PaymentReversed => complaint_against_reversed_payment_counts(),
+            ComplaintStanding::BridgeNotRecognised => false,
         }
     }
+}
+
+/// Whether this reader believes `order` was paid: its payment evidence can
+/// only have come from Bitcoin bridges this build recognises (harvest#144,
+/// Ian's decision, option 1).
+///
+/// **The one rule every reader-side count goes through.** A complaint counts
+/// against a store only if this says yes ([`complaint_standing`]), and a
+/// store's reversal discounts a complaint only if it says yes
+/// ([`reversal_stands`]). Nothing else in this build counts paid orders
+/// toward a store's standing; anything that starts to must call this, not
+/// restate it.
+///
+/// # Why "every bridge the order names", not "the bridge that proved it"
+///
+/// The bridges an order trusts are in its seller-signed terms, so the seller
+/// chooses them, and a bridge the seller runs can make an order read as paid
+/// with no Bitcoin moving (issue #144). `verify_payment_proof` folds the
+/// claims of EVERY named bridge together and takes its tip from any of them,
+/// so there is no single bridge that "proved" a payment: an unrecognised
+/// bridge's claim, its withheld retraction or its tip can each decide the
+/// answer. So an order counts only when every bridge it names is recognised,
+/// which means every signature its evidence can carry is one this build
+/// believes. It costs an honest buyer nothing: a buyer pays only orders whose
+/// bridges are all recognised (`PaymentBlocker::BridgeNotRecognised`).
+///
+/// # Lightning, and no evidence at all
+///
+/// Only on-chain evidence can be attested by a bridge. A Lightning proof is a
+/// preimage of a hash the seller chose, which the seller already knows, and
+/// no bridge is involved, so a Lightning payment is never counted, whatever
+/// bridges its order names. (The reputation contract already refuses a
+/// complaint about a Lightning order, `payment::complaint_preconditions`, and
+/// this build issues none.) An order with no evidence, or naming no bridge,
+/// is not counted either: "every bridge is recognised" is not allowed to be
+/// true of an empty list.
+///
+/// # What it cannot catch
+///
+/// A seller paying themselves through a recognised bridge. That payment is
+/// real, and a complaint on it counts against the seller who made it.
+pub fn payment_attested_by_recognised_bridges(order: &AuthorizedOrder) -> bool {
+    matches!(order.payment_proof, Some(OrderPaymentProof::OnChain(_)))
+        && !order.order.trusted_bridges.is_empty()
+        && crate::components::bitcoin_view::unrecognised_bridges(&order.order).is_empty()
 }
 
 /// The last block at which the buyer of `order` may complain: the despatch
@@ -424,11 +474,21 @@ fn window_end_from(
 /// closure anchor, so no rule of the form "discount complaints after
 /// closure" is safe; complaints are counted on the store key's record
 /// whatever the store's status.
+///
+/// # Only a payment a recognised bridge attested
+///
+/// Checked first ([`payment_attested_by_recognised_bridges`], harvest#144):
+/// a complaint whose order's payment rests on a bridge this reader does not
+/// recognise is [`ComplaintStanding::BridgeNotRecognised`], whatever else is
+/// true of it, because nothing else about it can be believed either.
 pub fn complaint_standing(
     complaint: &harvest_common::reputation::Complaint,
     store_order: Option<&AuthorizedOrder>,
     despatch: Option<&AuthorizedDespatch>,
 ) -> ComplaintStanding {
+    if !payment_attested_by_recognised_bridges(&complaint.order) {
+        return ComplaintStanding::BridgeNotRecognised;
+    }
     let reversal = store_order.filter(|held| {
         held.order.id == complaint.order.order.id && held.status == OrderStatus::PaymentReversed
     });
@@ -468,13 +528,17 @@ pub fn complaint_standing(
 /// honest buyer's complaint loses nothing here: only a reversal a recognised
 /// bridge attested discounts it. A bridge recognised once and dropped later
 /// makes its reversals count for nothing, which errs toward the buyer.
+///
+/// Since harvest#144 [`complaint_standing`] does not count such a complaint
+/// at all, so this check no longer decides a count there; it stays so that
+/// this function never honours an unrecognised bridge's retraction on its
+/// own, and it is the same rule, [`payment_attested_by_recognised_bridges`].
 pub fn reversal_stands(
     complaint: &harvest_common::reputation::Complaint,
     reversal: &AuthorizedOrder,
 ) -> bool {
     use harvest_common::payment::{verify_payment_proof, ProofError};
-    // A complaint's order names at least one bridge (`Complaint::verify`).
-    if !crate::components::bitcoin_view::unrecognised_bridges(&complaint.order.order).is_empty() {
+    if !payment_attested_by_recognised_bridges(&complaint.order) {
         return false;
     }
     let (Some(OrderPaymentProof::OnChain(theirs)), Some(OrderPaymentProof::OnChain(ours))) = (
@@ -774,10 +838,11 @@ mod tests {
     /// **A reversal counts only when every bridge the order names is
     /// recognised** (review round 6 of #143). A seller names its own bridge in
     /// a sockpuppet order, pays it, complains about it at its paid height, and
-    /// has its bridge retract the payment: with the bridge unrecognised the
-    /// reversal discounts nothing, so the complaint counts against the seller,
-    /// and a full record of them cannot push out honest complaints for free.
-    /// The same evidence under a recognised bridge still discounts it. Red if
+    /// has its bridge retract the payment: `reversal_stands` never honours
+    /// that retraction. The same evidence under a recognised bridge still
+    /// discounts the complaint. Since harvest#144 the unrecognised case is not
+    /// counted at all (`BridgeNotRecognised`), so what this pins is that the
+    /// reversal check itself still refuses the stranger's retraction. Red if
     /// `reversal_stands` stops checking the bridges.
     #[test]
     fn a_reversal_by_a_bridge_nobody_recognises_discounts_nothing() {
@@ -797,11 +862,13 @@ mod tests {
             !crate::components::bitcoin_view::unrecognised_bridges(&paid.order).is_empty(),
             "precondition: the fixture's bridge is not the build's"
         );
+        assert!(!reversal_stands(&complaint, &reversed));
         assert_eq!(
             complaint_standing(&complaint, Some(&reversed), None),
-            ComplaintStanding::Counts
+            ComplaintStanding::BridgeNotRecognised
         );
         let _recognised = recognise_fixture_bridge();
+        assert!(reversal_stands(&complaint, &reversed));
         assert_eq!(
             complaint_standing(&complaint, Some(&reversed), None),
             ComplaintStanding::PaymentReversed,
@@ -816,10 +883,177 @@ mod tests {
             .order
             .trusted_bridges
             .push(freenet_bitcoin_common::BridgeId([0x5e; 32]));
-        assert_eq!(
-            complaint_standing(&mixed, Some(&reversed), None),
-            ComplaintStanding::Counts,
+        assert!(
+            !reversal_stands(&mixed, &reversed),
             "a recognised bridge alongside the seller's own does not make the reversal stand"
+        );
+    }
+
+    /// A bridge no build recognises, standing in for one the seller runs.
+    fn strangers_bridge() -> freenet_bitcoin_common::BridgeId {
+        freenet_bitcoin_common::BridgeId([0x5e; 32])
+    }
+
+    /// **harvest#144, the predicate: a reader believes a payment only when
+    /// every bridge its order names is recognised, and never a Lightning
+    /// one.** One case per clause of `payment_attested_by_recognised_bridges`:
+    /// red if any clause is dropped (the on-chain match, the non-empty list,
+    /// the recognised check), or if the rule is loosened to "some named bridge
+    /// is recognised".
+    #[test]
+    fn only_a_payment_every_named_bridge_is_recognised_for_is_believed() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+
+        // The fixture's bridge is nobody's until recognised.
+        assert!(!payment_attested_by_recognised_bridges(&paid));
+        let _recognised = recognise_fixture_bridge();
+        assert!(payment_attested_by_recognised_bridges(&paid));
+
+        // A recognised bridge beside one the seller runs: the stranger's
+        // claims and tip are folded in with the recognised one's, so the
+        // order is not believed.
+        let mut mixed = paid.clone();
+        mixed.order.trusted_bridges.push(strangers_bridge());
+        assert!(!payment_attested_by_recognised_bridges(&mixed));
+        // And the stranger alone.
+        let mut stranger = paid.clone();
+        stranger.order.trusted_bridges = vec![strangers_bridge()];
+        assert!(!payment_attested_by_recognised_bridges(&stranger));
+
+        // "Every named bridge is recognised" is not true of none.
+        let mut none_named = paid.clone();
+        none_named.order.trusted_bridges.clear();
+        assert!(!payment_attested_by_recognised_bridges(&none_named));
+
+        // No evidence at all.
+        let mut no_proof = paid.clone();
+        no_proof.payment_proof = None;
+        assert!(!payment_attested_by_recognised_bridges(&no_proof));
+
+        // Lightning: a preimage of a hash the seller chose, attested by no
+        // bridge, even when every bridge the order names is recognised.
+        let mut lightning = paid.clone();
+        lightning.payment_proof = Some(OrderPaymentProof::Lightning(
+            harvest_common::payment::LightningPaymentProof {
+                preimage: [7u8; 32],
+            },
+        ));
+        assert!(crate::components::bitcoin_view::unrecognised_bridges(&lightning.order).is_empty());
+        assert!(!payment_attested_by_recognised_bridges(&lightning));
+    }
+
+    /// **harvest#144: a complaint whose order's payment rests on a bridge the
+    /// reader does not recognise is not counted, whatever else is true of
+    /// it.** Made inside its window, and about a payment nobody reversed, it
+    /// still reads `BridgeNotRecognised`; recognise the bridge and the same
+    /// complaint counts. Red if `complaint_standing` stops calling the
+    /// predicate, or calls it after the window check.
+    #[test]
+    fn a_complaint_paid_per_an_unrecognised_bridge_is_not_counted() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let complaint = complaint_at(&paid, paid_at + 10);
+
+        let standing = complaint_standing(&complaint, Some(&paid), None);
+        assert_eq!(standing, ComplaintStanding::BridgeNotRecognised);
+        assert!(!standing.counts());
+        // Late as well as unrecognised: the bridge is what it is shown as.
+        let end = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        assert_eq!(
+            complaint_standing(&complaint_at(&paid, end + 1), None, None),
+            ComplaintStanding::BridgeNotRecognised
+        );
+
+        let _recognised = recognise_fixture_bridge();
+        assert_eq!(
+            complaint_standing(&complaint, Some(&paid), None),
+            ComplaintStanding::Counts
+        );
+        let mut mixed = complaint.clone();
+        mixed.order.order.trusted_bridges.push(strangers_bridge());
+        assert_eq!(
+            complaint_standing(&mixed, Some(&paid), None),
+            ComplaintStanding::BridgeNotRecognised,
+            "one bridge the seller runs is enough to stop it counting"
+        );
+    }
+
+    /// **harvest#144, where it is counted and shown: a store's badge and its
+    /// record leave an unrecognised-bridge complaint out of the count, and
+    /// the record lists it apart.** Red if `BrowsingStore::counted_complaints`
+    /// or `RecordSections` stop going through `complaint_standing`, or if the
+    /// record files it with the judged complaints.
+    #[test]
+    fn a_store_counts_only_recognised_complaints_and_lists_the_rest_apart() {
+        use crate::components::reputation_view::RecordSections;
+        use crate::state::{BrowsingStore, RecordLoad};
+        let _recognised = recognise_fixture_bridge();
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let honest = complaint_at(&paid, paid_at + 10);
+        let mut own_bridge = honest.clone();
+        own_bridge.order.order.trusted_bridges = vec![strangers_bridge()];
+
+        let store = BrowsingStore {
+            record: RecordLoad::Loaded,
+            complaints: vec![honest.clone(), own_bridge.clone()],
+            ..BrowsingStore::default()
+        };
+        assert_eq!(store.counted_complaints(), 1);
+        assert_eq!(store.complaints_under_unrecognised_bridges(), 1);
+        assert_eq!(store.record_badge().1, "1 complaint(s)");
+
+        let sections = RecordSections::of(&store);
+        assert_eq!(sections.counted(), 1);
+        assert_eq!(
+            sections
+                .judged
+                .iter()
+                .map(|row| (&row.complaint, row.standing))
+                .collect::<Vec<_>>(),
+            vec![(&honest, ComplaintStanding::Counts)]
+        );
+        assert_eq!(
+            sections
+                .unrecognised
+                .iter()
+                .map(|row| (&row.complaint, row.standing))
+                .collect::<Vec<_>>(),
+            vec![(&own_bridge, ComplaintStanding::BridgeNotRecognised)]
+        );
+    }
+
+    /// **harvest#144: a full record never reads "Clean record".** A full
+    /// record keeps the complaints nearest their payments, and a seller can
+    /// date its own-bridge complaints at their payment, so a record full of
+    /// complaints nobody counts may have pushed every genuine one out. Red
+    /// if `record_badge` goes back to the bare count.
+    #[test]
+    fn a_full_record_of_uncounted_complaints_is_not_called_clean() {
+        use crate::state::{BrowsingStore, RecordLoad};
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let own_bridge = complaint_at(&paid, paid_at);
+        assert!(!payment_attested_by_recognised_bridges(&own_bridge.order));
+        let mut store = BrowsingStore {
+            record: RecordLoad::Loaded,
+            complaints: vec![own_bridge; harvest_common::reputation::MAX_COMPLAINTS - 1],
+            ..BrowsingStore::default()
+        };
+        assert_eq!(store.counted_complaints(), 0);
+        assert_eq!(
+            store.record_badge().1,
+            "Clean record",
+            "not full: every complaint anyone made is still on it"
+        );
+        store.complaints.push(store.complaints[0].clone());
+        assert!(store.record_full());
+        let (_, text) = store.record_badge();
+        assert_eq!(text, "Record full, none counted");
+        assert_eq!(
+            store.complaints_under_unrecognised_bridges(),
+            harvest_common::reputation::MAX_COMPLAINTS
         );
     }
 
@@ -1592,6 +1826,7 @@ mod tests {
     /// window, or measures it from anything but `complaint_window_end`.
     #[test]
     fn a_complaint_counts_inside_the_window_and_not_after() {
+        let _recognised = recognise_fixture_bridge();
         let paid_at = ANCHOR + 3;
         let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
         let end = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
@@ -1733,6 +1968,7 @@ mod tests {
     /// re-reads the height from anything else.
     #[test]
     fn the_window_counts_from_the_complaints_own_paid_height() {
+        let _recognised = recognise_fixture_bridge();
         let paid_at = ANCHOR + 3;
         let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
         let end = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;

@@ -8,10 +8,47 @@ use crate::state::RecordLoad;
 
 /// One complaint as a reader sees it: what it says, and how it counts.
 #[derive(Clone, PartialEq)]
-struct ComplaintRow {
-    complaint: Complaint,
-    standing: ComplaintStanding,
+pub(crate) struct ComplaintRow {
+    pub(crate) complaint: Complaint,
+    pub(crate) standing: ComplaintStanding,
     store_name: Option<String>,
+}
+
+/// A store's complaints, sorted the way its record shows them: the ones this
+/// reader judges (counted or not, each with its reason), and apart from
+/// them the ones about orders paid through a bridge this reader does not
+/// recognise (harvest#144), which are never counted.
+#[derive(Clone, PartialEq, Default)]
+pub(crate) struct RecordSections {
+    /// Complaints on orders a recognised bridge attested.
+    pub(crate) judged: Vec<ComplaintRow>,
+    /// Complaints on orders "paid, per a bridge you don't recognise".
+    pub(crate) unrecognised: Vec<ComplaintRow>,
+}
+
+impl RecordSections {
+    pub(crate) fn of(store: &crate::state::BrowsingStore) -> Self {
+        let mut sections = RecordSections::default();
+        for (complaint, standing) in store.complaint_standings() {
+            let row = ComplaintRow {
+                standing,
+                complaint: complaint.clone(),
+                store_name: None,
+            };
+            if standing == ComplaintStanding::BridgeNotRecognised {
+                sections.unrecognised.push(row);
+            } else {
+                sections.judged.push(row);
+            }
+        }
+        sections
+    }
+
+    /// How many complaints count against the seller: the same number the
+    /// store's badge shows (`BrowsingStore::counted_complaints`).
+    pub(crate) fn counted(&self) -> usize {
+        self.judged.iter().filter(|r| r.standing.counts()).count()
+    }
 }
 
 /// One store's record: its complaints, and nothing else's (harvest#93 phase 2).
@@ -23,47 +60,60 @@ struct ComplaintRow {
 /// (`BrowsingStore::complaint_standings`), so the two cannot disagree.
 #[component]
 pub fn StoreRecord(store_contract_id: Vec<u8>) -> Element {
-    let (rows, empty_text): (Vec<ComplaintRow>, String) = APP_STATE
+    let (sections, empty_text): (RecordSections, String) = APP_STATE
         .read()
         .browsing_stores
         .get(&store_contract_id)
-        .map(|store| {
-            let rows = store
-                .complaint_standings()
-                .map(|(complaint, standing)| ComplaintRow {
-                    standing,
-                    complaint: complaint.clone(),
-                    store_name: None,
-                })
-                .collect();
-            (rows, empty_record_text(store.record))
-        })
-        .unwrap_or_else(|| (Vec::new(), empty_record_text(RecordLoad::Loading)));
-    let counted = rows.iter().filter(|r| r.standing.counts()).count();
+        .map(|store| (RecordSections::of(store), empty_record_text(store.record)))
+        .unwrap_or_else(|| {
+            (
+                RecordSections::default(),
+                empty_record_text(RecordLoad::Loading),
+            )
+        });
+    let counted = sections.counted();
+    let judged = sections.judged.len();
+    let unrecognised = sections.unrecognised.len();
 
     rsx! {
         div { class: "store-record",
-            if rows.is_empty() {
+            if judged == 0 && unrecognised == 0 {
                 p { class: "text-muted", "{empty_text}" }
+            } else if judged == 0 {
+                p { class: "section-count", "No complaints counted" }
             } else {
                 p { class: "section-count",
-                    "{counted} complaint(s) counted, of {rows.len()} on record"
+                    "{counted} complaint(s) counted, of {judged} on record"
                 }
-                for row in rows.iter() {
+                for row in sections.judged.iter() {
+                    ComplaintCard { row: row.clone() }
+                }
+            }
+            if unrecognised > 0 {
+                p { class: "section-count",
+                    "Not counted: {unrecognised} paid, per a bridge you don't recognise"
+                }
+                p { class: "text-muted small",
+                    "These complaints are about orders that a Bitcoin bridge this app does not "
+                    "recognise says were paid. Anyone can run a bridge, the seller included, and "
+                    "one run by the seller can say an order was paid when it was not. So these "
+                    "are shown here, and not counted."
+                }
+                for row in sections.unrecognised.iter() {
                     ComplaintCard { row: row.clone() }
                 }
             }
             p { class: "text-muted small",
                 "A record holds complaints only, as categories, with no free text. Each one "
-                "names an order that the order's own Bitcoin bridges say was paid, and only that "
-                "order's buyer can make it, so a stranger cannot make one up and the seller "
-                "cannot take one down."
+                "names an order that a Bitcoin bridge says was paid, and only that order's buyer "
+                "can make it, so a stranger cannot make one up and the seller cannot take one "
+                "down. A complaint is counted only if every bridge its order names is one this "
+                "app recognises."
             }
             p { class: "text-muted small",
-                "What it cannot tell you: the seller chooses which bridges their orders trust, so "
-                "a seller who pays themselves through a bridge they run can put orders, and "
-                "complaints, on their own record. And a record with no complaints says nothing "
-                "about the orders nobody complained about."
+                "What it cannot tell you: a seller who pays themselves through a bridge this app "
+                "recognises can still put orders, and complaints, on their own record. And a "
+                "record with no complaints says nothing about the orders nobody complained about."
             }
         }
     }
@@ -99,6 +149,8 @@ fn ComplaintCard(row: ComplaintRow) -> Element {
         } else {
             "Payment reversed on the Bitcoin chain since, so it is not counted.".to_string()
         }),
+        // Listed under its own heading, which says why (`StoreRecord`).
+        ComplaintStanding::BridgeNotRecognised => None,
     };
     rsx! {
         div { class: "feedback-card",
