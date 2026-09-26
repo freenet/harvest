@@ -436,8 +436,10 @@ substitute must show the same paid height.
 - **With a reused address (section 2), one payment can back many complaints**, so the seller and
   sockpuppets complaining about their own orders can fill the record. What that buys them is
   stated in 7.3: to displace an honest complaint they need `MAX_COMPLAINTS` complaints dated
-  nearer their payments, each of which a reader counts (a reversal of one discounts it only when
-  a recognised bridge attested it, section 6).
+  nearer their payments. Under a recognised bridge a reader counts each of those (a reversal of
+  one discounts it only when a recognised bridge attested it, section 6). Under a bridge the
+  seller runs, since #144, a reader counts none of them, so that flood is free; the reader is
+  told instead (section 6, 7.3).
 - A record that does not load reads "record not loaded", never "clean record" (`RecordLoad`).
 
 ## 6. Reader rules (no re-key needed to change any of them)
@@ -468,21 +470,40 @@ substitute must show the same paid height.
 - **Counting never consults closure, retirement or backing.** A seller could backdate a closure
   anchor, so no rule of the form "discount orders after closure" is safe. Complaints are counted
   on the store key's record, whatever the store's status.
-- **Self-dealing and sockpuppets (#144, Ian's open call).**
-  - Every complaint carries its order's `trusted_bridges`. A reader-side filter that discounts
-    complaints whose bridges it does not recognise is **no longer free to add** (R6-4). Those
-    complaints can be dated at their paid height, which a full record keeps first (5.3), so such
-    a filter would let a seller's own-bridge complaints, counted for nothing, push honest
-    complaints out of a full record. Adding it needs the record to rank recognised-bridge
-    complaints first, which is a contract change, and section 8 freezes the ranking once
-    complaints exist. So #144 has to be decided before launch if the answer is "discount".
-    (Discounting paid-order history, which the record does not hold, is unaffected.)
-  - Such a filter must use an **append-only list of every bridge ever recognised**, not the
-    current one, or a key rotation would discount honest complaints made under the old key
-    (TM-G).
+- **Only a payment a recognised bridge attested counts (#144, decided by Ian 2026-09-26,
+  option 1).** A complaint counts only when every bridge its order names is one the reader's
+  build recognises (`fulfilment::payment_attested_by_recognised_bridges`, the one predicate every
+  reader-side count goes through). Anything else is `ComplaintStanding::BridgeNotRecognised`:
+  listed apart on the store's record ("paid, per a bridge you don't recognise") and never
+  counted.
+  - **Every named bridge, not "the bridge that proved it".** `verify_payment_proof` folds the
+    claims of every named bridge together and takes the tip from any of them, so no single bridge
+    proves a payment; an unrecognised bridge's claim, withheld retraction or tip can each decide
+    it. Requiring every named bridge to be recognised means every signature the evidence can
+    carry is one the reader believes. It costs an honest buyer nothing, since a buyer pays only
+    all-recognised orders (`BridgeNotRecognised` blocker), and it is the rule `reversal_stands`
+    already used.
+  - **Lightning is never counted.** Its proof is a preimage of a hash the seller chose, attested
+    by no bridge. The contract already refuses a complaint about a Lightning order
+    (`complaint_preconditions`), and this build issues none; the predicate refuses one anyway.
+  - **The cost, R6-4, is not closed.** Own-bridge complaints can be dated at their paid height,
+    which a full record keeps first (5.3), so a seller running its own bridge can fill its record
+    with complaints nobody counts and push honest ones out, for free. Closing that needs the
+    record to rank recognised-bridge complaints first, a reputation-contract change that section
+    8 freezes once complaints exist; #144 was decided UI-only. What the reader gets instead: a
+    full record never reads "Clean record" (`BrowsingStore::record_badge`: "Record full, none
+    counted"), and the store page says how many of a full record's complaints are under bridges
+    this app does not recognise and that they may have pushed genuine ones off. Before a full
+    record, nothing is displaced, so every honest complaint is still on it and counted.
+  - **The recognised set is the build's current list** (`bitcoin_config::TRUSTED_BRIDGE_ID_BS58`,
+    via `bitcoin_view::unrecognised_bridges`), not TM-G's append-only list of every bridge ever
+    recognised. The build has only ever had one bridge. Rotating it would stop complaints made
+    under the old key from counting, so a rotation must keep the old key recognised for reading
+    (or build TM-G's list) in the same change.
   - It cannot catch self-payment through a recognised bridge. Complaints by sockpuppets are
     bounded only by what the orders cost, which is decision 1's premise (payment guards the
-    complaint).
+    complaint). The rule can be relaxed once proofs are anchored to the real chain
+    (freenet/freenet-bitcoin#27).
 - **A buyer attestation, if Ian wants one, needs no reputation re-key.** An attestation would be
   a separate signed statement: a Ghost Key certificate plus a signature over the order id and
   receipt key. It would be published in its own record or alongside, and readers could weight
@@ -546,10 +567,14 @@ retractions), not with a Harvest-local copy of it.
   time, because every window moves with it.
 - **A full record** (5.3, R5-C, R6). An honest complaint is displaced only by `MAX_COMPLAINTS`
   complaints about other orders, each dated nearer its own payment. Honest complaints are dated
-  within the base window's distance (5.3), so every one of those is too, and a reader counts it:
-  a complaint within the base window counts, and a reversal of it counts only if a recognised
-  bridge attested one (section 6). So the record then reads as 146 counted complaints, and says
-  it is full. What remains:
+  within the base window's distance (5.3), so every one of those is too. Under a recognised
+  bridge a reader counts it: a complaint within the base window counts, and a reversal of it
+  counts only if a recognised bridge attested one (section 6). So such a record reads as 146
+  counted complaints, and says it is full. What remains:
+  - since #144, complaints on orders naming a bridge the reader does not recognise are not
+    counted, so a seller running its own bridge can fill the record with them for free and push
+    honest complaints out (R6-4, section 6). The record then reads "Record full, none counted",
+    never "Clean record", and says how many are under unrecognised bridges;
   - a seller, or a long-lived store's honest history, can freeze the record at 146: later
     complaints dated farther from their payment are dropped, and 146 is the most any record
     shows. A reader is told the record is full, not how much it dropped;
@@ -710,11 +735,11 @@ complaint, each a dependency the model had not named. The overseer's decisions (
 
 ## 9. For Ian (does not block this PR; the code works for either answer)
 
-- **#144, bridge trust and self-dealing:** open, and now **time-bound** (R6-4). Readers count
-  every complaint the contract accepts. A filter discounting complaints through unrecognised
-  bridges can no longer be added later for free: with the cap it lets own-bridge complaints push
-  honest ones out, and fixing that needs a contract ranking change, which section 8 freezes once
-  complaints exist. So if the answer is "discount", it has to be decided before launch.
+- **#144, bridge trust and self-dealing:** decided 2026-09-26 (option 1) and built UI-only
+  (section 6): only complaints under recognised bridges count. Still Ian's call: R6-4, own-bridge
+  complaints filling a full record for free, is made visible (the record never reads clean when
+  full) but not prevented; preventing it needs the record to rank recognised-bridge complaints
+  first, a reputation-contract change, and section 8 freezes the ranking once complaints exist.
 - **TM-G: a Ghost Key on complaints.** `incentive-mechanism.md` assumed one. Recommendation:
   record that assumption as superseded by the receipted design, since payment is the cost of a
   complaint. Keep an optional separate attestation as a later addition if sockpuppet complaints
@@ -780,7 +805,7 @@ is needed. "Residual" means section 7.
 | **R6-1** (P1) `MAX_COMPLAINT_BYTES` not a bound (unbounded tip) | Code (5.3): enforced in `Complaint::verify`. |
 | **R6-2** (P1) own-bridge reversals make distance-0 complaints count for nothing | Code (6): `reversal_stands` honours a reversal only when every bridge the order names is recognised. |
 | **R6-3** (P2) a complaint in a despatch-extended window outranked by late ones | Code (5.3): the UI dates complaints no later than the base window's close. |
-| **R6-4** (P2) the #144 discount filter conflicts with the cap | Model (6, 9): not free to add later; decide before launch. |
+| **R6-4** (P2) the #144 discount filter conflicts with the cap | #144 decided (option 1) and built UI-only (6); the conflict is shown to readers (a full record never reads clean), not prevented: that needs a contract ranking change (9). |
 | R6 P2 the record freezes at 146 | Residual (7.3); readers are told the record is full. |
 | R6 P2 honest sellers' watches lapse | Fixed for a seller whose tab is open (harvest#146: renewal now covers the whole payment window). Residual for a seller who is offline (1, 7.4): needs freenet/freenet-bitcoin#7 and #26. |
 | R6 P3 items (dropped complaint said to be on record, "to pay it" wording, first-run panel, row key, stale docs, test gaps) | Code, except the per-row `BitcoinState` clone (answered on the PR). |
