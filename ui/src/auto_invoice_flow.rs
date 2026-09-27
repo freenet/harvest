@@ -382,11 +382,12 @@ impl AppState {
     /// address a wallet with the usual gap limit may not look at
     /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`). Per store, on the page
     /// of the store it happened at.
-    pub fn wallet_gap_note_due(&self, store_contract_id: &[u8]) -> bool {
-        self.auto_invoice
-            .status
-            .get(store_contract_id)
-            .is_some_and(|s| s.as_ref().is_ok_and(|s| s.wallet_gap_paid_at_ms.is_some()))
+    /// The gap limit to tell the seller to set, when that is due.
+    pub fn wallet_gap_note_due(&self, store_contract_id: &[u8]) -> Option<u32> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(s)) if s.wallet_gap_paid_at_ms.is_some() => Some(s.wallet_gap_limit.max(100)),
+            _ => None,
+        }
     }
 
     /// What the seller's store page says about instant checkout, or `None`

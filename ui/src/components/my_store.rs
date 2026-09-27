@@ -667,8 +667,12 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -
 /// Said when a buyer paid an address past a run of 20 unused ones, which a
 /// wallet with the usual gap limit does not look at (Ian's wording,
 /// 2026-09-26).
-pub(crate) const WALLET_GAP_NOTE: &str = "Your wallet may not be showing all your payments. \
-     In your wallet's settings, set the gap limit to 100.";
+pub(crate) fn wallet_gap_note(limit: u32) -> String {
+    format!(
+        "Your wallet may not be showing all your payments. In your wallet's settings, set the \
+         gap limit to {limit}."
+    )
+}
 
 /// What needs the seller, what is left to set up, the link to share, and the
 /// store's record (wireframe C).
@@ -686,7 +690,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
     let needs: bool = store.unpriced > 0
-        || wallet_gap
+        || wallet_gap.is_some()
         || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
         || !store.certificate.is_verified()
@@ -722,16 +726,16 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     }
                 }
             }
-            if wallet_gap {
-                p { class: "text-warning", "{WALLET_GAP_NOTE}" }
+            if let Some(limit) = wallet_gap {
+                p { class: "text-warning", "{wallet_gap_note(limit)}" }
             }
             if store.unpriced > 0 {
                 div { class: "need row-between",
                     span {
                         if store.unpriced == 1 {
-                            "1 listing has no price yet, so buyers can\u{2019}t buy it. Use Edit to give it one."
+                            "1 listing can\u{2019}t be bought until you give it a price. Use Edit to give it one."
                         } else {
-                            "{store.unpriced} listings have no price yet, so buyers can\u{2019}t buy them. Use Edit to give each one a price."
+                            "{store.unpriced} listings can\u{2019}t be bought until you give them a price. Use Edit to give each one a price."
                         }
                     }
                     button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Listings), "Open listings" }
@@ -1908,6 +1912,7 @@ mod seller_stores_tests {
             oversold: vec![],
             paused: None,
             wallet_gap_paid_at_ms: gap,
+            wallet_gap_limit: 100,
             capped: None,
         };
         state
@@ -1918,8 +1923,13 @@ mod seller_stores_tests {
             .auto_invoice
             .status
             .insert(vec![2; 32], Ok(status(None)));
-        assert!(state.wallet_gap_note_due(&[1; 32]));
-        assert!(!state.wallet_gap_note_due(&[2; 32]));
-        assert!(!state.wallet_gap_note_due(&[3; 32]));
+        assert_eq!(state.wallet_gap_note_due(&[1; 32]), Some(100));
+        assert_eq!(state.wallet_gap_note_due(&[2; 32]), None);
+        assert_eq!(state.wallet_gap_note_due(&[3; 32]), None);
+        assert_eq!(
+            wallet_gap_note(100),
+            "Your wallet may not be showing all your payments. In your wallet's settings, set \
+             the gap limit to 100."
+        );
     }
 }

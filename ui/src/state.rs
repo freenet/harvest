@@ -31143,6 +31143,7 @@ mod buy_flow_tests {
             oversold: vec![],
             paused: paused.map(str::to_string),
             wallet_gap_paid_at_ms: None,
+            wallet_gap_limit: 0,
             capped: None,
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);

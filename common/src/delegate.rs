@@ -603,6 +603,11 @@ pub struct AutoInvoiceStatus {
     /// that payment, so the seller is told to raise it (Ian, 2026-09-26).
     #[serde(default)]
     pub wallet_gap_paid_at_ms: Option<u64>,
+    /// The gap limit the seller's wallet needs to show every payment, when
+    /// [`Self::wallet_gap_paid_at_ms`] is set: 100 unless a longer run of
+    /// unused addresses was paid past. 0 otherwise.
+    #[serde(default)]
+    pub wallet_gap_limit: u32,
     /// Which store limit turned a Buy now away in the last hour, if one did.
     /// The buyer was told; the seller is too.
     #[serde(default)]
@@ -1839,6 +1844,7 @@ mod tests {
                     oversold: vec![],
                     paused: None,
                     wallet_gap_paid_at_ms: None,
+                    wallet_gap_limit: 0,
                     capped: None,
                 }),
             },
