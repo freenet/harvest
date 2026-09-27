@@ -37,14 +37,25 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
         "legacy_index_contract.rs",
         "LEGACY_INDEX_CONTRACT",
     ),
+    (
+        "presence_contract.toml",
+        "legacy_presence_contract.rs",
+        "LEGACY_PRESENCE_CONTRACT",
+    ),
 ];
 
-/// Registries that may have no rows yet, and why. An artifact belongs here
-/// only while it genuinely has no predecessor generation (the Ghost Key index
-/// did, until harvest#53 Phase B recorded its first). A new artifact's FIRST
-/// superseded generation must be recorded as a row, and its entry removed,
-/// in the change that supersedes it.
-const MAY_BE_EMPTY: &[&str] = &[];
+/// Registries that may have no rows, and why. An artifact belongs here only
+/// while it genuinely has no predecessor generation worth probing (the Ghost
+/// Key index did, until harvest#53 Phase B recorded its first). A new
+/// artifact's FIRST superseded generation must be recorded as a row, and its
+/// entry removed, in the change that supersedes it.
+///
+/// The one PERMANENT entry is the presence contract: its state is a heartbeat
+/// that is worthless ten minutes after it is signed, so a re-key needs no
+/// migration and its registry stays empty for good. See the header of
+/// `legacy/presence_contract.toml`. If a row is ever added there, the guard
+/// below fails until this entry goes.
+const MAY_BE_EMPTY: &[&str] = &["presence_contract.toml"];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (
     "harvest_delegate.toml",

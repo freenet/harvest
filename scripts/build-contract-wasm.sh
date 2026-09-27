@@ -53,12 +53,12 @@ for arg in "$@"; do
   esac
 done
 
-# The four artifacts whose compiled bytes are network addresses. Keep in step
+# The artifacts whose compiled bytes are network addresses. Keep in step
 # with the workspace members under contracts/ and delegates/; a crate missing
 # from this list is a crate the drift guard does not watch.
-crates=(reputation-contract store-contract mailbox-contract index-contract harvest-delegate)
-artifacts=(reputation_contract store_contract mailbox_contract index_contract harvest_delegate)
-crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract delegates/harvest-delegate)
+crates=(reputation-contract store-contract mailbox-contract index-contract presence-contract harvest-delegate)
+artifacts=(reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate)
+crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract contracts/presence-contract delegates/harvest-delegate)
 
 # `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
 # freenet/ghostkeys, not built here, so nothing in this workspace can move it.
@@ -104,7 +104,7 @@ if [ "${HARVEST_ALLOW_MISSING_CRATES:-0}" = "1" ]; then
   crates=("${keep_crates[@]}"); artifacts=("${keep_artifacts[@]}")
 fi
 
-# One invocation for all four. This is NOT cosmetic: cargo unifies features
+# One invocation for all of them. This is NOT cosmetic: cargo unifies features
 # across the packages it is asked to build in a single invocation, so building
 # a subset can resolve different features and produce different bytes than
 # building them together.

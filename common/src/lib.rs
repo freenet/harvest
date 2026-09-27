@@ -25,6 +25,7 @@ pub mod listing;
 pub mod mailbox;
 pub mod migration;
 pub mod payment;
+pub mod presence;
 pub mod reputation;
 #[cfg(feature = "sealed")]
 pub mod sealed;

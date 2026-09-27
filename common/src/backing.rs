@@ -630,6 +630,8 @@ pub enum StoreKeyMessage {
     Copy,
     /// The seller's statement that an order was sent (harvest#53 Phase B).
     Despatch,
+    /// The seller is online (`crate::presence`).
+    Heartbeat,
 }
 
 /// Which kind of store-key message `payload` is, or `None` if it is none of
@@ -664,6 +666,11 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
         Some(StoreKeyMessage::Copy)
     } else if is::<crate::fulfilment::Despatch>(payload) {
         Some(StoreKeyMessage::Despatch)
+    // Last, so no message above changes classification. A heartbeat's
+    // one-variant `kind` tag keeps it from decoding as anything above, and
+    // anything above from decoding as it.
+    } else if is::<crate::presence::Heartbeat>(payload) {
+        Some(StoreKeyMessage::Heartbeat)
     } else {
         None
     }
@@ -2064,6 +2071,125 @@ mod tests {
             None
         );
         assert!(sign_with_store_key(&store_key(), crate::to_cbor(&stmt).unwrap()).is_err());
+    }
+
+    /// A heartbeat classifies as a heartbeat, so the delegate signs one, and
+    /// no other store-key record classifies as one: adding it moved nothing
+    /// else. Mutated red by dropping the heartbeat arm.
+    #[test]
+    fn a_heartbeat_is_a_heartbeat_and_nothing_else_is() {
+        use crate::presence::Heartbeat;
+        for heartbeat in [
+            Heartbeat::new(0, false),
+            Heartbeat::new(1_700_000_000_000, true),
+            Heartbeat::new(u64::MAX, true),
+        ] {
+            let bytes = crate::to_cbor(&heartbeat).unwrap();
+            assert_eq!(
+                classify_store_key_message(&bytes),
+                Some(StoreKeyMessage::Heartbeat)
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(classify_store_key_message(&trailing), None);
+            assert!(sign_with_store_key(&store_key(), bytes).is_ok());
+        }
+        // The same fields under another tag are nothing the store key signs.
+        #[derive(Serialize)]
+        struct Untagged {
+            kind: &'static str,
+            at_ms: u64,
+            taking_orders: bool,
+        }
+        for kind in ["HarvestPresenceV2", ""] {
+            let bytes = crate::to_cbor(&Untagged {
+                kind,
+                at_ms: 5,
+                taking_orders: true,
+            })
+            .unwrap();
+            assert_eq!(classify_store_key_message(&bytes), None, "{kind:?}");
+        }
+
+        let stmt = statement(&store_key(), &ghost(1), 100);
+        let info = crate::store::StoreInfoV1 {
+            version: 1,
+            certificate_pem: "cert".into(),
+            seller_fingerprint: "fp".into(),
+            reputation_contract_id: [0u8; 32],
+            store_name: "Store".into(),
+            description: String::new(),
+            encryption_public_key: None,
+            record_public_key: None,
+        };
+        let listing = crate::listing::Listing {
+            checkout: None,
+            choices: Vec::new(),
+            id: crate::listing::ListingId([0; 32]),
+            title: "t".into(),
+            description: String::new(),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        let order = crate::test_orders::order(1);
+        let status = (order.id.clone(), crate::payment::OrderStatus::Paid);
+        let listing_status = crate::listing::ListingStatus {
+            listing: crate::listing::ListingId([1; 32]),
+            revision: 3,
+            availability: crate::listing::ListingAvailability::SoldOut,
+        };
+        let copy = copy(&ghost(1), 1, 2).copy;
+        let despatch = crate::fulfilment::Despatch {
+            order_id: crate::payment::OrderId([9u8; 32]),
+            anchor: BlockAnchor {
+                height: 800_000,
+                hash: BlockHash([4u8; 32]),
+            },
+        };
+        let others: Vec<(Vec<u8>, StoreKeyMessage)> = vec![
+            (crate::to_cbor(&info).unwrap(), StoreKeyMessage::StoreInfo),
+            (crate::to_cbor(&listing).unwrap(), StoreKeyMessage::Listing),
+            (crate::to_cbor(&order).unwrap(), StoreKeyMessage::Order),
+            (
+                crate::to_cbor(&status).unwrap(),
+                StoreKeyMessage::OrderStatus,
+            ),
+            (
+                crate::to_cbor(&listing_status).unwrap(),
+                StoreKeyMessage::ListingStatus,
+            ),
+            (
+                crate::to_cbor(&BackingAcceptance {
+                    backing: stmt.clone(),
+                })
+                .unwrap(),
+                StoreKeyMessage::BackingAcceptance,
+            ),
+            (
+                crate::to_cbor(&Retirement {
+                    backer: ghost(1).verifying_key(),
+                })
+                .unwrap(),
+                StoreKeyMessage::Retirement,
+            ),
+            (
+                crate::to_cbor(&StoreClosure {
+                    store: store_key().verifying_key(),
+                })
+                .unwrap(),
+                StoreKeyMessage::Closure,
+            ),
+            (crate::to_cbor(&copy).unwrap(), StoreKeyMessage::Copy),
+            (
+                crate::to_cbor(&despatch).unwrap(),
+                StoreKeyMessage::Despatch,
+            ),
+        ];
+        for (bytes, kind) in &others {
+            assert_eq!(classify_store_key_message(bytes), Some(*kind));
+            assert!(crate::from_cbor::<Heartbeat>(bytes).is_err(), "{kind:?}");
+        }
     }
 
     #[test]

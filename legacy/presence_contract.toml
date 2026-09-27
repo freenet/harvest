@@ -1,0 +1,22 @@
+# Superseded generations of the Harvest store presence contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# NO ROWS, AND THERE NEVER NEED BE ANY. A presence re-key needs no migration:
+# the state is one heartbeat signed by the store key, and a heartbeat is
+# worthless `PRESENCE_FRESH_MS` (ten minutes) after it is signed. When this
+# contract's code moves, the seller's next heartbeat (every
+# `HEARTBEAT_EVERY_MS`, five minutes) lands at the new address, and nothing at
+# the old one is worth carrying forward. The worst a re-key does is show a
+# store as closed until that first heartbeat arrives.
+#
+# `ui/build.rs` lists this file in `MAY_BE_EMPTY` permanently for that reason,
+# and fails if a row is ever added here without taking it out. The file
+# exists so `scripts/check-code-hashes.sh` still watches the artifact: it
+# refuses a missing registry, and refuses the current hash appearing in one.
+#
+# Instance ids are derived per store: `BLAKE3(code_hash || cbor(
+# PresenceParameters))`, whose single field is the store's verifying key
+# (`harvest_common::presence`).

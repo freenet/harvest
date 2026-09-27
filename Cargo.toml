@@ -5,6 +5,7 @@ members = [
     "contracts/store-contract",
     "contracts/mailbox-contract",
     "contracts/index-contract",
+    "contracts/presence-contract",
     "delegates/harvest-delegate",
     "ui",
 ]

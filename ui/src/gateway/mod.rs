@@ -13,6 +13,8 @@ mod delegate_api;
 // pure and host-testable; only the send itself needs a browser.
 pub mod index_ops;
 pub mod mailbox_ops;
+// A store's presence contract: where its heartbeats live.
+pub mod presence_ops;
 // Secret-free one-line descriptions of delegate traffic: the only way a
 // response reaches a log (harvest#94).
 pub mod log_summary;

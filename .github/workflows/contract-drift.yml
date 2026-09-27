@@ -318,7 +318,7 @@ jobs:
             echo "|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          for a in reputation_contract store_contract mailbox_contract index_contract harvest_delegate; do
+          for a in reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate; do
             # Missing on either side is a failure, never a silent skip: a
             # renamed or dropped artifact would otherwise pass this job by
             # having nothing to compare.
