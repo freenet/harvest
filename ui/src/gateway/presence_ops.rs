@@ -21,7 +21,12 @@ pub fn presence_contract_key(
     store_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<ContractKey, String> {
     let params = crate::migrate::encode_params(&PresenceParameters::new(*store_key))?;
-    let code_hash = *ContractCode::from(PRESENCE_CONTRACT_WASM.to_vec()).hash();
+    // Hashed once: this runs for every store a buyer browses on every
+    // minute tick, and the WASM is hundreds of KB.
+    static CODE_HASH: std::sync::OnceLock<freenet_stdlib::prelude::CodeHash> =
+        std::sync::OnceLock::new();
+    let code_hash =
+        *CODE_HASH.get_or_init(|| *ContractCode::from(PRESENCE_CONTRACT_WASM.to_vec()).hash());
     Ok(ContractKey::from_id_and_code(
         crate::migrate::current_id(&code_hash, &params),
         code_hash,

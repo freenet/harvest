@@ -64,6 +64,15 @@ pub const HEARTBEAT_EVERY_MS: u64 = 5 * 60 * 1000;
 /// periods, so one late or lost heartbeat does not close the store.
 pub const PRESENCE_FRESH_MS: u64 = 10 * 60 * 1000;
 
+/// A heartbeat is not signed again within this long of the last one unless
+/// taking-orders changed or the tab forces one: the node's wake-up and an
+/// open tab may both ask every [`HEARTBEAT_EVERY_MS`], and one write per
+/// interval is enough. Under a period, so a wake-up on time is never held
+/// back by the one before; and short enough that when wake-ups stop, the
+/// last heartbeat sent is still fresh when the tab takes over (the bound is
+/// asserted in `harvest-ui`'s `presence_flow`).
+pub const HEARTBEAT_MIN_GAP_MS: u64 = 3 * 60 * 1000;
+
 /// How far AHEAD of the reader's clock a heartbeat may be dated and still
 /// count. Further ahead is closed: a far-future heartbeat would otherwise
 /// keep a store open long after its seller went offline.

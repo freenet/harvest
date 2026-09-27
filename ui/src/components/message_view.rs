@@ -83,6 +83,7 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             app_state.mailbox_entries(&store_contract_id),
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
             |tag, selection| paid_request_in(published_orders, tag, selection),
+            |digest| app_state.authored_here(&store_contract_id, digest),
         );
         // The only authorship this client can establish: what it sent itself.
         let authored: Vec<[u8; 32]> = entries
@@ -1127,13 +1128,17 @@ fn attribution(
     }
 }
 
-/// The line a seller sees in place of buyer messages [`shown_to_seller`]
-/// took out.
+/// The line a seller sees about buyer text [`shown_to_seller`] held back:
+/// messages left out, and notes and reasons blanked in a conversation that
+/// is not open.
 pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
     if hidden == 1 {
-        "1 message sent without a Ghost Key was not shown.".to_string()
+        "1 message was held back because it came without a Ghost Key or a paid order.".to_string()
     } else {
-        format!("{hidden} messages sent without a Ghost Key were not shown.")
+        format!(
+            "{hidden} messages were held back because they came without a Ghost Key or a paid \
+             order."
+        )
     }
 }
 
@@ -1161,16 +1166,22 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 ///   (`attribution`), so a script can flip the direction;
 /// * the free text inside other steps is blanked rather than the step left
 ///   out, so what a request or a decline DOES (answering, counting) is
-///   unchanged: a request's `note` and `shipping` (the address shows once it
-///   is paid, [`SHIPPING_SHOWN_ONCE_PAID`]) and a decline's `reason`.
+///   unchanged: a request's `note`, `shipping` (the address shows once it is
+///   paid, [`SHIPPING_SHOWN_ONCE_PAID`]) and Buy now picks (region, choices),
+///   and a decline's `reason`.
 ///
-/// The count is of buyer text the seller did not see: messages left out and
-/// non-empty notes and reasons blanked. A blanked address is not counted: a
-/// seller is not told about an unpaid Buy now at all.
+/// Whatever this tab wrote itself (`authored_here`, by digest) is shown as
+/// written: it is the seller's own text.
+///
+/// The count is of buyer text the seller did not see: messages left out, and
+/// requests whose note or picks were blanked. A blanked address is not
+/// counted (a seller is not told about an unpaid Buy now at all), nor a
+/// blanked decline (mostly the store's own answer to one).
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
     paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+    authored_here: impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
     use crate::messaging::Addressing;
     let tag_of = |conversation: &[u8]| <[u8; 32]>::try_from(conversation).ok();
@@ -1206,6 +1217,12 @@ pub(crate) fn shown_to_seller(
     let mut hidden = 0;
     let mut shown = Vec::with_capacity(entries.len());
     for (mut entry, verified) in entries.into_iter().zip(verdicts) {
+        // What this tab wrote itself (a seller's reply, or a decline it
+        // sent) is the seller's own text: shown as written wherever it is.
+        if authored_here(&entry.digest()) {
+            shown.push(entry);
+            continue;
+        }
         let open = opened.contains(entry.conversation());
         let keep = match &mut entry {
             MailboxEntry::Readable {
@@ -1223,10 +1240,28 @@ pub(crate) fn shown_to_seller(
                 ..
             } => open,
             MailboxEntry::Readable {
-                content: MessageContent::OrderRequest { note, shipping, .. },
+                content:
+                    MessageContent::OrderRequest {
+                        note,
+                        shipping,
+                        instant,
+                        ..
+                    },
                 ..
             } if !open => {
-                if !note.trim().is_empty() {
+                // Every free-text field a buyer fills, the picks included:
+                // the terms the seller needs (the request and the total) are
+                // not text and stay.
+                let picks = instant.as_mut().map(|selection| {
+                    let had = selection
+                        .region
+                        .take()
+                        .is_some_and(|r| !r.trim().is_empty())
+                        || !selection.choices.is_empty();
+                    selection.choices.clear();
+                    had
+                });
+                if !note.trim().is_empty() || picks == Some(true) {
                     hidden += 1;
                 }
                 note.clear();
@@ -1237,9 +1272,9 @@ pub(crate) fn shown_to_seller(
                 content: MessageContent::Decline { reason },
                 ..
             } if !open => {
-                if !reason.trim().is_empty() {
-                    hidden += 1;
-                }
+                // Blanked, not counted: a decline in a conversation nothing
+                // opened is mostly this store's own answer to an unpaid Buy
+                // now ("sold out"), which is nobody's message to the seller.
                 reason.clear();
                 true
             }
@@ -1876,6 +1911,11 @@ mod inbox_tests {
         );
         order.status = harvest_common::payment::OrderStatus::Paid;
         assert!(paid_request_in(&[order.clone()], &tag, &selection));
+        // Paid and then reversed (a reorg) was still paid for: money was
+        // spent to open it, which is the bar.
+        let mut reversed = order.clone();
+        reversed.status = harvest_common::payment::OrderStatus::PaymentReversed;
+        assert!(paid_request_in(&[reversed], &tag, &selection));
         let mut other = order.clone();
         other.order.id = harvest_common::payment::OrderId([7; 32]);
         assert!(
@@ -2446,10 +2486,24 @@ mod voucher_view_tests {
                 crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
             },
             |tag, _| *tag == PAID,
+            |digest| *digest == [AUTHORED; 32],
         )
     }
 
+    /// The first byte of the digest of what this tab wrote itself, in these
+    /// tests (`entry` makes a digest of the tag's first byte).
+    const AUTHORED: u8 = 7;
+
     fn buy_now(tag: [u8; 32], note: &str) -> MailboxEntry {
+        buy_now_picking(tag, note, None, vec![])
+    }
+
+    fn buy_now_picking(
+        tag: [u8; 32],
+        note: &str,
+        region: Option<&str>,
+        choices: Vec<String>,
+    ) -> MailboxEntry {
         entry(
             tag,
             Addressing::ToSeller,
@@ -2463,8 +2517,8 @@ mod voucher_view_tests {
                 instant: Some(crate::messaging::InstantSelection {
                     requested_at_ms: 1_700_000_000_000,
                     nonce: [4; 16],
-                    region: None,
-                    choices: vec![],
+                    region: region.map(str::to_string),
+                    choices,
                     expected_total_sats: 12_000,
                 }),
             },
@@ -2544,8 +2598,33 @@ mod voucher_view_tests {
             (String::new(), SHIPPING_SHOWN_ONCE_PAID.to_string())
         );
         assert_eq!(free_text(&shown_entries[2]).0, "");
-        // The note and the reason; an address held back is not counted.
-        assert_eq!(hidden, 2);
+        // The note; an address or a decline held back is not counted.
+        assert_eq!(hidden, 1);
+
+        // A Buy now's picks are the buyer's text too.
+        let (shown_entries, hidden) = shown(vec![buy_now_picking(
+            OTHER,
+            "",
+            Some("cheap pills at spam.example"),
+            vec!["visit spam.example".into()],
+        )]);
+        assert_eq!(hidden, 1);
+        let MailboxEntry::Readable {
+            content:
+                MessageContent::OrderRequest {
+                    instant: Some(selection),
+                    ..
+                },
+            ..
+        } = &shown_entries[0]
+        else {
+            panic!("{shown_entries:?}")
+        };
+        assert_eq!(
+            (selection.region.clone(), selection.choices.len()),
+            (None, 0)
+        );
+        assert_eq!(selection.expected_total_sats, 12_000, "the terms stay");
 
         // A paid Buy now's conversation is open: all of it is shown.
         let entries = vec![buy_now(PAID, "gift wrap please"), decline(PAID, "sold out")];
@@ -2576,15 +2655,25 @@ mod voucher_view_tests {
                 if conversation.as_slice() == OTHER || conversation.as_slice() == [4; 32])));
     }
 
+    /// What this tab wrote itself is shown as written, in a conversation
+    /// nothing opened. Mutated red by dropping the exemption.
+    #[test]
+    fn the_sellers_own_messages_are_shown() {
+        let own_reply = text([AUTHORED; 32], Addressing::ToBuyer);
+        let own_decline = decline([AUTHORED; 32], "sold out, sorry");
+        let entries = vec![own_reply, own_decline];
+        assert_eq!(shown(entries.clone()), (entries, 0));
+    }
+
     #[test]
     fn the_hidden_count_line_says_how_many() {
         assert_eq!(
             hidden_unvouched_line(1),
-            "1 message sent without a Ghost Key was not shown."
+            "1 message was held back because it came without a Ghost Key or a paid order."
         );
         assert_eq!(
             hidden_unvouched_line(3),
-            "3 messages sent without a Ghost Key were not shown."
+            "3 messages were held back because they came without a Ghost Key or a paid order."
         );
     }
 }

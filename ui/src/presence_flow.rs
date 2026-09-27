@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 use harvest_common::presence::{
     presence_verdict, ClosedWhy, Presence, PresenceParameters, PresenceStateV1, SignedHeartbeat,
-    HEARTBEAT_EVERY_MS, PRESENCE_FRESH_MS,
+    HEARTBEAT_EVERY_MS, HEARTBEAT_MIN_GAP_MS, PRESENCE_FRESH_MS,
 };
 
 use crate::state::AppState;
@@ -42,35 +42,49 @@ use crate::state::AppState;
 /// and "closed" said before it answers is a false "the seller isn't online".
 pub const PRESENCE_CHECKING_MS: u64 = 60 * 1000;
 
-/// How often this tab reads a store's presence again while it does not
-/// read open. Presence arrives by subscription, and a GET that found nothing
-/// yet (the seller's first heartbeat not out) or a subscription that died
-/// would otherwise leave an open store reading closed for the whole session.
+/// How soon this tab reads a store's presence again while it does not read
+/// open. Presence arrives by subscription, and a GET that found nothing yet
+/// (the seller's first heartbeat not out) or a subscription that died would
+/// otherwise leave an open store reading closed for the whole session.
+/// Doubled after each read that still leaves it not open, up to
+/// [`PRESENCE_REFRESH_MAX_MS`], so a buyer who browsed many stores whose
+/// sellers are away does not re-read all of them every two minutes.
 pub const PRESENCE_REFRESH_MS: u64 = 2 * 60 * 1000;
 
-/// How recent the delegate's last wake-up must be for the tab to leave the
-/// heartbeats to the node: one period plus a minute. Once wake-ups stop, the
-/// tab takes over while the last heartbeat is still fresh (at most six
-/// minutes old, against [`PRESENCE_FRESH_MS`]'s ten), so the store does not
-/// read closed in the handover. A late wake-up that brings the tab in early
-/// costs nothing: the delegate sends at most one heartbeat per interval
-/// whoever asks (`HEARTBEAT_MIN_GAP_MS`).
-pub const WAKEUPS_FRESH_MS: u64 = HEARTBEAT_EVERY_MS + 60 * 1000;
+/// The longest the re-read interval grows to.
+pub const PRESENCE_REFRESH_MAX_MS: u64 = 32 * 60 * 1000;
 
-// The handover: the tab takes over [`WAKEUPS_FRESH_MS`] after the last
-// wake-up, at its next minute tick, and that must be before the last
-// wake-up's heartbeat stops opening the store.
-const _: () = assert!(WAKEUPS_FRESH_MS + 60 * 1000 < PRESENCE_FRESH_MS);
+/// The wait before the next read of a presence after `misses` reads that did
+/// not find it open.
+pub fn presence_refresh_after(misses: u32) -> u64 {
+    (PRESENCE_REFRESH_MS << misses.min(4)).min(PRESENCE_REFRESH_MAX_MS)
+}
+
+/// How recent the delegate's last wake-up must be for the tab to leave the
+/// heartbeats to the node: one period and a half minute. Once wake-ups stop,
+/// the tab takes over while the last heartbeat sent is still fresh (see the
+/// bound below), so the store does not read closed in the handover. A late
+/// wake-up that brings the tab in early costs nothing: the delegate signs at
+/// most one heartbeat per [`HEARTBEAT_MIN_GAP_MS`] whoever asks.
+pub const WAKEUPS_FRESH_MS: u64 = HEARTBEAT_EVERY_MS + 30 * 1000;
+
+// The handover. The last heartbeat SENT may predate the last wake-up by up to
+// the gap (that wake-up was held back by it); the tab takes over
+// `WAKEUPS_FRESH_MS` after the wake-up, at its next minute tick. All of that
+// must fall inside the heartbeat's freshness.
+const _: () = assert!(HEARTBEAT_MIN_GAP_MS + WAKEUPS_FRESH_MS + 60 * 1000 < PRESENCE_FRESH_MS);
 
 /// What this tab holds about stores' presence.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PresenceUi {
-    /// Presence contract instance id -> (store contract id, store key, when
-    /// this tab started following it).
-    pub following: HashMap<Vec<u8>, (Vec<u8>, [u8; 32], u64)>,
-    /// When this tab last read each presence contract (by instance id).
-    pub read_ms: HashMap<Vec<u8>, u64>,
-    /// The latest verified presence state, per store contract id.
+    /// Presence contract instance id -> (store key, when this tab started
+    /// following it). Keyed by the presence contract, not the store: two
+    /// generations of one store (one key) share it.
+    pub following: HashMap<Vec<u8>, ([u8; 32], u64)>,
+    /// When this tab last read each presence contract, and how many reads in
+    /// a row have not found it open (see [`presence_refresh_after`]).
+    pub reads: HashMap<Vec<u8>, (u64, u32)>,
+    /// The latest verified presence state, per presence contract id.
     pub states: HashMap<Vec<u8>, PresenceStateV1>,
     /// When this tab last asked the delegate for a heartbeat, per store.
     pub heartbeat_asked_ms: HashMap<Vec<u8>, u64>,
@@ -139,47 +153,65 @@ pub fn store_presence(
 impl AppState {
     /// This store's presence, now.
     pub fn store_presence(&self, store_contract_id: &[u8], now_ms: u64) -> StorePresence {
-        let since = self
-            .presence
-            .following
-            .values()
-            .find(|(store, _, _)| store.as_slice() == store_contract_id)
-            .map(|(_, _, since)| *since);
-        store_presence(self.presence.states.get(store_contract_id), since, now_ms)
+        let presence = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.owner)
+            .and_then(|key| crate::auto_invoice_flow::presence_instance_bytes(&key));
+        self.presence_of(presence.as_ref().map(|p| p.as_slice()), now_ms)
     }
 
-    /// The presence contracts to GET (and subscribe to) now: every loaded
-    /// store's whose key is known and that this tab has not followed yet,
-    /// and again every [`PRESENCE_REFRESH_MS`] each one that does not read
-    /// open. Changes nothing.
-    pub fn presence_reads_due(&self, now_ms: u64) -> Vec<(Vec<u8>, [u8; 32], [u8; 32])> {
-        self.browsing_stores
-            .iter()
-            .filter_map(|(id, store)| store.owner.map(|key| (id.clone(), key)))
-            .filter_map(|(store_id, key)| {
+    fn presence_of(&self, presence: Option<&[u8]>, now_ms: u64) -> StorePresence {
+        let since = presence
+            .and_then(|p| self.presence.following.get(p))
+            .map(|(_, since)| *since);
+        let state = presence.and_then(|p| self.presence.states.get(p));
+        store_presence(state, since, now_ms)
+    }
+
+    /// The presence contracts to GET (and subscribe to) now, each once:
+    /// every loaded store's whose key is known and that this tab has not
+    /// followed yet, and again each one that does not read open, spaced by
+    /// [`presence_refresh_after`]. Changes nothing.
+    pub fn presence_reads_due(&self, now_ms: u64) -> Vec<([u8; 32], [u8; 32])> {
+        let keys: std::collections::BTreeSet<[u8; 32]> = self
+            .browsing_stores
+            .values()
+            .filter_map(|s| s.owner)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
                 let presence = crate::auto_invoice_flow::presence_instance_bytes(&key)?;
-                let due = match self.presence.read_ms.get(presence.as_slice()) {
+                let due = match self.presence.reads.get(presence.as_slice()) {
                     None => true,
-                    Some(at) => {
-                        now_ms.saturating_sub(*at) >= PRESENCE_REFRESH_MS
-                            && !self.store_presence(&store_id, now_ms).is_open()
+                    Some((at, misses)) => {
+                        now_ms.saturating_sub(*at) >= presence_refresh_after(*misses)
+                            && !self.presence_of(Some(&presence), now_ms).is_open()
                     }
                 };
-                due.then_some((store_id, key, presence))
+                due.then_some((key, presence))
             })
             .collect()
     }
 
-    /// [`Self::presence_reads_due`], recorded as read and followed.
+    /// [`Self::presence_reads_due`], recorded as read and followed. A read
+    /// again is one more miss, until a state finds the store open.
     pub fn follow_due_presence(&mut self, now_ms: u64) -> Vec<[u8; 32]> {
         let due = self.presence_reads_due(now_ms);
         let mut out = Vec::with_capacity(due.len());
-        for (store_id, key, presence) in due {
+        for (key, presence) in due {
             self.presence
                 .following
                 .entry(presence.to_vec())
-                .or_insert((store_id, key, now_ms));
-            self.presence.read_ms.insert(presence.to_vec(), now_ms);
+                .or_insert((key, now_ms));
+            let misses = self
+                .presence
+                .reads
+                .get(presence.as_slice())
+                .map_or(0, |(_, misses)| misses.saturating_add(1));
+            self.presence
+                .reads
+                .insert(presence.to_vec(), (now_ms, misses));
             out.push(presence);
         }
         out
@@ -189,7 +221,7 @@ impl AppState {
     /// state and return `true`; otherwise `false`. Routed by id, like an
     /// index: a presence state is a small map a store decode could misread.
     pub(crate) fn on_presence_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
-        let Some((store_id, key, _)) = self.presence.following.get(contract_id).cloned() else {
+        let Some((key, _)) = self.presence.following.get(contract_id).cloned() else {
             return false;
         };
         let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&key) else {
@@ -206,16 +238,25 @@ impl AppState {
             dioxus::logger::tracing::warn!("a store's presence did not verify: {e}");
             return true;
         }
-        self.keep_presence(&store_id, state);
+        self.keep_presence(contract_id, state);
         true
     }
 
-    /// Keep `state` for `store_id` unless what is held is newer.
-    fn keep_presence(&mut self, store_id: &[u8], state: PresenceStateV1) {
+    /// Keep `state` for the presence contract `presence` unless what is held
+    /// is newer; one that reads open resets the re-read spacing.
+    fn keep_presence(&mut self, presence: &[u8], state: PresenceStateV1) {
         let newer = |s: &PresenceStateV1| s.heartbeat.as_ref().map(|h| h.heartbeat.seq);
-        let held = self.presence.states.get(store_id).and_then(newer);
+        let held = self.presence.states.get(presence).and_then(newer);
         if newer(&state) >= held {
-            self.presence.states.insert(store_id.to_vec(), state);
+            self.presence.states.insert(presence.to_vec(), state);
+        }
+        if self
+            .presence_of(Some(presence), crate::state::now_ms())
+            .is_open()
+        {
+            if let Some((_, misses)) = self.presence.reads.get_mut(presence) {
+                *misses = 0;
+            }
         }
     }
 
@@ -281,10 +322,11 @@ impl AppState {
         }
         let heartbeat = answer.heartbeat?;
         let key = self.browsing_stores.get(&store_contract_id)?.owner?;
+        let presence = crate::auto_invoice_flow::presence_instance_bytes(&key)?;
         // Our own store reads open from our own heartbeat at once, rather
         // than after the network's copy comes back.
         self.keep_presence(
-            &store_contract_id,
+            &presence,
             PresenceStateV1 {
                 heartbeat: Some(heartbeat.clone()),
             },

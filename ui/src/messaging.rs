@@ -797,6 +797,11 @@ impl MailboxEntry {
     }
 }
 
+/// What an entry that did not open says, whatever the decoder said: see
+/// [`read_mailbox`].
+pub(crate) const UNREADABLE_WHY: &str =
+    "it did not open with this conversation's keys, or it is not a Harvest message";
+
 /// Read a mailbox with whatever conversation keys are on hand.
 ///
 /// `keys` maps a conversation's routing tag to the key pair the seller's
@@ -851,12 +856,18 @@ pub fn read_mailbox(
                     Err(why) => last_error = why,
                 }
             }
+            // The decoder's own error can quote the message's text (serde
+            // names an unknown variant or a mistyped string it met), and the
+            // mailbox is open-write: shown as it is, it would carry anyone's
+            // text past the seller's Ghost Key gate. A fixed reason is shown;
+            // the detail goes to the log.
+            dioxus::logger::tracing::debug!("a mailbox entry did not open: {last_error}");
             MailboxEntry::Unreadable {
                 conversation,
                 nonce: message.nonce,
                 digest,
                 timestamp: message.timestamp,
-                why: last_error,
+                why: UNREADABLE_WHY.to_string(),
             }
         })
         .collect();
@@ -1353,9 +1364,11 @@ mod tests {
             other => panic!("expected an unreadable entry: {other:?}"),
         }
         match by_nonce(foreign.nonce) {
-            MailboxEntry::Unreadable { why, .. } => assert!(
-                !why.contains("waiting"),
-                "a message that will never decrypt must not read as merely pending: {why}"
+            // A fixed reason, never the decoder's error, which can quote an
+            // open-write message's own text past the seller's gate.
+            MailboxEntry::Unreadable { why, .. } => assert_eq!(
+                why, UNREADABLE_WHY,
+                "a message that will never decrypt must not read as merely pending"
             ),
             other => panic!("a message we hold no key for must not read as decrypted: {other:?}"),
         }

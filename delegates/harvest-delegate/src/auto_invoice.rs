@@ -614,9 +614,7 @@ pub(crate) fn arm<S: SecretStore>(
     // above matter more. The seller's tab PUTs it anyway; this keeps the node
     // holding it once the tab is gone (see `resubscribe_all`).
     if let Some(presence) = arm.presence_contract_id {
-        subscribe.push(OutboundDelegateMsg::SubscribeContractRequest(
-            SubscribeContractRequest::new(ContractInstanceId::new(presence)),
-        ));
+        subscribe.extend(presence_ops(presence));
     }
     (
         HarvestDelegateResponse::AutoInvoice {
@@ -668,10 +666,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
 /// last_wakeup_ms`). Not exported: it describes this node.
 pub(crate) const WAKEUP_KEY: &[u8] = b"harvest:auto:wakeup";
 
-/// A heartbeat sent less than this long ago is not sent again unless the
-/// store's state changed or the tab forces one: a wake-up and an open tab
-/// both ask every five minutes, and one write per interval is enough.
-pub(crate) const HEARTBEAT_MIN_GAP_MS: u64 = 4 * 60 * 1000;
+pub(crate) use harvest_common::presence::HEARTBEAT_MIN_GAP_MS;
 
 fn beat_key(store_contract_id: &[u8]) -> Vec<u8> {
     format!(
@@ -843,13 +838,16 @@ pub(crate) fn heartbeat_request<S: SecretStore>(
     )
 }
 
-/// Subscribe again to every armed store's store, mailbox and chain tip, and
-/// read each tip once: the node's start (or this delegate's install), after
+/// Subscribe again to every armed store's contracts and read what the
+/// delegate needs now: the node's start (or this delegate's install), after
 /// which subscriptions may be gone and a notification missed.
 ///
-/// Stores first, then tips, and each tip once however many stores share it:
-/// a node that meters a run's operations (four on v0.2.138) then drops the
-/// least useful, and one store (the common case) needs exactly four.
+/// In order of what matters, since a node refuses a delegate's network
+/// operations past four per run (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`,
+/// counting only contracts it has never seen): each tip once (subscribed and
+/// read), then every store and mailbox, then every presence contract
+/// (subscribed, and read so this generation learns the `seq` to outrank:
+/// [`note_presence_seen`]).
 pub(crate) fn resubscribe_all<S: SecretStore>(secrets: &mut S) -> Vec<OutboundDelegateMsg> {
     if secrets.has_secret(EXPORTED_KEY) {
         return Vec::new();
@@ -879,21 +877,35 @@ pub(crate) fn resubscribe_all<S: SecretStore>(secrets: &mut S) -> Vec<OutboundDe
         let Ok(store) = <[u8; 32]>::try_from(record.arm.store_contract_id.as_slice()) else {
             continue;
         };
-        // The presence contract too: a wake-up's heartbeat is an UPDATE,
-        // which fails on a node that does not hold the contract (harvest#119;
-        // newer nodes fetch it first), and only the seller's open tab ever
-        // PUTs it. A subscription keeps this node holding it across restarts
-        // and eviction with no tab open.
-        for id in [store, record.arm.mailbox_contract_id]
-            .into_iter()
-            .chain(record.arm.presence_contract_id)
-        {
+        for id in [store, record.arm.mailbox_contract_id] {
             out.push(OutboundDelegateMsg::SubscribeContractRequest(
                 SubscribeContractRequest::new(ContractInstanceId::new(id)),
             ));
         }
     }
+    // The presence contracts last. A wake-up's heartbeat is an UPDATE, which
+    // fails on a node that does not hold the contract (harvest#119; newer
+    // nodes fetch it first), and only the seller's open tab ever PUTs it: a
+    // subscription keeps this node holding it with no tab open.
+    for presence in all.iter().filter_map(|r| r.arm.presence_contract_id) {
+        out.extend(presence_ops(presence));
+    }
     out
+}
+
+/// Subscribe to a presence contract and read it: the read is what
+/// [`note_presence_seen`] learns a heartbeat signed elsewhere from, which a
+/// notification alone never delivers once that signer has stopped (the
+/// contract merges our lower heartbeats away, so nothing changes).
+fn presence_ops(presence: [u8; 32]) -> [OutboundDelegateMsg; 2] {
+    [
+        OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
+            ContractInstanceId::new(presence),
+        )),
+        OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new(
+            presence,
+        ))),
+    ]
 }
 
 /// Stop this generation for good: remove every arm, so no background run
@@ -1432,6 +1444,15 @@ pub(crate) fn on_get_answer<S: SecretStore>(
     if context.is_empty() {
         if let Some(out) = on_tip_read(secrets, contract_id, state, now_ms) {
             return Some(out);
+        }
+        if let Some(record) = arms(secrets)
+            .into_iter()
+            .find(|r| r.arm.presence_contract_id == Some(*contract_id))
+        {
+            if let Some(state) = state {
+                note_presence_seen(secrets, &record, state);
+            }
+            return Some(Vec::new());
         }
     }
     on_store_state(secrets, state, context, now_ms)
@@ -4051,9 +4072,10 @@ mod tests {
     }
 
     /// A heartbeat another signer left in the presence contract (an earlier
-    /// generation, a second device, a clock that ran ahead) is learned from
-    /// the subscription, and the next one here outranks it at once. Mutated
-    /// red by not learning it, and by learning a lower one.
+    /// generation, a second device, a clock that ran ahead) is learned from a
+    /// read of it or the subscription, and the next one here outranks it at
+    /// once. Mutated red by not learning it, by not routing the read, and by
+    /// learning a lower one.
     #[test]
     fn a_heartbeat_signed_elsewhere_is_outranked() {
         use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
@@ -4065,8 +4087,12 @@ mod tests {
             heartbeat: Some(elsewhere),
         })
         .unwrap();
-        assert!(on_notification(&mut f.secrets, &[9; 32], &state, NOW)
-            .is_some_and(|out| out.is_empty()));
+        // Learned from the read arming and the node's start send: a signer
+        // that has stopped writing sends no notification.
+        assert!(
+            on_get_answer(&mut f.secrets, &[9; 32], Some(&state), &[], NOW)
+                .is_some_and(|out| out.is_empty())
+        );
         let (next, _) = heartbeat(&mut f.secrets, &f.record.clone(), NOW, false)
             .expect("nothing sent here yet, so not held back by the gap");
         assert_eq!(next.heartbeat.seq, ahead + 1);
@@ -4118,8 +4144,9 @@ mod tests {
     }
 
     /// The node starting (or this delegate being installed) subscribes again
-    /// to each tip once and reads it, then to each armed store's store,
-    /// mailbox and presence contract: five operations for one store.
+    /// to each tip once and reads it, then to every store and mailbox, then
+    /// subscribes to and reads every presence contract: six operations for
+    /// one store.
     /// Nothing after an export. Mutated red by dropping the tip read, the
     /// presence subscription, and the export check.
     #[test]
@@ -4137,17 +4164,24 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The tip once, first, then store, mailbox and presence contract per
-        // arm.
+        // The tip once, first, then every store and mailbox, then every
+        // presence contract, subscribed and read.
         assert_eq!(subscribed, vec![[3; 32], [1; 32], [2; 32], [9; 32]]);
-        assert!(matches!(
-            out.get(1),
-            Some(OutboundDelegateMsg::GetContractRequest(r)) if r.contract_id.as_bytes() == [3; 32]
-        ));
-        assert_eq!(out.len(), 5);
+        let reads: Vec<(usize, [u8; 32])> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match m {
+                OutboundDelegateMsg::GetContractRequest(r) => {
+                    Some((i, <[u8; 32]>::try_from(r.contract_id.as_bytes()).unwrap()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![(1, [3; 32]), (5, [9; 32])]);
+        assert_eq!(out.len(), 6);
         let installed =
             crate::background::on_background(&mut f.secrets, &BackgroundRun::Installed, NOW);
-        assert_eq!(installed.len(), 5);
+        assert_eq!(installed.len(), 6);
         // Our own heartbeat coming back through that subscription is taken
         // and dropped, not forwarded to a UI a background run does not have.
         assert!(on_notification(&mut f.secrets, &[9; 32], b"any", NOW)
@@ -4319,20 +4353,23 @@ mod tests {
                 ("subscribe", [3; 32]),
                 ("get", [3; 32]),
                 ("subscribe", [9; 32]),
+                ("get", [9; 32]),
             ]
         );
         // The node runs at most four network operations for one delegate
         // request (freenet-core's `MAX_NETWORK_CONTRACT_OPS_PER_PARK`,
         // counting only contracts it has never seen) and refuses the rest.
-        // The four instant checkout needs come first, so the one the node
-        // may refuse is the presence subscription, which the seller's tab
-        // PUTs in any case.
+        // The four instant checkout needs come first, so what the node may
+        // refuse is the presence contract's, which the seller's tab PUTs in
+        // any case.
         assert!(
-            subscriptions[..4].iter().all(
-                |m| !matches!(m, OutboundDelegateMsg::SubscribeContractRequest(r)
-                    if r.contract_id.as_bytes() == [9; 32])
-            ),
-            "the presence subscription goes last"
+            subscriptions[..4].iter().all(|m| match m {
+                OutboundDelegateMsg::SubscribeContractRequest(r) =>
+                    r.contract_id.as_bytes() != [9; 32],
+                OutboundDelegateMsg::GetContractRequest(r) => r.contract_id.as_bytes() != [9; 32],
+                _ => true,
+            }),
+            "the presence contract goes last"
         );
     }
 

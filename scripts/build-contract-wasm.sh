@@ -91,9 +91,12 @@ fi
 cargo fetch "${locked[@]}" --manifest-path "$workspace/Cargo.toml" >/dev/null
 git_remaps=""
 while read -r rev; do
-  short="${rev:0:7}"
-  for dir in "$cargo_home"/git/checkouts/*/"$short"; do
+  # Cargo names the directory by a short id of at least seven characters,
+  # longer where seven would be ambiguous, so match any length and keep only
+  # a genuine prefix of the revision.
+  for dir in "$cargo_home"/git/checkouts/*/"${rev:0:7}"*; do
     [ -d "$dir" ] || continue
+    case "$rev" in "$(basename "$dir")"*) ;; *) continue ;; esac
     git_remaps+=" --remap-path-prefix=$dir=/cargo/git/checkouts/$(basename "$(dirname "$dir")")"
   done
 done < <(grep -o 'source = "git+[^"]*#[0-9a-f]*"' "$workspace/Cargo.lock" | sed 's/.*#//; s/"$//' | sort -u)

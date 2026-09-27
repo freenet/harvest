@@ -31298,7 +31298,36 @@ mod buy_flow_tests {
         assert!(state.presence_due(now + PRESENCE_REFRESH_MS));
         assert_eq!(state.follow_due_presence(now + PRESENCE_REFRESH_MS), first);
         // Still followed since the first read: "checking" is not restarted.
-        assert_eq!(state.presence.following[first[0].as_slice()].2, now);
+        assert_eq!(state.presence.following[first[0].as_slice()].1, now);
+        // Each read that still finds it not open doubles the wait.
+        let second = now + PRESENCE_REFRESH_MS;
+        assert!(state
+            .follow_due_presence(second + 2 * PRESENCE_REFRESH_MS - 1)
+            .is_empty());
+        assert_eq!(
+            state.follow_due_presence(second + 2 * PRESENCE_REFRESH_MS),
+            first
+        );
+        assert_eq!(
+            crate::presence_flow::presence_refresh_after(40),
+            crate::presence_flow::PRESENCE_REFRESH_MAX_MS
+        );
+        // Another generation of the same store (one key) shares the presence
+        // contract: read once, and the same answer for both.
+        state.browsing_stores.insert(
+            vec![9; 32],
+            BrowsingStore {
+                owner: Some(sk.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        assert!(state.presence_reads_due(second + 1).is_empty());
+        let late = now + 10 * PRESENCE_REFRESH_MS;
+        assert_eq!(
+            state.store_presence(&[9; 32], late),
+            state.store_presence(&[8; 32], late)
+        );
+        assert!(state.store_presence(&[9; 32], late).is_closed());
     }
 
     /// The delegate's first heartbeat of the session is the one the tab
@@ -31337,7 +31366,6 @@ mod buy_flow_tests {
             .on_heartbeat_answer(store.clone(), answer(&sk))
             .is_none());
         // The PUT did not go out: forced again at once.
-        state.queue_heartbeats(now);
         state.on_presence_publish_failed(&store);
         assert_eq!(state.heartbeats_due(now), vec![(store.clone(), true)]);
         assert!(state.on_heartbeat_answer(store, answer(&sk)).is_some());
