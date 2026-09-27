@@ -1726,5 +1726,15 @@ mod tests {
             latest_answer(&declined_early, &at_send, Some(&ours)),
             Some(Answer::Declined("Sold out".into()))
         );
+        // A decline that was already there when this order went out is not
+        // this order's. Mutated red by dropping the digest filter.
+        let old_decline = message(
+            Addressing::ToBuyer,
+            MessageContent::Decline {
+                reason: "Only 1 left".into(),
+            },
+        );
+        let at_send = seller_answers(std::slice::from_ref(&old_decline));
+        assert_eq!(latest_answer(&[old_decline], &at_send, Some(&ours)), None);
     }
 }
