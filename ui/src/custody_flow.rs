@@ -1269,6 +1269,38 @@ mod tests {
         assert_eq!(purpose(&state), None, "the current backer is not connected");
     }
 
+    /// A pending delegation of watch requests holds custody back like a
+    /// watch request does: both are vault prompts, and a refusal names no
+    /// request. Mutated red by leaving `WatchDelegation` out of
+    /// `is_watch_signature`.
+    #[test]
+    fn custody_waits_behind_a_watch_delegation() {
+        let mut state = backed_store();
+        register(&mut state);
+        state
+            .pending_signatures
+            .push_back(crate::state::PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: FINGERPRINT.to_string(),
+                    ghostkey: freenet_bitcoin_inbox::GhostkeyId([1; 32]),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    bridge: freenet_bitcoin_common::BridgeId([2; 32]),
+                    inbox_contract_id: [3; 32],
+                    issued_mainnet_height: 4,
+                    signing_payload: vec![5],
+                    queued_at_ms: 6,
+                },
+            )));
+        state.start_custody_for(&[ID; 32]);
+        assert!(
+            state.pending_custody.is_empty(),
+            "deferred behind the vault"
+        );
+        state.pending_signatures.clear();
+        state.start_custody_where_needed();
+        assert!(!state.pending_custody.is_empty(), "started once it is free");
+    }
+
     /// Custody waits while anything else waits on the vault, and counts as
     /// the seller's own vault work while it waits (#99 review). Mutated red
     /// by dropping the deferral and by not counting custody.

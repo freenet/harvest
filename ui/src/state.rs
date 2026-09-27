@@ -31534,6 +31534,83 @@ mod buy_flow_tests {
         );
     }
 
+    /// Asked once per session, and again only when the delegate reports THAT
+    /// delegation stalled (review round 1 of #179): not while it may still be
+    /// on its way, not for an older one's stall, and then at a later height.
+    /// Mutated red by keeping the once-per-session rule, and by ignoring the
+    /// height asked.
+    #[test]
+    fn a_delegation_that_stalls_is_asked_again_in_the_session() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.on_watch_key(Ok([0x3c; 32]));
+        let asked = state
+            .queue_auto_invoice(DELEGATION_NOW)
+            .delegation
+            .delegate
+            .expect("asked");
+        state.pending_signatures.clear();
+        let mut held = held_delegation(&state, &gk);
+        // An OLDER delegation's stall: the one just asked for may be on its way.
+        held.issued_mainnet_height = asked.issued_mainnet_height - 1;
+        held.stalled = true;
+        state.on_watch_delegation(held.bridge, Ok(held.clone()));
+        assert_eq!(state.plan_watch_delegation(DELEGATION_NOW).delegate, None);
+        // The one asked for, stalled: asked again once the floor moves.
+        held.issued_mainnet_height = asked.issued_mainnet_height;
+        state.on_watch_delegation(held.bridge, Ok(held));
+        assert_eq!(state.plan_watch_delegation(DELEGATION_NOW).delegate, None);
+        let tracker = state.bitcoin.inbox.as_mut().unwrap();
+        let mut served = tracker.state.clone().unwrap();
+        inbox::raise_floor(&mut served, inbox::FLOOR + 1);
+        tracker.on_state(served, DELEGATION_NOW);
+        let again = state
+            .plan_watch_delegation(DELEGATION_NOW)
+            .delegate
+            .expect("asked again");
+        assert!(again.issued_mainnet_height > asked.issued_mainnet_height);
+    }
+
+    /// Retiring an inbox drops a delegation queued against it, and keeps one
+    /// queued against another; a pending delegation is something the minute
+    /// check acts on. Mutated red by dropping the `WatchDelegation` arm of
+    /// `retire_inbox`, and by leaving it out of `is_watch_signature`.
+    #[test]
+    fn a_retired_inbox_takes_its_queued_delegation_with_it() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        let old = inbox_id(&state);
+        let pending = |inbox: [u8; 32]| {
+            PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: "seller-fp".into(),
+                    ghostkey: gk.id(),
+                    network: BitcoinNetwork::Signet,
+                    bridge: state.bitcoin.inbox.as_ref().unwrap().bridge,
+                    inbox_contract_id: inbox,
+                    issued_mainnet_height: 1,
+                    signing_payload: inbox.to_vec(),
+                    queued_at_ms: DELEGATION_NOW,
+                },
+            ))
+        };
+        let (on_old, elsewhere) = (pending(old), pending([0x55; 32]));
+        state.pending_signatures.push_back(on_old);
+        state.pending_signatures.push_back(elsewhere);
+        assert!(state.watch_check_could_act());
+        state.retire_inbox();
+        let left: Vec<[u8; 32]> = state
+            .pending_signatures
+            .iter()
+            .filter_map(|p| match p {
+                PendingSignature::WatchDelegation(d) => Some(d.inbox_contract_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(left, vec![[0x55; 32]]);
+        assert_eq!(state.pending_signatures.len(), 1);
+    }
+
     /// A refused delegation is a watch signature: dropped, the key not asked
     /// again this session, and nothing of the seller's cleared. It also holds
     /// the watch requests back while it waits, so a refusal is about one

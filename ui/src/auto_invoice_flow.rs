@@ -40,7 +40,7 @@
 //! (`UpdateWatchDelegation`), and dates its own requests above the
 //! delegate's: the two share one timeline per Ghost Key.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use freenet_bitcoin_common::{BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::GhostkeyId;
@@ -93,8 +93,10 @@ pub struct AutoInvoiceUi {
     pub watch_key: Option<[u8; 32]>,
     pub watch_key_asked_ms: Option<u64>,
     /// The Ghost Key and bridge pairs this session has asked the vault to
-    /// delegate for: once each, never on every open.
-    pub delegation_asked: HashSet<(GhostkeyId, BridgeId)>,
+    /// delegate for, and the height the last delegation asked for was
+    /// issued at: once each, never on every open, and again only when the
+    /// delegate reports THAT delegation (or a later one) stalled.
+    pub delegation_asked: HashMap<(GhostkeyId, BridgeId), u32>,
     /// The delegation the delegate holds for each bridge, as it last said.
     pub delegations: HashMap<BridgeId, WatchDelegationStatus>,
     /// The last `UpdateWatchDelegation` sent per bridge: the inbox and
@@ -110,6 +112,7 @@ pub struct PendingWatchDelegation {
     pub network: BitcoinNetwork,
     pub bridge: BridgeId,
     pub inbox_contract_id: [u8; 32],
+    pub issued_mainnet_height: u32,
     /// `DelegationBody::signing_payload`, and so what the answer is matched
     /// by.
     pub signing_payload: Vec<u8>,
@@ -458,10 +461,19 @@ impl AppState {
             }
             return work;
         }
+        // Asked once this session: again only once the delegate says the
+        // delegation asked for (or a later one) has stalled, never while it
+        // may still be on its way or was refused.
+        let stalled_since_asked = |asked: u32| {
+            held.is_some_and(|d| {
+                d.ghostkey == ghostkey.0 && d.stalled && d.issued_mainnet_height >= asked
+            })
+        };
         if self
             .auto_invoice
             .delegation_asked
-            .contains(&(ghostkey, bridge))
+            .get(&(ghostkey, bridge))
+            .is_some_and(|asked| !stalled_since_asked(*asked))
         {
             return work;
         }
@@ -504,6 +516,7 @@ impl AppState {
             network,
             bridge,
             inbox_contract_id,
+            issued_mainnet_height: issued,
             signing_payload,
             queued_at_ms: now_ms,
         });
@@ -593,9 +606,10 @@ impl AppState {
             self.auto_invoice.watch_key_asked_ms = Some(now_ms);
         }
         if let Some(pending) = &work.delegation.delegate {
-            self.auto_invoice
-                .delegation_asked
-                .insert((pending.ghostkey, pending.bridge));
+            self.auto_invoice.delegation_asked.insert(
+                (pending.ghostkey, pending.bridge),
+                pending.issued_mainnet_height,
+            );
             self.pending_signatures
                 .push_back(crate::state::PendingSignature::WatchDelegation(Box::new(
                     pending.clone(),
