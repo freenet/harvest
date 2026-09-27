@@ -1173,6 +1173,7 @@ fn unanswered_requests(
             order_binding: *order_binding,
             buyer_receipt_key: *buyer_receipt_key,
             digest: *digest,
+            sent_at: *timestamp,
             instant: instant
                 .as_ref()
                 .zip(request)
@@ -1234,6 +1235,8 @@ struct PendingRequest {
     digest: [u8; 32],
     /// Set when the buyer sent this with instant checkout.
     instant: Option<InstantAnswer>,
+    /// The envelope time (the buyer's clock).
+    sent_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What a seller answering an instant-checkout request by hand carries over
@@ -1392,6 +1395,7 @@ pub(crate) fn requests_awaiting_invoice(
         &store.orders,
         |tag| state.conversation_keys.get(tag),
         |listing| store.availability(listing).is_buyable(),
+        crate::state::now_ms(),
     )
 }
 
@@ -1409,6 +1413,7 @@ fn count_unanswered<'a>(
     published: &[harvest_common::payment::AuthorizedOrder],
     keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
     on_sale: impl Fn(&harvest_common::listing::ListingId) -> bool,
+    now_ms: u64,
 ) -> usize {
     let mut conversations: Vec<(Vec<u8>, Vec<MailboxEntry>)> = Vec::new();
     for entry in entries {
@@ -1425,13 +1430,19 @@ fn count_unanswered<'a>(
         .map(|(tag, group)| {
             unanswered_requests(group, listings, published, keys_for(tag))
                 .iter()
-                // Not a Buy now: an unpaid one is not an order and does not
-                // need the seller (Ian, 2026-09-26). The seller's store
-                // answers every Buy now it reads, with an invoice or a
-                // decline saying why (harvest#177); one it has not read yet
-                // is answered when it next runs. The inbox still offers the
-                // seller the control to answer one by hand.
-                .filter(|request| request.instant.is_none())
+                // A Buy now is not the seller's to answer: an unpaid one is
+                // not an order (Ian, 2026-09-26), and their store answers
+                // every one it reads within seconds, with an invoice or a
+                // decline saying why. One still unanswered after
+                // `BUY_NOW_OVERDUE_MS` is a failure (the store's update
+                // refused, the store not running), and then it does need
+                // them (codex on harvest#177).
+                .filter(|request| {
+                    request.instant.is_none()
+                        || (now_ms.saturating_sub(request.sent_at.timestamp_millis().max(0) as u64)
+                            >= BUY_NOW_OVERDUE_MS
+                            && !declined_since(group, request.sent_at))
+                })
                 .filter(|request| {
                     listings.iter().any(|l| l.listing.id == request.listing_id)
                         && on_sale(&request.listing_id)
@@ -1439,6 +1450,26 @@ fn count_unanswered<'a>(
                 .count()
         })
         .sum()
+}
+
+/// How long a Buy now may wait for its store's answer before the seller is
+/// asked to look: the store answers in seconds when it runs.
+pub(crate) const BUY_NOW_OVERDUE_MS: u64 = 10 * 60 * 1000;
+
+/// Whether the seller's side sent a decline in this conversation at or after
+/// `since`.
+fn declined_since(entries: &[MailboxEntry], since: chrono::DateTime<chrono::Utc>) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            entry,
+            MailboxEntry::Readable {
+                addressing: crate::messaging::Addressing::ToBuyer,
+                content: MessageContent::Decline { .. },
+                timestamp,
+                ..
+            } if *timestamp >= since
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1619,7 +1650,7 @@ mod inbox_tests {
             }
         };
         assert_eq!(
-            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| true),
+            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| true, 0),
             2
         );
 
@@ -1627,16 +1658,19 @@ mod inbox_tests {
         // request: the second conversation computes a different tag.
         let answered = vec![published(1, Some(BINDING), Some(first.listing_tag(&id)))];
         assert_eq!(
-            count_unanswered(entries.clone(), &listings, &answered, keys_for, |_| true),
+            count_unanswered(entries.clone(), &listings, &answered, keys_for, |_| true, 0),
             1
         );
 
         // Not on sale, or never in this store: not counted.
         assert_eq!(
-            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| false),
+            count_unanswered(entries.clone(), &listings, &[], keys_for, |_| false, 0),
             0
         );
-        assert_eq!(count_unanswered(entries, &[], &[], keys_for, |_| true), 0);
+        assert_eq!(
+            count_unanswered(entries, &[], &[], keys_for, |_| true, 0),
+            0
+        );
     }
 
     /// A Buy now the store did not answer is left out of the count: an
@@ -1666,13 +1700,64 @@ mod inbox_tests {
             [1u8; 32],
         );
         let k = keys();
+        let MailboxEntry::Readable { timestamp, .. } = &buy_now else {
+            unreachable!()
+        };
+        let sent = timestamp.timestamp_millis() as u64;
         assert_eq!(
             unanswered_requests(std::slice::from_ref(&buy_now), &listings, &[], Some(&k)).len(),
             1,
             "still offered in the inbox"
         );
         assert_eq!(
-            count_unanswered(vec![buy_now], &listings, &[], |_| Some(&k), |_| true),
+            count_unanswered(
+                vec![buy_now.clone()],
+                &listings,
+                &[],
+                |_| Some(&k),
+                |_| true,
+                sent + 1
+            ),
+            0
+        );
+        // Unanswered for longer than a store takes: something failed, and
+        // now it does need the seller, unless the store declined it.
+        let overdue = sent + BUY_NOW_OVERDUE_MS;
+        assert_eq!(
+            count_unanswered(
+                vec![buy_now.clone()],
+                &listings,
+                &[],
+                |_| Some(&k),
+                |_| true,
+                overdue
+            ),
+            1
+        );
+        let mut declined = readable(
+            MessageContent::Decline {
+                reason: "Sold out".into(),
+            },
+            [2u8; 32],
+        );
+        if let MailboxEntry::Readable {
+            addressing,
+            timestamp,
+            ..
+        } = &mut declined
+        {
+            *addressing = crate::messaging::Addressing::ToBuyer;
+            *timestamp = chrono::DateTime::from_timestamp_millis(sent as i64 + 5).unwrap();
+        }
+        assert_eq!(
+            count_unanswered(
+                vec![buy_now, declined],
+                &listings,
+                &[],
+                |_| Some(&k),
+                |_| true,
+                overdue
+            ),
             0
         );
     }

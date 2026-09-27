@@ -408,8 +408,12 @@ fn latest_answer(
         })
         .skip(answers_before)
         .collect();
-    if answers.iter().any(|content| {
-        matches!(content, MessageContent::OrderAccepted { order_id } if Some(order_id) == expected)
+    // Anywhere in the thread, not only past `answers_before`: a reply dated
+    // by a seller clock behind an earlier one sorts before it (codex on
+    // harvest#177), and this order's id is unique to it.
+    if thread.iter().any(|message| {
+        message.addressing == Addressing::ToBuyer
+            && matches!(&message.content, MessageContent::OrderAccepted { order_id } if Some(order_id) == expected)
     }) {
         return Some(Answer::Accepted);
     }
@@ -1656,7 +1660,11 @@ mod tests {
             order_id: harvest_common::payment::OrderId([1u8; 32]),
         };
         let ours = harvest_common::payment::OrderId([1u8; 32]);
-        let mut thread = vec![message(Addressing::ToBuyer, accepted.clone())];
+        // An earlier order's acceptance, already in the thread.
+        let earlier = MessageContent::OrderAccepted {
+            order_id: harvest_common::payment::OrderId([3u8; 32]),
+        };
+        let mut thread = vec![message(Addressing::ToBuyer, earlier)];
         let before = seller_answers(&thread);
         assert_eq!(latest_answer(&thread, before, Some(&ours)), None);
         thread.push(message(Addressing::ToSeller, accepted.clone()));
@@ -1689,9 +1697,25 @@ mod tests {
             )),
             "not taken for ours"
         );
-        thread.push(message(Addressing::ToBuyer, accepted));
+        thread.push(message(Addressing::ToBuyer, accepted.clone()));
         assert_eq!(
             latest_answer(&thread, before, Some(&ours)),
+            Some(Answer::Accepted)
+        );
+        // Found wherever it sorts: a reply dated by a slower seller clock
+        // lands before the answers counted at send. Mutated red by looking
+        // only past `answers_before` again.
+        let early = vec![
+            message(Addressing::ToBuyer, accepted),
+            message(
+                Addressing::ToBuyer,
+                MessageContent::OrderAccepted {
+                    order_id: harvest_common::payment::OrderId([3u8; 32]),
+                },
+            ),
+        ];
+        assert_eq!(
+            latest_answer(&early, 1, Some(&ours)),
             Some(Answer::Accepted)
         );
     }

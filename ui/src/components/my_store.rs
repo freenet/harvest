@@ -67,6 +67,9 @@ pub(crate) struct SellerStore {
     /// Paid orders waiting to be sent: the moment a Buy now first needs the
     /// seller.
     pub to_send: usize,
+    /// Payments withheld for the seller to confirm (`AppState::
+    /// settlement_hold`).
+    pub to_confirm: usize,
     /// Listings on show with no sats price (from before every listing had
     /// one): nobody can buy them until the seller gives them one.
     pub unpriced: usize,
@@ -82,10 +85,13 @@ pub(crate) fn paid_to_send(
     orders
         .iter()
         .filter(|o| o.order.seller_fingerprint == fingerprint)
+        // Past its despatch window and still unsent it needs them all the
+        // more (`OrderStage::needs_attention`, codex on harvest#177).
         .filter(|o| {
             matches!(
                 stage_of(o),
                 crate::fulfilment::OrderStage::AwaitingDespatch { .. }
+                    | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
             )
         })
         .count()
@@ -97,7 +103,7 @@ pub(crate) fn paid_to_send(
 pub(crate) fn requests_needing_seller(state: &AppState) -> usize {
     seller_stores(state)
         .iter()
-        .map(|s| s.requests + s.to_send)
+        .map(|s| s.requests + s.to_send + s.to_confirm)
         .sum()
 }
 
@@ -158,6 +164,16 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                         .count()
                 })
                 .unwrap_or(0);
+            // A payment withheld for the seller to confirm needs them too:
+            // its card is on their list (`invoice_form::invoices_issued_by`).
+            let to_confirm = state
+                .withheld_settlements
+                .iter()
+                .filter(|(_, (store, order))| {
+                    store.as_slice() == id.as_slice()
+                        && order.order.seller_fingerprint == *fingerprint
+                })
+                .count();
             let to_send = browsing
                 .map(|b| {
                     paid_to_send(&b.orders, fingerprint, |o| {
@@ -220,6 +236,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
                 expired_invoices,
                 to_send,
+                to_confirm,
                 unpriced: browsing
                     .map(|b| {
                         b.listings
@@ -566,7 +583,7 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
     // Counts what needs the seller, not everything there is: a request
     // waiting for an invoice, or a paid order waiting to be sent. Never an
     // unpaid Buy now.
-    let orders_label = match store.requests + store.to_send {
+    let orders_label = match store.requests + store.to_send + store.to_confirm {
         0 => "Orders".to_string(),
         n => format!("Orders ({n})"),
     };
@@ -703,7 +720,8 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         || !store.certificate.is_verified()
         || store.expired_invoices > 0
         || store.requests > 0
-        || store.to_send > 0;
+        || store.to_send > 0
+        || store.to_confirm > 0;
 
     rsx! {
         section { class: "card",
@@ -746,6 +764,18 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                         }
                     }
                     button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Listings), "Open listings" }
+                }
+            }
+            if store.to_confirm > 0 {
+                div { class: "need row-between",
+                    strong {
+                        if store.to_confirm == 1 {
+                            "1 payment needs you to confirm which order it is for."
+                        } else {
+                            "{store.to_confirm} payments need you to confirm which order each is for."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
                 }
             }
             if store.to_send > 0 {
@@ -1891,18 +1921,31 @@ mod seller_stores_tests {
             status_scoped_payload: None,
             status_signature: None,
         };
-        let orders = vec![order("fp", 1), order("fp", 2), order("other", 3)];
+        let orders = vec![
+            order("fp", 1),
+            order("fp", 2),
+            order("other", 3),
+            order("fp", 4),
+        ];
         let stage = |o: &AuthorizedOrder| match o.order.id.0[0] {
             1 | 3 => OrderStage::AwaitingDespatch {
                 paid_at: 1,
                 despatch_by: 2,
+            },
+            4 => OrderStage::DespatchWindowClosed {
+                despatch_by: 2,
+                complaint_until: 3,
             },
             _ => OrderStage::Despatched {
                 despatched_at: 1,
                 complaint_until: 2,
             },
         };
-        assert_eq!(paid_to_send(&orders, "fp", stage), 1);
+        assert_eq!(
+            paid_to_send(&orders, "fp", stage),
+            2,
+            "overdue still counts"
+        );
     }
 
     /// The wallet-gap note is shown on the store it happened at, not on
