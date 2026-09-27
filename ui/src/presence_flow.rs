@@ -57,6 +57,11 @@ pub const PRESENCE_REFRESH_MS: u64 = 2 * 60 * 1000;
 /// whoever asks (`HEARTBEAT_MIN_GAP_MS`).
 pub const WAKEUPS_FRESH_MS: u64 = HEARTBEAT_EVERY_MS + 60 * 1000;
 
+// The handover: the tab takes over [`WAKEUPS_FRESH_MS`] after the last
+// wake-up, at its next minute tick, and that must be before the last
+// wake-up's heartbeat stops opening the store.
+const _: () = assert!(WAKEUPS_FRESH_MS + 60 * 1000 < PRESENCE_FRESH_MS);
+
 /// What this tab holds about stores' presence.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PresenceUi {
