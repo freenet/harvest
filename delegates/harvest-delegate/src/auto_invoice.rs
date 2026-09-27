@@ -1275,8 +1275,10 @@ fn global_refusal<S: SecretStore>(
     let arm = &record.arm;
     let watched = watch_set(secrets, record, tip, now_ms);
     // Lapsed only when neither source has anything: the delegate's own
-    // watches keep a store taking orders after the tab's have lapsed.
-    if !watched.arm_time_live && watched.delegated.is_empty() {
+    // watches keep a store taking orders after the tab's have lapsed. Not
+    // judged without a tip, which the delegate's watches are measured
+    // against: that is `NoFreshTip`, below.
+    if !watched.arm_time_live && watched.delegated.is_empty() && tip.is_some() {
         return Err(Refusal::WatchLapsed);
     }
     if store_key(secrets, &arm.store_verifying_key).is_none() {
@@ -4409,7 +4411,7 @@ mod tests {
         let read = run(&mut f, &[buyer.request(&jam(), 1, 4, 12_000)]);
         assert_eq!(read.refused[0].1, Refusal::WatchLapsed);
         assert!(!taking_orders(&f.secrets, &f.record, NOW));
-        wd::wake_and_scan(&mut f.secrets, &script_at(0), Some(wd::TIP), NOW + 600_000);
+        wd::wake_and_scan(&mut f.secrets, &script_at(10), Some(wd::TIP), NOW + 600_000);
         assert!(taking_orders(&f.secrets, &f.record, NOW));
         let status = status_of(&f.secrets, &f.record, NOW);
         assert_eq!(status.paused, None);
@@ -4420,7 +4422,7 @@ mod tests {
         assert_eq!(ok.orders[0].order.payment_script_pubkey, script_at(0));
 
         // The tip within an invoice's window of the horizon asked for.
-        let until = wd::TIP + freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS;
+        let until = wd::TIP + crate::watch_delegation::REQUEST_AHEAD_BLOCKS;
         wd::set_tip(&mut f.secrets, until - WATCH_NEEDED_BLOCKS + 1);
         let near = run(&mut f, &[buyer.request(&jam(), 1, 3, 12_000)]);
         assert_eq!(near.refused[0].1, Refusal::WatchLapsed);
@@ -4442,6 +4444,21 @@ mod tests {
         let decided = run(&mut f, &[Buyer::new(81).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(decided.orders.len(), 1, "{:?}", decided.refused);
         assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(0));
+    }
+
+    /// Without a tip the reason given is `NoFreshTip`, not a lapsed watch:
+    /// the delegate's watches are measured against the tip (review round 2
+    /// of #179). Mutated red by judging the lapse without a tip.
+    #[test]
+    fn without_a_tip_the_reason_is_the_tip() {
+        let mut f = fixture();
+        f.record.watched_until_ms = NOW;
+        crate::secrets::RemovableSecrets::remove_secret(
+            &mut f.secrets,
+            &tip_key(BitcoinNetwork::Signet),
+        );
+        let decided = run(&mut f, &[Buyer::new(82).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.refused[0].1, Refusal::NoFreshTip);
     }
 
     /// Review round 1 of #179, P1: what the store says (open, how many

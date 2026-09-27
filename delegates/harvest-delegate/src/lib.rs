@@ -342,6 +342,12 @@ fn handle_contract_notification(
     }) {
         return Ok(out);
     }
+    // A bridge inbox or address contract the delegated watch subscribed to
+    // keep the node's copy fresh: every verdict comes from a GET, so the
+    // notification itself needs nothing, and a background run has no UI.
+    if contract_id.is_some_and(|id| watch_delegation::subscribed_to(&CtxSecrets(ctx), &id)) {
+        return Ok(Vec::new());
+    }
 
     // The notification contains the contract key and the update data.
     // We need to determine which contract type this is and handle accordingly.

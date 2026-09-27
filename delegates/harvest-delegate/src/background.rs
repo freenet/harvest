@@ -73,6 +73,9 @@ pub(crate) fn on_background<S: SecretStore>(
         // A tag this generation did not declare (a successor's, say): nothing.
         BackgroundRun::Wakeup { .. } => Vec::new(),
         BackgroundRun::Installed | BackgroundRun::NodeStarted => {
+            // Subscriptions of an earlier run may be gone: none of the
+            // delegated watch's counts as settled until renewed.
+            crate::watch_delegation::on_node_started(secrets);
             crate::auto_invoice::resubscribe_all(secrets)
         }
     }
