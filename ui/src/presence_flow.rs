@@ -270,14 +270,17 @@ impl AppState {
 
     /// Our stores that are due a heartbeat from this tab, and whether to
     /// force one (the first of a session, which the tab creates the presence
-    /// contract with). Only stores armed this session, since the delegate
-    /// sends heartbeats for armed stores only. Changes nothing.
+    /// contract with). Only stores the delegate has answered an arm for
+    /// this session: it heartbeats armed stores only, and a heartbeat asked
+    /// for before the arm is stored would be refused and not asked again for
+    /// a whole interval. Changes nothing.
     pub fn heartbeats_due(&self, now_ms: u64) -> Vec<(Vec<u8>, bool)> {
         let wakeups = self.wakeups_live(now_ms);
         self.instant_checkout_stores()
             .into_iter()
             .map(|(_, registration)| registration.store_contract_id)
             .filter(|id| self.auto_invoice.sent.contains_key(id))
+            .filter(|id| matches!(self.auto_invoice.status.get(id), Some(Ok(_))))
             .filter_map(|id| {
                 let force = !self.presence.published.contains(&id);
                 if !force && wakeups {
@@ -403,11 +406,22 @@ pub fn seller_presence_line(presence: StorePresence, wakeups: bool) -> String {
         }
         StorePresence::Closed(_) => "Buyers see your store as closed.".into(),
     };
-    let how = if wakeups {
-        "It stays open while this computer is on and Freenet is running, with Harvest open or not."
+    // Said of an open store as it is, and of any other as what will happen
+    // once it can take orders.
+    let lead = if presence.is_open() {
+        "It stays open"
     } else {
-        "It stays open only while Harvest is open here. Once Freenet updates to a version that \
-         keeps stores open in the background, it will stay open while this computer is on."
+        "Once it can take orders, it stays open"
+    };
+    let how = if wakeups {
+        format!(
+            "{lead} while this computer is on and Freenet is running, with Harvest open or not."
+        )
+    } else {
+        format!(
+            "{lead} only while Harvest is open here. Once Freenet updates to a version that \
+             keeps stores open in the background, it will stay open while this computer is on."
+        )
     };
     format!("{state} {how}")
 }
@@ -457,6 +471,22 @@ mod tests {
         assert_eq!(
             store_presence(Some(&not_taking), Some(NOW), NOW),
             StorePresence::Closed(ClosedWhy::NotTakingOrders)
+        );
+    }
+
+    /// The seller's line says how the store stays open as a fact only when
+    /// it is open. Mutated red by always saying it as a fact.
+    #[test]
+    fn the_seller_is_told_how_the_store_stays_open() {
+        let open = seller_presence_line(StorePresence::Open, true);
+        assert!(
+            open.starts_with("Buyers see your store as open. It stays open while"),
+            "{open}"
+        );
+        let closed = seller_presence_line(StorePresence::Closed(ClosedWhy::NotTakingOrders), false);
+        assert!(
+            closed.contains("Once it can take orders, it stays open only while Harvest is open"),
+            "{closed}"
         );
     }
 

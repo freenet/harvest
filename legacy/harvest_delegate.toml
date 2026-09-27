@@ -234,7 +234,7 @@ delegate_key = "01633f573f568bd52acfad8ecd87da23e63fd467c64e0e9edb9159dcd38ea00b
 
 [[entry]]
 version = "V27"
-description = "Superseded by the delegated watch key (harvest#179): the delegate holds its own Ed25519 watch key (new unexported secret `harvest:auto:watchkey`) and the seller's delegations to it (`harvest:auto:delegation:*`, unexported), and on a wake-up reads the bridge inbox and sends delegated Watch requests itself; a delegated watch counts for invoicing once the bridge's scan watermark confirms it. New requests `GetWatchKey`, `SetWatchDelegation`, `UpdateWatchDelegation`; `AutoInvoiceStatus` gained `watch_delegation` (`#[serde(default)]`). No import family changed. The parameters are unchanged (empty). The generation always-open stores shipped (harvest#178, `e275bae`)."
+description = "Superseded by the delegated watch key (harvest#179): the delegate holds its own Ed25519 watch key (new unexported secret `harvest:auto:watchkey`) and the seller's delegations to it (`harvest:auto:watchdeleg:*`, unexported), and on a wake-up reads the bridge inbox and sends delegated Watch requests itself; a delegated watch counts for invoicing once the bridge's scan watermark confirms it. New requests `GetWatchKey`, `SetWatchDelegation`, `UpdateWatchDelegation`; `AutoInvoiceStatus` gained `watch_delegation` (`#[serde(default)]`). No import family changed. The parameters are unchanged (empty). The generation always-open stores shipped (harvest#178, `e275bae`)."
 date = "2026-09-27"
 code_hash = "6973d27838d0e512de90917621c4ac78dd78bc004914e3dbd6edc4f2fd4e14e4"
 delegate_key = "1303939ef49623c1497b713bde85564a71472996f8db39ac2bab6c5c22d24695"

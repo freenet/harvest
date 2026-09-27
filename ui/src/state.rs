@@ -31249,11 +31249,31 @@ mod buy_flow_tests {
         assert!(arm.presence_contract_id.is_some());
     }
 
+    /// A status the delegate would send for a store it has stored an arm
+    /// for.
+    fn an_answered_arm() -> harvest_common::delegate::AutoInvoiceStatus {
+        harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 5,
+            invoicing_until_ms: 0,
+            last_background_run_ms: None,
+            issued_last_day: 0,
+            oversold: vec![],
+            paused: None,
+            wallet_gap_paid_at_ms: None,
+            wallet_gap_limit: 0,
+            capped: None,
+            last_wakeup_ms: None,
+            watch_delegation: None,
+        }
+    }
+
     /// The open tab heartbeats an armed store every five minutes, forcing
     /// the first of the session (which creates the presence contract), and
     /// leaves it to the node once wake-ups are seen, except for that first
-    /// one. Mutated red by never forcing, by ignoring wake-ups, and by
-    /// dropping the interval.
+    /// one; and asks only once the delegate has answered the arm. Mutated
+    /// red by never forcing, by ignoring wake-ups, by dropping the interval,
+    /// and by asking before the arm is answered.
     #[test]
     fn the_tab_heartbeats_until_the_node_does() {
         use harvest_common::presence::HEARTBEAT_EVERY_MS;
@@ -31266,6 +31286,14 @@ mod buy_flow_tests {
             .auto_invoice_arm("seller-fp", &registration, 10)
             .expect("an arm");
         state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        assert!(
+            state.heartbeats_due(100).is_empty(),
+            "the arm is sent but the delegate has not answered it"
+        );
+        state
+            .auto_invoice
+            .status
+            .insert(store.clone(), Ok(an_answered_arm()));
         assert_eq!(state.queue_heartbeats(100), vec![(store.clone(), true)]);
         assert!(state.heartbeats_due(200).is_empty(), "asked just now");
         state.presence.published.insert(store.clone());
@@ -31819,6 +31847,10 @@ mod buy_flow_tests {
             .auto_invoice_arm("seller-fp", &registration, 10)
             .expect("an arm");
         state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        state
+            .auto_invoice
+            .status
+            .insert(store.clone(), Ok(an_answered_arm()));
         let key = crate::state::test_store_key();
         state.browsing_stores.get_mut(&store).unwrap().owner = Some(key);
         let now = crate::state::now_ms();
