@@ -1091,6 +1091,46 @@ mod tests {
         );
     }
 
+    /// **A full record with a REALISTIC mix still reads its count** (testing
+    /// review of #144 round 1): the "Record full, none counted" text is only
+    /// for a full record with zero counted, never for one that is full but
+    /// still has honest complaints counted. Red if `record_badge` drops its
+    /// `counted == 0` guard and reads every full record as "none counted".
+    #[test]
+    fn a_full_record_with_some_counted_complaints_reads_its_count() {
+        use crate::state::{BrowsingStore, RecordLoad};
+        let _recognised = recognise_fixture_bridge();
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let honest = complaint_at(&paid, paid_at + 10);
+        assert!(payment_attested_by_recognised_bridges(&honest.order));
+
+        let mut own_bridge_order = paid.clone();
+        own_bridge_order.order.trusted_bridges = vec![strangers_bridge()];
+        let own_bridge = complaint_at(&own_bridge_order, paid_at);
+        assert!(!payment_attested_by_recognised_bridges(&own_bridge.order));
+
+        let honest_count = harvest_common::reputation::MAX_COMPLAINTS / 2;
+        let filler_count = harvest_common::reputation::MAX_COMPLAINTS - honest_count;
+        let mut complaints = vec![honest; honest_count];
+        complaints.extend(vec![own_bridge; filler_count]);
+        let store = BrowsingStore {
+            record: RecordLoad::Loaded,
+            complaints,
+            ..BrowsingStore::default()
+        };
+        assert!(store.record_full());
+        assert_eq!(store.counted_complaints(), honest_count);
+        assert_eq!(
+            store.record_badge(),
+            (
+                "reputation-negative",
+                format!("{honest_count} complaint(s)")
+            ),
+            "a full record with real counted complaints is not \"none counted\""
+        );
+    }
+
     fn anchor(height: u32) -> BlockAnchor {
         BlockAnchor {
             height,
