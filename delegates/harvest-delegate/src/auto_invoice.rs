@@ -1068,8 +1068,8 @@ fn accepted_run<S: SecretStore>(
 ///   ([`ArmRecord::watched_until_ms`]), and by height when it named one.
 /// - **The delegate's own** (`crate::watch_delegation`), each script while
 ///   the horizon its confirmed request asked for is at least
-///   [`WATCH_NEEDED_BLOCKS`] past the tip, and its delegation has not
-///   stalled.
+///   [`WATCH_NEEDED_BLOCKS`] past the tip, no probe has found it unscanned,
+///   and its canary can still vouch for it (`watch_delegation::vouched`).
 pub(crate) struct WatchSet {
     /// The arm's watch outlasts an invoice's window by the clock.
     arm_time_live: bool,

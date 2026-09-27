@@ -78,7 +78,9 @@
 //! doubling [`FAILURE_BACKOFF_MS`] between them) stall the delegation: it
 //! sends nothing until the open tab delegates again, and the tab is told
 //! ([`WatchDelegationStatus::stalled`]). Watches already confirmed keep
-//! counting while the probe keeps finding them scanned.
+//! counting while the probe keeps finding them scanned, and only while their
+//! canary can still vouch for them (outside the tab's pool, not named by an
+//! arm: [`vouched`]); the canary itself is evidence, never a credited watch.
 //!
 //! # The watch key is not exported
 //!
@@ -94,7 +96,12 @@
 //!   canary index; its watch would then confirm this delegate's canary.
 //! - **Probe latency.** A revocation or a watch ending is noticed at the
 //!   next probe, up to [`PROBE_EVERY_MS`] (plus [`SETTLE_MS`] after a node
-//!   restart) late.
+//!   restart) late when no request is in flight. A request in flight takes
+//!   the wake-up's one read first (its inbox read, then its confirmation), so
+//!   on a busy store a revocation can go unnoticed for the request's life:
+//!   up to two hours outstanding plus the confirmation window, about one to
+//!   three hours in all. Invoices in that time go to addresses the bridge
+//!   may have stopped watching.
 //! - **Two devices, one Ghost Key.** The bridge honours one delegation per
 //!   Ghost Key; the other device's requests are read and ignored. Its canary
 //!   never shows, so it credits nothing and stalls, and each device's tab
@@ -788,7 +795,8 @@ fn vouched<S: SecretStore>(secrets: &S, held: &Held, w: &Watched) -> bool {
 /// horizon asked, for a store on `network` trusting `bridges`: the union
 /// across every delegation it holds for them. A stalled delegation still
 /// counts what its probes keep finding scanned; a probe that finds it not
-/// scanned clears it.
+/// scanned clears it; and a watch whose canary can no longer vouch for it
+/// ([`vouched`]) does not count.
 pub(crate) fn delegated_watched<S: SecretStore>(
     secrets: &S,
     network: BitcoinNetwork,
@@ -1385,10 +1393,15 @@ fn on_inbox<S: SecretStore>(
         return save_if_changed(secrets, &before, &held).then(Vec::new);
     }
     let inbox = held.inbox_contract_id;
-    let canary = held
-        .canary
-        .clone()
-        .filter(|c| now_ms.saturating_sub(c.at_ms) < CANARY_VALID_MS);
+    // Still clear of the tab's pool by the full margin at the counter as it
+    // is NOW: sales since the canary was chosen would otherwise let it enter
+    // the pool while scripts of this request are still unsold, and those
+    // would stop counting (`vouched`) before they are used.
+    let counter_now = crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index);
+    let canary = held.canary.clone().filter(|c| {
+        now_ms.saturating_sub(c.at_ms) < CANARY_VALID_MS
+            && counter_now.is_some_and(|n| c.index >= canary_floor(n))
+    });
     // A request needs: nothing waiting, no backoff, a canary just found
     // unscanned, a fresh tip, and a settled copy of the inbox, so its date is
     // the live floor's rather than an old copy's (a misdated entry is dropped
@@ -1709,7 +1722,7 @@ pub(crate) mod test_support {
         };
         save(
             &mut secrets,
-            &arm_key(&record.arm.store_contract_id),
+            &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
             &record,
         );
         secrets
@@ -2281,8 +2294,21 @@ mod tests {
         let watched = watched_now(&secrets, TIP);
         assert_eq!(watched, (0..10).map(script_at).collect::<Vec<_>>());
         assert!(!watched.contains(&script_at(20)), "the canary is evidence");
-        // Sales move the counter so the canary (index 20) is in the pool.
-        set_counter(&mut secrets, 11);
+        let h = held(&secrets);
+        assert!(
+            refill_scripts(&secrets, &h, TIP, NOW).is_empty(),
+            "all fresh"
+        );
+        // An arm (a tab) names the canary: the scripts are unsold, but the
+        // canary no longer vouches for them, so they stop counting and are
+        // refilled.
+        let mut record = arm_record(&secrets);
+        record.arm.watched_scripts = vec![script_at(20)];
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
+            &record,
+        );
         assert!(
             watched_now(&secrets, TIP).is_empty(),
             "no longer vouched for"
@@ -2292,6 +2318,45 @@ mod tests {
             !refill_scripts(&secrets, &h, TIP, NOW).is_empty(),
             "refilled"
         );
+        // Nor is the next address probed through that canary.
+        let probe_id = address_id(&secrets, &script_at(20));
+        assert!(!on_wakeup(&mut secrets, NOW + 2 * PROBE_EVERY_MS)
+            .iter()
+            .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(r)
+                if r.contract_id.as_bytes() == probe_id.as_slice())));
+        // Sales moving the canary into the pool do the same.
+        record.arm.watched_scripts = Vec::new();
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
+            &record,
+        );
+        assert_eq!(watched_now(&secrets, TIP).len(), 10);
+        set_counter(&mut secrets, 11);
+        assert!(watched_now(&secrets, TIP).is_empty());
+    }
+
+    /// A canary chosen before sales moved the counter is dropped at build
+    /// time if it is no longer clear of the pool by the full margin: sent,
+    /// it would stop vouching while scripts of its request are unsold.
+    /// Mutated red by building on it regardless.
+    #[test]
+    fn a_canary_overtaken_by_sales_is_not_used() {
+        let mut secrets = delegated();
+        let inbox = open_inbox();
+        // The canary read finds index 20 unscanned; then three sales before
+        // the inbox read builds the request.
+        let get = wake(&mut secrets, NOW);
+        answer(&mut secrets, &get, None, NOW);
+        assert!(held(&secrets).canary.is_some(), "a canary was chosen");
+        set_counter(&mut secrets, 3);
+        let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
+        assert!(
+            !out.iter()
+                .any(|m| matches!(m, OutboundDelegateMsg::UpdateContractRequest(_))),
+            "no request on an overtaken canary: {out:?}"
+        );
+        assert!(held(&secrets).outstanding.is_none());
     }
 
     /// Pruning keeps the list in append order, so every later prune still
