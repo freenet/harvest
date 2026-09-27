@@ -331,6 +331,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by instant checkout: listings and orders gained
                 // their fixed terms and request id.
                 "307332ee371b0ed7a21c696180a09e9b55d53cbd07e96b4e219abf9a5ac5ddf1",
+                // V23, from `git show 4f040c6:ui/public/contracts/store_contract.wasm`.
+                // Superseded by always-open stores; moves only because
+                // `harvest-common` is compiled into it.
+                "93a1ea1040977cc8f7c22bc4a5fdccde561bcf332893e38176cfc01977134a04",
             ],
         ),
         (
@@ -399,6 +403,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // this artifact moves only because `harvest-common` is
                 // compiled into it.
                 "492c6e74953058477ec0cb736a1ae2f8d751b858e0df8c3176274599d9f1b8df",
+                // V18, from `git show 4f040c6:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by always-open stores; moves only because
+                // `harvest-common` is compiled into it.
+                "a394f610c92ab0c2c7ae8540aca0655eaf9c2012a25b71969c540138b7bd90b6",
             ],
         ),
         (
@@ -455,6 +463,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // this artifact moves only because `harvest-common` is
                 // compiled into it.
                 "4b02a3f41d494efa2570c75fc3044f091775858566569c115a219091346087d4",
+                // V17, from `git show 4f040c6:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by always-open stores; moves only because
+                // `harvest-common` is compiled into it.
+                "f22a69dbb0a1ff273e32858e3726a06f99e03ba6e7ecb57395236990a92644ef",
             ],
         ),
         (
@@ -477,6 +489,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by instant checkout; this artifact moves only
                 // because `harvest-common` is compiled into it.
                 "e23c43c86fa12acfbed7778b8c15b22d4af87c8c0d6c673f47a5d606d9cca9e5",
+                // V5, from `git show 4f040c6:ui/public/contracts/index_contract.wasm`.
+                // Superseded by always-open stores; moves only because
+                // `harvest-common` is compiled into it.
+                "c7e6e6e0c88c6aabfd71191ca6995270f1557276027c9e3761f5e53594a1b234",
             ],
         ),
     ];
@@ -595,6 +611,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // V25, from `git show da2faa1:ui/public/contracts/harvest_delegate.wasm`.
             // Superseded by the always-open product decisions.
             "6472846e92abe0ec9209e7ab34b50fd72306eb04bad0416797584289a4f6a128".to_string(),
+            // V26, the generation harvest#177 shipped. Superseded by always-open
+            // stores: wake-ups, heartbeats and the manifest.
+            "4e7262f786906ea56f9963e39da6fa4c366e4ab866cafe83a8f6b1da3eb86ecb".to_string(),
         ],
     );
 }
@@ -1123,6 +1142,8 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         (21, Code),
         // V22: harvest#70 (`f9558cd`). Still the store key's code, 29B.
         (22, Code),
+        // V23: instant checkout (`4f040c6`). Still the store key's code, 29B.
+        (23, Code),
     ]
 };
 
