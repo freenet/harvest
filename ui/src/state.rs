@@ -8772,6 +8772,13 @@ impl AppState {
     /// answer is matched, so this cannot withdraw a different request that
     /// happens to sit at the same position.
     pub(crate) fn withdraw_pending_signature(&mut self, withdrawn: &PendingSignature) {
+        // A delegation whose request never left this tab was not asked in
+        // effect: free its once-per-session marker (see `retire_inbox`).
+        if let PendingSignature::WatchDelegation(delegation) = withdrawn {
+            self.auto_invoice
+                .delegation_asked
+                .remove(&(delegation.ghostkey, delegation.bridge));
+        }
         let Ok(bytes) = withdrawn.signed_bytes() else {
             return;
         };
@@ -12842,13 +12849,25 @@ impl AppState {
             .retired_contracts
             .insert(old.contract_key.id().as_bytes().to_vec());
         let old_id = old.contract_key.id().as_bytes().to_vec();
+        let mut abandoned = Vec::new();
         self.pending_signatures.retain(|pending| match pending {
             PendingSignature::InboxEntry(entry) => entry.contract_key != old.contract_key,
             PendingSignature::WatchDelegation(delegation) => {
-                delegation.inbox_contract_id.as_slice() != old_id.as_slice()
+                let keep = delegation.inbox_contract_id.as_slice() != old_id.as_slice();
+                if !keep {
+                    abandoned.push((delegation.ghostkey, delegation.bridge));
+                }
+                keep
             }
             _ => true,
         });
+        // A delegation abandoned before it reached the delegate was never
+        // asked in effect: nothing can report it stalled, so without this the
+        // once-per-session marker would keep delegated watching off for the
+        // session (codex, review round 4 of #179).
+        for pair in abandoned {
+            self.auto_invoice.delegation_asked.remove(&pair);
+        }
     }
 
     /// The payment scripts each of this node's sellers needs `bridge` to
@@ -31597,6 +31616,61 @@ mod buy_flow_tests {
             .delegate
             .expect("asked again");
         assert!(again.issued_mainnet_height > asked.issued_mainnet_height);
+    }
+
+    /// Codex, review round 4: a delegation abandoned before it reached the
+    /// delegate (its inbox retired mid-signature, or its send failed) frees
+    /// the once-per-session marker, so the next plan asks again against the
+    /// new inbox. Mutated red by leaving the marker in `retire_inbox`, and in
+    /// `withdraw_pending_signature`.
+    #[test]
+    fn an_abandoned_delegation_is_asked_again() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.on_watch_key(Ok([0x3a; 32]));
+        let first = state
+            .queue_auto_invoice(DELEGATION_NOW)
+            .delegation
+            .delegate
+            .expect("asked");
+        assert!(state
+            .plan_watch_delegation(DELEGATION_NOW)
+            .delegate
+            .is_none());
+        // The bridge's inbox pointer moves mid-signature.
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        state.retire_inbox();
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            crate::bitcoin_inbox::inbox_contract_key(
+                bridge,
+                freenet_stdlib::prelude::CodeHash::new([0x39; 32]),
+            )
+            .unwrap(),
+        ));
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .unwrap()
+            .on_state(inbox::open_inbox(), DELEGATION_NOW);
+        let again = state
+            .plan_watch_delegation(DELEGATION_NOW + 1)
+            .delegate
+            .expect("asked again against the new inbox");
+        assert_ne!(again.inbox_contract_id, first.inbox_contract_id);
+
+        // A send that failed frees it too.
+        let queued = state
+            .queue_auto_invoice(DELEGATION_NOW + 2)
+            .delegation
+            .delegate
+            .unwrap();
+        state.withdraw_pending_signature(&PendingSignature::WatchDelegation(Box::new(queued)));
+        assert!(state
+            .plan_watch_delegation(DELEGATION_NOW + 3)
+            .delegate
+            .is_some());
     }
 
     /// Retiring an inbox drops a delegation queued against it, and keeps one
