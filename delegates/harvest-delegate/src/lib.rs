@@ -121,15 +121,33 @@ impl DelegateInterface for HarvestDelegate {
                 handle_get_contract_response(ctx, &response)
             }
 
-            InboundDelegateMsg::SubscribeContractResponse(key) => {
-                // Subscription confirmed -- nothing to do for now
-                let _ = key;
+            // The delegated watch's copies count as settled only from the
+            // node's Ok here (`watch_delegation::on_subscribed`); every other
+            // subscription's answer needs nothing.
+            InboundDelegateMsg::SubscribeContractResponse(response) => {
+                if let Ok(contract_id) = <[u8; 32]>::try_from(response.contract_id.as_bytes()) {
+                    watch_delegation::on_subscribed(
+                        &mut CtxSecrets(ctx),
+                        &contract_id,
+                        &response.result,
+                        now_ms(),
+                    );
+                }
                 Ok(vec![])
             }
 
             // A store update instant checkout sent: on success, send the
             // replies it was holding back (see `auto_invoice::on_store_updated`).
             InboundDelegateMsg::UpdateContractResponse(response) => {
+                // The delegated watch's inbox UPDATE first: a refused one was
+                // never sent (`watch_delegation::on_update_answer`).
+                if let Some(out) = watch_delegation::on_update_answer(
+                    &mut CtxSecrets(ctx),
+                    &response.result,
+                    response.context.as_ref(),
+                ) {
+                    return Ok(out);
+                }
                 Ok(auto_invoice::on_store_update_answer(
                     &mut CtxSecrets(ctx),
                     &response.result,
@@ -762,6 +780,33 @@ mod boundary_tests {
 /// `auto_invoice::on_get_answer` is tested there.
 #[cfg(test)]
 mod get_answer_routing_tests {
+    /// The dispatcher routes the delegated watch's notifications and answers
+    /// to `watch_delegation`: source-pinned because its secrets are inert off
+    /// `wasm32`; the decisions are tested in `watch_delegation::tests`.
+    /// Mutated red by dropping the `subscribed_to` check.
+    #[test]
+    fn watched_contract_notifications_are_dropped_and_answers_routed() {
+        let src = include_str!("lib.rs");
+        let handler = &src[src.find("fn handle_contract_notification(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        let dropped = handler
+            .find("watch_delegation::subscribed_to(")
+            .expect("checked");
+        let forwarded = handler.find("ContractUpdate {").expect("forwarded");
+        assert!(dropped < forwarded, "dropped before anything is forwarded");
+        let process = &src[src.find("fn process(").unwrap()..];
+        assert!(process.contains("watch_delegation::on_subscribed("));
+        let update = &process[process.find("UpdateContractResponse(response)").unwrap()..];
+        let watch = update.find("watch_delegation::on_update_answer(").unwrap();
+        let store = update
+            .find("auto_invoice::on_store_update_answer(")
+            .unwrap();
+        assert!(
+            watch < store,
+            "the delegated watch's UPDATE answer is recognised first"
+        );
+    }
+
     #[test]
     fn a_get_answer_goes_to_instant_checkout_first() {
         let src = include_str!("lib.rs");

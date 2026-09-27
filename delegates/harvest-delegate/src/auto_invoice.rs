@@ -4411,7 +4411,7 @@ mod tests {
         let read = run(&mut f, &[buyer.request(&jam(), 1, 4, 12_000)]);
         assert_eq!(read.refused[0].1, Refusal::WatchLapsed);
         assert!(!taking_orders(&f.secrets, &f.record, NOW));
-        wd::wake_and_scan(&mut f.secrets, &script_at(10), Some(wd::TIP), NOW + 600_000);
+        wd::wake_and_scan(&mut f.secrets, &script_at(20), Some(wd::TIP), NOW + 600_000);
         assert!(taking_orders(&f.secrets, &f.record, NOW));
         let status = status_of(&f.secrets, &f.record, NOW);
         assert_eq!(status.paused, None);

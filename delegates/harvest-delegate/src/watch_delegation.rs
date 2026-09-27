@@ -23,50 +23,62 @@
 //! proves only that SOMEONE has it watched: the tab watches the same
 //! addresses.
 //!
-//! So every request ends with a **canary**: an address beyond the ones the
-//! tab watches (the pool is the next [`MAX_UPCOMING_ADDRESSES`], exactly what
-//! the tab asks for), whose address contract showed no fresh watermark just
-//! before the request went out. The bridge applies a request's scripts in
-//! order and stops at its cap, so the canary's watermark reaching the tip the
-//! request left the inbox at shows the WHOLE request was applied. Only then
-//! are its scripts credited, with the horizon asked for.
+//! So every request ends with a **canary**: an address that is unscanned BY
+//! CONSTRUCTION. It lies past the tab's pool (the next
+//! [`MAX_UPCOMING_ADDRESSES`], exactly what the tab asks for) by
+//! [`CANARY_MARGIN`] more, past every canary this delegate has used, and is
+//! not one an arm names. Nobody else asks for it, so its address contract
+//! normally does not exist at all: the bridge creates one only when it
+//! publishes for a watched script. The bridge applies a request's scripts in
+//! order and counts the rest refused once the Ghost Key's cap is reached; the
+//! count only grows within a request, so the canary (last) scanned means
+//! every script before it was applied too. The request's scripts are credited
+//! only once the canary's watermark, signed by this bridge, reaches the tip
+//! the request left the inbox at, and only while the canary is still outside
+//! the tab's pool and the tab's watches.
 //!
 //! # One request's life
 //!
 //! 1. **Canary.** When the first [`REFILL_BELOW`] addresses from the counter
 //!    are not all watched with [`RENEW_MARGIN_BLOCKS`] to spare, a wake-up
-//!    reads the next canary candidate's address contract. Scanned by someone:
-//!    try the next (at most [`MAX_CANARY_TRIES`] a round). Not scanned: read
-//!    the inbox at once, in the same run.
+//!    reads the next canary candidate's address contract (a GET only). No
+//!    state, or no fresh watermark: go on to the inbox in the same run. A
+//!    fresh watermark (someone has it watched): skip it, at most
+//!    [`MAX_CANARY_TRIES`] a round.
 //! 2. **Sent.** ONE delegated Watch for every next address not so watched,
-//!    then the canary, through `tip + REQUEST_AHEAD_BLOCKS`.
+//!    then the canary, through `tip + REQUEST_AHEAD_BLOCKS`. A node that
+//!    refuses the UPDATE means it was never sent: forgotten, not a failure.
 //! 3. **Left the inbox.** On a removal the bridge signed, on the floor
 //!    passing its height, or after [`OUTSTANDING_MAX_MS`].
 //! 4. **Confirmed** by the canary's watermark reaching the tip it left at.
-//!    A settled copy still short of it [`CONFIRM_BLOCKS`] later is a failure.
+//!    Still short [`CONFIRM_BLOCKS`] later, with a fresh tip, is a failure:
+//!    a canary nobody asks for has no contract until the bridge publishes,
+//!    so an absent state is the evidence. A canary the counter or the tab has
+//!    reached since proves nothing either way: dropped, uncredited.
 //! 5. **Kept honest.** Every [`PROBE_EVERY_MS`] the canary of the next
 //!    address's request is read again; a settled copy more than
 //!    [`LIVE_LAG_BLOCKS`] behind a fresh tip withdraws every watch of the
 //!    delegation (a revocation withdraws them at the bridge too).
 //!
-//! # Only positive evidence counts
+//! # Settled copies
 //!
 //! A delegate's GET is answered from the node's LOCAL copy when it holds one,
 //! with no freshness check (freenet-core `contract.rs`, the delegate GET
-//! path). So every contract read here is also SUBSCRIBED to, which keeps the
-//! local copy following the network, and a verdict of "not scanned" (the
-//! canary's check, a failed confirmation, a failed probe) is drawn only from a
-//! copy subscribed for at least [`SETTLE_MS`] in this node run. A read with no
-//! state, or an unsettled one, is no evidence either way. A request is sent
-//! only against a settled inbox copy, so its date is the live floor's. Nothing
-//! is judged without a fresh tip (a bridge that is down stops its tip too).
+//! path). So every inbox and confirm/probe read is also SUBSCRIBED to, which
+//! keeps the local copy following the network, and a copy counts as settled
+//! only [`SETTLE_MS`] after the node answered that SUBSCRIBE Ok in this node
+//! run. A probe withdraws only on a settled copy; a request is dated only from
+//! a settled inbox copy. A read with no state is no evidence for a probe.
+//! Nothing is judged without a fresh tip (a bridge that is down stops its tip
+//! too).
 //!
 //! # Stalls
 //!
 //! [`MAX_FAILURES`] requests in a row whose canary never showed (with a
 //! doubling [`FAILURE_BACKOFF_MS`] between them) stall the delegation: it
-//! sends nothing until the open tab delegates again. Watches already
-//! confirmed keep counting while the probe keeps finding them scanned.
+//! sends nothing until the open tab delegates again, and the tab is told
+//! ([`WatchDelegationStatus::stalled`]). Watches already confirmed keep
+//! counting while the probe keeps finding them scanned.
 //!
 //! # The watch key is not exported
 //!
@@ -77,10 +89,9 @@
 //!
 //! # Residuals
 //!
-//! - **The tab racing a canary.** A canary enters the pool (and the tab's
-//!   watches) only after as many sales as the pool is long; if that happens
-//!   inside one request's confirmation window and the tab is open, the tab's
-//!   watch can confirm the canary. The tab's horizon then covers it.
+//! - **Another device, same store and payment key.** A second device armed
+//!   for the same store derives the same addresses, and could watch the same
+//!   canary index; its watch would then confirm this delegate's canary.
 //! - **Probe latency.** A revocation or a watch ending is noticed at the
 //!   next probe, up to [`PROBE_EVERY_MS`] (plus [`SETTLE_MS`] after a node
 //!   restart) late.
@@ -88,26 +99,28 @@
 //!   Ghost Key; the other device's requests are read and ignored. Its canary
 //!   never shows, so it credits nothing and stalls, and each device's tab
 //!   re-delegates at a later height when it opens, taking the bridge back.
-//! - **`made_at_ms` clamp.** The bridge counts a delegated request as made at
-//!   most an hour past its own clock; a tab clock more than an hour fast
-//!   makes the delegate's requests stale. Their canaries never show, and the
-//!   delegation stalls: fail closed.
+//! - **The horizon credited is the one asked.** A bridge that knows no
+//!   reference height for the network keeps a plain day's watch while the
+//!   delegate credits nine days; the watermark does not carry the horizon.
+//!   The live bridge always knows one (it clamps from its own tip).
+//! - **A read outage is a failure.** A canary the bridge did apply, whose
+//!   contract the node cannot fetch for the whole confirmation window, counts
+//!   as not applied: a backoff, and after three a stall, which only stops
+//!   sending.
 //! - **Pointers.** The inbox and the address contract's code hash are the
 //!   ones the tab last named; the delegate does not resolve the bridge's
 //!   generation pointers itself. After a re-key with no tab open, requests
-//!   go unread and address reads find nothing: nothing is credited, the
-//!   delegation stalls (a re-keyed address contract leaves reads empty,
-//!   which is no evidence, so confirmed watches lapse at their horizon), and
-//!   the tab re-names both when it opens. Fail closed.
+//!   go unread or unapplied, their canaries never show, and the delegation
+//!   stalls; the tab re-names both when it opens. Fail closed.
 //! - **The tip is the network's, not the bridge's.** Horizons and freshness
 //!   are judged against the tip contract the arm names for the network: with
 //!   one bridge per network (every network Harvest runs on) the bridge's own.
 //! - **Revocation.** The tab never restates `revoke_watch_keys_through`
 //!   (the API recommends it on every Ghost Key request); nothing Harvest does
 //!   revokes.
-//! - **Subscriptions.** Every inbox and address contract read here is
-//!   subscribed to: the inbox, one canary per request, and the probes, a few
-//!   a week.
+//! - **Subscriptions.** Every inbox, confirm and probe read is subscribed to,
+//!   a few a week, never unsubscribed (stdlib 0.8.5 has no unsubscribe); their
+//!   notifications are dropped (up to [`EVER_SUBSCRIBED_CAP`] per delegation).
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_bitcoin_common::{BitcoinAddressParameters, BitcoinNetwork, BridgeId};
@@ -175,9 +188,9 @@ pub(crate) const OUTSTANDING_MAX_MS: u64 = 2 * 60 * 60 * 1000;
 /// must reach the tip it left at.
 pub(crate) const CONFIRM_BLOCKS: u32 = 6;
 
-/// How long an unconfirmed request may go without any evidence (no settled
-/// copy of its canary) before it is dropped: uncredited, not a failure.
-pub(crate) const CONFIRM_MAX_MS: u64 = 6 * 60 * 60 * 1000;
+/// How far past the tab's pool a canary is chosen, so the counter moving
+/// while a request waits does not bring its canary into the tab's watches.
+pub(crate) const CANARY_MARGIN: u32 = MAX_UPCOMING_ADDRESSES;
 
 /// How often a watched request's canary is read again, and how far behind a
 /// fresh tip it may be.
@@ -211,9 +224,13 @@ pub(crate) const MAX_DELEGATIONS: usize = 8;
 pub(crate) const WATCHED_CAP: usize = 64;
 
 /// Contracts recorded as subscribed, per delegation.
-const SUBSCRIBED_CAP: usize = 64;
+pub(crate) const SUBSCRIBED_CAP: usize = 64;
 
-const READ_MAGIC: [u8; 8] = *b"hvwinb03";
+/// Contracts ever subscribed to, per delegation, whose notifications are
+/// dropped rather than forwarded.
+pub(crate) const EVER_SUBSCRIBED_CAP: usize = 256;
+
+const READ_MAGIC: [u8; 8] = *b"hvwinb04";
 
 /// A delegation as this delegate holds it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -256,9 +273,17 @@ pub(crate) struct Held {
     pub canary_tries: u32,
     #[serde(default)]
     pub defer_until_ms: Option<u64>,
-    /// Contracts subscribed to in this node run, and since when.
+    /// Contracts whose SUBSCRIBE the node confirmed in this node run, and
+    /// since when: what a verdict that something is NOT happening rests on.
     #[serde(default)]
     pub subscribed: Vec<([u8; 32], u64)>,
+    /// Contracts a SUBSCRIBE was sent for and not yet answered.
+    #[serde(default)]
+    pub subscribing: Vec<[u8; 32]>,
+    /// Every contract ever subscribed to (bounded), whose notifications
+    /// need no handling.
+    #[serde(default)]
+    pub ever_subscribed: Vec<[u8; 32]>,
 }
 
 impl Held {
@@ -288,11 +313,46 @@ impl Held {
             .any(|(id, since)| id == contract && now_ms.saturating_sub(*since) >= SETTLE_MS)
     }
 
+    /// The node confirmed a SUBSCRIBE: settled from now, unless it already
+    /// was (a repeat keeps its first time).
     fn note_subscribed(&mut self, contract: [u8; 32], now_ms: u64) {
-        if !self.subscribed.iter().any(|(id, _)| *id == contract) {
-            self.subscribed.push((contract, now_ms));
-            while self.subscribed.len() > SUBSCRIBED_CAP {
-                self.subscribed.remove(0);
+        if self.subscribed.iter().any(|(id, _)| *id == contract) {
+            return;
+        }
+        self.subscribed.push((contract, now_ms));
+        while self.subscribed.len() > SUBSCRIBED_CAP {
+            // The oldest one nothing here reads any more; the oldest of all
+            // only if every one is in use.
+            let at = self
+                .subscribed
+                .iter()
+                .position(|(id, _)| !self.in_use(id))
+                .unwrap_or(0);
+            self.subscribed.remove(at);
+        }
+    }
+
+    /// Whether a read of this delegation may still need `contract` settled.
+    fn in_use(&self, contract: &[u8; 32]) -> bool {
+        *contract == self.inbox_contract_id
+            || self
+                .unconfirmed
+                .as_ref()
+                .is_some_and(|u| u.canary_contract == *contract)
+            || self.watched.iter().any(|w| w.canary_contract == *contract)
+    }
+
+    fn note_subscribing(&mut self, contract: [u8; 32]) {
+        if !self.subscribing.contains(&contract) {
+            self.subscribing.push(contract);
+            while self.subscribing.len() > SUBSCRIBED_CAP {
+                self.subscribing.remove(0);
+            }
+        }
+        if !self.ever_subscribed.contains(&contract) {
+            self.ever_subscribed.push(contract);
+            while self.ever_subscribed.len() > EVER_SUBSCRIBED_CAP {
+                self.ever_subscribed.remove(0);
             }
         }
     }
@@ -314,6 +374,8 @@ pub(crate) struct Outstanding {
     pub mainnet_height: u32,
     pub scripts: Vec<Vec<u8>>,
     pub canary: Vec<u8>,
+    #[serde(default)]
+    pub canary_index: u32,
     pub until_height: u32,
     pub sent_at_ms: u64,
 }
@@ -323,6 +385,11 @@ pub(crate) struct Outstanding {
 pub(crate) struct Unconfirmed {
     pub scripts: Vec<Vec<u8>>,
     pub canary: Vec<u8>,
+    #[serde(default)]
+    pub canary_index: u32,
+    /// The canary's address contract.
+    #[serde(default)]
+    pub canary_contract: [u8; 32],
     pub until_height: u32,
     /// The tip when it was seen to leave: the watermark must reach it.
     pub since_tip: u32,
@@ -338,6 +405,8 @@ pub(crate) struct Watched {
     pub script: Vec<u8>,
     pub until_height: u32,
     pub canary: Vec<u8>,
+    #[serde(default)]
+    pub canary_contract: [u8; 32],
 }
 
 /// What a read this module sent is for.
@@ -350,6 +419,8 @@ enum ReadKind {
     Probe,
     /// A canary candidate, before a request.
     Canary,
+    /// The inbox UPDATE that submits a request.
+    Sent,
 }
 
 /// Carried through a GET this module sent.
@@ -579,6 +650,14 @@ pub(crate) fn set_delegation<S: SecretStore>(
             .as_ref()
             .map(|h| h.subscribed.clone())
             .unwrap_or_default(),
+        subscribing: same
+            .as_ref()
+            .map(|h| h.subscribing.clone())
+            .unwrap_or_default(),
+        ever_subscribed: same
+            .as_ref()
+            .map(|h| h.ever_subscribed.clone())
+            .unwrap_or_default(),
     };
     if !store_held(secrets, &record) {
         return Err("the node refused to store the delegation".into());
@@ -690,22 +769,49 @@ fn pool<S: SecretStore>(secrets: &S, network: BitcoinNetwork) -> Vec<Vec<u8>> {
         .unwrap_or_default()
 }
 
-/// The next canary candidate: the first address past the pool (which is
-/// exactly what the tab watches) not yet tried, and its index.
+/// The next canary candidate, and its index: unscanned BY CONSTRUCTION.
+/// Past the tab's pool (the next `MAX_UPCOMING_ADDRESSES` from the counter,
+/// exactly what the tab prewatches) by [`CANARY_MARGIN`] more, so the counter
+/// moving while a request waits leaves it outside; past every canary this
+/// delegate has used; and not one an arm names as the tab's. Nobody else asks
+/// for such an address, so its address contract normally does not even exist
+/// yet: the bridge creates one only when it publishes for a watched script.
 fn next_canary<S: SecretStore>(secrets: &S, held: &Held) -> Option<(u32, Vec<u8>)> {
     let xpub = crate::bitcoin::load_payment_xpub(secrets)?;
     if xpub.network != held.network {
         return None;
     }
-    let index = xpub
-        .next_index
-        .saturating_add(MAX_UPCOMING_ADDRESSES)
-        .max(held.canary_next);
-    let script = crate::bip32::AccountXpub::parse(&xpub.xpub)
+    let chain = crate::bip32::AccountXpub::parse(&xpub.xpub)
         .and_then(|a| a.external_chain())
-        .and_then(|chain| chain.script_at(index))
         .ok()?;
-    Some((index, script))
+    let tabs: Vec<Vec<u8>> = armed_for(secrets, held)
+        .into_iter()
+        .flat_map(|r| r.arm.watched_scripts)
+        .collect();
+    let first = canary_floor(xpub.next_index).max(held.canary_next);
+    (first..first.saturating_add(64)).find_map(|index| {
+        let script = chain.script_at(index).ok()?;
+        (!tabs.contains(&script)).then_some((index, script))
+    })
+}
+
+/// The lowest index a canary may have with the counter at `next_index`.
+fn canary_floor(next_index: u32) -> u32 {
+    next_index
+        .saturating_add(MAX_UPCOMING_ADDRESSES)
+        .saturating_add(CANARY_MARGIN)
+}
+
+/// Whether a canary could by now be one the tab watches: the counter moved it
+/// into the tab's pool, or an arm names it. Its watermark then shows nothing
+/// about this delegate's request.
+fn canary_compromised<S: SecretStore>(secrets: &S, held: &Held, index: u32, script: &[u8]) -> bool {
+    let in_pool = crate::bitcoin::load_payment_xpub(secrets)
+        .is_none_or(|xpub| index < xpub.next_index.saturating_add(MAX_UPCOMING_ADDRESSES));
+    in_pool
+        || armed_for(secrets, held)
+            .iter()
+            .any(|r| r.arm.watched_scripts.iter().any(|s| s == script))
 }
 
 fn fresh_tip<S: SecretStore>(
@@ -851,27 +957,54 @@ fn due_read<S: SecretStore>(
 }
 
 /// A GET of `id` carrying `context`, and a SUBSCRIBE to it: the subscription
-/// is what keeps the node's local copy, which later GETs are answered from,
-/// following the network. On a contract the node already holds it costs no
-/// network operation.
+/// keeps the node's local copy, which later GETs are answered from, following
+/// the network, and the node's Ok to it is what makes a copy settled
+/// ([`on_subscribed`]). On a contract the node already holds it costs no
+/// network operation. A canary candidate is read without one: most likely it
+/// is a contract nobody has created, and one found scanned is skipped for
+/// good.
 fn read_msgs(
     held: &mut Held,
     id: [u8; 32],
     context: &ReadContext,
-    now_ms: u64,
+    _now_ms: u64,
 ) -> Vec<OutboundDelegateMsg> {
-    let Ok(context) = to_cbor(context) else {
+    let Ok(bytes) = to_cbor(context) else {
         return Vec::new();
     };
-    held.note_subscribed(id, now_ms);
     let mut get = GetContractRequest::new(ContractInstanceId::new(id));
-    get.context = DelegateContext::new(context);
-    vec![
-        OutboundDelegateMsg::GetContractRequest(get),
-        OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(
-            ContractInstanceId::new(id),
-        )),
-    ]
+    get.context = DelegateContext::new(bytes);
+    let mut out = vec![OutboundDelegateMsg::GetContractRequest(get)];
+    if context.kind != ReadKind::Canary {
+        held.note_subscribing(id);
+        out.push(OutboundDelegateMsg::SubscribeContractRequest(
+            SubscribeContractRequest::new(ContractInstanceId::new(id)),
+        ));
+    }
+    out
+}
+
+/// The node answered a SUBSCRIBE. `true` when it was one this module sent:
+/// only an Ok makes the contract settled, from now.
+pub(crate) fn on_subscribed<S: SecretStore>(
+    secrets: &mut S,
+    contract: &[u8; 32],
+    result: &Result<(), String>,
+    now_ms: u64,
+) -> bool {
+    let mut ours = false;
+    for mut held in all_held(secrets) {
+        if !held.subscribing.contains(contract) {
+            continue;
+        }
+        ours = true;
+        held.subscribing.retain(|id| id != contract);
+        if result.is_ok() {
+            held.note_subscribed(*contract, now_ms);
+        }
+        store_held(secrets, &held);
+    }
+    ours
 }
 
 /// A wake-up's work: one read, for the delegation that has gone longest
@@ -912,19 +1045,21 @@ pub(crate) fn on_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<Out
 /// an earlier run may be gone, so none counts as settled any more.
 pub(crate) fn on_node_started<S: SecretStore>(secrets: &mut S) {
     for mut held in all_held(secrets) {
-        if !held.subscribed.is_empty() {
+        if !held.subscribed.is_empty() || !held.subscribing.is_empty() {
             held.subscribed.clear();
+            held.subscribing.clear();
             store_held(secrets, &held);
         }
     }
 }
 
-/// Whether `contract` is one this module subscribed to: its notifications
-/// need no handling, since every verdict comes from a GET.
+/// Whether `contract` is one this module ever subscribed to (within
+/// [`EVER_SUBSCRIBED_CAP`]): its notifications need no handling, since every
+/// verdict comes from a GET, and are not forwarded as a `ContractUpdate`.
 pub(crate) fn subscribed_to<S: SecretStore>(secrets: &S, contract: &[u8; 32]) -> bool {
     all_held(secrets)
         .iter()
-        .any(|h| h.subscribed.iter().any(|(id, _)| id == contract))
+        .any(|h| h.ever_subscribed.contains(contract))
 }
 
 /// A GET [`on_wakeup`] (or a canary read) sent has answered. `None` when the
@@ -954,6 +1089,7 @@ pub(crate) fn on_inbox_read<S: SecretStore>(
         ReadKind::Confirm | ReadKind::Probe | ReadKind::Canary => {
             on_address(secrets, held, &read, contract_id, state, now_ms)
         }
+        ReadKind::Sent => None,
     };
     Some(out.unwrap_or_default())
 }
@@ -1001,17 +1137,24 @@ fn on_address<S: SecretStore>(
             if pending.canary != read.script {
                 return None;
             }
-            if seen.is_some_and(|h| h >= pending.since_tip) {
+            if canary_compromised(secrets, &held, pending.canary_index, &pending.canary) {
+                // The tab may be what scans it now: no evidence either way.
+                // Dropped uncredited, not a failure; the next request gets a
+                // new canary.
+                held.unconfirmed = None;
+            } else if seen.is_some_and(|h| h >= pending.since_tip) {
                 for script in pending.scripts {
                     match held.watched.iter_mut().find(|w| w.script == script) {
                         Some(w) => {
                             w.until_height = w.until_height.max(pending.until_height);
                             w.canary = pending.canary.clone();
+                            w.canary_contract = pending.canary_contract;
                         }
                         None => held.watched.push(Watched {
                             script,
                             until_height: pending.until_height,
                             canary: pending.canary.clone(),
+                            canary_contract: pending.canary_contract,
                         }),
                     }
                 }
@@ -1020,16 +1163,15 @@ fn on_address<S: SecretStore>(
                 held.failures = 0;
                 held.last_failure_ms = None;
                 held.last_probe_ms = Some(now_ms);
-            } else if settled
-                && tip.anchor.height >= pending.since_tip.saturating_add(CONFIRM_BLOCKS)
-            {
-                // A settled copy, well past the tip it left at, and the canary
-                // is not scanned: the bridge did not apply the request.
+            } else if tip.anchor.height >= pending.since_tip.saturating_add(CONFIRM_BLOCKS) {
+                // The request left the inbox, a fresh tip is past the window,
+                // and its canary shows nothing: the bridge did not apply it.
+                // A canary nobody else asks for has no address contract until
+                // the bridge publishes for it, so an absent state IS the
+                // evidence here. A read outage looks the same; it costs a
+                // backoff, and a stall only stops sending.
                 held.unconfirmed = None;
                 held.fail(now_ms);
-            } else if now_ms.saturating_sub(pending.left_at_ms) >= CONFIRM_MAX_MS {
-                // Never any evidence: dropped, uncredited, not a failure.
-                held.unconfirmed = None;
             }
         }
         ReadKind::Probe => {
@@ -1053,7 +1195,9 @@ fn on_address<S: SecretStore>(
                     held.canary_tries = 0;
                     held.defer_until_ms = Some(now_ms.saturating_add(CANARY_DEFER_MS));
                 }
-            } else if settled {
+            } else {
+                // Unscanned by construction (see `next_canary`); a read that
+                // finds no contract, or no fresh watermark in one, agrees.
                 held.canary = Some(Canary {
                     script: read.script.clone(),
                     index: read.index,
@@ -1071,8 +1215,8 @@ fn on_address<S: SecretStore>(
                 let inbox = held.inbox_contract_id;
                 out = read_msgs(&mut held, inbox, &context, now_ms);
             }
-            // Unsettled: no evidence yet; read again at the next wake-up.
         }
+        ReadKind::Sent => {}
         ReadKind::Inbox => {}
     }
     if held != before && !store_held(secrets, &held) {
@@ -1136,9 +1280,15 @@ fn on_inbox<S: SecretStore>(
                 return save_if_changed(secrets, &before, &held).then(Vec::new);
             };
             held.outstanding = None;
+            let canary_contract = armed_for(secrets, &held)
+                .first()
+                .and_then(|r| address_contract(&held, &r.arm, &sent.canary))
+                .unwrap_or_default();
             held.unconfirmed = Some(Unconfirmed {
                 scripts: sent.scripts,
                 canary: sent.canary,
+                canary_index: sent.canary_index,
+                canary_contract,
                 until_height: sent.until_height,
                 since_tip: tip.anchor.height,
                 removed,
@@ -1169,21 +1319,33 @@ fn on_inbox<S: SecretStore>(
     let mut scripts = refill_scripts(secrets, &held, tip.anchor.height, now_ms);
     if !scripts.is_empty() {
         // The canary goes LAST: the bridge applies a request's scripts in
-        // order and stops at its cap, so the canary scanned means every
-        // script before it was applied too.
+        // order and counts the rest refused once the Ghost Key's cap is
+        // reached (the count only grows within a request), so the canary
+        // scanned means every script before it was applied too.
         scripts.retain(|s| *s != canary.script);
         scripts.push(canary.script.clone());
-        if let Some((sent, delta)) = build_request(secrets, &held, &floor, &tip, scripts, now_ms) {
+        if let Some((mut sent, delta)) =
+            build_request(secrets, &held, &floor, &tip, scripts, now_ms)
+        {
+            sent.outstanding.canary_index = canary.index;
             held.own_made_at_ms = sent.made_at_ms;
             held.outstanding = Some(sent.outstanding);
             held.canary = None;
             held.canary_next = canary.index.saturating_add(1);
-            out.push(OutboundDelegateMsg::UpdateContractRequest(
-                UpdateContractRequest::new(
-                    ContractInstanceId::new(inbox),
-                    UpdateData::Delta(StateDelta::from(delta)),
-                ),
-            ));
+            let mut update = UpdateContractRequest::new(
+                ContractInstanceId::new(inbox),
+                UpdateData::Delta(StateDelta::from(delta)),
+            );
+            if let Ok(context) = to_cbor(&ReadContext {
+                magic: READ_MAGIC,
+                bridge: held.bridge,
+                kind: ReadKind::Sent,
+                script: Vec::new(),
+                index: 0,
+            }) {
+                update.context = DelegateContext::new(context);
+            }
+            out.push(OutboundDelegateMsg::UpdateContractRequest(update));
         }
     }
     // Recorded before anything is sent: a request sent but not recorded
@@ -1192,6 +1354,29 @@ fn on_inbox<S: SecretStore>(
         return None;
     }
     Some(out)
+}
+
+/// The node answered the inbox UPDATE that submitted a request. `None` when
+/// the context is not this module's. Refused (the contract would not take the
+/// entry): the request was never sent, so it is forgotten, not counted as a
+/// failure, and the next wake-up tries again with a new canary.
+pub(crate) fn on_update_answer<S: SecretStore>(
+    secrets: &mut S,
+    result: &Result<(), String>,
+    context: &[u8],
+) -> Option<Vec<OutboundDelegateMsg>> {
+    let read: ReadContext = from_cbor(context).ok()?;
+    if read.magic != READ_MAGIC || read.kind != ReadKind::Sent {
+        return None;
+    }
+    if result.is_err() {
+        if let Some(mut held) = load_held(secrets, &read.bridge) {
+            if held.outstanding.take().is_some() {
+                store_held(secrets, &held);
+            }
+        }
+    }
+    Some(Vec::new())
 }
 
 fn save_if_changed<S: SecretStore>(secrets: &mut S, before: &Held, now: &Held) -> bool {
@@ -1268,6 +1453,7 @@ fn build_request<S: SecretStore>(
                 mainnet_height,
                 scripts,
                 canary,
+                canary_index: 0,
                 until_height,
                 sent_at_ms: now_ms,
             },
@@ -1554,26 +1740,29 @@ pub(crate) mod test_support {
         (delta, entry)
     }
 
-    /// The one GET a wake-up sends, which must come first, followed by the
-    /// SUBSCRIBE that keeps the node's copy of it fresh.
+    /// The one read a wake-up sends, which must come first: a GET, and a
+    /// SUBSCRIBE of the same contract unless it is a canary candidate.
     pub fn wake(secrets: &mut MemSecrets, now_ms: u64) -> GetContractRequest {
         let out = on_wakeup(secrets, now_ms);
         got_read(&out)
     }
 
-    /// `out` is exactly one read: a GET and a SUBSCRIBE of the same contract.
+    /// `out` is exactly one read.
     pub fn got_read(out: &[OutboundDelegateMsg]) -> GetContractRequest {
-        assert_eq!(out.len(), 2, "one read: {out:?}");
-        let OutboundDelegateMsg::GetContractRequest(get) = &out[0] else {
-            panic!("expected a GET, got {:?}", out[0]);
+        let Some(OutboundDelegateMsg::GetContractRequest(get)) = out.first() else {
+            panic!("expected a GET first, got {out:?}");
         };
-        let OutboundDelegateMsg::SubscribeContractRequest(sub) = &out[1] else {
-            panic!("expected a SUBSCRIBE, got {:?}", out[1]);
-        };
-        assert_eq!(
-            sub.contract_id, get.contract_id,
-            "subscribed to what is read"
-        );
+        match out.get(1) {
+            Some(OutboundDelegateMsg::SubscribeContractRequest(sub)) => {
+                assert_eq!(out.len(), 2, "one read: {out:?}");
+                assert_eq!(
+                    sub.contract_id, get.contract_id,
+                    "subscribed to what is read"
+                );
+            }
+            None => {}
+            Some(other) => panic!("expected only a read, got {other:?}"),
+        }
         get.clone()
     }
 
@@ -1589,7 +1778,8 @@ pub(crate) mod test_support {
     }
 
     /// A wake-up, answered: a canary read first, if that is what it asks
-    /// (answered unscanned), then the inbox read, answered with `state`.
+    /// (answered as live, with no state), then the inbox read, answered with
+    /// `state`.
     pub fn wake_and_read(
         secrets: &mut MemSecrets,
         state: &InboxStateV1,
@@ -1603,8 +1793,8 @@ pub(crate) mod test_support {
                 address_id(secrets, &canary).as_slice(),
                 "a canary is read before a request"
             );
-            let unscanned = address_state(secrets, &canary, None);
-            get = got_read(&answer(secrets, &get, Some(unscanned), now_ms));
+            // As live: nobody has created a canary's address contract.
+            get = got_read(&answer(secrets, &get, None, now_ms));
         }
         assert_eq!(
             get.contract_id.as_bytes(),
@@ -1667,7 +1857,7 @@ pub(crate) mod test_support {
     }
 
     /// Record `scripts` as confirmed watched through `until`, shown by the
-    /// canary at index 100.
+    /// canary at index 40.
     pub fn confirm_watched(secrets: &mut MemSecrets, scripts: &[Vec<u8>], until: u32) {
         let mut h = held(secrets);
         for script in scripts {
@@ -1675,7 +1865,8 @@ pub(crate) mod test_support {
             h.watched.push(Watched {
                 script: script.clone(),
                 until_height: until,
-                canary: script_at(100),
+                canary: script_at(40),
+                canary_contract: address_id(secrets, &script_at(40)),
             });
         }
         put_held(secrets, &h);
@@ -1851,7 +2042,7 @@ mod tests {
         let request = opened(&entry);
         assert_eq!(request.action, Action::Watch);
         assert_eq!(request.network, BitcoinNetwork::Signet);
-        assert_eq!(scripts(&entry), with_canary(0..10, 10));
+        assert_eq!(scripts(&entry), with_canary(0..10, 20));
         assert_eq!(request.watch_until_height, Some(TIP + REQUEST_AHEAD_BLOCKS));
         assert_eq!(request.made_at_ms, NOW + 501, "above the tab's last");
         assert_eq!(request.revoke_watch_keys_through, None);
@@ -1860,9 +2051,10 @@ mod tests {
         assert_eq!(held.own_made_at_ms, NOW + 501);
         let sent = held.outstanding.expect("recorded as outstanding");
         assert_eq!(sent.entry_key, entry.entry.key());
-        assert_eq!(sent.canary, script_at(10));
+        assert_eq!(sent.canary, script_at(20));
+        assert_eq!(sent.canary_index, 20);
         assert_eq!(sent.until_height, TIP + REQUEST_AHEAD_BLOCKS);
-        assert_eq!(held.canary_next, 11, "a canary is used once");
+        assert_eq!(held.canary_next, 21, "a canary is used once");
     }
 
     /// Review round 2 of #179, P1: a request the bridge IGNORED credits
@@ -1883,7 +2075,7 @@ mod tests {
 
         let mut inbox = open_inbox();
         let (delta, entry) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
-        assert_eq!(scripts(&entry).last(), Some(&script_at(10)), "the canary");
+        assert_eq!(scripts(&entry).last(), Some(&script_at(20)), "the canary");
         inbox.apply_delta(&params(), &delta).unwrap();
         // Read and removed, with no effect.
         bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
@@ -1892,45 +2084,63 @@ mod tests {
         let get = wake(&mut secrets, NOW + 10 * MINUTE);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(10)).as_slice(),
+            address_id(&secrets, &script_at(20)).as_slice(),
             "the canary is what is read, not the first script"
         );
-        let unscanned = address_state(&secrets, &script_at(10), None);
-        answer(&mut secrets, &get, Some(unscanned), NOW + 10 * MINUTE);
+        // As live: the canary's address contract was never created.
+        answer(&mut secrets, &get, None, NOW + 10 * MINUTE);
         assert!(watched_now(&secrets, TIP).is_empty(), "nothing credited");
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS, NOW + 60 * MINUTE);
-        wake_and_scan(&mut secrets, &script_at(10), None, NOW + 60 * MINUTE);
+        let get = wake(&mut secrets, NOW + 60 * MINUTE);
+        answer(&mut secrets, &get, None, NOW + 60 * MINUTE);
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.watched.is_empty());
         assert_eq!(h.failures, 1);
     }
 
-    /// A canary candidate someone already has scanned cannot show a request,
-    /// so the next address is tried; after `MAX_CANARY_TRIES` the delegation
-    /// waits. An unsettled copy is no evidence either way. Mutated red by
-    /// taking a scanned candidate, and by trusting an unsettled copy.
+    /// Review round 3 of #179, P1: a canary is unscanned BY CONSTRUCTION
+    /// (past the tab's pool by a margin, past every canary used, not one the
+    /// tab names), so the read that finds NO state (as it does live: nobody
+    /// has created its address contract) goes straight on to the request. A
+    /// candidate someone has scanned is skipped for the next; after
+    /// `MAX_CANARY_TRIES` the delegation waits. Mutated red by requiring a
+    /// state, taking a scanned candidate, dropping the margin, and never
+    /// deferring.
     #[test]
-    fn a_canary_must_be_unscanned_on_a_settled_copy() {
+    fn a_canary_is_unscanned_by_construction() {
         let mut secrets = delegated();
-        let out = wake_and_scan(&mut secrets, &script_at(10), Some(TIP), NOW);
+        // Live: the canary read answers None, and the inbox is read at once.
+        let get = wake(&mut secrets, NOW);
+        assert_eq!(
+            get.contract_id.as_bytes(),
+            address_id(&secrets, &script_at(20)).as_slice(),
+            "past the pool of ten by a margin of ten"
+        );
+        let out = answer(&mut secrets, &get, None, NOW);
+        assert_eq!(got_read(&out).contract_id.as_bytes(), INBOX.as_slice());
+
+        let mut secrets = delegated();
+        let out = wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW);
         assert!(out.is_empty(), "no inbox read for a scanned canary");
-        assert_eq!(held(&secrets).canary_next, 11);
+        assert_eq!(held(&secrets).canary_next, 21);
         assert!(held(&secrets).canary.is_none());
 
-        // Unsettled (a node that just started): no verdict.
-        on_node_started(&mut secrets);
-        let out = wake_and_scan(&mut secrets, &script_at(11), None, NOW + MINUTE);
-        assert!(out.is_empty() && held(&secrets).canary.is_none());
-        settle_all(&mut secrets);
-        let out = wake_and_scan(&mut secrets, &script_at(11), None, NOW + 2 * MINUTE);
-        let get = got_read(&out);
-        assert_eq!(get.contract_id.as_bytes(), INBOX.as_slice());
+        // One the tab names is never a canary.
+        let key = crate::auto_invoice::arm_key(&[1; 32]);
+        let mut record = arm_record(&secrets);
+        record.arm.watched_scripts = vec![script_at(21)];
+        save(&mut secrets, &key, &record);
+        let get = wake(&mut secrets, NOW + MINUTE);
+        assert_eq!(
+            get.contract_id.as_bytes(),
+            address_id(&secrets, &script_at(22)).as_slice()
+        );
 
         let mut secrets = delegated();
         for i in 0..MAX_CANARY_TRIES {
             wake_and_scan(
                 &mut secrets,
-                &script_at(10 + i),
+                &script_at(20 + i),
                 Some(TIP),
                 NOW + u64::from(i),
             );
@@ -1940,6 +2150,52 @@ mod tests {
             "waits"
         );
         assert!(!on_wakeup(&mut secrets, NOW + CANARY_DEFER_MS + 10).is_empty());
+    }
+
+    /// A canary the counter has since brought into the tab's pool, or that
+    /// the tab now names, shows nothing about the request: dropped without
+    /// credit and without a failure, even with a watermark. Mutated red by
+    /// dropping the check.
+    #[test]
+    fn a_canary_that_reached_the_tabs_pool_proves_nothing() {
+        let mut secrets = delegated();
+        let mut inbox = open_inbox();
+        let (delta, entry) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
+        inbox.apply_delta(&params(), &delta).unwrap();
+        bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 5 * MINUTE).is_empty());
+        set_counter(&mut secrets, 11);
+        wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW + 10 * MINUTE);
+        let h = held(&secrets);
+        assert!(h.unconfirmed.is_none() && h.watched.is_empty() && h.failures == 0);
+    }
+
+    /// The node refusing the inbox UPDATE means the request was never sent:
+    /// forgotten, not a failure, and not waited on for two hours. Mutated red
+    /// by ignoring the answer.
+    #[test]
+    fn a_refused_inbox_update_is_not_waited_on() {
+        let mut secrets = delegated();
+        let out = wake_and_read(&mut secrets, &open_inbox(), NOW);
+        let OutboundDelegateMsg::UpdateContractRequest(update) = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert!(
+            on_update_answer(&mut secrets, &Ok(()), update.context.as_ref())
+                .is_some_and(|out| out.is_empty())
+        );
+        assert!(
+            held(&secrets).outstanding.is_some(),
+            "taken: still waited on"
+        );
+        on_update_answer(
+            &mut secrets,
+            &Err("refused".into()),
+            update.context.as_ref(),
+        );
+        let h = held(&secrets);
+        assert!(h.outstanding.is_none() && h.failures == 0);
+        assert!(on_update_answer(&mut secrets, &Ok(()), b"not ours").is_none());
     }
 
     /// One request at a time: while it sits unread in the inbox, may still be
@@ -1996,11 +2252,10 @@ mod tests {
     /// A removal is not a watch: the scripts count for I7 only once the
     /// canary's watermark by this bridge reaches the tip the request left at;
     /// one from before it, one signed by another key, none, or no state at
-    /// all, does not confirm, and only a settled copy still short past
-    /// `CONFIRM_BLOCKS` fails it. Mutated red by: confirming on the removal
-    /// alone, dropping the `since_tip` comparison, not verifying the claim's
-    /// signature, not failing after `CONFIRM_BLOCKS`, and failing on an
-    /// unsettled copy.
+    /// all, does not confirm, and one still short `CONFIRM_BLOCKS` past it
+    /// fails. Mutated red by: confirming on the removal alone, dropping the
+    /// `since_tip` comparison, not verifying the claim's signature, not
+    /// failing at `CONFIRM_BLOCKS`, and failing before it.
     #[test]
     fn a_read_request_counts_only_once_its_canary_shows() {
         let mut secrets = delegated();
@@ -2014,7 +2269,7 @@ mod tests {
             "read, not yet watched"
         );
 
-        let canary = script_at(10);
+        let canary = script_at(20);
         wake_and_scan(&mut secrets, &canary, None, NOW + 10 * MINUTE);
         wake_and_scan(&mut secrets, &canary, Some(TIP - 1), NOW + 15 * MINUTE);
         // Signed by someone other than the bridge.
@@ -2043,17 +2298,22 @@ mod tests {
         assert!(watched_now(&secrets, TIP).is_empty());
 
         wake_and_scan(&mut secrets, &canary, Some(TIP), NOW + 25 * MINUTE);
-        assert_eq!(watched_now(&secrets, TIP), with_canary(0..10, 10));
+        assert_eq!(watched_now(&secrets, TIP), with_canary(0..10, 20));
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.failures == 0);
         let status = status_of(&secrets, &h, NOW);
         assert_eq!((status.watched, status.outstanding), (10, false));
 
-        // Another request whose canary never shows.
+        // Another request whose canary never shows: its address contract
+        // is never created, so every read answers None. Inside the window,
+        // no verdict; at `CONFIRM_BLOCKS` past the tip it left at (review
+        // round 3, P2-a: stalls must be reachable), a failure.
         let mut h = held(&secrets);
         h.unconfirmed = Some(Unconfirmed {
-            scripts: vec![script_at(0), script_at(20)],
-            canary: script_at(20),
+            scripts: vec![script_at(0), script_at(30)],
+            canary: script_at(30),
+            canary_index: 30,
+            canary_contract: address_id(&secrets, &script_at(30)),
             until_height: TIP + 1,
             since_tip: TIP,
             removed: true,
@@ -2061,17 +2321,13 @@ mod tests {
         });
         put_held(&mut secrets, &h);
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS - 1, NOW + 30 * MINUTE);
-        wake_and_scan(&mut secrets, &script_at(20), None, NOW + 30 * MINUTE);
+        let get = wake(&mut secrets, NOW + 30 * MINUTE);
+        answer(&mut secrets, &get, None, NOW + 30 * MINUTE);
         assert_eq!(held(&secrets).failures, 0, "not yet");
+        assert!(held(&secrets).unconfirmed.is_some());
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS, NOW + 35 * MINUTE);
-        // No state at all, and then an unsettled copy: no evidence.
         let get = wake(&mut secrets, NOW + 35 * MINUTE);
         answer(&mut secrets, &get, None, NOW + 35 * MINUTE);
-        on_node_started(&mut secrets);
-        wake_and_scan(&mut secrets, &script_at(20), None, NOW + 36 * MINUTE);
-        assert_eq!(held(&secrets).failures, 0, "no evidence yet");
-        settle_all(&mut secrets);
-        wake_and_scan(&mut secrets, &script_at(20), None, NOW + 37 * MINUTE);
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none());
         assert_eq!(h.failures, 1);
@@ -2090,7 +2346,7 @@ mod tests {
         let h = held(&secrets);
         assert!(h.unconfirmed.as_ref().is_some_and(|u| !u.removed));
         assert_eq!(h.failures, 0);
-        wake_and_scan(&mut secrets, &script_at(10), Some(TIP), NOW + 45 * MINUTE);
+        wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW + 45 * MINUTE);
         assert_eq!(watched_now(&secrets, TIP).len(), 11);
     }
 
@@ -2150,7 +2406,7 @@ mod tests {
         assert!(on_wakeup(&mut secrets, NOW + 30 * MINUTE).is_empty());
         let at = NOW + 10 * MINUTE + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 6, at);
-        wake_and_scan(&mut secrets, &script_at(10), Some(TIP + 6), at);
+        wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 6), at);
         assert_eq!(watched_now(&secrets, TIP + 6).len(), 11, "live");
         let at = at + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 20, at);
@@ -2158,14 +2414,14 @@ mod tests {
         let get = wake(&mut secrets, at);
         answer(&mut secrets, &get, None, at);
         assert_eq!(watched_now(&secrets, TIP + 20).len(), 11);
-        // Unsettled: nothing withdrawn.
+        // Unsettled (the SUBSCRIBE not yet answered Ok): nothing withdrawn.
         on_node_started(&mut secrets);
-        wake_and_scan(&mut secrets, &script_at(10), Some(TIP + 13), at + MINUTE);
+        wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 13), at + MINUTE);
         assert_eq!(watched_now(&secrets, TIP + 20).len(), 11);
         settle_all(&mut secrets);
         wake_and_scan(
             &mut secrets,
-            &script_at(10),
+            &script_at(20),
             Some(TIP + 13),
             at + 2 * MINUTE,
         );
@@ -2196,7 +2452,7 @@ mod tests {
             &open_inbox(),
             NOW + 30 * MINUTE,
         ));
-        assert_eq!(scripts(&renewal), with_canary(0..10, 11));
+        assert_eq!(scripts(&renewal), with_canary(0..10, 21));
         assert!(
             opened(&renewal).made_at_ms > NOW + 501,
             "above its own last"
@@ -2233,7 +2489,7 @@ mod tests {
             u1 - WATCH_NEEDED_BLOCKS - RENEW_MARGIN_BLOCKS + 1,
         );
         let (_, renewal) = submitted(&wake_and_read(&mut secrets, &open_inbox(), NOW));
-        assert_eq!(scripts(&renewal), with_canary(6..10, 16));
+        assert_eq!(scripts(&renewal), with_canary(6..10, 26));
     }
 
     /// Requests whose canary never shows: each failure waits a doubling
@@ -2301,11 +2557,11 @@ mod tests {
             },
             NOW,
         );
-        assert!(out.len() >= 3, "{out:?}");
-        let get = got_read(&out[..2]);
+        assert!(out.len() >= 2, "{out:?}");
+        let get = got_read(&out[..1]);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(10)).as_slice()
+            address_id(&secrets, &script_at(20)).as_slice()
         );
     }
 
@@ -2353,6 +2609,7 @@ mod tests {
             script: script_at(1),
             until_height: TIP + 500,
             canary: script_at(90),
+            canary_contract: [0; 32],
         });
         store_held(&mut secrets, &second);
         let both = [bridge(), other];
@@ -2424,29 +2681,79 @@ mod tests {
                 script: script_at(i),
                 until_height: TIP + i,
                 canary: Vec::new(),
+                canary_contract: [0; 32],
             });
         }
         h.watched.push(Watched {
             script: vec![1],
             until_height: TIP - 1,
             canary: Vec::new(),
+            canary_contract: [0; 32],
         });
         prune_watched(&mut h, TIP);
         assert_eq!(h.watched.len(), WATCHED_CAP);
         assert!(h.watched.iter().all(|w| w.until_height >= TIP + 10));
     }
 
-    /// Every read also subscribes, and a node start makes every copy
-    /// unsettled again. Mutated red by not clearing on start.
+    /// Review round 3, P2-b: a copy is settled only once the node answered
+    /// its SUBSCRIBE Ok, `SETTLE_MS` ago; an Err, no answer, or a node start
+    /// leaves it unsettled. A notification for any contract ever subscribed
+    /// to is this module's, even once its record is evicted. Mutated red by
+    /// settling on the send, settling on an Err, not clearing on start, and
+    /// forgetting evicted contracts.
     #[test]
-    fn a_node_start_unsettles_every_copy() {
+    fn a_copy_is_settled_only_by_an_ok_to_its_subscribe() {
         let mut secrets = delegated();
-        assert!(held(&secrets).settled(&INBOX, NOW));
         on_node_started(&mut secrets);
         assert!(!held(&secrets).settled(&INBOX, NOW));
-        assert!(!subscribed_to(&secrets, &INBOX));
-        wake(&mut secrets, NOW);
-        assert!(!held(&secrets).subscribed.is_empty());
+        // An inbox read subscribes; nothing is settled until the node says Ok.
+        let mut h = held(&secrets);
+        let context = ReadContext {
+            magic: READ_MAGIC,
+            bridge: bridge(),
+            kind: ReadKind::Inbox,
+            script: Vec::new(),
+            index: 0,
+        };
+        let out = read_msgs(&mut h, INBOX, &context, NOW);
+        put_held(&mut secrets, &h);
+        got_read(&out);
+        assert!(!held(&secrets).settled(&INBOX, NOW + SETTLE_MS));
+        assert!(on_subscribed(&mut secrets, &INBOX, &Err("no".into()), NOW));
+        assert!(!held(&secrets).settled(&INBOX, NOW + SETTLE_MS));
+        assert!(
+            !on_subscribed(&mut secrets, &INBOX, &Ok(()), NOW),
+            "not asked any more"
+        );
+        let mut h = held(&secrets);
+        read_msgs(&mut h, INBOX, &context, NOW);
+        put_held(&mut secrets, &h);
+        assert!(on_subscribed(&mut secrets, &INBOX, &Ok(()), NOW));
+        assert!(!held(&secrets).settled(&INBOX, NOW + SETTLE_MS - 1));
+        assert!(held(&secrets).settled(&INBOX, NOW + SETTLE_MS));
+        assert!(
+            !on_subscribed(&mut secrets, &[0x77; 32], &Ok(()), NOW),
+            "not ours"
+        );
+        on_node_started(&mut secrets);
+        assert!(!held(&secrets).settled(&INBOX, NOW + SETTLE_MS));
+        assert!(subscribed_to(&secrets, &INBOX), "still dropped as ours");
+    }
+
+    /// `SUBSCRIBED_CAP`: past it, the oldest record nothing reads any more is
+    /// evicted, never the inbox or a canary in use while another could go.
+    /// Mutated red by evicting the oldest regardless.
+    #[test]
+    fn the_subscribed_record_evicts_what_is_not_in_use() {
+        let mut h = held(&delegated());
+        h.subscribed.clear();
+        h.note_subscribed(INBOX, 0);
+        for n in 0..SUBSCRIBED_CAP as u8 {
+            h.note_subscribed([n.wrapping_add(100); 32], 1);
+        }
+        assert_eq!(h.subscribed.len(), SUBSCRIBED_CAP);
+        assert!(h.settled(&INBOX, SETTLE_MS), "the inbox stays");
+        assert!(!h.subscribed.iter().any(|(id, _)| *id == [100; 32]));
     }
 
     /// Nothing is sent without a delegation, without an armed store on its
