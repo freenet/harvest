@@ -105,12 +105,8 @@ pub fn BuyForm(
             .get(&store_contract_id)
             .and_then(|s| s.conversations.last())
             .map(|c| c.buyer_public_key);
-        let purchases: Vec<BuyerPurchase> = state
-            .buyer_purchases(&store_contract_id)
-            .into_iter()
-            .filter(|p| Some(p.conversation) == current)
-            .collect();
-        open_unpaid_orders(&purchases) >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
+        unpaid_in_conversation(&state.buyer_purchases(&store_contract_id), current)
+            >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
     };
     let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid;
 
@@ -288,6 +284,18 @@ pub fn BuyForm(
             }
         }
     }
+}
+
+/// [`open_unpaid_orders`] in the conversation tagged `current` alone: the
+/// one a Buy now goes out in, and what the store counts per. None before a
+/// conversation exists.
+fn unpaid_in_conversation(purchases: &[BuyerPurchase], current: Option<[u8; 32]>) -> usize {
+    let here: Vec<BuyerPurchase> = purchases
+        .iter()
+        .filter(|p| Some(p.conversation) == current)
+        .cloned()
+        .collect();
+    open_unpaid_orders(&here)
 }
 
 /// How many of this buyer's orders at a store are Buy now orders still
@@ -1599,6 +1607,15 @@ mod tests {
             open_unpaid_orders(&[paid, cancelled, stale, by_hand, unpublished]),
             0
         );
+        // Only the conversation the Buy now goes out in counts. Mutated red
+        // by counting every conversation.
+        let mut elsewhere = open.clone();
+        elsewhere.conversation = [9; 32];
+        assert_eq!(
+            unpaid_in_conversation(&[open.clone(), elsewhere], Some([2; 32])),
+            1
+        );
+        assert_eq!(unpaid_in_conversation(std::slice::from_ref(&open), None), 0);
         let at_cap = vec![open; harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER];
         assert_eq!(
             open_unpaid_orders(&at_cap),
