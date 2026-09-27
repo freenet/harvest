@@ -11109,7 +11109,7 @@ impl AppState {
             } => {
                 let create = self.on_heartbeat_answer(store_contract_id, result);
                 #[cfg(target_arch = "wasm32")]
-                if let Some((store_key, heartbeat)) = create {
+                if let Some((store_id, store_key, heartbeat)) = create {
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Err(e) =
                             crate::gateway::presence_ops::publish(&store_key, heartbeat).await
@@ -11117,6 +11117,11 @@ impl AppState {
                             dioxus::logger::tracing::warn!(
                                 "could not create the store's presence contract: {e}"
                             );
+                            // Try again with the next heartbeat, rather than
+                            // leave the delegate's UPDATEs nothing to land on.
+                            crate::gateway::APP_STATE
+                                .write()
+                                .on_presence_publish_failed(&store_id);
                         }
                     });
                 }
@@ -31156,6 +31161,25 @@ mod buy_flow_tests {
             .expect("an arm");
         assert_eq!(arm.watched_until_height, Some(4_000));
         assert_eq!(arm.watch_left_ms, 3_000 * HORIZON_BLOCK_MS);
+        // A renewal the bridge has not read yet counts for the horizon the
+        // last READ request bought, not the one it asks for.
+        let unread = crate::bitcoin_inbox::SentWatch {
+            read: false,
+            until_height: Some(9_000),
+            read_until_height: Some(3_500),
+            ..sent(0)
+        };
+        state
+            .bitcoin
+            .inbox
+            .as_mut()
+            .unwrap()
+            .sent
+            .insert(key(6), unread);
+        let (arm, _) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert_eq!(arm.watched_until_height, Some(3_500));
         let store_key = registration.store_verifying_key.unwrap();
         assert_eq!(
             arm.presence_contract_id,
@@ -31242,6 +31266,81 @@ mod buy_flow_tests {
         );
         // Not ours: the caller goes on.
         assert!(!state.on_presence_state(&[0; 32], &signed_by(&sk)));
+        // Open: not read again, however long.
+        let later = now + crate::presence_flow::PRESENCE_REFRESH_MS;
+        assert!(state.follow_due_presence(later).is_empty(), "open");
+    }
+
+    /// A store whose presence does not read open is read again every
+    /// [`crate::presence_flow::PRESENCE_REFRESH_MS`]: a GET that found
+    /// nothing yet, or a subscription that died, does not leave it closed
+    /// for the session. Mutated red by never reading again, and by reading
+    /// again however recently read.
+    #[test]
+    fn a_store_that_does_not_read_open_is_read_again() {
+        use crate::presence_flow::PRESENCE_REFRESH_MS;
+        let mut state = AppState::default();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x35; 32]);
+        state.browsing_stores.insert(
+            vec![8; 32],
+            BrowsingStore {
+                owner: Some(sk.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        let now = 1_800_000_000_000u64;
+        let first = state.follow_due_presence(now);
+        assert_eq!(first.len(), 1);
+        assert!(state
+            .follow_due_presence(now + PRESENCE_REFRESH_MS - 1)
+            .is_empty());
+        assert!(!state.presence_due(now + PRESENCE_REFRESH_MS - 1));
+        assert!(state.presence_due(now + PRESENCE_REFRESH_MS));
+        assert_eq!(state.follow_due_presence(now + PRESENCE_REFRESH_MS), first);
+        // Still followed since the first read: "checking" is not restarted.
+        assert_eq!(state.presence.following[first[0].as_slice()].2, now);
+    }
+
+    /// The delegate's first heartbeat of the session is the one the tab
+    /// creates the presence contract with, and the store reads open from it
+    /// at once; later ones create nothing. If the create does not go out,
+    /// the next heartbeat asked for is forced and creates it again. Mutated
+    /// red by creating every time, and by not forcing after a failure.
+    #[test]
+    fn the_first_heartbeat_creates_the_presence_contract_until_it_goes_out() {
+        use harvest_common::delegate::HeartbeatAnswer;
+        use harvest_common::presence::{Heartbeat, SignedHeartbeat};
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let store = instant_store();
+        let registration = state.my_stores["seller-fp"][0].clone();
+        let (arm, _) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        let key = crate::state::test_store_key();
+        state.browsing_stores.get_mut(&store).unwrap().owner = Some(key);
+        let now = crate::state::now_ms();
+        let answer = |sk: &ed25519_dalek::SigningKey| {
+            Ok(HeartbeatAnswer {
+                heartbeat: Some(SignedHeartbeat::sign(sk, Heartbeat::new(now, now, true)).unwrap()),
+                last_wakeup_ms: None,
+            })
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        let created = state
+            .on_heartbeat_answer(store.clone(), answer(&sk))
+            .expect("the first creates");
+        assert_eq!((created.0.as_slice(), created.1), (store.as_slice(), key));
+        assert!(state.store_presence(&store, now).is_open());
+        assert!(state
+            .on_heartbeat_answer(store.clone(), answer(&sk))
+            .is_none());
+        // The PUT did not go out: forced again at once.
+        state.queue_heartbeats(now);
+        state.on_presence_publish_failed(&store);
+        assert_eq!(state.heartbeats_due(now), vec![(store.clone(), true)]);
+        assert!(state.on_heartbeat_answer(store, answer(&sk)).is_some());
     }
 
     /// The delegate writes its orders to the store an arm names, so an arm
@@ -32002,6 +32101,70 @@ mod store_code_tests {
         assert_eq!(rows[1].code, plain, "archived after the rest");
         assert_eq!(rows[1].label, format!("Store {plain}"), "labelled by code");
         assert!(rows[1].archived);
+    }
+
+    /// A closed store is greyed and listed after the open ones, whatever its
+    /// name. Mutated red by dropping the closed key from the sort.
+    #[test]
+    fn closed_stores_are_listed_after_open_ones() {
+        use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
+        let mut state = AppState::default();
+        let open_key = seller();
+        let closed_key = other();
+        let code =
+            |k: &ed25519_dalek::SigningKey| harvest_common::store::store_code(&k.verifying_key());
+        state.on_delegate_response(HarvestDelegateResponse::RememberedStores {
+            stores: [&open_key, &closed_key]
+                .iter()
+                .map(|k| harvest_common::RememberedStore {
+                    store_code: code(k),
+                    archived: false,
+                })
+                .collect(),
+        });
+        let now = crate::state::now_ms();
+        for (key, name) in [(&open_key, "Z open"), (&closed_key, "A closed")] {
+            let id = crate::gateway::store_ops::store_instance_id(
+                &StoreParameters::from_code(&code(key)).expect("a code"),
+            )
+            .expect("derive");
+            let store = state
+                .browsing_stores
+                .entry(id.as_bytes().to_vec())
+                .or_default();
+            store.owner = Some(key.verifying_key().to_bytes());
+            store.info = Some(StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: name.to_string(),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            });
+        }
+        // Both followed long enough ago to be past "checking"; only one has
+        // a fresh heartbeat.
+        let follow = state.follow_due_presence(now - crate::presence_flow::PRESENCE_CHECKING_MS);
+        assert_eq!(follow.len(), 2);
+        let open_presence =
+            crate::auto_invoice_flow::presence_instance_bytes(&open_key.verifying_key().to_bytes())
+                .unwrap();
+        let fresh = harvest_common::to_cbor(&PresenceStateV1 {
+            heartbeat: Some(
+                SignedHeartbeat::sign(&open_key, Heartbeat::new(now, now, true)).unwrap(),
+            ),
+        })
+        .unwrap();
+        assert!(state.on_presence_state(&open_presence, &fresh));
+        let (rows, _) = state.store_list_rows(false);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.label.as_str(), r.closed))
+                .collect::<Vec<_>>(),
+            vec![("Z open", false), ("A closed", true)]
+        );
     }
 }
 

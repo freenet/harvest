@@ -78,9 +78,11 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     if owned {
         // Buyer text no Ghost Key vouches for is taken out here, before
         // anything counts or groups it (the anti-spam gate's seller half).
+        let published_orders = store.map(|s| s.orders.as_slice()).unwrap_or_default();
         let (entries, unvouched) = shown_to_seller(
             app_state.mailbox_entries(&store_contract_id),
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
+            |tag, selection| paid_request_in(published_orders, tag, selection),
         );
         // The only authorship this client can establish: what it sent itself.
         let authored: Vec<[u8; 32]> = entries
@@ -1140,38 +1142,49 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 ///
 /// Buyer-to-seller messages need a Ghost Key (anti-spam); buying does not.
 /// The mailbox is open-write, so the buyer's compose gate alone stops nobody
-/// with a script, and this is the half that does: free text is shown only
-/// when a Ghost Key vouches for the conversation it arrived in.
+/// with a script, and this is the half that does: free text reaches the
+/// seller only in a conversation that is OPEN, which takes one of
 ///
-/// * A buyer's plain [`MessageContent::Text`] (addressed to the seller) is
-///   left out: a current buyer sends [`MessageContent::VouchedText`].
-/// * A `VouchedText` is shown only if its voucher verifies for THIS
-///   conversation's tag (`verifies`), so one copied from another conversation
-///   vouches for nothing.
-/// * Text addressed to the BUYER is the seller's own reply direction, but
-///   both parties hold both keys (`attribution`), so a script can flip the
-///   direction to get past the rule above. It is shown only in a conversation
-///   the buyer opened legitimately: one with a verified voucher, or a request
-///   to buy.
+/// * a [`MessageContent::VouchedText`] whose voucher verifies for THIS
+///   conversation's tag (`verifies`), so one copied from another
+///   conversation vouches for nothing; or
+/// * a Buy now request whose order the seller's store has PAID
+///   (`paid_request`): money, not a Ghost Key, but no cheaper for a spammer.
 ///
-/// Everything else -- requests to buy, acceptances, declines, unreadable
-/// entries -- is untouched: buying needs no Ghost Key.
+/// A request to buy on its own opens nothing: it costs nothing to send.
+///
+/// In a conversation that is not open:
+///
+/// * a buyer's plain [`MessageContent::Text`] is left out (a current buyer
+///   sends `VouchedText`), and so is text addressed to the BUYER: that is the
+///   seller's reply direction, but both parties hold both keys
+///   (`attribution`), so a script can flip the direction;
+/// * the free text inside other steps is blanked rather than the step left
+///   out, so what a request or a decline DOES (answering, counting) is
+///   unchanged: a request's `note` and `shipping` (the address shows once it
+///   is paid, [`SHIPPING_SHOWN_ONCE_PAID`]) and a decline's `reason`.
+///
+/// The count is of buyer text the seller did not see: messages left out and
+/// non-empty notes and reasons blanked. A blanked address is not counted: a
+/// seller is not told about an unpaid Buy now at all.
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
+    paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
     use crate::messaging::Addressing;
+    let tag_of = |conversation: &[u8]| <[u8; 32]>::try_from(conversation).ok();
     let vouched = |entry: &MailboxEntry| match entry {
         MailboxEntry::Readable {
             conversation,
             content: MessageContent::VouchedText { voucher, .. },
             ..
-        } => <[u8; 32]>::try_from(conversation.as_slice()).is_ok_and(|tag| verifies(voucher, &tag)),
+        } => tag_of(conversation).is_some_and(|tag| verifies(voucher, &tag)),
         _ => false,
     };
     // Verified once per entry: `verifies` may be an RSA chain check.
     let verdicts: Vec<bool> = entries.iter().map(vouched).collect();
-    let opened: std::collections::HashSet<&[u8]> = entries
+    let opened: std::collections::HashSet<Vec<u8>> = entries
         .iter()
         .zip(&verdicts)
         .filter(|(entry, verified)| {
@@ -1179,21 +1192,26 @@ pub(crate) fn shown_to_seller(
                 || matches!(
                     entry,
                     MailboxEntry::Readable {
-                        content: MessageContent::OrderRequest { .. },
+                        content: MessageContent::OrderRequest {
+                            instant: Some(selection),
+                            ..
+                        },
+                        conversation,
                         ..
-                    }
+                    } if tag_of(conversation).is_some_and(|tag| paid_request(&tag, selection))
                 )
         })
-        .map(|(entry, _)| entry.conversation())
+        .map(|(entry, _)| entry.conversation().to_vec())
         .collect();
-    let keep: Vec<bool> = entries
-        .iter()
-        .zip(&verdicts)
-        .map(|(entry, verified)| match entry {
+    let mut hidden = 0;
+    let mut shown = Vec::with_capacity(entries.len());
+    for (mut entry, verified) in entries.into_iter().zip(verdicts) {
+        let open = opened.contains(entry.conversation());
+        let keep = match &mut entry {
             MailboxEntry::Readable {
                 content: MessageContent::VouchedText { .. },
                 ..
-            } => *verified,
+            } => verified,
             MailboxEntry::Readable {
                 content: MessageContent::Text(_),
                 addressing: Addressing::ToSeller,
@@ -1202,19 +1220,59 @@ pub(crate) fn shown_to_seller(
             MailboxEntry::Readable {
                 content: MessageContent::Text(_),
                 addressing: Addressing::ToBuyer,
-                conversation,
                 ..
-            } => opened.contains(conversation.as_slice()),
+            } => open,
+            MailboxEntry::Readable {
+                content: MessageContent::OrderRequest { note, shipping, .. },
+                ..
+            } if !open => {
+                if !note.trim().is_empty() {
+                    hidden += 1;
+                }
+                note.clear();
+                *shipping = SHIPPING_SHOWN_ONCE_PAID.to_string();
+                true
+            }
+            MailboxEntry::Readable {
+                content: MessageContent::Decline { reason },
+                ..
+            } if !open => {
+                if !reason.trim().is_empty() {
+                    hidden += 1;
+                }
+                reason.clear();
+                true
+            }
             _ => true,
-        })
-        .collect();
-    let hidden = keep.iter().filter(|kept| !**kept).count();
-    let shown = entries
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(entry, kept)| kept.then_some(entry))
-        .collect();
+        };
+        if keep {
+            shown.push(entry);
+        } else {
+            hidden += 1;
+        }
+    }
     (shown, hidden)
+}
+
+/// What a seller reads in place of the address on a request whose
+/// conversation is not open ([`shown_to_seller`]).
+pub(crate) const SHIPPING_SHOWN_ONCE_PAID: &str = "(shown once it is paid)";
+
+/// Whether the Buy now request `selection`, in the conversation `tag`, is
+/// answered by an order in `published` that has been paid: what opens a
+/// conversation to the seller without a voucher ([`shown_to_seller`]).
+pub(crate) fn paid_request_in(
+    published: &[harvest_common::payment::AuthorizedOrder],
+    tag: &[u8; 32],
+    selection: &crate::messaging::InstantSelection,
+) -> bool {
+    let Some(request) = selection.answered_request(tag) else {
+        return false;
+    };
+    let id = request.order_id();
+    published
+        .iter()
+        .any(|order| order.order.id == id && !crate::fulfilment::is_unpaid_buy_now(order))
 }
 
 /// The request to buy this conversation is waiting on, if any.
@@ -1790,6 +1848,46 @@ mod inbox_tests {
         assert_eq!(found[0].instant.unwrap().request, request(2));
     }
 
+    /// A Buy now request opens its conversation to the seller only once its
+    /// own order is paid: not unpaid, not cancelled, not another order.
+    /// Mutated red by dropping the paid check, and the id match.
+    #[test]
+    fn only_a_paid_buy_now_opens_its_conversation() {
+        let tag = [1u8; 32];
+        let selection = crate::messaging::InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [4; 16],
+            region: None,
+            choices: vec![],
+            expected_total_sats: 12_000,
+        };
+        let own = selection.answered_request(&tag).unwrap();
+        let mut order = published(1, Some(BINDING), None);
+        order.order.id = own.order_id();
+        order.order.request_id = Some(own.request_id);
+        assert!(
+            !paid_request_in(&[order.clone()], &tag, &selection),
+            "unpaid"
+        );
+        order.status = harvest_common::payment::OrderStatus::Cancelled;
+        assert!(
+            !paid_request_in(&[order.clone()], &tag, &selection),
+            "cancelled"
+        );
+        order.status = harvest_common::payment::OrderStatus::Paid;
+        assert!(paid_request_in(&[order.clone()], &tag, &selection));
+        let mut other = order.clone();
+        other.order.id = harvest_common::payment::OrderId([7; 32]);
+        assert!(
+            !paid_request_in(&[other], &tag, &selection),
+            "another order"
+        );
+        assert!(
+            !paid_request_in(&[order], &[2u8; 32], &selection),
+            "another conversation"
+        );
+    }
+
     /// The count beside Orders is the number of accept controls the inbox
     /// would show, summed over conversations, each judged with its OWN keys,
     /// less requests for a listing not on sale or not in the store.
@@ -2338,10 +2436,63 @@ mod voucher_view_tests {
         )
     }
 
+    /// The conversation whose Buy now is paid, in these tests.
+    const PAID: [u8; 32] = [6; 32];
+
     fn shown(entries: Vec<MailboxEntry>) -> (Vec<MailboxEntry>, usize) {
-        shown_to_seller(entries, |voucher, tag| {
-            crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
-        })
+        shown_to_seller(
+            entries,
+            |voucher, tag| {
+                crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
+            },
+            |tag, _| *tag == PAID,
+        )
+    }
+
+    fn buy_now(tag: [u8; 32], note: &str) -> MailboxEntry {
+        entry(
+            tag,
+            Addressing::ToSeller,
+            MessageContent::OrderRequest {
+                listing_id: harvest_common::listing::ListingId([9; 32]),
+                quantity: 1,
+                shipping: "12 Example St".into(),
+                note: note.into(),
+                order_binding: [5; 32],
+                buyer_receipt_key: None,
+                instant: Some(crate::messaging::InstantSelection {
+                    requested_at_ms: 1_700_000_000_000,
+                    nonce: [4; 16],
+                    region: None,
+                    choices: vec![],
+                    expected_total_sats: 12_000,
+                }),
+            },
+        )
+    }
+
+    fn decline(tag: [u8; 32], reason: &str) -> MailboxEntry {
+        entry(
+            tag,
+            Addressing::ToBuyer,
+            MessageContent::Decline {
+                reason: reason.into(),
+            },
+        )
+    }
+
+    fn free_text(entry: &MailboxEntry) -> (String, String) {
+        match entry {
+            MailboxEntry::Readable {
+                content: MessageContent::OrderRequest { note, shipping, .. },
+                ..
+            } => (note.clone(), shipping.clone()),
+            MailboxEntry::Readable {
+                content: MessageContent::Decline { reason },
+                ..
+            } => (reason.clone(), String::new()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -2371,40 +2522,58 @@ mod voucher_view_tests {
         assert_eq!(shown(vec![vouched(TAG, &broken)]).1, 1);
     }
 
-    /// Buying needs no Ghost Key: requests to buy, and everything else that
-    /// is not free text, are shown whatever the conversation carries.
+    /// Buying needs no Ghost Key: a request to buy and a decline are shown
+    /// in any conversation, but the free text in them only once the
+    /// conversation is open. Otherwise one free request carries a spammer's
+    /// text past the gate. Mutated red by showing them unblanked, and by not
+    /// counting what was blanked.
     #[test]
-    fn order_requests_and_other_steps_are_shown() {
-        let entries = vec![
+    fn requests_and_declines_are_shown_with_their_text_held_back() {
+        let (shown_entries, hidden) = shown(vec![
             order_request(TAG),
-            entry(
-                OTHER,
-                Addressing::ToSeller,
-                MessageContent::Decline {
-                    reason: "changed my mind".into(),
-                },
-            ),
-        ];
+            buy_now(OTHER, "buy my stuff at example.com"),
+            decline(OTHER, "cheap pills"),
+        ]);
+        assert_eq!(shown_entries.len(), 3, "every step is shown");
+        assert_eq!(
+            free_text(&shown_entries[0]),
+            (String::new(), SHIPPING_SHOWN_ONCE_PAID.to_string())
+        );
+        assert_eq!(
+            free_text(&shown_entries[1]),
+            (String::new(), SHIPPING_SHOWN_ONCE_PAID.to_string())
+        );
+        assert_eq!(free_text(&shown_entries[2]).0, "");
+        // The note and the reason; an address held back is not counted.
+        assert_eq!(hidden, 2);
+
+        // A paid Buy now's conversation is open: all of it is shown.
+        let entries = vec![buy_now(PAID, "gift wrap please"), decline(PAID, "sold out")];
         assert_eq!(shown(entries.clone()), (entries, 0));
     }
 
-    /// Text in the seller's reply direction is shown in a conversation the
-    /// buyer opened legitimately, and not in one opened by nothing: both
+    /// Text in the seller's reply direction is shown in a conversation that
+    /// is open (a verified voucher, a paid Buy now) and in no other: both
     /// parties hold both keys, so flipping the direction must not get a
-    /// script past the gate.
+    /// script past the gate, and an unpaid request to buy opens nothing.
     #[test]
-    fn reply_direction_text_needs_a_legitimately_opened_conversation() {
+    fn reply_direction_text_needs_an_open_conversation() {
         let (voucher, _, _) = vouch(&TAG);
         let (shown_entries, hidden) = shown(vec![
             vouched(TAG, &voucher),
             text(TAG, Addressing::ToBuyer),
-            order_request(OTHER),
+            buy_now(PAID, ""),
+            text(PAID, Addressing::ToBuyer),
+            buy_now(OTHER, ""),
             text(OTHER, Addressing::ToBuyer),
             text([4; 32], Addressing::ToBuyer),
         ]);
-        assert_eq!(hidden, 1);
-        assert_eq!(shown_entries.len(), 4);
-        assert!(shown_entries.iter().all(|e| e.conversation() != [4; 32]));
+        assert_eq!(hidden, 2);
+        assert_eq!(shown_entries.len(), 5);
+        assert!(shown_entries
+            .iter()
+            .all(|e| !matches!(e, MailboxEntry::Readable { content: MessageContent::Text(_), conversation, .. }
+                if conversation.as_slice() == OTHER || conversation.as_slice() == [4; 32])));
     }
 
     #[test]

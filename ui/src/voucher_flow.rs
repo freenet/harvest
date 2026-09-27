@@ -546,9 +546,11 @@ mod tests {
                 .to_bytes();
             keys.insert(tag.to_vec(), ConversationKeys::from_shared_secret(&shared));
         }
-        shown_to_seller(crate::messaging::read_mailbox(messages, &keys), |v, t| {
-            crate::ghostkey_cert::verify_voucher_under(v, t, &test_master()).is_ok()
-        })
+        shown_to_seller(
+            crate::messaging::read_mailbox(messages, &keys),
+            |v, t| crate::ghostkey_cert::verify_voucher_under(v, t, &test_master()).is_ok(),
+            |_, _| false,
+        )
     }
 
     #[test]

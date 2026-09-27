@@ -1635,6 +1635,70 @@ mod tests {
 
     /// **A renewal after a read starts a new run**, so a healthy watch renewed
     /// every twelve hours is not reported as unread.
+    /// One request asks for the furthest horizon any script in it wants
+    /// (a longer watch costs the bridge a little, never a payment), and none
+    /// when none does. Mutated red by taking the nearest.
+    #[test]
+    fn a_batch_asks_for_the_furthest_horizon_any_script_in_it_wants() {
+        let gk = authority().mint();
+        let mut t = tracker_on(open_inbox());
+        let until = |n: u8, h: Option<u32>| WatchWanted {
+            until_height: h,
+            ..wanted(BitcoinNetwork::Signet, n, 10)
+        };
+        let plan = t.plan(
+            gk.id(),
+            &[until(1, Some(500)), until(2, Some(700)), until(3, None)],
+            &[],
+            T0,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].watch_until_height, Some(700));
+        let mut t = tracker_on(open_inbox());
+        let plan = t.plan(gk.id(), &[until(1, None)], &[], T0);
+        assert_eq!(plan[0].watch_until_height, None);
+    }
+
+    /// The horizon a script is known to be watched through is the latest
+    /// READ request's: a renewal asking for more does not count until the
+    /// bridge reads it (a bridge never shortens a horizon, so the read one
+    /// stands meanwhile). Mutated red by counting the unread renewal's, and
+    /// by dropping the read one while the renewal waits.
+    #[test]
+    fn a_renewal_keeps_the_read_horizon_until_it_is_read_itself() {
+        let gk = authority().mint();
+        let w = |h: u32| {
+            [WatchWanted {
+                until_height: Some(h),
+                ..wanted(BitcoinNetwork::Signet, 1, 1)
+            }]
+        };
+        let key = (BitcoinNetwork::Signet, vec![0x00, 0x14, 1]);
+        let mut inbox = open_inbox();
+        let mut t = tracker_on(inbox.clone());
+        let plan = t.plan(gk.id(), &w(500), &[], T0);
+        let entry = send(&mut t, &mut inbox, &gk, &plan[0], T0);
+        assert_eq!(t.sent[&key].watched_until_height(), None, "not read yet");
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone(), T0 + 1);
+        assert_eq!(t.sent[&key].watched_until_height(), Some(500));
+
+        let renew = T0 + RENEW_AFTER_MS;
+        raise_floor(&mut inbox, FLOOR + 72);
+        t.on_state(inbox.clone(), renew);
+        let plan = t.plan(gk.id(), &w(800), &[], renew);
+        assert_eq!(plan[0].watch_until_height, Some(800));
+        let entry = send(&mut t, &mut inbox, &gk, &plan[0], renew);
+        assert_eq!(
+            t.sent[&key].watched_until_height(),
+            Some(500),
+            "still the read one"
+        );
+        bridge_reads(&mut inbox, &entry);
+        t.on_state(inbox.clone(), renew + 1);
+        assert_eq!(t.sent[&key].watched_until_height(), Some(800));
+    }
+
     #[test]
     fn a_renewal_after_a_read_starts_a_fresh_unread_run() {
         let gk = authority().mint();
