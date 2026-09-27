@@ -1433,7 +1433,27 @@ fn on_inbox<S: SecretStore>(
         })
         .map(|up| up.into_iter().map(|a| a.script_pubkey).collect())
         .unwrap_or_default();
+    // If the canary cannot vouch for every script the next addresses need
+    // (the first `REFILL_BELOW` of the pool), a request on it would leave
+    // those waiting for a whole request's life: forget it instead, and the
+    // next wake-up picks a fresh canary past the pool for all of them.
+    let needed = crate::bitcoin::load_payment_xpub(secrets)
+        .and_then(|xpub| crate::bitcoin::upcoming_addresses(&xpub, REFILL_BELOW as u32).ok())
+        .unwrap_or_default();
+    if needed
+        .iter()
+        .any(|a| scripts.contains(&a.script_pubkey) && !vouchable.contains(&a.script_pubkey))
+    {
+        held.canary = None;
+        return save_if_changed(secrets, &before, &held).then(Vec::new);
+    }
     scripts.retain(|s| vouchable.contains(s));
+    if scripts.is_empty() {
+        // Nothing it can vouch for: forget it rather than hold the one read
+        // per wake-up on the inbox until it expires.
+        held.canary = None;
+        return save_if_changed(secrets, &before, &held).then(Vec::new);
+    }
     if !scripts.is_empty() {
         // The canary goes LAST: the bridge applies a request's scripts in
         // order and counts the rest refused once the Ghost Key's cap is
@@ -2390,6 +2410,23 @@ mod tests {
             None,
             "forgotten, so a fresh one is picked"
         );
+        // A canary outside the pool that cannot vouch for every script the
+        // next addresses need (counter 7: it covers up to 10, the next five
+        // run to 11; counter 10, the pool's very edge: it covers only 10) is
+        // forgotten rather than used for a partial request.
+        for counter in [7, 10] {
+            let mut secrets = delegated();
+            let get = wake(&mut secrets, NOW);
+            answer(&mut secrets, &get, None, NOW);
+            set_counter(&mut secrets, counter);
+            let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
+            assert!(
+                !out.iter()
+                    .any(|m| matches!(m, OutboundDelegateMsg::UpdateContractRequest(_))),
+                "counter {counter}: {out:?}"
+            );
+            assert_eq!(held(&secrets).canary, None, "counter {counter}");
+        }
     }
 
     /// Pruning keeps the list in append order, so every later prune still
