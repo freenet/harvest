@@ -112,7 +112,7 @@ pub fn BuyForm(
 
     if let Some(sent) = sent() {
         let thread = APP_STATE.read().conversation_thread(&store_contract_id);
-        let answer = latest_answer(&thread, sent.answers_before, sent.expected.as_ref());
+        let answer = latest_answer(&thread, &sent.answers_before, sent.expected.as_ref());
         let _ = now_ms();
         return match instant_wait(sent.at_ms, unix_millis(), answer.is_some()) {
             InstantWait::Answered => match answer {
@@ -326,7 +326,7 @@ fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
 #[derive(Clone, PartialEq, Debug)]
 struct Sent {
     at_ms: u64,
-    answers_before: usize,
+    answers_before: Vec<[u8; 32]>,
     /// The order the store would issue for this request
     /// (`OrderId::for_request`), so an acceptance of another request is
     /// never read as this one's.
@@ -360,10 +360,11 @@ fn instant_wait(sent_at_ms: u64, now_ms: u64, answered: bool) -> InstantWait {
     }
 }
 
-/// How many answers from the seller (an accepted order or a decline) the
-/// buyer's thread with this store holds. Compared before and after a
-/// request, so it does not depend on the seller's clock.
-fn seller_answers(thread: &[crate::messaging::ConversationMessage]) -> usize {
+/// The seller's answers (an accepted order or a decline) the buyer's thread
+/// with this store holds, by entry digest. Taken when a Buy now goes out, so
+/// an answer that arrives later is told apart by what it is, not by where a
+/// seller's clock sorts it (codex on harvest#177).
+fn seller_answers(thread: &[crate::messaging::ConversationMessage]) -> Vec<[u8; 32]> {
     thread
         .iter()
         .filter(|message| message.addressing == Addressing::ToBuyer)
@@ -373,7 +374,8 @@ fn seller_answers(thread: &[crate::messaging::ConversationMessage]) -> usize {
                 MessageContent::OrderAccepted { .. } | MessageContent::Decline { .. }
             )
         })
-        .count()
+        .map(|message| message.digest)
+        .collect()
 }
 
 /// The seller's store's answer to an order: an acceptance (the order is
@@ -384,43 +386,34 @@ enum Answer {
     Declined(String),
 }
 
-/// This order's answer among the seller's answers past the first
-/// `answers_before` (counted as [`seller_answers`] counts them): the
-/// acceptance of the order it `expected`, else the newest decline, or `None`
-/// when there is neither yet. An acceptance of another request is never
-/// taken for this one's (codex on harvest#177); a decline names no order, so
-/// one sent to another request of the same buyer at the same moment can
-/// still be shown here.
+/// This order's answer: the acceptance of the order it `expected`, found
+/// anywhere in the thread (the id is unique to this request), else the
+/// newest decline that was not already there when it went out (`before`,
+/// from [`seller_answers`]), or `None` when there is neither yet. Neither
+/// depends on where a seller's clock sorts a reply. An acceptance of another
+/// request is never taken for this one's; a decline names no order, so one
+/// sent to another request of the same buyer at the same moment can still
+/// be shown here.
 fn latest_answer(
     thread: &[crate::messaging::ConversationMessage],
-    answers_before: usize,
+    before: &[[u8; 32]],
     expected: Option<&harvest_common::payment::OrderId>,
 ) -> Option<Answer> {
-    let answers: Vec<&MessageContent> = thread
+    let to_buyer = thread
         .iter()
-        .filter(|message| message.addressing == Addressing::ToBuyer)
-        .map(|message| &message.content)
-        .filter(|content| {
-            matches!(
-                content,
-                MessageContent::OrderAccepted { .. } | MessageContent::Decline { .. }
-            )
-        })
-        .skip(answers_before)
-        .collect();
-    // Anywhere in the thread, not only past `answers_before`: a reply dated
-    // by a seller clock behind an earlier one sorts before it (codex on
-    // harvest#177), and this order's id is unique to it.
-    if thread.iter().any(|message| {
-        message.addressing == Addressing::ToBuyer
-            && matches!(&message.content, MessageContent::OrderAccepted { order_id } if Some(order_id) == expected)
+        .filter(|message| message.addressing == Addressing::ToBuyer);
+    if to_buyer.clone().any(|message| {
+        matches!(&message.content, MessageContent::OrderAccepted { order_id } if Some(order_id) == expected)
     }) {
         return Some(Answer::Accepted);
     }
-    answers.iter().rev().find_map(|content| match content {
-        MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
-        _ => None,
-    })
+    to_buyer
+        .filter(|message| !before.contains(&message.digest))
+        .filter_map(|message| match &message.content {
+            MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
+            _ => None,
+        })
+        .last()
 }
 
 /// A fresh request nonce. Only the buyer's own resends reuse one, and this
@@ -1502,15 +1495,18 @@ mod tests {
         assert_eq!(instant_wait(sent, sent - 1, false), InstantWait::Waiting);
     }
 
+    /// A message with a digest of its own, as every real entry has.
     fn message(
         addressing: Addressing,
         content: MessageContent,
     ) -> crate::messaging::ConversationMessage {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static NEXT: AtomicU8 = AtomicU8::new(1);
         crate::messaging::ConversationMessage {
             addressing,
             timestamp: chrono::Utc::now(),
             nonce: [0u8; 24],
-            digest: [0u8; 32],
+            digest: [NEXT.fetch_add(1, Ordering::Relaxed); 32],
             content,
         }
     }
@@ -1533,7 +1529,7 @@ mod tests {
             message(Addressing::ToBuyer, MessageContent::Text("Hello".into())),
             message(Addressing::ToSeller, accepted),
         ];
-        assert_eq!(seller_answers(&thread), 2);
+        assert_eq!(seller_answers(&thread).len(), 2);
     }
 
     fn order(
@@ -1666,13 +1662,13 @@ mod tests {
         };
         let mut thread = vec![message(Addressing::ToBuyer, earlier)];
         let before = seller_answers(&thread);
-        assert_eq!(latest_answer(&thread, before, Some(&ours)), None);
+        assert_eq!(latest_answer(&thread, &before, Some(&ours)), None);
         thread.push(message(Addressing::ToSeller, accepted.clone()));
         thread.push(message(
             Addressing::ToBuyer,
             MessageContent::Text("Hi".into()),
         ));
-        assert_eq!(latest_answer(&thread, before, Some(&ours)), None);
+        assert_eq!(latest_answer(&thread, &before, Some(&ours)), None);
         thread.push(message(
             Addressing::ToBuyer,
             MessageContent::Decline {
@@ -1680,7 +1676,7 @@ mod tests {
             },
         ));
         assert_eq!(
-            latest_answer(&thread, before, Some(&ours)),
+            latest_answer(&thread, &before, Some(&ours)),
             Some(Answer::Declined(
                 harvest_common::delegate::TOO_MANY_UNPAID.into()
             ))
@@ -1691,7 +1687,7 @@ mod tests {
         };
         thread.push(message(Addressing::ToBuyer, theirs));
         assert_eq!(
-            latest_answer(&thread, before, Some(&ours)),
+            latest_answer(&thread, &before, Some(&ours)),
             Some(Answer::Declined(
                 harvest_common::delegate::TOO_MANY_UNPAID.into()
             )),
@@ -1699,24 +1695,36 @@ mod tests {
         );
         thread.push(message(Addressing::ToBuyer, accepted.clone()));
         assert_eq!(
-            latest_answer(&thread, before, Some(&ours)),
+            latest_answer(&thread, &before, Some(&ours)),
             Some(Answer::Accepted)
         );
         // Found wherever it sorts: a reply dated by a slower seller clock
-        // lands before the answers counted at send. Mutated red by looking
-        // only past `answers_before` again.
-        let early = vec![
-            message(Addressing::ToBuyer, accepted),
+        // lands before the answers there at send. Mutated red by skipping by
+        // position again.
+        let old = message(
+            Addressing::ToBuyer,
+            MessageContent::OrderAccepted {
+                order_id: harvest_common::payment::OrderId([3u8; 32]),
+            },
+        );
+        let at_send = seller_answers(std::slice::from_ref(&old));
+        let early = vec![message(Addressing::ToBuyer, accepted), old.clone()];
+        assert_eq!(
+            latest_answer(&early, &at_send, Some(&ours)),
+            Some(Answer::Accepted)
+        );
+        let declined_early = vec![
             message(
                 Addressing::ToBuyer,
-                MessageContent::OrderAccepted {
-                    order_id: harvest_common::payment::OrderId([3u8; 32]),
+                MessageContent::Decline {
+                    reason: "Sold out".into(),
                 },
             ),
+            old,
         ];
         assert_eq!(
-            latest_answer(&early, 1, Some(&ours)),
-            Some(Answer::Accepted)
+            latest_answer(&declined_early, &at_send, Some(&ours)),
+            Some(Answer::Declined("Sold out".into()))
         );
     }
 }

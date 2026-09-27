@@ -124,10 +124,14 @@ impl DelegateInterface for HarvestDelegate {
 
             // A store update instant checkout sent: on success, send the
             // replies it was holding back (see `auto_invoice::on_store_updated`).
-            InboundDelegateMsg::UpdateContractResponse(response) => Ok(
-                auto_invoice::on_store_updated(&response.result, response.context.as_ref())
-                    .unwrap_or_default(),
-            ),
+            InboundDelegateMsg::UpdateContractResponse(response) => {
+                Ok(auto_invoice::on_store_update_answer(
+                    &mut CtxSecrets(ctx),
+                    &response.result,
+                    response.context.as_ref(),
+                )
+                .unwrap_or_default())
+            }
 
             other => {
                 let msg_type = match &other {

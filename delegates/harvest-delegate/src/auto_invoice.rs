@@ -433,6 +433,15 @@ struct PendingReplies {
     magic: [u8; 8],
     mailbox_contract_id: [u8; 32],
     replies: Vec<EncryptedMessage>,
+    /// The store the orders went to, and each answered request's entry
+    /// digest and request id: if the store refuses the update, they are
+    /// forgotten as seen and answered, so the store's next run decides them
+    /// again instead of leaving the buyer unanswered for good (codex on
+    /// harvest#177).
+    #[serde(default)]
+    store_contract_id: Vec<u8>,
+    #[serde(default)]
+    retry: Vec<([u8; 32], [u8; 32])>,
 }
 
 const BATCH_MAGIC: [u8; 8] = *b"hvauto01";
@@ -1325,6 +1334,30 @@ pub(crate) fn on_store_state<S: SecretStore>(
 
 /// A store UPDATE this module sent has been applied or refused. `None` when
 /// the context is not one of this module's.
+/// [`on_store_updated`], and on a refused update, the requests it answered
+/// made undecided again in the store's ledger.
+pub(crate) fn on_store_update_answer<S: SecretStore>(
+    secrets: &mut S,
+    result: &Result<(), String>,
+    context: &[u8],
+) -> Option<Vec<OutboundDelegateMsg>> {
+    if result.is_err() {
+        if let Ok(pending) = from_cbor::<PendingReplies>(context) {
+            if pending.magic == REPLIES_MAGIC && !pending.retry.is_empty() {
+                let mut ledger = load_ledger(secrets, &pending.store_contract_id);
+                ledger
+                    .seen
+                    .retain(|digest| !pending.retry.iter().any(|(d, _)| d == digest));
+                ledger
+                    .answered
+                    .retain(|request| !pending.retry.iter().any(|(_, r)| r == request));
+                save(secrets, &ledger_key(&pending.store_contract_id), &ledger);
+            }
+        }
+    }
+    on_store_updated(result, context)
+}
+
 pub(crate) fn on_store_updated(
     result: &Result<(), String>,
     context: &[u8],
@@ -1360,6 +1393,9 @@ pub(crate) struct Decided {
     /// goes to the mailbox at once, so a refused store update cannot drop a
     /// buyer's answer (review round 2 of harvest#177).
     pub held_back: Vec<EncryptedMessage>,
+    /// Each invoiced request's entry digest and request id, to be decided
+    /// again if the store refuses the update (`on_store_update_answer`).
+    pub retry: Vec<([u8; 32], [u8; 32])>,
     /// Why each request not answered with an invoice was not, by entry
     /// digest. For tests and the log.
     pub refused: Vec<([u8; 32], Refusal)>,
@@ -1388,6 +1424,8 @@ impl Decided {
                     magic: REPLIES_MAGIC,
                     mailbox_contract_id: arm.mailbox_contract_id,
                     replies: now,
+                    store_contract_id: Vec::new(),
+                    retry: Vec::new(),
                 })
                 .unwrap_or_default(),
             )
@@ -1412,6 +1450,8 @@ impl Decided {
             magic: REPLIES_MAGIC,
             mailbox_contract_id: arm.mailbox_contract_id,
             replies: held_back,
+            store_contract_id: arm.store_contract_id.clone(),
+            retry: self.retry,
         }) {
             if context.len() < DelegateContext::MAX_SIZE {
                 update.context = DelegateContext::new(context);
@@ -1548,6 +1588,9 @@ pub(crate) fn decide<S: SecretStore>(
         );
         match outcome {
             Ok(Answer::Invoice { order, reply }) => {
+                if let Some(request) = order.order.request_id {
+                    decided.retry.push((digest, request));
+                }
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
                 decided.held_back.push(reply.clone());
@@ -3726,6 +3769,8 @@ mod tests {
             magic: REPLIES_MAGIC,
             mailbox_contract_id: [2; 32],
             replies: vec![Buyer::new(40).request(&jam(), 1, 1, 1)],
+            store_contract_id: Vec::new(),
+            retry: Vec::new(),
         })
         .unwrap();
         assert_eq!(
@@ -3736,5 +3781,36 @@ mod tests {
         );
         assert_eq!(on_store_updated(&Ok(()), &context).unwrap().len(), 1);
         assert!(on_store_updated(&Ok(()), b"not ours").is_none());
+    }
+
+    /// A store update the store refused leaves the requests it answered
+    /// undecided again, so the next run answers them instead of leaving the
+    /// buyers waiting for good; one that landed does not. Mutated red by
+    /// dropping the forgetting.
+    #[test]
+    fn a_refused_store_update_leaves_its_requests_to_be_decided_again() {
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let entry = buyer.request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        assert_eq!(decided.orders.len(), 1);
+        let out = decided.into_messages(&f.record.arm);
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let context = update.context.as_ref().to_vec();
+        let seen = |f: &Fixture| {
+            load_ledger(&f.secrets, &f.record.arm.store_contract_id)
+                .seen
+                .contains(&entry_digest(&entry))
+        };
+        assert!(seen(&f));
+        on_store_update_answer(&mut f.secrets, &Ok(()), &context);
+        assert!(seen(&f), "landed: stays decided");
+        on_store_update_answer(&mut f.secrets, &Err("refused".into()), &context);
+        assert!(!seen(&f), "refused: decided again");
+        // And it is: the next run answers it.
+        let again = run(&mut f, &[entry]);
+        assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
     }
 }
