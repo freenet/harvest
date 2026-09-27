@@ -592,6 +592,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // V24, from `git show 4f040c6:ui/public/contracts/harvest_delegate.wasm`.
             // Superseded by harvest#162: arming reads the tip once.
             "74cf700046aafc5af19bd69183b2b88f3d640ffd7dbb7817dc60084359eee04b".to_string(),
+            // V25, from `git show da2faa1:ui/public/contracts/harvest_delegate.wasm`.
+            // Superseded by the always-open product decisions.
+            "6472846e92abe0ec9209e7ab34b50fd72306eb04bad0416797584289a4f6a128".to_string(),
         ],
     );
 }
