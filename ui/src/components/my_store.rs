@@ -67,6 +67,9 @@ pub(crate) struct SellerStore {
     /// Paid orders waiting to be sent: the moment a Buy now first needs the
     /// seller.
     pub to_send: usize,
+    /// Listings on show with no sats price (from before every listing had
+    /// one): nobody can buy them until the seller gives them one.
+    pub unpriced: usize,
 }
 
 /// How many of `fingerprint`'s orders are paid and waiting to be sent, each
@@ -217,6 +220,18 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
                 expired_invoices,
                 to_send,
+                unpriced: browsing
+                    .map(|b| {
+                        b.listings
+                            .iter()
+                            .filter(|l| {
+                                b.availability(&l.listing.id)
+                                    != harvest_common::listing::ListingAvailability::Withdrawn
+                                    && !l.listing.offers_instant_checkout()
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0),
             })
         })
         .collect();
@@ -670,7 +685,8 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
-    let needs: bool = wallet_gap
+    let needs: bool = store.unpriced > 0
+        || wallet_gap
         || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
         || !store.certificate.is_verified()
@@ -708,6 +724,18 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
             if wallet_gap {
                 p { class: "text-warning", "{WALLET_GAP_NOTE}" }
+            }
+            if store.unpriced > 0 {
+                div { class: "need row-between",
+                    span {
+                        if store.unpriced == 1 {
+                            "1 listing has no price yet, so buyers can\u{2019}t buy it. Use Edit to give it one."
+                        } else {
+                            "{store.unpriced} listings have no price yet, so buyers can\u{2019}t buy them. Use Edit to give each one a price."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Listings), "Open listings" }
+                }
             }
             if store.to_send > 0 {
                 div { class: "need row-between",
@@ -1808,6 +1836,11 @@ mod seller_stores_tests {
         assert_eq!(stores[0].contract_id, vec![1u8; 32]);
         assert_eq!(stores[0].fingerprint, "fp");
         assert_eq!(stores[0].listings, 1);
+        // The one on show has no sats price (a quote-only listing from
+        // before every listing had one); the one taken down is not counted.
+        // Mutated red by dropping the price filter and the `Withdrawn`
+        // filter.
+        assert_eq!(stores[0].unpriced, 1);
         assert_eq!(stores[0].requests, 0);
         assert!(stores[0].code.is_some() && stores[0].link.is_some());
         assert_eq!(requests_needing_seller(&state), 0);

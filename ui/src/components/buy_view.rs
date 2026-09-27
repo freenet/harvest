@@ -119,7 +119,10 @@ pub fn BuyForm(
                     // `Sale::holds`), and only for the hour: a payment after
                     // that still counts, but the item may have gone.
                     if counted {
-                        p { class: "text-muted", "Pay soon: this item is kept for you for about an hour." }
+                        p { class: "text-muted",
+                            "Pay soon: this item is kept for you for about an hour. If it sells out "
+                            "before your payment is confirmed, the seller either sends it anyway or refunds you."
+                        }
                     }
                 },
             },

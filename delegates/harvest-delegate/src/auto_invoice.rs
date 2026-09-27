@@ -662,9 +662,11 @@ fn store_key<S: SecretStore>(secrets: &S, verifying: &[u8; 32]) -> Option<Signin
         .and_then(|vk| crate::store_keys::load(secrets, &vk))
 }
 
-/// Why a request was not answered with an invoice. Every one leaves the
-/// request for the seller. (Not enough stock is answered, with a decline,
-/// rather than refused.)
+/// Why a request was not answered with an invoice. A store-wide one leaves
+/// the request unseen, to be decided again; a per-request one marks it seen
+/// and, when it is about the buyer's request or a store limit, answers it
+/// with a Decline naming why ([`Refusal::buyer_reason`]). (Not enough stock
+/// is declined directly rather than refused.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     // Store-wide: nothing is answered, and the request is not marked seen, so
@@ -678,15 +680,16 @@ pub(crate) enum Refusal {
     NoFreshTip,
     NoWatchedAddress,
     CounterNotSaved,
-    // Per request: the request is marked seen and left for the seller.
+    // Per request: the request is marked seen, and declined where
+    // `buyer_reason` has words for it; the rest stay in the seller's inbox.
     NotInstant,
     AlreadyAnswered,
     NoBuyerKey,
     NoListing,
     Withdrawn,
     /// Enough is published, but not once unpaid instant invoices' holds are
-    /// counted. Left for the seller rather than declined: those invoices may
-    /// never be paid.
+    /// counted. Declined with "try again in about an hour": the holds end
+    /// then, paid or not.
     Reserved,
     TotalMismatch,
     BindingElsewhere,
@@ -706,9 +709,9 @@ impl Refusal {
     /// copies another conversation's binding).
     pub(crate) fn buyer_reason(&self) -> Option<&'static str> {
         match self {
-            Refusal::Reserved => Some(
-                "Someone else is paying for the last one right now. Try again in about an hour.",
-            ),
+            Refusal::Reserved => {
+                Some("What is left is held for orders not yet paid. Try again in about an hour.")
+            }
             Refusal::StoreCap | Refusal::DailyCap | Refusal::TrailingUnpaid => {
                 Some("This store can't take more orders right now. Please try again later.")
             }
@@ -920,13 +923,16 @@ pub(crate) fn settle(
     if gap_paid {
         ledger.gap_paid_at_ms = Some(now_ms);
     }
-    // Paid, or settled any other way: nothing left to watch for.
+    // Paid or reversed: nothing left to watch for. A cancelled one stays
+    // (bounded by `GAP_ORDERS_CAP`): Paid outranks Cancelled, so it may yet
+    // be paid.
     ledger.gap_orders.retain(|id| {
-        store
-            .orders
-            .orders
-            .get(id)
-            .is_none_or(|o| o.status == OrderStatus::AwaitingPayment)
+        store.orders.orders.get(id).is_none_or(|o| {
+            matches!(
+                o.status,
+                OrderStatus::AwaitingPayment | OrderStatus::Cancelled
+            )
+        })
     });
     while ledger.oversold.len() > STATUSES_CAP {
         ledger.oversold.remove(0);
@@ -1304,6 +1310,11 @@ pub(crate) struct Decided {
     pub orders: Vec<AuthorizedOrder>,
     pub statuses: Vec<AuthorizedListingStatus>,
     pub replies: Vec<EncryptedMessage>,
+    /// The replies that point a buyer at an order this run publishes: held
+    /// back until the store takes the orders. Every other reply (a decline)
+    /// goes to the mailbox at once, so a refused store update cannot drop a
+    /// buyer's answer (review round 2 of harvest#177).
+    pub held_back: Vec<EncryptedMessage>,
     /// Why each request not answered with an invoice was not, by entry
     /// digest. For tests and the log.
     pub refused: Vec<([u8; 32], Refusal)>,
@@ -1318,18 +1329,27 @@ impl Decided {
         let Some(owner) = self.owner else {
             return Vec::new();
         };
-        if self.orders.is_empty() && self.statuses.is_empty() {
-            // Only declines: nothing for the store, straight to the mailbox.
-            return on_store_updated(
+        let (held_back, now): (Vec<_>, Vec<_>) = self
+            .replies
+            .into_iter()
+            .partition(|reply| self.held_back.contains(reply));
+        // Declines: nothing for the store, straight to the mailbox.
+        let mut out = if now.is_empty() {
+            Vec::new()
+        } else {
+            on_store_updated(
                 &Ok(()),
                 &to_cbor(&PendingReplies {
                     magic: REPLIES_MAGIC,
                     mailbox_contract_id: arm.mailbox_contract_id,
-                    replies: self.replies,
+                    replies: now,
                 })
                 .unwrap_or_default(),
             )
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
+        if self.orders.is_empty() && self.statuses.is_empty() {
+            return out;
         }
         let Ok(delta) = to_cbor(&StoreStateV1Delta {
             owner: Some(owner),
@@ -1337,7 +1357,7 @@ impl Decided {
             listing_statuses: (!self.statuses.is_empty()).then_some(self.statuses),
             ..Default::default()
         }) else {
-            return Vec::new();
+            return out;
         };
         let mut update = UpdateContractRequest::new(
             ContractInstanceId::new(store_id),
@@ -1346,13 +1366,14 @@ impl Decided {
         if let Ok(context) = to_cbor(&PendingReplies {
             magic: REPLIES_MAGIC,
             mailbox_contract_id: arm.mailbox_contract_id,
-            replies: self.replies,
+            replies: held_back,
         }) {
             if context.len() < DelegateContext::MAX_SIZE {
                 update.context = DelegateContext::new(context);
             }
         }
-        vec![OutboundDelegateMsg::UpdateContractRequest(update)]
+        out.push(OutboundDelegateMsg::UpdateContractRequest(update));
+        out
     }
 }
 
@@ -1486,6 +1507,7 @@ pub(crate) fn decide<S: SecretStore>(
             Ok(Answer::Invoice { order, reply }) => {
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
+                decided.held_back.push(reply.clone());
                 decided.replies.push(reply);
                 ledger.saw(digest);
             }
@@ -1749,10 +1771,11 @@ fn decide_one<S: SecretStore>(
 /// down until one does: `(all, recent)`. `all` is the whole run, which is
 /// what a wallet's gap limit is about: a wallet stops scanning after a run of
 /// about 20 unused addresses, so a payment past such a run is invisible to
-/// it. `recent` stops, in addition, at an address whose order is more than a
-/// day old: the store limit counts it, so the limit turns buyers away for a
-/// day at most rather than for good, which unpaid clicks alone would
-/// otherwise make permanent (review round 1 of harvest#177).
+/// it. `recent` stops, in addition, at an address that is not one of this
+/// store's orders from the last day: the store limit counts it, so the limit
+/// turns buyers away for a day at most rather than for good, which unpaid
+/// clicks alone would otherwise make permanent (review rounds 1 and 2 of
+/// harvest#177).
 ///
 /// Paid means paid at ANY store of this device: the payment key is shared
 /// by every store (`paid_elsewhere`), so another store's paid address closes
@@ -1773,11 +1796,15 @@ fn trailing_unpaid(
                 .iter()
                 .any(|o| o.status == OrderStatus::Paid && o.order.payment_script_pubkey == script)
     };
-    let old = |script: &[u8]| {
+    // Only this store's own orders from the last day extend the limit's
+    // run: an address with an older order, or none here (another store's,
+    // or one spent and never published), ends it, so no other store's
+    // clicks and nothing stranded can hold this one at its limit.
+    let recent_here = |script: &[u8]| {
         orders.iter().any(|o| {
             o.order.payment_script_pubkey == script
                 && now_ms.saturating_sub(o.order.created_at.timestamp_millis().max(0) as u64)
-                    > DAY_MS
+                    <= DAY_MS
         })
     };
     let (mut all, mut recent, mut recent_open) = (0, 0, true);
@@ -1788,7 +1815,7 @@ fn trailing_unpaid(
             Ok(script) if paid(&script) => break,
             Ok(script) => {
                 all += 1;
-                if recent_open && old(&script) {
+                if recent_open && !recent_here(&script) {
                     recent_open = false;
                 }
                 if recent_open {
@@ -1805,14 +1832,22 @@ fn trailing_unpaid(
 /// newest last: [`trailing_unpaid`]'s `paid_elsewhere`. Not exported: a
 /// successor relearns it from its stores.
 pub(crate) const PAID_SCRIPTS_KEY: &[u8] = b"harvest:auto:paid";
-const PAID_SCRIPTS_CAP: usize = 512;
+const PAID_SCRIPTS_CAP: usize = 2048;
 
 fn note_paid_scripts<S: SecretStore>(secrets: &mut S, store: &StoreStateV1) {
     let mut held: VecDeque<Vec<u8>> = load(secrets, PAID_SCRIPTS_KEY).unwrap_or_default();
     let before = held.len();
-    for order in store.orders.orders.values() {
+    // Oldest first, so what the cap drops is the oldest payments.
+    let mut paid: Vec<&AuthorizedOrder> = store
+        .orders
+        .orders
+        .values()
+        .filter(|o| o.status == OrderStatus::Paid && !o.order.payment_script_pubkey.is_empty())
+        .collect();
+    paid.sort_by_key(|o| o.order.created_at);
+    for order in paid {
         let script = &order.order.payment_script_pubkey;
-        if order.status == OrderStatus::Paid && !script.is_empty() && !held.contains(script) {
+        if !held.contains(script) {
             held.push_back(script.clone());
         }
     }
@@ -2108,6 +2143,16 @@ mod tests {
             buyer_receipt_key: None,
             request_id: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    /// Unpaid orders of this store on the scripts at `indexes`, dated `at_ms`.
+    fn unpaid_orders_on(f: &mut Fixture, indexes: std::ops::Range<u32>, at_ms: u64) {
+        for i in indexes {
+            let mut o = order_on(script_at(i));
+            o.created_at = chrono::DateTime::from_timestamp_millis(at_ms as i64).unwrap();
+            let o = sign_order(&store_sk(), o.with_derived_id()).unwrap();
+            f.store.orders.orders.insert(o.order.id.clone(), o);
         }
     }
 
@@ -2557,6 +2602,47 @@ mod tests {
         let later = run(&mut f, &[Buyer::new(42).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(later.refused[0].1, Refusal::Reserved);
         assert_eq!(counter(&f), 1);
+    }
+
+    /// A decline goes to the mailbox at once; only the acceptance waits on
+    /// the store taking its order, so a refused store update drops no
+    /// buyer's decline (review round 2 of harvest#177). Mutated red by
+    /// holding every reply back again.
+    #[test]
+    fn a_decline_does_not_wait_on_the_store_update() {
+        let mut f = fixture();
+        counted(&mut f, 1);
+        let (a, b) = (Buyer::new(40), Buyer::new(41));
+        let decided = run(
+            &mut f,
+            &[
+                a.request_at(&jam(), 1, 1, 12_000, NOW - 9_000),
+                b.request_at(&jam(), 1, 1, 12_000, NOW - 8_000),
+            ],
+        );
+        let out = decided.into_messages(&f.record.arm);
+        let mut mailbox = Vec::new();
+        let mut held = Vec::new();
+        for m in &out {
+            let OutboundDelegateMsg::UpdateContractRequest(update) = m else {
+                panic!("{m:?}")
+            };
+            if update.contract_id.as_bytes() == f.record.arm.mailbox_contract_id.as_slice() {
+                let UpdateData::Delta(delta) = &update.update else {
+                    panic!("a delta")
+                };
+                let delta: harvest_common::mailbox::MailboxDelta =
+                    from_cbor(delta.as_ref()).unwrap();
+                mailbox.extend(delta);
+            } else {
+                let pending: PendingReplies = from_cbor(update.context.as_ref()).unwrap();
+                held.extend(pending.replies);
+            }
+        }
+        assert_eq!(b.read(&mailbox).len(), 1, "B's decline, at once");
+        assert!(a.read(&mailbox).is_empty());
+        assert_eq!(a.read(&held).len(), 1, "A's acceptance, after the store");
+        assert!(b.read(&held).is_empty());
     }
 
     /// Published stock that is genuinely short is declined, not left.
@@ -3096,7 +3182,8 @@ mod tests {
     }
 
     /// I4. Past the per-buyer cap the buyer is told, in the words their own
-    /// app uses; past each other cap the request is left for the seller.
+    /// app uses; past each other cap the buyer is told to try again later
+    /// and the seller sees the limit for an hour.
     /// Mutated red by removing each cap's check in turn.
     #[test]
     fn exposure_is_capped() {
@@ -3167,10 +3254,12 @@ mod tests {
         let capped = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(capped.refused[0].1, Refusal::DailyCap);
 
-        // A run of unpaid addresses below the counter.
+        // A run of this store's unpaid orders from the last day below the
+        // counter.
         let mut f = fixture();
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(MAX_TRAILING_UNPAID)).unwrap();
         f.record.arm.watched_scripts = vec![script_at(MAX_TRAILING_UNPAID)];
+        unpaid_orders_on(&mut f, 0..MAX_TRAILING_UNPAID, NOW - 60_000);
         let capped = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(capped.refused[0].1, Refusal::TrailingUnpaid);
         assert_eq!(counter(&f), MAX_TRAILING_UNPAID);
@@ -3182,6 +3271,7 @@ mod tests {
         let start = MAX_TRAILING_UNPAID - 1;
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(start)).unwrap();
         f.record.arm.watched_scripts = vec![script_at(start), script_at(start + 1)];
+        unpaid_orders_on(&mut f, 0..start, NOW - 60_000);
         let both = run(
             &mut f,
             &[
@@ -3197,13 +3287,7 @@ mod tests {
         let mut f = fixture();
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(MAX_TRAILING_UNPAID)).unwrap();
         f.record.arm.watched_scripts = vec![script_at(MAX_TRAILING_UNPAID)];
-        for i in 0..MAX_TRAILING_UNPAID {
-            let mut o = order_on(script_at(i));
-            o.created_at =
-                chrono::DateTime::from_timestamp_millis((NOW - DAY_MS - 1) as i64).unwrap();
-            let o = sign_order(&store_sk(), o.with_derived_id()).unwrap();
-            f.store.orders.orders.insert(o.order.id.clone(), o);
-        }
+        unpaid_orders_on(&mut f, 0..MAX_TRAILING_UNPAID, NOW - DAY_MS - 1);
         let healed = run(&mut f, &[Buyer::new(52).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(healed.orders.len(), 1, "{:?}", healed.refused);
         assert_eq!(
@@ -3214,11 +3298,20 @@ mod tests {
             "past the wallet's gap all the same"
         );
 
+        // Nor do addresses that are not this store's orders (another store's
+        // of this device, or spent and never published).
+        let mut f = fixture();
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(MAX_TRAILING_UNPAID)).unwrap();
+        f.record.arm.watched_scripts = vec![script_at(MAX_TRAILING_UNPAID)];
+        let foreign = run(&mut f, &[Buyer::new(54).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(foreign.orders.len(), 1, "{:?}", foreign.refused);
+
         // An address paid at ANOTHER store of this device closes the run:
         // the payment key is shared by every store.
         let mut f = fixture();
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(MAX_TRAILING_UNPAID)).unwrap();
         f.record.arm.watched_scripts = vec![script_at(MAX_TRAILING_UNPAID)];
+        unpaid_orders_on(&mut f, 0..MAX_TRAILING_UNPAID, NOW - 60_000);
         let paid: VecDeque<Vec<u8>> = [script_at(MAX_TRAILING_UNPAID - 1)].into();
         save(&mut f.secrets, PAID_SCRIPTS_KEY, &paid);
         let elsewhere = run(&mut f, &[Buyer::new(53).request(&jam(), 1, 1, 12_000)]);
