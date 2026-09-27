@@ -12866,6 +12866,22 @@ impl AppState {
         // asked in effect: nothing can report it stalled, so without this the
         // once-per-session marker would keep delegated watching off for the
         // session (codex, review round 4 of #179).
+        // The same for one signed and handed to the delegate but not taken
+        // yet: resending it would only name the retired inbox.
+        self.auto_invoice.delegation_in_flight.retain(|_, f| {
+            let harvest_common::HarvestDelegateRequest::SetWatchDelegation { grant } = &f.request
+            else {
+                return true;
+            };
+            let keep = grant.inbox_contract_id.as_slice() != old_id.as_slice();
+            if !keep {
+                abandoned.push((
+                    freenet_bitcoin_inbox::GhostkeyId(grant.ghostkey),
+                    grant.bridge,
+                ));
+            }
+            keep
+        });
         for pair in abandoned {
             self.auto_invoice.delegation_asked.remove(&pair);
         }
@@ -31554,6 +31570,51 @@ mod buy_flow_tests {
                 .resend,
             None
         );
+
+        // Sent every time and never answered: given up, and the vault may be
+        // asked afresh (nothing would ever report it stalled).
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending.clone(), gk.pem.clone(), scoped, signature, t);
+        let mut at = t;
+        for _ in 1..DELEGATION_SEND_ATTEMPTS {
+            at += DELEGATION_RESEND_MS;
+            assert!(state.queue_auto_invoice(at).delegation.resend.is_some());
+        }
+        assert!(state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        state.queue_auto_invoice(at + DELEGATION_RESEND_MS);
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert!(!state
+            .auto_invoice
+            .delegation_asked
+            .contains_key(&(pending.ghostkey, bridge)));
+
+        // A retired inbox takes the one in flight for it with it, and frees
+        // the marker.
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending.clone(), gk.pem.clone(), scoped, signature, t);
+        state
+            .auto_invoice
+            .delegation_asked
+            .insert((pending.ghostkey, bridge), pending.issued_mainnet_height);
+        state.retire_inbox();
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert!(!state
+            .auto_invoice
+            .delegation_asked
+            .contains_key(&(pending.ghostkey, bridge)));
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            bridge,
+            inbox::inbox_key(),
+        ));
 
         // Taken: nothing more to send.
         let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());

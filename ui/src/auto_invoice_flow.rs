@@ -420,11 +420,12 @@ impl AppState {
             }
         }
         work.delegation = self.plan_watch_delegation(now_ms);
-        work.delegation.resend = self
-            .auto_invoice
-            .delegation_in_flight
-            .values()
-            .find(|f| {
+        // Only for the bridge this tab uses now: a delegation for another
+        // was prepared against an inbox the tab no longer reads.
+        let bridge = self.bitcoin.inbox.as_ref().map(|inbox| inbox.bridge);
+        work.delegation.resend = bridge
+            .and_then(|bridge| self.auto_invoice.delegation_in_flight.get(&bridge))
+            .filter(|f| {
                 f.attempts < DELEGATION_SEND_ATTEMPTS
                     && now_ms.saturating_sub(f.sent_ms) >= DELEGATION_RESEND_MS
             })
@@ -688,6 +689,26 @@ impl AppState {
                 .push_back(crate::state::PendingSignature::WatchDelegation(Box::new(
                     pending.clone(),
                 )));
+        }
+        // Sent every time and never answered: nothing will report it
+        // stalled, so it is given up and the vault may be asked afresh (a
+        // refusal that keeps coming is handled in `on_watch_delegation`,
+        // where it is the delegate's verdict and is not re-asked).
+        let unanswered: Vec<(GhostkeyId, BridgeId)> = self
+            .auto_invoice
+            .delegation_in_flight
+            .iter()
+            .filter(|(_, f)| {
+                f.attempts >= DELEGATION_SEND_ATTEMPTS
+                    && now_ms.saturating_sub(f.sent_ms) >= DELEGATION_RESEND_MS
+            })
+            .map(|(bridge, f)| (GhostkeyId(f.ghostkey), *bridge))
+            .collect();
+        for (ghostkey, bridge) in unanswered {
+            self.auto_invoice.delegation_in_flight.remove(&bridge);
+            self.auto_invoice
+                .delegation_asked
+                .remove(&(ghostkey, bridge));
         }
         if let Some(HarvestDelegateRequest::SetWatchDelegation { grant }) = &work.delegation.resend
         {

@@ -1276,10 +1276,15 @@ fn on_address<S: SecretStore>(
 }
 
 /// Keep the watched list bounded: expired entries go, then the nearest
-/// horizons.
+/// horizons, and among equal horizons the OLDEST (codex, round 5 of #179):
+/// entries are appended as they are confirmed, so the newest are the next
+/// addresses I7 needs, and several requests confirmed at one tip share a
+/// horizon.
 fn prune_watched(held: &mut Held, tip_height: u32) {
     held.watched.retain(|w| w.until_height >= tip_height);
     if held.watched.len() > WATCHED_CAP {
+        // Newest first, then a stable sort by horizon: ties keep newest first.
+        held.watched.reverse();
         held.watched
             .sort_by_key(|w| std::cmp::Reverse(w.until_height));
         held.watched.truncate(WATCHED_CAP);
@@ -2887,6 +2892,25 @@ mod tests {
         prune_watched(&mut h, TIP);
         assert_eq!(h.watched.len(), WATCHED_CAP);
         assert!(h.watched.iter().all(|w| w.until_height >= TIP + 10));
+
+        // Equal horizons (several requests confirmed at one tip): the newest
+        // stay, since they are the next addresses I7 needs.
+        let mut h = held(&delegated());
+        for i in 0..(WATCHED_CAP as u32 + 10) {
+            h.watched.push(Watched {
+                script: script_at(i),
+                until_height: TIP + 100,
+                canary: Vec::new(),
+                canary_contract: [0; 32],
+            });
+        }
+        prune_watched(&mut h, TIP);
+        assert_eq!(h.watched.len(), WATCHED_CAP);
+        assert!(h
+            .watched
+            .iter()
+            .any(|w| w.script == script_at(WATCHED_CAP as u32 + 9)));
+        assert!(!h.watched.iter().any(|w| w.script == script_at(0)));
     }
 
     /// Review round 3, P2-b: a copy is settled only once the node answered
