@@ -651,7 +651,10 @@ pub(crate) fn heartbeat<S: SecretStore>(
     record: &ArmRecord,
     now_ms: u64,
     force: bool,
-) -> Option<(harvest_common::presence::SignedHeartbeat, OutboundDelegateMsg)> {
+) -> Option<(
+    harvest_common::presence::SignedHeartbeat,
+    OutboundDelegateMsg,
+)> {
     use harvest_common::presence::{Heartbeat, SignedHeartbeat};
     let presence = record.arm.presence_contract_id?;
     if secrets.has_secret(EXPORTED_KEY) {
@@ -715,11 +718,16 @@ pub(crate) fn heartbeat_request<S: SecretStore>(
         result,
     };
     let Some(record) = load_arm(secrets, store_contract_id) else {
-        return (answer(Err("this store is not armed here".into())), Vec::new());
+        return (
+            answer(Err("this store is not armed here".into())),
+            Vec::new(),
+        );
     };
     if record.arm.presence_contract_id.is_none() {
         return (
-            answer(Err("this store was armed without a presence contract".into())),
+            answer(Err(
+                "this store was armed without a presence contract".into()
+            )),
             Vec::new(),
         );
     }
@@ -769,9 +777,9 @@ pub(crate) fn resubscribe_all<S: SecretStore>(secrets: &mut S) -> Vec<OutboundDe
         ));
     }
     for tip in tips {
-        out.push(OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
-            ContractInstanceId::new(tip),
-        )));
+        out.push(OutboundDelegateMsg::GetContractRequest(
+            GetContractRequest::new(ContractInstanceId::new(tip)),
+        ));
     }
     out
 }
@@ -3817,6 +3825,168 @@ mod tests {
             status_of(&f.secrets, &f.record, NOW + OVERSOLD_SHOWN_MS).wallet_gap_limit,
             0
         );
+    }
+
+    fn heartbeat_of(out: &[OutboundDelegateMsg]) -> Vec<harvest_common::presence::SignedHeartbeat> {
+        out.iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::UpdateContractRequest(u)
+                    if u.contract_id.as_bytes() == [9; 32] =>
+                {
+                    let UpdateData::Delta(d) = &u.update else {
+                        panic!("a delta")
+                    };
+                    Some(harvest_common::presence::decode_delta(d.as_ref()).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A wake-up sends each armed store's heartbeat to its presence
+    /// contract, signed by the store key, saying whether it takes orders;
+    /// a second one inside `HEARTBEAT_MIN_GAP_MS` saying the same is not
+    /// sent; one after it is, with a larger `seq`. The wake-up is recorded
+    /// for the tab. Mutated red by dropping the gap check, by never sending,
+    /// and by not recording the wake-up.
+    #[test]
+    fn a_wake_up_sends_a_heartbeat_and_is_remembered() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut f = fixture();
+        let wake = BackgroundRun::Wakeup {
+            tag: HEARTBEAT_TAG.to_vec(),
+        };
+        let out = crate::background::on_background(&mut f.secrets, &wake, NOW);
+        let beats = heartbeat_of(&out);
+        assert_eq!(beats.len(), 1, "{out:?}");
+        beats[0]
+            .verify(&store_sk().verifying_key())
+            .expect("signed by the store key");
+        assert!(beats[0].heartbeat.taking_orders);
+        assert_eq!(beats[0].heartbeat.at_ms, NOW);
+        assert_eq!(load::<_, u64>(&f.secrets, WAKEUP_KEY), Some(NOW));
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).last_wakeup_ms,
+            Some(NOW)
+        );
+
+        let soon = crate::background::on_background(&mut f.secrets, &wake, NOW + 60_000);
+        assert!(heartbeat_of(&soon).is_empty(), "one per interval");
+        let later =
+            crate::background::on_background(&mut f.secrets, &wake, NOW + HEARTBEAT_MIN_GAP_MS);
+        let again = heartbeat_of(&later);
+        assert_eq!(again.len(), 1);
+        assert!(again[0].heartbeat.seq > beats[0].heartbeat.seq);
+
+        // A tag this generation did not declare does nothing.
+        let other = BackgroundRun::Wakeup { tag: b"x".to_vec() };
+        assert!(crate::background::on_background(&mut f.secrets, &other, NOW + DAY_MS).is_empty());
+    }
+
+    /// A heartbeat says the store is not taking orders when it could not
+    /// issue payment details (here, the watch lapsed), and a change of that
+    /// goes out at once, inside the interval. Its `seq` keeps rising
+    /// through a clock that jumped back. Mutated red by taking orders
+    /// regardless, and by ordering on the clock.
+    #[test]
+    fn a_heartbeat_says_when_the_store_cannot_take_orders() {
+        let mut f = fixture();
+        let (first, _) = heartbeat(&mut f.secrets, &f.record.clone(), NOW, false).unwrap();
+        assert!(first.heartbeat.taking_orders);
+        let mut lapsed = f.record.clone();
+        lapsed.watched_until_ms = NOW;
+        let (closed, _) = heartbeat(&mut f.secrets, &lapsed, NOW + 1_000, false).expect("changed");
+        assert!(!closed.heartbeat.taking_orders);
+        // The clock jumps back an hour: still a later heartbeat.
+        let (back, _) =
+            heartbeat(&mut f.secrets, &f.record.clone(), NOW - 3_600_000, true).unwrap();
+        assert!(back.heartbeat.seq > closed.heartbeat.seq);
+        assert_eq!(back.heartbeat.at_ms, NOW - 3_600_000);
+    }
+
+    /// No heartbeat without a presence contract (an older UI armed it) or
+    /// once this generation handed its keys on. Mutated red by dropping
+    /// each check.
+    #[test]
+    fn no_heartbeat_without_a_presence_contract_or_after_export() {
+        let mut f = fixture();
+        let mut old_ui = f.record.clone();
+        old_ui.arm.presence_contract_id = None;
+        assert!(heartbeat(&mut f.secrets, &old_ui, NOW, true).is_none());
+        f.secrets.set_secret(EXPORTED_KEY, b"1");
+        assert!(heartbeat(&mut f.secrets, &f.record.clone(), NOW, true).is_none());
+    }
+
+    /// The tab's heartbeat request: answered with the heartbeat it sent and
+    /// the last wake-up, or with why not. Mutated red by answering an
+    /// unarmed store.
+    #[test]
+    fn the_tabs_heartbeat_request_is_answered() {
+        let mut f = fixture();
+        note_wakeup(&mut f.secrets, NOW - 5);
+        let (answer, out) = heartbeat_request(&mut f.secrets, &[1; 32], true, NOW);
+        let HarvestDelegateResponse::Heartbeat { result: Ok(a), .. } = answer else {
+            panic!("{answer:?}")
+        };
+        assert!(a.heartbeat.is_some());
+        assert_eq!(a.last_wakeup_ms, Some(NOW - 5));
+        assert_eq!(heartbeat_of(&out).len(), 1);
+        let (unarmed, out) = heartbeat_request(&mut f.secrets, &[8; 32], true, NOW);
+        assert!(matches!(
+            unarmed,
+            HarvestDelegateResponse::Heartbeat { result: Err(_), .. }
+        ));
+        assert!(out.is_empty());
+    }
+
+    /// The node starting (or this delegate being installed) subscribes again
+    /// to each armed store's store and mailbox, then to each tip once, and
+    /// reads the tip: four operations for one store. Nothing after an
+    /// export. Mutated red by dropping the tip read, and the export check.
+    #[test]
+    fn the_node_starting_resubscribes_every_arm() {
+        use crate::node_glue::BackgroundRun;
+        let mut f = fixture();
+        let out =
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::NodeStarted, NOW);
+        let subscribed: Vec<[u8; 32]> = out
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::SubscribeContractRequest(r) => {
+                    Some(<[u8; 32]>::try_from(r.contract_id.as_bytes()).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subscribed, vec![[1; 32], [2; 32], [3; 32]]);
+        assert!(matches!(
+            out.last(),
+            Some(OutboundDelegateMsg::GetContractRequest(r)) if r.contract_id.as_bytes() == [3; 32]
+        ));
+        assert_eq!(out.len(), 4);
+        let installed =
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::Installed, NOW);
+        assert_eq!(installed.len(), 4);
+        f.secrets.set_secret(EXPORTED_KEY, b"1");
+        assert!(
+            crate::background::on_background(&mut f.secrets, &BackgroundRun::NodeStarted, NOW)
+                .is_empty()
+        );
+    }
+
+    /// A watch that ends at a height must outlast an invoice's window in
+    /// blocks: none is issued once the tip is within `WATCH_NEEDED_BLOCKS`
+    /// of it. Mutated red by dropping the check and by an off-by-one.
+    #[test]
+    fn a_watch_horizon_near_the_tip_stops_invoicing() {
+        let mut f = fixture();
+        f.record.arm.watched_until_height = Some(1_000 + WATCH_NEEDED_BLOCKS);
+        let ok = run(&mut f, &[Buyer::new(70).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(ok.orders.len(), 1, "{:?}", ok.refused);
+        let mut f = fixture();
+        f.record.arm.watched_until_height = Some(1_000 + WATCH_NEEDED_BLOCKS - 1);
+        let near = run(&mut f, &[Buyer::new(71).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(near.refused[0].1, Refusal::WatchLapsed);
     }
 
     /// I5. Stale tip, a store this key does not own, a closed store and a

@@ -3572,9 +3572,8 @@ impl AppState {
                     label: crate::store_link::store_label(&s.store_code, name.as_deref()),
                     code: s.store_code.clone(),
                     archived: s.archived,
-                    closed: id.is_some_and(|id| {
-                        self.store_presence(id.as_bytes(), now_ms).is_closed()
-                    }),
+                    closed: id
+                        .is_some_and(|id| self.store_presence(id.as_bytes(), now_ms).is_closed()),
                 }
             })
             .collect();

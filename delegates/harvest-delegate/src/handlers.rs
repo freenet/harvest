@@ -389,7 +389,13 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_contract_id,
             force,
         } => {
-            crate::auto_invoice::heartbeat_request(store, &store_contract_id, force, crate::now_ms()).0
+            crate::auto_invoice::heartbeat_request(
+                store,
+                &store_contract_id,
+                force,
+                crate::now_ms(),
+            )
+            .0
         }
 
         _ => HarvestDelegateResponse::Error {

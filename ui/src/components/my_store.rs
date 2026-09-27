@@ -1977,6 +1977,7 @@ mod seller_stores_tests {
             wallet_gap_paid_at_ms: gap,
             wallet_gap_limit: 100,
             capped: None,
+            last_wakeup_ms: None,
         };
         state
             .auto_invoice

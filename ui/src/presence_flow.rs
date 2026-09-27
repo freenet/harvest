@@ -106,7 +106,8 @@ pub fn store_presence(
     now_ms: u64,
 ) -> StorePresence {
     if state.is_none()
-        && following_since_ms.is_none_or(|since| now_ms.saturating_sub(since) < PRESENCE_CHECKING_MS)
+        && following_since_ms
+            .is_none_or(|since| now_ms.saturating_sub(since) < PRESENCE_CHECKING_MS)
     {
         return StorePresence::Checking;
     }
@@ -351,7 +352,10 @@ mod tests {
     #[test]
     fn a_store_is_checking_then_open_or_closed() {
         assert_eq!(store_presence(None, None, NOW), StorePresence::Checking);
-        assert_eq!(store_presence(None, Some(NOW - 1_000), NOW), StorePresence::Checking);
+        assert_eq!(
+            store_presence(None, Some(NOW - 1_000), NOW),
+            StorePresence::Checking
+        );
         assert_eq!(
             store_presence(None, Some(NOW - PRESENCE_CHECKING_MS), NOW),
             StorePresence::Closed(ClosedWhy::NoHeartbeat)
@@ -359,7 +363,10 @@ mod tests {
         let fresh = PresenceStateV1 {
             heartbeat: Some(signed(NOW - 60_000, true)),
         };
-        assert_eq!(store_presence(Some(&fresh), Some(NOW), NOW), StorePresence::Open);
+        assert_eq!(
+            store_presence(Some(&fresh), Some(NOW), NOW),
+            StorePresence::Open
+        );
         let stale = PresenceStateV1 {
             heartbeat: Some(signed(NOW - PRESENCE_FRESH_MS - 1, true)),
         };

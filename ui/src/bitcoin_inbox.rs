@@ -681,7 +681,10 @@ impl InboxTracker {
                 }
             });
             this.until_height = pending.until_height;
-            this.read_until_height = self.sent.get(&key).and_then(SentWatch::watched_until_height);
+            this.read_until_height = self
+                .sent
+                .get(&key)
+                .and_then(SentWatch::watched_until_height);
             self.sent.insert(key, this);
         }
     }

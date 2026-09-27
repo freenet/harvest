@@ -158,8 +158,7 @@ pub extern "C" fn process(parameters: i64, origin: i64, inbound: i64) -> i64 {
     };
     let parameters = unsafe {
         let param_buf = &*(parameters as *const freenet_stdlib::memory::buf::BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.bytes_written());
+        let bytes = &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.bytes_written());
         Parameters::from(bytes)
     };
     let origin: Option<MessageOrigin> = unsafe {
@@ -179,9 +178,9 @@ pub extern "C" fn process(parameters: i64, origin: i64, inbound: i64) -> i64 {
         match decode_inbound(bytes) {
             Ok(v) => v,
             Err(err) => {
-                return DelegateInterfaceResult::from(
-                    Err::<Vec<OutboundDelegateMsg>, _>(DelegateError::Deser(err)),
-                )
+                return DelegateInterfaceResult::from(Err::<Vec<OutboundDelegateMsg>, _>(
+                    DelegateError::Deser(err),
+                ))
                 .into_raw()
             }
         }
@@ -191,9 +190,9 @@ pub extern "C" fn process(parameters: i64, origin: i64, inbound: i64) -> i64 {
     // context uses are available.
     let mut ctx = unsafe { DelegateCtx::__new() };
     let result = match inbound {
-        Inbound::Known(msg) => {
-            <crate::HarvestDelegate as DelegateInterface>::process(&mut ctx, parameters, origin, msg)
-        }
+        Inbound::Known(msg) => <crate::HarvestDelegate as DelegateInterface>::process(
+            &mut ctx, parameters, origin, msg,
+        ),
         Inbound::Background(run) => crate::background::run(&mut ctx, run, crate::now_ms()),
     };
     DelegateInterfaceResult::from(result).into_raw()
@@ -266,13 +265,17 @@ mod tests {
     /// The manifest asks for exactly what the delegate handles.
     #[test]
     fn the_manifest_asks_for_what_the_delegate_handles() {
-        let json: freenet_stdlib::prelude::serde_json::Value = freenet_stdlib::prelude::serde_json::from_str(MANIFEST_JSON).expect("valid JSON");
+        let json: freenet_stdlib::prelude::serde_json::Value =
+            freenet_stdlib::prelude::serde_json::from_str(MANIFEST_JSON).expect("valid JSON");
         assert_eq!(json["manifest_version"], 1);
         assert_eq!(
             json["lifecycle"],
             freenet_stdlib::prelude::serde_json::json!(["installed", "node_started"])
         );
-        assert_eq!(json["capabilities"], freenet_stdlib::prelude::serde_json::json!(["background"]));
+        assert_eq!(
+            json["capabilities"],
+            freenet_stdlib::prelude::serde_json::json!(["background"])
+        );
         assert_eq!(
             json["wakeups"],
             freenet_stdlib::prelude::serde_json::json!([{ "tag": "heartbeat", "every_secs": 300 }])
