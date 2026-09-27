@@ -1271,8 +1271,10 @@ mod tests {
 
     /// A pending delegation of watch requests holds custody back like a
     /// watch request does: both are vault prompts, and a refusal names no
-    /// request. Mutated red by leaving `WatchDelegation` out of
-    /// `is_watch_signature`.
+    /// request. (Leaving it out of `is_watch_signature` alone does not turn
+    /// this red, since it would then count as the seller's own signature;
+    /// that mutation is caught by `the_seller_delegates_once_per_ghost_key_
+    /// and_bridge`.)
     #[test]
     fn custody_waits_behind_a_watch_delegation() {
         let mut state = backed_store();

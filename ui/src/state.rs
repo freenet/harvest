@@ -31572,9 +31572,8 @@ mod buy_flow_tests {
     }
 
     /// Retiring an inbox drops a delegation queued against it, and keeps one
-    /// queued against another; a pending delegation is something the minute
-    /// check acts on. Mutated red by dropping the `WatchDelegation` arm of
-    /// `retire_inbox`, and by leaving it out of `is_watch_signature`.
+    /// queued against another. Mutated red by dropping the `WatchDelegation`
+    /// arm of `retire_inbox`.
     #[test]
     fn a_retired_inbox_takes_its_queued_delegation_with_it() {
         let gk = inbox::authority().mint();
