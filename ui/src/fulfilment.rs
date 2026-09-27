@@ -1029,6 +1029,11 @@ mod tests {
         let sections = RecordSections::of(&store);
         assert_eq!(sections.counted(), 1);
         assert_eq!(
+            sections.headline().as_deref(),
+            Some("1 complaint(s) counted, of 2 on record"),
+            "the total is the whole record, both sections"
+        );
+        assert_eq!(
             sections
                 .judged
                 .iter()
@@ -1076,6 +1081,13 @@ mod tests {
         assert_eq!(
             store.complaints_under_unrecognised_bridges(),
             harvest_common::reputation::MAX_COMPLAINTS
+        );
+        assert_eq!(
+            crate::components::reputation_view::RecordSections::of(&store).headline(),
+            Some(format!(
+                "No complaints counted, of {} on record",
+                harvest_common::reputation::MAX_COMPLAINTS
+            ))
         );
     }
 

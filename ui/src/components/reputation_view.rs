@@ -49,6 +49,20 @@ impl RecordSections {
     pub(crate) fn counted(&self) -> usize {
         self.judged.iter().filter(|r| r.standing.counts()).count()
     }
+
+    /// The record's first line, or `None` when it holds no complaint at all
+    /// (the empty text says why). The total is every complaint on the
+    /// record, both sections.
+    pub(crate) fn headline(&self) -> Option<String> {
+        let total = self.judged.len() + self.unrecognised.len();
+        match (total, self.counted()) {
+            (0, _) => None,
+            (_, 0) => Some(format!("No complaints counted, of {total} on record")),
+            (_, counted) => Some(format!(
+                "{counted} complaint(s) counted, of {total} on record"
+            )),
+        }
+    }
 }
 
 /// One store's record: its complaints, and nothing else's (harvest#93 phase 2).
@@ -71,23 +85,18 @@ pub fn StoreRecord(store_contract_id: Vec<u8>) -> Element {
                 empty_record_text(RecordLoad::Loading),
             )
         });
-    let counted = sections.counted();
-    let judged = sections.judged.len();
+    let headline = sections.headline();
     let unrecognised = sections.unrecognised.len();
 
     rsx! {
         div { class: "store-record",
-            if judged == 0 && unrecognised == 0 {
-                p { class: "text-muted", "{empty_text}" }
-            } else if judged == 0 {
-                p { class: "section-count", "No complaints counted" }
-            } else {
-                p { class: "section-count",
-                    "{counted} complaint(s) counted, of {judged} on record"
-                }
+            if let Some(headline) = headline {
+                p { class: "section-count", "{headline}" }
                 for row in sections.judged.iter() {
                     ComplaintCard { row: row.clone() }
                 }
+            } else {
+                p { class: "text-muted", "{empty_text}" }
             }
             if unrecognised > 0 {
                 p { class: "section-count",
