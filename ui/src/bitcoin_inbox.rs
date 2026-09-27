@@ -96,6 +96,7 @@ pub fn watch_requests(
             scan_from_height,
             made_at_ms: made_at_ms + i as u64,
             watch_until_height: None,
+            revoke_watch_keys_through: None,
         })
         .collect()
 }
@@ -654,6 +655,7 @@ impl InboxTracker {
                     // watch than an order script needs costs the bridge a
                     // little, never a payment.
                     watch_until_height: batch.iter().filter_map(|w| w.until_height).max(),
+                    revoke_watch_keys_through: None,
                 });
             }
         }

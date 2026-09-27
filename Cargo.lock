@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-common"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#fda0c40476be8d62e289ee7ffae6bad31b35d31e"
 dependencies = [
  "blake3",
  "bs58",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-generation"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#fda0c40476be8d62e289ee7ffae6bad31b35d31e"
 dependencies = [
  "blake3",
  "bs58",
@@ -1565,7 +1565,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-inbox"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#fda0c40476be8d62e289ee7ffae6bad31b35d31e"
 dependencies = [
  "blake3",
  "blind-rsa-signatures",
