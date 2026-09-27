@@ -31116,6 +31116,134 @@ mod buy_flow_tests {
         state
     }
 
+    /// An arm names the store's presence contract, and the horizon the
+    /// bridge was asked to watch its addresses through: the nearest one read,
+    /// with the time left counted at the pessimistic block rate. Mutated red
+    /// by taking the furthest horizon, and by dropping the presence id.
+    #[test]
+    fn an_arm_carries_the_presence_contract_and_the_watch_horizon() {
+        use crate::auto_invoice_flow::HORIZON_BLOCK_MS;
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let registration = state.my_stores["seller-fp"][0].clone();
+        state.bitcoin.tips.insert(
+            BitcoinNetwork::Signet,
+            TipView {
+                network: BitcoinNetwork::Signet,
+                tip_height: Some(1_000),
+                signed_tip: None,
+                last_block_time: None,
+                recent_blocks: Vec::new(),
+            },
+        );
+        let key = |i: u8| (BitcoinNetwork::Signet, vec![0x00, 0x14, i]);
+        let sent = |until: u32| crate::bitcoin_inbox::SentWatch {
+            sent_at_ms: 1_000,
+            entry_key: Default::default(),
+            mainnet_height: 0,
+            ghostkey: gk.id(),
+            read: true,
+            unread_since_ms: 1_000,
+            read_lease_ms: Some(1_000),
+            until_height: Some(until),
+            read_until_height: None,
+        };
+        let inbox = state.bitcoin.inbox.as_mut().unwrap();
+        inbox.sent.insert(key(4), sent(5_000));
+        inbox.sent.insert(key(5), sent(4_000));
+        let (arm, _) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        assert_eq!(arm.watched_until_height, Some(4_000));
+        assert_eq!(arm.watch_left_ms, 3_000 * HORIZON_BLOCK_MS);
+        let store_key = registration.store_verifying_key.unwrap();
+        assert_eq!(
+            arm.presence_contract_id,
+            crate::auto_invoice_flow::presence_instance_bytes(&store_key)
+        );
+        assert!(arm.presence_contract_id.is_some());
+    }
+
+    /// The open tab heartbeats an armed store every five minutes, forcing
+    /// the first of the session (which creates the presence contract), and
+    /// leaves it to the node once wake-ups are seen, except for that first
+    /// one. Mutated red by never forcing, by ignoring wake-ups, and by
+    /// dropping the interval.
+    #[test]
+    fn the_tab_heartbeats_until_the_node_does() {
+        use harvest_common::presence::HEARTBEAT_EVERY_MS;
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let store = instant_store();
+        assert!(state.heartbeats_due(100).is_empty(), "not armed yet");
+        let registration = state.my_stores["seller-fp"][0].clone();
+        let (arm, _) = state
+            .auto_invoice_arm("seller-fp", &registration, 10)
+            .expect("an arm");
+        state.auto_invoice.sent.insert(store.clone(), (arm, 0, 0));
+        assert_eq!(state.queue_heartbeats(100), vec![(store.clone(), true)]);
+        assert!(state.heartbeats_due(200).is_empty(), "asked just now");
+        state.presence.published.insert(store.clone());
+        assert_eq!(
+            state.heartbeats_due(100 + HEARTBEAT_EVERY_MS),
+            vec![(store.clone(), false)]
+        );
+        // The node wakes the delegate: the tab stops.
+        state.note_wakeup_status(Some(100 + HEARTBEAT_EVERY_MS));
+        assert!(state.wakeups_live(100 + HEARTBEAT_EVERY_MS));
+        assert!(state.heartbeats_due(100 + HEARTBEAT_EVERY_MS).is_empty());
+        // Wake-ups stop: the tab takes over again.
+        let late = 100 + HEARTBEAT_EVERY_MS + crate::presence_flow::WAKEUPS_FRESH_MS;
+        assert!(!state.wakeups_live(late));
+        assert_eq!(state.heartbeats_due(late), vec![(store, false)]);
+    }
+
+    /// A store's presence is followed once its key is known, and a state
+    /// is used only if it verifies against that key: a heartbeat signed by
+    /// another key is refused. Mutated red by dropping the verification.
+    #[test]
+    fn a_stores_presence_is_followed_and_verified() {
+        use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
+        let mut state = AppState::default();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        state.browsing_stores.insert(
+            vec![7; 32],
+            BrowsingStore {
+                owner: Some(sk.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        let now = 1_800_000_000_000u64;
+        let follow = state.follow_due_presence(now);
+        assert_eq!(follow.len(), 1);
+        assert!(state.follow_due_presence(now).is_empty(), "once");
+        assert_eq!(
+            state.store_presence(&[7; 32], now),
+            crate::presence_flow::StorePresence::Checking
+        );
+        let signed_by = |key: &ed25519_dalek::SigningKey| {
+            harvest_common::to_cbor(&PresenceStateV1 {
+                heartbeat: Some(
+                    SignedHeartbeat::sign(key, Heartbeat::new(now, now, true)).unwrap(),
+                ),
+            })
+            .unwrap()
+        };
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        assert!(state.on_presence_state(&follow[0], &signed_by(&other)));
+        assert_ne!(
+            state.store_presence(&[7; 32], now),
+            crate::presence_flow::StorePresence::Open
+        );
+        assert!(state.on_presence_state(&follow[0], &signed_by(&sk)));
+        assert_eq!(
+            state.store_presence(&[7; 32], now),
+            crate::presence_flow::StorePresence::Open
+        );
+        // Not ours: the caller goes on.
+        assert!(!state.on_presence_state(&[0; 32], &signed_by(&sk)));
+    }
+
     /// The delegate writes its orders to the store an arm names, so an arm
     /// never names an earlier generation of it (harvest#164). Mutated red by
     /// dropping the `store_write_target` check from
