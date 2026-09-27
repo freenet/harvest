@@ -31125,6 +31125,8 @@ mod buy_flow_tests {
                 read,
                 unread_since_ms: at,
                 read_lease_ms,
+                until_height: None,
+                read_until_height: None,
             };
         let inbox = state.bitcoin.inbox.as_mut().unwrap();
         inbox.sent.insert(key(4), sent(1_000, true, Some(1_000)));
@@ -31200,6 +31202,7 @@ mod buy_flow_tests {
             wallet_gap_paid_at_ms: None,
             wallet_gap_limit: 0,
             capped: None,
+            last_wakeup_ms: None,
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(

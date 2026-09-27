@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn signed(at_ms: u64, taking_orders: bool) -> SignedHeartbeat {
-        SignedHeartbeat::sign(&store_key(), Heartbeat::new(at_ms, taking_orders)).unwrap()
+        SignedHeartbeat::sign(&store_key(), Heartbeat::new(at_ms, at_ms, taking_orders)).unwrap()
     }
 
     fn state_bytes(at_ms: u64, taking_orders: bool) -> Vec<u8> {

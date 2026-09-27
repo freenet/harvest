@@ -48,6 +48,7 @@ use serde::Deserialize;
 /// Field for field what stdlib 0.12.1's `#[delegate(manifest(lifecycle =
 /// [Installed, NodeStarted], capabilities = [Background], wakeups =
 /// [heartbeat = 300]))]` writes; a reader keys on names, not order.
+#[cfg_attr(not(any(test, target_family = "wasm")), allow(dead_code))]
 pub(crate) const MANIFEST_JSON: &str = concat!(
     r#"{"manifest_version":1,"#,
     r#""lifecycle":["installed","node_started"],"#,

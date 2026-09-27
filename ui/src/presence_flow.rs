@@ -180,7 +180,7 @@ impl AppState {
 
     /// Keep `state` for `store_id` unless what is held is newer.
     fn keep_presence(&mut self, store_id: &[u8], state: PresenceStateV1) {
-        let newer = |s: &PresenceStateV1| s.heartbeat.as_ref().map(|h| h.heartbeat.at_ms);
+        let newer = |s: &PresenceStateV1| s.heartbeat.as_ref().map(|h| h.heartbeat.seq);
         let held = self.presence.states.get(store_id).and_then(newer);
         if newer(&state) >= held {
             self.presence.states.insert(store_id.to_vec(), state);
@@ -341,7 +341,7 @@ mod tests {
 
     fn signed(at_ms: u64, taking: bool) -> SignedHeartbeat {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
-        SignedHeartbeat::sign(&sk, Heartbeat::new(at_ms, taking)).unwrap()
+        SignedHeartbeat::sign(&sk, Heartbeat::new(at_ms, at_ms, taking)).unwrap()
     }
 
     const NOW: u64 = 1_800_000_000_000;

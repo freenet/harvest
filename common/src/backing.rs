@@ -2080,9 +2080,9 @@ mod tests {
     fn a_heartbeat_is_a_heartbeat_and_nothing_else_is() {
         use crate::presence::Heartbeat;
         for heartbeat in [
-            Heartbeat::new(0, false),
-            Heartbeat::new(1_700_000_000_000, true),
-            Heartbeat::new(u64::MAX, true),
+            Heartbeat::new(0, 0, false),
+            Heartbeat::new(1_700_000_000_000, 1_700_000_000_000, true),
+            Heartbeat::new(u64::MAX, u64::MAX, true),
         ] {
             let bytes = crate::to_cbor(&heartbeat).unwrap();
             assert_eq!(

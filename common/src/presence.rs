@@ -20,7 +20,7 @@
 //!
 //! # State and merge
 //!
-//! At most one [`SignedHeartbeat`]. Two are ordered by `at_ms`, larger
+//! At most one [`SignedHeartbeat`]. Two are ordered by `seq`, larger
 //! first, then by the smaller canonical encoding: a total order, so keeping
 //! the maximum is commutative, associative and idempotent. The contract
 //! checks the signature, the exact envelope and the size bounds; it reads no
@@ -28,6 +28,16 @@
 //! heartbeat dated in the future. Only the store key can sign one, and
 //! [`presence_verdict`] treats one dated more than [`PRESENCE_SKEW_MS`]
 //! ahead as closed.
+//!
+//! # Why a sequence number and not the time
+//!
+//! Ordering by `at_ms` would let one heartbeat signed while the seller's
+//! clock ran ahead (a machine that booted with a wrong clock, say) outrank
+//! every correct one after it, and hold the store closed until real time
+//! caught up with it: a year-ahead clock, a year closed. The delegate numbers
+//! heartbeats `max(last + 1, now)` instead, so the next heartbeat after the
+//! clock is put right still wins, and `at_ms` is only what freshness is read
+//! from.
 //!
 //! # A re-key needs no migration
 //!
@@ -109,7 +119,11 @@ pub enum HeartbeatKind {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Heartbeat {
     pub kind: HeartbeatKind,
-    /// Unix milliseconds, by the seller's clock.
+    /// What orders two heartbeats: larger is later. The signer's
+    /// `max(last + 1, now in ms)`, so it keeps rising through a clock that
+    /// jumps back.
+    pub seq: u64,
+    /// Unix milliseconds, by the seller's clock: what freshness is read from.
     pub at_ms: u64,
     /// Whether the store can issue payment details now. False closes the
     /// store as surely as silence does.
@@ -117,9 +131,10 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    pub fn new(at_ms: u64, taking_orders: bool) -> Self {
+    pub fn new(seq: u64, at_ms: u64, taking_orders: bool) -> Self {
         Self {
             kind: HeartbeatKind::HarvestPresenceV1,
+            seq,
             at_ms,
             taking_orders,
         }
@@ -196,11 +211,11 @@ impl SignedHeartbeat {
 }
 
 /// Whether `held` stays when `incoming` arrives: it is later, or as late
-/// and encodes no larger. A total order (at_ms descending, then bytes
+/// and encodes no larger. A total order (seq descending, then bytes
 /// ascending), so keeping its maximum is idempotent, commutative and
 /// associative.
 fn keeps_held(held: &SignedHeartbeat, incoming: &SignedHeartbeat) -> Result<bool, String> {
-    Ok(match held.heartbeat.at_ms.cmp(&incoming.heartbeat.at_ms) {
+    Ok(match held.heartbeat.seq.cmp(&incoming.heartbeat.seq) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => held.bytes()? <= incoming.bytes()?,
@@ -214,13 +229,13 @@ pub struct PresenceStateV1 {
     pub heartbeat: Option<SignedHeartbeat>,
 }
 
-/// What a peer tells another it holds: the heartbeat's time and a digest of
-/// it. The digest is what makes two heartbeats with the same `at_ms` (the
-/// same moment, `taking_orders` flipped) converge; `at_ms` alone would
-/// call them equal and neither side would ever send.
+/// What a peer tells another it holds: the heartbeat's `seq` and a digest
+/// of it. The digest is what makes two heartbeats with the same `seq`
+/// (`taking_orders` flipped) converge; `seq` alone would call them equal and
+/// neither side would ever send.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PresenceSummaryV1 {
-    pub at_ms: u64,
+    pub seq: u64,
     pub digest: Bytes32,
 }
 
@@ -265,7 +280,7 @@ impl PresenceStateV1 {
             .as_ref()
             .map(|h| {
                 Ok(PresenceSummaryV1 {
-                    at_ms: h.heartbeat.at_ms,
+                    seq: h.heartbeat.seq,
                     digest: h.digest()?,
                 })
             })
@@ -285,7 +300,7 @@ impl PresenceStateV1 {
         };
         let send = match theirs {
             None => true,
-            Some(theirs) => match ours.heartbeat.at_ms.cmp(&theirs.at_ms) {
+            Some(theirs) => match ours.heartbeat.seq.cmp(&theirs.seq) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Equal => ours.digest()? != theirs.digest,
@@ -391,7 +406,7 @@ mod tests {
     }
 
     fn signed(at_ms: u64, taking_orders: bool) -> SignedHeartbeat {
-        SignedHeartbeat::sign(&store_key(), Heartbeat::new(at_ms, taking_orders)).unwrap()
+        SignedHeartbeat::sign(&store_key(), Heartbeat::new(at_ms, at_ms, taking_orders)).unwrap()
     }
 
     fn state(h: SignedHeartbeat) -> PresenceStateV1 {
@@ -429,7 +444,7 @@ mod tests {
     #[test]
     fn a_heartbeat_by_another_key_is_refused() {
         let other = SigningKey::from_bytes(&[0x72; 32]);
-        let h = SignedHeartbeat::sign(&other, Heartbeat::new(1_000, true)).unwrap();
+        let h = SignedHeartbeat::sign(&other, Heartbeat::new(1_000, 1_000, true)).unwrap();
         assert!(refusal(&h).contains("not signed by the store key"));
     }
 
@@ -454,7 +469,7 @@ mod tests {
             crate::backing::sign_with_store_key(&store_key(), crate::to_cbor(&retirement).unwrap())
                 .unwrap();
         let h = SignedHeartbeat {
-            heartbeat: Heartbeat::new(1_000, true),
+            heartbeat: Heartbeat::new(1_000, 1_000, true),
             scoped_payload,
             signature,
         };
@@ -475,7 +490,7 @@ mod tests {
             &scoped,
             &sig,
             &store_key().verifying_key(),
-            &Heartbeat::new(1_000, true)
+            &Heartbeat::new(1_000, 1_000, true)
         )
         .is_err());
     }

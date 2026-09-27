@@ -624,7 +624,15 @@ mod boundary_tests {
                     address_code_hash: [8u8; 32],
                     watched_scripts: vec![],
                     watch_left_ms: 1,
+                    watched_until_height: None,
+                    presence_contract_id: None,
                 }),
+            })
+            .expect("cbor"),
+            // A heartbeat signs with a store key and writes a contract.
+            to_cbor(&HarvestDelegateRequest::Heartbeat {
+                store_contract_id: vec![3u8; 32],
+                force: true,
             })
             .expect("cbor"),
             to_cbor(&BtcReq::PeekOrderAddresses {

@@ -621,6 +621,9 @@ fn beat_key(store_contract_id: &[u8]) -> Vec<u8> {
 struct BeatRecord {
     at_ms: u64,
     taking_orders: bool,
+    /// The `seq` it was signed with (`harvest_common::presence::Heartbeat`).
+    #[serde(default)]
+    seq: u64,
 }
 
 pub(crate) fn note_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) {
@@ -667,7 +670,10 @@ pub(crate) fn heartbeat<S: SecretStore>(
         }
     }
     let store_sk = store_key(secrets, &record.arm.store_verifying_key)?;
-    let signed = SignedHeartbeat::sign(&store_sk, Heartbeat::new(now_ms, taking)).ok()?;
+    // Rising through a clock that jumps back (see `Heartbeat::seq`).
+    let seq = load::<_, BeatRecord>(secrets, &key)
+        .map_or(now_ms, |last| now_ms.max(last.seq.saturating_add(1)));
+    let signed = SignedHeartbeat::sign(&store_sk, Heartbeat::new(seq, now_ms, taking)).ok()?;
     let delta = to_cbor(&signed).ok()?;
     save(
         secrets,
@@ -675,6 +681,7 @@ pub(crate) fn heartbeat<S: SecretStore>(
         &BeatRecord {
             at_ms: now_ms,
             taking_orders: taking,
+            seq,
         },
     );
     Some((
@@ -2364,6 +2371,8 @@ mod tests {
                 address_code_hash: [5; 32],
                 watched_scripts: (0..5).map(script_at).collect(),
                 watch_left_ms: WATCH_NEEDED_MS + 3_600_000,
+                watched_until_height: None,
+                presence_contract_id: Some([9; 32]),
             },
             armed_at_ms: NOW - 1_000,
             watched_until_ms: NOW + WATCH_NEEDED_MS + 3_600_000,

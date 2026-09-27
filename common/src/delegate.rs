@@ -1625,9 +1625,11 @@ mod tests {
             R::KeptPurchases { .. } => (27, true),
             R::KeepPurchaseRefused { .. } => (28, false),
             R::AutoInvoice { .. } => (29, false),
+            // A store-key signature over a public heartbeat, published.
+            R::Heartbeat { .. } => (30, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 30;
+    const RESPONSE_VARIANTS: usize = 31;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1667,9 +1669,10 @@ mod tests {
             Q::ListKeptPurchases => (26, false),
             // Public payment scripts and contract ids.
             Q::ArmAutoInvoice { .. } => (27, false),
+            Q::Heartbeat { .. } => (28, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 28;
+    const REQUEST_VARIANTS: usize = 29;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1890,6 +1893,14 @@ mod tests {
                     wallet_gap_paid_at_ms: None,
                     wallet_gap_limit: 0,
                     capped: None,
+                    last_wakeup_ms: Some(6),
+                }),
+            },
+            R::Heartbeat {
+                store_contract_id: vec![3u8; 32],
+                result: Ok(HeartbeatAnswer {
+                    heartbeat: None,
+                    last_wakeup_ms: Some(7),
                 }),
             },
         ]
@@ -2053,7 +2064,13 @@ mod tests {
                     address_code_hash: [8u8; 32],
                     watched_scripts: vec![vec![0u8, 20]],
                     watch_left_ms: 9,
+                    watched_until_height: Some(10),
+                    presence_contract_id: Some([11u8; 32]),
                 }),
+            },
+            Q::Heartbeat {
+                store_contract_id: store(),
+                force: true,
             },
         ]
     }
