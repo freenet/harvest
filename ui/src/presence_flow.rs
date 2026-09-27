@@ -291,7 +291,13 @@ impl AppState {
                         }
                     }
                     for (store, force) in heartbeats {
-                        crate::gateway::delegate_api::spawn_harvest_heartbeat(store, force);
+                        crate::state::spawn_harvest_request(
+                            harvest_common::HarvestDelegateRequest::Heartbeat {
+                                store_contract_id: store,
+                                force,
+                            },
+                            "a heartbeat request",
+                        );
                     }
                 });
             }

@@ -26,6 +26,36 @@ pub fn presence_contract_key(
     ))
 }
 
+/// Create `store_key`'s presence contract holding `heartbeat`, or merge the
+/// heartbeat into it if it exists (a PUT of an existing contract merges:
+/// `index_ops::publish_entry`). The open seller tab does this once a
+/// session, so the delegate's later heartbeats, sent as UPDATEs, find the
+/// contract on this node. Resolves when the send succeeds.
+#[cfg(target_arch = "wasm32")]
+pub async fn publish(
+    store_key: &[u8; 32],
+    heartbeat: harvest_common::presence::SignedHeartbeat,
+) -> Result<(), String> {
+    use freenet_stdlib::prelude::{
+        ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
+    };
+    use std::sync::Arc;
+
+    let key = ed25519_dalek::VerifyingKey::from_bytes(store_key)
+        .map_err(|e| format!("the store key is unusable: {e}"))?;
+    let params = crate::migrate::encode_params(&PresenceParameters::new(key))?;
+    let wrapped = WrappedContract::new(
+        Arc::new(ContractCode::from(PRESENCE_CONTRACT_WASM.to_vec())),
+        params,
+    );
+    let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+    let state = harvest_common::to_cbor(&harvest_common::presence::PresenceStateV1 {
+        heartbeat: Some(heartbeat),
+    })
+    .map_err(|e| format!("serialize presence state: {e}"))?;
+    super::put_contract(container, WrappedState::new(state)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
