@@ -1520,7 +1520,8 @@ mod tests {
     fn a_buyers_unpaid_orders_are_counted_like_the_stores_cap() {
         use harvest_common::payment::OrderStatus;
         let open = purchase(Some(order(OrderStatus::AwaitingPayment, true)), vec![]);
-        let mut paid = purchase(Some(order(OrderStatus::Paid, true)), vec![]);
+        // Paid by what this node holds, while the store still reads unpaid.
+        let mut paid = purchase(Some(order(OrderStatus::AwaitingPayment, true)), vec![]);
         paid.paid = Some(order(OrderStatus::Paid, true));
         let cancelled = purchase(
             Some(order(OrderStatus::Cancelled, true)),
