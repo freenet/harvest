@@ -1185,8 +1185,54 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // V21: harvest#53 Phase C, superseded by harvest#70's listing
         // statuses. `StoreParameters` untouched: still the store code.
         (21, Code),
+        // V22 (harvest#70, `f9558cd`) and V23 (instant checkout, `4f040c6`)
+        // were missed the same way, found by the always-open rehearsal. Still
+        // the store code. A const assertion below now fails the build (and
+        // CI) when a generation is recorded without its row here.
+        (22, Code),
+        (23, Code),
     ]
 };
+
+/// The store lineage as the app records it: the same codegen `ui/build.rs`
+/// runs, from this harness's own build script.
+mod recorded_store_lineage {
+    include!(concat!(env!("OUT_DIR"), "/legacy_store_contract.rs"));
+}
+
+/// True if `table` has exactly one row for each generation in `lineage`.
+const fn covers(table: &[(u32, Shape)], lineage: &[freenet_migrate::ContractLineageEntry]) -> bool {
+    if table.len() != lineage.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < lineage.len() {
+        let mut found = 0;
+        let mut j = 0;
+        while j < table.len() {
+            if table[j].0 == lineage[i].generation {
+                found += 1;
+            }
+            j += 1;
+        }
+        if found != 1 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// A row per recorded generation, checked when the harness COMPILES, which CI
+// does on every PR. The same check at run time needs a live node, so the
+// table went stale three times unnoticed.
+const _: () = assert!(
+    covers(
+        ENCODING_BY_GENERATION,
+        recorded_store_lineage::LEGACY_STORE_CONTRACT
+    ),
+    "ENCODING_BY_GENERATION needs one row per generation in legacy/store_contract.toml"
+);
 
 /// Every recorded generation is published under one of three shapes: the
 /// three-field (`legacy`), the whole key, or (V17 onwards) the store code.
