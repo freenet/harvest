@@ -31593,6 +31593,31 @@ mod buy_flow_tests {
             .auto_invoice
             .delegation_asked
             .contains_key(&(pending.ghostkey, bridge)));
+        // But the vault is not asked again at once: a delegate that is simply
+        // unreachable would otherwise bring a prompt every few minutes.
+        let given_up = at + DELEGATION_RESEND_MS;
+        assert_eq!(state.plan_watch_delegation(given_up + 1).delegate, None);
+        let (times, until) = state.auto_invoice.delegation_unanswered[&(pending.ghostkey, bridge)];
+        assert_eq!(
+            (times, until),
+            (
+                1,
+                given_up + crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+            )
+        );
+        // It is the backoff alone that holds it back.
+        // (The first prompt was answered by hand above, so its queue entry
+        // is still there; the vault's answer would have taken it off.)
+        state
+            .pending_signatures
+            .retain(|p| !matches!(p, PendingSignature::WatchDelegation(_)));
+        assert_eq!(state.plan_watch_delegation(given_up + 1).delegate, None);
+        let mut without = state.clone();
+        without.auto_invoice.delegation_unanswered.clear();
+        assert!(without
+            .plan_watch_delegation(given_up + 1)
+            .delegate
+            .is_some());
 
         // A retired inbox takes the one in flight for it with it, and frees
         // the marker.
@@ -31625,6 +31650,10 @@ mod buy_flow_tests {
             .auto_invoice
             .delegation_in_flight
             .contains_key(&bridge));
+        assert!(
+            state.auto_invoice.delegation_unanswered.is_empty(),
+            "taken: the backoff is over"
+        );
         assert_eq!(
             state
                 .queue_auto_invoice(t + 10 * DELEGATION_RESEND_MS)

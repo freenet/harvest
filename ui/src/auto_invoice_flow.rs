@@ -109,7 +109,18 @@ pub struct AutoInvoiceUi {
     /// passing refusal does not leave delegated watching off for the session
     /// behind the once-only `delegation_asked`.
     pub delegation_in_flight: HashMap<BridgeId, InFlightDelegation>,
+    /// Pairs whose signed delegation went unanswered through every send:
+    /// how many times in a row, and until when the vault is not asked again.
+    /// Doubling from `UNANSWERED_BACKOFF_MS`, so a delegate that is simply
+    /// unreachable does not bring a vault prompt every few minutes.
+    pub delegation_unanswered: HashMap<(GhostkeyId, BridgeId), (u32, u64)>,
 }
+
+/// The first wait before the vault is asked again after a signed delegation
+/// went unanswered; doubled each time in a row, up to
+/// `UNANSWERED_BACKOFF_MAX_MS`.
+pub const UNANSWERED_BACKOFF_MS: u64 = 10 * 60 * 1000;
+pub const UNANSWERED_BACKOFF_MAX_MS: u64 = 4 * 60 * 60 * 1000;
 
 /// See [`AutoInvoiceUi::delegation_in_flight`].
 #[derive(Clone, Debug, PartialEq)]
@@ -514,6 +525,14 @@ impl AppState {
         {
             return work;
         }
+        if self
+            .auto_invoice
+            .delegation_unanswered
+            .get(&(ghostkey, bridge))
+            .is_some_and(|(_, until)| now_ms < *until)
+        {
+            return work;
+        }
         let Some(watch_key) = self.auto_invoice.watch_key else {
             work.get_watch_key = self
                 .auto_invoice
@@ -632,6 +651,9 @@ impl AppState {
                     })
                 {
                     self.auto_invoice.delegation_in_flight.remove(&bridge);
+                    self.auto_invoice
+                        .delegation_unanswered
+                        .remove(&(GhostkeyId(status.ghostkey), bridge));
                 }
                 self.note_watch_delegation(status)
             }
@@ -706,6 +728,15 @@ impl AppState {
             .collect();
         for (ghostkey, bridge) in unanswered {
             self.auto_invoice.delegation_in_flight.remove(&bridge);
+            let times = self
+                .auto_invoice
+                .delegation_unanswered
+                .get(&(ghostkey, bridge))
+                .map_or(1, |(n, _)| n.saturating_add(1));
+            let wait = (UNANSWERED_BACKOFF_MS << (times - 1).min(8)).min(UNANSWERED_BACKOFF_MAX_MS);
+            self.auto_invoice
+                .delegation_unanswered
+                .insert((ghostkey, bridge), (times, now_ms.saturating_add(wait)));
             self.auto_invoice
                 .delegation_asked
                 .remove(&(ghostkey, bridge));

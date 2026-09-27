@@ -433,6 +433,13 @@ pub(crate) struct Watched {
     pub canary: Vec<u8>,
     #[serde(default)]
     pub canary_contract: [u8; 32],
+    /// The canary's index: once the tab's pool reaches it (or an arm names
+    /// it), its watermark no longer proves anything about this delegation
+    /// (the tab's own watch keeps it fresh), so the watch it vouches for
+    /// stops counting (`vouched`). A record from before this field reads 0,
+    /// which is in the pool: it stops counting and is refilled.
+    #[serde(default)]
+    pub canary_index: u32,
 }
 
 /// What a read this module sent is for.
@@ -743,7 +750,7 @@ fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDele
     let watched = fresh_tip(secrets, held.network, now_ms).map_or(0, |tip| {
         pool(secrets, held.network)
             .iter()
-            .take_while(|s| covers(held, s, tip.anchor.height))
+            .take_while(|s| covers(secrets, held, s, tip.anchor.height))
             .count() as u32
     });
     WatchDelegationStatus {
@@ -760,10 +767,20 @@ fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDele
 
 /// Whether the bridge is confirmed watching `script` for this delegation
 /// through a horizon an invoice issued at `tip_height` can rely on.
-fn covers(held: &Held, script: &[u8], tip_height: u32) -> bool {
+fn covers<S: SecretStore>(secrets: &S, held: &Held, script: &[u8], tip_height: u32) -> bool {
     held.watched.iter().any(|w| {
-        w.script == script && tip_height.saturating_add(WATCH_NEEDED_BLOCKS) <= w.until_height
+        w.script == script
+            && tip_height.saturating_add(WATCH_NEEDED_BLOCKS) <= w.until_height
+            && vouched(secrets, held, w)
     })
+}
+
+/// Whether `w`'s canary can still vouch for it: a probe of a canary the tab
+/// now watches (it entered the pool, or an arm names it) would find it
+/// scanned whether or not this delegation still stands (codex, round 5 of
+/// #179), so such a watch no longer counts.
+fn vouched<S: SecretStore>(secrets: &S, held: &Held, w: &Watched) -> bool {
+    !canary_compromised(secrets, held, w.canary_index, &w.canary)
 }
 
 /// I7's second source: the scripts this delegate's own confirmed requests
@@ -784,7 +801,7 @@ pub(crate) fn delegated_watched<S: SecretStore>(
         .flat_map(|h| {
             h.watched
                 .iter()
-                .filter(|w| covers(h, &w.script, tip_height))
+                .filter(|w| covers(secrets, h, &w.script, tip_height))
                 .map(|w| (w.script.clone(), w.until_height))
                 .collect::<Vec<_>>()
         })
@@ -885,14 +902,13 @@ fn refill_scripts<S: SecretStore>(
         .saturating_add(WATCH_NEEDED_BLOCKS)
         .saturating_add(RENEW_MARGIN_BLOCKS);
     let fresh = |script: &Vec<u8>| {
-        held.watched
-            .iter()
-            .any(|w| w.script == *script && w.until_height >= threshold)
-            || armed.iter().any(|r| {
-                now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
-                    && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
-                    && r.arm.watched_scripts.contains(script)
-            })
+        held.watched.iter().any(|w| {
+            w.script == *script && w.until_height >= threshold && vouched(secrets, held, w)
+        }) || armed.iter().any(|r| {
+            now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
+                && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
+                && r.arm.watched_scripts.contains(script)
+        })
     };
     let pool = pool(secrets, held.network);
     if pool.iter().take(REFILL_BELOW).all(fresh) {
@@ -960,7 +976,7 @@ fn due_read<S: SecretStore>(
     let probe = next.and_then(|next| {
         held.watched
             .iter()
-            .find(|w| w.script == next && covers(held, &w.script, tip.anchor.height))
+            .find(|w| w.script == next && covers(secrets, held, &w.script, tip.anchor.height))
             .map(|w| w.canary.clone())
     });
     if let Some(canary) = probe {
@@ -1178,20 +1194,26 @@ fn on_address<S: SecretStore>(
                 // new canary.
                 held.unconfirmed = None;
             } else if seen.is_some_and(|h| h >= pending.since_tip) {
-                for script in pending.scripts {
-                    match held.watched.iter_mut().find(|w| w.script == script) {
-                        Some(w) => {
-                            w.until_height = w.until_height.max(pending.until_height);
-                            w.canary = pending.canary.clone();
-                            w.canary_contract = pending.canary_contract;
-                        }
-                        None => held.watched.push(Watched {
-                            script,
-                            until_height: pending.until_height,
-                            canary: pending.canary.clone(),
-                            canary_contract: pending.canary_contract,
-                        }),
-                    }
+                // The canary is evidence, not a payment watch: credited, it
+                // would count once the counter reaches it, when the tab
+                // watches it too (codex, round 5 of #179).
+                for script in pending.scripts.into_iter().filter(|s| *s != pending.canary) {
+                    // Re-confirmed or new, it goes to the END: the list's
+                    // order is its recency, which `prune_watched` keeps
+                    // among equal horizons.
+                    let held_until = held
+                        .watched
+                        .iter()
+                        .position(|w| w.script == script)
+                        .map(|at| held.watched.remove(at).until_height);
+                    held.watched.push(Watched {
+                        script,
+                        until_height: held_until
+                            .map_or(pending.until_height, |h| h.max(pending.until_height)),
+                        canary: pending.canary.clone(),
+                        canary_contract: pending.canary_contract,
+                        canary_index: pending.canary_index,
+                    });
                 }
                 prune_watched(&mut held, tip.anchor.height);
                 held.unconfirmed = None;
@@ -1283,11 +1305,19 @@ fn on_address<S: SecretStore>(
 fn prune_watched(held: &mut Held, tip_height: u32) {
     held.watched.retain(|w| w.until_height >= tip_height);
     if held.watched.len() > WATCHED_CAP {
-        // Newest first, then a stable sort by horizon: ties keep newest first.
-        held.watched.reverse();
-        held.watched
-            .sort_by_key(|w| std::cmp::Reverse(w.until_height));
-        held.watched.truncate(WATCHED_CAP);
+        // Choose which to keep by (horizon, then position: later is newer),
+        // and keep the survivors in their order, so the list's order stays
+        // its recency through every later prune (codex, round 5 of #179).
+        let mut ranked: Vec<usize> = (0..held.watched.len()).collect();
+        ranked.sort_by_key(|&i| std::cmp::Reverse((held.watched[i].until_height, i)));
+        let keep: std::collections::BTreeSet<usize> =
+            ranked.into_iter().take(WATCHED_CAP).collect();
+        let mut i = 0;
+        held.watched.retain(|_| {
+            let kept = keep.contains(&i);
+            i += 1;
+            kept
+        });
     }
 }
 
@@ -1929,6 +1959,7 @@ pub(crate) mod test_support {
                 until_height: until,
                 canary: script_at(40),
                 canary_contract: address_id(secrets, &script_at(40)),
+                canary_index: 40,
             });
         }
         put_held(secrets, &h);
@@ -2237,6 +2268,73 @@ mod tests {
         assert!(h.unconfirmed.is_none() && h.watched.is_empty() && h.failures == 0);
     }
 
+    /// A confirmed watch counts only while its canary can vouch for it:
+    /// once the counter brings the canary into the tab's pool (the tab then
+    /// watches it, so a probe finds it scanned whatever this delegation's
+    /// state), the watch stops counting and is refilled. The canary itself
+    /// is never credited. Mutated red by crediting the canary, and by
+    /// dropping the vouching check.
+    #[test]
+    fn a_watch_counts_only_while_its_canary_can_vouch_for_it() {
+        let mut secrets = delegated();
+        send_read_confirm(&mut secrets, TIP, NOW);
+        let watched = watched_now(&secrets, TIP);
+        assert_eq!(watched, (0..10).map(script_at).collect::<Vec<_>>());
+        assert!(!watched.contains(&script_at(20)), "the canary is evidence");
+        // Sales move the counter so the canary (index 20) is in the pool.
+        set_counter(&mut secrets, 11);
+        assert!(
+            watched_now(&secrets, TIP).is_empty(),
+            "no longer vouched for"
+        );
+        let h = held(&secrets);
+        assert!(
+            !refill_scripts(&secrets, &h, TIP, NOW).is_empty(),
+            "refilled"
+        );
+    }
+
+    /// Pruning keeps the list in append order, so every later prune still
+    /// keeps the newest among equal horizons. Mutated red by sorting the list
+    /// in place.
+    #[test]
+    fn repeated_prunes_keep_the_newest() {
+        let mut h = held(&delegated());
+        let entry = |i: u32| Watched {
+            script: script_at(i),
+            until_height: TIP + 100,
+            canary: Vec::new(),
+            canary_contract: [0; 32],
+            canary_index: 0,
+        };
+        h.watched.push(Watched {
+            until_height: TIP + 500,
+            ..entry(1000)
+        });
+        for i in 0..(WATCHED_CAP as u32 + 5) {
+            h.watched.push(entry(i));
+        }
+        prune_watched(&mut h, TIP);
+        for i in 100..110 {
+            h.watched.push(entry(i));
+        }
+        prune_watched(&mut h, TIP);
+        assert_eq!(h.watched.len(), WATCHED_CAP);
+        assert!(
+            h.watched.iter().any(|w| w.script == script_at(1000)),
+            "the furthest horizon"
+        );
+        assert!(
+            (100..110).all(|i| h.watched.iter().any(|w| w.script == script_at(i))),
+            "the newest"
+        );
+        assert_eq!(
+            h.watched.last().map(|w| w.script.clone()),
+            Some(script_at(109)),
+            "append order"
+        );
+    }
+
     /// The node refusing the inbox UPDATE means the request was never sent:
     /// forgotten, not a failure, and not waited on for two hours. Mutated red
     /// by ignoring the answer.
@@ -2365,11 +2463,48 @@ mod tests {
         assert!(watched_now(&secrets, TIP).is_empty());
 
         wake_and_scan(&mut secrets, &canary, Some(TIP), NOW + 25 * MINUTE);
-        assert_eq!(watched_now(&secrets, TIP), with_canary(0..10, 20));
+        // The request's scripts, but not its canary: that is evidence, not
+        // a payment watch (codex, round 5).
+        assert_eq!(
+            watched_now(&secrets, TIP),
+            (0..10).map(script_at).collect::<Vec<_>>()
+        );
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.failures == 0);
         let status = status_of(&secrets, &h, NOW);
         assert_eq!((status.watched, status.outstanding), (10, false));
+        // A re-confirmed script moves to the end of the list, whose order
+        // is its recency (`prune_watched` keeps the newest among equal
+        // horizons).
+        assert_eq!(
+            h.watched.first().map(|w| w.script.clone()),
+            Some(script_at(0))
+        );
+        let before = h.watched.len();
+        let mut h = held(&secrets);
+        h.unconfirmed = Some(Unconfirmed {
+            scripts: vec![script_at(0)],
+            canary: canary.clone(),
+            canary_index: 20,
+            canary_contract: address_id(&secrets, &canary),
+            until_height: TIP + 1,
+            since_tip: TIP,
+            removed: true,
+            left_at_ms: NOW + 25 * MINUTE,
+            late_reads: 0,
+        });
+        put_held(&mut secrets, &h);
+        wake_and_scan(&mut secrets, &canary, Some(TIP), NOW + 26 * MINUTE);
+        let h = held(&secrets);
+        assert_eq!(
+            h.watched.last().map(|w| w.script.clone()),
+            Some(script_at(0))
+        );
+        assert_eq!(h.watched.len(), before, "moved, not duplicated");
+        assert!(
+            h.watched.iter().all(|w| w.until_height > TIP + 1),
+            "a re-confirmation never shortens a horizon"
+        );
 
         // Another request whose canary never shows: its address contract
         // is never created, so every read answers None. Inside the window,
@@ -2546,7 +2681,7 @@ mod tests {
         assert!(h.unconfirmed.as_ref().is_some_and(|u| !u.removed));
         assert_eq!(h.failures, 0);
         wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW + 45 * MINUTE);
-        assert_eq!(watched_now(&secrets, TIP).len(), 11);
+        assert_eq!(watched_now(&secrets, TIP).len(), 10);
     }
 
     /// An inbox that stops moving (re-keyed, say) holds the entry for ever;
@@ -2600,23 +2735,23 @@ mod tests {
     fn a_stale_canary_withdraws_the_delegations_watches() {
         let mut secrets = delegated();
         send_read_confirm(&mut secrets, TIP, NOW);
-        assert_eq!(watched_now(&secrets, TIP).len(), 11);
+        assert_eq!(watched_now(&secrets, TIP).len(), 10);
         // Probed within the hour of confirming: nothing to read.
         assert!(on_wakeup(&mut secrets, NOW + 30 * MINUTE).is_empty());
         let at = NOW + 10 * MINUTE + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 6, at);
         wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 6), at);
-        assert_eq!(watched_now(&secrets, TIP + 6).len(), 11, "live");
+        assert_eq!(watched_now(&secrets, TIP + 6).len(), 10, "live");
         let at = at + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 20, at);
         // No state: nothing withdrawn.
         let get = wake(&mut secrets, at);
         answer(&mut secrets, &get, None, at);
-        assert_eq!(watched_now(&secrets, TIP + 20).len(), 11);
+        assert_eq!(watched_now(&secrets, TIP + 20).len(), 10);
         // Unsettled (the SUBSCRIBE not yet answered Ok): nothing withdrawn.
         on_node_started(&mut secrets);
         wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 13), at + MINUTE);
-        assert_eq!(watched_now(&secrets, TIP + 20).len(), 11);
+        assert_eq!(watched_now(&secrets, TIP + 20).len(), 10);
         settle_all(&mut secrets);
         wake_and_scan(
             &mut secrets,
@@ -2637,7 +2772,7 @@ mod tests {
         send_read_confirm(&mut secrets, TIP, NOW);
         let until = TIP + REQUEST_AHEAD_BLOCKS;
         let last_ok = until - WATCH_NEEDED_BLOCKS;
-        assert_eq!(watched_now(&secrets, last_ok).len(), 11);
+        assert_eq!(watched_now(&secrets, last_ok).len(), 10);
         assert!(watched_now(&secrets, last_ok + 1).is_empty());
 
         let mut h = held(&secrets);
@@ -2721,7 +2856,7 @@ mod tests {
         assert!(status_of(&secrets, &h, NOW).stalled);
         assert_eq!(
             watched_now(&secrets, TIP).len(),
-            11,
+            10,
             "what probes confirm still counts"
         );
         set_tip_at(&mut secrets, TIP, at + 10 * FAILURE_BACKOFF_MS);
@@ -2809,6 +2944,7 @@ mod tests {
             until_height: TIP + 500,
             canary: script_at(90),
             canary_contract: [0; 32],
+            canary_index: 90,
         });
         store_held(&mut secrets, &second);
         let both = [bridge(), other];
@@ -2881,6 +3017,7 @@ mod tests {
                 until_height: TIP + i,
                 canary: Vec::new(),
                 canary_contract: [0; 32],
+                canary_index: 0,
             });
         }
         h.watched.push(Watched {
@@ -2888,6 +3025,7 @@ mod tests {
             until_height: TIP - 1,
             canary: Vec::new(),
             canary_contract: [0; 32],
+            canary_index: 0,
         });
         prune_watched(&mut h, TIP);
         assert_eq!(h.watched.len(), WATCHED_CAP);
@@ -2902,6 +3040,7 @@ mod tests {
                 until_height: TIP + 100,
                 canary: Vec::new(),
                 canary_contract: [0; 32],
+                canary_index: 0,
             });
         }
         prune_watched(&mut h, TIP);
