@@ -177,6 +177,8 @@ pub(crate) const REQUIRED_CONFIRMATIONS: u32 = 1;
 /// confirm can still be missed if the seller stays away: a residual.
 pub(crate) const WATCH_NEEDED_MS: u64 =
     MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 3 * 60 * 60 * 1000;
+/// How far ahead of this node's clock a Buy now may be dated.
+pub(crate) const MAX_CLOCK_AHEAD_MS: u64 = 10 * 60 * 1000;
 /// A sale whose order has not appeared in the store after this long is
 /// taken to have never landed (a refused update), and forgotten.
 pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
@@ -258,6 +260,10 @@ pub(crate) struct Ledger {
     /// seller is told for [`CAPPED_SHOWN_MS`] (`AutoInvoiceStatus::capped`).
     #[serde(default)]
     pub capped: Option<(u64, String)>,
+    /// A store or mailbox update this delegate sent was refused, so some
+    /// requests are undecided again and wait for a run to answer them.
+    #[serde(default)]
+    pub retry_pending: bool,
 }
 
 /// How long the seller is told a store limit turned a buyer away.
@@ -442,6 +448,10 @@ struct PendingReplies {
     store_contract_id: Vec<u8>,
     #[serde(default)]
     retry: Vec<([u8; 32], [u8; 32])>,
+    /// The orders the update carried: their sales and gap records are
+    /// dropped with them if it is refused, so they do not hold stock.
+    #[serde(default)]
+    orders: Vec<OrderId>,
 }
 
 const BATCH_MAGIC: [u8; 8] = *b"hvauto01";
@@ -637,6 +647,7 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     if incoming.capped.as_ref().map(|(at, _)| *at) > held.capped.as_ref().map(|(at, _)| *at) {
         held.capped = incoming.capped;
     }
+    held.retry_pending |= incoming.retry_pending;
     for oversold in incoming.oversold {
         if !held.oversold.iter().any(|o| o.order == oversold.order) {
             held.oversold.push(oversold);
@@ -731,6 +742,8 @@ pub(crate) enum Refusal {
     // Per request: the request is marked seen, and declined where
     // `buyer_reason` has words for it; the rest stay in the seller's inbox.
     NotInstant,
+    /// Dated more than [`MAX_CLOCK_AHEAD_MS`] ahead of this node's clock.
+    ClockAhead,
     AlreadyAnswered,
     NoBuyerKey,
     NoListing,
@@ -768,6 +781,9 @@ impl Refusal {
                  it is now, then try again.",
             ),
             Refusal::Withdrawn => Some("This listing has been taken down."),
+            Refusal::ClockAhead => Some(
+                "Your computer's clock is ahead of the right time. Set it right, then try again.",
+            ),
             _ => None,
         }
     }
@@ -1343,7 +1359,9 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
 ) -> Option<Vec<OutboundDelegateMsg>> {
     if result.is_err() {
         if let Ok(pending) = from_cbor::<PendingReplies>(context) {
-            if pending.magic == REPLIES_MAGIC && !pending.retry.is_empty() {
+            if pending.magic == REPLIES_MAGIC
+                && (!pending.retry.is_empty() || !pending.orders.is_empty())
+            {
                 let mut ledger = load_ledger(secrets, &pending.store_contract_id);
                 ledger
                     .seen
@@ -1351,6 +1369,15 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
                 ledger
                     .answered
                     .retain(|request| !pending.retry.iter().any(|(_, r)| r == request));
+                ledger
+                    .sales
+                    .retain(|sale| !pending.orders.contains(&sale.order));
+                ledger
+                    .gap_orders
+                    .retain(|(id, _)| !pending.orders.contains(id));
+                // A refused update needs a run to be answered again: the next
+                // wake-up re-reads the mailbox (`retry_pending`).
+                ledger.retry_pending = true;
                 save(secrets, &ledger_key(&pending.store_contract_id), &ledger);
             }
         }
@@ -1396,6 +1423,9 @@ pub(crate) struct Decided {
     /// Each invoiced request's entry digest and request id, to be decided
     /// again if the store refuses the update (`on_store_update_answer`).
     pub retry: Vec<([u8; 32], [u8; 32])>,
+    /// The entry digests of the requests declined this run, to be decided
+    /// again if the mailbox refuses the declines.
+    pub declined: Vec<[u8; 32]>,
     /// Why each request not answered with an invoice was not, by entry
     /// digest. For tests and the log.
     pub refused: Vec<([u8; 32], Refusal)>,
@@ -1414,8 +1444,9 @@ impl Decided {
             .replies
             .into_iter()
             .partition(|reply| self.held_back.contains(reply));
-        // Declines: nothing for the store, straight to the mailbox.
-        let mut out = if now.is_empty() {
+        // Declines: nothing for the store, straight to the mailbox, carrying
+        // what to decide again if the mailbox refuses them.
+        let mut out: Vec<OutboundDelegateMsg> = if now.is_empty() {
             Vec::new()
         } else {
             on_store_updated(
@@ -1426,14 +1457,32 @@ impl Decided {
                     replies: now,
                     store_contract_id: Vec::new(),
                     retry: Vec::new(),
+                    orders: Vec::new(),
                 })
                 .unwrap_or_default(),
             )
             .unwrap_or_default()
         };
+        if let Ok(context) = to_cbor(&PendingReplies {
+            magic: REPLIES_MAGIC,
+            mailbox_contract_id: arm.mailbox_contract_id,
+            replies: Vec::new(),
+            store_contract_id: arm.store_contract_id.clone(),
+            retry: self.declined.iter().map(|d| (*d, [0u8; 32])).collect(),
+            orders: Vec::new(),
+        }) {
+            for message in &mut out {
+                if let OutboundDelegateMsg::UpdateContractRequest(update) = message {
+                    if context.len() < DelegateContext::MAX_SIZE {
+                        update.context = DelegateContext::new(context.clone());
+                    }
+                }
+            }
+        }
         if self.orders.is_empty() && self.statuses.is_empty() {
             return out;
         }
+        let order_ids: Vec<OrderId> = self.orders.iter().map(|o| o.order.id.clone()).collect();
         let Ok(delta) = to_cbor(&StoreStateV1Delta {
             owner: Some(owner),
             orders: (!self.orders.is_empty()).then_some(self.orders),
@@ -1452,6 +1501,7 @@ impl Decided {
             replies: held_back,
             store_contract_id: arm.store_contract_id.clone(),
             retry: self.retry,
+            orders: order_ids,
         }) {
             if context.len() < DelegateContext::MAX_SIZE {
                 update.context = DelegateContext::new(context);
@@ -1599,6 +1649,7 @@ pub(crate) fn decide<S: SecretStore>(
             }
             Ok(Answer::Decline(reply)) => {
                 decided.replies.push(reply);
+                decided.declined.push(digest);
                 ledger.saw(digest);
             }
             Err(why) => {
@@ -1613,6 +1664,7 @@ pub(crate) fn decide<S: SecretStore>(
                     .and_then(|reason| decline(&store_sk, message, reason, now_ms))
                 {
                     decided.replies.push(reply);
+                    decided.declined.push(digest);
                 }
                 decided.refused.push((digest, why));
                 if store_wide {
@@ -1676,6 +1728,13 @@ fn decide_one<S: SecretStore>(
                 && now_ms.abs_diff(at.timestamp_millis() as u64) <= REQUEST_MAX_AGE_MS
         })
         .ok_or(Refusal::NotInstant)?;
+    // Dated ahead of this node's clock by more than a clock can drift: the
+    // date becomes the order's, and the store's limits count an order's age
+    // from it, so a buyer could keep one young for a day (codex on
+    // harvest#177). Told, since it is theirs to fix.
+    if requested_at.timestamp_millis() as u64 > now_ms.saturating_add(MAX_CLOCK_AHEAD_MS) {
+        return Err(Refusal::ClockAhead);
+    }
 
     // I1: one order per request, checked before anything is spent.
     let request_id = request_id(&tag, &request.instant.nonce);
@@ -2962,6 +3021,7 @@ mod tests {
             gap_orders: [(OrderId([8; 32]), 25)].into(),
             gap_paid: Some((NOW - 1, 150)),
             capped: Some((NOW - 2, "a limit".into())),
+            retry_pending: false,
         };
         assert!(merge_ledgers(&mut held, incoming.clone()));
         assert!(held.gap_orders.contains(&(OrderId([8; 32]), 25)));
@@ -3442,6 +3502,63 @@ mod tests {
         );
     }
 
+    /// A Buy now dated well ahead of this node's clock is declined with
+    /// words the buyer can act on; one a few minutes ahead is fine. Mutated
+    /// red by dropping the check.
+    #[test]
+    fn a_buy_now_from_a_clock_far_ahead_is_told_so() {
+        let mut f = fixture();
+        let buyer = Buyer::new(61);
+        let ahead = run(
+            &mut f,
+            &[buyer.request_at(&jam(), 1, 1, 12_000, NOW + MAX_CLOCK_AHEAD_MS + 1)],
+        );
+        assert_eq!(ahead.refused[0].1, Refusal::ClockAhead);
+        assert_eq!(
+            buyer.read(&ahead.replies),
+            vec![MessageContent::Decline {
+                reason: Refusal::ClockAhead.buyer_reason().unwrap().into()
+            }]
+        );
+        let ok = run(
+            &mut f,
+            &[Buyer::new(62).request_at(&jam(), 1, 1, 12_000, NOW + 60_000)],
+        );
+        assert_eq!(ok.orders.len(), 1, "{:?}", ok.refused);
+    }
+
+    /// A decline the mailbox refused leaves its request to be decided again,
+    /// and a refused store update also drops its sale, so the retry is not
+    /// held back by its own stock. Mutated red by not attaching the decline's
+    /// retry, and by keeping the sale.
+    #[test]
+    fn refused_answers_are_undone_so_the_retry_can_answer() {
+        let mut f = fixture();
+        counted(&mut f, 1);
+        let (a, b) = (Buyer::new(40), Buyer::new(41));
+        let (ea, eb) = (
+            a.request_at(&jam(), 1, 1, 12_000, NOW - 9_000),
+            b.request_at(&jam(), 1, 1, 12_000, NOW - 8_000),
+        );
+        let decided = run(&mut f, &[ea.clone(), eb.clone()]);
+        let out = decided.into_messages(&f.record.arm);
+        let contexts: Vec<Vec<u8>> = out
+            .iter()
+            .map(|m| match m {
+                OutboundDelegateMsg::UpdateContractRequest(u) => u.context.as_ref().to_vec(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(contexts.len(), 2, "the decline and the store update");
+        for context in &contexts {
+            on_store_update_answer(&mut f.secrets, &Err("refused".into()), context);
+        }
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(!ledger.seen.contains(&entry_digest(&eb)), "decline undone");
+        assert!(!ledger.seen.contains(&entry_digest(&ea)), "invoice undone");
+        assert!(ledger.sales.is_empty(), "its stock is not held");
+    }
+
     /// A Buy now for a listing that changed or went away is answered, not
     /// left waiting on a request nothing retries. Mutated red by dropping
     /// the decline.
@@ -3771,6 +3888,7 @@ mod tests {
             replies: vec![Buyer::new(40).request(&jam(), 1, 1, 1)],
             store_contract_id: Vec::new(),
             retry: Vec::new(),
+            orders: Vec::new(),
         })
         .unwrap();
         assert_eq!(
@@ -3809,6 +3927,8 @@ mod tests {
         assert!(seen(&f), "landed: stays decided");
         on_store_update_answer(&mut f.secrets, &Err("refused".into()), &context);
         assert!(!seen(&f), "refused: decided again");
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.retry_pending, "waits for a run");
         // And it is: the next run answers it.
         let again = run(&mut f, &[entry]);
         assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
