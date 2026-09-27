@@ -54,12 +54,19 @@ pub(crate) fn on_background<S: SecretStore>(
                 return Vec::new();
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
-            let mut out = crate::auto_invoice::heartbeats(secrets, now_ms);
-            // Then at most one inbox read for the delegated watch, before
-            // the mailbox re-reads (rare: only after a refused update): a
-            // node that meters a run's operations drops the tail, and the
-            // watch is what keeps the store taking orders at all.
-            out.extend(crate::watch_delegation::on_wakeup(secrets, now_ms));
+            // The delegated watch's one read (the bridge inbox, or an
+            // address contract) FIRST. The node runs at most four operations
+            // per run that must reach the network
+            // (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`): a GET or SUBSCRIBE of a
+            // contract it has never seen, or the fetch an UPDATE to one it
+            // does not hold sets off, and refuses the rest. An inbox or
+            // address contract this node never read is exactly such a GET,
+            // and a wake-up can carry up to sixteen heartbeat UPDATEs, so
+            // put last it would be the one refused; while this read is what
+            // keeps the store able to take orders at all.
+            let mut out = crate::watch_delegation::on_wakeup(secrets, now_ms);
+            out.extend(crate::auto_invoice::heartbeats(secrets, now_ms));
+            // The mailbox re-reads last (rare: only after a refused update).
             out.extend(crate::auto_invoice::mailbox_retries(secrets));
             out
         }

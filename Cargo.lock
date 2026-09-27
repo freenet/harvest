@@ -1961,6 +1961,7 @@ name = "harvest-delegate"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "blake3",
  "bs58",
  "chrono",
  "ciborium",

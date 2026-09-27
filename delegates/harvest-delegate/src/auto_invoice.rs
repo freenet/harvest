@@ -635,14 +635,15 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let ledger = load_ledger(secrets, &record.arm.store_contract_id);
     let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
-    let remaining = remaining_watched(secrets, &record.arm, &watched);
+    let (remaining, run_until_ms) = accepted_run(secrets, record, &watched, now_ms);
     AutoInvoiceStatus {
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
-        invoicing_until_ms: record
-            .watched_until_ms
-            .saturating_sub(WATCH_NEEDED_MS)
-            .max(watched.delegated_until_ms(now_ms)),
+        invoicing_until_ms: if remaining == 0 {
+            record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS)
+        } else {
+            run_until_ms
+        },
         last_background_run_ms: load::<_, u64>(secrets, RAN_KEY),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
         oversold: ledger
@@ -1024,27 +1025,40 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     *held != before
 }
 
-/// How many watched scripts are at or after the counter: the arm's (whether
-/// or not its watch is still live, which `paused` reports) and the
-/// delegate's own ([`WatchSet::delegated`]).
-fn remaining_watched<S: SecretStore>(secrets: &S, arm: &AutoInvoiceArm, watched: &WatchSet) -> u32 {
+/// The run of next addresses, from the counter, that I7 would accept now,
+/// across both sources ([`WatchSet`]), and until when by this node's clock
+/// the whole run stays usable (0 for an empty run).
+///
+/// A contiguous run, because I7 only ever invoices the NEXT address: a
+/// watched address past an unwatched one cannot be reached until the
+/// unwatched one is used, so counting it would show a store OPEN that answers
+/// every Buy now with "no watched address" (review round 1 of
+/// freenet/harvest#179). What a heartbeat's `taking_orders`, and the store
+/// page, rest on.
+fn accepted_run<S: SecretStore>(
+    secrets: &S,
+    record: &ArmRecord,
+    watched: &WatchSet,
+    now_ms: u64,
+) -> (u32, u64) {
     let Some(status) = crate::bitcoin::load_payment_xpub(secrets) else {
-        return 0;
+        return (0, 0);
     };
-    crate::bitcoin::upcoming_addresses(
+    let upcoming = crate::bitcoin::upcoming_addresses(
         &status,
         harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
     )
-    .map(|upcoming| {
-        upcoming
-            .iter()
-            .filter(|a| {
-                arm.watched_scripts.contains(&a.script_pubkey)
-                    || watched.delegated.contains(&a.script_pubkey)
-            })
-            .count() as u32
-    })
-    .unwrap_or(0)
+    .unwrap_or_default();
+    let mut count = 0u32;
+    let mut until = u64::MAX;
+    for address in upcoming {
+        let Some(this) = watched.usable_until_ms(&address.script_pubkey, record, now_ms) else {
+            break;
+        };
+        count += 1;
+        until = until.min(this);
+    }
+    (count, if count == 0 { 0 } else { until })
 }
 
 /// The payment scripts I7 accepts now, from its two sources.
@@ -1053,37 +1067,47 @@ fn remaining_watched<S: SecretStore>(secrets: &S, arm: &AutoInvoiceArm, watched:
 ///   tab had read still outlasts an invoice's window: by this node's clock
 ///   ([`ArmRecord::watched_until_ms`]), and by height when it named one.
 /// - **The delegate's own** (`crate::watch_delegation`), each script while
-///   the horizon its read request asked for is at least
-///   [`WATCH_NEEDED_BLOCKS`] past the tip.
+///   the horizon its confirmed request asked for is at least
+///   [`WATCH_NEEDED_BLOCKS`] past the tip, and its delegation has not
+///   stalled.
 pub(crate) struct WatchSet {
     /// The arm's watch outlasts an invoice's window by the clock.
     arm_time_live: bool,
     /// ... and by height, when it names one and the tip is known.
     arm_live: bool,
     arm: Vec<Vec<u8>>,
-    pub(crate) delegated: Vec<Vec<u8>>,
-    /// The nearest horizon among `delegated`, and the tip it was judged at.
-    delegated_until: Option<(u32, u32)>,
+    /// Each with the horizon asked.
+    pub(crate) delegated: Vec<(Vec<u8>, u32)>,
+    tip_height: Option<u32>,
 }
 
 impl WatchSet {
     fn accepts(&self, script: &[u8]) -> bool {
         (self.arm_live && self.arm.iter().any(|s| s == script))
-            || self.delegated.iter().any(|s| s == script)
+            || self.delegated.iter().any(|(s, _)| s == script)
     }
 
-    /// Until when, by this node's clock, the delegate's own watches let an
-    /// invoice go out, counted at the same pessimistic five minutes a block
-    /// the tab counts a horizon at. 0 without any.
-    fn delegated_until_ms(&self, now_ms: u64) -> u64 {
-        self.delegated_until.map_or(0, |(until, tip)| {
-            now_ms.saturating_add(
-                u64::from(until.saturating_sub(tip.saturating_add(WATCH_NEEDED_BLOCKS)))
-                    * 5
-                    * 60
-                    * 1000,
-            )
-        })
+    /// Until when, by this node's clock, an invoice on `script` may go out,
+    /// or `None` if I7 refuses it now. A horizon is counted at the same
+    /// pessimistic five minutes a block the tab counts one at.
+    fn usable_until_ms(&self, script: &[u8], record: &ArmRecord, now_ms: u64) -> Option<u64> {
+        let arm = (self.arm_live && self.arm.iter().any(|s| s == script))
+            .then(|| record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS));
+        let delegated = self
+            .delegated
+            .iter()
+            .filter(|(s, _)| s == script)
+            .map(|(_, until)| {
+                let tip = self.tip_height.unwrap_or(u32::MAX);
+                now_ms.saturating_add(
+                    u64::from(until.saturating_sub(tip.saturating_add(WATCH_NEEDED_BLOCKS)))
+                        * 5
+                        * 60
+                        * 1000,
+                )
+            })
+            .max();
+        arm.max(delegated)
     }
 }
 
@@ -1107,21 +1131,12 @@ pub(crate) fn watch_set<S: SecretStore>(
             tip.anchor.height,
         )
     });
-    let delegated_until = tip.and_then(|tip| {
-        crate::watch_delegation::nearest_delegated_horizon(
-            secrets,
-            arm.network,
-            &arm.trusted_bridges,
-            tip.anchor.height,
-        )
-        .map(|until| (until, tip.anchor.height))
-    });
     WatchSet {
         arm_time_live,
         arm_live: arm_time_live && arm_height_live,
         arm: arm.watched_scripts.clone(),
         delegated,
-        delegated_until,
+        tip_height: tip.map(|t| t.anchor.height),
     }
 }
 
@@ -4387,10 +4402,15 @@ mod tests {
         assert_eq!(waiting.refused[0].1, Refusal::WatchLapsed);
         assert_eq!(counter(&f), 0, "nothing spent");
 
-        // Read by the bridge.
+        // Read by the bridge: still nothing, until the watermark shows.
         inbox.apply_delta(&wd::params(), &delta).unwrap();
         wd::bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
         assert!(wd::wake_and_read(&mut f.secrets, &inbox, NOW + 300_000).is_empty());
+        let read = run(&mut f, &[buyer.request(&jam(), 1, 4, 12_000)]);
+        assert_eq!(read.refused[0].1, Refusal::WatchLapsed);
+        assert!(!taking_orders(&f.secrets, &f.record, NOW));
+        wd::wake_and_scan(&mut f.secrets, &script_at(0), Some(wd::TIP), NOW + 600_000);
+        assert!(taking_orders(&f.secrets, &f.record, NOW));
         let status = status_of(&f.secrets, &f.record, NOW);
         assert_eq!(status.paused, None);
         assert_eq!(status.watched_remaining, 10);
@@ -4413,11 +4433,7 @@ mod tests {
     fn the_tabs_and_the_delegates_watches_are_one_set() {
         use crate::watch_delegation::test_support as wd;
         let mut secrets = wd::delegated();
-        let mut inbox = wd::open_inbox();
-        let (delta, entry) = wd::submitted(&wd::wake_and_read(&mut secrets, &inbox, NOW));
-        inbox.apply_delta(&wd::params(), &delta).unwrap();
-        wd::bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
-        wd::wake_and_read(&mut secrets, &inbox, NOW + 300_000);
+        wd::send_read_confirm(&mut secrets, wd::TIP, NOW);
         let mut f = fixture();
         f.secrets = secrets;
         f.record.arm.trusted_bridges = vec![wd::bridge()];
@@ -4426,6 +4442,59 @@ mod tests {
         let decided = run(&mut f, &[Buyer::new(81).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(decided.orders.len(), 1, "{:?}", decided.refused);
         assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(0));
+    }
+
+    /// Review round 1 of #179, P1: what the store says (open, how many
+    /// orders, until when) is the run of addresses from the counter I7 would
+    /// actually accept, across both sources, not watched addresses anywhere.
+    /// 6-9 watched through an older horizon, 10-15 through a newer one: once
+    /// the older one is too near the tip, the next address is refused, so the
+    /// store is closed although six watched addresses sit further on. The
+    /// same at the tab-to-delegate handoff: the tab's 6-9 lapse, the
+    /// delegate's 10-15 do not help. Mutated red by counting watched
+    /// addresses anywhere in the pool (the old `remaining_watched`).
+    #[test]
+    fn the_store_is_open_only_while_the_next_address_is_watched() {
+        use crate::watch_delegation::test_support as wd;
+        let mut secrets = wd::delegated();
+        let u1 = wd::TIP + 3_000;
+        let u2 = wd::TIP + freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS;
+        wd::confirm_watched(
+            &mut secrets,
+            &(6..10).map(script_at).collect::<Vec<_>>(),
+            u1,
+        );
+        wd::confirm_watched(
+            &mut secrets,
+            &(10..16).map(script_at).collect::<Vec<_>>(),
+            u2,
+        );
+        wd::set_counter(&mut secrets, 6);
+        let record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
+        let status = status_of(&secrets, &record, NOW);
+        assert_eq!(status.watched_remaining, 10);
+        assert!(taking_orders(&secrets, &record, NOW));
+        // Too near U1: 6-9 no longer count, and nothing past them does.
+        wd::set_tip(&mut secrets, u1 - WATCH_NEEDED_BLOCKS + 1);
+        let status = status_of(&secrets, &record, NOW);
+        assert_eq!(status.watched_remaining, 0);
+        assert!(!taking_orders(&secrets, &record, NOW));
+
+        // The handoff: the tab watched 6-9 and has lapsed; the delegate 10-15.
+        let mut secrets = wd::delegated();
+        wd::confirm_watched(
+            &mut secrets,
+            &(10..16).map(script_at).collect::<Vec<_>>(),
+            u2,
+        );
+        wd::set_counter(&mut secrets, 6);
+        let mut record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
+        record.arm.watched_scripts = (6..10).map(script_at).collect();
+        record.watched_until_ms = NOW + WATCH_NEEDED_MS + 60_000;
+        assert_eq!(status_of(&secrets, &record, NOW).watched_remaining, 10);
+        record.watched_until_ms = NOW + WATCH_NEEDED_MS;
+        assert_eq!(status_of(&secrets, &record, NOW).watched_remaining, 0);
+        assert!(!taking_orders(&secrets, &record, NOW));
     }
 
     /// A watch that ends at a height must outlast an invoice's window in

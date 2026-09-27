@@ -19,6 +19,12 @@ freenet-bitcoin-common = { workspace = true }
 # request to the bridge; its randomness comes through this crate's registered
 # `getrandom` backend, the same one key generation uses.
 freenet-bitcoin-inbox = { workspace = true, features = ["seal"] }
+# The requestor of the Ghost Key's signed delegation, checked as the inbox
+# contract checks it (no default features: plain types only).
+ghostkey-common = { workspace = true }
+# Addressing a payment script's address contract, whose scan watermark
+# confirms the bridge is watching it (`watch_delegation`).
+blake3 = { workspace = true }
 freenet-stdlib = { workspace = true }
 # The delegate half: `handle_export_request` plus the origin policy that gates
 # it. Answering a successor's export request is the ONLY way this generation's
