@@ -102,7 +102,32 @@ pub struct AutoInvoiceUi {
     /// The last `UpdateWatchDelegation` sent per bridge: the inbox and
     /// `made_at_ms` it named, and when.
     pub delegation_update_sent: HashMap<BridgeId, ([u8; 32], u64, u64)>,
+    /// A signed delegation handed to the delegate and not yet taken, per
+    /// bridge: the request, the height it was issued at, when it was last
+    /// sent, and how many times. Resent as it is (no new vault prompt) until
+    /// the delegate's answer shows it held, so a send that never arrived or a
+    /// passing refusal does not leave delegated watching off for the session
+    /// behind the once-only `delegation_asked`.
+    pub delegation_in_flight: HashMap<BridgeId, InFlightDelegation>,
 }
+
+/// See [`AutoInvoiceUi::delegation_in_flight`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct InFlightDelegation {
+    pub request: HarvestDelegateRequest,
+    pub ghostkey: [u8; 32],
+    pub issued_mainnet_height: u32,
+    pub sent_ms: u64,
+    pub attempts: u32,
+}
+
+/// How long a signed delegation may go unanswered before it is sent again.
+pub const DELEGATION_RESEND_MS: u64 = 60 * 1000;
+
+/// How many times a signed delegation is sent in all. Past this it is given
+/// up: a refusal that keeps coming is the delegate's verdict (a wrong key,
+/// an older delegation), and asking the vault again would only repeat it.
+pub const DELEGATION_SEND_ATTEMPTS: u32 = 3;
 
 /// A delegation of watch requests queued for the Ghost Key's signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +151,8 @@ pub struct DelegationWork {
     pub get_watch_key: bool,
     /// Ask the vault to sign this delegation.
     pub delegate: Option<PendingWatchDelegation>,
+    /// Send again a signed delegation the delegate has not taken.
+    pub resend: Option<HarvestDelegateRequest>,
     /// Tell the delegate a moved inbox or a later `made_at_ms`.
     pub update: Option<HarvestDelegateRequest>,
 }
@@ -393,6 +420,15 @@ impl AppState {
             }
         }
         work.delegation = self.plan_watch_delegation(now_ms);
+        work.delegation.resend = self
+            .auto_invoice
+            .delegation_in_flight
+            .values()
+            .find(|f| {
+                f.attempts < DELEGATION_SEND_ATTEMPTS
+                    && now_ms.saturating_sub(f.sent_ms) >= DELEGATION_RESEND_MS
+            })
+            .map(|f| f.request.clone());
         work
     }
 
@@ -531,6 +567,7 @@ impl AppState {
         certificate_pem: String,
         scoped_payload: Vec<u8>,
         signature: Vec<u8>,
+        now_ms: u64,
     ) -> Option<HarvestDelegateRequest> {
         // Prepared for an inbox this tab has since stopped using: its bridge
         // may be another, and the next plan asks again against the current one.
@@ -539,7 +576,7 @@ impl AppState {
             .inbox
             .as_ref()
             .filter(|inbox| inbox.bridge == pending.bridge)?;
-        Some(HarvestDelegateRequest::SetWatchDelegation {
+        let request = HarvestDelegateRequest::SetWatchDelegation {
             grant: Box::new(WatchDelegationGrant {
                 network: pending.network,
                 bridge: pending.bridge,
@@ -550,7 +587,18 @@ impl AppState {
                 inbox_contract_id: pending.inbox_contract_id,
                 last_made_at_ms: inbox.last_made_at_ms().unwrap_or(0),
             }),
-        })
+        };
+        self.auto_invoice.delegation_in_flight.insert(
+            pending.bridge,
+            InFlightDelegation {
+                request: request.clone(),
+                ghostkey: pending.ghostkey.0,
+                issued_mainnet_height: pending.issued_mainnet_height,
+                sent_ms: now_ms,
+                attempts: 1,
+            },
+        );
+        Some(request)
     }
 
     /// The delegate's answer to `GetWatchKey`.
@@ -569,11 +617,37 @@ impl AppState {
         result: Result<WatchDelegationStatus, String>,
     ) {
         match result {
-            Ok(status) => self.note_watch_delegation(status),
-            Err(e) => dioxus::logger::tracing::warn!(
-                "the delegate did not take the watch delegation for bridge {}: {e}",
-                bs58::encode(bridge.0).into_string()
-            ),
+            Ok(status) => {
+                // Taken once the delegate holds it, or a later one for the
+                // same Ghost Key (an update's answer for an older one does
+                // not count).
+                if self
+                    .auto_invoice
+                    .delegation_in_flight
+                    .get(&bridge)
+                    .is_some_and(|f| {
+                        status.ghostkey == f.ghostkey
+                            && status.issued_mainnet_height >= f.issued_mainnet_height
+                    })
+                {
+                    self.auto_invoice.delegation_in_flight.remove(&bridge);
+                }
+                self.note_watch_delegation(status)
+            }
+            Err(e) => {
+                dioxus::logger::tracing::warn!(
+                    "the delegate did not take the watch delegation for bridge {}: {e}",
+                    bs58::encode(bridge.0).into_string()
+                );
+                // Due again at once, until the attempts run out.
+                if let Some(f) = self.auto_invoice.delegation_in_flight.get_mut(&bridge) {
+                    if f.attempts >= DELEGATION_SEND_ATTEMPTS {
+                        self.auto_invoice.delegation_in_flight.remove(&bridge);
+                    } else {
+                        f.sent_ms = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -615,6 +689,17 @@ impl AppState {
                     pending.clone(),
                 )));
         }
+        if let Some(HarvestDelegateRequest::SetWatchDelegation { grant }) = &work.delegation.resend
+        {
+            if let Some(f) = self
+                .auto_invoice
+                .delegation_in_flight
+                .get_mut(&grant.bridge)
+            {
+                f.sent_ms = now_ms;
+                f.attempts = f.attempts.saturating_add(1);
+            }
+        }
         if let Some(HarvestDelegateRequest::UpdateWatchDelegation {
             bridge,
             inbox_contract_id,
@@ -648,6 +733,9 @@ impl AppState {
             }
             if let Some(update) = work.delegation.update.clone() {
                 crate::state::spawn_harvest_request(update, "the watch delegation update");
+            }
+            if let Some(resend) = work.delegation.resend.clone() {
+                crate::state::spawn_harvest_request(resend, "the watch delegation (again)");
             }
             if let Some(pending) = work.delegation.delegate.clone() {
                 spawn_delegation_signature(pending);

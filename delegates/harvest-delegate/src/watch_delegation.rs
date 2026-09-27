@@ -1232,7 +1232,12 @@ fn on_address<S: SecretStore>(
             // Otherwise no evidence: asked again at the next wake-up.
         }
         ReadKind::Canary => {
-            if scanned_now {
+            if read.index < held.canary_next {
+                // A late or repeated answer for a candidate already passed:
+                // taking it would put an index used before back into a
+                // request, which is exactly what `canary_next` exists to
+                // prevent. Nothing to do.
+            } else if scanned_now {
                 // Someone has it watched: it cannot show this request.
                 held.canary_next = held.canary_next.max(read.index.saturating_add(1));
                 held.canary_tries = held.canary_tries.saturating_add(1);
@@ -2512,6 +2517,13 @@ mod tests {
         let id = address_id(&secrets, &script_at(30));
         let scanned = address_state(&secrets, &script_at(30), Some(TIP));
         on_inbox_read(&mut secrets, &id, Some(&scanned), &context, NOW);
+        assert_eq!(held(&secrets).canary_next, 500);
+        // Nor, unscanned, is it taken as this request's canary: an index
+        // below `canary_next` was passed already.
+        let unscanned = address_state(&secrets, &script_at(30), None);
+        on_inbox_read(&mut secrets, &id, Some(&unscanned), &context, NOW);
+        on_inbox_read(&mut secrets, &id, None, &context, NOW);
+        assert_eq!(held(&secrets).canary, None, "an index already passed");
         assert_eq!(held(&secrets).canary_next, 500);
     }
 

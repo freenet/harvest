@@ -11736,6 +11736,7 @@ impl AppState {
                     certificate_pem,
                     scoped_payload,
                     signature,
+                    now_ms(),
                 );
                 #[cfg(target_arch = "wasm32")]
                 if let Some(request) = request {
@@ -31460,8 +31461,14 @@ mod buy_flow_tests {
             .iter()
             .any(|p| matches!(p, PendingSignature::WatchDelegation(_))));
         state.bitcoin.inbox.as_mut().unwrap().raise_made_at(77);
-        let Some(harvest_common::HarvestDelegateRequest::SetWatchDelegation { grant }) =
-            state.on_watch_delegation_signed(pending, gk.pem.clone(), scoped.clone(), signature)
+        let Some(harvest_common::HarvestDelegateRequest::SetWatchDelegation { grant }) = state
+            .on_watch_delegation_signed(
+                pending.clone(),
+                gk.pem.clone(),
+                scoped.clone(),
+                signature.clone(),
+                DELEGATION_NOW + 1,
+            )
         else {
             panic!("a SetWatchDelegation");
         };
@@ -31484,6 +31491,85 @@ mod buy_flow_tests {
         assert_eq!(
             state.plan_watch_delegation(DELEGATION_NOW + 2),
             Default::default()
+        );
+    }
+
+    /// A signed delegation the delegate has not taken is sent again as it
+    /// is, with no new vault prompt: after a minute with no answer, and at
+    /// once after a refusal, at most `DELEGATION_SEND_ATTEMPTS` times in all;
+    /// the delegate's answer that it holds it (or a later one) stops it.
+    /// Mutated red by: never resending, resending before the minute, not
+    /// capping the attempts, and not clearing it on the delegate's answer.
+    #[test]
+    fn a_signed_delegation_is_sent_again_until_the_delegate_takes_it() {
+        use crate::auto_invoice_flow::{DELEGATION_RESEND_MS, DELEGATION_SEND_ATTEMPTS};
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_to_delegate(&gk, None);
+        state.queue_auto_invoice(DELEGATION_NOW);
+        let watch_key = ed25519_dalek::SigningKey::from_bytes(&[0x3d; 32]);
+        state.on_watch_key(Ok(watch_key.verifying_key().to_bytes()));
+        let pending = state
+            .queue_auto_invoice(DELEGATION_NOW + 1)
+            .delegation
+            .delegate
+            .expect("the vault is asked");
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        let sent = state
+            .on_watch_delegation_signed(
+                pending.clone(),
+                gk.pem.clone(),
+                scoped,
+                signature,
+                DELEGATION_NOW + 2,
+            )
+            .expect("a SetWatchDelegation");
+        let bridge = pending.bridge;
+
+        // Not before the minute; then the same request, and no vault prompt.
+        let early = state.queue_auto_invoice(DELEGATION_NOW + 1 + DELEGATION_RESEND_MS);
+        assert_eq!(early.delegation.resend, None);
+        let t = DELEGATION_NOW + 2 + DELEGATION_RESEND_MS;
+        let again = state.queue_auto_invoice(t);
+        assert_eq!(again.delegation.resend.as_ref(), Some(&sent));
+        assert_eq!(again.delegation.delegate, None, "no new vault prompt");
+        // A refusal: due at once, until the attempts run out.
+        state.on_watch_delegation(bridge, Err("the node refused the write".into()));
+        assert_eq!(
+            state.queue_auto_invoice(t + 1).delegation.resend.as_ref(),
+            Some(&sent)
+        );
+        assert_eq!(
+            state.auto_invoice.delegation_in_flight[&bridge].attempts,
+            DELEGATION_SEND_ATTEMPTS
+        );
+        state.on_watch_delegation(bridge, Err("the node refused the write".into()));
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert_eq!(
+            state
+                .queue_auto_invoice(t + 10 * DELEGATION_RESEND_MS)
+                .delegation
+                .resend,
+            None
+        );
+
+        // Taken: nothing more to send.
+        let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
+        state.on_watch_delegation_signed(pending, gk.pem.clone(), scoped, signature, t);
+        let held = held_delegation(&state, &gk);
+        state.on_watch_delegation(bridge, Ok(held));
+        assert!(!state
+            .auto_invoice
+            .delegation_in_flight
+            .contains_key(&bridge));
+        assert_eq!(
+            state
+                .queue_auto_invoice(t + 10 * DELEGATION_RESEND_MS)
+                .delegation
+                .resend,
+            None
         );
     }
 
