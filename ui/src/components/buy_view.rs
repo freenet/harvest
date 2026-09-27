@@ -408,12 +408,12 @@ fn latest_answer(
         return Some(Answer::Accepted);
     }
     to_buyer
+        .rev()
         .filter(|message| !before.contains(&message.digest))
-        .filter_map(|message| match &message.content {
+        .find_map(|message| match &message.content {
             MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
             _ => None,
         })
-        .last()
 }
 
 /// A fresh request nonce. Only the buyer's own resends reuse one, and this
