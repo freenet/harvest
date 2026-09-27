@@ -122,6 +122,11 @@ pub struct AutoInvoiceUi {
 pub const UNANSWERED_BACKOFF_MS: u64 = 10 * 60 * 1000;
 pub const UNANSWERED_BACKOFF_MAX_MS: u64 = 4 * 60 * 60 * 1000;
 
+/// The wait after the `times`-th unanswered delegation in a row.
+pub fn unanswered_wait(times: u32) -> u64 {
+    (UNANSWERED_BACKOFF_MS << times.saturating_sub(1).min(8)).min(UNANSWERED_BACKOFF_MAX_MS)
+}
+
 /// See [`AutoInvoiceUi::delegation_in_flight`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct InFlightDelegation {
@@ -733,7 +738,7 @@ impl AppState {
                 .delegation_unanswered
                 .get(&(ghostkey, bridge))
                 .map_or(1, |(n, _)| n.saturating_add(1));
-            let wait = (UNANSWERED_BACKOFF_MS << (times - 1).min(8)).min(UNANSWERED_BACKOFF_MAX_MS);
+            let wait = unanswered_wait(times);
             self.auto_invoice
                 .delegation_unanswered
                 .insert((ghostkey, bridge), (times, now_ms.saturating_add(wait)));

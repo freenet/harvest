@@ -1393,15 +1393,18 @@ fn on_inbox<S: SecretStore>(
         return save_if_changed(secrets, &before, &held).then(Vec::new);
     }
     let inbox = held.inbox_contract_id;
-    // Still clear of the tab's pool by the full margin at the counter as it
-    // is NOW: sales since the canary was chosen would otherwise let it enter
-    // the pool while scripts of this request are still unsold, and those
-    // would stop counting (`vouched`) before they are used.
     let counter_now = crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index);
-    let canary = held.canary.clone().filter(|c| {
-        now_ms.saturating_sub(c.at_ms) < CANARY_VALID_MS
-            && counter_now.is_some_and(|n| c.index >= canary_floor(n))
-    });
+    // A canary the counter has brought into the tab's pool can vouch for
+    // nothing: forget it, so the next wake-up picks a fresh one.
+    if held.canary.as_ref().is_some_and(|c| {
+        counter_now.is_none_or(|n| c.index < n.saturating_add(MAX_UPCOMING_ADDRESSES))
+    }) {
+        held.canary = None;
+    }
+    let canary = held
+        .canary
+        .clone()
+        .filter(|c| now_ms.saturating_sub(c.at_ms) < CANARY_VALID_MS);
     // A request needs: nothing waiting, no backoff, a canary just found
     // unscanned, a fresh tip, and a settled copy of the inbox, so its date is
     // the live floor's rather than an old copy's (a misdated entry is dropped
@@ -1416,6 +1419,21 @@ fn on_inbox<S: SecretStore>(
     let floor = state.floor.clone()?;
     let mut out = Vec::new();
     let mut scripts = refill_scripts(secrets, &held, tip.anchor.height, now_ms);
+    // Only scripts the canary can vouch for until they are sold: it stops
+    // vouching once the counter passes `canary.index - MAX_UPCOMING_ADDRESSES`
+    // (`vouched`), so a script at or past that index could still be unsold
+    // then. Sales since the canary was chosen shrink the request; they do
+    // not waste the canary.
+    let vouchable: Vec<Vec<u8>> = counter_now
+        .and_then(|n| {
+            let last = canary.index.checked_sub(MAX_UPCOMING_ADDRESSES)?;
+            let xpub = crate::bitcoin::load_payment_xpub(secrets)?;
+            let count = last.checked_sub(n)?.saturating_add(1);
+            crate::bitcoin::upcoming_addresses(&xpub, count.min(MAX_UPCOMING_ADDRESSES)).ok()
+        })
+        .map(|up| up.into_iter().map(|a| a.script_pubkey).collect())
+        .unwrap_or_default();
+    scripts.retain(|s| vouchable.contains(s));
     if !scripts.is_empty() {
         // The canary goes LAST: the bridge applies a request's scripts in
         // order and counts the rest refused once the Ghost Key's cap is
@@ -2336,27 +2354,42 @@ mod tests {
         assert!(watched_now(&secrets, TIP).is_empty());
     }
 
-    /// A canary chosen before sales moved the counter is dropped at build
-    /// time if it is no longer clear of the pool by the full margin: sent,
-    /// it would stop vouching while scripts of its request are unsold.
-    /// Mutated red by building on it regardless.
+    /// Sales between choosing the canary and building the request shrink
+    /// the request to the scripts the canary can vouch for until they are
+    /// sold (up to its index less the pool); they do not waste it. A canary
+    /// the counter has brought into the pool is forgotten and nothing is
+    /// sent on it. Mutated red by sending the whole pool, and by keeping an
+    /// overtaken canary.
     #[test]
-    fn a_canary_overtaken_by_sales_is_not_used() {
+    fn sales_before_the_build_shrink_the_request() {
         let mut secrets = delegated();
         let inbox = open_inbox();
-        // The canary read finds index 20 unscanned; then three sales before
-        // the inbox read builds the request.
         let get = wake(&mut secrets, NOW);
         answer(&mut secrets, &get, None, NOW);
-        assert!(held(&secrets).canary.is_some(), "a canary was chosen");
+        assert_eq!(held(&secrets).canary.as_ref().map(|c| c.index), Some(20));
         set_counter(&mut secrets, 3);
+        let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
+        let (_, entry) = submitted(&out);
+        assert_eq!(
+            scripts(&entry),
+            (3..=10).chain([20]).map(script_at).collect::<Vec<_>>()
+        );
+
+        let mut secrets = delegated();
+        let get = wake(&mut secrets, NOW);
+        answer(&mut secrets, &get, None, NOW);
+        set_counter(&mut secrets, 11);
         let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
         assert!(
             !out.iter()
                 .any(|m| matches!(m, OutboundDelegateMsg::UpdateContractRequest(_))),
-            "no request on an overtaken canary: {out:?}"
+            "{out:?}"
         );
-        assert!(held(&secrets).outstanding.is_none());
+        assert_eq!(
+            held(&secrets).canary,
+            None,
+            "forgotten, so a fresh one is picked"
+        );
     }
 
     /// Pruning keeps the list in append order, so every later prune still

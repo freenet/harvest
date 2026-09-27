@@ -12882,6 +12882,8 @@ impl AppState {
             }
             keep
         });
+        // `delegation_unanswered` is left as it is: it describes whether the
+        // delegate answers at all, which a new inbox does not change.
         for pair in abandoned {
             self.auto_invoice.delegation_asked.remove(&pair);
         }
@@ -31618,6 +31620,23 @@ mod buy_flow_tests {
             .plan_watch_delegation(given_up + 1)
             .delegate
             .is_some());
+
+        // Doubling each time in a row, up to four hours.
+        use crate::auto_invoice_flow::{unanswered_wait, UNANSWERED_BACKOFF_MAX_MS};
+        assert_eq!(
+            unanswered_wait(1),
+            crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(
+            unanswered_wait(2),
+            2 * crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(
+            unanswered_wait(3),
+            4 * crate::auto_invoice_flow::UNANSWERED_BACKOFF_MS
+        );
+        assert_eq!(unanswered_wait(6), UNANSWERED_BACKOFF_MAX_MS);
+        assert_eq!(unanswered_wait(u32::MAX), UNANSWERED_BACKOFF_MAX_MS);
 
         // A retired inbox takes the one in flight for it with it, and frees
         // the marker.
