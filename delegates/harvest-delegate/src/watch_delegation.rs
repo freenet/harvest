@@ -2104,13 +2104,16 @@ mod tests {
     /// has created its address contract) goes straight on to the request. A
     /// candidate someone has scanned is skipped for the next; after
     /// `MAX_CANARY_TRIES` the delegation waits. Mutated red by requiring a
-    /// state, taking a scanned candidate, dropping the margin, and never
-    /// deferring.
+    /// state, taking a scanned candidate, dropping the margin, taking one the
+    /// tab names, subscribing to a candidate, and never deferring.
     #[test]
     fn a_canary_is_unscanned_by_construction() {
         let mut secrets = delegated();
         // Live: the canary read answers None, and the inbox is read at once.
-        let get = wake(&mut secrets, NOW);
+        // A canary candidate is read without a SUBSCRIBE.
+        let out = on_wakeup(&mut secrets, NOW);
+        assert_eq!(out.len(), 1, "a GET only: {out:?}");
+        let get = got_read(&out);
         assert_eq!(
             get.contract_id.as_bytes(),
             address_id(&secrets, &script_at(20)).as_slice(),
