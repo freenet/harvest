@@ -637,6 +637,12 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -
     }
 }
 
+/// Said when a buyer paid an address past a run of 20 unused ones, which a
+/// wallet with the usual gap limit does not look at (Ian's wording,
+/// 2026-09-26).
+pub(crate) const WALLET_GAP_NOTE: &str = "Your wallet may not be showing all your payments. \
+     In your wallet's settings, set the gap limit to 100.";
+
 /// What needs the seller, what is left to set up, the link to share, and the
 /// store's record (wireframe C).
 #[component]
@@ -651,7 +657,9 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         .read()
         .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
 
-    let needs: bool = store.foreign_owner.is_some()
+    let wallet_gap = APP_STATE.read().wallet_gap_note_due();
+    let needs: bool = wallet_gap
+        || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
         || !store.certificate.is_verified()
         || store.expired_invoices > 0
@@ -685,6 +693,9 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                         " ({why})"
                     }
                 }
+            }
+            if wallet_gap {
+                p { class: "text-warning", "{WALLET_GAP_NOTE}" }
             }
             if store.to_send > 0 {
                 div { class: "need row-between",

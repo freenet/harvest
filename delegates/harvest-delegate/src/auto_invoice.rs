@@ -28,8 +28,8 @@
 //! - **I4, bounded exposure.** At most [`MAX_OPEN_PER_STORE`] open unpaid
 //!   instant invoices per store, [`MAX_OPEN_PER_CONVERSATION`] per buyer
 //!   conversation, [`MAX_PER_DAY`] a day, and none while the newest
-//!   [`MAX_TRAILING_UNPAID`] addresses are all unpaid (a wallet stops looking
-//!   after about 20 unused addresses in a row).
+//!   [`MAX_TRAILING_UNPAID`] addresses are all unpaid. All generous and
+//!   invisible (Ian, 2026-09-26): a genuine buyer never meets one.
 //! - **I5, fall back rather than guess.** Every missing or doubtful input ends
 //!   in no invoice: see [`Refusal`].
 //! - **I6, authority.** Only the Harvest web app can arm (the origin gate in
@@ -144,14 +144,18 @@ pub(crate) const TIP_MAX_AGE_MS: u64 = 3 * 60 * 60 * 1000;
 // I4's caps are invisible and generous (Ian, 2026-09-26): no genuine buyer
 // should reach one, and sellers are not told about them. The per-buyer one is
 // shared with the buyer's app, which says so before sending
-// (`harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER`). The trailing
-// one cannot be raised the same way: it is the seller's wallet's gap limit
-// (see `trailing_unpaid`), not a matter of generosity.
-pub(crate) const MAX_OPEN_PER_STORE: usize = 15;
+// (`harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER`).
+pub(crate) const MAX_OPEN_PER_STORE: usize = 50;
 pub(crate) const MAX_OPEN_PER_CONVERSATION: usize =
     harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER;
-pub(crate) const MAX_PER_DAY: usize = 60;
-pub(crate) const MAX_TRAILING_UNPAID: u32 = 15;
+pub(crate) const MAX_PER_DAY: usize = 100;
+/// A sanity bound, not a working limit (Ian, 2026-09-26): a store never
+/// stops taking orders because buyers pressed Buy now and did not pay. A
+/// wallet that stops looking after 20 unused addresses in a row may then miss
+/// a payment past such a run, so the seller is told to raise its gap limit to
+/// this when that has happened (`ui::gap_limit`), and the wallet guide says
+/// so up front.
+pub(crate) const MAX_TRAILING_UNPAID: u32 = 100;
 /// Requests answered in one run; the rest wait for the next change.
 pub(crate) const MAX_BATCH: usize = 16;
 /// Every instant invoice asks one confirmation (harvest#155).
@@ -181,7 +185,7 @@ const STATUSES_CAP: usize = 64;
 /// Sales are kept for a whole payment window (about two weeks), at most
 /// [`MAX_PER_DAY`] a day. Past it no new instant invoice is issued, rather
 /// than one whose sale could not be recorded.
-const SALES_CAP: usize = 1024;
+const SALES_CAP: usize = 2048;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Written when this generation's secrets are exported to a successor: from
 /// then on it arms nothing, so an old tab cannot put it back to work beside
@@ -230,7 +234,24 @@ pub(crate) struct Ledger {
     /// seller for [`OVERSOLD_SHOWN_MS`], then dropped.
     #[serde(default)]
     pub oversold: Vec<Oversold>,
+    /// Instant orders issued at an address past a run of
+    /// [`WALLET_GAP_LIMIT`] or more unpaid ones: a wallet with the usual gap
+    /// limit does not look that far, so a payment to one may not show in it.
+    /// Kept until one is seen paid (then [`Self::gap_paid_at_ms`]) or it
+    /// falls off the end.
+    #[serde(default)]
+    pub gap_orders: VecDeque<OrderId>,
+    /// When one of [`Self::gap_orders`] was last seen paid: the seller is
+    /// told to raise their wallet's gap limit for [`OVERSOLD_SHOWN_MS`] after
+    /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`).
+    #[serde(default)]
+    pub gap_paid_at_ms: Option<u64>,
 }
+
+/// The gap limit most wallets start with: how many unused addresses in a
+/// row they look past before they stop.
+pub(crate) const WALLET_GAP_LIMIT: u32 = 20;
+const GAP_ORDERS_CAP: usize = 256;
 
 /// An instant order paid when published stock could not cover it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -499,6 +520,9 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
         paused: global_refusal(secrets, record, tip.as_ref(), now_ms)
             .err()
             .map(|r| r.explain()),
+        wallet_gap_paid_at_ms: ledger
+            .gap_paid_at_ms
+            .filter(|at| now_ms.saturating_sub(*at) < OVERSOLD_SHOWN_MS),
     }
 }
 
@@ -540,6 +564,15 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     held.issued_at_ms.sort_unstable();
     let excess = held.issued_at_ms.len().saturating_sub(2 * MAX_PER_DAY);
     held.issued_at_ms.drain(..excess);
+    for id in incoming.gap_orders {
+        if !held.gap_orders.contains(&id) {
+            held.gap_orders.push_back(id);
+        }
+    }
+    while held.gap_orders.len() > GAP_ORDERS_CAP {
+        held.gap_orders.pop_front();
+    }
+    held.gap_paid_at_ms = held.gap_paid_at_ms.max(incoming.gap_paid_at_ms);
     for oversold in incoming.oversold {
         if !held.oversold.iter().any(|o| o.order == oversold.order) {
             held.oversold.push(oversold);
@@ -774,7 +807,7 @@ fn on_store_change<S: SecretStore>(
     }
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
-    if ledger.sales.is_empty() && ledger.statuses.is_empty() {
+    if ledger.sales.is_empty() && ledger.statuses.is_empty() && ledger.gap_orders.is_empty() {
         return Vec::new();
     }
     let statuses = settle(
@@ -826,6 +859,19 @@ pub(crate) fn settle(
     ledger
         .oversold
         .retain(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS);
+    // A payment to an address past the wallet's usual gap: the seller needs
+    // to raise their wallet's gap limit to see it.
+    let before = ledger.gap_orders.len();
+    ledger.gap_orders.retain(|id| {
+        store
+            .orders
+            .orders
+            .get(id)
+            .is_none_or(|o| o.status != OrderStatus::Paid)
+    });
+    if ledger.gap_orders.len() < before {
+        ledger.gap_paid_at_ms = Some(now_ms);
+    }
     while ledger.oversold.len() > STATUSES_CAP {
         ledger.oversold.remove(0);
     }
@@ -1322,6 +1368,13 @@ pub(crate) fn decide<S: SecretStore>(
     let mut ledger = load_ledger(secrets, &arm.store_contract_id);
     decided.statuses = settle(&mut ledger, store, Some(anchor.height), &store_sk, now_ms);
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
+    // Counted once a run, not per request: up to MAX_TRAILING_UNPAID
+    // derivations each time. Every invoice this run adds one unpaid address
+    // on top, and nothing else moves the counter.
+    let trailing_at_start = {
+        let orders: Vec<&AuthorizedOrder> = store.orders.orders.values().collect();
+        trailing_unpaid(&xpub, &orders)
+    };
     let tip_height = anchor.height;
 
     let mut ordered: Vec<&EncryptedMessage> = entries.iter().collect();
@@ -1341,6 +1394,7 @@ pub(crate) fn decide<S: SecretStore>(
             tip_height,
             &mut ledger,
             &issued_now,
+            trailing_at_start.saturating_add(issued_now.len() as u32),
             message,
             now_ms,
         );
@@ -1394,6 +1448,7 @@ fn decide_one<S: SecretStore>(
     tip_height: u32,
     ledger: &mut Ledger,
     issued_now: &[AuthorizedOrder],
+    trailing: u32,
     message: &EncryptedMessage,
     now_ms: u64,
 ) -> Result<Answer, Refusal> {
@@ -1531,7 +1586,7 @@ fn decide_one<S: SecretStore>(
     if left.is_some() && ledger.sales.len() >= SALES_CAP {
         return Err(Refusal::StoreCap);
     }
-    if trailing_unpaid(xpub, &all_orders) >= MAX_TRAILING_UNPAID {
+    if trailing >= MAX_TRAILING_UNPAID {
         return Err(Refusal::TrailingUnpaid);
     }
 
@@ -1572,6 +1627,12 @@ fn decide_one<S: SecretStore>(
     let reply = seal(MessageContent::OrderAccepted {
         order_id: signed.order.id.clone(),
     })?;
+    if trailing >= WALLET_GAP_LIMIT {
+        ledger.gap_orders.push_back(signed.order.id.clone());
+        while ledger.gap_orders.len() > GAP_ORDERS_CAP {
+            ledger.gap_orders.pop_front();
+        }
+    }
     if left.is_some() {
         ledger.sales.push(Sale {
             order: signed.order.id.clone(),
@@ -2557,8 +2618,12 @@ mod tests {
                 order: OrderId([4; 32]),
                 found_at_ms: NOW,
             }],
+            gap_orders: [OrderId([8; 32])].into(),
+            gap_paid_at_ms: Some(NOW - 1),
         };
         assert!(merge_ledgers(&mut held, incoming.clone()));
+        assert!(held.gap_orders.contains(&OrderId([8; 32])));
+        assert_eq!(held.gap_paid_at_ms, Some(NOW - 1));
         assert_eq!(
             held.sales,
             vec![sale(1, Some(9)), sale(2, None)],
@@ -2572,6 +2637,7 @@ mod tests {
             "nothing new the second time"
         );
         assert_eq!(held.issued_at_ms, vec![NOW - 5, NOW - 4]);
+        assert_eq!(held.gap_orders.len(), 1);
     }
 
     /// A sale this delegate settled and forgot stays forgotten when the
@@ -2937,6 +3003,65 @@ mod tests {
         let capped = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
         assert_eq!(capped.refused[0].1, Refusal::TrailingUnpaid);
         assert_eq!(counter(&f), MAX_TRAILING_UNPAID);
+
+        // The run is counted once and grows with each invoice in it: one
+        // short of the cap, the first request is invoiced and the second,
+        // in the same run, is not.
+        let mut f = fixture();
+        let start = MAX_TRAILING_UNPAID - 1;
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(start)).unwrap();
+        f.record.arm.watched_scripts = vec![script_at(start), script_at(start + 1)];
+        let both = run(
+            &mut f,
+            &[
+                Buyer::new(50).request(&jam(), 1, 1, 12_000),
+                Buyer::new(51).request(&jam(), 1, 1, 12_000),
+            ],
+        );
+        assert_eq!(both.orders.len(), 1, "{:?}", both.refused);
+        assert_eq!(both.refused[0].1, Refusal::TrailingUnpaid);
+    }
+
+    /// An invoice issued past a run of `WALLET_GAP_LIMIT` unpaid addresses
+    /// is remembered, and once it is paid the seller is told (for two weeks)
+    /// to raise their wallet's gap limit; one issued inside the gap is not.
+    /// Mutated red by never recording, by recording every invoice, and by
+    /// never noticing the payment.
+    #[test]
+    fn a_payment_past_the_wallet_gap_is_reported() {
+        // Inside the gap: nothing to tell.
+        let mut f = fixture();
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(WALLET_GAP_LIMIT - 1)).unwrap();
+        f.record.arm.watched_scripts = vec![script_at(WALLET_GAP_LIMIT - 1)];
+        let inside = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(inside.orders.len(), 1, "{:?}", inside.refused);
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.gap_orders.is_empty());
+
+        // Past it: remembered, and reported once paid.
+        let mut f = fixture();
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &xpub_at(WALLET_GAP_LIMIT)).unwrap();
+        f.record.arm.watched_scripts = vec![script_at(WALLET_GAP_LIMIT)];
+        let past = run(&mut f, &[Buyer::new(50).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(past.orders.len(), 1, "{:?}", past.refused);
+        publish(&mut f, &past);
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert_eq!(ledger.gap_orders.len(), 1);
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).wallet_gap_paid_at_ms,
+            None
+        );
+        with_status(&mut f, &past.orders[0].order.id, OrderStatus::Paid);
+        store_change(&mut f);
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).wallet_gap_paid_at_ms,
+            Some(NOW)
+        );
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW + OVERSOLD_SHOWN_MS).wallet_gap_paid_at_ms,
+            None,
+            "said for two weeks"
+        );
     }
 
     /// I5. Stale tip, a store this key does not own, a closed store and a

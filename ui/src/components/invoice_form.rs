@@ -511,6 +511,12 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 " on signet and testnet. Harvest derives a fresh receiving "
                 "address from it for each invoice, so no address is ever reused."
             }
+            p {
+                "In your wallet's settings, set the "
+                strong { "gap limit" }
+                " to 100. Buyers who press Buy now and never pay still use up addresses, and "
+                "a wallet left at the usual 20 can miss a payment that comes after them."
+            }
             p { class: "text-muted",
                 "This is a "
                 strong { "public" }

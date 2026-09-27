@@ -378,6 +378,16 @@ impl AppState {
         self.auto_invoice.status.insert(store_contract_id, result);
     }
 
+    /// Whether any of this device's stores has, in the last two weeks, been
+    /// paid at an address a wallet with the usual gap limit may not look at
+    /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`).
+    pub fn wallet_gap_note_due(&self) -> bool {
+        self.auto_invoice
+            .status
+            .values()
+            .any(|s| s.as_ref().is_ok_and(|s| s.wallet_gap_paid_at_ms.is_some()))
+    }
+
     /// What the seller's store page says about instant checkout, or `None`
     /// when the store sells nothing with it.
     pub fn instant_checkout_notice(&self, store_contract_id: &[u8], now_ms: u64) -> Option<String> {

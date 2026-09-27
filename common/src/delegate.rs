@@ -598,6 +598,11 @@ pub struct AutoInvoiceStatus {
     pub oversold: Vec<crate::payment::OrderId>,
     /// Why the next request would wait for the seller, if it would.
     pub paused: Option<String>,
+    /// When, in the last two weeks, a buyer paid an address past a run of 20
+    /// or more unpaid ones: a wallet with the usual gap limit may not show
+    /// that payment, so the seller is told to raise it (Ian, 2026-09-26).
+    #[serde(default)]
+    pub wallet_gap_paid_at_ms: Option<u64>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -1829,6 +1834,7 @@ mod tests {
                     issued_last_day: 5,
                     oversold: vec![],
                     paused: None,
+                    wallet_gap_paid_at_ms: None,
                 }),
             },
         ]
