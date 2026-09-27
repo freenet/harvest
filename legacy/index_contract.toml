@@ -46,3 +46,9 @@ version = "V5"
 description = "Superseded by always-open stores (harvest#177's successor, 2026-09-26), which changed `harvest-common`: a new `presence` module (the per-store presence contract's types: a store-key-signed `Heartbeat {kind, seq, at_ms, taking_orders}`), `classify_store_key_message` recognising a heartbeat as a store-key message (its last arm, so no existing record changes classification), and `sealed::MessageContent::VouchedText` (a buyer's text with a Ghost Key voucher; `sealed` is compiled into every artifact by the one-shot WASM build). `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed; this one's merge, validation and state encoding are unchanged. The parameters are unchanged. The generation instant checkout shipped (`4f040c6`, #159), unchanged through #177."
 date = "2026-09-26"
 code_hash = "c7e6e6e0c88c6aabfd71191ca6995270f1557276027c9e3761f5e53594a1b234"
+
+[[entry]]
+version = "V6"
+description = "Superseded by the delegated watch key (harvest#179), which changed `harvest-common`: `delegate.rs` gained the `GetWatchKey` / `SetWatchDelegation` / `UpdateWatchDelegation` requests and their answers, and `AutoInvoiceStatus` gained `watch_delegation` (`#[serde(default)]`); `freenet-bitcoin` went from d1ce3bb to fda0c40. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This one's merge, validation and state encoding are unchanged, and the parameters are unchanged. The generation always-open stores shipped (harvest#178, `e275bae`)."
+date = "2026-09-27"
+code_hash = "80b868743aa48c6c0ec9791c7a75a125615ea9ae30aa2d2eb6993da7d621d114"

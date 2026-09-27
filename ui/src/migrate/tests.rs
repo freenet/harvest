@@ -335,6 +335,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by always-open stores; moves only because
                 // `harvest-common` is compiled into it.
                 "93a1ea1040977cc8f7c22bc4a5fdccde561bcf332893e38176cfc01977134a04",
+                // V24, from `git show e275bae:ui/public/contracts/store_contract.wasm`.
+                // Superseded by the delegated watch key; moves only because
+                // `harvest-common` is compiled into it.
+                "31f745898fb8f8a7a76586422b671cc878ea55d1de6abc9d73843cf79e802f52",
             ],
         ),
         (
@@ -407,6 +411,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by always-open stores; moves only because
                 // `harvest-common` is compiled into it.
                 "a394f610c92ab0c2c7ae8540aca0655eaf9c2012a25b71969c540138b7bd90b6",
+                // V19, from `git show e275bae:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by the delegated watch key.
+                "7fee9e1480aa99aec42e0044b4c7b30050ad6bb36670d2cc1d011fcd2b445847",
             ],
         ),
         (
@@ -467,6 +474,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by always-open stores; moves only because
                 // `harvest-common` is compiled into it.
                 "f22a69dbb0a1ff273e32858e3726a06f99e03ba6e7ecb57395236990a92644ef",
+                // V18, from `git show e275bae:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by the delegated watch key.
+                "537f95a7f8678ef0c4255e11d2cd427b2ce9c4c048f96d1d45b4ec7e46062d89",
             ],
         ),
         (
@@ -493,6 +503,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by always-open stores; moves only because
                 // `harvest-common` is compiled into it.
                 "c7e6e6e0c88c6aabfd71191ca6995270f1557276027c9e3761f5e53594a1b234",
+                // V6, from `git show e275bae:ui/public/contracts/index_contract.wasm`.
+                // Superseded by the delegated watch key.
+                "80b868743aa48c6c0ec9791c7a75a125615ea9ae30aa2d2eb6993da7d621d114",
             ],
         ),
     ];
@@ -614,6 +627,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // V26, the generation harvest#177 shipped. Superseded by always-open
             // stores: wake-ups, heartbeats and the manifest.
             "b7fd3abea2d1045f667ed1bd3b73be5d37e0af05b48ccc1e3fce1a40f32027ca".to_string(),
+            // V27, from `git show e275bae:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#178 shipped. Superseded by the delegated
+            // watch key.
+            "6973d27838d0e512de90917621c4ac78dd78bc004914e3dbd6edc4f2fd4e14e4".to_string(),
         ],
     );
 }
@@ -1144,6 +1161,9 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         (22, Code),
         // V23: instant checkout (`4f040c6`). Still the store key's code, 29B.
         (23, Code),
+        // V24: always-open stores (`e275bae`). Still the store key's code,
+        // 29B.
+        (24, Code),
     ]
 };
 

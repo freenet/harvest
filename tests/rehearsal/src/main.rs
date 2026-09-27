@@ -1191,6 +1191,8 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // CI) when a generation is recorded without its row here.
         (22, Code),
         (23, Code),
+        // V24: always-open stores (`e275bae`). Still the store code.
+        (24, Code),
     ]
 };
 
