@@ -460,6 +460,61 @@ struct PendingReplies {
 }
 
 const BATCH_MAGIC: [u8; 8] = *b"hvauto01";
+const RETRY_MAGIC: [u8; 8] = *b"hvretry1";
+
+/// Carried through a mailbox read a wake-up asks for when a refused update
+/// left requests undecided (`Ledger::retry_pending`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+struct MailboxRetry {
+    magic: [u8; 8],
+    store_contract_id: Vec<u8>,
+}
+
+/// A mailbox read for every armed store with requests left undecided by a
+/// refused update: the wake-up's way to answer them without waiting for the
+/// mailbox to change (codex on harvest#177).
+pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelegateMsg> {
+    if secrets.has_secret(EXPORTED_KEY) {
+        return Vec::new();
+    }
+    arms(secrets)
+        .iter()
+        .filter(|record| load_ledger(secrets, &record.arm.store_contract_id).retry_pending)
+        .filter_map(|record| {
+            let context = to_cbor(&MailboxRetry {
+                magic: RETRY_MAGIC,
+                store_contract_id: record.arm.store_contract_id.clone(),
+            })
+            .ok()?;
+            let mut get =
+                GetContractRequest::new(ContractInstanceId::new(record.arm.mailbox_contract_id));
+            get.context = DelegateContext::new(context);
+            Some(OutboundDelegateMsg::GetContractRequest(get))
+        })
+        .collect()
+}
+
+/// The mailbox read [`mailbox_retries`] asked for: the retry flag cleared,
+/// and the mailbox decided as if it had just changed.
+fn on_mailbox_retry<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    state: Option<&[u8]>,
+    now_ms: u64,
+) -> Vec<OutboundDelegateMsg> {
+    let Some(record) = load_arm(secrets, store_contract_id) else {
+        return Vec::new();
+    };
+    let Some(state) = state else {
+        return Vec::new();
+    };
+    let mut ledger = load_ledger(secrets, store_contract_id);
+    if ledger.retry_pending {
+        ledger.retry_pending = false;
+        save(secrets, &ledger_key(store_contract_id), &ledger);
+    }
+    on_mailbox(secrets, &record, state, now_ms)
+}
 const REPLIES_MAGIC: [u8; 8] = *b"hvrepl01";
 
 fn load<S: SecretStore, T: for<'de> Deserialize<'de>>(secrets: &S, key: &[u8]) -> Option<T> {
@@ -1297,6 +1352,16 @@ pub(crate) fn on_get_answer<S: SecretStore>(
     context: &[u8],
     now_ms: u64,
 ) -> Option<Vec<OutboundDelegateMsg>> {
+    if let Ok(retry) = from_cbor::<MailboxRetry>(context) {
+        if retry.magic == RETRY_MAGIC {
+            return Some(on_mailbox_retry(
+                secrets,
+                &retry.store_contract_id,
+                state,
+                now_ms,
+            ));
+        }
+    }
     if context.is_empty() {
         if let Some(out) = on_tip_read(secrets, contract_id, state, now_ms) {
             return Some(out);
@@ -3972,6 +4037,65 @@ mod tests {
             crate::background::on_background(&mut f.secrets, &BackgroundRun::NodeStarted, NOW)
                 .is_empty()
         );
+    }
+
+    /// A wake-up re-reads the mailbox of a store whose update was refused,
+    /// and the answer is decided as a mailbox change is: the undecided
+    /// request goes to the store read again, and the flag clears. Mutated
+    /// red by never asking, and by not clearing the flag.
+    #[test]
+    fn a_wake_up_retries_requests_a_refused_update_left_undecided() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut f = fixture();
+        let buyer = Buyer::new(40);
+        let entry = buyer.request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        let out = decided.into_messages(&f.record.arm);
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        on_store_update_answer(
+            &mut f.secrets,
+            &Err("refused".into()),
+            update.context.as_ref(),
+        );
+        let wake = BackgroundRun::Wakeup {
+            tag: HEARTBEAT_TAG.to_vec(),
+        };
+        let out = crate::background::on_background(&mut f.secrets, &wake, NOW);
+        let gets: Vec<&GetContractRequest> = out
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::GetContractRequest(g) => Some(g),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gets.len(), 1, "{out:?}");
+        assert_eq!(gets[0].contract_id.as_bytes(), [2; 32].as_slice());
+        let mailbox = to_cbor(&MailboxStateV1 {
+            messages: vec![entry.clone()],
+        })
+        .unwrap();
+        let answered = on_get_answer(
+            &mut f.secrets,
+            &[2; 32],
+            Some(&mailbox),
+            gets[0].context.as_ref(),
+            NOW,
+        )
+        .expect("ours");
+        let [OutboundDelegateMsg::GetContractRequest(store_read)] = answered.as_slice() else {
+            panic!("{answered:?}")
+        };
+        let batch: PendingBatch = from_cbor(store_read.context.as_ref()).unwrap();
+        assert_eq!(batch.entries, vec![entry]);
+        assert!(!load_ledger(&f.secrets, &f.record.arm.store_contract_id).retry_pending);
+        // Nothing more to retry.
+        let later =
+            crate::background::on_background(&mut f.secrets, &wake, NOW + HEARTBEAT_MIN_GAP_MS);
+        assert!(!later
+            .iter()
+            .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_))));
     }
 
     /// A watch that ends at a height must outlast an invoice's window in

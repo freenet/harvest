@@ -613,7 +613,7 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             "6472846e92abe0ec9209e7ab34b50fd72306eb04bad0416797584289a4f6a128".to_string(),
             // V26, the generation harvest#177 shipped. Superseded by always-open
             // stores: wake-ups, heartbeats and the manifest.
-            "4e7262f786906ea56f9963e39da6fa4c366e4ab866cafe83a8f6b1da3eb86ecb".to_string(),
+            "b7fd3abea2d1045f667ed1bd3b73be5d37e0af05b48ccc1e3fce1a40f32027ca".to_string(),
         ],
     );
 }

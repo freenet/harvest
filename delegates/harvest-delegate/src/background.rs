@@ -48,7 +48,9 @@ pub(crate) fn on_background<S: SecretStore>(
     match run {
         BackgroundRun::Wakeup { tag } if tag.as_slice() == HEARTBEAT_TAG => {
             crate::auto_invoice::note_wakeup(secrets, now_ms);
-            crate::auto_invoice::heartbeats(secrets, now_ms)
+            let mut out = crate::auto_invoice::heartbeats(secrets, now_ms);
+            out.extend(crate::auto_invoice::mailbox_retries(secrets));
+            out
         }
         // A tag this generation did not declare (a successor's, say): nothing.
         BackgroundRun::Wakeup { .. } => Vec::new(),
