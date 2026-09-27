@@ -352,12 +352,19 @@ And a capacity cost: the 4 KiB size class keeps at most 128 messages
 fewer buyer texts, and junk written into the 4 KiB class (which costs a
 flooder nothing) evicts them sooner than it would have evicted 1 KiB text.
 
-What the gate does NOT cover, because buying needs no Ghost Key: the free-text
-fields of a request to buy (`note`, `shipping`) and a `Decline`'s `reason`
-are shown without a voucher. Text in the seller's reply direction is shown
-only in a conversation opened by a verified voucher or a request to buy --
-both parties hold both keys, so direction alone cannot be trusted -- which
-means one free request to buy also opens that channel.
+What opens a conversation to the seller: a voucher that verifies for it, or
+a Buy now in it whose order the store has PAID (money, which no spammer
+spends to write). A request to buy on its own opens nothing, because it
+costs nothing to send. In a conversation that is not open the seller still
+sees every step (a request, a decline, an acceptance), so buying needs no
+Ghost Key, but not the free text in them: a request's note and shipping
+address (the address shows once it is paid) and a decline's reason are
+blanked, and text in either direction is left out (both parties hold both
+keys, so direction alone cannot be trusted). The count the seller is shown
+is of buyer text left out or blanked; a blanked address is not counted.
+
+A buyer's plain text sealed before the gate existed, and the seller's own
+replies in a conversation nothing opens, are no longer shown to the seller.
 
 ## The tag is a deliberate trade, and here is the other side of it
 

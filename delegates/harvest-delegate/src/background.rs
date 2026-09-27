@@ -4,7 +4,7 @@
 //! # What each does, and why
 //!
 //! - **A `heartbeat` wake-up** (every five minutes, on a node with
-//!   freenet-core#5614) signs a heartbeat for every armed store and sends it
+//!   freenet-core#5747) signs a heartbeat for every armed store and sends it
 //!   to the store's presence contract, so buyers see the store OPEN while
 //!   this node is online, with no tab open. It also records when it ran,
 //!   which is how the seller's tab learns this node wakes the delegate and

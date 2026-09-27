@@ -6,7 +6,9 @@
 //! send them, and a buyer to read them.
 //!
 //! No predecessor probe: a heartbeat is worthless ten minutes after it is
-//! signed, so a re-key needs no migration (`legacy/presence_contract.toml`).
+//! signed, and one at an older address comes from an older delegate
+//! generation that cannot take an order placed at the current addresses
+//! (`legacy/presence_contract.toml`).
 
 use freenet_stdlib::prelude::{ContractCode, ContractKey};
 use harvest_common::presence::PresenceParameters;

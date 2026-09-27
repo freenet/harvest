@@ -39,11 +39,17 @@
 //! clock is put right still wins, and `at_ms` is only what freshness is read
 //! from.
 //!
-//! # A re-key needs no migration
+//! # A re-key
 //!
-//! A heartbeat is ephemeral: it is worthless ten minutes after it is signed.
-//! When this contract's code moves, the next heartbeat simply lands at the
-//! new address, and nothing at the old one is worth carrying forward.
+//! Nothing at an old address is worth carrying forward: a heartbeat is
+//! worthless ten minutes after it is signed. But a re-key closes the store
+//! until its seller opens the new Harvest. The address the delegate writes to
+//! is the one the seller's tab armed it with, and a Harvest re-key has so far
+//! always moved the store and mailbox contracts and the delegate too, whose
+//! previous generation keeps serving only the previous addresses. So readers
+//! follow the current address alone: a heartbeat at an older one says an
+//! older generation is running, and that generation cannot take an order
+//! placed at the current addresses.
 
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -200,7 +206,7 @@ impl SignedHeartbeat {
         .map_err(|e| format!("heartbeat is not signed by the store key: {e}"))
     }
 
-    /// The canonical encoding, which an `at_ms` tie is decided by.
+    /// The canonical encoding, which a `seq` tie is decided by.
     fn bytes(&self) -> Result<Vec<u8>, String> {
         crate::to_cbor(self)
     }

@@ -3,9 +3,10 @@
 //!
 //! # Why this is not the macro
 //!
-//! A node runs a delegate with no tab open in three ways since freenet-core
-//! #5730 and #5614: once when it is installed, once each time the node
-//! starts, and on a schedule the delegate declares (a wake-up). The delegate
+//! A node runs a delegate with no tab open in three ways, from freenet-core
+//! #5730 (lifecycle) and #5747 (wake-ups, not in a release yet): once when
+//! it is installed, once each time the node starts, and on a schedule the
+//! delegate declares (a wake-up). The delegate
 //! declares which it wants in a manifest, a WASM custom section named
 //! `freenet-manifest`, and the node delivers them as two new inbound
 //! messages, `WakeupFired` (bincode tag 9) and `Lifecycle` (tag 10).

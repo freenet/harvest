@@ -636,7 +636,7 @@ pub struct AutoInvoiceStatus {
     #[serde(default)]
     pub capped: Option<String>,
     /// When the node last woke this delegate on its own schedule, by the
-    /// node's clock (freenet-core#5614). `None`, or long ago, means this node
+    /// node's clock (freenet-core#5747). `None`, or long ago, means this node
     /// does not wake it: heartbeats then come only from an open tab.
     #[serde(default)]
     pub last_wakeup_ms: Option<u64>,

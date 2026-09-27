@@ -149,13 +149,16 @@ pub enum MessageContent {
     ///
     /// Buyer-to-seller messages need a Ghost Key (anti-spam); buying does
     /// not. The mailbox is open-write, so a gate in the buyer's UI alone is
-    /// no gate: a script writes past it. The seller's side therefore refuses
-    /// to show buyer text that does not carry a voucher verifying for the
-    /// conversation it arrived in (`harvest-ui`'s `components::message_view`).
+    /// no gate: a script writes past it. The seller's side therefore shows
+    /// free text only in a conversation that a voucher verifying for it, or
+    /// a paid Buy now, has opened (`harvest-ui`'s
+    /// `components::message_view::shown_to_seller`).
     ///
     /// [`Self::Text`] stays for the seller's replies, which need no voucher
     /// (the buyer chose to write to this store), and so that messages sealed
-    /// before this existed still open.
+    /// before this existed still decode. A buyer's plain text from before is
+    /// no longer shown to the seller, nor the seller's replies in a
+    /// conversation nothing opens.
     VouchedText {
         text: String,
         voucher: MessageVoucher,
