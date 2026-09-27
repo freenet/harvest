@@ -36,10 +36,13 @@
 //!   `lib.rs`), and notifications are acted on only for contracts named in an
 //!   arm.
 //! - **I7, every address is watched.** The delegate invoices only on an
-//!   address the seller's UI has had the bridge read a watch request for, and
-//!   only until that watch lapses (see [`AutoInvoiceArm`]). Without this a
-//!   payment made before the seller next opened Harvest would never be seen,
-//!   because the bridge does not look back (freenet-bitcoin#7).
+//!   address the bridge has read a watch request for, and only while that
+//!   watch outlasts the invoice's payment window: one the seller's UI had
+//!   watched (see [`AutoInvoiceArm`]), or one this delegate asked for itself
+//!   with the watch key the seller's Ghost Key delegated to it
+//!   (`crate::watch_delegation`); see [`WatchSet`]. Without this a payment
+//!   made before the seller next opened Harvest would never be seen, because
+//!   the bridge does not look back (freenet-bitcoin#7).
 //!
 //! # What this cannot do
 //!

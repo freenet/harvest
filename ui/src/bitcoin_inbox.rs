@@ -451,6 +451,21 @@ impl InboxTracker {
         }
     }
 
+    /// The latest `made_at_ms` this tab has dated a request with.
+    pub fn last_made_at_ms(&self) -> Option<u64> {
+        self.last_made_at_ms
+    }
+
+    /// Date this tab's next request above `made_at_ms`: the delegate's
+    /// latest, on the one timeline the tab and the delegate share per Ghost
+    /// Key (freenet-bitcoin#30). A request at or below the last the bridge
+    /// applied from that Ghost Key is ignored.
+    pub fn raise_made_at(&mut self, made_at_ms: u64) {
+        if self.last_made_at_ms.is_none_or(|last| last < made_at_ms) {
+            self.last_made_at_ms = Some(made_at_ms);
+        }
+    }
+
     /// Take a newly served state, noting any request it shows the bridge read.
     pub fn on_state(&mut self, state: InboxStateV1, now_ms: u64) {
         for sent in self.sent.values_mut() {

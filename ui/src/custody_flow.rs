@@ -419,7 +419,7 @@ impl AppState {
             || self
                 .pending_signatures
                 .iter()
-                .any(|p| matches!(p, crate::state::PendingSignature::InboxEntry(_)))
+                .any(crate::state::PendingSignature::is_watch_signature)
     }
 
     /// The custody request a loaded store calls for, if any. Pure over the
