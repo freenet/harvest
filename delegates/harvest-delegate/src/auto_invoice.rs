@@ -448,8 +448,7 @@ struct PendingReplies {
     store_contract_id: Vec<u8>,
     #[serde(default)]
     retry: Vec<([u8; 32], [u8; 32])>,
-    /// The orders the update carried: their sales and gap records are
-    /// dropped with them if it is refused, so they do not hold stock.
+    /// The orders the update carried (for the log and a later retry).
     #[serde(default)]
     orders: Vec<OrderId>,
 }
@@ -1369,14 +1368,13 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
                 ledger
                     .answered
                     .retain(|request| !pending.retry.iter().any(|(_, r)| r == request));
-                ledger
-                    .sales
-                    .retain(|sale| !pending.orders.contains(&sale.order));
-                ledger
-                    .gap_orders
-                    .retain(|(id, _)| !pending.orders.contains(id));
-                // A refused update needs a run to be answered again: the next
-                // wake-up re-reads the mailbox (`retry_pending`).
+                // The sales stay: a refusal reported for an update that did
+                // land would otherwise lose the stock its order holds, and
+                // one that did not land is released after `NOT_LANDED_MS`
+                // anyway. A request made undecided here is answered at the
+                // store's next run, which the next mailbox change starts;
+                // `retry_pending` is what a run started some other way (a
+                // wake-up, next PR) looks at.
                 ledger.retry_pending = true;
                 save(secrets, &ledger_key(&pending.store_contract_id), &ledger);
             }
@@ -3528,9 +3526,9 @@ mod tests {
     }
 
     /// A decline the mailbox refused leaves its request to be decided again,
-    /// and a refused store update also drops its sale, so the retry is not
-    /// held back by its own stock. Mutated red by not attaching the decline's
-    /// retry, and by keeping the sale.
+    /// as does a refused store update; the sale stays (an update reported
+    /// refused may have landed, and one that did not is released after
+    /// `NOT_LANDED_MS`). Mutated red by not attaching the decline's retry.
     #[test]
     fn refused_answers_are_undone_so_the_retry_can_answer() {
         let mut f = fixture();
@@ -3556,7 +3554,8 @@ mod tests {
         let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
         assert!(!ledger.seen.contains(&entry_digest(&eb)), "decline undone");
         assert!(!ledger.seen.contains(&entry_digest(&ea)), "invoice undone");
-        assert!(ledger.sales.is_empty(), "its stock is not held");
+        assert!(ledger.retry_pending);
+        assert_eq!(ledger.sales.len(), 1, "the sale stays");
     }
 
     /// A Buy now for a listing that changed or went away is answered, not
