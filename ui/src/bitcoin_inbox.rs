@@ -95,6 +95,7 @@ pub fn watch_requests(
             scripts: batch.iter().map(|s| ByteBuf((*s).clone())).collect(),
             scan_from_height,
             made_at_ms: made_at_ms + i as u64,
+            watch_until_height: None,
         })
         .collect()
 }
@@ -186,6 +187,12 @@ pub struct SentWatch {
     /// When the latest request the bridge WAS seen to read was sent: the
     /// watch that is certainly running while a renewal waits to be read.
     pub read_lease_ms: Option<u64>,
+    /// The `watch_until_height` this request asked for (freenet-bitcoin#26),
+    /// and the one the latest request the bridge WAS seen to read asked for:
+    /// a bridge never shortens a horizon, so that one stands while a renewal
+    /// waits to be read, as `read_lease_ms` does for the day.
+    pub until_height: Option<u32>,
+    pub read_until_height: Option<u32>,
 }
 
 impl SentWatch {
@@ -199,6 +206,18 @@ impl SentWatch {
             read: false,
             unread_since_ms: now_ms,
             read_lease_ms: None,
+            until_height: None,
+            read_until_height: None,
+        }
+    }
+
+    /// The horizon the bridge is known to be watching this script to: this
+    /// request's once it was read, else the last read one's.
+    pub fn watched_until_height(&self) -> Option<u32> {
+        if self.read {
+            self.until_height
+        } else {
+            self.read_until_height
         }
     }
 
@@ -277,6 +296,12 @@ pub struct WatchWanted {
     /// for an order's, [`PREWATCH_RENEW_AFTER_MS`] for instant checkout's
     /// next addresses.
     pub renew_after_ms: u64,
+    /// The last block to keep watching through, for a script that must stay
+    /// watched with no tab open (instant checkout's next addresses): sent as
+    /// `watch_until_height` (freenet-bitcoin#26), which keeps the watch past
+    /// the day a request otherwise buys, up to
+    /// `freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS` past the bridge's tip.
+    pub until_height: Option<u32>,
 }
 
 /// A request prepared and handed to the ghostkey delegate, waiting on its
@@ -293,6 +318,9 @@ pub struct PendingInboxEntry {
     pub floor: SignedFloor,
     pub network: BitcoinNetwork,
     pub scripts: Vec<Vec<u8>>,
+    /// The request's `watch_until_height`, recorded against each script once
+    /// it is sent.
+    pub until_height: Option<u32>,
     /// What the delegate is asked to sign, and so what its answer is matched by.
     pub signing_payload: Vec<u8>,
     /// When it was queued, so a signature that never comes back does not hold
@@ -622,6 +650,10 @@ impl InboxTracker {
                     scripts: batch.iter().map(|w| ByteBuf(w.script.clone())).collect(),
                     scan_from_height: batch.iter().filter_map(|w| w.anchor_height).min(),
                     made_at_ms,
+                    // The furthest any script in the batch wants: a longer
+                    // watch than an order script needs costs the bridge a
+                    // little, never a payment.
+                    watch_until_height: batch.iter().filter_map(|w| w.until_height).max(),
                 });
             }
         }
@@ -648,6 +680,8 @@ impl InboxTracker {
                     p.read_lease_ms
                 }
             });
+            this.until_height = pending.until_height;
+            this.read_until_height = self.sent.get(&key).and_then(SentWatch::watched_until_height);
             self.sent.insert(key, this);
         }
     }
@@ -1098,6 +1132,7 @@ mod tests {
             network,
             script: vec![0x00, 0x14, n],
             anchor_height: Some(anchor),
+            until_height: None,
         }
     }
 
@@ -1130,6 +1165,7 @@ mod tests {
             floor: floor.clone(),
             network: request.network,
             scripts: request.scripts.iter().map(|s| s.0.clone()).collect(),
+            until_height: request.watch_until_height,
             signing_payload: prepared.signing_payload,
             queued_at_ms: T0,
         };
@@ -1263,6 +1299,7 @@ mod tests {
             floor,
             network: BitcoinNetwork::Signet,
             scripts: vec![w[0].script.clone()],
+            until_height: None,
             signing_payload: prepared.signing_payload,
             queued_at_ms: T0,
         };
@@ -1345,6 +1382,7 @@ mod tests {
             floor: SignedFloor::sign(&bridge_key(), FLOOR),
             network: BitcoinNetwork::Signet,
             scripts: vec![w[0].script.clone()],
+            until_height: None,
             signing_payload: vec![],
             queued_at_ms: T0,
         };

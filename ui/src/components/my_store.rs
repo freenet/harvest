@@ -711,6 +711,16 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
     let instant_checkout = APP_STATE
         .read()
         .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
+    // Whether buyers see this store open, and what keeps it so. Only for a
+    // store that sells (the notice above is `None` otherwise).
+    let presence_line = instant_checkout.as_ref().map(|_| {
+        let state = APP_STATE.read();
+        let now = crate::state::now_ms();
+        crate::presence_flow::seller_presence_line(
+            state.store_presence(&store.contract_id, now),
+            state.wakeups_live(now),
+        )
+    });
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
     let needs: bool = store.unpriced > 0
@@ -822,6 +832,9 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         if let Some(notice) = instant_checkout {
             section { class: "card",
                 h3 { "Taking orders" }
+                if let Some(ref line) = presence_line {
+                    p { "{line}" }
+                }
                 p { class: "text-muted", "{notice}" }
             }
         }

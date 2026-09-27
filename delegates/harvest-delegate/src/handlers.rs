@@ -384,6 +384,13 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
         HarvestDelegateRequest::ArmAutoInvoice { arm } => {
             crate::auto_invoice::arm(store, *arm, crate::now_ms()).0
         }
+        // Likewise answered in `lib.rs`, which also sends the update.
+        HarvestDelegateRequest::Heartbeat {
+            store_contract_id,
+            force,
+        } => {
+            crate::auto_invoice::heartbeat_request(store, &store_contract_id, force, crate::now_ms()).0
+        }
 
         _ => HarvestDelegateResponse::Error {
             message: "unsupported request variant for this delegate version".into(),

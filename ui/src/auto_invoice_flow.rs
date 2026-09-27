@@ -48,6 +48,10 @@ pub const WATCH_MARGIN_MS: u64 = 2 * 60 * 60 * 1000;
 /// background is taken to be unable to: a new block arrives about every ten
 /// minutes, and each one runs it.
 pub const NO_BACKGROUND_RUN_AFTER_MS: u64 = 30 * 60 * 1000;
+/// The time counted per block of a watch horizon when telling the delegate
+/// how long its watch has left: half the ten-minute target, so a run of fast
+/// blocks does not outrun the estimate. The delegate also checks the height.
+pub const HORIZON_BLOCK_MS: u64 = 5 * 60 * 1000;
 
 /// What the seller's side of instant checkout holds.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -73,6 +77,10 @@ pub struct AutoInvoiceUi {
 pub struct AutoInvoiceWork {
     pub peek: bool,
     pub arms: Vec<AutoInvoiceArm>,
+    /// For each of `arms`, when its day-long watch lapses by this tab's
+    /// clock (0 when nothing is watched): what the next plan compares to
+    /// tell a renewed watch from an unchanged one.
+    pub lapses_at_ms: Vec<u64>,
 }
 
 impl AppState {
@@ -188,6 +196,12 @@ impl AppState {
                             network,
                             script: a.script_pubkey.clone(),
                             anchor_height: tip_height,
+                            // As far ahead as a bridge will watch: the store
+                            // keeps taking orders with no tab open until the
+                            // tip nears it or these addresses are used.
+                            until_height: tip_height.map(|tip| {
+                                tip.saturating_add(freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS)
+                            }),
                         })
                         .collect(),
                 ))
@@ -225,30 +239,49 @@ impl AppState {
         let inbox = self.bitcoin.inbox.as_ref()?;
         let mut watched_scripts = Vec::new();
         let mut earliest: Option<u64> = None;
+        // The nearest horizon among them, or `None` once any lacks one.
+        let mut horizon: Option<Option<u32>> = None;
         for address in upcoming {
-            let Some(read_at) = inbox
-                .sent
-                .get(&(network, address.script_pubkey.clone()))
-                .and_then(|s| {
-                    if s.read {
-                        Some(s.sent_at_ms)
-                    } else {
-                        s.read_lease_ms
-                    }
-                })
-            else {
+            let Some(sent) = inbox.sent.get(&(network, address.script_pubkey.clone())) else {
+                break;
+            };
+            let Some(read_at) = (if sent.read {
+                Some(sent.sent_at_ms)
+            } else {
+                sent.read_lease_ms
+            }) else {
                 // The delegate hands addresses out in order, so one not
                 // watched ends the usable run.
                 break;
             };
             watched_scripts.push(address.script_pubkey.clone());
             earliest = Some(earliest.map_or(read_at, |e| e.min(read_at)));
+            let this = sent.watched_until_height();
+            horizon = Some(match horizon {
+                None => this,
+                Some(held) => held.zip(this).map(|(a, b)| a.min(b)),
+            });
         }
+        let watched_until_height = horizon.flatten();
+        let tip_height = self.bitcoin.tips.get(&network).and_then(|t| t.tip_height);
+        // When the day the earliest read request bought runs out. Also what
+        // the caller compares to tell a renewed watch from an unchanged one,
+        // so it must not move with the clock.
         let lapses_at_ms = earliest
             .map(|at| at + WATCH_LIFETIME_MS - WATCH_MARGIN_MS)
             .filter(|until| *until > now_ms)
             .unwrap_or(0);
-        if lapses_at_ms == 0 {
+        // Past the day, a horizon keeps the watch until the tip passes it:
+        // counted at a pessimistic block rate here, since the delegate checks
+        // the height itself (`watched_until_height`).
+        let horizon_left_ms = match (watched_until_height, tip_height) {
+            (Some(until), Some(tip)) if !watched_scripts.is_empty() => {
+                u64::from(until.saturating_sub(tip)) * HORIZON_BLOCK_MS
+            }
+            _ => 0,
+        };
+        let watch_left_ms = lapses_at_ms.saturating_sub(now_ms).max(horizon_left_ms);
+        if watch_left_ms == 0 {
             watched_scripts.clear();
         }
         let arm = AutoInvoiceArm {
@@ -260,8 +293,14 @@ impl AppState {
             tip_contract_id,
             trusted_bridges,
             address_code_hash,
+            watched_until_height: if watched_scripts.is_empty() {
+                None
+            } else {
+                watched_until_height
+            },
             watched_scripts,
-            watch_left_ms: lapses_at_ms.saturating_sub(now_ms),
+            watch_left_ms,
+            presence_contract_id: presence_instance_bytes(&store_verifying_key),
         };
         Some((arm, lapses_at_ms))
     }
@@ -290,6 +329,7 @@ impl AppState {
             };
             if due {
                 work.arms.push(arm);
+                work.lapses_at_ms.push(lapses_at);
             }
         }
         work
@@ -306,20 +346,11 @@ impl AppState {
         if work.peek {
             self.auto_invoice.peek_sent_ms = Some(now_ms);
         }
-        for arm in &work.arms {
+        for (arm, lapses_at) in work.arms.iter().zip(&work.lapses_at_ms) {
             self.auto_invoice.sent.insert(
                 arm.store_contract_id.clone(),
-                (
-                    without_left(arm),
-                    // As `auto_invoice_arm` gives it: 0 when nothing is
-                    // watched.
-                    if arm.watch_left_ms == 0 {
-                        0
-                    } else {
-                        now_ms.saturating_add(arm.watch_left_ms)
-                    },
-                    now_ms,
-                ),
+                // As `auto_invoice_arm` gives it: 0 when nothing is watched.
+                (without_left(arm), *lapses_at, now_ms),
             );
         }
         work
@@ -413,6 +444,20 @@ impl AppState {
             Some(Ok(status)) => instant_checkout_status_text(status, now_ms),
         })
     }
+}
+
+/// The instance id of the presence contract of the store `store_key` owns,
+/// as this build addresses it.
+pub(crate) fn presence_instance_bytes(store_key: &[u8; 32]) -> Option<[u8; 32]> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(store_key).ok()?;
+    crate::gateway::presence_ops::presence_contract_key(&key)
+        .ok()
+        .map(|k| *k.id())
+        .map(|id| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(id.as_bytes());
+            out
+        })
 }
 
 /// `arm` with its shrinking duration zeroed, for telling whether anything

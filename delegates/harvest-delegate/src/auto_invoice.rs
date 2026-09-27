@@ -179,6 +179,12 @@ pub(crate) const WATCH_NEEDED_MS: u64 =
     MAX_ANCHOR_AGE_BLOCKS as u64 * 10 * 60 * 1000 + 3 * 60 * 60 * 1000;
 /// How far ahead of this node's clock a Buy now may be dated.
 pub(crate) const MAX_CLOCK_AHEAD_MS: u64 = 10 * 60 * 1000;
+/// [`WATCH_NEEDED_MS`] in blocks, for a watch that ends at a height
+/// ([`AutoInvoiceArm::watched_until_height`]): the blocks a buyer may still
+/// start paying in, three hours of blocks for the payment to confirm, and six
+/// for the tip the UI read being behind the bridge's (a horizon is clamped
+/// from the bridge's own tip, which a reorg can leave lower).
+pub(crate) const WATCH_NEEDED_BLOCKS: u32 = MAX_ANCHOR_AGE_BLOCKS + 18 + 6;
 /// A sale whose order has not appeared in the store after this long is
 /// taken to have never landed (a refused update), and forgotten.
 pub(crate) const NOT_LANDED_MS: u64 = 10 * 60 * 1000;
@@ -588,7 +594,179 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
             .as_ref()
             .filter(|(at, _)| now_ms.saturating_sub(*at) < CAPPED_SHOWN_MS)
             .map(|(_, why)| why.clone()),
+        last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
     }
+}
+
+/// When the node last woke this delegate on its schedule: what tells the
+/// seller's tab that heartbeats go on without it (`AutoInvoiceStatus::
+/// last_wakeup_ms`). Not exported: it describes this node.
+pub(crate) const WAKEUP_KEY: &[u8] = b"harvest:auto:wakeup";
+
+/// A heartbeat sent less than this long ago is not sent again unless the
+/// store's state changed or the tab forces one: a wake-up and an open tab
+/// both ask every five minutes, and one write per interval is enough.
+pub(crate) const HEARTBEAT_MIN_GAP_MS: u64 = 4 * 60 * 1000;
+
+fn beat_key(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{AUTO_PREFIX}beat:{}",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+/// The last heartbeat this delegate sent for one store. Not exported.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+struct BeatRecord {
+    at_ms: u64,
+    taking_orders: bool,
+}
+
+pub(crate) fn note_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) {
+    save(secrets, WAKEUP_KEY, &now_ms);
+}
+
+/// Whether the store can take an order now: it would issue payment details
+/// for a Buy now (no store-wide refusal) and has a watched address left.
+/// What a heartbeat carries as `taking_orders`.
+///
+/// It does not see the per-request caps, which need the store's state: a
+/// store at its open-order or daily cap still reads as taking orders.
+fn taking_orders<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> bool {
+    let status = status_of(secrets, record, now_ms);
+    status.paused.is_none() && status.watched_remaining > 0
+}
+
+/// Sign a heartbeat for `record`'s store and send it to its presence
+/// contract, unless one went out less than [`HEARTBEAT_MIN_GAP_MS`] ago
+/// saying the same (or `force`). `None` when there is nothing to send: no
+/// presence contract named (an older UI armed it), no store key, this
+/// generation exported, or a heartbeat just sent.
+pub(crate) fn heartbeat<S: SecretStore>(
+    secrets: &mut S,
+    record: &ArmRecord,
+    now_ms: u64,
+    force: bool,
+) -> Option<(harvest_common::presence::SignedHeartbeat, OutboundDelegateMsg)> {
+    use harvest_common::presence::{Heartbeat, SignedHeartbeat};
+    let presence = record.arm.presence_contract_id?;
+    if secrets.has_secret(EXPORTED_KEY) {
+        return None;
+    }
+    let taking = taking_orders(secrets, record, now_ms);
+    let key = beat_key(&record.arm.store_contract_id);
+    if !force {
+        if let Some(last) = load::<_, BeatRecord>(secrets, &key) {
+            if last.taking_orders == taking
+                && now_ms >= last.at_ms
+                && now_ms - last.at_ms < HEARTBEAT_MIN_GAP_MS
+            {
+                return None;
+            }
+        }
+    }
+    let store_sk = store_key(secrets, &record.arm.store_verifying_key)?;
+    let signed = SignedHeartbeat::sign(&store_sk, Heartbeat::new(now_ms, taking)).ok()?;
+    let delta = to_cbor(&signed).ok()?;
+    save(
+        secrets,
+        &key,
+        &BeatRecord {
+            at_ms: now_ms,
+            taking_orders: taking,
+        },
+    );
+    Some((
+        signed,
+        OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+            ContractInstanceId::new(presence),
+            UpdateData::Delta(StateDelta::from(delta)),
+        )),
+    ))
+}
+
+/// A heartbeat for every armed store that is due one: the wake-up's work.
+pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<OutboundDelegateMsg> {
+    arms(secrets)
+        .iter()
+        .filter_map(|record| heartbeat(secrets, record, now_ms, false))
+        .map(|(_, message)| message)
+        .collect()
+}
+
+/// The tab's heartbeat request ([`HarvestDelegateRequest::Heartbeat`]): the
+/// answer, and the update to send.
+pub(crate) fn heartbeat_request<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    force: bool,
+    now_ms: u64,
+) -> (HarvestDelegateResponse, Vec<OutboundDelegateMsg>) {
+    let answer = |result| HarvestDelegateResponse::Heartbeat {
+        store_contract_id: store_contract_id.to_vec(),
+        result,
+    };
+    let Some(record) = load_arm(secrets, store_contract_id) else {
+        return (answer(Err("this store is not armed here".into())), Vec::new());
+    };
+    if record.arm.presence_contract_id.is_none() {
+        return (
+            answer(Err("this store was armed without a presence contract".into())),
+            Vec::new(),
+        );
+    }
+    let (heartbeat, out) = match heartbeat(secrets, &record, now_ms, force) {
+        Some((signed, message)) => (Some(signed), vec![message]),
+        None => (None, Vec::new()),
+    };
+    (
+        answer(Ok(harvest_common::delegate::HeartbeatAnswer {
+            heartbeat,
+            last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
+        })),
+        out,
+    )
+}
+
+/// Subscribe again to every armed store's store, mailbox and chain tip, and
+/// read each tip once: the node's start (or this delegate's install), after
+/// which subscriptions may be gone and a notification missed.
+///
+/// Stores first, then tips, and each tip once however many stores share it:
+/// a node that meters a run's operations (four on v0.2.138) then drops the
+/// least useful, and one store (the common case) needs exactly four.
+pub(crate) fn resubscribe_all<S: SecretStore>(secrets: &mut S) -> Vec<OutboundDelegateMsg> {
+    if secrets.has_secret(EXPORTED_KEY) {
+        return Vec::new();
+    }
+    let all = arms(secrets);
+    let mut out = Vec::new();
+    let mut tips: Vec<[u8; 32]> = Vec::new();
+    for record in &all {
+        let Ok(store) = <[u8; 32]>::try_from(record.arm.store_contract_id.as_slice()) else {
+            continue;
+        };
+        for id in [store, record.arm.mailbox_contract_id] {
+            out.push(OutboundDelegateMsg::SubscribeContractRequest(
+                SubscribeContractRequest::new(ContractInstanceId::new(id)),
+            ));
+        }
+        if !tips.contains(&record.arm.tip_contract_id) {
+            tips.push(record.arm.tip_contract_id);
+        }
+    }
+    for tip in &tips {
+        out.push(OutboundDelegateMsg::SubscribeContractRequest(
+            SubscribeContractRequest::new(ContractInstanceId::new(*tip)),
+        ));
+    }
+    for tip in tips {
+        out.push(OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
+            ContractInstanceId::new(tip),
+        )));
+    }
+    out
 }
 
 /// Stop this generation for good: remove every arm, so no background run
@@ -860,6 +1038,15 @@ fn global_refusal<S: SecretStore>(
     let tip = tip.ok_or(Refusal::NoFreshTip)?;
     if now_ms.saturating_sub(u64::from(tip.block_time) * 1000) > TIP_MAX_AGE_MS {
         return Err(Refusal::NoFreshTip);
+    }
+    // A watch that ends at a height (freenet-bitcoin#26) must outlast the
+    // invoice's window in blocks too: the time above is the UI's estimate
+    // of the same horizon, and blocks can come faster than it assumed.
+    if arm
+        .watched_until_height
+        .is_some_and(|until| tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) > until)
+    {
+        return Err(Refusal::WatchLapsed);
     }
     Ok(tip.anchor)
 }

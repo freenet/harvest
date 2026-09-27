@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 mod auto_invoice;
+mod background;
 mod bip32;
 mod bitcoin;
 mod handlers;
@@ -10,13 +11,14 @@ mod known_stores;
 mod markers;
 mod messaging;
 mod migration;
+mod node_glue;
 mod origin;
 mod secrets;
 mod store_keys;
 
 use freenet_stdlib::prelude::{
-    delegate, ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface,
-    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
+    ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface, InboundDelegateMsg,
+    MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
 use crate::secrets::CtxSecrets;
@@ -68,7 +70,9 @@ pub(crate) fn now_ms() -> u64 {
 
 pub struct HarvestDelegate;
 
-#[delegate]
+// Not `#[delegate]`: the exported entry point is `node_glue::process`, which
+// is that macro's glue plus the two background runs stdlib 0.8.5 cannot
+// decode, and the manifest that asks for them. See `node_glue`.
 impl DelegateInterface for HarvestDelegate {
     fn process(
         ctx: &mut DelegateCtx,
@@ -217,6 +221,25 @@ fn handle_request(
                 ApplicationMessage::new(response_bytes),
             )];
             out.extend(subscriptions);
+            Ok(out)
+        }
+        // Also dispatched here: its answer comes with an update to send.
+        Ok(HarvestDelegateRequest::Heartbeat {
+            store_contract_id,
+            force,
+        }) => {
+            let (response, updates) = auto_invoice::heartbeat_request(
+                &mut CtxSecrets(ctx),
+                &store_contract_id,
+                force,
+                now_ms(),
+            );
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+            let mut out = vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )];
+            out.extend(updates);
             Ok(out)
         }
         Ok(request) => {

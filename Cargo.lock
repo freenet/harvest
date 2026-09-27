@@ -1474,7 +1474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-common"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "bs58",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-generation"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "bs58",
@@ -1565,7 +1565,7 @@ dependencies = [
 [[package]]
 name = "freenet-bitcoin-inbox"
 version = "0.1.0"
-source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#a037181f375e09d4961e27c972a5fa5b702ae4b8"
+source = "git+https://github.com/freenet/freenet-bitcoin?branch=main#d1ce3bbc9f8c80bb916d74da5d89db929e9966bf"
 dependencies = [
  "blake3",
  "blind-rsa-signatures",
@@ -3232,7 +3232,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3547,7 +3547,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4726,7 +4726,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

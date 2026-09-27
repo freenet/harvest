@@ -105,6 +105,15 @@ pub fn start() {
                 if auto_invoice_due {
                     APP_STATE.write().send_due_auto_invoice();
                 }
+                // Presence: follow stores' presence contracts, and heartbeat
+                // our own stores while this node does not wake the delegate.
+                let presence_due = {
+                    use dioxus::prelude::ReadableExt;
+                    APP_STATE.peek().presence_due(crate::state::now_ms())
+                };
+                if presence_due {
+                    APP_STATE.write().send_due_presence();
+                }
                 // The kept purchases, asked again until the delegate answers
                 // (review round 2 of #143, P3): the payment details wait on
                 // that list, so a lost answer would hide them all session.

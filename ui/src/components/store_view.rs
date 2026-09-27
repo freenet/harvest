@@ -134,7 +134,7 @@ fn StoreList() -> Element {
                 p { class: "text-muted text-italic", "Stores you open are listed here." }
             }
             for row in rows {
-                div { class: "form-actions", key: "{row.code}",
+                div { class: if row.closed { "form-actions store-row-closed" } else { "form-actions" }, key: "{row.code}",
                     button {
                         class: "btn btn-sm btn-outline",
                         onclick: {
@@ -148,6 +148,9 @@ fn StoreList() -> Element {
                         "{row.label}"
                     }
                     span { class: "text-muted", " {row.code} " }
+                    if row.closed {
+                        span { class: "text-muted small", "Closed " }
+                    }
                     button {
                         class: "btn btn-sm btn-outline",
                         onclick: {
@@ -204,6 +207,23 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
         .read()
         .store_owner_fingerprint(&contract_id)
         .is_some();
+    // Whether the store is open is judged against the clock, so this
+    // re-renders every half minute: a store whose seller went offline reads
+    // closed within the ten minutes the rule allows, with nobody touching
+    // anything.
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(30_000).await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
+    let presence = APP_STATE
+        .read()
+        .store_presence(&contract_id, crate::state::now_ms());
 
     rsx! {
         div {
@@ -264,6 +284,12 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         "This store has closed. Its seller closed it because its key may be \
                          in someone else's hands, so nothing here can be bought. Its record \
                          stays visible."
+                    }
+                } else if !owned {
+                    if let Some(line) = presence.buyer_line() {
+                        p { class: if presence.is_closed() { "text-warning store-closed-note" } else { "text-muted" },
+                            "{line}"
+                        }
                     }
                 }
             }
@@ -331,7 +357,8 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // and a mismatched listing is a per-listing fact.
                         // And for a listing its seller has marked sold out
                         // (harvest#70): shown, never offered.
-                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability),
+                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability, presence.is_open()),
+                        closed: presence.is_closed(),
                     }
                 }
             }
@@ -368,17 +395,19 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
 
 /// The Buy control for one listing: what [`buyable`] allows for the store,
 /// less a listing whose own certificate did not verify, less one its seller
-/// marked sold out (harvest#70), less one with no sats price to buy it at.
-/// The component renders exactly this, so the tests assert what the screen
-/// does.
+/// marked sold out (harvest#70), less one with no sats price to buy it at,
+/// and none at all while the store is not open (`presence_flow`). The
+/// component renders exactly this, so the tests assert what the screen does.
 fn offered_buy(
     store: &crate::state::BrowsingStore,
     contract_id: &[u8],
     owned: bool,
     listing: &harvest_common::listing::Listing,
     availability: &ListingAvailability,
+    open: bool,
 ) -> Option<Buyable> {
     buyable(store, contract_id, owned)
+        .filter(|_| open)
         .filter(|_| !store.unverified_listings.contains(&listing.id))
         .filter(|_| availability.is_buyable())
         .filter(|_| listing.offers_instant_checkout())
@@ -530,6 +559,9 @@ fn ListingCard(
     availability: ListingAvailability,
     certificate_mismatch: bool,
     buyable: Option<Buyable>,
+    /// The store is closed: greyed, as a sold-out listing is.
+    #[props(default)]
+    closed: bool,
 ) -> Element {
     let l = &listing.listing;
     let stock = match &availability {
@@ -542,7 +574,7 @@ fn ListingCard(
     let sold_out = !availability.is_buyable();
 
     rsx! {
-        div { class: if sold_out { "listing-card listing-sold-out" } else { "listing-card" },
+        div { class: if sold_out || closed { "listing-card listing-sold-out" } else { "listing-card" },
             div { class: "listing-header",
                 h4 { "{l.title}" }
                 span { class: "badge {kind_badge_class(&l.kind)}",
@@ -981,7 +1013,7 @@ mod availability_tests {
         };
         let priced = priced_listing(9).listing;
         let offered = |availability: &ListingAvailability| {
-            offered_buy(&store, &[4u8; 32], false, &priced, availability).is_some()
+            offered_buy(&store, &[4u8; 32], false, &priced, availability, true).is_some()
         };
         assert!(offered(&ListingAvailability::Available { quantity: None }));
         assert!(offered(&ListingAvailability::Available {
@@ -1001,7 +1033,19 @@ mod availability_tests {
             &[4u8; 32],
             false,
             &quote_only,
-            &ListingAvailability::Available { quantity: None }
+            &ListingAvailability::Available { quantity: None },
+            true
+        )
+        .is_none());
+        // A closed store offers nothing, whatever the listing. Mutated red
+        // by dropping the `open` filter.
+        assert!(offered_buy(
+            &store,
+            &[4u8; 32],
+            false,
+            &priced,
+            &ListingAvailability::Available { quantity: None },
+            false
         )
         .is_none());
     }

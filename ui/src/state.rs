@@ -728,6 +728,10 @@ pub struct AppState {
 
     /// Instant checkout, the seller's side (`crate::auto_invoice_flow`).
     pub auto_invoice: crate::auto_invoice_flow::AutoInvoiceUi,
+
+    /// Whether stores are open, and our own heartbeats
+    /// (`crate::presence_flow`).
+    pub presence: crate::presence_flow::PresenceUi,
 }
 
 /// Details for a store being created, waiting on the two delegate responses
@@ -2722,6 +2726,9 @@ pub struct StoreListRow {
     pub code: String,
     pub label: String,
     pub archived: bool,
+    /// The store is closed (`presence_flow`): greyed, and listed after the
+    /// open ones.
+    pub closed: bool,
 }
 
 /// What a seller is told when their store's address is held by another key
@@ -3528,12 +3535,15 @@ impl AppState {
         } else {
             remembered.iter().filter(|s| s.archived).count()
         };
+        let now_ms = now_ms();
         let mut rows: Vec<StoreListRow> = remembered
             .iter()
             .filter(|s| show_archived || !s.archived)
             .map(|s| {
-                let name = StoreParameters::from_code(&s.store_code)
-                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                let id = StoreParameters::from_code(&s.store_code)
+                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok());
+                let name = id
+                    .as_ref()
                     .and_then(|id| self.browsing_stores.get(id.as_bytes()))
                     .and_then(|store| store.info.as_ref())
                     .map(|info| info.store_name.clone());
@@ -3541,10 +3551,18 @@ impl AppState {
                     label: crate::store_link::store_label(&s.store_code, name.as_deref()),
                     code: s.store_code.clone(),
                     archived: s.archived,
+                    closed: id.is_some_and(|id| {
+                        self.store_presence(id.as_bytes(), now_ms).is_closed()
+                    }),
                 }
             })
             .collect();
-        rows.sort_by(|a, b| a.archived.cmp(&b.archived).then(a.label.cmp(&b.label)));
+        rows.sort_by(|a, b| {
+            a.archived
+                .cmp(&b.archived)
+                .then(a.closed.cmp(&b.closed))
+                .then(a.label.cmp(&b.label))
+        });
         (rows, hidden)
     }
 
@@ -4397,6 +4415,10 @@ impl AppState {
         // A Ghost Key's index, routed by id before anything guesses at the
         // bytes (harvest#93 phase 1c; see `index_flow`).
         if self.on_index_state(&contract_id, &state_bytes) {
+            return;
+        }
+        // A store's presence, likewise (`presence_flow`).
+        if self.on_presence_state(&contract_id, &state_bytes) {
             return;
         }
 
@@ -11049,7 +11071,33 @@ impl AppState {
             HarvestDelegateResponse::AutoInvoice {
                 store_contract_id,
                 result,
-            } => self.on_auto_invoice_status(store_contract_id, result),
+            } => {
+                if let Ok(status) = &result {
+                    self.note_wakeup_status(status.last_wakeup_ms);
+                }
+                self.on_auto_invoice_status(store_contract_id, result)
+            }
+
+            HarvestDelegateResponse::Heartbeat {
+                store_contract_id,
+                result,
+            } => {
+                let create = self.on_heartbeat_answer(store_contract_id, result);
+                #[cfg(target_arch = "wasm32")]
+                if let Some((store_key, heartbeat)) = create {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) =
+                            crate::gateway::presence_ops::publish(&store_key, heartbeat).await
+                        {
+                            dioxus::logger::tracing::warn!(
+                                "could not create the store's presence contract: {e}"
+                            );
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = create;
+            }
 
             // A conversation the delegate did not keep dies with the tab, and
             // the buyer has already been told their message was sent -- so
@@ -12765,6 +12813,10 @@ impl AppState {
                         network: o.order.network,
                         script: o.order.payment_script_pubkey.clone(),
                         anchor_height: o.order.anchor.map(|a| a.height),
+                        // An order's watch is renewed while Harvest is open;
+                        // one issued with no tab open was an address the
+                        // tab had already watched through a horizon.
+                        until_height: None,
                     })
                     .collect();
                 if wanted.is_empty() {
@@ -13028,6 +13080,7 @@ impl AppState {
                             floor: floor.clone(),
                             network: request.network,
                             scripts: request.scripts.iter().map(|s| s.0.clone()).collect(),
+                            until_height: request.watch_until_height,
                             signing_payload: prepared.signing_payload,
                             queued_at_ms: now_ms,
                         };
@@ -16198,6 +16251,7 @@ mod tests {
                     ),
                     network: freenet_bitcoin_common::BitcoinNetwork::Signet,
                     scripts: vec![vec![0x00, 0x14]],
+                    until_height: None,
                     signing_payload: vec![1, 2, 3],
                     queued_at_ms: 0,
                 },
@@ -27716,6 +27770,7 @@ mod buy_flow_tests {
             floor: freenet_bitcoin_inbox::SignedFloor::sign(&inbox::bridge_key(), inbox::FLOOR),
             network: BitcoinNetwork::Signet,
             scripts: vec![vec![0x00, 0x14, 0x99]],
+            until_height: None,
             signing_payload: vec![9, 9, 9],
             queued_at_ms: 0,
         }
@@ -31756,6 +31811,7 @@ mod store_code_tests {
                 code: named.clone(),
                 label: "Bean Shop".to_string(),
                 archived: false,
+                closed: false,
             }]
         );
         let (rows, hidden) = state.store_list_rows(true);

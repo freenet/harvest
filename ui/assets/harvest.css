@@ -1291,6 +1291,12 @@ h4 {
   color: var(--text-secondary);
 }
 
+/* A closed store (presence_flow): its row in the store list reads as
+   switched off, like a sold-out listing. */
+.store-row-closed {
+  opacity: 0.55;
+}
+
 .listing-sold-out {
   background: transparent;
 }

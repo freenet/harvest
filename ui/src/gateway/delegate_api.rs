@@ -65,6 +65,21 @@ pub async fn arm_auto_invoice(arm: harvest_common::delegate::AutoInvoiceArm) -> 
     }
 }
 
+/// Ask the delegate for a heartbeat for one of our stores
+/// ([`harvest_common::HarvestDelegateRequest::Heartbeat`]): the open tab's
+/// fallback on a node that does not wake the delegate (`presence_flow`).
+/// Failures are logged: the next minute asks again.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_harvest_heartbeat(store_contract_id: Vec<u8>, force: bool) {
+    crate::state::spawn_harvest_request(
+        harvest_common::HarvestDelegateRequest::Heartbeat {
+            store_contract_id,
+            force,
+        },
+        "a heartbeat request",
+    );
+}
+
 /// GET a contract's state, optionally subscribing to updates.
 pub async fn get_contract(
     contract_key: &ContractInstanceId,
