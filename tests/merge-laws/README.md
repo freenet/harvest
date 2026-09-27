@@ -124,4 +124,4 @@ second statement by one of those buyers whose terms encode smaller, and the
 full record once the honest ones arrive. It is zero violations and zero
 inconclusive; the generator itself asserts the associativity it is built
 around, so a corpus that stops exercising it fails to generate.
-Everything else is expected to be zero violations and zero inconclusive.
+Everything else is expected to be zero violations. Corpora that deliberately mix refused states with valid ones (`index-bad`, `presence-adv`, the other `-bad` corpora) also show inconclusive cases, since a refused state cannot be merged; zero inconclusive is expected only of the rest.
