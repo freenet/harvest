@@ -10,7 +10,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-harvest-common = { path = "../../common" }
+harvest-common = { path = "../../common", features = ["sealed"] }
 ghostkey-common = "0.3"
 # `ui/src/ghostkey_cert.rs`, compiled in by path like `migrate.rs`.
 ghostkey_lib = "0.2"
