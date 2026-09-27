@@ -47,6 +47,12 @@ pub(crate) fn on_background<S: SecretStore>(
 ) -> Vec<OutboundDelegateMsg> {
     match run {
         BackgroundRun::Wakeup { tag } if tag.as_slice() == HEARTBEAT_TAG => {
+            // Not once this generation has handed on: it stays registered
+            // and is still woken, and a write every five minutes for nothing
+            // is waste.
+            if secrets.has_secret(crate::auto_invoice::EXPORTED_KEY) {
+                return Vec::new();
+            }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
             let mut out = crate::auto_invoice::heartbeats(secrets, now_ms);
             out.extend(crate::auto_invoice::mailbox_retries(secrets));

@@ -202,6 +202,17 @@ pub(crate) fn sign<S: SecretStore>(
             "this device does not hold the key for that store, so it cannot sign for it".into(),
         ));
     };
+    // A heartbeat is signed only by `auto_invoice::heartbeat`, which numbers
+    // it above every one before. Signed here, the UI could name any `seq`,
+    // and one at `u64::MAX` would outrank every heartbeat after it and hold
+    // the store closed until its presence contract moves.
+    if harvest_common::backing::classify_store_key_message(&payload)
+        == Some(harvest_common::backing::StoreKeyMessage::Heartbeat)
+    {
+        return answer(Err(
+            "a heartbeat is signed by the node's own schedule, not on request".into(),
+        ));
+    }
     answer(
         harvest_common::backing::sign_with_store_key(&key, payload).map(
             |(scoped_payload, signature)| StoreKeySignature {
@@ -426,6 +437,22 @@ mod tests {
                 "signed {payload:?}"
             );
         }
+    }
+
+    /// A heartbeat is not signed on request, whatever it says: only the
+    /// delegate's own schedule numbers them. Mutated red by dropping the
+    /// check (the heartbeat is a store record, so it would sign).
+    #[test]
+    fn it_refuses_to_sign_a_heartbeat() {
+        use harvest_common::presence::Heartbeat;
+        let mut secrets = MemSecrets::default();
+        let store = created(&mut secrets);
+        let frozen = harvest_common::to_cbor(&Heartbeat::new(u64::MAX, 0, true)).unwrap();
+        assert_eq!(
+            harvest_common::backing::classify_store_key_message(&frozen),
+            Some(harvest_common::backing::StoreKeyMessage::Heartbeat)
+        );
+        assert!(signed(sign(&secrets, 1, store.to_bytes(), frozen)).is_err());
     }
 
     #[test]
