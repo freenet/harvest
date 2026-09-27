@@ -55,15 +55,18 @@ pub(crate) fn on_background<S: SecretStore>(
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
             // The delegated watch's one read (the bridge inbox, or an
-            // address contract) FIRST. The node runs at most four operations
-            // per run that must reach the network
-            // (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`): a GET or SUBSCRIBE of a
-            // contract it has never seen, or the fetch an UPDATE to one it
-            // does not hold sets off, and refuses the rest. An inbox or
-            // address contract this node never read is exactly such a GET,
-            // and a wake-up can carry up to sixteen heartbeat UPDATEs, so
-            // put last it would be the one refused; while this read is what
-            // keeps the store able to take orders at all.
+            // address contract) first in the list. Order in the list is not
+            // order of execution: the node handles a run's GETs first, then
+            // its UPDATEs, then its SUBSCRIBEs (freenet-core `contract.rs`),
+            // and runs at most four operations per run that must reach the
+            // network (`MAX_NETWORK_CONTRACT_OPS_PER_PARK`): a GET of a
+            // contract it has never seen, the fetch an UPDATE to one it does
+            // not hold sets off, or a SUBSCRIBE of an unseen one, all sharing
+            // that budget and refused past it. The read's GET therefore goes
+            // before the heartbeat UPDATEs' self-heal fetches can use the
+            // budget up, and its SUBSCRIBE after them: a SUBSCRIBE refused
+            // leaves the copy unsettled, which delays a verdict, never fakes
+            // one.
             let mut out = crate::watch_delegation::on_wakeup(secrets, now_ms);
             out.extend(crate::auto_invoice::heartbeats(secrets, now_ms));
             // The mailbox re-reads last (rare: only after a refused update).

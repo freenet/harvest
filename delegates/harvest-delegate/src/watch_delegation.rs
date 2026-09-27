@@ -118,6 +118,13 @@
 //! - **Revocation.** The tab never restates `revoke_watch_keys_through`
 //!   (the API recommends it on every Ghost Key request); nothing Harvest does
 //!   revokes.
+//! - **Reads of contracts nobody has.** A canary's address contract usually
+//!   does not exist, so its GET is a guaranteed network miss, and the node
+//!   parks the delegate while it waits: up to `OPERATION_TTL` (60 s) per
+//!   GET, a park lasting up to `PARK_TTL` (90 s), during which requests past
+//!   `MAX_PENDING_PER_DELEGATE` (8) error (freenet-core `delegate_park.rs`).
+//!   One canary read per request and at most one read per wake-up keep it to
+//!   about one such wait per request; how it behaves live should be measured.
 //! - **Subscriptions.** Every inbox, confirm and probe read is subscribed to,
 //!   a few a week, never unsubscribed (stdlib 0.8.5 has no unsubscribe); their
 //!   notifications are dropped (up to [`EVER_SUBSCRIBED_CAP`] per delegation).
@@ -203,6 +210,21 @@ pub(crate) const SETTLE_MS: u64 = 20 * 60 * 1000;
 
 /// How long a canary found unscanned may wait for its request.
 pub(crate) const CANARY_VALID_MS: u64 = 10 * 60 * 1000;
+
+/// How far past a canary floor a delegation with no record here starts its
+/// canaries: past any a predecessor (another generation of this delegate, or
+/// an earlier delegation held for this bridge) may still have watched. A
+/// watched canary stays watched at the bridge until its height passes, and a
+/// Watch naming a script already watched is applied without the Ghost Key's
+/// cap check, so a canary index used twice could show a request whose other
+/// scripts were refused over the cap. Canaries never take payments, so the
+/// gap costs nothing (review round 4 of freenet/harvest#179).
+pub(crate) const CANARY_GENERATION_OFFSET: u32 = 200;
+
+/// Confirm reads at or past the window before a canary that still shows
+/// nothing counts as a failure: one read after a node slept through the
+/// window can be a stale copy or a GET miss.
+pub(crate) const CONFIRM_LATE_READS: u32 = 2;
 
 /// Canary candidates found scanned in a row before the delegation waits
 /// [`CANARY_DEFER_MS`] and starts again.
@@ -349,11 +371,12 @@ impl Held {
                 self.subscribing.remove(0);
             }
         }
-        if !self.ever_subscribed.contains(&contract) {
-            self.ever_subscribed.push(contract);
-            while self.ever_subscribed.len() > EVER_SUBSCRIBED_CAP {
-                self.ever_subscribed.remove(0);
-            }
+        // Most recently subscribed last, so what is still read (the inbox
+        // above all) is never the first evicted.
+        self.ever_subscribed.retain(|id| *id != contract);
+        self.ever_subscribed.push(contract);
+        while self.ever_subscribed.len() > EVER_SUBSCRIBED_CAP {
+            self.ever_subscribed.remove(0);
         }
     }
 }
@@ -396,6 +419,9 @@ pub(crate) struct Unconfirmed {
     /// Whether a removal was seen (read), or it merely left.
     pub removed: bool,
     pub left_at_ms: u64,
+    /// Confirm reads made at or past the window.
+    #[serde(default)]
+    pub late_reads: u32,
 }
 
 /// A script the bridge is watching for this delegate, the height asked, and
@@ -588,6 +614,15 @@ pub(crate) fn set_delegation<S: SecretStore>(
     }
 
     let held = load_held(secrets, &grant.bridge);
+    // Canary indices only ever rise, across a change of Ghost Key too; a
+    // delegation with no record here starts well past any a predecessor may
+    // still have watched (see `CANARY_GENERATION_OFFSET`).
+    let canary_next = match &held {
+        Some(h) => h.canary_next,
+        None => crate::bitcoin::load_payment_xpub(secrets)
+            .map_or(0, |xpub| canary_floor(xpub.next_index))
+            .saturating_add(CANARY_GENERATION_OFFSET),
+    };
     if held.is_none() && all_held(secrets).len() >= MAX_DELEGATIONS {
         return Err(format!(
             "this delegate holds watch delegations for at most {MAX_DELEGATIONS} bridges"
@@ -643,7 +678,7 @@ pub(crate) fn set_delegation<S: SecretStore>(
         last_read_ms: same.as_ref().map_or(0, |h| h.last_read_ms),
         last_probe_ms: same.as_ref().and_then(|h| h.last_probe_ms),
         canary: None,
-        canary_next: same.as_ref().map_or(0, |h| h.canary_next),
+        canary_next,
         canary_tries: 0,
         defer_until_ms: None,
         subscribed: same
@@ -1165,13 +1200,23 @@ fn on_address<S: SecretStore>(
                 held.last_probe_ms = Some(now_ms);
             } else if tip.anchor.height >= pending.since_tip.saturating_add(CONFIRM_BLOCKS) {
                 // The request left the inbox, a fresh tip is past the window,
-                // and its canary shows nothing: the bridge did not apply it.
-                // A canary nobody else asks for has no address contract until
-                // the bridge publishes for it, so an absent state IS the
-                // evidence here. A read outage looks the same; it costs a
-                // backoff, and a stall only stops sending.
-                held.unconfirmed = None;
-                held.fail(now_ms);
+                // and its canary shows nothing. A canary nobody else asks for
+                // has no address contract until the bridge publishes for it,
+                // so an ABSENT state is evidence the bridge did not apply it;
+                // a state that exists with a lagging watermark is evidence
+                // only from a settled copy (the bridge did publish; the copy
+                // may just be old). And never from one read: a node that
+                // slept through the window gets one stale copy or GET miss on
+                // waking. A read outage still ends here; it costs a backoff,
+                // and a stall only stops sending.
+                let late_reads = pending.late_reads.saturating_add(1);
+                let evidence = state.is_none() || held.settled(contract_id, now_ms);
+                if evidence && late_reads >= CONFIRM_LATE_READS {
+                    held.unconfirmed = None;
+                    held.fail(now_ms);
+                } else if let Some(u) = held.unconfirmed.as_mut() {
+                    u.late_reads = late_reads;
+                }
             }
         }
         ReadKind::Probe => {
@@ -1189,7 +1234,7 @@ fn on_address<S: SecretStore>(
         ReadKind::Canary => {
             if scanned_now {
                 // Someone has it watched: it cannot show this request.
-                held.canary_next = read.index.saturating_add(1);
+                held.canary_next = held.canary_next.max(read.index.saturating_add(1));
                 held.canary_tries = held.canary_tries.saturating_add(1);
                 if held.canary_tries >= MAX_CANARY_TRIES {
                     held.canary_tries = 0;
@@ -1293,6 +1338,7 @@ fn on_inbox<S: SecretStore>(
                 since_tip: tip.anchor.height,
                 removed,
                 left_at_ms: now_ms,
+                late_reads: 0,
             });
         }
         // Either way nothing is sent until it is confirmed or failed.
@@ -1331,7 +1377,7 @@ fn on_inbox<S: SecretStore>(
             held.own_made_at_ms = sent.made_at_ms;
             held.outstanding = Some(sent.outstanding);
             held.canary = None;
-            held.canary_next = canary.index.saturating_add(1);
+            held.canary_next = held.canary_next.max(canary.index.saturating_add(1));
             let mut update = UpdateContractRequest::new(
                 ContractInstanceId::new(inbox),
                 UpdateData::Delta(StateDelta::from(delta)),
@@ -1689,6 +1735,12 @@ pub(crate) mod test_support {
             NOW,
         )
         .expect("the delegation is kept");
+        // As a delegation held here for a while: its canaries from 20 on.
+        // A new one starts `CANARY_GENERATION_OFFSET` further on
+        // (`canaries_never_repeat`).
+        let mut h = held(&secrets);
+        h.canary_next = 0;
+        put_held(&mut secrets, &h);
         settle_all(&mut secrets);
         secrets
     }
@@ -2091,8 +2143,10 @@ mod tests {
         answer(&mut secrets, &get, None, NOW + 10 * MINUTE);
         assert!(watched_now(&secrets, TIP).is_empty(), "nothing credited");
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS, NOW + 60 * MINUTE);
-        let get = wake(&mut secrets, NOW + 60 * MINUTE);
-        answer(&mut secrets, &get, None, NOW + 60 * MINUTE);
+        for at in [NOW + 60 * MINUTE, NOW + 65 * MINUTE] {
+            let get = wake(&mut secrets, at);
+            answer(&mut secrets, &get, None, at);
+        }
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.watched.is_empty());
         assert_eq!(h.failures, 1);
@@ -2321,6 +2375,7 @@ mod tests {
             since_tip: TIP,
             removed: true,
             left_at_ms: NOW + 30 * MINUTE,
+            late_reads: 0,
         });
         put_held(&mut secrets, &h);
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS - 1, NOW + 30 * MINUTE);
@@ -2329,11 +2384,135 @@ mod tests {
         assert_eq!(held(&secrets).failures, 0, "not yet");
         assert!(held(&secrets).unconfirmed.is_some());
         set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS, NOW + 35 * MINUTE);
+        // Review round 4: one late read is not enough (a node waking from
+        // sleep gets one stale copy or miss).
         let get = wake(&mut secrets, NOW + 35 * MINUTE);
         answer(&mut secrets, &get, None, NOW + 35 * MINUTE);
+        assert_eq!(held(&secrets).failures, 0, "one late read");
+        let get = wake(&mut secrets, NOW + 40 * MINUTE);
+        answer(&mut secrets, &get, None, NOW + 40 * MINUTE);
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none());
         assert_eq!(h.failures, 1);
+    }
+
+    /// Review round 4: a canary state that EXISTS means the bridge published
+    /// for it, so a lagging watermark in it is a stale copy unless the copy
+    /// is settled: no failure from an unsettled one, however many reads; a
+    /// failure from a settled one after `CONFIRM_LATE_READS`. Mutated red by
+    /// failing on any copy, and by failing on the first late read.
+    #[test]
+    fn a_lagging_canary_copy_fails_only_when_settled_and_read_twice() {
+        let mut secrets = delegated();
+        let canary = script_at(30);
+        let pending = Unconfirmed {
+            scripts: vec![script_at(0), canary.clone()],
+            canary: canary.clone(),
+            canary_index: 30,
+            canary_contract: address_id(&secrets, &canary),
+            until_height: TIP + 1,
+            since_tip: TIP,
+            removed: true,
+            left_at_ms: NOW,
+            late_reads: 0,
+        };
+        let mut h = held(&secrets);
+        h.unconfirmed = Some(pending.clone());
+        h.subscribed
+            .retain(|(id, _)| *id != pending.canary_contract);
+        put_held(&mut secrets, &h);
+        set_tip_at(&mut secrets, TIP + CONFIRM_BLOCKS, NOW);
+        for i in 0..4 {
+            wake_and_scan(&mut secrets, &canary, Some(TIP - 1), NOW + i * MINUTE);
+        }
+        let h = held(&secrets);
+        assert!(
+            h.unconfirmed.is_some() && h.failures == 0,
+            "unsettled: no evidence"
+        );
+
+        let mut h = held(&secrets);
+        h.unconfirmed = Some(pending);
+        put_held(&mut secrets, &h);
+        settle_all(&mut secrets);
+        wake_and_scan(&mut secrets, &canary, Some(TIP - 1), NOW + 10 * MINUTE);
+        assert_eq!(held(&secrets).failures, 0, "one read");
+        wake_and_scan(&mut secrets, &canary, Some(TIP - 1), NOW + 15 * MINUTE);
+        assert_eq!(held(&secrets).failures, 1, "settled, read twice");
+    }
+
+    /// Review round 4: subscribing again moves a contract to the back of
+    /// the ever-subscribed record, so what is still read (the inbox) is not
+    /// the first evicted. Mutated red by keeping its first place.
+    #[test]
+    fn a_contract_subscribed_again_is_evicted_last() {
+        let mut h = held(&delegated());
+        h.ever_subscribed.clear();
+        h.note_subscribing(INBOX);
+        for n in 0..(EVER_SUBSCRIBED_CAP - 1) as u16 {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_le_bytes());
+            id[2] = 1;
+            h.note_subscribing(id);
+        }
+        h.note_subscribing(INBOX);
+        let mut id = [0u8; 32];
+        id[2] = 2;
+        h.note_subscribing(id);
+        assert!(h.ever_subscribed.contains(&INBOX));
+        assert_eq!(h.ever_subscribed.len(), EVER_SUBSCRIBED_CAP);
+    }
+
+    /// Review round 4: canary indices never repeat. A delegation with no
+    /// record here starts `CANARY_GENERATION_OFFSET` past the floor (a
+    /// predecessor's canaries may still be watched at the bridge), a change
+    /// of Ghost Key keeps the index, and nothing moves it backwards.
+    /// Mutated red by seeding at the floor, resetting on a new Ghost Key, and
+    /// taking the read index without the max.
+    #[test]
+    fn canaries_never_repeat() {
+        let mut secrets = armed();
+        let key = get_watch_key(&mut secrets).unwrap();
+        set_delegation(&mut secrets, grant_for(key, sender_height(FLOOR), 0), NOW).unwrap();
+        assert_eq!(held(&secrets).canary_next, 20 + CANARY_GENERATION_OFFSET);
+
+        let mut h = held(&secrets);
+        h.canary_next = 500;
+        put_held(&mut secrets, &h);
+        let other = authority().mint();
+        let body = freenet_bitcoin_inbox::DelegationBody {
+            bridge: bridge(),
+            watch_key: freenet_bitcoin_inbox::WatchKeyId(key),
+            issued_mainnet_height: sender_height(FLOOR),
+            expires_mainnet_height: None,
+        };
+        let (scoped, signature) = sign_as(&other, body.signing_payload().unwrap());
+        let mut grant = grant_for(key, sender_height(FLOOR), 0);
+        grant.ghostkey = other.id().0;
+        grant.certificate_pem = other.pem.clone();
+        grant.delegation_scoped_payload = scoped;
+        grant.delegation_signature = signature;
+        set_delegation(&mut secrets, grant, NOW).unwrap();
+        assert_eq!(
+            held(&secrets).canary_next,
+            500,
+            "kept across a new Ghost Key"
+        );
+
+        // An answer for an older candidate does not move it back.
+        settle_all(&mut secrets);
+        let context = to_cbor(&ReadContext {
+            magic: READ_MAGIC,
+            bridge: bridge(),
+            kind: ReadKind::Canary,
+            script: script_at(30),
+            index: 30,
+        })
+        .unwrap();
+        let id = address_id(&secrets, &script_at(30));
+        let scanned = address_state(&secrets, &script_at(30), Some(TIP));
+        on_inbox_read(&mut secrets, &id, Some(&scanned), &context, NOW);
+        assert_eq!(held(&secrets).canary_next, 500);
     }
 
     /// A request gone from the inbox without a removal seen (the floor passed
