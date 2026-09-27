@@ -77,12 +77,35 @@ elif [ ! -f "$workspace/Cargo.lock" ]; then
   exit 1
 fi
 
-# Order matters: rustc applies the FIRST matching prefix, so the checkout has
-# to be remapped before the broader home directories that may contain it.
+# A git dependency is checked out under `$cargo_home/git/checkouts/<repo>-
+# <url hash>/<short rev>/`, and that path (revision included) is baked into
+# panic-location strings like any other. Left in, every bump of such a
+# dependency moves the bytes of every artifact that links it, with no source
+# change in any of them: a freenet-bitcoin bump re-keyed all five contracts
+# through `freenet-bitcoin-common`'s panic lines alone. So each checkout the
+# lockfile names is remapped to its directory WITHOUT the revision. The
+# revision still decides the code; it just no longer decides the bytes when
+# the code is the same.
+# The checkouts have to exist to be named, and on a fresh machine they do not
+# until something fetches them.
+cargo fetch "${locked[@]}" --manifest-path "$workspace/Cargo.toml" >/dev/null
+git_remaps=""
+while read -r rev; do
+  short="${rev:0:7}"
+  for dir in "$cargo_home"/git/checkouts/*/"$short"; do
+    [ -d "$dir" ] || continue
+    git_remaps+=" --remap-path-prefix=$dir=/cargo/git/checkouts/$(basename "$(dirname "$dir")")"
+  done
+done < <(grep -o 'source = "git+[^"]*#[0-9a-f]*"' "$workspace/Cargo.lock" | sed 's/.*#//; s/"$//' | sort -u)
+
+# Order matters: when several prefixes match, rustc applies the LAST one
+# given, so each more specific prefix comes after the broader directory that
+# contains it (the checkouts after `$cargo_home`).
 export RUSTFLAGS="\
 --remap-path-prefix=$workspace=/harvest \
 --remap-path-prefix=$cargo_home=/cargo \
 --remap-path-prefix=$rustup_home=/rustup \
+$git_remaps \
 ${RUSTFLAGS:-}"
 
 cd "$workspace"
