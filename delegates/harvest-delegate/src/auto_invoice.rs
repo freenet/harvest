@@ -3443,6 +3443,10 @@ mod tests {
             None,
             "said for two weeks"
         );
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW + OVERSOLD_SHOWN_MS).wallet_gap_limit,
+            0
+        );
     }
 
     /// I5. Stale tip, a store this key does not own, a closed store and a
