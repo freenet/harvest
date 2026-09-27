@@ -4087,7 +4087,8 @@ mod tests {
             heartbeat: Some(elsewhere),
         })
         .unwrap();
-        // Learned from the read arming and the node's start send: a signer
+        // Learned from a read (the node's start sends one; arming does too,
+        // though a node may refuse it past its operation budget): a signer
         // that has stopped writing sends no notification.
         assert!(
             on_get_answer(&mut f.secrets, &[9; 32], Some(&state), &[], NOW)

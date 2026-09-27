@@ -71,7 +71,7 @@ pub const PRESENCE_FRESH_MS: u64 = 10 * 60 * 1000;
 /// back by the one before; and short enough that when wake-ups stop, the
 /// last heartbeat sent is still fresh when the tab takes over (the bound is
 /// asserted in `harvest-ui`'s `presence_flow`).
-pub const HEARTBEAT_MIN_GAP_MS: u64 = 3 * 60 * 1000;
+pub const HEARTBEAT_MIN_GAP_MS: u64 = 2 * 60 * 1000;
 
 /// How far AHEAD of the reader's clock a heartbeat may be dated and still
 /// count. Further ahead is closed: a far-future heartbeat would otherwise

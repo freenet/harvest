@@ -31330,6 +31330,32 @@ mod buy_flow_tests {
         assert!(state.store_presence(&[9; 32], late).is_closed());
     }
 
+    /// A store found open again starts its re-read spacing afresh. Mutated
+    /// red by never resetting it.
+    #[test]
+    fn a_store_found_open_resets_its_re_read_spacing() {
+        use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
+        let mut state = AppState::default();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x36; 32]);
+        state.browsing_stores.insert(
+            vec![10; 32],
+            BrowsingStore {
+                owner: Some(sk.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        let now = crate::state::now_ms();
+        let presence = state.follow_due_presence(now)[0];
+        state.follow_due_presence(now + crate::presence_flow::PRESENCE_REFRESH_MS);
+        assert_eq!(state.presence.reads[presence.as_slice()].1, 1);
+        let fresh = harvest_common::to_cbor(&PresenceStateV1 {
+            heartbeat: Some(SignedHeartbeat::sign(&sk, Heartbeat::new(now, now, true)).unwrap()),
+        })
+        .unwrap();
+        assert!(state.on_presence_state(&presence, &fresh));
+        assert_eq!(state.presence.reads[presence.as_slice()].1, 0);
+    }
+
     /// The delegate's first heartbeat of the session is the one the tab
     /// creates the presence contract with, and the store reads open from it
     /// at once; later ones create nothing. If the create does not go out,
@@ -31365,7 +31391,10 @@ mod buy_flow_tests {
         assert!(state
             .on_heartbeat_answer(store.clone(), answer(&sk))
             .is_none());
-        // The PUT did not go out: forced again at once.
+        // The PUT did not go out: forced again at once, though a heartbeat
+        // was just asked for.
+        state.queue_heartbeats(now);
+        assert!(state.heartbeats_due(now).is_empty());
         state.on_presence_publish_failed(&store);
         assert_eq!(state.heartbeats_due(now), vec![(store.clone(), true)]);
         assert!(state.on_heartbeat_answer(store, answer(&sk)).is_some());

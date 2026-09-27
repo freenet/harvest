@@ -79,8 +79,14 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
         // Buyer text no Ghost Key vouches for is taken out here, before
         // anything counts or groups it (the anti-spam gate's seller half).
         let published_orders = store.map(|s| s.orders.as_slice()).unwrap_or_default();
+        let all = app_state.mailbox_entries(&store_contract_id);
+        let open = open_conversations(
+            &all,
+            |voucher, tag| app_state.voucher_verifies(voucher, tag),
+            |tag, selection| paid_request_in(published_orders, tag, selection),
+        );
         let (entries, unvouched) = shown_to_seller(
-            app_state.mailbox_entries(&store_contract_id),
+            all,
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
             |tag, selection| paid_request_in(published_orders, tag, selection),
             |digest| app_state.authored_here(&store_contract_id, digest),
@@ -100,6 +106,7 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 store_contract_id: store_contract_id.clone(),
                 entries: entries,
                 unvouched: unvouched,
+                open: open,
                 authored: authored,
                 listings: listings,
                 published: published,
@@ -877,6 +884,8 @@ fn Inbox(
     entries: Vec<MailboxEntry>,
     /// Buyer messages taken out by [`shown_to_seller`].
     unvouched: usize,
+    /// Conversations [`open_conversations`] opened.
+    open: std::collections::HashSet<Vec<u8>>,
     authored: Vec<[u8; 32]>,
     listings: Vec<harvest_common::listing::AuthorizedListing>,
     published: Vec<harvest_common::payment::AuthorizedOrder>,
@@ -938,6 +947,7 @@ fn Inbox(
                 Conversation {
                     key: "{bs58::encode(tag).into_string()}",
                     store_contract_id: store_contract_id.clone(),
+                    open: open.contains(tag),
                     tag: tag.clone(),
                     entries: group.clone(),
                     authored: authored.clone(),
@@ -953,6 +963,8 @@ fn Inbox(
 #[component]
 fn Conversation(
     store_contract_id: Vec<u8>,
+    /// Whether this conversation is open ([`open_conversations`]).
+    open: bool,
     tag: Vec<u8>,
     entries: Vec<MailboxEntry>,
     authored: Vec<[u8; 32]>,
@@ -1002,7 +1014,10 @@ fn Conversation(
                 &listings,
                 &published,
                 crate::gateway::APP_STATE.read().conversation_keys.get(&tag),
-            ) {
+            )
+            .into_iter()
+            .filter(|request| offered_by_hand(request, open))
+            {
                 // The key sits on the first node of the loop body, the only
                 // place dioxus reads a list key from, so each request keeps
                 // its own accept control's state when an earlier one drops
@@ -1173,17 +1188,39 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 /// Whatever this tab wrote itself (`authored_here`, by digest) is shown as
 /// written: it is the seller's own text.
 ///
-/// The count is of buyer text the seller did not see: messages left out, and
-/// requests whose note or picks were blanked. A blanked address is not
-/// counted (a seller is not told about an unpaid Buy now at all), nor a
-/// blanked decline (mostly the store's own answer to one).
+/// The count is of buyer text the seller did not see: buyer-direction
+/// messages left out, and requests whose note or picks were blanked. Not
+/// counted: a blanked address (a seller is not told about an unpaid Buy now
+/// at all), a blanked decline (mostly the store's own answer to one), and
+/// reply-direction text left out (as likely the seller's own, after a reload,
+/// as anyone's).
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
     paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
     authored_here: impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
-    use crate::messaging::Addressing;
+    let (verdicts, opened) = verdicts_and_open(&entries, &verifies, &paid_request);
+    shown_given(entries, verdicts, &opened, authored_here)
+}
+
+/// The conversations a seller's inbox shows free text in (see
+/// [`shown_to_seller`]): those with a verified voucher, or a Buy now whose
+/// own order is paid. Also what decides whether a Buy now may be answered
+/// by hand ([`offered_by_hand`]).
+pub(crate) fn open_conversations(
+    entries: &[MailboxEntry],
+    verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
+    paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+) -> std::collections::HashSet<Vec<u8>> {
+    verdicts_and_open(entries, &verifies, &paid_request).1
+}
+
+fn verdicts_and_open(
+    entries: &[MailboxEntry],
+    verifies: &impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
+    paid_request: &impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+) -> (Vec<bool>, std::collections::HashSet<Vec<u8>>) {
     let tag_of = |conversation: &[u8]| <[u8; 32]>::try_from(conversation).ok();
     let vouched = |entry: &MailboxEntry| match entry {
         MailboxEntry::Readable {
@@ -1214,6 +1251,16 @@ pub(crate) fn shown_to_seller(
         })
         .map(|(entry, _)| entry.conversation().to_vec())
         .collect();
+    (verdicts, opened)
+}
+
+fn shown_given(
+    entries: Vec<MailboxEntry>,
+    verdicts: Vec<bool>,
+    opened: &std::collections::HashSet<Vec<u8>>,
+    authored_here: impl Fn(&[u8; 32]) -> bool,
+) -> (Vec<MailboxEntry>, usize) {
+    use crate::messaging::Addressing;
     let mut hidden = 0;
     let mut shown = Vec::with_capacity(entries.len());
     for (mut entry, verified) in entries.into_iter().zip(verdicts) {
@@ -1234,11 +1281,14 @@ pub(crate) fn shown_to_seller(
                 addressing: Addressing::ToSeller,
                 ..
             } => false,
+            // Left out, not counted: in the reply direction it is as likely
+            // the seller's own reply (after a reload this tab no longer knows
+            // it wrote it) as a buyer's, and the count's line blames buyers.
             MailboxEntry::Readable {
                 content: MessageContent::Text(_),
                 addressing: Addressing::ToBuyer,
                 ..
-            } => open,
+            } if !open => continue,
             MailboxEntry::Readable {
                 content:
                     MessageContent::OrderRequest {
@@ -1287,6 +1337,15 @@ pub(crate) fn shown_to_seller(
         }
     }
     (shown, hidden)
+}
+
+/// Whether the seller's inbox offers to answer `request` by hand. A Buy now
+/// only in an open conversation ([`open_conversations`]): elsewhere its picks
+/// are blanked, so the seller could not check the total against them, and an
+/// unpaid Buy now is not the seller's order (the store answers it itself). A
+/// quote request (from before fixed prices) is offered as before.
+fn offered_by_hand(request: &PendingRequest, open: bool) -> bool {
+    request.instant.is_none() || open
 }
 
 /// What a seller reads in place of the address on a request whose
@@ -1881,6 +1940,42 @@ mod inbox_tests {
         let found = unanswered_requests(&entries, &listings, &[answer], Some(&keys()));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].instant.unwrap().request, request(2));
+    }
+
+    /// A Buy now is offered for a hand answer only in an open conversation,
+    /// where its picks can be read; a quote request is offered as before.
+    /// Mutated red by offering every Buy now.
+    #[test]
+    fn a_buy_now_is_answered_by_hand_only_in_an_open_conversation() {
+        let id = ListingId([9u8; 32]);
+        let listings = vec![listing(id.clone(), "Ghost Pepper")];
+        let request = |instant| {
+            readable(
+                MessageContent::OrderRequest {
+                    instant,
+                    listing_id: id.clone(),
+                    quantity: 1,
+                    shipping: "12 Example St".into(),
+                    note: String::new(),
+                    order_binding: BINDING,
+                    buyer_receipt_key: None,
+                },
+                [1; 32],
+            )
+        };
+        let buy_now = request(Some(crate::messaging::InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [1; 16],
+            region: None,
+            choices: vec![],
+            expected_total_sats: 12_000,
+        }));
+        let found = unanswered_requests(&[buy_now], &listings, &[], Some(&keys()));
+        assert_eq!(found.len(), 1);
+        assert!(!offered_by_hand(&found[0], false));
+        assert!(offered_by_hand(&found[0], true));
+        let quote = unanswered_requests(&[request(None)], &listings, &[], Some(&keys()));
+        assert!(offered_by_hand(&quote[0], false));
     }
 
     /// A Buy now request opens its conversation to the seller only once its
@@ -2647,7 +2742,9 @@ mod voucher_view_tests {
             text(OTHER, Addressing::ToBuyer),
             text([4; 32], Addressing::ToBuyer),
         ]);
-        assert_eq!(hidden, 2);
+        // Reply-direction text left out is not counted: it is as likely the
+        // seller's own reply, after a reload, as a buyer's.
+        assert_eq!(hidden, 0);
         assert_eq!(shown_entries.len(), 5);
         assert!(shown_entries
             .iter()
