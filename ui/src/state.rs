@@ -732,6 +732,21 @@ pub struct AppState {
     /// Whether stores are open, and our own heartbeats
     /// (`crate::presence_flow`).
     pub presence: crate::presence_flow::PresenceUi,
+
+    /// A buyer's messages to sellers, and the Ghost Key vouchers they carry
+    /// (`crate::voucher_flow`).
+    pub vouchers: crate::voucher_flow::VoucherState,
+
+    /// Verdicts on vouchers already checked, by
+    /// `ghostkey_cert::voucher_verdict_key`. The seller's inbox re-renders on
+    /// every keystroke in a reply box, and each verdict is an RSA chain check.
+    /// See [`AppState::voucher_verifies`].
+    pub voucher_verdicts: std::cell::RefCell<HashMap<[u8; 32], bool>>,
+
+    /// The master key vouchers are checked against in tests; production
+    /// always uses Freenet's (`ghostkey_cert`).
+    #[cfg(test)]
+    pub(crate) voucher_master_for_tests: Option<ed25519_dalek::VerifyingKey>,
 }
 
 /// Details for a store being created, waiting on the two delegate responses
@@ -1538,6 +1553,9 @@ pub enum PendingSignature {
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
     /// A listing's availability, for the store key (harvest#70).
     ListingStatus(Box<crate::listing_status_flow::PendingListingStatus>),
+    /// A buyer's Ghost Key vouching for one conversation, so their messages
+    /// in it are shown to the seller (`crate::voucher_flow`).
+    MessageVoucher(Box<crate::voucher_flow::PendingMessageVoucher>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1562,6 +1580,9 @@ impl PendingSignature {
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
             PendingSignature::Despatch(pending) => harvest_common::to_cbor(&pending.despatch),
             PendingSignature::InboxEntry(pending) => Ok(pending.signing_payload.clone()),
+            PendingSignature::MessageVoucher(pending) => {
+                harvest_common::sealed::voucher_message(&pending.tag)
+            }
             PendingSignature::BackingStatement(pending) => {
                 harvest_common::to_cbor(&pending.statement)
             }
@@ -1590,9 +1611,9 @@ impl PendingSignature {
             | PendingSignature::Cancellation(_)
             | PendingSignature::Despatch(_)
             | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
-            PendingSignature::InboxEntry(_) | PendingSignature::BackingStatement(_) => {
-                Signer::GhostKey
-            }
+            PendingSignature::InboxEntry(_)
+            | PendingSignature::BackingStatement(_)
+            | PendingSignature::MessageVoucher(_) => Signer::GhostKey,
         }
     }
 }
@@ -5045,7 +5066,7 @@ impl AppState {
     /// no identity and nothing is committed by sending this: it is an ask,
     /// and the seller decides whether to publish a commitment against it.
     ///
-    /// Like [`Self::compose_to_seller`], this asks the delegate to keep the
+    /// Like [`Self::compose_vouched_to_seller`], this asks the delegate to keep the
     /// conversation on the path that opens it rather than leaving that to a
     /// caller -- and here it matters more, because the answer to a request is
     /// the acceptance the buyer needs in order to pay at all.
@@ -5089,7 +5110,7 @@ impl AppState {
     ///
     /// The LAST rather than the first: a returning buyer resumes the thread
     /// the delegate handed back instead of forking a second one beside it.
-    fn conversation_with(
+    pub(crate) fn conversation_with(
         &mut self,
         store_contract_id: &[u8],
         seller_encryption_key: &[u8; 32],
@@ -5125,6 +5146,11 @@ impl AppState {
     /// Returns the sealed message for the caller to dispatch. Sealing and
     /// dispatching are separate because the dispatch needs a browser and this
     /// decides what gets sent.
+    ///
+    /// Plain text, which a seller no longer shows: kept for this crate's tests
+    /// of the conversation mechanics. A buyer's message goes out through
+    /// [`Self::compose_vouched_to_seller`] (`crate::voucher_flow`).
+    #[cfg(test)]
     pub fn compose_to_seller(
         &mut self,
         store_contract_id: &[u8],
@@ -11661,6 +11687,15 @@ impl AppState {
             Some(PendingSignature::BackingAcceptance(pending)) => {
                 self.on_backing_accepted(*pending, scoped_payload, signature);
             }
+            Some(PendingSignature::MessageVoucher(pending)) => {
+                let voucher = harvest_common::sealed::MessageVoucher {
+                    certificate_pem,
+                    scoped_payload,
+                    signature,
+                };
+                let ready = self.on_message_voucher_signed(*pending, voucher, chrono::Utc::now());
+                crate::voucher_flow::deliver_vouched(ready);
+            }
             None => {
                 let from = match signer {
                     Signer::GhostKey => "Ghost Key",
@@ -11684,8 +11719,23 @@ impl AppState {
                 .pending_signatures
                 .iter()
                 .any(|pending| matches!(pending, PendingSignature::BackingStatement(_)));
+        // A buyer's messages waiting on a voucher will not be sent now; they
+        // are handed back to the buyer with the reason.
+        let vouchers: Vec<(Vec<u8>, [u8; 32])> = self
+            .pending_signatures
+            .iter()
+            .filter_map(|pending| match pending {
+                PendingSignature::MessageVoucher(voucher) => {
+                    Some((voucher.store_contract_id.clone(), voucher.tag))
+                }
+                _ => None,
+            })
+            .collect();
         self.pending_signatures
             .retain(|pending| pending.signer() == Signer::StoreKey);
+        for (store, tag) in vouchers {
+            self.message_voucher_failed(&store, &tag, "your Ghost Key vault did not sign it");
+        }
         // A creation waiting on the vault (its certificate, or the Ghost
         // Key's backing statement) will never finish now; release it so the
         // seller can try again. The caller says why.
@@ -15877,7 +15927,8 @@ mod tests {
                 | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_) => None,
+                | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::MessageVoucher(_) => None,
             })
     }
 
@@ -16611,7 +16662,8 @@ mod tests {
                 | PendingSignature::Despatch(_)
                 | PendingSignature::InboxEntry(_)
                 | PendingSignature::BackingStatement(_)
-                | PendingSignature::BackingAcceptance(_) => None,
+                | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::MessageVoucher(_) => None,
             })
             .collect();
         assert_eq!(

@@ -7,7 +7,10 @@
 //! # The exchange is one-sided, and that is the design
 //!
 //! A buyer has no identity in Harvest -- no ghostkey, no account, nothing to
-//! register -- so there is nobody to run a two-sided handshake with. Instead
+//! register -- so there is nobody to run a two-sided handshake with. (A buyer
+//! who sends TEXT does show the seller a Ghost Key, inside the encryption, as
+//! the anti-spam price of writing; buying needs none. See
+//! `crate::voucher_flow`.) Instead
 //! the SELLER publishes a long-term X25519 public key in
 //! [`harvest_common::store::StoreInfoV1::encryption_public_key`], and each
 //! buyer generates an ephemeral keypair per message, encrypts to the seller's
@@ -416,13 +419,39 @@ impl BuyerConversation {
         )
     }
 
-    /// Seal one message for the seller.
+    /// Seal one plain-text message for the seller: the pre-voucher format,
+    /// which a seller no longer shows. For this crate's tests of the
+    /// conversation mechanics; a buyer's message goes out through
+    /// [`Self::seal_vouched`].
+    #[cfg(test)]
     pub fn seal(&self, text: String) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
             &self.buyer_public_key,
             &self.conversation_id,
             MessageContent::Text(text),
+        )
+    }
+
+    /// Seal one message for the seller, carrying the Ghost Key voucher for
+    /// this conversation (`crate::voucher_flow`).
+    ///
+    /// `timestamp` is the caller's, so several messages queued behind one
+    /// signature can be stamped in the order they were typed: the thread
+    /// sorts by it, and one clock reading for all of them would let the
+    /// nonce decide their order.
+    pub fn seal_vouched(
+        &self,
+        text: String,
+        voucher: harvest_common::sealed::MessageVoucher,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<EncryptedMessage, String> {
+        harvest_common::sealed::seal(
+            &self.keys.to_seller,
+            &self.buyer_public_key,
+            &self.conversation_id,
+            MessageContent::VouchedText { text, voucher },
+            timestamp,
         )
     }
 

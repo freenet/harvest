@@ -166,8 +166,60 @@ fn certificate_naming_one_of(
     }
 }
 
+/// Whether `voucher` vouches for the conversation tagged `tag`: its
+/// certificate chains to Freenet's master key, the Ghost Key it certifies
+/// signed the voucher, and what was signed is this conversation's terms under
+/// Harvest's requestor pin. Returns the vouching Ghost Key.
+///
+/// The certified key and the signing key are the same key by construction
+/// here, which is the copied-certificate check: the signature is verified
+/// under the key the certificate names, so a genuine certificate pasted
+/// beside a throwaway key's signature fails.
+pub fn verify_voucher(
+    voucher: &harvest_common::sealed::MessageVoucher,
+    tag: &[u8; 32],
+) -> Result<VerifyingKey, String> {
+    verify_voucher_under(voucher, tag, &PRODUCTION_MASTER)
+}
+
+pub(crate) fn verify_voucher_under(
+    voucher: &harvest_common::sealed::MessageVoucher,
+    tag: &[u8; 32],
+    master: &Option<VerifyingKey>,
+) -> Result<VerifyingKey, String> {
+    let key = certified_key(&voucher.certificate_pem, master)?;
+    harvest_common::listing::verify_scoped_signature(
+        &voucher.scoped_payload,
+        &voucher.signature,
+        &key,
+        &harvest_common::sealed::voucher_terms(tag),
+    )?;
+    Ok(key)
+}
+
+/// The key a verdict on `voucher` for the conversation `tag` is remembered
+/// under (`AppState::voucher_verifies`): every field, length-prefixed, so two
+/// different vouchers cannot share a verdict.
+pub(crate) fn voucher_verdict_key(
+    voucher: &harvest_common::sealed::MessageVoucher,
+    tag: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"harvest/voucher-verdict");
+    hasher.update(tag);
+    for part in [
+        voucher.certificate_pem.as_bytes(),
+        &voucher.scoped_payload,
+        &voucher.signature,
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use ghostkey_lib::notary_certificate::NotaryCertificateV1;
@@ -219,7 +271,7 @@ mod tests {
         certificate_naming_one_of(pem, backers, master)
     }
 
-    fn test_master() -> Option<VerifyingKey> {
+    pub(crate) fn test_master() -> Option<VerifyingKey> {
         Some(authority().master.verifying_key())
     }
 
@@ -357,5 +409,118 @@ mod tests {
         // The contract's own fixture, under the production key.
         let fixture = include_str!("../../tests/fixtures/ghostkey-certificate.pem");
         assert_eq!(record_certificate(fixture), fixture);
+    }
+
+    // ---- Buyer vouchers ----
+
+    use harvest_common::sealed::MessageVoucher;
+
+    const TAG: [u8; 32] = [9; 32];
+
+    /// What the vault's `SignMessage` returns for the voucher terms of `tag`,
+    /// asked by `requestor`.
+    pub(crate) fn sign_as_vault(
+        key: &SigningKey,
+        requestor: ghostkey_common::SignatureRequestor,
+        tag: &[u8; 32],
+    ) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer;
+        let scoped_payload = ghostkey_common::to_cbor(&ghostkey_common::ScopedPayload {
+            requestor,
+            payload: harvest_common::sealed::voucher_message(tag).unwrap(),
+        })
+        .unwrap();
+        let signature = key.sign(&scoped_payload).to_bytes().to_vec();
+        (scoped_payload, signature)
+    }
+
+    /// A voucher for `tag`, signed as the vault signs: the terms wrapped in a
+    /// `ScopedPayload` under Harvest's requestor, by a Ghost Key issued under
+    /// the test authority. Returns the key and the PEM too.
+    pub(crate) fn vouch(tag: &[u8; 32]) -> (MessageVoucher, VerifyingKey, SigningKey) {
+        let a = authority();
+        let (cert, signing_key) = GhostkeyCertificateV1::new(&a.notary, &a.notary_key);
+        let pem = cert.to_armored_string().expect("armor the certificate");
+        let (scoped_payload, signature) = sign_as_vault(
+            &signing_key,
+            harvest_common::expected_harvest_requestor(),
+            tag,
+        );
+        (
+            MessageVoucher {
+                certificate_pem: pem,
+                scoped_payload,
+                signature,
+            },
+            cert.verifying_key,
+            signing_key,
+        )
+    }
+
+    #[test]
+    fn a_voucher_verifies_for_its_own_conversation() {
+        let (voucher, key, _) = vouch(&TAG);
+        assert_eq!(
+            verify_voucher_under(&voucher, &TAG, &test_master()),
+            Ok(key)
+        );
+    }
+
+    /// A voucher is for one conversation. Moved to another, it vouches for
+    /// nothing.
+    #[test]
+    fn a_voucher_for_another_conversation_is_refused() {
+        let (voucher, _, _) = vouch(&TAG);
+        assert!(verify_voucher_under(&voucher, &[10; 32], &test_master()).is_err());
+    }
+
+    /// A certificate from anywhere but Freenet's master key vouches for
+    /// nothing, and neither does the production check with a test chain.
+    #[test]
+    fn a_voucher_whose_certificate_does_not_chain_is_refused() {
+        let (voucher, _, _) = vouch(&TAG);
+        let stranger = Some(SigningKey::from_bytes(&[0x22; 32]).verifying_key());
+        assert!(verify_voucher_under(&voucher, &TAG, &stranger).is_err());
+        assert!(verify_voucher(&voucher, &TAG).is_err());
+    }
+
+    /// The copied-certificate attack: a genuine certificate beside a
+    /// signature by some other key.
+    #[test]
+    fn a_voucher_signed_by_a_key_other_than_the_certified_one_is_refused() {
+        let (genuine, _, _) = vouch(&TAG);
+        let throwaway = SigningKey::from_bytes(&[0x33; 32]);
+        let (scoped_payload, signature) = sign_as_vault(
+            &throwaway,
+            harvest_common::expected_harvest_requestor(),
+            &TAG,
+        );
+        let forged = MessageVoucher {
+            certificate_pem: genuine.certificate_pem,
+            scoped_payload,
+            signature,
+        };
+        assert!(verify_voucher_under(&forged, &TAG, &test_master()).is_err());
+    }
+
+    /// Signed by the right key over the right terms, but for another webapp:
+    /// a site the buyer granted Ghost Key access must not mint Harvest
+    /// vouchers.
+    #[test]
+    fn a_voucher_signed_for_another_requestor_is_refused() {
+        let (genuine, _, signing_key) = vouch(&TAG);
+        let (scoped_payload, signature) = sign_as_vault(
+            &signing_key,
+            ghostkey_common::SignatureRequestor::WebApp(
+                freenet_stdlib::prelude::ContractInstanceId::new([0x44; 32]),
+            ),
+            &TAG,
+        );
+        let other_app = MessageVoucher {
+            certificate_pem: genuine.certificate_pem,
+            scoped_payload,
+            signature,
+        };
+        assert!(verify_voucher_under(&other_app, &TAG, &test_master()).is_err());
     }
 }

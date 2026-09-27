@@ -1303,6 +1303,23 @@ caps are invisible and generous; stock is held about an hour.
 | `my_store::seller_stores` `to_send` | Paid orders not yet sent count toward "needs you", the Orders tab and the navigation number: the first moment a Buy now needs the seller. | **Not tested.** Read: the same `order_stage` call the expired count makes, matching `AwaitingDespatch`. |
 | `buy_view::open_unpaid_orders`, `purchase_headline`, `latest_answer` | The buyer is told they are at the unpaid-order cap before sending, counted as the store counts it (unpaid Buy now, still payable); a purchase reads "Order placed, waiting for your payment." then "Paid."; the form shows the newest answer after the order went out, a decline with its reason. | **Yes** -- `a_buyers_unpaid_orders_are_counted_like_the_stores_cap`, `a_purchase_reads_placed_then_paid`, `the_answer_shown_is_the_newest_one_after_the_order_went_out` (red dropping the skip). **Residual:** a buyer with orders on another device is counted per device; the store's decline covers the difference. |
 
+### Buyer messages need a Ghost Key (added 2026-09-26)
+
+A buyer's text to a seller carries a per-conversation Ghost Key voucher
+(`harvest_common::sealed::MessageVoucher`), and the seller's inbox shows buyer
+text only with one that verifies (`ui/src/voucher_flow.rs`,
+`ui/src/components/message_view.rs::shown_to_seller`). "Red with ..." means
+the guard was broken by a script, the test run, and the file restored.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `ghostkey_cert::verify_voucher_under` | The certificate chains to the master key, the certified key made the signature, the signed terms name the arrival tag, under Harvest's requestor. | **Yes** -- `a_voucher_whose_certificate_does_not_chain_is_refused`, `a_voucher_signed_by_a_key_other_than_the_certified_one_is_refused`, `a_voucher_for_another_conversation_is_refused`, `a_voucher_signed_for_another_requestor_is_refused`; each red with its check removed. |
+| `message_view::shown_to_seller` | Buyer `Text` is hidden; a `VouchedText` is shown only if its voucher verifies for its own conversation; reply-direction text only in a conversation opened by a voucher or a request to buy; everything else is shown. | **Yes** -- the `voucher_view_tests`; red with each rule dropped. |
+| `voucher_flow` compose and signing | No Ghost Key, no compose; one vault request per conversation; queued texts sealed in the order typed; a refusal, a timeout (not a stale one) or a voucher the seller would refuse hands the texts back unsent. | **Yes** -- `voucher_flow::tests`; red with each guard removed. |
+| `voucher_flow::spawn_message_voucher_signature`, `deliver_vouched`, and the `Compose` / `Inbox` rendering | The request is sent and its timeout started; sealed texts reach `deliver_to_seller`; the gate, "Signing with your Ghost Key...", the unsent texts and the hidden-count line are on screen. | **No.** wasm-only; type-checked by the wasm32 clippy step, never executed. The state they drive is tested. |
+| `AppState::voucher_verifies` | Verdicts are remembered per (voucher, tag). | **Yes** -- `voucher_verdicts_are_remembered_per_conversation` (red with the tag left out of the key). |
+| The vault's `SignResult` | Its `certificate_pem` is the certificate of the key that signed. | **Not tested in this repo**, and not relied on: the buyer checks the voucher as the seller will before sending under it, so a mismatch is told to the buyer rather than hidden from the seller. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

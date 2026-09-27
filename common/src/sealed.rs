@@ -144,6 +144,81 @@ pub enum MessageContent {
     /// from the request (`OrderId::for_request`), so the buyer finds it even
     /// if this message is lost.
     OrderAccepted { order_id: crate::payment::OrderId },
+    /// Free-form text from a BUYER, carrying a Ghost Key's voucher for the
+    /// conversation it travels in.
+    ///
+    /// Buyer-to-seller messages need a Ghost Key (anti-spam); buying does
+    /// not. The mailbox is open-write, so a gate in the buyer's UI alone is
+    /// no gate: a script writes past it. The seller's side therefore refuses
+    /// to show buyer text that does not carry a voucher verifying for the
+    /// conversation it arrived in (`harvest-ui`'s `components::message_view`).
+    ///
+    /// [`Self::Text`] stays for the seller's replies, which need no voucher
+    /// (the buyer chose to write to this store), and so that messages sealed
+    /// before this existed still open.
+    VouchedText {
+        text: String,
+        voucher: MessageVoucher,
+    },
+}
+
+/// The domain a buyer's voucher signs under, so the same Ghost Key signature
+/// can never be read as any other Harvest statement.
+pub const BUYER_VOUCHER_DOMAIN: &str = "harvest/buyer-voucher/v1";
+
+/// What a Ghost Key signs to vouch for one conversation: this domain, and the
+/// conversation's routing tag (the buyer's ephemeral X25519 key on the
+/// envelope, [`EncryptedMessage::sender_public_key`]).
+///
+/// Per conversation rather than per message, so the buyer is asked once. It
+/// cannot be moved to another conversation, because the seller checks it
+/// against the tag the message ARRIVED under, and a tag can only be written
+/// under by whoever holds that conversation's keys.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct VoucherTerms {
+    pub domain: String,
+    pub conversation: [u8; 32],
+}
+
+/// The terms a voucher for the conversation tagged `tag` signs. One function
+/// for the signer and the verifier, so the two cannot drift: a drift here
+/// fails silently, as every buyer's text being hidden.
+pub fn voucher_terms(tag: &[u8; 32]) -> VoucherTerms {
+    VoucherTerms {
+        domain: BUYER_VOUCHER_DOMAIN.to_string(),
+        conversation: *tag,
+    }
+}
+
+/// [`voucher_terms`] as the bytes handed to the vault's `SignMessage`, which
+/// come back verbatim as the signed `ScopedPayload::payload`.
+pub fn voucher_message(tag: &[u8; 32]) -> Result<Vec<u8>, String> {
+    crate::to_cbor(&voucher_terms(tag))
+}
+
+/// A Ghost Key's signature over [`voucher_terms`] for one conversation, with
+/// the certificate that says the key is a real (donation-backed) Ghost Key.
+///
+/// Exactly what the vault's `SignResult` returns. Checked by the seller's
+/// browser: the certificate chains to Freenet's master key, the signature
+/// verifies under the key it certifies, and the signed payload is this
+/// conversation's terms under Harvest's requestor pin.
+///
+/// # What it tells the seller
+///
+/// That a Ghost Key holder opened this conversation, and which Ghost Key: it
+/// is a pseudonym, and the same key used at two stores links the two
+/// conversations for anyone who can read both. See
+/// `docs/messaging-privacy.md`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MessageVoucher {
+    pub certificate_pem: String,
+    /// CBOR `ScopedPayload` from the vault, wrapping [`voucher_message`].
+    #[serde(with = "serde_bytes")]
+    pub scoped_payload: Vec<u8>,
+    /// Ed25519 signature over `scoped_payload`.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
 }
 
 /// What a buyer picked for an instant-checkout purchase, inside their
@@ -313,4 +388,62 @@ pub fn decrypt_message(
 
     // Deserialize from CBOR
     crate::from_cbor(&plaintext_bytes).map_err(|e| format!("deserialize plaintext: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TAG: [u8; 32] = [7; 32];
+
+    fn voucher() -> MessageVoucher {
+        MessageVoucher {
+            certificate_pem: include_str!("../../tests/fixtures/ghostkey-certificate.pem")
+                .to_string(),
+            // About the size the vault's envelope comes to: a requestor id
+            // and the CBOR terms, plus framing.
+            scoped_payload: vec![0xa5; 160],
+            signature: vec![0x5a; 64],
+        }
+    }
+
+    /// The terms carry the domain and the tag, and nothing else a signer or
+    /// verifier could fill in differently.
+    #[test]
+    fn voucher_terms_name_the_domain_and_the_conversation() {
+        let terms = voucher_terms(&TAG);
+        assert_eq!(terms.domain, BUYER_VOUCHER_DOMAIN);
+        assert_eq!(terms.conversation, TAG);
+        assert_eq!(
+            voucher_message(&TAG).unwrap(),
+            crate::to_cbor(&terms).unwrap()
+        );
+        assert_ne!(voucher_message(&TAG), voucher_message(&[8; 32]));
+    }
+
+    /// A vouched text survives sealing and opening intact, and an ordinary
+    /// message with a voucher still fits a mailbox: the certificate moves it
+    /// up a size bucket, not past the largest.
+    #[test]
+    fn a_vouched_text_seals_opens_and_fits() {
+        let key = [3u8; 32];
+        let id = ConversationId([4; 32]);
+        let content = MessageContent::VouchedText {
+            text: "Is this still available? ".repeat(40),
+            voucher: voucher(),
+        };
+        let sealed = seal(
+            &key,
+            &TAG,
+            &id,
+            content.clone(),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .expect("a normal message with a voucher fits");
+        assert!(
+            crate::mailbox::size_class(&sealed).is_some_and(|class| class <= 1),
+            "a thousand characters and a voucher stay in the 4 KiB bucket"
+        );
+        assert_eq!(decrypt_message(&sealed, &key).unwrap().content, content);
+    }
 }

@@ -76,7 +76,12 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
         .is_some();
 
     if owned {
-        let entries = app_state.mailbox_entries(&store_contract_id);
+        // Buyer text no Ghost Key vouches for is taken out here, before
+        // anything counts or groups it (the anti-spam gate's seller half).
+        let (entries, unvouched) = shown_to_seller(
+            app_state.mailbox_entries(&store_contract_id),
+            |voucher, tag| app_state.voucher_verifies(voucher, tag),
+        );
         // The only authorship this client can establish: what it sent itself.
         let authored: Vec<[u8; 32]> = entries
             .iter()
@@ -91,6 +96,7 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             Inbox {
                 store_contract_id: store_contract_id.clone(),
                 entries: entries,
+                unvouched: unvouched,
                 authored: authored,
                 listings: listings,
                 published: published,
@@ -560,6 +566,22 @@ fn Compose(
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
 
+    let (gate, signing, failure) = {
+        let state = APP_STATE.read();
+        (
+            state.compose_gate(),
+            state.texts_awaiting_voucher(&store_contract_id),
+            state.voucher_failure(&store_contract_id).cloned(),
+        )
+    };
+    // No Ghost Key, no compose box: the seller would not be shown what was
+    // typed (`shown_to_seller`), so offering the box would be a dead end.
+    if gate == crate::voucher_flow::ComposeGate::NeedsGhostKey {
+        return rsx! {
+            GhostKeyGate {}
+        };
+    }
+
     let can_send = !draft().trim().is_empty();
 
     rsx! {
@@ -589,6 +611,33 @@ fn Compose(
 
         if let Some(message) = problem() {
             p { class: "text-warning", "{message}" }
+        }
+
+        // Waiting on the Ghost Key's signature for this conversation. Shown
+        // here rather than in the thread: nothing has been sent yet.
+        for text in signing.iter() {
+            div { class: "card", style: "margin-top: 0.5rem;",
+                p { class: "text-muted", style: "font-size: 0.8rem;",
+                    "Signing with your Ghost Key..."
+                }
+                p { style: "white-space: pre-wrap;", "{text}" }
+            }
+        }
+        if let Some(failure) = failure {
+            p { class: "text-warning",
+                "Not sent: {failure.why}. Copy anything you want to keep, then send again."
+            }
+            for text in failure.texts.iter() {
+                div { class: "card", style: "margin-top: 0.5rem;",
+                    p { class: "text-muted", style: "font-size: 0.8rem;", "Not sent" }
+                    p { style: "white-space: pre-wrap;", "{text}" }
+                }
+            }
+        }
+
+        p { class: "text-muted", style: "font-size: 0.85rem;",
+            "Your first message in a conversation is signed by your Ghost Key, so the seller "
+            "knows a Ghost Key holder wrote it. They see which Ghost Key; nobody else does."
         }
 
         button {
@@ -629,12 +678,52 @@ fn send(
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
-    let sealed = APP_STATE.write().compose_to_seller(
+    // Taken for writing only for this statement: the dispatch below writes
+    // the state again.
+    let composed = APP_STATE.write().compose_vouched_to_seller(
         store_contract_id,
         seller_encryption_key,
+        seller_verifying_key,
         text.clone(),
+        crate::state::now_ms(),
     )?;
-    deliver_to_seller(store_contract_id, seller, text, sealed)
+    match composed {
+        crate::voucher_flow::VouchedCompose::Sealed(sealed) => {
+            deliver_to_seller(store_contract_id, seller, text, sealed)
+        }
+        crate::voucher_flow::VouchedCompose::AwaitingSignature(Some(pending)) => {
+            crate::voucher_flow::spawn_message_voucher_signature(pending);
+            Ok(())
+        }
+        crate::voucher_flow::VouchedCompose::AwaitingSignature(None) => Ok(()),
+    }
+}
+
+/// In place of the compose box for a buyer with no Ghost Key connected.
+///
+/// Worded for someone who has never heard of a Ghost Key: what it is for,
+/// that buying does not need one, and where to get one.
+#[component]
+fn GhostKeyGate() -> Element {
+    rsx! {
+        div { class: "info-box",
+            p { "{crate::voucher_flow::NEEDS_GHOST_KEY}" }
+            div { class: "form-actions",
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| super::my_store::connect_ghostkey(),
+                    "Use a Ghost Key"
+                }
+                a {
+                    class: "btn btn-outline",
+                    href: "https://freenet.org/ghostkey/create/",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "What is a Ghost Key?"
+                }
+            }
+        }
+    }
 }
 
 /// Subscribe, dispatch, and record -- everything a buyer's outgoing message
@@ -783,6 +872,8 @@ fn Unavailable(why: String) -> Element {
 fn Inbox(
     store_contract_id: Vec<u8>,
     entries: Vec<MailboxEntry>,
+    /// Buyer messages taken out by [`shown_to_seller`].
+    unvouched: usize,
     authored: Vec<[u8; 32]>,
     listings: Vec<harvest_common::listing::AuthorizedListing>,
     published: Vec<harvest_common::payment::AuthorizedOrder>,
@@ -791,7 +882,13 @@ fn Inbox(
         return rsx! {
             div { class: "card",
                 h3 { "Messages" }
-                p { class: "text-muted text-italic", "No one has written to this store yet." }
+                if unvouched == 0 {
+                    p { class: "text-muted text-italic", "No one has written to this store yet." }
+                } else {
+                    p { class: "text-muted", style: "font-size: 0.85rem;",
+                        "{hidden_unvouched_line(unvouched)}"
+                    }
+                }
             }
         };
     }
@@ -827,6 +924,11 @@ fn Inbox(
                     style: "font-size: 0.85rem;",
                     "{unreadable} of these cannot be read. Anyone can write to this mailbox, "
                     "so some entries are junk or were encrypted to a key you do not hold."
+                }
+            }
+            if unvouched > 0 {
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "{hidden_unvouched_line(unvouched)}"
                 }
             }
             for (tag, group) in conversations.iter() {
@@ -1021,6 +1123,98 @@ fn attribution(
         (Role::Seller, Addressing::ToSeller) => "Addressed to you",
         (Role::Seller, Addressing::ToBuyer) => "Addressed to this buyer",
     }
+}
+
+/// The line a seller sees in place of buyer messages [`shown_to_seller`]
+/// took out.
+pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
+    if hidden == 1 {
+        "1 message sent without a Ghost Key was not shown.".to_string()
+    } else {
+        format!("{hidden} messages sent without a Ghost Key were not shown.")
+    }
+}
+
+/// A seller's inbox as the seller is shown it, and how many buyer messages
+/// were left out for carrying no Ghost Key's voucher.
+///
+/// Buyer-to-seller messages need a Ghost Key (anti-spam); buying does not.
+/// The mailbox is open-write, so the buyer's compose gate alone stops nobody
+/// with a script, and this is the half that does: free text is shown only
+/// when a Ghost Key vouches for the conversation it arrived in.
+///
+/// * A buyer's plain [`MessageContent::Text`] (addressed to the seller) is
+///   left out: a current buyer sends [`MessageContent::VouchedText`].
+/// * A `VouchedText` is shown only if its voucher verifies for THIS
+///   conversation's tag (`verifies`), so one copied from another conversation
+///   vouches for nothing.
+/// * Text addressed to the BUYER is the seller's own reply direction, but
+///   both parties hold both keys (`attribution`), so a script can flip the
+///   direction to get past the rule above. It is shown only in a conversation
+///   the buyer opened legitimately: one with a verified voucher, or a request
+///   to buy.
+///
+/// Everything else -- requests to buy, acceptances, declines, unreadable
+/// entries -- is untouched: buying needs no Ghost Key.
+pub(crate) fn shown_to_seller(
+    entries: Vec<MailboxEntry>,
+    verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
+) -> (Vec<MailboxEntry>, usize) {
+    use crate::messaging::Addressing;
+    let vouched = |entry: &MailboxEntry| match entry {
+        MailboxEntry::Readable {
+            conversation,
+            content: MessageContent::VouchedText { voucher, .. },
+            ..
+        } => <[u8; 32]>::try_from(conversation.as_slice()).is_ok_and(|tag| verifies(voucher, &tag)),
+        _ => false,
+    };
+    // Verified once per entry: `verifies` may be an RSA chain check.
+    let verdicts: Vec<bool> = entries.iter().map(vouched).collect();
+    let opened: std::collections::HashSet<&[u8]> = entries
+        .iter()
+        .zip(&verdicts)
+        .filter(|(entry, verified)| {
+            **verified
+                || matches!(
+                    entry,
+                    MailboxEntry::Readable {
+                        content: MessageContent::OrderRequest { .. },
+                        ..
+                    }
+                )
+        })
+        .map(|(entry, _)| entry.conversation())
+        .collect();
+    let keep: Vec<bool> = entries
+        .iter()
+        .zip(&verdicts)
+        .map(|(entry, verified)| match entry {
+            MailboxEntry::Readable {
+                content: MessageContent::VouchedText { .. },
+                ..
+            } => *verified,
+            MailboxEntry::Readable {
+                content: MessageContent::Text(_),
+                addressing: Addressing::ToSeller,
+                ..
+            } => false,
+            MailboxEntry::Readable {
+                content: MessageContent::Text(_),
+                addressing: Addressing::ToBuyer,
+                conversation,
+                ..
+            } => opened.contains(conversation.as_slice()),
+            _ => true,
+        })
+        .collect();
+    let hidden = keep.iter().filter(|kept| !**kept).count();
+    let shown = entries
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(entry, kept)| kept.then_some(entry))
+        .collect();
+    (shown, hidden)
 }
 
 /// The request to buy this conversation is waiting on, if any.
@@ -1335,7 +1529,7 @@ fn MessageCard(entry: MailboxEntry, authored_here: bool) -> Element {
 /// shown a blank message.
 fn describe(content: &MessageContent) -> String {
     match content {
-        MessageContent::Text(text) => text.clone(),
+        MessageContent::Text(text) | MessageContent::VouchedText { text, .. } => text.clone(),
         MessageContent::Decline { reason } => format!("Declined: {reason}"),
         MessageContent::OrderRequest {
             quantity,
@@ -2089,5 +2283,139 @@ mod inbox_tests {
 
         let quote = describe(&request(None));
         assert!(!quote.contains("Instant checkout"), "{quote}");
+    }
+}
+
+#[cfg(test)]
+mod voucher_view_tests {
+    use super::*;
+    use crate::ghostkey_cert::tests::{test_master, vouch};
+    use crate::messaging::Addressing;
+
+    const TAG: [u8; 32] = [1; 32];
+    const OTHER: [u8; 32] = [2; 32];
+
+    fn entry(tag: [u8; 32], addressing: Addressing, content: MessageContent) -> MailboxEntry {
+        MailboxEntry::Readable {
+            conversation: tag.to_vec(),
+            conversation_id: harvest_common::mailbox::ConversationId([3; 32]),
+            addressing,
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            nonce: [0; 24],
+            digest: [tag[0]; 32],
+            content,
+        }
+    }
+
+    fn vouched(tag: [u8; 32], voucher: &harvest_common::sealed::MessageVoucher) -> MailboxEntry {
+        entry(
+            tag,
+            Addressing::ToSeller,
+            MessageContent::VouchedText {
+                text: "hello".into(),
+                voucher: voucher.clone(),
+            },
+        )
+    }
+
+    fn text(tag: [u8; 32], addressing: Addressing) -> MailboxEntry {
+        entry(tag, addressing, MessageContent::Text("hi".into()))
+    }
+
+    fn order_request(tag: [u8; 32]) -> MailboxEntry {
+        entry(
+            tag,
+            Addressing::ToSeller,
+            MessageContent::OrderRequest {
+                listing_id: harvest_common::listing::ListingId([9; 32]),
+                quantity: 1,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+                order_binding: [5; 32],
+                buyer_receipt_key: None,
+                instant: None,
+            },
+        )
+    }
+
+    fn shown(entries: Vec<MailboxEntry>) -> (Vec<MailboxEntry>, usize) {
+        shown_to_seller(entries, |voucher, tag| {
+            crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
+        })
+    }
+
+    #[test]
+    fn vouched_text_is_shown() {
+        let (voucher, _, _) = vouch(&TAG);
+        assert_eq!(
+            shown(vec![vouched(TAG, &voucher)]),
+            (vec![vouched(TAG, &voucher)], 0)
+        );
+    }
+
+    /// Plain text from a buyer, which is what a script writing past the
+    /// compose gate sends, is not shown.
+    #[test]
+    fn unvouched_buyer_text_is_hidden() {
+        assert_eq!(shown(vec![text(TAG, Addressing::ToSeller)]), (vec![], 1));
+    }
+
+    /// A voucher copied from another conversation vouches for nothing here,
+    /// and one that does not verify at all is no better than none.
+    #[test]
+    fn a_voucher_that_does_not_verify_for_this_conversation_is_hidden() {
+        let (voucher, _, _) = vouch(&OTHER);
+        assert_eq!(shown(vec![vouched(TAG, &voucher)]).1, 1);
+        let (mut broken, _, _) = vouch(&TAG);
+        broken.signature[0] ^= 1;
+        assert_eq!(shown(vec![vouched(TAG, &broken)]).1, 1);
+    }
+
+    /// Buying needs no Ghost Key: requests to buy, and everything else that
+    /// is not free text, are shown whatever the conversation carries.
+    #[test]
+    fn order_requests_and_other_steps_are_shown() {
+        let entries = vec![
+            order_request(TAG),
+            entry(
+                OTHER,
+                Addressing::ToSeller,
+                MessageContent::Decline {
+                    reason: "changed my mind".into(),
+                },
+            ),
+        ];
+        assert_eq!(shown(entries.clone()), (entries, 0));
+    }
+
+    /// Text in the seller's reply direction is shown in a conversation the
+    /// buyer opened legitimately, and not in one opened by nothing: both
+    /// parties hold both keys, so flipping the direction must not get a
+    /// script past the gate.
+    #[test]
+    fn reply_direction_text_needs_a_legitimately_opened_conversation() {
+        let (voucher, _, _) = vouch(&TAG);
+        let (shown_entries, hidden) = shown(vec![
+            vouched(TAG, &voucher),
+            text(TAG, Addressing::ToBuyer),
+            order_request(OTHER),
+            text(OTHER, Addressing::ToBuyer),
+            text([4; 32], Addressing::ToBuyer),
+        ]);
+        assert_eq!(hidden, 1);
+        assert_eq!(shown_entries.len(), 4);
+        assert!(shown_entries.iter().all(|e| e.conversation() != [4; 32]));
+    }
+
+    #[test]
+    fn the_hidden_count_line_says_how_many() {
+        assert_eq!(
+            hidden_unvouched_line(1),
+            "1 message sent without a Ghost Key was not shown."
+        );
+        assert_eq!(
+            hidden_unvouched_line(3),
+            "3 messages sent without a Ghost Key were not shown."
+        );
     }
 }
