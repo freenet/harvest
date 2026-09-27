@@ -668,6 +668,13 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -
 /// wallet with the usual gap limit does not look at (Ian's wording,
 /// 2026-09-26).
 pub(crate) fn wallet_gap_note(limit: u32) -> String {
+    if limit == u32::MAX {
+        // More than a thousand unused addresses in a row: the count stops
+        // there, so no figure is given that might fall short.
+        return "Your wallet may not be showing all your payments. In your wallet's settings, \
+                set the gap limit as high as it goes, well over 1000."
+            .to_string();
+    }
     format!(
         "Your wallet may not be showing all your payments. In your wallet's settings, set the \
          gap limit to {limit}."
@@ -1926,6 +1933,7 @@ mod seller_stores_tests {
         assert_eq!(state.wallet_gap_note_due(&[1; 32]), Some(100));
         assert_eq!(state.wallet_gap_note_due(&[2; 32]), None);
         assert_eq!(state.wallet_gap_note_due(&[3; 32]), None);
+        assert!(wallet_gap_note(u32::MAX).contains("as high as it goes"));
         assert_eq!(
             wallet_gap_note(100),
             "Your wallet may not be showing all your payments. In your wallet's settings, set \

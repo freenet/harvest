@@ -271,7 +271,14 @@ pub(crate) const WALLET_GAP_LIMIT: u32 = 20;
 /// `run` unused addresses: 100 (the figure the wallet guide gives) unless
 /// the run was that long or longer, then the next hundred above it. One to
 /// spare, for wallets that count the limit one short.
+///
+/// A run counted to [`MAX_ADDRESS_RUN`] may be longer than that (the count
+/// stops there): `u32::MAX`, which the seller's page words as "as high as it
+/// goes" rather than a figure that may fall short.
 pub(crate) fn wallet_gap_limit_for(run: u32) -> u32 {
+    if run >= MAX_ADDRESS_RUN {
+        return u32::MAX;
+    }
     let needed = run.saturating_add(1);
     if needed < 100 {
         100
@@ -279,7 +286,9 @@ pub(crate) fn wallet_gap_limit_for(run: u32) -> u32 {
         (needed / 100 + 1) * 100
     }
 }
-const GAP_ORDERS_CAP: usize = 256;
+/// A payment window's worth at the daily cap (100 a day for about two
+/// weeks), so no gap order still payable is dropped (codex on harvest#177).
+const GAP_ORDERS_CAP: usize = 1500;
 
 /// An instant order paid when published stock could not cover it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -3382,6 +3391,12 @@ mod tests {
         assert_eq!(wallet_gap_limit_for(98), 100);
         assert_eq!(wallet_gap_limit_for(99), 200, "one to spare");
         assert_eq!(wallet_gap_limit_for(250), 300);
+        assert_eq!(wallet_gap_limit_for(MAX_ADDRESS_RUN - 1), 1100);
+        assert_eq!(
+            wallet_gap_limit_for(MAX_ADDRESS_RUN),
+            u32::MAX,
+            "counted no further"
+        );
     }
 
     /// A Buy now for a listing that changed or went away is answered, not

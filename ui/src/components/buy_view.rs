@@ -96,13 +96,27 @@ pub fn BuyForm(
     });
     // The buyer's own unpaid orders here, counted the way the seller's store
     // counts them. Said before sending rather than after a wait.
-    let too_many_unpaid = open_unpaid_orders(&APP_STATE.read().buyer_purchases(&store_contract_id))
-        >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER;
+    // Only the conversation this Buy now goes out in (`conversation_with`
+    // continues the last one), which is what the store counts per.
+    let too_many_unpaid = {
+        let state = APP_STATE.read();
+        let current = state
+            .browsing_stores
+            .get(&store_contract_id)
+            .and_then(|s| s.conversations.last())
+            .map(|c| c.buyer_public_key);
+        let purchases: Vec<BuyerPurchase> = state
+            .buyer_purchases(&store_contract_id)
+            .into_iter()
+            .filter(|p| Some(p.conversation) == current)
+            .collect();
+        open_unpaid_orders(&purchases) >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
+    };
     let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid;
 
     if let Some(sent) = sent() {
         let thread = APP_STATE.read().conversation_thread(&store_contract_id);
-        let answer = latest_answer(&thread, sent.answers_before);
+        let answer = latest_answer(&thread, sent.answers_before, sent.expected.as_ref());
         let _ = now_ms();
         return match instant_wait(sent.at_ms, unix_millis(), answer.is_some()) {
             InstantWait::Answered => match answer {
@@ -237,6 +251,7 @@ pub fn BuyForm(
                             expected_total_sats: total,
                             requested_at_ms: unix_millis() as i64,
                         };
+                        let answering = selection.clone();
                         let answers_before = seller_answers(
                             &APP_STATE.read().conversation_thread(&store_contract_id),
                         );
@@ -250,11 +265,14 @@ pub fn BuyForm(
                             note().trim().to_string(),
                             selection,
                         ) {
-                            Ok(()) => {
+                            Ok(tag) => {
                                 problem.set(None);
                                 sent.set(Some(Sent {
                                     at_ms: unix_millis(),
                                     answers_before,
+                                    expected: answering
+                                        .answered_request(&tag)
+                                        .map(|request| request.order_id()),
                                 }));
                                 wake_after_wait(now_ms);
                             }
@@ -297,10 +315,14 @@ fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
 
 /// An instant request that was sent: when, and how many seller answers the
 /// thread held at that moment.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct Sent {
     at_ms: u64,
     answers_before: usize,
+    /// The order the store would issue for this request
+    /// (`OrderId::for_request`), so an acceptance of another request is
+    /// never read as this one's.
+    expected: Option<harvest_common::payment::OrderId>,
 }
 
 /// How long a buyer waits for the seller's store before being told it is
@@ -354,23 +376,39 @@ enum Answer {
     Declined(String),
 }
 
-/// The newest seller answer in the thread past the first `answers_before`,
-/// counted as [`seller_answers`] counts them, or `None` when there is none
-/// yet.
+/// This order's answer among the seller's answers past the first
+/// `answers_before` (counted as [`seller_answers`] counts them): the
+/// acceptance of the order it `expected`, else the newest decline, or `None`
+/// when there is neither yet. An acceptance of another request is never
+/// taken for this one's (codex on harvest#177); a decline names no order, so
+/// one sent to another request of the same buyer at the same moment can
+/// still be shown here.
 fn latest_answer(
     thread: &[crate::messaging::ConversationMessage],
     answers_before: usize,
+    expected: Option<&harvest_common::payment::OrderId>,
 ) -> Option<Answer> {
-    thread
+    let answers: Vec<&MessageContent> = thread
         .iter()
         .filter(|message| message.addressing == Addressing::ToBuyer)
-        .filter_map(|message| match &message.content {
-            MessageContent::OrderAccepted { .. } => Some(Answer::Accepted),
-            MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
-            _ => None,
+        .map(|message| &message.content)
+        .filter(|content| {
+            matches!(
+                content,
+                MessageContent::OrderAccepted { .. } | MessageContent::Decline { .. }
+            )
         })
         .skip(answers_before)
-        .last()
+        .collect();
+    if answers.iter().any(|content| {
+        matches!(content, MessageContent::OrderAccepted { order_id } if Some(order_id) == expected)
+    }) {
+        return Some(Answer::Accepted);
+    }
+    answers.iter().rev().find_map(|content| match content {
+        MessageContent::Decline { reason } => Some(Answer::Declined(reason.clone())),
+        _ => None,
+    })
 }
 
 /// A fresh request nonce. Only the buyer's own resends reuse one, and this
@@ -418,7 +456,7 @@ fn request(
     shipping: String,
     note: String,
     instant: InstantSelection,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
@@ -436,7 +474,13 @@ fn request(
         Some(instant),
     )?;
 
-    super::message_view::deliver_to_seller(store_contract_id, seller, record_as, sealed)
+    let tag: [u8; 32] = sealed
+        .sender_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "the conversation's key is not 32 bytes".to_string())?;
+    super::message_view::deliver_to_seller(store_contract_id, seller, record_as, sealed)?;
+    Ok(tag)
 }
 
 /// What this buyer has been accepted for at one store, and whether each is
@@ -1594,15 +1638,16 @@ mod tests {
         let accepted = MessageContent::OrderAccepted {
             order_id: harvest_common::payment::OrderId([1u8; 32]),
         };
+        let ours = harvest_common::payment::OrderId([1u8; 32]);
         let mut thread = vec![message(Addressing::ToBuyer, accepted.clone())];
         let before = seller_answers(&thread);
-        assert_eq!(latest_answer(&thread, before), None);
+        assert_eq!(latest_answer(&thread, before, Some(&ours)), None);
         thread.push(message(Addressing::ToSeller, accepted.clone()));
         thread.push(message(
             Addressing::ToBuyer,
             MessageContent::Text("Hi".into()),
         ));
-        assert_eq!(latest_answer(&thread, before), None);
+        assert_eq!(latest_answer(&thread, before, Some(&ours)), None);
         thread.push(message(
             Addressing::ToBuyer,
             MessageContent::Decline {
@@ -1610,12 +1655,27 @@ mod tests {
             },
         ));
         assert_eq!(
-            latest_answer(&thread, before),
+            latest_answer(&thread, before, Some(&ours)),
             Some(Answer::Declined(
                 harvest_common::delegate::TOO_MANY_UNPAID.into()
             ))
         );
+        // Another request's acceptance is not this one's.
+        let theirs = MessageContent::OrderAccepted {
+            order_id: harvest_common::payment::OrderId([2u8; 32]),
+        };
+        thread.push(message(Addressing::ToBuyer, theirs));
+        assert_eq!(
+            latest_answer(&thread, before, Some(&ours)),
+            Some(Answer::Declined(
+                harvest_common::delegate::TOO_MANY_UNPAID.into()
+            )),
+            "not taken for ours"
+        );
         thread.push(message(Addressing::ToBuyer, accepted));
-        assert_eq!(latest_answer(&thread, before), Some(Answer::Accepted));
+        assert_eq!(
+            latest_answer(&thread, before, Some(&ours)),
+            Some(Answer::Accepted)
+        );
     }
 }
