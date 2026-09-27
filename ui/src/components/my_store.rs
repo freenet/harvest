@@ -69,6 +69,25 @@ pub(crate) struct SellerStore {
     pub to_send: usize,
 }
 
+/// How many of `fingerprint`'s orders are paid and waiting to be sent, each
+/// judged by `stage_of` (`fulfilment::order_stage` against this node's view).
+pub(crate) fn paid_to_send(
+    orders: &[harvest_common::payment::AuthorizedOrder],
+    fingerprint: &str,
+    stage_of: impl Fn(&harvest_common::payment::AuthorizedOrder) -> crate::fulfilment::OrderStage,
+) -> usize {
+    orders
+        .iter()
+        .filter(|o| o.order.seller_fingerprint == fingerprint)
+        .filter(|o| {
+            matches!(
+                stage_of(o),
+                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
+            )
+        })
+        .count()
+}
+
 /// What needs the seller across every store this device manages: requests
 /// waiting for an invoice, and paid orders waiting to be sent. The number
 /// beside "My store" in the navigation.
@@ -138,26 +157,19 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                 .unwrap_or(0);
             let to_send = browsing
                 .map(|b| {
-                    b.orders
-                        .iter()
-                        .filter(|o| o.order.seller_fingerprint == *fingerprint)
-                        .filter(|o| {
-                            let tip = state
-                                .bitcoin
-                                .tips
-                                .get(&o.order.network)
-                                .and_then(|tip| tip.tip_height);
-                            matches!(
-                                crate::fulfilment::order_stage(
-                                    o,
-                                    state.despatch_of(o).as_ref(),
-                                    tip,
-                                    state.payment_sight(o),
-                                ),
-                                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
-                            )
-                        })
-                        .count()
+                    paid_to_send(&b.orders, fingerprint, |o| {
+                        let tip = state
+                            .bitcoin
+                            .tips
+                            .get(&o.order.network)
+                            .and_then(|tip| tip.tip_height);
+                        crate::fulfilment::order_stage(
+                            o,
+                            state.despatch_of(o).as_ref(),
+                            tip,
+                            state.payment_sight(o),
+                        )
+                    })
                 })
                 .unwrap_or(0);
             Some(SellerStore {
@@ -657,7 +669,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         .read()
         .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
 
-    let wallet_gap = APP_STATE.read().wallet_gap_note_due();
+    let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
     let needs: bool = wallet_gap
         || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
@@ -1799,5 +1811,82 @@ mod seller_stores_tests {
         assert_eq!(stores[0].requests, 0);
         assert!(stores[0].code.is_some() && stores[0].link.is_some());
         assert_eq!(requests_needing_seller(&state), 0);
+    }
+
+    /// Paid orders waiting to be sent are what a Buy now first needs the
+    /// seller for; only this seller's, and only at that stage. Mutated red by
+    /// dropping each filter.
+    #[test]
+    fn paid_orders_to_send_are_counted() {
+        use crate::fulfilment::OrderStage;
+        use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+        let order = |seller: &str, n: u8| AuthorizedOrder {
+            order: Order {
+                request_id: Some([n; 32]),
+                id: OrderId([n; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: seller.into(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: vec![n],
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: OrderStatus::Paid,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        let orders = vec![order("fp", 1), order("fp", 2), order("other", 3)];
+        let stage = |o: &AuthorizedOrder| match o.order.id.0[0] {
+            1 | 3 => OrderStage::AwaitingDespatch {
+                paid_at: 1,
+                despatch_by: 2,
+            },
+            _ => OrderStage::Despatched {
+                despatched_at: 1,
+                complaint_until: 2,
+            },
+        };
+        assert_eq!(paid_to_send(&orders, "fp", stage), 1);
+    }
+
+    /// The wallet-gap note is shown on the store it happened at, not on
+    /// every store of the device. Mutated red by answering for any store.
+    #[test]
+    fn the_wallet_gap_note_is_per_store() {
+        let mut state = AppState::default();
+        let status = |gap: Option<u64>| harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 1,
+            invoicing_until_ms: 0,
+            last_background_run_ms: None,
+            issued_last_day: 0,
+            oversold: vec![],
+            paused: None,
+            wallet_gap_paid_at_ms: gap,
+            capped: None,
+        };
+        state
+            .auto_invoice
+            .status
+            .insert(vec![1; 32], Ok(status(Some(5))));
+        state
+            .auto_invoice
+            .status
+            .insert(vec![2; 32], Ok(status(None)));
+        assert!(state.wallet_gap_note_due(&[1; 32]));
+        assert!(!state.wallet_gap_note_due(&[2; 32]));
+        assert!(!state.wallet_gap_note_due(&[3; 32]));
     }
 }

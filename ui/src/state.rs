@@ -8660,7 +8660,10 @@ impl AppState {
             store
                 .orders
                 .iter()
-                .filter(|order| !crate::fulfilment::is_unpaid_buy_now(order))
+                .filter(|order| {
+                    !crate::fulfilment::is_unpaid_buy_now(order)
+                        || self.withheld_settlements.contains_key(&order.order.id)
+                })
                 .cloned()
                 .collect()
         } else {
@@ -31140,6 +31143,7 @@ mod buy_flow_tests {
             oversold: vec![],
             paused: paused.map(str::to_string),
             wallet_gap_paid_at_ms: None,
+            capped: None,
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
@@ -31174,6 +31178,14 @@ mod buy_flow_tests {
         oversold.oversold = vec![OrderId([7; 32])];
         let told = instant_checkout_status_text(&oversold, 1);
         assert!(told.contains(&OrderId([7; 32]).short()), "{told}");
+        // A store limit that turned a buyer away is said, ahead of the rest.
+        let mut capped = status(Some(1), None);
+        capped.capped = Some("50 instant invoices are waiting for payment".into());
+        let said = instant_checkout_status_text(&capped, 1);
+        assert!(
+            said.starts_with("In the last hour a buyer couldn't order because 50 instant"),
+            "{said}"
+        );
 
         let gk = inbox::authority().mint();
         let state = an_instant_seller(&gk);

@@ -74,6 +74,12 @@ pub fn BuyForm(
     let now_ms = use_signal(unix_millis);
 
     let listing_title = listing.title.clone();
+    let counted = matches!(
+        APP_STATE
+            .read()
+            .listing_availability(&store_contract_id, &listing.id),
+        harvest_common::listing::ListingAvailability::Available { quantity: Some(_) }
+    );
     let by_region = match &listing.checkout {
         Some(FixedCheckout {
             delivery: DeliveryPrice::ByRegion(rows),
@@ -107,8 +113,13 @@ pub fn BuyForm(
                 _ => rsx! {
                     p { strong { "Order placed, waiting for your payment." } }
                     p { class: "text-muted",
-                        "The payment details are under \u{201c}Your purchases\u{201d} below. "
-                        "Your order is kept for you for about an hour; pay within that time to be sure of it."
+                        "The payment details are under \u{201c}Your purchases\u{201d} below."
+                    }
+                    // Only a counted listing holds stock (the delegate's
+                    // `Sale::holds`), and only for the hour: a payment after
+                    // that still counts, but the item may have gone.
+                    if counted {
+                        p { class: "text-muted", "Pay soon: this item is kept for you for about an hour." }
                     }
                 },
             },

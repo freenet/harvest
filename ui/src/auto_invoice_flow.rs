@@ -378,14 +378,15 @@ impl AppState {
         self.auto_invoice.status.insert(store_contract_id, result);
     }
 
-    /// Whether any of this device's stores has, in the last two weeks, been
-    /// paid at an address a wallet with the usual gap limit may not look at
-    /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`).
-    pub fn wallet_gap_note_due(&self) -> bool {
+    /// Whether this store has, in the last two weeks, been paid at an
+    /// address a wallet with the usual gap limit may not look at
+    /// (`AutoInvoiceStatus::wallet_gap_paid_at_ms`). Per store, on the page
+    /// of the store it happened at.
+    pub fn wallet_gap_note_due(&self, store_contract_id: &[u8]) -> bool {
         self.auto_invoice
             .status
-            .values()
-            .any(|s| s.as_ref().is_ok_and(|s| s.wallet_gap_paid_at_ms.is_some()))
+            .get(store_contract_id)
+            .is_some_and(|s| s.as_ref().is_ok_and(|s| s.wallet_gap_paid_at_ms.is_some()))
     }
 
     /// What the seller's store page says about instant checkout, or `None`
@@ -439,6 +440,17 @@ pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> 
 }
 
 fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+    let line = instant_checkout_state_line(status, now_ms);
+    match &status.capped {
+        Some(why) => format!(
+            "In the last hour a buyer couldn't order because {why}; they were told to try again \
+             later. {line}"
+        ),
+        None => line,
+    }
+}
+
+fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {

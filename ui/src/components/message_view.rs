@@ -1426,10 +1426,11 @@ fn count_unanswered<'a>(
             unanswered_requests(group, listings, published, keys_for(tag))
                 .iter()
                 // Not a Buy now: an unpaid one is not an order and does not
-                // need the seller (Ian, 2026-09-26), even one their store
-                // could not answer. The store answers it the next time it
-                // runs, within a day of the request; the inbox still offers
-                // the seller the control to answer it by hand.
+                // need the seller (Ian, 2026-09-26). The seller's store
+                // answers every Buy now it reads, with an invoice or a
+                // decline saying why (harvest#177); one it has not read yet
+                // is answered when it next runs. The inbox still offers the
+                // seller the control to answer one by hand.
                 .filter(|request| request.instant.is_none())
                 .filter(|request| {
                     listings.iter().any(|l| l.listing.id == request.listing_id)

@@ -603,6 +603,10 @@ pub struct AutoInvoiceStatus {
     /// that payment, so the seller is told to raise it (Ian, 2026-09-26).
     #[serde(default)]
     pub wallet_gap_paid_at_ms: Option<u64>,
+    /// Which store limit turned a Buy now away in the last hour, if one did.
+    /// The buyer was told; the seller is too.
+    #[serde(default)]
+    pub capped: Option<String>,
 }
 
 /// What the UI asks the delegate to keep (harvest#53 Phase C). See
@@ -1835,6 +1839,7 @@ mod tests {
                     oversold: vec![],
                     paused: None,
                     wallet_gap_paid_at_ms: None,
+                    capped: None,
                 }),
             },
         ]
