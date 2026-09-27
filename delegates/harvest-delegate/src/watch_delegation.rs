@@ -1561,6 +1561,24 @@ mod tests {
         // The next wake-up reads the watermark, not the inbox.
         let get = wake(&mut secrets, NOW + 20 * MINUTE);
         assert_ne!(get.contract_id.as_bytes(), INBOX.as_slice());
+        // And an inbox read answered meanwhile (sent before it left) sends
+        // nothing either.
+        let late_inbox_read = to_cbor(&ReadContext {
+            magic: READ_MAGIC,
+            bridge: bridge(),
+            kind: ReadKind::Inbox,
+            script: Vec::new(),
+        })
+        .unwrap();
+        let out = on_inbox_read(
+            &mut secrets,
+            &INBOX,
+            Some(&state_bytes(&open_inbox())),
+            &late_inbox_read,
+            NOW + 20 * MINUTE,
+        )
+        .unwrap();
+        assert!(out.is_empty(), "{out:?}");
     }
 
     /// A removal is not a watch: the scripts count for I7 only once the first

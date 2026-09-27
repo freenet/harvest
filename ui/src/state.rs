@@ -31611,6 +31611,38 @@ mod buy_flow_tests {
         assert_eq!(state.pending_signatures.len(), 1);
     }
 
+    /// A pending delegation is something the minute check acts on, and one
+    /// the vault never answers times out like a watch request: dropped, and
+    /// its key not asked again this session. Mutated red by leaving
+    /// `WatchDelegation` out of `is_watch_signature`, and out of the timeout.
+    #[test]
+    fn an_unanswered_delegation_times_out_like_a_watch_request() {
+        let mut state = AppState::default();
+        state.bitcoin.inbox = Some(crate::bitcoin_inbox::InboxTracker::new(
+            inbox::bridge(),
+            inbox::inbox_key(),
+        ));
+        assert!(!state.watch_check_could_act());
+        state
+            .pending_signatures
+            .push_back(PendingSignature::WatchDelegation(Box::new(
+                crate::auto_invoice_flow::PendingWatchDelegation {
+                    fingerprint: "seller-fp".into(),
+                    ghostkey: freenet_bitcoin_inbox::GhostkeyId([1; 32]),
+                    network: BitcoinNetwork::Signet,
+                    bridge: inbox::bridge(),
+                    inbox_contract_id: [2; 32],
+                    issued_mainnet_height: 3,
+                    signing_payload: vec![4],
+                    queued_at_ms: DELEGATION_NOW,
+                },
+            )));
+        assert!(state.watch_check_could_act());
+        state.queue_due_watch_requests(DELEGATION_NOW + crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS);
+        assert!(state.pending_signatures.is_empty());
+        assert!(state.bitcoin.watch_requests_stopped.contains("seller-fp"));
+    }
+
     /// A refused delegation is a watch signature: dropped, the key not asked
     /// again this session, and nothing of the seller's cleared. It also holds
     /// the watch requests back while it waits, so a refusal is about one
