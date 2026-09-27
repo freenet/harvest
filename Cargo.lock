@@ -1966,6 +1966,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-bitcoin-common",
+ "freenet-bitcoin-inbox",
  "freenet-migrate",
  "freenet-stdlib",
  "getrandom 0.2.17",

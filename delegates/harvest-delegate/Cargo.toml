@@ -13,6 +13,12 @@ freenet-main-delegate = []
 [dependencies]
 harvest-common = { workspace = true, features = ["custody"] }
 freenet-bitcoin-common = { workspace = true }
+# Asking the bridge to watch the next payment addresses with no tab open,
+# signed by a watch key the seller's Ghost Key delegated to this delegate
+# (freenet-bitcoin#30; see src/watch_delegation.rs). `seal` encrypts the
+# request to the bridge; its randomness comes through this crate's registered
+# `getrandom` backend, the same one key generation uses.
+freenet-bitcoin-inbox = { workspace = true, features = ["seal"] }
 freenet-stdlib = { workspace = true }
 # The delegate half: `handle_export_request` plus the origin policy that gates
 # it. Answering a successor's export request is the ONLY way this generation's
@@ -61,6 +67,9 @@ ghostkey-common = { workspace = true }
 # than stubbing out payment verification -- same reasoning as
 # `common/Cargo.toml` and `contracts/store-contract/Cargo.toml`.
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+# A throwaway Ghost Key authority, so the watch-delegation tests build entries
+# the real inbox contract logic admits.
+freenet-bitcoin-inbox = { workspace = true, features = ["test-support"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

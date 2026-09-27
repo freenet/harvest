@@ -15,6 +15,7 @@ mod node_glue;
 mod origin;
 mod secrets;
 mod store_keys;
+mod watch_delegation;
 
 use freenet_stdlib::prelude::{
     ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface, InboundDelegateMsg,
@@ -241,6 +242,22 @@ fn handle_request(
             )];
             out.extend(updates);
             Ok(out)
+        }
+        // The watch key and the Ghost Key's delegation to it
+        // (`watch_delegation`). Checked above like everything else: only the
+        // Harvest web app may read the watch key or hand it a delegation.
+        Ok(
+            request @ (HarvestDelegateRequest::GetWatchKey
+            | HarvestDelegateRequest::SetWatchDelegation { .. }
+            | HarvestDelegateRequest::UpdateWatchDelegation { .. }),
+        ) => {
+            let response =
+                watch_delegation::handle_request(&mut CtxSecrets(ctx), request, now_ms());
+            let response_bytes = to_cbor(&response)
+                .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(response_bytes),
+            )])
         }
         Ok(request) => {
             let response = handlers::handle(&mut CtxSecrets(ctx), origin, request);

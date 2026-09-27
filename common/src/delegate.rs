@@ -516,6 +516,92 @@ pub enum HarvestDelegateRequest {
         store_contract_id: Vec<u8>,
         force: bool,
     },
+
+    /// The public half of this delegate's watch key, made on first asking
+    /// and kept: the key the seller's Ghost Key delegates its bridge watch
+    /// requests to (see [`WatchDelegationGrant`]). Answered with
+    /// [`HarvestDelegateResponse::WatchKey`].
+    GetWatchKey,
+
+    /// Keep the seller's Ghost Key's delegation of bridge watch requests to
+    /// this delegate's watch key, so the delegate can have the bridge watch
+    /// its next payment addresses with no tab open. Answered with
+    /// [`HarvestDelegateResponse::WatchDelegation`].
+    SetWatchDelegation { grant: Box<WatchDelegationGrant> },
+
+    /// Tell the delegate, for a delegation it already holds, which inbox the
+    /// bridge now serves (the bridge's inbox pointer can move it) and the
+    /// latest `made_at_ms` the tab has sent, which the delegate's own
+    /// requests must stay above. Answered with
+    /// [`HarvestDelegateResponse::WatchDelegation`].
+    UpdateWatchDelegation {
+        bridge: freenet_bitcoin_common::BridgeId,
+        inbox_contract_id: [u8; 32],
+        last_made_at_ms: u64,
+    },
+}
+
+/// The seller's Ghost Key letting the Harvest delegate's watch key ask one
+/// bridge to watch scripts on its behalf (freenet-bitcoin#30,
+/// `freenet_bitcoin_inbox::Delegation`).
+///
+/// # Why
+///
+/// A payment is seen only at an address the bridge was asked to watch before
+/// it was paid, and the watch request must come from the seller's Ghost Key.
+/// A delegate running with no tab cannot reach the Ghost Key vault, so
+/// without this the store stops taking orders once the addresses the tab
+/// had watched are used or their watch horizon nears. With it, the delegate
+/// signs its own requests with its watch key, and the bridge acts on them as
+/// the Ghost Key's.
+///
+/// Everything here is public: the delegation travels in the clear in the
+/// bridge's inbox, and a certificate is published with every entry.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct WatchDelegationGrant {
+    /// The network the delegated requests are for, and the bridge.
+    pub network: freenet_bitcoin_common::BitcoinNetwork,
+    pub bridge: freenet_bitcoin_common::BridgeId,
+    /// The seller's Ghost Key (its Ed25519 verifying key): the key the
+    /// delegation is signed by, and the one each request is sealed to.
+    pub ghostkey: [u8; 32],
+    /// That Ghost Key's certificate, carried by every entry.
+    pub certificate_pem: String,
+    /// `freenet_bitcoin_inbox::Delegation`, as the vault's `SignResult` for
+    /// `DelegationBody::signing_payload` returned it.
+    pub delegation_scoped_payload: Vec<u8>,
+    pub delegation_signature: Vec<u8>,
+    /// The bridge's inbox contract, as the tab resolved it from the bridge's
+    /// pointer.
+    pub inbox_contract_id: [u8; 32],
+    /// The latest `made_at_ms` the tab has sent this bridge: the tab and the
+    /// delegate share one timeline per Ghost Key, and a request dated below
+    /// the last one the bridge applied is ignored.
+    pub last_made_at_ms: u64,
+}
+
+/// A delegation the delegate holds, as the tab is told it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct WatchDelegationStatus {
+    pub bridge: freenet_bitcoin_common::BridgeId,
+    pub ghostkey: [u8; 32],
+    /// The height the delegation was issued at: a later one supersedes it.
+    pub issued_mainnet_height: u32,
+    pub inbox_contract_id: [u8; 32],
+    /// The latest `made_at_ms` on this Ghost Key's timeline the delegate
+    /// knows of, its own or the tab's: the tab dates its next request above
+    /// it.
+    pub made_at_ms: u64,
+    /// The delegate's next payment addresses the bridge has read the
+    /// delegate's own watch request for, with the watch outlasting a payment
+    /// window.
+    pub watched: u32,
+    /// A request of the delegate's is waiting to be read.
+    pub outstanding: bool,
+    /// The delegate's requests have twice left the inbox unread: the bridge
+    /// is refusing the delegation (revoked, or superseded by another
+    /// device's). It sends no more until the tab delegates again.
+    pub stalled: bool,
 }
 
 /// The most unpaid instant orders one buyer conversation may hold at a
@@ -640,6 +726,12 @@ pub struct AutoInvoiceStatus {
     /// does not wake it: heartbeats then come only from an open tab.
     #[serde(default)]
     pub last_wakeup_ms: Option<u64>,
+    /// The delegation of watch requests the delegate holds for one of this
+    /// store's bridges, if any ([`WatchDelegationGrant`]). `None` from a
+    /// delegate that holds none, and from one that predates them: the tab
+    /// then asks the seller's Ghost Key for one.
+    #[serde(default)]
+    pub watch_delegation: Option<WatchDelegationStatus>,
 }
 
 /// A heartbeat the delegate signed for the tab ([`HarvestDelegateRequest::
@@ -1069,6 +1161,17 @@ pub enum HarvestDelegateResponse {
     Heartbeat {
         store_contract_id: Vec<u8>,
         result: Result<HeartbeatAnswer, String>,
+    },
+    /// The answer to [`HarvestDelegateRequest::GetWatchKey`]: the watch
+    /// key's PUBLIC half.
+    WatchKey {
+        result: Result<[u8; 32], String>,
+    },
+    /// The answer to [`HarvestDelegateRequest::SetWatchDelegation`] and
+    /// [`HarvestDelegateRequest::UpdateWatchDelegation`].
+    WatchDelegation {
+        bridge: freenet_bitcoin_common::BridgeId,
+        result: Result<WatchDelegationStatus, String>,
     },
 }
 
@@ -1627,9 +1730,13 @@ mod tests {
             R::AutoInvoice { .. } => (29, false),
             // A store-key signature over a public heartbeat, published.
             R::Heartbeat { .. } => (30, false),
+            // The watch key's public half; its secret never leaves.
+            R::WatchKey { .. } => (31, false),
+            // A delegation, which is published in the bridge's inbox.
+            R::WatchDelegation { .. } => (32, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 31;
+    const RESPONSE_VARIANTS: usize = 33;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1670,9 +1777,14 @@ mod tests {
             // Public payment scripts and contract ids.
             Q::ArmAutoInvoice { .. } => (27, false),
             Q::Heartbeat { .. } => (28, false),
+            Q::GetWatchKey => (29, false),
+            // A Ghost Key's delegation and certificate, both published in
+            // the bridge's inbox.
+            Q::SetWatchDelegation { .. } => (30, false),
+            Q::UpdateWatchDelegation { .. } => (31, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 29;
+    const REQUEST_VARIANTS: usize = 32;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1894,6 +2006,7 @@ mod tests {
                     wallet_gap_limit: 0,
                     capped: None,
                     last_wakeup_ms: Some(6),
+                    watch_delegation: Some(watch_delegation_status()),
                 }),
             },
             R::Heartbeat {
@@ -1903,7 +2016,27 @@ mod tests {
                     last_wakeup_ms: Some(7),
                 }),
             },
+            R::WatchKey {
+                result: Ok([12u8; 32]),
+            },
+            R::WatchDelegation {
+                bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
+                result: Ok(watch_delegation_status()),
+            },
         ]
+    }
+
+    fn watch_delegation_status() -> WatchDelegationStatus {
+        WatchDelegationStatus {
+            bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
+            ghostkey: [14u8; 32],
+            issued_mainnet_height: 15,
+            inbox_contract_id: [16u8; 32],
+            made_at_ms: 17,
+            watched: 3,
+            outstanding: true,
+            stalled: false,
+        }
     }
 
     fn purchase_to_keep() -> PurchaseToKeep {
@@ -2071,6 +2204,24 @@ mod tests {
             Q::Heartbeat {
                 store_contract_id: store(),
                 force: true,
+            },
+            Q::GetWatchKey,
+            Q::SetWatchDelegation {
+                grant: Box::new(WatchDelegationGrant {
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
+                    ghostkey: [14u8; 32],
+                    certificate_pem: "cert".into(),
+                    delegation_scoped_payload: vec![18u8; 8],
+                    delegation_signature: vec![19u8; 64],
+                    inbox_contract_id: [16u8; 32],
+                    last_made_at_ms: 17,
+                }),
+            },
+            Q::UpdateWatchDelegation {
+                bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
+                inbox_contract_id: [16u8; 32],
+                last_made_at_ms: 18,
             },
         ]
     }

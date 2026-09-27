@@ -517,11 +517,14 @@ fn on_mailbox_retry<S: SecretStore>(
 }
 const REPLIES_MAGIC: [u8; 8] = *b"hvrepl01";
 
-fn load<S: SecretStore, T: for<'de> Deserialize<'de>>(secrets: &S, key: &[u8]) -> Option<T> {
+pub(crate) fn load<S: SecretStore, T: for<'de> Deserialize<'de>>(
+    secrets: &S,
+    key: &[u8],
+) -> Option<T> {
     secrets.get_secret(key).and_then(|b| from_cbor(&b).ok())
 }
 
-fn save<S: SecretStore, T: Serialize>(secrets: &mut S, key: &[u8], value: &T) -> bool {
+pub(crate) fn save<S: SecretStore, T: Serialize>(secrets: &mut S, key: &[u8], value: &T) -> bool {
     to_cbor(value).is_ok_and(|bytes| secrets.set_secret(key, &bytes))
 }
 
@@ -529,7 +532,7 @@ pub(crate) fn load_arm<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) ->
     load(secrets, &arm_key(store_contract_id))
 }
 
-fn arms<S: SecretStore>(secrets: &S) -> Vec<ArmRecord> {
+pub(crate) fn arms<S: SecretStore>(secrets: &S) -> Vec<ArmRecord> {
     secrets
         .list_secrets(format!("{AUTO_PREFIX}arm:").as_bytes())
         .iter()
@@ -628,11 +631,15 @@ pub(crate) fn arm<S: SecretStore>(
 fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> AutoInvoiceStatus {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let ledger = load_ledger(secrets, &record.arm.store_contract_id);
-    let remaining = remaining_watched(secrets, &record.arm);
+    let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
+    let remaining = remaining_watched(secrets, &record.arm, &watched);
     AutoInvoiceStatus {
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
-        invoicing_until_ms: record.watched_until_ms.saturating_sub(WATCH_NEEDED_MS),
+        invoicing_until_ms: record
+            .watched_until_ms
+            .saturating_sub(WATCH_NEEDED_MS)
+            .max(watched.delegated_until_ms(now_ms)),
         last_background_run_ms: load::<_, u64>(secrets, RAN_KEY),
         issued_last_day: ledger.issued_last_day(now_ms) as u32,
         oversold: ledger
@@ -658,6 +665,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
             .filter(|(at, _)| now_ms.saturating_sub(*at) < CAPPED_SHOWN_MS)
             .map(|(_, why)| why.clone()),
         last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
+        watch_delegation: crate::watch_delegation::status_for_arm(secrets, &record.arm, now_ms),
     }
 }
 
@@ -1013,8 +1021,10 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     *held != before
 }
 
-/// How many watched scripts are at or after the counter.
-fn remaining_watched<S: SecretStore>(secrets: &S, arm: &AutoInvoiceArm) -> u32 {
+/// How many watched scripts are at or after the counter: the arm's (whether
+/// or not its watch is still live, which `paused` reports) and the
+/// delegate's own ([`WatchSet::delegated`]).
+fn remaining_watched<S: SecretStore>(secrets: &S, arm: &AutoInvoiceArm, watched: &WatchSet) -> u32 {
     let Some(status) = crate::bitcoin::load_payment_xpub(secrets) else {
         return 0;
     };
@@ -1025,10 +1035,91 @@ fn remaining_watched<S: SecretStore>(secrets: &S, arm: &AutoInvoiceArm) -> u32 {
     .map(|upcoming| {
         upcoming
             .iter()
-            .filter(|a| arm.watched_scripts.contains(&a.script_pubkey))
+            .filter(|a| {
+                arm.watched_scripts.contains(&a.script_pubkey)
+                    || watched.delegated.contains(&a.script_pubkey)
+            })
             .count() as u32
     })
     .unwrap_or(0)
+}
+
+/// The payment scripts I7 accepts now, from its two sources.
+///
+/// - **The tab's** ([`AutoInvoiceArm::watched_scripts`]), while the watch the
+///   tab had read still outlasts an invoice's window: by this node's clock
+///   ([`ArmRecord::watched_until_ms`]), and by height when it named one.
+/// - **The delegate's own** (`crate::watch_delegation`), each script while
+///   the horizon its read request asked for is at least
+///   [`WATCH_NEEDED_BLOCKS`] past the tip.
+pub(crate) struct WatchSet {
+    /// The arm's watch outlasts an invoice's window by the clock.
+    arm_time_live: bool,
+    /// ... and by height, when it names one and the tip is known.
+    arm_live: bool,
+    arm: Vec<Vec<u8>>,
+    pub(crate) delegated: Vec<Vec<u8>>,
+    /// The nearest horizon among `delegated`, and the tip it was judged at.
+    delegated_until: Option<(u32, u32)>,
+}
+
+impl WatchSet {
+    fn accepts(&self, script: &[u8]) -> bool {
+        (self.arm_live && self.arm.iter().any(|s| s == script))
+            || self.delegated.iter().any(|s| s == script)
+    }
+
+    /// Until when, by this node's clock, the delegate's own watches let an
+    /// invoice go out, counted at the same pessimistic five minutes a block
+    /// the tab counts a horizon at. 0 without any.
+    fn delegated_until_ms(&self, now_ms: u64) -> u64 {
+        self.delegated_until.map_or(0, |(until, tip)| {
+            now_ms.saturating_add(
+                u64::from(until.saturating_sub(tip.saturating_add(WATCH_NEEDED_BLOCKS)))
+                    * 5
+                    * 60
+                    * 1000,
+            )
+        })
+    }
+}
+
+pub(crate) fn watch_set<S: SecretStore>(
+    secrets: &S,
+    record: &ArmRecord,
+    tip: Option<&TipCache>,
+    now_ms: u64,
+) -> WatchSet {
+    let arm = &record.arm;
+    let arm_time_live = now_ms.saturating_add(WATCH_NEEDED_MS) < record.watched_until_ms;
+    let arm_height_live = match (arm.watched_until_height, tip) {
+        (Some(until), Some(tip)) => tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) <= until,
+        _ => true,
+    };
+    let delegated = tip.map_or_else(Vec::new, |tip| {
+        crate::watch_delegation::delegated_watched(
+            secrets,
+            arm.network,
+            &arm.trusted_bridges,
+            tip.anchor.height,
+        )
+    });
+    let delegated_until = tip.and_then(|tip| {
+        crate::watch_delegation::nearest_delegated_horizon(
+            secrets,
+            arm.network,
+            &arm.trusted_bridges,
+            tip.anchor.height,
+        )
+        .map(|until| (until, tip.anchor.height))
+    });
+    WatchSet {
+        arm_time_live,
+        arm_live: arm_time_live && arm_height_live,
+        arm: arm.watched_scripts.clone(),
+        delegated,
+        delegated_until,
+    }
 }
 
 fn store_key<S: SecretStore>(secrets: &S, verifying: &[u8; 32]) -> Option<SigningKey> {
@@ -1164,7 +1255,10 @@ fn global_refusal<S: SecretStore>(
     now_ms: u64,
 ) -> Result<BlockAnchor, Refusal> {
     let arm = &record.arm;
-    if now_ms.saturating_add(WATCH_NEEDED_MS) >= record.watched_until_ms {
+    let watched = watch_set(secrets, record, tip, now_ms);
+    // Lapsed only when neither source has anything: the delegate's own
+    // watches keep a store taking orders after the tab's have lapsed.
+    if !watched.arm_time_live && watched.delegated.is_empty() {
         return Err(Refusal::WatchLapsed);
     }
     if store_key(secrets, &arm.store_verifying_key).is_none() {
@@ -1181,10 +1275,7 @@ fn global_refusal<S: SecretStore>(
     // A watch that ends at a height (freenet-bitcoin#26) must outlast the
     // invoice's window in blocks too: the time above is the UI's estimate
     // of the same horizon, and blocks can come faster than it assumed.
-    if arm
-        .watched_until_height
-        .is_some_and(|until| tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) > until)
-    {
+    if !watched.arm_live && watched.delegated.is_empty() {
         return Err(Refusal::WatchLapsed);
     }
     Ok(tip.anchor)
@@ -1454,6 +1545,12 @@ pub(crate) fn on_get_answer<S: SecretStore>(
             }
             return Some(Vec::new());
         }
+    }
+    // The bridge inbox a wake-up read (`watch_delegation::on_wakeup`).
+    if let Some(out) =
+        crate::watch_delegation::on_inbox_read(secrets, contract_id, state, context, now_ms)
+    {
+        return Some(out);
     }
     on_store_state(secrets, state, context, now_ms)
 }
@@ -1964,6 +2061,7 @@ pub(crate) fn decide<S: SecretStore>(
         trailing_unpaid(&xpub, &orders, &paid, now_ms)
     };
     let tip_height = anchor.height;
+    let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
 
     let mut ordered: Vec<&EncryptedMessage> = entries.iter().collect();
     ordered.sort_by_key(|m| (m.timestamp, entry_digest(m)));
@@ -1980,6 +2078,7 @@ pub(crate) fn decide<S: SecretStore>(
             &mut xpub,
             &anchor,
             tip_height,
+            &watched,
             &mut ledger,
             &issued_now,
             (
@@ -2054,6 +2153,7 @@ fn decide_one<S: SecretStore>(
     xpub: &mut harvest_common::PaymentXpubStatus,
     anchor: &BlockAnchor,
     tip_height: u32,
+    watched: &WatchSet,
     ledger: &mut Ledger,
     issued_now: &[AuthorizedOrder],
     (gap, trailing): (u32, u32),
@@ -2206,12 +2306,12 @@ fn decide_one<S: SecretStore>(
     }
 
     // I7 then I2: the next address must be one the bridge was asked to
-    // watch; only then is it spent, and the counter saved before anything
-    // names it.
+    // watch, by the tab or by this delegate ([`WatchSet`]); only then is it
+    // spent, and the counter saved before anything names it.
     let mut next = xpub.clone();
     let derived = crate::bitcoin::apply_derive_order_address(&mut next)
         .map_err(|_| Refusal::NoWatchedAddress)?;
-    if !arm.watched_scripts.contains(&derived.script_pubkey) {
+    if !watched.accepts(&derived.script_pubkey) {
         return Err(Refusal::NoWatchedAddress);
     }
     crate::bitcoin::save_payment_xpub(secrets, &next).map_err(|_| Refusal::CounterNotSaved)?;

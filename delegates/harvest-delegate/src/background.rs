@@ -18,12 +18,12 @@
 //!   No heartbeat here: on a node without wake-ups the tab heartbeats, and on
 //!   one with them the first wake-up comes within about a minute of start.
 //!
-//! What none of them can do is ask the Bitcoin bridge to watch new
-//! addresses: that request is signed with the seller's Ghost Key, and a run
-//! with no tab cannot reach the Ghost Key vault (freenet-core refuses
-//! delegate-to-delegate messages from background runs). The watches the
-//! delegate relies on are requested by the tab, for weeks at a time
-//! (freenet-bitcoin#26); see `auto_invoice::global_refusal`.
+//! - **A `heartbeat` wake-up** also keeps the next payment addresses
+//!   watched: a run with no tab cannot reach the Ghost Key vault
+//!   (freenet-core refuses delegate-to-delegate messages from background
+//!   runs), so it signs its own watch requests with a watch key the seller's
+//!   Ghost Key delegated to it once, while the tab was open
+//!   (freenet-bitcoin#30). One inbox read per run; see `watch_delegation`.
 
 use freenet_migrate::SecretStore;
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError, OutboundDelegateMsg};
@@ -55,6 +55,11 @@ pub(crate) fn on_background<S: SecretStore>(
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
             let mut out = crate::auto_invoice::heartbeats(secrets, now_ms);
+            // Then at most one inbox read for the delegated watch, before
+            // the mailbox re-reads (rare: only after a refused update): a
+            // node that meters a run's operations drops the tail, and the
+            // watch is what keeps the store taking orders at all.
+            out.extend(crate::watch_delegation::on_wakeup(secrets, now_ms));
             out.extend(crate::auto_invoice::mailbox_retries(secrets));
             out
         }
