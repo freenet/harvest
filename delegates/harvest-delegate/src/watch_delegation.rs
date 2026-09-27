@@ -1214,6 +1214,26 @@ mod tests {
         assert_eq!(on_wakeup(&secrets, NOW + 900_000).len(), 1);
     }
 
+    /// The five-minute wake-up is what runs it: after the heartbeats, one
+    /// inbox read. Mutated red by dropping the call from `background`.
+    #[test]
+    fn the_wakeup_reads_the_inbox() {
+        use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
+        let mut secrets = delegated();
+        let out = crate::background::on_background(
+            &mut secrets,
+            &BackgroundRun::Wakeup {
+                tag: HEARTBEAT_TAG.to_vec(),
+            },
+            NOW,
+        );
+        assert!(
+            matches!(out.last(), Some(OutboundDelegateMsg::GetContractRequest(get))
+                if get.contract_id.as_bytes() == INBOX.as_slice()),
+            "{out:?}"
+        );
+    }
+
     /// Nothing is sent without a delegation, without an armed store on its
     /// bridge, without a fresh tip, or once this generation is exported.
     #[test]
