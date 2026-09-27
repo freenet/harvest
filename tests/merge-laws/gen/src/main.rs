@@ -44,6 +44,7 @@ use harvest_common::mailbox::{
     MAX_MAILBOX_BYTES,
 };
 use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
+use harvest_common::presence::{Heartbeat, PresenceParameters, PresenceStateV1, SignedHeartbeat};
 use harvest_common::reputation::{
     Complaint, ComplaintTag, ComplaintTerms, ReputationParameters, ReputationStateV1,
     MAX_COMPLAINTS,
@@ -1542,6 +1543,168 @@ fn gen_index(root: &Path) {
     ]);
 }
 
+// ---------------------------------------------------------------------------
+// Presence: one store's latest heartbeat (harvest-presence-contract)
+// ---------------------------------------------------------------------------
+
+/// Store presence (`common/src/presence.rs`): the whole state is at most one
+/// signed heartbeat, kept by larger `seq` then smaller canonical encoding --
+/// a total order over a single slot, unlike mailbox's list or index's map.
+///
+/// `presence` is HONEST: every state is reachable via `apply_delta` from
+/// empty, with several seqs, a same-seq tie (different `at_ms` and
+/// `taking_orders`, decided by encoding, not by either field), and both
+/// `taking_orders` values; plus the pairwise merges and delta steps so the
+/// delta laws run.
+///
+/// `presence-adv` holds what the contract must REFUSE -- another key's
+/// signature, a tampered payload under a genuine signature, and a
+/// non-canonical encoding of a valid state (the contract's own
+/// `is_canonical_cbor` check, `presence-contract/src/lib.rs`) -- beside
+/// boundary values it must ACCEPT: `seq` at `u64::MAX` and `at_ms` at 0,
+/// which stress the total order and tie-break at the ends of the type
+/// rather than testing a refusal.
+fn gen_presence(root: &Path) {
+    let store_key = SigningKey::from_bytes(&[0xF7; 32]);
+    let other_key = SigningKey::from_bytes(&[0xF8; 32]);
+    let params = PresenceParameters::new(store_key.verifying_key());
+    let pbytes = cbor(&params);
+
+    let hb = |seq: u64, at_ms: u64, taking_orders: bool| -> SignedHeartbeat {
+        SignedHeartbeat::sign(&store_key, Heartbeat::new(seq, at_ms, taking_orders)).unwrap()
+    };
+    let build = |h: SignedHeartbeat| {
+        let mut s = PresenceStateV1::default();
+        s.apply_delta(&params, &h).unwrap();
+        s.verify(&params).unwrap();
+        s
+    };
+    let merge = |a: &PresenceStateV1, b: &PresenceStateV1| {
+        let mut m = a.clone();
+        m.merge(&params, b).unwrap();
+        m
+    };
+
+    let h1 = hb(1, 1_000, true);
+    let h2 = hb(2, 2_000, false);
+    let h3 = hb(3, 3_000, true);
+    // Same seq, different at_ms and taking_orders: the tie is decided by the
+    // smaller canonical encoding, not by either field.
+    let h5a = hb(5, 5_000, true);
+    let h5b = hb(5, 6_000, false);
+    println!(
+        "presence: seq-5 tie winner is {}",
+        if cbor(&h5a) <= cbor(&h5b) { "H5a" } else { "H5b" }
+    );
+
+    let honest: Vec<(&str, PresenceStateV1)> = vec![
+        ("default", PresenceStateV1::default()),
+        ("H1", build(h1.clone())),
+        ("H2", build(h2.clone())),
+        ("H3", build(h3.clone())),
+        ("H5a", build(h5a.clone())),
+        ("H5b", build(h5b.clone())),
+    ];
+    let pairs = [
+        ("default", "H1"), ("H1", "default"),
+        ("H1", "H2"), ("H2", "H1"),
+        ("H2", "H3"), ("H3", "H2"),
+        ("H1", "H3"), ("H3", "H1"),
+        ("H5a", "H5b"), ("H5b", "H5a"),
+        ("H3", "H5a"), ("H5a", "H3"),
+        ("default", "H5a"), ("H5a", "default"),
+    ];
+    let find = |all: &Vec<(&str, PresenceStateV1)>, n: &str| {
+        all.iter().find(|(m, _)| *m == n).unwrap().1.clone()
+    };
+
+    let mut c = Corpus::new(root, "presence", &pbytes);
+    let mut all = honest.clone();
+    let mut extra = vec![];
+    for (a, b) in pairs {
+        let r = merge(&find(&all, a), &find(&all, b));
+        let name: &'static str = Box::leak(format!("m_{a}__{b}").into_boxed_str());
+        extra.push((a, name, r));
+    }
+    for (_, n, s) in &extra {
+        all.push((n, s.clone()));
+    }
+    for (n, s) in &all {
+        c.state(n, &cbor(s));
+    }
+    for (a, n, _) in &extra {
+        c.transition(a, n);
+    }
+    for (a, b) in pairs {
+        let base = find(&all, a);
+        let tgt = find(&all, b);
+        // The wire summary is empty bytes when there is no heartbeat to
+        // summarize, never the CBOR of `None` (`summarize_state` in
+        // presence-contract/src/lib.rs); the delta laws are fed through
+        // this same wire shape, not the native `Option<PresenceSummaryV1>`.
+        let summ_opt = base.summarize().unwrap();
+        let summ_bytes = summ_opt.as_ref().map(|s| cbor(s)).unwrap_or_default();
+        let Some(d) = tgt.delta(summ_opt.as_ref()).unwrap() else {
+            continue;
+        };
+        let mut r = base.clone();
+        r.apply_delta(&params, &d).unwrap();
+        r.verify(&params).unwrap();
+        c.delta_step(&cbor(&base), &summ_bytes, &cbor(&d), &cbor(&r));
+    }
+    c.finish();
+
+    // ---- presence-adv: refusals, plus boundary values the contract must accept.
+    let base_bytes = cbor(&build(h1.clone()));
+
+    // Boundary values: legal u64 extremes, still an honestly-signed and
+    // honestly-applied heartbeat, to stress the seq order and tie-break
+    // rather than a refusal.
+    let seq_max = build(hb(u64::MAX, 9_000, true));
+    let at_ms_zero = build(hb(9, 0, true));
+
+    // Signed by a DIFFERENT store key: refused by `verify` and by
+    // `apply_delta` (`a_heartbeat_by_another_key_is_refused`,
+    // common/src/presence.rs).
+    let other_signed = SignedHeartbeat::sign(&other_key, Heartbeat::new(9, 9_000, true)).unwrap();
+    assert!(
+        other_signed.verify(&store_key.verifying_key()).is_err(),
+        "a fixture meant to be refused must actually fail verify"
+    );
+    let adv_other_key = PresenceStateV1 {
+        heartbeat: Some(other_signed),
+    };
+    assert!(adv_other_key.verify(&params).is_err());
+
+    // A tampered field under an otherwise-genuine signature: the exact
+    // envelope check refuses it, same as
+    // `a_changed_heartbeat_under_a_valid_signature_is_refused`.
+    let mut tampered = hb(9, 9_000, true);
+    tampered.heartbeat.at_ms = 12_345;
+    assert!(tampered.verify(&store_key.verifying_key()).is_err());
+    let adv_tampered = PresenceStateV1 {
+        heartbeat: Some(tampered),
+    };
+    assert!(adv_tampered.verify(&params).is_err());
+
+    // Non-canonical encodings of a valid state: a trailing byte, and an
+    // unknown map key. `is_canonical_cbor` refuses both even though they
+    // decode and `verify` (presence-contract's
+    // `a_non_canonical_encoding_is_refused`).
+    let (trailing, unknown_field) = noncanon(&base_bytes);
+
+    let mut c = Corpus::new(root, "presence-adv", &pbytes);
+    c.state("default", &cbor(&PresenceStateV1::default()));
+    c.state("H1", &base_bytes);
+    c.state("adv_seq_max", &cbor(&seq_max));
+    c.state("adv_at_ms_zero", &cbor(&at_ms_zero));
+    c.state("adv_other_key", &cbor(&adv_other_key));
+    c.state("adv_tampered_payload", &cbor(&adv_tampered));
+    c.state("adv_trailing_byte", &trailing);
+    c.state("adv_unknown_field", &unknown_field);
+    c.finish();
+}
+
 fn main() {
     let root = PathBuf::from(
         std::env::args()
@@ -1597,6 +1760,9 @@ fn main() {
     }
     if want("request") {
         gen_request(&root);
+    }
+    if want("presence") {
+        gen_presence(&root);
     }
 }
 

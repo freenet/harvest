@@ -40,6 +40,7 @@ if [ ${#corpora[@]} -eq 0 ]; then
     mailbox mailbox-empty mailbox-adv mailbox-cap mailbox-cap2 mailbox-cap3
     mailbox-noncanon mailbox-rr
     index index-cap index-bad index-clash index-adv
+    presence presence-adv
   )
 fi
 props=(state_idempotence state_commutativity state_associativity emitted_state_validity update_determinism summary_determinism delta_determinism delta_idempotence delta_permutation_invariance self_delta_empty whole_state_self_delta reconciliation_cycle path_agreement transition_path_agreement)
@@ -56,7 +57,7 @@ OUT="${OUT:-$W/results}"; mkdir -p "$OUT"
 # runs. The hashes go in the results, so a reported number always names the
 # bytes it describes.
 SNAP="$OUT/wasm"; mkdir -p "$SNAP"
-for a in store_contract reputation_contract mailbox_contract index_contract; do
+for a in store_contract reputation_contract mailbox_contract index_contract presence_contract; do
   src="$REPO/target/wasm32-unknown-unknown/release/$a.wasm"
   [ -f "$src" ] && cp "$src" "$SNAP/$a.wasm"
 done
