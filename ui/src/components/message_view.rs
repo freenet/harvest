@@ -80,6 +80,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
         // anything counts or groups it (the anti-spam gate's seller half).
         let published_orders = store.map(|s| s.orders.as_slice()).unwrap_or_default();
         let all = app_state.mailbox_entries(&store_contract_id);
+        // `shown_to_seller` works the vouchers out again below; that is a
+        // cache hit (`voucher_verifies` remembers each verdict), not a second
+        // chain check.
         let open = open_conversations(
             &all,
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
@@ -1340,10 +1343,14 @@ fn shown_given(
 }
 
 /// Whether the seller's inbox offers to answer `request` by hand. A Buy now
-/// only in an open conversation ([`open_conversations`]): elsewhere its picks
-/// are blanked, so the seller could not check the total against them, and an
-/// unpaid Buy now is not the seller's order (the store answers it itself). A
-/// quote request (from before fixed prices) is offered as before.
+/// only in an open conversation ([`open_conversations`]: a verified voucher
+/// or a paid Buy now in it): elsewhere its picks are blanked, so the seller
+/// could not check the total against them, and a Buy now from a buyer who
+/// has neither vouched nor paid is not the seller's to answer (the store
+/// answers it itself). Openness is per conversation on purpose: only the
+/// holder of that conversation's key can write under its tag, so a voucher
+/// or payment there speaks for every request in it. A quote request (from
+/// before fixed prices) is offered as before.
 fn offered_by_hand(request: &PendingRequest, open: bool) -> bool {
     request.instant.is_none() || open
 }
