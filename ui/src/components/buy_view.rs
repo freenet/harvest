@@ -1536,7 +1536,7 @@ mod tests {
         );
         let by_hand = purchase(Some(order(OrderStatus::AwaitingPayment, false)), vec![]);
         let unpublished = purchase(None, vec![PaymentBlocker::CommitmentNotPublished]);
-        assert_eq!(open_unpaid_orders(&[open.clone()]), 1);
+        assert_eq!(open_unpaid_orders(std::slice::from_ref(&open)), 1);
         assert_eq!(
             open_unpaid_orders(&[paid, cancelled, stale, by_hand, unpublished]),
             0

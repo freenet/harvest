@@ -31160,9 +31160,15 @@ mod buy_flow_tests {
         assert!(on.starts_with("Your store is taking orders"), "{on}");
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
-        assert!(waiting.contains("taking orders right now: no recent block"), "{waiting}");
+        assert!(
+            waiting.contains("taking orders right now: no recent block"),
+            "{waiting}"
+        );
         let paused = instant_checkout_status_text(&status(Some(1), Some("no recent block")), 1);
-        assert!(paused.contains("taking orders right now: no recent block"), "{paused}");
+        assert!(
+            paused.contains("taking orders right now: no recent block"),
+            "{paused}"
+        );
         let mut oversold = status(Some(1), None);
         oversold.oversold = vec![OrderId([7; 32])];
         let told = instant_checkout_status_text(&oversold, 1);
