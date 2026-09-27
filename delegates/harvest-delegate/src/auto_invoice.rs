@@ -4353,6 +4353,78 @@ mod tests {
             .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_))));
     }
 
+    /// I7's second source, end to end: the tab's watch has lapsed and named
+    /// nothing, the delegate's own delegated Watch is sent, read by the bridge
+    /// (a real removal in a real inbox), and the next Buy now is then invoiced
+    /// on the first address it named. Before the removal, and once the tip
+    /// nears the horizon asked for, the store waits for the seller instead.
+    /// Mutated red by: dropping the delegated source from `WatchSet::accepts`
+    /// (NoWatchedAddress), and from the `global_refusal` lapse checks
+    /// (WatchLapsed).
+    #[test]
+    fn a_script_the_delegate_had_watched_is_invoiced_with_the_tab_gone() {
+        use crate::watch_delegation::test_support as wd;
+        let mut secrets = wd::delegated();
+        let record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
+        assert!(record.arm.watched_scripts.is_empty() && record.watched_until_ms <= NOW);
+        let base = fixture();
+        let mut f = Fixture {
+            secrets: MemSecrets::default(),
+            record,
+            store: base.store,
+            listing: base.listing,
+        };
+        let buyer = Buyer::new(80);
+
+        // Sent, not yet read: nothing to rely on.
+        let mut inbox = wd::open_inbox();
+        let (delta, entry) = wd::submitted(&wd::wake_and_read(&mut secrets, &inbox, NOW));
+        f.secrets = secrets;
+        let waiting = run(&mut f, &[buyer.request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(waiting.refused[0].1, Refusal::WatchLapsed);
+        assert_eq!(counter(&f), 0, "nothing spent");
+
+        // Read by the bridge.
+        inbox.apply_delta(&wd::params(), &delta).unwrap();
+        wd::bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
+        assert!(wd::wake_and_read(&mut f.secrets, &inbox, NOW + 300_000).is_empty());
+        let status = status_of(&f.secrets, &f.record, NOW);
+        assert_eq!(status.paused, None);
+        assert_eq!(status.watched_remaining, 10);
+        assert!(status.watch_delegation.is_some_and(|d| d.watched == 10));
+        let ok = run(&mut f, &[buyer.request(&jam(), 1, 2, 12_000)]);
+        assert_eq!(ok.orders.len(), 1, "{:?}", ok.refused);
+        assert_eq!(ok.orders[0].order.payment_script_pubkey, script_at(0));
+
+        // The tip within an invoice's window of the horizon asked for.
+        let until = wd::TIP + freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS;
+        wd::set_tip(&mut f.secrets, until - WATCH_NEEDED_BLOCKS + 1);
+        let near = run(&mut f, &[buyer.request(&jam(), 1, 3, 12_000)]);
+        assert_eq!(near.refused[0].1, Refusal::WatchLapsed);
+    }
+
+    /// With the tab's watch live, a next address only the delegate had
+    /// watched is invoiced too: the two sources are one set. Mutated red by
+    /// dropping the delegated source from `WatchSet::accepts`.
+    #[test]
+    fn the_tabs_and_the_delegates_watches_are_one_set() {
+        use crate::watch_delegation::test_support as wd;
+        let mut secrets = wd::delegated();
+        let mut inbox = wd::open_inbox();
+        let (delta, entry) = wd::submitted(&wd::wake_and_read(&mut secrets, &inbox, NOW));
+        inbox.apply_delta(&wd::params(), &delta).unwrap();
+        wd::bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
+        wd::wake_and_read(&mut secrets, &inbox, NOW + 300_000);
+        let mut f = fixture();
+        f.secrets = secrets;
+        f.record.arm.trusted_bridges = vec![wd::bridge()];
+        // The tab watches index 1 only; index 0 is the delegate's.
+        f.record.arm.watched_scripts = vec![script_at(1)];
+        let decided = run(&mut f, &[Buyer::new(81).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.orders.len(), 1, "{:?}", decided.refused);
+        assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(0));
+    }
+
     /// A watch that ends at a height must outlast an invoice's window in
     /// blocks: none is issued once the tip is within `WATCH_NEEDED_BLOCKS`
     /// of it. Mutated red by dropping the check and by an off-by-one.

@@ -498,6 +498,46 @@ mod boundary_tests {
         );
     }
 
+    /// Only the Harvest web app may read the watch key or hand the delegate
+    /// a Ghost Key's delegation: another web app could otherwise have this
+    /// node's delegate ask the bridge for watches in the seller's name, or
+    /// learn which delegate serves which seller. Mutated red by removing the
+    /// `authorize` call from `handle_request`.
+    #[test]
+    fn a_foreign_web_app_cannot_touch_the_watch_key() {
+        use harvest_common::delegate::WatchDelegationGrant;
+        let bridge = freenet_bitcoin_common::BridgeId([1u8; 32]);
+        for request in [
+            HarvestDelegateRequest::GetWatchKey,
+            HarvestDelegateRequest::SetWatchDelegation {
+                grant: Box::new(WatchDelegationGrant {
+                    network: BitcoinNetwork::Signet,
+                    bridge,
+                    ghostkey: [2u8; 32],
+                    certificate_pem: String::new(),
+                    delegation_scoped_payload: vec![],
+                    delegation_signature: vec![],
+                    inbox_contract_id: [3u8; 32],
+                    last_made_at_ms: 0,
+                }),
+            },
+            HarvestDelegateRequest::UpdateWatchDelegation {
+                bridge,
+                inbox_contract_id: [3u8; 32],
+                last_made_at_ms: 0,
+            },
+        ] {
+            let payload = to_cbor(&request).expect("cbor");
+            for origin in [Some(a_different_web_app()), None] {
+                let message = refusal(&payload, origin.as_ref());
+                assert!(
+                    message.contains("Harvest web app") || message.contains("origin"),
+                    "{request:?}: {message}"
+                );
+            }
+        }
+    }
+
     /// A `PurchaseToKeep` that decodes but never verifies -- good enough for a
     /// test that only exercises the ORIGIN gate, which fires before this
     /// content is looked at.

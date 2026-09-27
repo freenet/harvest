@@ -272,6 +272,29 @@ mod tests {
         );
     }
 
+    /// The watch key stays behind: a successor has none until the tab
+    /// delegates to it, and that newer delegation supersedes this
+    /// generation's at the bridge. Exported, an old generation left running
+    /// could go on asking in the seller's name beside its successor. Mutated
+    /// red by exporting everything under `harvest:auto:`.
+    #[test]
+    fn the_watch_key_and_its_delegation_are_not_exported() {
+        let mut s = store();
+        s.set_secret(crate::watch_delegation::WATCH_KEY, &[7u8; 32]);
+        let delegation =
+            crate::watch_delegation::delegation_key(&freenet_bitcoin_common::BridgeId([1; 32]));
+        s.set_secret(&delegation, b"a delegation");
+        let msgs = export(&mut s, Some(&harvest_origin()), 4).expect("authorized");
+        let keys: Vec<Vec<u8>> = exported(&msgs)
+            .secrets
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!keys.iter().any(|k| k == crate::watch_delegation::WATCH_KEY));
+        assert!(!keys.contains(&delegation));
+        assert!(keys.iter().any(|k| k == b"harvest:rsa_sk:fp1"));
+    }
+
     /// Exporting to a successor disarms instant checkout here, and never
     /// carries an arm. Mutated red by dropping the `disarm_all` call.
     #[test]

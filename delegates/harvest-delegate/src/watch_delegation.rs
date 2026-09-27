@@ -730,3 +730,541 @@ fn build_request<S: SecretStore>(
         delta,
     ))
 }
+
+/// A real inbox, a test Ghost Key authority and a delegate set up to use
+/// them, shared with `auto_invoice`'s tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::auto_invoice::{arm_key, ArmRecord};
+    use crate::secrets::MemSecrets;
+    use freenet_bitcoin_common::{BlockAnchor, BlockHash};
+    use freenet_bitcoin_inbox::test_support::{TestAuthority, TestGhostkey};
+    use freenet_bitcoin_inbox::{InboxParameters, RemovalBatch, SignedFloor};
+    use std::sync::OnceLock;
+
+    pub const NOW: u64 = 1_800_000_000_000;
+    pub const FLOOR: u32 = 900_000;
+    pub const TIP: u32 = 1_000;
+    pub const INBOX: [u8; 32] = [0x1b; 32];
+
+    /// An RSA notary key per test binary, not per test.
+    pub fn authority() -> &'static TestAuthority {
+        static A: OnceLock<TestAuthority> = OnceLock::new();
+        A.get_or_init(TestAuthority::new)
+    }
+
+    /// The seller's Ghost Key.
+    pub fn seller() -> &'static TestGhostkey {
+        static G: OnceLock<TestGhostkey> = OnceLock::new();
+        G.get_or_init(|| authority().mint())
+    }
+
+    pub fn bridge_key() -> SigningKey {
+        SigningKey::from_bytes(&[3u8; 32])
+    }
+
+    pub fn bridge() -> BridgeId {
+        BridgeId(bridge_key().verifying_key().to_bytes())
+    }
+
+    pub fn params() -> InboxParameters {
+        authority().params(bridge())
+    }
+
+    pub fn open_inbox() -> InboxStateV1 {
+        let mut s = InboxStateV1::default();
+        s.apply_delta(
+            &params(),
+            &InboxDelta {
+                floor: Some(SignedFloor::sign(&bridge_key(), FLOOR)),
+                entries: vec![],
+                removals: vec![],
+            },
+        )
+        .expect("the bridge opens its inbox");
+        s
+    }
+
+    pub fn state_bytes(state: &InboxStateV1) -> Vec<u8> {
+        freenet_bitcoin_common::to_cbor(state).expect("state encodes")
+    }
+
+    /// The bridge reading `key`, dated `height`: a signed removal.
+    pub fn bridge_reads(state: &mut InboxStateV1, key: &EntryKey, height: u32) {
+        let mut removed = std::collections::BTreeSet::new();
+        removed.insert(key.removal_prefix());
+        state
+            .apply_delta(
+                &params(),
+                &InboxDelta {
+                    floor: state.floor.clone(),
+                    entries: vec![],
+                    removals: vec![RemovalBatch::sign(&bridge_key(), height, &removed)],
+                },
+            )
+            .expect("the bridge removes what it read");
+    }
+
+    pub fn signet_vpub() -> String {
+        let mut bytes = bs58::decode(
+            "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs",
+        )
+        .with_check(None)
+        .into_vec()
+        .expect("the BIP-84 vector must decode");
+        bytes[..4].copy_from_slice(&0x045f_1cf6u32.to_be_bytes());
+        bs58::encode(bytes).with_check().into_string()
+    }
+
+    pub fn script_at(index: u32) -> Vec<u8> {
+        crate::bip32::AccountXpub::parse(&signet_vpub())
+            .unwrap()
+            .external_chain()
+            .unwrap()
+            .script_at(index)
+            .unwrap()
+    }
+
+    /// A tip `height`, a block ten minutes old at [`NOW`].
+    pub fn set_tip(secrets: &mut MemSecrets, height: u32) {
+        save(
+            secrets,
+            &tip_key(BitcoinNetwork::Signet),
+            &TipCache {
+                anchor: BlockAnchor {
+                    height,
+                    hash: BlockHash([7; 32]),
+                },
+                block_time: (NOW / 1000) as u32 - 600,
+            },
+        );
+    }
+
+    /// A delegate with a payment key at index 0, a tip at [`TIP`], and one
+    /// store armed on the test bridge whose tab watches nothing.
+    pub fn armed() -> MemSecrets {
+        let mut secrets = MemSecrets::default();
+        let store_sk = SigningKey::from_bytes(&[0x51; 32]);
+        crate::store_keys::keep(&mut secrets, &store_sk);
+        crate::bitcoin::save_payment_xpub(
+            &mut secrets,
+            &harvest_common::PaymentXpubStatus {
+                xpub: signet_vpub(),
+                network: BitcoinNetwork::Signet,
+                next_index: 0,
+            },
+        )
+        .unwrap();
+        set_tip(&mut secrets, TIP);
+        let record = ArmRecord {
+            arm: AutoInvoiceArm {
+                store_contract_id: vec![1; 32],
+                store_verifying_key: store_sk.verifying_key().to_bytes(),
+                mailbox_contract_id: [2; 32],
+                seller_fingerprint: "seller".into(),
+                network: BitcoinNetwork::Signet,
+                tip_contract_id: [3; 32],
+                trusted_bridges: vec![bridge()],
+                address_code_hash: [5; 32],
+                watched_scripts: Vec::new(),
+                watch_left_ms: 0,
+                watched_until_height: None,
+                presence_contract_id: None,
+            },
+            armed_at_ms: NOW - 1_000,
+            watched_until_ms: NOW,
+        };
+        save(
+            &mut secrets,
+            &arm_key(&record.arm.store_contract_id),
+            &record,
+        );
+        secrets
+    }
+
+    /// The seller's Ghost Key delegating to `watch_key`, issued at `issued`,
+    /// as the tab hands it over.
+    pub fn grant_for(watch_key: [u8; 32], issued: u32, ui_made_at_ms: u64) -> WatchDelegationGrant {
+        let body = freenet_bitcoin_inbox::DelegationBody {
+            bridge: bridge(),
+            watch_key: freenet_bitcoin_inbox::WatchKeyId(watch_key),
+            issued_mainnet_height: issued,
+            expires_mainnet_height: None,
+        };
+        let (scoped, signature) = sign_as(seller(), body.signing_payload().unwrap());
+        WatchDelegationGrant {
+            network: BitcoinNetwork::Signet,
+            bridge: bridge(),
+            ghostkey: seller().id().0,
+            certificate_pem: seller().pem.clone(),
+            delegation_scoped_payload: scoped,
+            delegation_signature: signature,
+            inbox_contract_id: INBOX,
+            last_made_at_ms: ui_made_at_ms,
+        }
+    }
+
+    /// What the vault's `SignResult` carries for `payload`.
+    pub fn sign_as(gk: &TestGhostkey, payload: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::Signer;
+        let scoped = freenet_bitcoin_common::to_cbor(&ghostkey_common::ScopedPayload {
+            requestor: ghostkey_common::SignatureRequestor::WebApp(ContractInstanceId::new(
+                [7u8; 32],
+            )),
+            payload,
+        })
+        .unwrap();
+        let sig = gk.sk.sign(&scoped).to_bytes().to_vec();
+        (scoped, sig)
+    }
+
+    /// [`armed`], with the seller's delegation to this delegate's watch key
+    /// held, the tab having last sent at `NOW + 500`.
+    pub fn delegated() -> MemSecrets {
+        let mut secrets = armed();
+        let key = get_watch_key(&mut secrets).unwrap();
+        set_delegation(
+            &mut secrets,
+            grant_for(key, freenet_bitcoin_inbox::sender_height(FLOOR), NOW + 500),
+            NOW,
+        )
+        .expect("the delegation is kept");
+        secrets
+    }
+
+    pub fn held(secrets: &MemSecrets) -> Held {
+        load_held(secrets, &bridge()).expect("a delegation is held")
+    }
+
+    /// The inbox update in `out`, decoded, and the entry it submits.
+    pub fn submitted(out: &[OutboundDelegateMsg]) -> (InboxDelta, WireEntry) {
+        assert_eq!(out.len(), 1, "exactly one message: {out:?}");
+        let OutboundDelegateMsg::UpdateContractRequest(update) = &out[0] else {
+            panic!("expected an inbox update, got {:?}", out[0]);
+        };
+        assert_eq!(
+            update.contract_id.as_bytes(),
+            INBOX.as_slice(),
+            "sent to the inbox"
+        );
+        let UpdateData::Delta(delta) = &update.update else {
+            panic!("expected a delta");
+        };
+        let delta: InboxDelta = freenet_bitcoin_common::from_cbor(delta.as_ref()).unwrap();
+        let entry = delta.entries[0].clone();
+        (delta, entry)
+    }
+
+    /// A wake-up's GET, answered with `state`: what the answer sends.
+    pub fn wake_and_read(
+        secrets: &mut MemSecrets,
+        state: &InboxStateV1,
+        now_ms: u64,
+    ) -> Vec<OutboundDelegateMsg> {
+        let out = on_wakeup(secrets, now_ms);
+        assert_eq!(out.len(), 1, "one inbox read: {out:?}");
+        let OutboundDelegateMsg::GetContractRequest(get) = &out[0] else {
+            panic!("expected a GET, got {:?}", out[0]);
+        };
+        assert_eq!(
+            get.contract_id.as_bytes(),
+            INBOX.as_slice(),
+            "the inbox is read"
+        );
+        on_inbox_read(
+            secrets,
+            &INBOX,
+            Some(&state_bytes(state)),
+            get.context.as_ref(),
+            now_ms,
+        )
+        .expect("the answer is this module's")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::secrets::MemSecrets;
+
+    /// Made on first asking and the same ever after, and stored under
+    /// `harvest:auto:`, which the migration export leaves behind. Mutated red
+    /// by generating a fresh key on every call.
+    #[test]
+    fn the_watch_key_is_made_once_and_kept() {
+        let mut secrets = MemSecrets::default();
+        let first = get_watch_key(&mut secrets).unwrap();
+        assert_eq!(get_watch_key(&mut secrets).unwrap(), first);
+        assert_eq!(
+            watch_key(&secrets).unwrap().verifying_key().to_bytes(),
+            first
+        );
+        assert!(WATCH_KEY.starts_with(AUTO_PREFIX.as_bytes()));
+        assert!(!crate::auto_invoice::is_ledger_key(WATCH_KEY));
+        // A host that refuses the write gets no key it would lose.
+        assert!(get_watch_key(&mut MemSecrets::refusing_writes()).is_err());
+    }
+
+    /// A good grant is kept; one naming another watch key, signed by another
+    /// Ghost Key, carrying another key's certificate, or older than the one
+    /// held, is refused. Each check mutated red by removing it.
+    #[test]
+    fn a_delegation_is_checked_before_it_is_kept() {
+        let mut secrets = armed();
+        let key = get_watch_key(&mut secrets).unwrap();
+        let issued = sender_height(FLOOR);
+
+        let other_key = SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes();
+        assert!(set_delegation(&mut secrets, grant_for(other_key, issued, 0), NOW).is_err());
+
+        let mut forged = grant_for(key, issued, 0);
+        let stranger = authority().mint();
+        forged.ghostkey = stranger.id().0;
+        forged.certificate_pem = stranger.pem.clone();
+        let err = set_delegation(&mut secrets, forged, NOW).unwrap_err();
+        assert!(err.contains("did not sign"), "{err}");
+
+        let mut wrong_cert = grant_for(key, issued, 0);
+        wrong_cert.certificate_pem = stranger.pem.clone();
+        let err = set_delegation(&mut secrets, wrong_cert, NOW).unwrap_err();
+        assert!(err.contains("another Ghost Key"), "{err}");
+
+        let mut other_bridge = grant_for(key, issued, 0);
+        other_bridge.bridge = BridgeId(SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes());
+        assert!(set_delegation(&mut secrets, other_bridge, NOW).is_err());
+        assert!(load_held(&secrets, &bridge()).is_none(), "nothing kept yet");
+
+        let status = set_delegation(&mut secrets, grant_for(key, issued + 5, 7), NOW).unwrap();
+        assert_eq!(status.issued_mainnet_height, issued + 5);
+        assert_eq!(status.ghostkey, seller().id().0);
+        assert_eq!(status.made_at_ms, 7);
+        let err = set_delegation(&mut secrets, grant_for(key, issued, 0), NOW).unwrap_err();
+        assert!(err.contains("newer"), "{err}");
+        assert_eq!(held(&secrets).issued_mainnet_height, issued + 5);
+    }
+
+    /// The whole request, against the real inbox and the real bridge key: a
+    /// wake-up with too few watched addresses reads the inbox, and the answer
+    /// sends exactly one delegated Watch that the inbox contract admits and
+    /// the bridge opens, naming the next addresses, the horizon asked from
+    /// the tip, and a `made_at_ms` above the tab's. Mutated red by: sealing to
+    /// the watch key instead of the Ghost Key (bridge cannot open), dating by
+    /// the floor itself (inbox refuses), and dropping the `ui_made_at + 1`
+    /// floor.
+    #[test]
+    fn a_low_pool_sends_one_delegated_watch_the_inbox_admits() {
+        let mut secrets = delegated();
+        let mut inbox = open_inbox();
+        let out = wake_and_read(&mut secrets, &inbox, NOW);
+        let (delta, entry) = submitted(&out);
+
+        inbox.apply_delta(&params(), &delta).unwrap();
+        assert!(
+            inbox.entries.contains_key(&entry.entry.key()),
+            "the inbox admits it"
+        );
+        inbox
+            .verify(&params())
+            .expect("and the state verifies whole");
+        assert!(entry.entry.delegation.is_some(), "signed by the watch key");
+        assert_eq!(entry.entry.ghostkey, seller().id(), "as the seller's");
+
+        let body = entry.entry.body().unwrap();
+        let request = freenet_bitcoin_inbox::seal::unseal(
+            &bridge_key(),
+            &seller().id(),
+            entry.entry.mainnet_height,
+            &body.sealed,
+        )
+        .expect("the bridge opens it");
+        assert_eq!(request.action, Action::Watch);
+        assert_eq!(request.network, BitcoinNetwork::Signet);
+        let scripts: Vec<Vec<u8>> = request.scripts.iter().map(|s| s.0.clone()).collect();
+        assert_eq!(scripts, (0..10).map(script_at).collect::<Vec<_>>());
+        assert_eq!(
+            request.watch_until_height,
+            Some(TIP + MAX_WATCH_AHEAD_BLOCKS)
+        );
+        assert_eq!(request.made_at_ms, NOW + 501, "above the tab's last");
+        assert_eq!(request.revoke_watch_keys_through, None);
+
+        let held = held(&secrets);
+        assert_eq!(held.own_made_at_ms, NOW + 501);
+        let sent = held.outstanding.expect("recorded as outstanding");
+        assert_eq!(sent.entry_key, entry.entry.key());
+        assert_eq!(sent.until_height, TIP + MAX_WATCH_AHEAD_BLOCKS);
+    }
+
+    /// One request waiting at a time: while it sits unread in the inbox, or
+    /// may still be landing, nothing else is sent. Mutated red by dropping
+    /// the "still waiting" branch.
+    #[test]
+    fn no_second_request_while_one_is_outstanding() {
+        let mut secrets = delegated();
+        let mut inbox = open_inbox();
+        let (delta, _) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
+        // Landing: this node's copy does not hold it yet.
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 60_000).is_empty());
+        inbox.apply_delta(&params(), &delta).unwrap();
+        // Waiting, unread, well past the grace.
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 600_000).is_empty());
+        assert!(held(&secrets).outstanding.is_some());
+    }
+
+    /// The bridge reading the request makes its scripts watched through the
+    /// height asked for, and with the pool watched nothing more is sent; a
+    /// later request dates above this one. Mutated red by not recording the
+    /// scripts on removal.
+    #[test]
+    fn a_removal_records_the_scripts_as_watched() {
+        let mut secrets = delegated();
+        let mut inbox = open_inbox();
+        let (delta, entry) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
+        inbox.apply_delta(&params(), &delta).unwrap();
+        bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
+
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 300_000).is_empty());
+        let held = held(&secrets);
+        assert!(held.outstanding.is_none());
+        assert_eq!(held.watched.len(), 10);
+        assert!(held
+            .watched
+            .iter()
+            .all(|w| w.until_height == TIP + MAX_WATCH_AHEAD_BLOCKS));
+        assert_eq!(
+            delegated_watched(&secrets, BitcoinNetwork::Signet, &[bridge()], TIP),
+            (0..10).map(script_at).collect::<Vec<_>>()
+        );
+        assert!(
+            on_wakeup(&secrets, NOW + 600_000).is_empty(),
+            "a watched pool needs no inbox read"
+        );
+        let status = status_of(&secrets, &held, NOW);
+        assert_eq!((status.watched, status.outstanding), (10, false));
+    }
+
+    /// A horizon is relied on only while it covers an invoice's window, and
+    /// renewed a day before: at the margin a new request goes out. Mutated
+    /// red by an off-by-one in `covers` and by dropping the margin.
+    #[test]
+    fn a_horizon_near_the_tip_is_not_relied_on_and_is_renewed() {
+        let mut secrets = delegated();
+        let mut inbox = open_inbox();
+        let (delta, entry) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
+        inbox.apply_delta(&params(), &delta).unwrap();
+        bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 300_000).is_empty());
+        let until = TIP + MAX_WATCH_AHEAD_BLOCKS;
+
+        let last_ok = until - WATCH_NEEDED_BLOCKS;
+        assert_eq!(
+            delegated_watched(&secrets, BitcoinNetwork::Signet, &[bridge()], last_ok).len(),
+            10
+        );
+        assert!(
+            delegated_watched(&secrets, BitcoinNetwork::Signet, &[bridge()], last_ok + 1)
+                .is_empty()
+        );
+
+        // A day of blocks before that, still quiet; one block later, renewed.
+        set_tip(&mut secrets, last_ok - RENEW_MARGIN_BLOCKS);
+        assert!(on_wakeup(&secrets, NOW + 600_000).is_empty());
+        set_tip(&mut secrets, last_ok - RENEW_MARGIN_BLOCKS + 1);
+        let later = open_inbox();
+        let (_, renewal) = submitted(&wake_and_read(&mut secrets, &later, NOW + 900_000));
+        let request = freenet_bitcoin_inbox::seal::unseal(
+            &bridge_key(),
+            &seller().id(),
+            renewal.entry.mainnet_height,
+            &renewal.entry.body().unwrap().sealed,
+        )
+        .unwrap();
+        assert_eq!(request.scripts.len(), 10);
+        assert!(request.made_at_ms > NOW + 501, "above its own last");
+    }
+
+    /// Unread twice in a row (the bridge refusing the delegation), and the
+    /// delegate stops and says so. Mutated red by never counting a drop.
+    #[test]
+    fn requests_left_unread_twice_stop_the_delegate() {
+        let mut secrets = delegated();
+        let inbox = open_inbox();
+        submitted(&wake_and_read(&mut secrets, &inbox, NOW));
+        // Gone without a removal, twice: each read resends once.
+        submitted(&wake_and_read(&mut secrets, &inbox, NOW + 300_000));
+        assert!(wake_and_read(&mut secrets, &inbox, NOW + 600_000).is_empty());
+        let held = held(&secrets);
+        assert_eq!(held.unread_drops, MAX_UNREAD_SENDS);
+        assert!(status_of(&secrets, &held, NOW).stalled);
+        assert!(
+            on_wakeup(&secrets, NOW + 900_000).is_empty(),
+            "no more reads"
+        );
+
+        // The tab delegating again starts it afresh.
+        let key = get_watch_key(&mut secrets).unwrap();
+        set_delegation(
+            &mut secrets,
+            grant_for(key, sender_height(FLOOR) + 1, 0),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(on_wakeup(&secrets, NOW + 900_000).len(), 1);
+    }
+
+    /// Nothing is sent without a delegation, without an armed store on its
+    /// bridge, without a fresh tip, or once this generation is exported.
+    #[test]
+    fn nothing_is_sent_without_everything_it_needs() {
+        let mut none = armed();
+        get_watch_key(&mut none).unwrap();
+        assert!(on_wakeup(&none, NOW).is_empty(), "no delegation");
+
+        let mut unarmed = delegated();
+        for key in unarmed.list_secrets(format!("{AUTO_PREFIX}arm:").as_bytes()) {
+            crate::secrets::RemovableSecrets::remove_secret(&mut unarmed, &key);
+        }
+        assert!(on_wakeup(&unarmed, NOW).is_empty(), "no store armed");
+
+        let stale = delegated();
+        assert!(
+            on_wakeup(&stale, NOW + TIP_MAX_AGE_MS + 600_001).is_empty(),
+            "no fresh tip"
+        );
+
+        let mut exported = delegated();
+        exported.set_secret(EXPORTED_KEY, b"1");
+        assert!(on_wakeup(&exported, NOW).is_empty(), "exported");
+        assert!(get_watch_key(&mut exported).is_err());
+    }
+
+    /// An arm whose tab already watches the pool far enough ahead needs
+    /// nothing from the delegate. Mutated red by ignoring the arm's watches.
+    #[test]
+    fn the_tabs_own_watches_count() {
+        let mut secrets = delegated();
+        let key = crate::auto_invoice::arm_key(&[1; 32]);
+        let mut record: crate::auto_invoice::ArmRecord = load(&secrets, &key).unwrap();
+        record.arm.watched_scripts = (0..10).map(script_at).collect();
+        record.arm.watched_until_height = Some(TIP + MAX_WATCH_AHEAD_BLOCKS);
+        record.watched_until_ms = NOW + 30 * 24 * 60 * 60 * 1000;
+        save(&mut secrets, &key, &record);
+        assert!(on_wakeup(&secrets, NOW).is_empty());
+    }
+
+    /// The tab naming a new inbox drops what was sent to the old one, and
+    /// its `made_at_ms` raises the floor the delegate dates above.
+    #[test]
+    fn an_update_moves_the_inbox_and_raises_the_timeline() {
+        let mut secrets = delegated();
+        submitted(&wake_and_read(&mut secrets, &open_inbox(), NOW));
+        let status =
+            update_delegation(&mut secrets, bridge(), [0x2c; 32], NOW + 9_000, NOW).unwrap();
+        assert_eq!(status.inbox_contract_id, [0x2c; 32]);
+        assert!(!status.outstanding);
+        assert_eq!(held(&secrets).ui_made_at_ms, NOW + 9_000);
+        assert!(update_delegation(&mut secrets, BridgeId([8; 32]), [0; 32], 0, NOW).is_err());
+    }
+}
