@@ -701,7 +701,10 @@ fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> El
             button {
                 class: if open() { "btn btn-sm btn-outline" } else { "btn btn-primary btn-sm" },
                 onclick: move |_| open.toggle(),
-                if open() { "Cancel" } else { "Buy now" }
+                // "Close", not "Cancel": once an order is placed the form
+                // shows its pay card, and "Cancel" there read as cancelling
+                // the order.
+                if open() { "Close" } else { "Buy now" }
             }
             if open() {
                 super::buy_view::BuyForm {

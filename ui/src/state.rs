@@ -6422,9 +6422,11 @@ impl AppState {
             .collect()
     }
 
-    /// The buyer pressed "Pay this order" (`docs/complaint-threat-model.md`
-    /// section 3.1): ask the delegate to keep the store's unpaid copy. The
-    /// payment details appear once the delegate's list holds it.
+    /// The buyer pressed "Try again" after the node refused to keep an order
+    /// (`docs/complaint-threat-model.md` section 3.1): ask the delegate again
+    /// to keep the store's unpaid copy, even though it refused this very copy
+    /// earlier this session. The payment details appear once the delegate's
+    /// list holds it.
     ///
     /// Refused unless keeping it is the only thing between the buyer and
     /// paying ([`BuyerPurchase::ready_to_keep`]), so the control cannot
@@ -6433,6 +6435,36 @@ impl AppState {
         &mut self,
         store_contract_id: &[u8],
         order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        self.keep_purchase_as(store_contract_id, order_id, true)
+    }
+
+    /// Keep the order the buyer's Buy now press just created, with nothing
+    /// more pressed: sent as soon as keeping it is the only thing left, so
+    /// the payment details follow Buy now without a second press (the
+    /// 2026-09-27 friction report). Called only by the card under the Buy
+    /// now form, for the order whose id that form derived from its own fresh
+    /// nonce: the Buy now press is the buyer's press that takes the slot
+    /// (`docs/complaint-threat-model.md` section 5.1), so nothing a seller
+    /// mints reaches here. Unlike [`Self::keep_purchase`] it never asks again
+    /// for a copy the delegate refused this session: that waits for the
+    /// buyer's "Try again", so a refusal is not re-sent in a loop.
+    pub fn keep_when_ready(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Result<(), String> {
+        if self.keep_refusals.contains_key(order_id) {
+            return Ok(());
+        }
+        self.keep_purchase_as(store_contract_id, order_id, false)
+    }
+
+    fn keep_purchase_as(
+        &mut self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+        retry_refused: bool,
     ) -> Result<(), String> {
         let purchase = self
             .buyer_purchases(store_contract_id)
@@ -6453,8 +6485,10 @@ impl AppState {
             .ok_or("this store's key is not known here")?;
         // The buyer's own press: a refusal earlier this session does not
         // stop it being asked again ("Try again").
-        self.keeps_refused
-            .remove(&(order_id.clone(), KeepStep::Keep));
+        if retry_refused {
+            self.keeps_refused
+                .remove(&(order_id.clone(), KeepStep::Keep));
+        }
         self.send_keep(
             KeepStep::Keep,
             harvest_common::delegate::PurchaseToKeep {
@@ -6489,6 +6523,47 @@ impl AppState {
     /// Why the delegate refused to keep order `order_id`, if it did.
     pub fn keep_refusal(&self, order_id: &harvest_common::payment::OrderId) -> Option<&str> {
         self.keep_refusals.get(order_id).map(String::as_str)
+    }
+
+    /// What the buyer asked for in the Buy now that `purchase` answers: the
+    /// listing's title (when the store still lists it) and the quantity,
+    /// read from the buyer's own request in that conversation. The order
+    /// itself names neither (harvest#57), so a purchase from before Buy now,
+    /// or one whose request is not in this device's thread, has none.
+    pub fn purchase_item(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<(Option<String>, u32)> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)?;
+        conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .find_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&purchase.conversation)
+                        .is_some_and(|request| request.order_id() == purchase.order_id) =>
+                {
+                    let title = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == listing_id)
+                        .map(|l| l.listing.title.clone());
+                    Some((title, quantity))
+                }
+                _ => None,
+            })
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for
@@ -30425,6 +30500,29 @@ mod buy_flow_tests {
         assert_eq!(state.keep_requests.len(), 2, "sent again");
     }
 
+    /// **The pay card keeps an order by itself, but never re-sends a copy
+    /// the delegate refused** (the UI pass removed the "Pay this order"
+    /// press): `keep_when_ready` sends as the press did, and after a refusal
+    /// sends nothing until the buyer's "Try again" (`keep_purchase`). Red if
+    /// `keep_when_ready` retries a refused copy, which would loop.
+    #[test]
+    fn keeping_by_itself_waits_for_try_again_after_a_refusal() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state
+            .keep_when_ready(STORE, &unpaid.order.id)
+            .expect("ready");
+        assert_eq!(state.keep_requests.len(), 1, "sent with nothing pressed");
+        state.on_keep_refused(&unpaid.order.id, "full".into());
+        state
+            .keep_when_ready(STORE, &unpaid.order.id)
+            .expect("nothing to do");
+        assert_eq!(state.keep_requests.len(), 1, "a refusal is not re-sent");
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("Try again");
+        assert_eq!(state.keep_requests.len(), 2, "the buyer's press asks again");
+    }
+
     /// **A keep left unanswered times out** (review round 3, P3): an answer
     /// lost, or an error naming no order, must not hold the button or the
     /// complaint for the session. Red if the marker never expires.
@@ -31227,6 +31325,39 @@ mod buy_flow_tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].order_id, instant.order.id);
         assert_eq!(found[0].blockers, expected);
+
+        // The pay card names what was bought, from the buyer's own request:
+        // the quantity, and the listing's title while the store lists it.
+        assert_eq!(state.purchase_item(STORE, &found[0]), Some((None, 1)));
+        let listing = harvest_common::listing::Listing {
+            id: widget(),
+            title: "Widget".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout: None,
+            choices: Vec::new(),
+        };
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .listings
+            .push(AuthorizedListing {
+                listing,
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            });
+        assert_eq!(
+            state.purchase_item(STORE, &found[0]),
+            Some((Some("Widget".to_string()), 1))
+        );
+        // Another order in the same conversation is not this request's.
+        let mut other = found[0].clone();
+        other.order_id = ordinary.order.id.clone();
+        assert_eq!(state.purchase_item(STORE, &other), None);
     }
 
     // --- Instant checkout, the seller's side (`crate::auto_invoice_flow`) ---

@@ -578,21 +578,24 @@ impl DestinationNote {
 /// the store see it. Shared rather than duplicated: the bridge warning below
 /// is the check a buyer has to make before parting with coin, and a second
 /// copy of this card is how one of them ends up without it.
+///
+/// `buyer`: the card is on a buyer's purchase, which carries the order's
+/// reference itself, so the card leaves that line out and offers the address
+/// as the three pay steps ([`super::pay_card::PaySteps`]) instead of a bare
+/// field. Every check before the address is the same either way.
 #[component]
-pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> Element {
+pub(crate) fn OrderCard(
+    order: AuthorizedOrder,
+    live: Option<AddressView>,
+    #[props(default)] buyer: bool,
+) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
     let unrecognised = unrecognised_bridges(o);
     let bridge_note = if o.trusted_bridges.is_empty() {
         BridgeNote::None
     } else if unrecognised.is_empty() {
-        BridgeNote::Recognised(
-            o.trusted_bridges
-                .iter()
-                .map(|b| short_bridge(&b.to_bs58()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
+        BridgeNote::Recognised
     } else {
         BridgeNote::Unrecognised(
             unrecognised
@@ -651,10 +654,17 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
     rsx! {
         div { class: "listing-card",
             div { class: "listing-header",
-                span { class: "listing-price", "{format_sats(o.amount_sats)}" }
+                span { class: "listing-price",
+                    "{super::pay_card::amount_text(o.amount_sats, o.network)}"
+                    if super::pay_card::is_test_network(o.network) {
+                        span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+                    }
+                }
                 span { class: "{status_class}", "{status_text}" }
             }
-            p { class: "text-muted", "Order {o.id.short()} · {o.network.as_str()}" }
+            if !buyer {
+                p { class: "text-muted", "Order {o.id.short()}" }
+            }
             if let Some(note) = stage_note {
                 p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
             }
@@ -692,6 +702,12 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                 // of a cancelled, lapsed or settled order is not offered, so
                 // nobody sends coin the order will not recognise or does not
                 // need (harvest#53).
+            } else if destination.payable() && buyer {
+                super::pay_card::PaySteps {
+                    address: o.payment_address.clone(),
+                    amount_sats: o.amount_sats,
+                    network: o.network,
+                }
             } else if destination.payable() {
                 // A readonly input rather than a paragraph, so the address can
                 // be selected and copied without hand-transcribing 42
@@ -748,9 +764,11 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                          you have no reason to trust — check with the seller before paying."
                     }
                 },
-                BridgeNote::Recognised(ids) => rsx! {
-                    p { class: "text-muted", "Settled by bridge {ids}" }
-                },
+                // A bridge this app recognises is the normal case and says
+                // nothing a buyer or seller acts on, so it is not shown
+                // (the 2026-09-27 friction report: "Settled by bridge" under
+                // "Awaiting payment" read as a status).
+                BridgeNote::Recognised => rsx! {},
             }
         }
     }
@@ -982,7 +1000,7 @@ enum BridgeNote {
     /// No bridge named: the invoice can never be proven paid.
     None,
     /// Every named bridge is one this build trusts.
-    Recognised(String),
+    Recognised,
     /// At least one named bridge is a stranger.
     Unrecognised(String),
 }

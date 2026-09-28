@@ -205,7 +205,8 @@ body::before {
        .form-row, .identity-card, .btc-status-bar, .btc-block-list,
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
-       .seller-listing, .seller-listing-actions, .own-store-banner) > * {
+       .seller-listing, .seller-listing-actions, .own-store-banner,
+       .pay-ways, .copy-line) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -778,6 +779,77 @@ h4 {
 .form-textarea {
   min-height: 80px;
   resize: vertical;
+}
+
+/* ---- Paying an order (components/pay_card.rs) ----
+   Three numbered steps; the middle one offers three labelled ways to send.
+   Near-monochrome on purpose: the only filled button is "Open in my wallet",
+   the one most buyers on a phone or a desktop with a wallet will press. */
+.pay-steps {
+  padding-left: 1.3rem;
+}
+
+.pay-steps > li + li {
+  margin-top: var(--space-md);
+}
+
+.pay-ways {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-sm);
+}
+
+.pay-way {
+  padding: var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.pay-way-wide {
+  grid-column: 1 / -1;
+}
+
+.pay-way-head {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.pay-qr {
+  display: block;
+  width: 11rem;
+  max-width: 100%;
+  height: auto;
+}
+
+.copy-label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.copy-line {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-top: var(--space-xs);
+}
+
+.copy-line > .copy-field {
+  flex: 1;
+  min-width: 0;
+}
+
+/* "test coins, no value" beside a test-network amount. */
+.test-coins {
+  margin-left: var(--space-sm);
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--text-muted);
 }
 
 .form-row {

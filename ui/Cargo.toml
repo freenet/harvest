@@ -72,6 +72,11 @@ ghostkey_lib = "0.2"
 # only ever handles scriptPubKey bytes directly.
 bech32 = "0.11"
 
+# The QR code on a buyer's pay card (address and amount as one `bitcoin:`
+# link). No default features: the card draws the module grid itself as one
+# SVG path, so none of the crate's image or SVG renderers are needed.
+qrcode = { version = "0.14", default-features = false }
+
 # Utilities
 # Browser wasm, not a contract, so `wasmbind` is correct here -- the workspace
 # default disables it because it makes CONTRACT modules unloadable.

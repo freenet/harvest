@@ -171,8 +171,12 @@ conversation, receipt_seed, order, complaint }`.
 
 ### 3.1 Keep, then reveal
 
-An order that passes every other blocker shows a *Pay this order* control, and no payment
-details. The blockers include two added in revision 2:
+An order that passes every other blocker shows no payment details until this node keeps its
+own copy. The buyer asks for that with a press: *Pay this order*, or, since the 2026-09-27 UI
+pass, the *Buy now* press itself, for the one order that press created (its id comes from the
+nonce the form just chose, so no seller-made order passes for it); the card under the form
+then keeps it with nothing more to press. A refusal waits for the buyer's *Try again*. The
+blockers include two added in revision 2:
 
 - `UnfitForComplaint`: the order fails the complaint preconditions (section 4).
 - `AddressContractNotCurrent`: the order's `bitcoin_address_code_hash` is not the address
@@ -181,7 +185,7 @@ details. The blockers include two added in revision 2:
   redeploy. An unpaid order issued before a redeploy is then refused, and the buyer asks for it
   again. Orders are payable for at most `MAX_ANCHOR_AGE_BLOCKS` anyway (TM-A).
 
-Pressing the control sends `KeepPurchase` with the seller-signed `AwaitingPayment` copy. The
+The app then sends `KeepPurchase` with the seller-signed `AwaitingPayment` copy. The
 delegate:
 
 - verifies the copy under `store_key`;
@@ -347,8 +351,9 @@ claims were read from, only that they verify.
 ### 5.1 The delegate
 
 - `MAX_KEPT_PURCHASES` = 1024 per node.
-- A slot is consumed only by the buyer's own press: *Pay this order*, or *File a complaint*
-  about a paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
+- A slot is consumed only by the buyer's own press: *Pay this order*, *Buy now* (for the one
+  order that press created, in the tab that pressed it; 3.1), or *File a complaint* about a
+  paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
   for ever takes one.
 - A slot taken by a *Pay* press that was never paid is held for the node's lifetime, and its
   address watched until no complaint about it could count (3.2). That is bounded by the buyer's own presses, 1,024 of them (about 2,048

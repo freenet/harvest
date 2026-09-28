@@ -120,21 +120,45 @@ pub fn BuyForm(
                     p { class: "text-warning", "The seller\u{2019}s store couldn\u{2019}t take this order: {reason}" }
                     p { class: "text-muted small", "You haven\u{2019}t been charged anything." }
                 },
-                _ => rsx! {
-                    p { strong { "Order placed, waiting for your payment." } }
-                    p { class: "text-muted",
-                        "The payment details are under \u{201c}Your purchases\u{201d} below."
-                    }
-                    // Only a counted listing holds stock (the delegate's
-                    // `Sale::holds`), and only for the hour: a payment after
-                    // that still counts, but the item may have gone.
-                    if counted {
-                        p { class: "text-muted",
-                            "Pay soon: this item is kept for you for about an hour. If it sells out "
-                            "before your payment is confirmed, the seller either sends it anyway or refunds you."
+                _ => {
+                    // The order's own card, here under the listing where the
+                    // buyer pressed Buy now, rather than a pointer to a list
+                    // further down the page (the 2026-09-27 friction report).
+                    let purchase = sent.expected.as_ref().and_then(|expected| {
+                        APP_STATE
+                            .read()
+                            .buyer_purchases(&store_contract_id)
+                            .into_iter()
+                            .find(|p| &p.order_id == expected)
+                    });
+                    let bitcoin = APP_STATE.read().bitcoin.clone();
+                    rsx! {
+                        // Only a counted listing holds stock (the delegate's
+                        // `Sale::holds`), and only for the hour: a payment
+                        // after that still counts, but the item may have gone.
+                        if counted {
+                            p { class: "text-muted",
+                                "Pay soon: this item is kept for you for about an hour. If it sells out "
+                                "before your payment is confirmed, the seller either sends it anyway or refunds you."
+                            }
+                        }
+                        match purchase {
+                            Some(purchase) => rsx! {
+                                InlinePurchase { order_id: purchase.order_id.clone() }
+                                PurchaseCard {
+                                    store_contract_id: store_contract_id.clone(),
+                                    purchase,
+                                    bitcoin,
+                                    just_bought: true,
+                                }
+                            },
+                            None => rsx! {
+                                p { strong { "Order placed." } }
+                                p { class: "text-muted", "Getting the payment details ready\u{2026}" }
+                            },
                         }
                     }
-                },
+                }
             },
             InstantWait::Waiting => rsx! {
                 p { strong { "Order placed." } }
@@ -284,6 +308,32 @@ pub fn BuyForm(
             }
         }
     }
+}
+
+/// The order a Buy now form is showing in place, which the store page's
+/// "Your purchases" list then leaves out rather than showing twice. One at a
+/// time: the last form to show an order holds it.
+static SHOWN_IN_BUY_FORM: GlobalSignal<Option<harvest_common::payment::OrderId>> =
+    GlobalSignal::new(|| None);
+
+/// Marks `order_id` as shown by a Buy now form for as long as this is
+/// mounted beside its card.
+#[component]
+fn InlinePurchase(order_id: harvest_common::payment::OrderId) -> Element {
+    let mine = order_id.clone();
+    use_hook(move || {
+        // Deferred to a task: a signal is not written while a component
+        // renders.
+        spawn(async move {
+            *SHOWN_IN_BUY_FORM.write() = Some(order_id);
+        });
+    });
+    use_drop(move || {
+        if SHOWN_IN_BUY_FORM.peek().as_ref() == Some(&mine) {
+            *SHOWN_IN_BUY_FORM.write() = None;
+        }
+    });
+    rsx! {}
 }
 
 /// [`open_unpaid_orders`] in the conversation tagged `current` alone: the
@@ -492,9 +542,15 @@ fn request(
 /// safe to pay.
 #[component]
 pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
+    // The order a Buy now form on this page is already showing, in place,
+    // right under the listing: not listed a second time here.
+    let shown_above = SHOWN_IN_BUY_FORM();
     let app_state = APP_STATE.read();
     let purchases = app_state.buyer_purchases(&store_contract_id);
-    if purchases.is_empty() {
+    if purchases
+        .iter()
+        .all(|p| Some(&p.order_id) == shown_above.as_ref())
+    {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
@@ -503,15 +559,7 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
     rsx! {
         div { style: "margin-top: 24px;",
             h4 { "Your purchases" }
-            p { class: "text-muted",
-                "A seller has to publish an order publicly before you can pay for it, and "
-                "your software checks that yours is there rather than taking anyone's word. "
-                "What that buys you today is that the seller cannot take your money without "
-                "first admitting in public that they owe you goods. It does not yet tell you "
-                "they can cover it: there is nothing staked behind these orders, and nothing "
-                "here counts one."
-            }
-            for purchase in purchases.iter() {
+            for purchase in purchases.iter().filter(|p| Some(&p.order_id) != shown_above.as_ref()) {
                 PurchaseCard {
                     key: "{purchase.order_id}",
                     store_contract_id: store_contract_id.clone(),
@@ -524,21 +572,36 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
 }
 
 #[component]
-fn PurchaseCard(
+pub(crate) fn PurchaseCard(
     store_contract_id: Vec<u8>,
     purchase: BuyerPurchase,
     bitcoin: crate::state::BitcoinState,
+    /// Set only by the Buy now form, for the one order its own press just
+    /// created: that press is the buyer's, so the order is kept with nothing
+    /// more to press (see [`KeepBeforePaying`]).
+    #[props(default)]
+    just_bought: bool,
 ) -> Element {
     let short = purchase.order_id.short();
     let cancellable = purchase.cancellable();
+    let item = APP_STATE
+        .read()
+        .purchase_item(&store_contract_id, &purchase);
+    let what = match item {
+        Some((Some(title), quantity)) => {
+            format!("{title} \u{00d7} {quantity} \u{00b7} order {short}")
+        }
+        Some((None, quantity)) => {
+            format!("{quantity} \u{00d7} an item no longer listed \u{00b7} order {short}")
+        }
+        None => format!("Order {short}"),
+    };
     rsx! {
         div { class: "card", style: "margin-top: 0.5rem;",
             if let Some(headline) = purchase_headline(&purchase) {
                 p { strong { "{headline}" } }
             }
-            p { class: "text-muted", style: "font-size: 0.8rem;",
-                "Order {short}, from conversation {crate::state::short_conversation_tag(&purchase.conversation)}"
-            }
+            p { class: "text-muted small", "{what}" }
             if cancellable {
                 CancelPurchase {
                     store_contract_id: store_contract_id.clone(),
@@ -570,27 +633,25 @@ fn PurchaseCard(
                 }
             } else if purchase.ready_to_keep() {
                 // Everything checks out but this node does not keep its own
-                // copy yet: the press keeps it, and the payment details
-                // appear once the delegate says it holds it
-                // (`docs/complaint-threat-model.md` section 3.1). No address
-                // here, for the reason the blocker arm below gives.
-                PayThisOrder {
+                // copy yet. The payment details appear once the delegate says
+                // it holds it (`docs/complaint-threat-model.md` section 3.1).
+                // No address here, for the reason the blocker arm below gives.
+                KeepBeforePaying {
                     store_contract_id: store_contract_id.clone(),
                     purchase: purchase.clone(),
+                    just_bought,
                 }
             } else {
             match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
                 // Everything checks out, so the payment details are shown --
                 // through the same `OrderCard` the seller's own panel uses,
-                // which carries the per-invoice bridge check with it.
+                // which carries the per-invoice bridge check with it, laid
+                // out as the buyer's pay steps.
                 (true, Some(commitment)) => rsx! {
-                    p { class: "text-muted",
-                        "This order is published, signed by this store's seller, and anchored "
-                        "to a recent block your node agrees with."
-                    }
                     super::bitcoin_view::OrderCard {
                         order: commitment.clone(),
                         live: super::bitcoin_view::live_address_for_order(&bitcoin, &commitment.order),
+                        buyer: true,
                     }
                 },
                 // Deliberately no payment address while anything is
@@ -646,12 +707,26 @@ fn purchase_headline(purchase: &BuyerPurchase) -> Option<&'static str> {
         .map(|_| "Order placed, waiting for your payment.")
 }
 
-/// "Pay this order": ask this node's delegate to keep the seller-signed terms
-/// before any payment details are shown (`docs/complaint-threat-model.md`
-/// section 3.1). Shown only when keeping them is the one thing left
-/// ([`BuyerPurchase::ready_to_keep`]).
+/// Before any payment details: this node keeps its own copy of the
+/// seller-signed terms (`docs/complaint-threat-model.md` section 3.1), so a
+/// complaint about the order never depends on what the seller keeps.
+///
+/// Only the buyer's own press takes one of the node's kept-purchase slots
+/// (section 5.1), so nothing a seller mints can fill them. Buy now is such a
+/// press: the order it creates is named by the nonce that form just chose
+/// (`OrderId::for_request`), so a seller cannot make another order that
+/// passes for it. For that one order (`just_bought`, set only by the form)
+/// the copy is asked for by itself and the pay steps follow Buy now with no
+/// second press (the 2026-09-27 friction report). Anywhere else, such as an
+/// order found after a reload, whose request this tab did not send, the
+/// buyer still presses "Pay this order". A refusal is shown with "Try
+/// again", and only that press asks again for the same copy.
 #[component]
-fn PayThisOrder(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+fn KeepBeforePaying(
+    store_contract_id: Vec<u8>,
+    purchase: BuyerPurchase,
+    just_bought: bool,
+) -> Element {
     let order_id = purchase.order_id.clone();
     let mut problem = use_signal(|| Option::<String>::None);
     let (sent, refusal) = {
@@ -682,32 +757,61 @@ fn PayThisOrder(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element 
             }
         };
     }
-    if sent {
+    if !just_bought && !sent {
         return rsx! {
             p { class: "text-muted",
-                "Keeping your copy of this order. The payment details appear here once your \
-                 node has it."
+                "Before you pay, Harvest keeps its own copy of this order, so a complaint about \
+                 it never depends on what the seller keeps."
+            }
+            if let Some(why) = problem() {
+                p { class: "text-warning", "{why}" }
+            }
+            button {
+                class: "btn btn-sm btn-primary",
+                onclick: move |_| {
+                    let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
+                    problem.set(result.err());
+                },
+                "Pay this order"
             }
         };
     }
     rsx! {
-        p { class: "text-muted",
-            "This order is published, signed by this store's seller, and anchored to a recent \
-             block your node agrees with. Before you pay, your node keeps its own copy of it, \
-             so a complaint about it never depends on what the seller keeps."
+        if !sent {
+            AskToKeep {
+                store_contract_id: store_contract_id.clone(),
+                order_id: order_id.clone(),
+                problem,
+            }
         }
         if let Some(why) = problem() {
             p { class: "text-warning", "{why}" }
-        }
-        button {
-            class: "btn btn-sm btn-primary",
-            onclick: move |_| {
-                let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
-                problem.set(result.err());
-            },
-            "Pay this order"
+        } else {
+            p { class: "text-muted", "Getting the payment details ready\u{2026}" }
         }
     }
+}
+
+/// Mounted while an order waits to be kept and nothing is on its way: asks
+/// the delegate once, on mount. It unmounts once the ask is in flight and
+/// mounts again only if that ask times out unanswered
+/// (`AppState::drop_timed_out_keeps`), which is what sends it again.
+#[component]
+fn AskToKeep(
+    store_contract_id: Vec<u8>,
+    order_id: harvest_common::payment::OrderId,
+    problem: Signal<Option<String>>,
+) -> Element {
+    use_hook(move || {
+        // Deferred to a task: state is not written while a component renders.
+        spawn(async move {
+            let result = APP_STATE
+                .write()
+                .keep_when_ready(&store_contract_id, &order_id);
+            problem.set(result.err());
+        });
+    });
+    rsx! {}
 }
 
 /// The buyer's control to cancel one of their own unpaid purchases
