@@ -2291,6 +2291,10 @@ pub enum PaymentBlocker {
     /// shows the order's own amount, and nothing else compared it with what
     /// the buyer was quoted.
     AmountNotAsked { asked_sats: u64, order_sats: u64 },
+    /// A Buy now order (it carries a request id) whose request is not in
+    /// this conversation's thread any more, so there is no total to check
+    /// its amount against (see [`Self::AmountNotAsked`]).
+    AmountUnchecked,
     /// The order has already moved past awaiting payment.
     NotAwaitingPayment(harvest_common::payment::OrderStatus),
     /// The commitment carries no block anchor, so nothing in it can be dated.
@@ -2442,6 +2446,10 @@ impl PaymentBlocker {
                 crate::components::pay_card::btc_amount(*order_sats),
                 crate::components::pay_card::btc_amount(*asked_sats),
             ),
+            PaymentBlocker::AmountUnchecked => "Your node no longer has the Buy now request this \
+                 order answers, so it can\u{2019}t check the amount against the total you agreed \
+                 to. Do not pay it."
+                .to_string(),
             PaymentBlocker::NotAwaitingPayment(status) => format!(
                 "This order is no longer awaiting payment ({status:?}), so there is nothing \
                  to pay."
@@ -2606,6 +2614,7 @@ impl BuyerPurchase {
             | PaymentBlocker::AddressContractNotCurrent { .. }
             // An order the buyer will not pay is one they may withdraw.
             | PaymentBlocker::AmountNotAsked { .. }
+            | PaymentBlocker::AmountUnchecked
             | PaymentBlocker::ConversationNotKept
             | PaymentBlocker::PurchaseNotKept => true,
         })
@@ -8217,14 +8226,20 @@ impl AppState {
         // Collected with the rest rather than returned alone, so it hides
         // none of them (round 2 of harvest#187).
         let mut blockers = Vec::new();
-        if let Some(asked) = Self::amounts_asked(store, conversation, &commitment.order.id)
-            .into_iter()
-            .find(|asked| *asked != commitment.order.amount_sats)
+        let asked = Self::amounts_asked(store, conversation, &commitment.order.id);
+        if let Some(asked) = asked
+            .iter()
+            .find(|asked| **asked != commitment.order.amount_sats)
         {
             blockers.push(PaymentBlocker::AmountNotAsked {
-                asked_sats: asked,
+                asked_sats: *asked,
                 order_sats: commitment.order.amount_sats,
             });
+        } else if asked.is_empty() && commitment.order.request_id.is_some() {
+            // A Buy now order whose request this thread no longer holds:
+            // nothing to check the amount against, so not paid (codex,
+            // round 5 of harvest#187).
+            blockers.push(PaymentBlocker::AmountUnchecked);
         }
         // The key this buyer will sign with to cancel the order unpaid or to
         // complain about it paid (harvest#53 Phase B). Compared against what
@@ -31566,9 +31581,23 @@ mod buy_flow_tests {
                 .remove(0)
                 .blockers
                 .into_iter()
-                .filter(|b| matches!(b, PaymentBlocker::AmountNotAsked { .. }))
+                .filter(|b| {
+                    matches!(
+                        b,
+                        PaymentBlocker::AmountNotAsked { .. } | PaymentBlocker::AmountUnchecked
+                    )
+                })
                 .collect::<Vec<_>>()
         };
+        // No request left in the thread, only the seller's acceptance:
+        // nothing to check the amount against, so not paid (codex, round 5).
+        // Red if a missing request passes.
+        let (state, _) = buyer_conversation();
+        let state = buyer_holding(state, conversation.clone(), &instant);
+        assert!(purchases(&state)
+            .remove(0)
+            .blockers
+            .contains(&PaymentBlocker::AmountUnchecked));
         let agreed = instant.order.amount_sats;
         assert!(
             blockers(vec![ask(&conversation, agreed)]).is_empty(),
@@ -32826,6 +32855,7 @@ mod payment_blocker_wording_tests {
                 asked_sats: 1_100,
                 order_sats: 2_200,
             },
+            PaymentBlocker::AmountUnchecked,
             PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
             PaymentBlocker::AnchorMissing,
             PaymentBlocker::ChainUnknown,
@@ -32871,6 +32901,7 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::DestinationUnreadable
                 | PaymentBlocker::CommitmentNotRequested
                 | PaymentBlocker::AmountNotAsked { .. }
+                | PaymentBlocker::AmountUnchecked
                 | PaymentBlocker::NotAwaitingPayment(_)
                 | PaymentBlocker::AnchorMissing
                 | PaymentBlocker::ChainUnknown
@@ -32900,7 +32931,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 24;
+    const EVERY_BLOCKER: usize = 25;
 
     /// **Every blocker says something, and says it as prose.**
     ///
