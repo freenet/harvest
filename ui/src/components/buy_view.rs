@@ -132,11 +132,15 @@ pub fn BuyForm(
                             .find(|p| &p.order_id == expected)
                     });
                     let bitcoin = APP_STATE.read().bitcoin.clone();
+                    // Said only while there is something to pay.
+                    let payable = purchase
+                        .as_ref()
+                        .is_some_and(|p| p.blockers.is_empty() || p.ready_to_keep());
                     rsx! {
                         // Only a counted listing holds stock (the delegate's
                         // `Sale::holds`), and only for the hour: a payment
                         // after that still counts, but the item may have gone.
-                        if counted {
+                        if counted && payable {
                             p { class: "text-muted",
                                 "Pay soon: this item is kept for you for about an hour. If it sells out "
                                 "before your payment is confirmed, the seller either sends it anyway or refunds you."
@@ -310,11 +314,11 @@ pub fn BuyForm(
     }
 }
 
-/// The order a Buy now form is showing in place, which the store page's
-/// "Your purchases" list then leaves out rather than showing twice. One at a
-/// time: the last form to show an order holds it.
-static SHOWN_IN_BUY_FORM: GlobalSignal<Option<harvest_common::payment::OrderId>> =
-    GlobalSignal::new(|| None);
+/// The orders Buy now forms are showing in place, one entry per mounted
+/// card, which the store page's "Your purchases" list then leaves out rather
+/// than showing twice. Several forms (one per listing) can each show one.
+static SHOWN_IN_BUY_FORM: GlobalSignal<Vec<harvest_common::payment::OrderId>> =
+    GlobalSignal::new(Vec::new);
 
 /// Marks `order_id` as shown by a Buy now form for as long as this is
 /// mounted beside its card.
@@ -323,17 +327,31 @@ fn InlinePurchase(order_id: harvest_common::payment::OrderId) -> Element {
     let mine = order_id.clone();
     use_hook(move || {
         // Deferred to a task: a signal is not written while a component
-        // renders.
+        // renders. The task belongs to this component, so it never runs
+        // after the drop below.
         spawn(async move {
-            *SHOWN_IN_BUY_FORM.write() = Some(order_id);
+            SHOWN_IN_BUY_FORM.write().push(order_id);
         });
     });
     use_drop(move || {
-        if SHOWN_IN_BUY_FORM.peek().as_ref() == Some(&mine) {
-            *SHOWN_IN_BUY_FORM.write() = None;
+        let mut shown = SHOWN_IN_BUY_FORM.write();
+        if let Some(at) = shown.iter().position(|id| *id == mine) {
+            shown.remove(at);
         }
     });
     rsx! {}
+}
+
+/// The purchases "Your purchases" lists: all but those a Buy now form on the
+/// page is already showing (`shown_above`).
+fn purchases_to_list<'a>(
+    purchases: &'a [BuyerPurchase],
+    shown_above: &[harvest_common::payment::OrderId],
+) -> Vec<&'a BuyerPurchase> {
+    purchases
+        .iter()
+        .filter(|p| !shown_above.contains(&p.order_id))
+        .collect()
 }
 
 /// [`open_unpaid_orders`] in the conversation tagged `current` alone: the
@@ -547,10 +565,11 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
     let shown_above = SHOWN_IN_BUY_FORM();
     let app_state = APP_STATE.read();
     let purchases = app_state.buyer_purchases(&store_contract_id);
-    if purchases
-        .iter()
-        .all(|p| Some(&p.order_id) == shown_above.as_ref())
-    {
+    let listed: Vec<BuyerPurchase> = purchases_to_list(&purchases, &shown_above)
+        .into_iter()
+        .cloned()
+        .collect();
+    if listed.is_empty() {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
@@ -559,7 +578,7 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
     rsx! {
         div { style: "margin-top: 24px;",
             h4 { "Your purchases" }
-            for purchase in purchases.iter().filter(|p| Some(&p.order_id) != shown_above.as_ref()) {
+            for purchase in listed.iter() {
                 PurchaseCard {
                     key: "{purchase.order_id}",
                     store_contract_id: store_contract_id.clone(),
@@ -785,7 +804,17 @@ fn KeepBeforePaying(
             }
         }
         if let Some(why) = problem() {
+            // Said, with the press to ask again now rather than at the next
+            // automatic try.
             p { class: "text-warning", "{why}" }
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    let result = APP_STATE.write().keep_purchase(&store_contract_id, &order_id);
+                    problem.set(result.err());
+                },
+                "Try again"
+            }
         } else {
             p { class: "text-muted", "Getting the payment details ready\u{2026}" }
         }
@@ -793,23 +822,35 @@ fn KeepBeforePaying(
 }
 
 /// Mounted while an order waits to be kept and nothing is on its way: asks
-/// the delegate once, on mount. It unmounts once the ask is in flight and
-/// mounts again only if that ask times out unanswered
-/// (`AppState::drop_timed_out_keeps`), which is what sends it again.
+/// the delegate at once, then every `AUTO_KEEP_RETRY_MS` for as long as it
+/// stays mounted (`AppState::keep_when_ready` enforces the spacing, so a
+/// remount after a failed send does not ask again early). It unmounts while
+/// an ask is in flight.
 #[component]
 fn AskToKeep(
     store_contract_id: Vec<u8>,
     order_id: harvest_common::payment::OrderId,
     problem: Signal<Option<String>>,
 ) -> Element {
-    use_hook(move || {
-        // Deferred to a task: state is not written while a component renders.
-        spawn(async move {
-            let result = APP_STATE
-                .write()
-                .keep_when_ready(&store_contract_id, &order_id);
-            problem.set(result.err());
-        });
+    // A task of this component: it ends when the component unmounts.
+    use_future(move || {
+        let store_contract_id = store_contract_id.clone();
+        let order_id = order_id.clone();
+        async move {
+            let mut ask = move || {
+                let result = APP_STATE
+                    .write()
+                    .keep_when_ready(&store_contract_id, &order_id);
+                problem.set(result.err());
+            };
+            ask();
+            #[cfg(target_arch = "wasm32")]
+            loop {
+                gloo_timers::future::TimeoutFuture::new(crate::state::AUTO_KEEP_RETRY_MS as u32)
+                    .await;
+                ask();
+            }
+        }
     });
     rsx! {}
 }
@@ -1515,6 +1556,10 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // The thread the order was agreed in is gone; a new request starts a
         // new one.
         PaymentBlocker::ConversationForgotten => Remedy::AskAgain,
+        // A Buy now order's id comes from its request, and the store merges
+        // only upwards, so the seller cannot put the amount right under this
+        // id: a new Buy now gets a new order.
+        PaymentBlocker::AmountNotAsked { .. } => Remedy::AskAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
@@ -1530,6 +1575,29 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Your purchases" leaves out every order a Buy now form is showing, and
+    /// only those: two forms open on two listings each hide their own
+    /// (codex and review round 1 of harvest#187). Red with a single slot.
+    #[test]
+    fn purchases_shown_under_a_form_are_not_listed_again() {
+        let purchase = |seed: u8| BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([seed; 32]),
+            conversation: [0; 32],
+            commitment: None,
+            blockers: Vec::new(),
+            paid: None,
+        };
+        let all = vec![purchase(1), purchase(2), purchase(3)];
+        let ids = |list: Vec<&BuyerPurchase>| -> Vec<u8> {
+            list.iter().map(|p| p.order_id.0[0]).collect()
+        };
+        assert_eq!(ids(purchases_to_list(&all, &[])), vec![1, 2, 3]);
+        let two_forms = [all[0].order_id.clone(), all[2].order_id.clone()];
+        assert_eq!(ids(purchases_to_list(&all, &two_forms)), vec![2]);
+        let elsewhere = [harvest_common::payment::OrderId([9; 32])];
+        assert_eq!(ids(purchases_to_list(&all, &elsewhere)), vec![1, 2, 3]);
+    }
 
     /// A seller answers an instant request by hand only when no order for it
     /// is published and the buyer dated it within a day of now. Mutated red

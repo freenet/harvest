@@ -53,6 +53,15 @@ pub(crate) fn payment_uri(address: &str, sats: u64) -> String {
     format!("bitcoin:{address}?amount={}", btc_amount(sats))
 }
 
+/// How long a payment usually takes to show as paid, for an order that
+/// needs `confirmations` blocks: about ten minutes a block, and up to twenty
+/// more for a slow block and for the node to hear of it. A Buy now order
+/// needs one; an invoice issued by hand may ask for more.
+pub(crate) fn confirmation_wait(confirmations: u32) -> String {
+    let blocks = confirmations.max(1);
+    format!("{} to {} minutes", blocks * 10, blocks * 10 + 20)
+}
+
 /// The QR code for `data` as the side length in modules and one SVG path
 /// drawing every dark module. `None` only for data too long for any QR code,
 /// which a payment link never is.
@@ -73,8 +82,14 @@ pub(crate) fn qr_path(data: &str) -> Option<(usize, String)> {
 
 /// The three steps, for one order's `address` and amount.
 #[component]
-pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwork) -> Element {
+pub(crate) fn PaySteps(
+    address: String,
+    amount_sats: u64,
+    network: BitcoinNetwork,
+    confirmations: u32,
+) -> Element {
     let amount = amount_text(amount_sats, network);
+    let wait = confirmation_wait(confirmations);
     let uri = payment_uri(&address, amount_sats);
     let qr = qr_path(&uri);
     let test = is_test_network(network);
@@ -86,17 +101,19 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
                 li {
                     strong { "Open your bitcoin wallet." }
                     " A wallet is the app that holds and sends bitcoin, on your phone or computer."
-                    if test && network == BitcoinNetwork::Signet {
+                    if test {
                         p { class: "text-muted small",
                             "This store takes test coins, so the wallet has to be set to Bitcoin\u{2019}s "
-                            "test network, signet. "
-                            a {
-                                href: "https://signetfaucet.com/",
-                                target: "_blank",
-                                rel: "noopener noreferrer",
-                                "Get some free test coins"
+                            "test network, {network.as_str()}. "
+                            if network == BitcoinNetwork::Signet {
+                                a {
+                                    href: "https://signetfaucet.com/",
+                                    target: "_blank",
+                                    rel: "noopener noreferrer",
+                                    "Get some free test coins"
+                                }
+                                "."
                             }
-                            "."
                         }
                     }
                 }
@@ -122,6 +139,7 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
                                 p { class: "pay-way-head", "With your phone" }
                                 svg {
                                     class: "pay-qr",
+                                    shape_rendering: "crispEdges",
                                     view_box: "-4 -4 {width + 8} {width + 8}",
                                     role: "img",
                                     "aria-label": "QR code for this payment",
@@ -132,7 +150,7 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
                                         height: "{width + 8}",
                                         fill: "#fff",
                                     }
-                                    path { d: "{path}", fill: "#2c2416" }
+                                    path { class: "pay-qr-modules", d: "{path}" }
                                 }
                                 p { class: "text-muted small",
                                     "Scan this in your wallet app. It carries the address and the amount."
@@ -141,7 +159,15 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
                         }
                         div { class: "pay-way pay-way-wide",
                             p { class: "pay-way-head", "By hand" }
-                            CopyField { label: "Payment address", value: address.clone() }
+                            // Two rows for the address, so the whole of it can be
+                            // checked: in a one-line field 42-62 characters scroll
+                            // sideways, and a partial selection pastes a truncated
+                            // address.
+                            CopyField {
+                                label: "Payment address",
+                                value: address.clone(),
+                                rows: 2,
+                            }
                             CopyField { label: "Amount", value: btc_amount(amount_sats) }
                             p { class: "text-muted small",
                                 "Paste both into your wallet\u{2019}s Send screen. This address is only for "
@@ -157,7 +183,7 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
                 li {
                     strong { "That\u{2019}s it." }
                     " Harvest sees the payment by itself and shows this order as paid, usually "
-                    "10 to 30 minutes after you send. You can close Harvest while you wait."
+                    "{wait} after you send. You can close Harvest while you wait."
                 }
             }
         }
@@ -169,34 +195,65 @@ pub(crate) fn PaySteps(address: String, amount_sats: u64, network: BitcoinNetwor
 /// the value and says so. The app runs in the gateway's sandboxed iframe, so
 /// the clipboard may not be there; the field itself always works.
 #[component]
-fn CopyField(label: &'static str, value: String) -> Element {
+fn CopyField(
+    label: &'static str,
+    value: String,
+    /// More than one row shows the value as a wrapping text area.
+    #[props(default = 1)]
+    rows: u32,
+) -> Element {
     let mut said = use_signal(|| Option::<&'static str>::None);
+    // An id for the field, so the Copy button can select it when the
+    // clipboard refuses: the press has moved focus off the field by then.
+    let id = format!(
+        "copy-{}",
+        &blake3::hash(format!("{label}\0{value}").as_bytes()).to_hex()[..12]
+    );
     rsx! {
         div { class: "copy-row",
             label { class: "copy-label",
                 "{label}"
                 div { class: "copy-line",
-                    input {
-                        class: "copy-field",
-                        readonly: true,
-                        spellcheck: false,
-                        value: "{value}",
-                        onfocus: |_| super::select_focused_field(),
-                        onclick: |_| super::select_focused_field(),
+                    if rows > 1 {
+                        textarea {
+                            id: "{id}",
+                            class: "copy-field",
+                            readonly: true,
+                            spellcheck: false,
+                            rows: "{rows}",
+                            value: "{value}",
+                            onfocus: |_| super::select_focused_field(),
+                            onclick: |_| super::select_focused_field(),
+                        }
+                    } else {
+                        input {
+                            id: "{id}",
+                            class: "copy-field",
+                            readonly: true,
+                            spellcheck: false,
+                            value: "{value}",
+                            onfocus: |_| super::select_focused_field(),
+                            onclick: |_| super::select_focused_field(),
+                        }
                     }
                     button {
                         class: "btn btn-sm btn-outline",
                         r#type: "button",
                         onclick: {
                             let value = value.clone();
+                            let id = id.clone();
                             move |_| {
                                 let value = value.clone();
+                                let id = id.clone();
                                 spawn(async move {
-                                    said.set(Some(if copy_to_clipboard(&value).await {
-                                        "Copied."
+                                    if copy_to_clipboard(&value).await {
+                                        said.set(Some("Copied."));
                                     } else {
-                                        "Selected: copy it with your keyboard or a long press."
-                                    }));
+                                        super::select_field_by_id(&id);
+                                        said.set(Some(
+                                            "Selected: copy it with your keyboard or a long press.",
+                                        ));
+                                    }
                                 });
                             }
                         },
@@ -275,6 +332,13 @@ mod tests {
         );
         assert!(!is_test_network(BitcoinNetwork::Bitcoin));
         assert!(is_test_network(BitcoinNetwork::Regtest));
+    }
+
+    #[test]
+    fn the_wait_follows_the_confirmations_the_order_needs() {
+        assert_eq!(confirmation_wait(1), "10 to 30 minutes");
+        assert_eq!(confirmation_wait(0), "10 to 30 minutes");
+        assert_eq!(confirmation_wait(6), "60 to 80 minutes");
     }
 
     /// BIP21: the address, then the amount in bitcoin.

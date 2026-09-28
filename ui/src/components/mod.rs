@@ -20,9 +20,10 @@ pub(crate) use my_store::{ensure_encryption_key, mint_encryption_key};
 /// link, a payment address, a backup) call it on focus and on click, so one
 /// tap selects the whole value ready to copy. A click alone only places a
 /// caret, which left a buyer pressing Ctrl+A, Ctrl+C (the 2026-09-27 friction
-/// report). A clipboard button is not the alternative it looks like: the app
-/// runs in the gateway's sandboxed iframe, where the clipboard API is not
-/// reliably available, and selection works there.
+/// report). Selection works in the gateway's sandboxed iframe, where the
+/// clipboard API may not be available, so a Copy button is only ever an
+/// addition that falls back to selecting (`pay_card`'s `CopyField`), never
+/// a replacement.
 pub(crate) fn select_focused_field() {
     #[cfg(target_arch = "wasm32")]
     {
@@ -41,6 +42,30 @@ pub(crate) fn select_focused_field() {
             }
         }
     }
+}
+
+/// Focus and select all of the field with this `id`, for a Copy button the
+/// clipboard refused.
+pub(crate) fn select_field_by_id(id: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(field) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id(id))
+        else {
+            return;
+        };
+        for method in ["focus", "select"] {
+            if let Ok(f) = js_sys::Reflect::get(&field, &method.into()) {
+                if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+                    let _ = f.call0(&field);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = id;
 }
 
 #[cfg(test)]

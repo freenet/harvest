@@ -702,11 +702,21 @@ pub(crate) fn OrderCard(
                 // of a cancelled, lapsed or settled order is not offered, so
                 // nobody sends coin the order will not recognise or does not
                 // need (harvest#53).
+            } else if destination.payable() && buyer && reading.seen_any() {
+                // A payment to this address is already on its way: no steps
+                // telling the buyer to send, which would invite paying twice.
+                // The pill above says whether it covers the amount.
+                p {
+                    "A payment to this order\u{2019}s address has been seen. It shows as paid once it \
+                     confirms, usually {super::pay_card::confirmation_wait(o.required_confirmations)} \
+                     after it was sent. You can close Harvest while you wait."
+                }
             } else if destination.payable() && buyer {
                 super::pay_card::PaySteps {
                     address: o.payment_address.clone(),
                     amount_sats: o.amount_sats,
                     network: o.network,
+                    confirmations: o.required_confirmations,
                 }
             } else if destination.payable() {
                 // A readonly input rather than a paragraph, so the address can
@@ -869,6 +879,14 @@ pub(crate) struct AddressReading {
 }
 
 impl AddressReading {
+    /// Whether a payment for this order is already in sight: confirmed
+    /// inside its window, or unconfirmed. A payment from before the order
+    /// (another order's, on a reused address) or after its window does not
+    /// count.
+    pub(crate) fn seen_any(&self) -> bool {
+        self.in_window_sats > 0 || self.pending_sats > 0
+    }
+
     pub(crate) fn of(order: &harvest_common::payment::Order, live: Option<&AddressView>) -> Self {
         let window = order.payment_window();
         let base = Self {
@@ -1731,6 +1749,17 @@ mod address_reading_tests {
         assert_eq!(reading.in_window_sats, 10_000);
         assert_eq!(reading.in_window_heights, vec![151]);
         assert_eq!(reading.outside_note(false), None);
+    }
+
+    /// The buyer's pay steps give way once a payment is in sight, so nobody
+    /// is told to send twice; a payment from before the order does not count
+    /// (review of harvest#187).
+    #[test]
+    fn a_payment_in_sight_ends_the_pay_steps() {
+        let order = order_anchored_at(150);
+        assert!(!AddressReading::of(&order, None).seen_any());
+        assert!(AddressReading::of(&order, Some(&address_with(&[(160, 50_000)]))).seen_any());
+        assert!(!AddressReading::of(&order, Some(&address_with(&[(140, 50_000)]))).seen_any());
     }
 
     /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a

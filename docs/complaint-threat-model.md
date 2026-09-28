@@ -19,7 +19,8 @@ section 10.
 P1s were again in NEW mechanisms, so revision 3 removes one mechanism rather than guarding it:
 
 - **Auto-keep is gone.** A slot is taken only by a buyer's own press: *Pay this order*, or
-  *File a complaint* about a paid copy the node has not kept.
+  *File a complaint* about a paid copy the node has not kept. (Since the 2026-09-27 UI pass,
+  also *Buy now*, for the one order that press created: see 3.1 and 5.1.)
 - **No screen shows a buyer a payment address except the purchase card**, once the copy is kept.
 - **A kept paid copy tracks the freshest evidence until a complaint is filed**, so a reorg
   before the complaint cannot strand it.
@@ -173,10 +174,14 @@ conversation, receipt_seed, order, complaint }`.
 
 An order that passes every other blocker shows no payment details until this node keeps its
 own copy. The buyer asks for that with a press: *Pay this order*, or, since the 2026-09-27 UI
-pass, the *Buy now* press itself, for the one order that press created (its id comes from the
-nonce the form just chose, so no seller-made order passes for it); the card under the form
-then keeps it with nothing more to press. A refusal waits for the buyer's *Try again*. The
-blockers include two added in revision 2:
+pass, the *Buy now* press itself, for the one order that press created. That order's id comes
+from the nonce the form just chose, so no other order passes for it; its TERMS are still the
+seller's, which is why the blockers compare its amount with the total the buyer agreed to
+(`AmountNotAsked`) before anything is kept. The card under the form then keeps it with nothing
+more to press, retrying at most every 30 seconds while nothing is on its way, and a refusal
+waits for the buyer's *Try again*. So a Buy now whose answer arrives while its form is open
+takes a slot even if the buyer then never pays; before, the buyer could walk away without
+using one. The blockers include two added in revision 2:
 
 - `UnfitForComplaint`: the order fails the complaint preconditions (section 4).
 - `AddressContractNotCurrent`: the order's `bitcoin_address_code_hash` is not the address
@@ -196,7 +201,11 @@ delegate:
 
 Payment details appear only once the delegate's list holds the copy (blocker `PurchaseNotKept`).
 So before any money moves, the buyer holds seller-signed terms that a complaint will verify
-against, and every later seller act on the store is irrelevant to them.
+against, and every later seller act on the store is irrelevant to them. The card shows those
+kept terms: a Buy now order's id comes from its request rather than its terms, so the store
+can take a second, unpaid version under the same id (a higher amount wins the merge) with
+another amount and address, and while both are unpaid the kept copy, not the store's, is what
+the buyer is shown and pays (review of harvest#187).
 
 ### 3.2 Watching and upgrading
 
@@ -355,7 +364,7 @@ claims were read from, only that they verify.
   order that press created, in the tab that pressed it; 3.1), or *File a complaint* about a
   paid copy the node never kept (3.3). Nothing the seller mints, fabricates or pays
   for ever takes one.
-- A slot taken by a *Pay* press that was never paid is held for the node's lifetime, and its
+- A slot taken by a *Pay* or *Buy now* press that was never paid is held for the node's lifetime, and its
   address watched until no complaint about it could count (3.2). That is bounded by the buyer's own presses, 1,024 of them (about 2,048
   address watches). Releasing a lapsed unpaid keep needs positive evidence that it was never
   paid, which the node does not have, so revision 4 removed the attempt rather than guessing

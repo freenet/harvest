@@ -152,6 +152,11 @@ pub struct AppState {
     /// and when the user asks again.
     pub ghostkey_access_problem: Option<GhostKeyAccessProblem>,
 
+    /// When the pay card last asked, with nothing pressed, to keep each order
+    /// (`AppState::keep_when_ready`), so a send that fails at once is not
+    /// repeated on every repaint.
+    pub auto_keeps_asked: HashMap<harvest_common::payment::OrderId, u64>,
+
     /// The per-device RSA public keys our identities' reputation records were
     /// addressed by before harvest#93 phase 1b (fingerprint -> DER bytes),
     /// as the delegate's `RsaPublicKey` reports them.
@@ -2275,6 +2280,17 @@ pub enum PaymentBlocker {
     /// compare, and a seller may perfectly well invoice against a conversation
     /// that never used the buy form.
     CommitmentNotRequested,
+    /// A Buy now order asks for a different amount than the total the buyer
+    /// agreed to when they pressed Buy now (`InstantSelection::
+    /// expected_total_sats`, in the buyer's own request). The seller's
+    /// delegate checks the same total, so an honest order always matches.
+    /// Every request in the conversation that this order answers must agree:
+    /// the seller holds the conversation's keys too and could add a request
+    /// naming its own total, and one disagreeing request is enough to stop
+    /// the buyer paying. Checked on the buyer's side because the pay card
+    /// shows the order's own amount, and nothing else compared it with what
+    /// the buyer was quoted.
+    AmountNotAsked { asked_sats: u64, order_sats: u64 },
     /// The order has already moved past awaiting payment.
     NotAwaitingPayment(harvest_common::payment::OrderStatus),
     /// The commitment carries no block anchor, so nothing in it can be dated.
@@ -2359,8 +2375,9 @@ pub enum PaymentBlocker {
     /// this conversation (`docs/complaint-threat-model.md` section 3.1).
     ///
     /// Last, because it is the one the buyer clears themselves: when it is the
-    /// only blocker, the card offers "Pay this order", which asks the
-    /// delegate to keep the seller-signed terms, and the payment details
+    /// only blocker, the card offers "Pay this order" (or, for the order a
+    /// Buy now form just created, asks by itself), which asks the delegate to
+    /// keep the seller-signed terms, and the payment details
     /// appear only once the delegate's list holds them. So before any money
     /// moves the buyer holds what a complaint will verify against, whatever
     /// the seller does to the store afterwards.
@@ -2416,6 +2433,15 @@ impl PaymentBlocker {
                  different listing than the one you asked about. Do not pay it -- ask the seller \
                  what it is for."
                 .to_string(),
+            PaymentBlocker::AmountNotAsked {
+                asked_sats,
+                order_sats,
+            } => format!(
+                "The seller\u{2019}s store asks {} for this order, not the {} total you agreed to \
+                 when you pressed Buy now. Do not pay it. Buy again, or ask the seller.",
+                crate::components::pay_card::btc_amount(*order_sats),
+                crate::components::pay_card::btc_amount(*asked_sats),
+            ),
             PaymentBlocker::NotAwaitingPayment(status) => format!(
                 "This order is no longer awaiting payment ({status:?}), so there is nothing \
                  to pay."
@@ -2477,8 +2503,8 @@ impl PaymentBlocker {
                  payment is seen."
                 .to_string(),
             PaymentBlocker::PurchaseNotKept => "Your node has not yet kept its own copy of this \
-                 order, which is what a complaint about it would rest on. Pay this order to \
-                 keep it; the payment details appear once it is kept."
+                 order, which is what a complaint about it would rest on. The payment \
+                 details appear once it is kept."
                 .to_string(),
         }
     }
@@ -2578,6 +2604,8 @@ impl BuyerPurchase {
             | PaymentBlocker::AnchorStale { .. }
             | PaymentBlocker::UnfitForComplaint(_)
             | PaymentBlocker::AddressContractNotCurrent { .. }
+            // An order the buyer will not pay is one they may withdraw.
+            | PaymentBlocker::AmountNotAsked { .. }
             | PaymentBlocker::ConversationNotKept
             | PaymentBlocker::PurchaseNotKept => true,
         })
@@ -2585,8 +2613,8 @@ impl BuyerPurchase {
 
     /// Whether the only thing between the buyer and the payment details is
     /// this node keeping its own copy of the order, which the buyer asks for
-    /// by pressing "Pay this order" (`docs/complaint-threat-model.md`
-    /// section 3.1).
+    /// by pressing "Pay this order", or by the Buy now press for the order it
+    /// created (`docs/complaint-threat-model.md` section 3.1).
     pub fn ready_to_keep(&self) -> bool {
         self.blockers.as_slice() == [PaymentBlocker::PurchaseNotKept]
     }
@@ -2684,7 +2712,8 @@ impl ComplaintParts {
 /// (`docs/complaint-threat-model.md` section 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeepStep {
-    /// Keep the unpaid copy: the buyer pressed "Pay this order" (3.1).
+    /// Keep the unpaid copy: the buyer pressed "Pay this order", or Buy now
+    /// for the order it created (3.1).
     Keep,
     /// Keep the `Paid` copy with its minimal proof: the upgrade of a kept
     /// unpaid copy (3.2).
@@ -2719,6 +2748,10 @@ pub struct KeepInFlight {
 /// marker is let go: the length [`LISTING_CERTIFICATE_TIMEOUT_MS`] gives a
 /// delegate round trip, which needs no prompt.
 pub(crate) const KEEP_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+
+/// How often the pay card under a Buy now form asks again to keep its order
+/// while nothing is on its way (`AppState::keep_when_ready`).
+pub(crate) const AUTO_KEEP_RETRY_MS: u64 = 30 * 1000;
 
 /// A digest of `order`'s encoding, to tell one copy of an order from another
 /// within a session: the same terms under other evidence, or re-signed.
@@ -6169,9 +6202,24 @@ impl AppState {
         // (R2-6); else the store's copy; else the kept copy, which is what
         // lets a buyer still pay an order the seller evicted before the
         // payment was seen (R2-2).
+        //
+        // Except where the store's copy is still awaiting payment and its
+        // terms are not the kept copy's: a Buy now order's id comes from the
+        // buyer's request, not its terms, so the store can take a second
+        // version under the same id (a higher amount wins its merge), with
+        // another amount and another address. The kept copy is what the
+        // buyer's node watches and what a complaint verifies against, so it
+        // is what the buyer is shown and pays (review of harvest#187).
+        let store_copy = held.filter(|held| {
+            !kept.is_some_and(|kept| {
+                held.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                    && kept.order.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                    && held.order != kept.order.order
+            })
+        });
         let commitment = paid
             .clone()
-            .or_else(|| held.cloned())
+            .or_else(|| store_copy.cloned())
             .or_else(|| kept.map(|kept| kept.order.clone()));
         let blockers = match conversation {
             Some(conversation) => self.payment_blockers(store, conversation, commitment.as_ref()),
@@ -6422,9 +6470,9 @@ impl AppState {
             .collect()
     }
 
-    /// The buyer pressed "Try again" after the node refused to keep an order
-    /// (`docs/complaint-threat-model.md` section 3.1): ask the delegate again
-    /// to keep the store's unpaid copy, even though it refused this very copy
+    /// The buyer pressed "Pay this order", or "Try again" after the node
+    /// refused to keep it (`docs/complaint-threat-model.md` section 3.1): ask
+    /// the delegate to keep the store's unpaid copy, even a copy it refused
     /// earlier this session. The payment details appear once the delegate's
     /// list holds it.
     ///
@@ -6454,9 +6502,24 @@ impl AppState {
         store_contract_id: &[u8],
         order_id: &harvest_common::payment::OrderId,
     ) -> Result<(), String> {
+        // `keep_refusals` holds a refusal of any keep step for the order,
+        // but only the Keep step can be refused before the order is kept,
+        // which is the only time this is called.
         if self.keep_refusals.contains_key(order_id) {
             return Ok(());
         }
+        // At most once per `AUTO_KEEP_RETRY_MS` per order: a send that fails
+        // at once (no delegate yet, the socket down) releases its marker,
+        // and without this the card would send again on every repaint.
+        let now = now_ms();
+        if self
+            .auto_keeps_asked
+            .get(order_id)
+            .is_some_and(|at| now.saturating_sub(*at) < AUTO_KEEP_RETRY_MS)
+        {
+            return Ok(());
+        }
+        self.auto_keeps_asked.insert(order_id.clone(), now);
         self.keep_purchase_as(store_contract_id, order_id, false)
     }
 
@@ -6541,10 +6604,13 @@ impl AppState {
             .conversations
             .iter()
             .find(|c| c.buyer_public_key == purchase.conversation)?;
-        conversation
+        // Every matching request, not the first: the seller holds the
+        // conversation's keys too, and could add a request under the same id
+        // naming something else. Requests that disagree name nothing.
+        let asked: Vec<(harvest_common::listing::ListingId, u32)> = conversation
             .read(&store.mailbox_messages)
             .into_iter()
-            .find_map(|message| match message.content {
+            .filter_map(|message| match message.content {
                 MessageContent::OrderRequest {
                     listing_id,
                     quantity,
@@ -6555,15 +6621,24 @@ impl AppState {
                         .answered_request(&purchase.conversation)
                         .is_some_and(|request| request.order_id() == purchase.order_id) =>
                 {
-                    let title = store
-                        .listings
-                        .iter()
-                        .find(|l| l.listing.id == listing_id)
-                        .map(|l| l.listing.title.clone());
-                    Some((title, quantity))
+                    Some((listing_id, quantity))
                 }
                 _ => None,
             })
+            .collect();
+        let (listing_id, quantity) = asked.first()?.clone();
+        if asked
+            .iter()
+            .any(|other| *other != (listing_id.clone(), quantity))
+        {
+            return None;
+        }
+        let title = store
+            .listings
+            .iter()
+            .find(|l| l.listing.id == listing_id)
+            .map(|l| l.listing.title.clone());
+        Some((title, quantity))
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for
@@ -6783,6 +6858,36 @@ impl AppState {
         let wait = (60_000u64 << failures.min(6)).min(60 * 60_000);
         self.reassert_backoff
             .insert(order_id.clone(), (failures, now_ms().saturating_add(wait)));
+    }
+
+    /// The totals the Buy now requests in `conversation` that order
+    /// `order_id` answers agreed to, as each request carries them
+    /// (`InstantSelection::expected_total_sats`). Normally one; several only
+    /// if something added requests under the same id, which is why the
+    /// caller compares every one.
+    fn amounts_asked(
+        store: &BrowsingStore,
+        conversation: &crate::messaging::BuyerConversation,
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Vec<u64> {
+        use crate::messaging::{Addressing, MessageContent};
+        conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&conversation.buyer_public_key)
+                        .is_some_and(|request| &request.order_id() == order_id) =>
+                {
+                    Some(selection.expected_total_sats)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every listing this conversation has asked about.
@@ -8119,6 +8224,18 @@ impl AppState {
         // this conversation at. See `BuyerPurchase::settled`.
         if commitment.status != OrderStatus::AwaitingPayment {
             return vec![PaymentBlocker::NotAwaitingPayment(commitment.status)];
+        }
+        // A Buy now order must ask the total the buyer agreed to (see
+        // `PaymentBlocker::AmountNotAsked`). Every request in this
+        // conversation that this order answers is compared, not the first.
+        if let Some(asked) = Self::amounts_asked(store, conversation, &commitment.order.id)
+            .into_iter()
+            .find(|asked| *asked != commitment.order.amount_sats)
+        {
+            return vec![PaymentBlocker::AmountNotAsked {
+                asked_sats: asked,
+                order_sats: commitment.order.amount_sats,
+            }];
         }
 
         let mut blockers = Vec::new();
@@ -30500,9 +30617,9 @@ mod buy_flow_tests {
         assert_eq!(state.keep_requests.len(), 2, "sent again");
     }
 
-    /// **The pay card keeps an order by itself, but never re-sends a copy
-    /// the delegate refused** (the UI pass removed the "Pay this order"
-    /// press): `keep_when_ready` sends as the press did, and after a refusal
+    /// **The card under a Buy now form keeps its order by itself, but never
+    /// re-sends a copy the delegate refused** (the UI pass removed the second
+    /// press for that one order): `keep_when_ready` sends as the press did, and after a refusal
     /// sends nothing until the buyer's "Try again" (`keep_purchase`). Red if
     /// `keep_when_ready` retries a refused copy, which would loop.
     #[test]
@@ -30521,6 +30638,68 @@ mod buy_flow_tests {
             .keep_purchase(STORE, &unpaid.order.id)
             .expect("Try again");
         assert_eq!(state.keep_requests.len(), 2, "the buyer's press asks again");
+    }
+
+    /// **A keep that fails to send is not re-sent on every repaint** (codex
+    /// and review round 1 of harvest#187): with the socket down every send
+    /// fails at once and releases its marker, which remounted the card and
+    /// sent again, in a loop that froze the tab. `keep_when_ready` asks at
+    /// most once per `AUTO_KEEP_RETRY_MS`. Red without the spacing.
+    #[test]
+    fn a_keep_that_fails_to_send_waits_before_it_is_sent_again() {
+        let (mut state, unpaid, _, _) = an_unkept_purchase();
+        state
+            .keep_when_ready(STORE, &unpaid.order.id)
+            .expect("ready");
+        assert_eq!(state.keep_requests.len(), 1);
+        state.on_keep_send_failed(&unpaid.order.id, KeepStep::Keep);
+        assert!(!state.keep_sent(&unpaid.order.id), "the marker is released");
+        state
+            .keep_when_ready(STORE, &unpaid.order.id)
+            .expect("nothing to do yet");
+        assert_eq!(state.keep_requests.len(), 1, "not again at once");
+        *state.auto_keeps_asked.get_mut(&unpaid.order.id).unwrap() -= AUTO_KEEP_RETRY_MS;
+        state
+            .keep_when_ready(STORE, &unpaid.order.id)
+            .expect("ready");
+        assert_eq!(state.keep_requests.len(), 2, "again once the wait is over");
+    }
+
+    /// **After the keep, the buyer is shown and pays the KEPT terms** (review
+    /// of harvest#187): a Buy now order's id comes from its request, so the
+    /// store can take a second version under the same id with a higher
+    /// amount and another address. The purchase judges and shows the kept
+    /// copy while both are unpaid. Red if the store's copy wins.
+    #[test]
+    fn a_second_version_under_the_same_id_does_not_replace_the_kept_terms() {
+        let (unpaid, _, _) = a_paid_order();
+        let mut v1 = unpaid.clone();
+        v1.order.request_id = Some([3u8; 32]);
+        let v1 = resigned(v1, &seller_signing_key());
+        let mut v2 = v1.clone();
+        v2.order.amount_sats += 10_000;
+        v2.order.payment_address =
+            "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7".into();
+        let v2 = resigned(v2, &seller_signing_key());
+        assert_eq!(v1.order.id, v2.order.id, "one id: the request's");
+
+        let recognised = recognise_settling_bridge();
+        let (mut state, _) = buyer_after_acceptance(&v2);
+        state.test_guards.push(recognised);
+        assert_eq!(
+            purchases(&state)[0].commitment.as_ref(),
+            Some(&v2),
+            "not kept yet"
+        );
+        state.on_kept_purchases(vec![kept(&v1)]);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.commitment.as_ref(), Some(&v1), "the kept terms");
+
+        // The same terms in both: the store's copy, as before.
+        let (mut same, _) = buyer_after_acceptance(&v1);
+        same.test_guards.push(recognise_settling_bridge());
+        same.on_kept_purchases(vec![kept(&v1)]);
+        assert_eq!(purchases(&same)[0].commitment.as_ref(), Some(&v1));
     }
 
     /// **A keep left unanswered times out** (review round 3, P3): an answer
@@ -31358,6 +31537,106 @@ mod buy_flow_tests {
         let mut other = found[0].clone();
         other.order_id = ordinary.order.id.clone();
         assert_eq!(state.purchase_item(STORE, &other), None);
+        // A second request under the same id naming another quantity (the
+        // seller holds the keys and could write one): nothing is named.
+        let forged = conversation
+            .request_order(
+                &widget(),
+                5,
+                "1 Lane".into(),
+                String::new(),
+                Some(crate::messaging::InstantSelection {
+                    requested_at_ms,
+                    nonce,
+                    region: None,
+                    choices: vec![],
+                    expected_total_sats: 50_000,
+                }),
+            )
+            .expect("sealed");
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("store")
+            .mailbox_messages
+            .push(forged);
+        assert_eq!(state.purchase_item(STORE, &found[0]), None);
+    }
+
+    /// **A Buy now order must ask the total the buyer agreed to** (review of
+    /// harvest#187): the order's amount is compared with every request in
+    /// the conversation it answers, and one that disagrees stops the buyer
+    /// paying, even beside one that agrees (the seller holds the keys and
+    /// could add one). Red without the check, and red comparing only the
+    /// first request.
+    #[test]
+    fn a_buy_now_order_for_another_amount_is_not_paid() {
+        let conversation = the_buyers_conversation();
+        let tag = conversation.buyer_public_key;
+        let nonce = [8u8; 16];
+        let requested_at_ms = 1_700_000_000_000;
+        let request = harvest_common::payment::AnsweredRequest {
+            request_id: harvest_common::payment::request_id(&tag, &nonce),
+            requested_at: chrono::DateTime::from_timestamp_millis(requested_at_ms).unwrap(),
+        };
+        let mut instant = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        instant.order.request_id = Some(request.request_id);
+        instant.order.created_at = request.requested_at;
+        let instant = resigned(instant, &seller_signing_key());
+        let ask = |conversation: &crate::messaging::BuyerConversation, total: u64| {
+            conversation
+                .request_order(
+                    &widget(),
+                    1,
+                    "1 Lane".into(),
+                    String::new(),
+                    Some(crate::messaging::InstantSelection {
+                        requested_at_ms,
+                        nonce,
+                        region: None,
+                        choices: vec![],
+                        expected_total_sats: total,
+                    }),
+                )
+                .expect("sealed")
+        };
+        let blockers = |requests: Vec<EncryptedMessage>| {
+            let (state, _) = buyer_conversation();
+            let mut state = buyer_holding(state, conversation.clone(), &instant);
+            state
+                .browsing_stores
+                .get_mut(STORE)
+                .expect("store")
+                .mailbox_messages = requests;
+            purchases(&state).remove(0).blockers
+        };
+        let agreed = instant.order.amount_sats;
+        assert!(
+            !blockers(vec![ask(&conversation, agreed)])
+                .iter()
+                .any(|b| matches!(b, PaymentBlocker::AmountNotAsked { .. })),
+            "the agreed total"
+        );
+        let asked_less = PaymentBlocker::AmountNotAsked {
+            asked_sats: agreed - 1_000,
+            order_sats: agreed,
+        };
+        assert_eq!(
+            blockers(vec![ask(&conversation, agreed - 1_000)]),
+            vec![asked_less.clone()]
+        );
+        assert_eq!(
+            blockers(vec![
+                ask(&conversation, agreed),
+                ask(&conversation, agreed - 1_000)
+            ]),
+            vec![asked_less],
+            "one disagreeing request is enough"
+        );
     }
 
     // --- Instant checkout, the seller's side (`crate::auto_invoice_flow`) ---
@@ -32590,6 +32869,10 @@ mod payment_blocker_wording_tests {
             PaymentBlocker::DestinationDisagrees,
             PaymentBlocker::DestinationUnreadable,
             PaymentBlocker::CommitmentNotRequested,
+            PaymentBlocker::AmountNotAsked {
+                asked_sats: 1_100,
+                order_sats: 2_200,
+            },
             PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
             PaymentBlocker::AnchorMissing,
             PaymentBlocker::ChainUnknown,
@@ -32634,6 +32917,7 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::DestinationDisagrees
                 | PaymentBlocker::DestinationUnreadable
                 | PaymentBlocker::CommitmentNotRequested
+                | PaymentBlocker::AmountNotAsked { .. }
                 | PaymentBlocker::NotAwaitingPayment(_)
                 | PaymentBlocker::AnchorMissing
                 | PaymentBlocker::ChainUnknown
@@ -32663,7 +32947,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 23;
+    const EVERY_BLOCKER: usize = 24;
 
     /// **Every blocker says something, and says it as prose.**
     ///
