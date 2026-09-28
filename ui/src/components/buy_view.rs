@@ -133,9 +133,12 @@ pub fn BuyForm(
                     });
                     let bitcoin = APP_STATE.read().bitcoin.clone();
                     // Said only while there is something to pay.
-                    let payable = purchase
-                        .as_ref()
-                        .is_some_and(|p| p.blockers.is_empty() || p.ready_to_keep());
+                    let payable = purchase.as_ref().is_some_and(|p| {
+                        (p.blockers.is_empty() || p.ready_to_keep())
+                            && p.commitment
+                                .as_ref()
+                                .is_some_and(|c| c.order.amount_sats == sent.asked_sats)
+                    });
                     rsx! {
                         // Only a counted listing holds stock (the delegate's
                         // `Sale::holds`), and only for the hour: a payment
@@ -674,6 +677,9 @@ pub(crate) fn PurchaseCard(
                 }
             } else if let Some(blocker) = not_asked {
                 p { class: "text-warning", "{blocker.describe()}" }
+                p { class: "text-muted", style: "font-size: 0.85rem;",
+                    "No payment details are shown while that is true. Buy it again to get an order you can pay."
+                }
             } else if purchase.ready_to_keep() {
                 // Everything checks out but this node does not keep its own
                 // copy yet. The payment details appear once the delegate says
@@ -742,6 +748,14 @@ fn purchase_headline(purchase: &BuyerPurchase) -> Option<&'static str> {
         return Some("Paid.");
     }
     if purchase.settled().is_some() || purchase.unconfirmed_paid() {
+        return None;
+    }
+    // Not "waiting for your payment" above a line saying not to pay it.
+    if purchase
+        .blockers
+        .iter()
+        .any(|b| matches!(remedy(b), Remedy::BuyAgain | Remedy::WalkAway))
+    {
         return None;
     }
     purchase
@@ -1597,9 +1611,7 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // A Buy now order's id comes from its request, and the store merges
         // only upwards, so the seller cannot put these right under this id:
         // a new Buy now gets a new order.
-        PaymentBlocker::AmountNotAsked { .. } | PaymentBlocker::KeptTermsChanged => {
-            Remedy::BuyAgain
-        }
+        PaymentBlocker::AmountNotAsked { .. } => Remedy::BuyAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
@@ -1615,6 +1627,56 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No "waiting for your payment" above a line saying not to pay it
+    /// (round 3 of harvest#187). Red without the check.
+    #[test]
+    fn a_purchase_not_to_pay_has_no_waiting_headline() {
+        let order = harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: None,
+                id: harvest_common::payment::OrderId([0u8; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: "me".into(),
+                amount_sats: 2,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: vec![0x00, 0x14, 1],
+                payment_address: "tb1qtest".into(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id(),
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        let mut purchase = BuyerPurchase {
+            order_id: order.order.id.clone(),
+            conversation: [0; 32],
+            commitment: Some(order),
+            blockers: Vec::new(),
+            paid: None,
+        };
+        assert_eq!(
+            purchase_headline(&purchase),
+            Some("Order placed, waiting for your payment.")
+        );
+        purchase.blockers = vec![PaymentBlocker::AmountNotAsked {
+            asked_sats: 1,
+            order_sats: 2,
+        }];
+        assert_eq!(purchase_headline(&purchase), None);
+    }
 
     /// "Your purchases" leaves out every order a Buy now form is showing, and
     /// only those: two forms open on two listings each hide their own

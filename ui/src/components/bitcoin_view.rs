@@ -702,7 +702,7 @@ pub(crate) fn OrderCard(
                 // of a cancelled, lapsed or settled order is not offered, so
                 // nobody sends coin the order will not recognise or does not
                 // need (harvest#53).
-            } else if destination.payable() && buyer && reading.covers(o, tip_height) {
+            } else if destination.payable() && buyer && sight.settles() {
                 // A payment covering the amount is already in sight: the
                 // steps are folded away rather than shown, so nobody is told
                 // to send twice. Only a covering payment folds them: anyone
@@ -711,9 +711,10 @@ pub(crate) fn OrderCard(
                 // Still reachable, because a covering payment that never
                 // confirms is possible too.
                 p {
-                    "A payment covering this order has been seen. It shows as paid once it \
-                     confirms, usually {super::pay_card::confirmation_wait(o.required_confirmations)} \
-                     after it was sent. You can close Harvest while you wait."
+                    "A payment covering this order has been seen. It shows as paid once the \
+                     payment is final, usually \
+                     {super::pay_card::confirmation_wait(o.required_confirmations)} after it was \
+                     sent. You can close Harvest while you wait."
                 }
                 details {
                     summary { class: "text-muted small", "Didn\u{2019}t send it? Show how to pay" }
@@ -726,16 +727,27 @@ pub(crate) fn OrderCard(
                     }
                 }
             } else if destination.payable() && buyer {
+                // After a confirmed payment short of the amount, the steps ask
+                // for what is left, not the whole amount again: the wallet
+                // link, QR code and Amount field all carry the remainder, so
+                // following them never overpays (codex, round 3 of #187).
                 if let Some(short) = reading.short_of() {
                     p { class: "text-warning",
-                        "A payment smaller than this order\u{2019}s amount has been seen at its \
-                         address. If it was yours, send the remaining \
-                         {super::pay_card::amount_text(short, o.network)} to the same address."
+                        "A payment smaller than this order\u{2019}s amount has arrived at its \
+                         address. If it was yours, send the rest, \
+                         {super::pay_card::amount_text(short, o.network)}, the same way. The \
+                         steps below ask for that amount."
+                    }
+                } else if reading.short_in_flight() {
+                    p { class: "text-warning",
+                        "A payment smaller than this order\u{2019}s amount is on its way to its \
+                         address. If it is yours, wait for it to arrive: Harvest then shows how \
+                         much is left to send."
                     }
                 }
                 super::pay_card::PaySteps {
                     address: o.payment_address.clone(),
-                    amount_sats: o.amount_sats,
+                    amount_sats: reading.short_of().unwrap_or(o.amount_sats),
                     network: o.network,
                     confirmations: o.required_confirmations,
                     order_ref: o.id.short(),
@@ -901,25 +913,21 @@ pub(crate) struct AddressReading {
 }
 
 impl AddressReading {
-    /// Whether a payment covering this order is in sight: confirmed inside
-    /// its window, or confirmed there plus in flight, for the full amount
-    /// ([`Self::sight`]). Dust, which anyone can send to a published
-    /// address, does not count, nor does a payment from before the order or
-    /// after its window.
-    pub(crate) fn covers(
-        &self,
-        order: &harvest_common::payment::Order,
-        tip_height: Option<u32>,
-    ) -> bool {
-        let sight = self.sight(order, tip_height);
-        sight.covered || sight.in_flight
+    /// How much is still to send when a CONFIRMED payment short of the
+    /// amount is in the window, else `None`. The verifier sums the window's
+    /// outputs, so sending the rest settles the order. Unconfirmed value is
+    /// left out: it can still be replaced and never arrive, and a remainder
+    /// counted from it would leave the order short.
+    pub(crate) fn short_of(&self) -> Option<u64> {
+        (self.in_window_sats > 0 && self.in_window_sats < self.amount_sats)
+            .then(|| self.amount_sats - self.in_window_sats)
     }
 
-    /// How much is still to send when something short of the amount is in
-    /// sight (confirmed in the window plus in flight), else `None`.
-    pub(crate) fn short_of(&self) -> Option<u64> {
-        let seen = self.in_window_sats.saturating_add(self.unconfirmed_sats);
-        (seen > 0 && seen < self.amount_sats).then(|| self.amount_sats - seen)
+    /// Whether an unconfirmed payment short of the amount (with what is
+    /// confirmed) is on its way.
+    pub(crate) fn short_in_flight(&self) -> bool {
+        self.unconfirmed_sats > 0
+            && self.in_window_sats.saturating_add(self.unconfirmed_sats) < self.amount_sats
     }
 
     pub(crate) fn of(order: &harvest_common::payment::Order, live: Option<&AddressView>) -> Self {
@@ -1797,15 +1805,29 @@ mod address_reading_tests {
         let amount = order.amount_sats;
         let tip = Some(170);
         let reading = |rows: &[(u32, u64)]| AddressReading::of(&order, Some(&address_with(rows)));
-        assert!(!AddressReading::of(&order, None).covers(&order, tip));
-        assert!(reading(&[(160, amount)]).covers(&order, tip));
-        assert!(!reading(&[(160, 1)]).covers(&order, tip), "dust");
+        // What `OrderCard` folds on is `AppState::payment_sight`, which is
+        // this reading's `sight` less a payment another order on a reused
+        // address may own.
+        let folds = |r: AddressReading| r.sight(&order, tip).settles();
+        assert!(!folds(AddressReading::of(&order, None)));
+        assert!(folds(reading(&[(160, amount)])));
+        assert!(!folds(reading(&[(160, 1)])), "dust");
         assert_eq!(reading(&[(160, 1)]).short_of(), Some(amount - 1));
-        assert!(
-            !reading(&[(140, amount)]).covers(&order, tip),
-            "before the order"
-        );
+        assert!(!folds(reading(&[(140, amount)])), "before the order");
         assert_eq!(reading(&[(160, amount)]).short_of(), None);
+        // Unconfirmed value can be replaced and never arrive: no remainder
+        // is counted from it (codex, round 3 of #187).
+        let mut pending = address_with(&[]);
+        pending.pending_sats = 1;
+        pending.txs.push(TxRow {
+            txid_display: "mempool".into(),
+            value_sats: 1,
+            status: TxRowStatus::Unconfirmed,
+        });
+        let pending = AddressReading::of(&order, Some(&pending));
+        assert_eq!(pending.short_of(), None);
+        assert!(pending.short_in_flight());
+        assert!(!reading(&[(160, 1)]).short_in_flight());
     }
 
     /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a

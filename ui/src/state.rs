@@ -2291,13 +2291,6 @@ pub enum PaymentBlocker {
     /// shows the order's own amount, and nothing else compared it with what
     /// the buyer was quoted.
     AmountNotAsked { asked_sats: u64, order_sats: u64 },
-    /// The store's copy of an unpaid order no longer has the terms this
-    /// node kept for it: a second version under the same request-derived id
-    /// (a higher amount wins the store's merge), with another amount or
-    /// address. The kept copy is what the node watches and a complaint
-    /// verifies against, and the store's copy is what the seller sees, so
-    /// neither can be paid safely.
-    KeptTermsChanged,
     /// The order has already moved past awaiting payment.
     NotAwaitingPayment(harvest_common::payment::OrderStatus),
     /// The commitment carries no block anchor, so nothing in it can be dated.
@@ -2445,14 +2438,10 @@ impl PaymentBlocker {
                 order_sats,
             } => format!(
                 "The seller\u{2019}s store asks {} for this order, not the {} total you agreed to \
-                 when you pressed Buy now. Do not pay it. Buy again, or ask the seller.",
+                 when you pressed Buy now. Do not pay it.",
                 crate::components::pay_card::btc_amount(*order_sats),
                 crate::components::pay_card::btc_amount(*asked_sats),
             ),
-            PaymentBlocker::KeptTermsChanged => "The store changed this order after your node \
-                 kept a copy of it: the amount or the address is different now. Do not pay it. \
-                 Buy again, or ask the seller."
-                .to_string(),
             PaymentBlocker::NotAwaitingPayment(status) => format!(
                 "This order is no longer awaiting payment ({status:?}), so there is nothing \
                  to pay."
@@ -2617,7 +2606,6 @@ impl BuyerPurchase {
             | PaymentBlocker::AddressContractNotCurrent { .. }
             // An order the buyer will not pay is one they may withdraw.
             | PaymentBlocker::AmountNotAsked { .. }
-            | PaymentBlocker::KeptTermsChanged
             | PaymentBlocker::ConversationNotKept
             | PaymentBlocker::PurchaseNotKept => true,
         })
@@ -6214,11 +6202,6 @@ impl AppState {
         // (R2-6); else the store's copy; else the kept copy, which is what
         // lets a buyer still pay an order the seller evicted before the
         // payment was seen (R2-2).
-        // A store copy whose terms are not the kept copy's is refused by
-        // `PaymentBlocker::KeptTermsChanged`, not swapped for the kept one:
-        // the store is where a payment is published and the seller looks,
-        // so paying terms it no longer holds would leave a paid order the
-        // seller never sees (round 2 of harvest#187).
         let commitment = paid
             .clone()
             .or_else(|| held.cloned())
@@ -8325,23 +8308,6 @@ impl AppState {
         // again", inviting a second payment (review round 3, P3). An order
         // already paid returned above.
         let kept = self.holds_kept_copy(store, conversation, &commitment.order.id);
-        // A Buy now order's id comes from the buyer's request, not its terms,
-        // so the store can take a second unpaid version under the same id (a
-        // higher amount wins its merge) with another amount and address. The
-        // kept copy is what this node watches and a complaint verifies
-        // against: a store copy that is not it is not paid (review of
-        // harvest#187).
-        if let Some(owner) = store.owner {
-            if self
-                .kept_copy(&owner, &commitment.order.id)
-                .is_some_and(|kept| {
-                    kept.order.status == OrderStatus::AwaitingPayment
-                        && kept.order.order != commitment.order
-                })
-            {
-                blockers.push(PaymentBlocker::KeptTermsChanged);
-            }
-        }
         match self.bitcoin.address_generation.code_hash() {
             _ if kept => {}
             Some(current) if commitment.order.bitcoin_address_code_hash == Some(current) => {}
@@ -30686,53 +30652,6 @@ mod buy_flow_tests {
         assert_eq!(state.keep_requests.len(), 2, "again once the wait is over");
     }
 
-    /// **After the keep, a second version under the same id is not paid**
-    /// (review of harvest#187): a Buy now order's id comes from its request,
-    /// so the store can take a second unpaid version with a higher amount
-    /// and another address. Neither the kept copy (the seller no longer sees
-    /// it) nor the store's (the node does not watch it, and a complaint
-    /// would not verify) is safe to pay, so `KeptTermsChanged` stops it.
-    /// Red without the check.
-    #[test]
-    fn a_second_version_under_the_same_id_does_not_replace_the_kept_terms() {
-        let (unpaid, _, _) = a_paid_order();
-        let mut v1 = unpaid.clone();
-        v1.order.request_id = Some([3u8; 32]);
-        let v1 = resigned(v1, &seller_signing_key());
-        let mut v2 = v1.clone();
-        v2.order.amount_sats += 10_000;
-        v2.order.payment_address =
-            "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7".into();
-        let v2 = resigned(v2, &seller_signing_key());
-        assert_eq!(v1.order.id, v2.order.id, "one id: the request's");
-
-        let recognised = recognise_settling_bridge();
-        let (mut state, _) = buyer_after_acceptance(&v2);
-        state.test_guards.push(recognised);
-        assert_eq!(
-            purchases(&state)[0].commitment.as_ref(),
-            Some(&v2),
-            "not kept yet"
-        );
-        state.on_kept_purchases(vec![kept(&v1)]);
-        let purchase = purchases(&state).remove(0);
-        assert!(
-            purchase
-                .blockers
-                .contains(&PaymentBlocker::KeptTermsChanged),
-            "{:?}",
-            purchase.blockers
-        );
-        assert!(purchase.cancellable(), "the buyer may still withdraw it");
-
-        // The same terms in both: nothing stops it.
-        let (mut same, _) = buyer_after_acceptance(&v1);
-        same.test_guards.push(recognise_settling_bridge());
-        same.on_kept_purchases(vec![kept(&v1)]);
-        let purchase = purchases(&same).remove(0);
-        assert!(purchase.blockers.is_empty(), "{:?}", purchase.blockers);
-    }
-
     /// **A keep left unanswered times out** (review round 3, P3): an answer
     /// lost, or an error naming no order, must not hold the button or the
     /// complaint for the session. Red if the marker never expires.
@@ -32907,7 +32826,6 @@ mod payment_blocker_wording_tests {
                 asked_sats: 1_100,
                 order_sats: 2_200,
             },
-            PaymentBlocker::KeptTermsChanged,
             PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled),
             PaymentBlocker::AnchorMissing,
             PaymentBlocker::ChainUnknown,
@@ -32953,7 +32871,6 @@ mod payment_blocker_wording_tests {
                 | PaymentBlocker::DestinationUnreadable
                 | PaymentBlocker::CommitmentNotRequested
                 | PaymentBlocker::AmountNotAsked { .. }
-                | PaymentBlocker::KeptTermsChanged
                 | PaymentBlocker::NotAwaitingPayment(_)
                 | PaymentBlocker::AnchorMissing
                 | PaymentBlocker::ChainUnknown
@@ -32983,7 +32900,7 @@ mod payment_blocker_wording_tests {
     /// The one number a future edit has to change by hand, and the assertion
     /// above is what makes forgetting it fail rather than silently narrow the
     /// coverage.
-    const EVERY_BLOCKER: usize = 25;
+    const EVERY_BLOCKER: usize = 24;
 
     /// **Every blocker says something, and says it as prose.**
     ///
