@@ -87,6 +87,9 @@ pub(crate) fn PaySteps(
     amount_sats: u64,
     network: BitcoinNetwork,
     confirmations: u32,
+    /// The order's short reference: keeps the copy fields' element ids apart
+    /// when two orders on one page share an amount.
+    order_ref: String,
 ) -> Element {
     let amount = amount_text(amount_sats, network);
     let wait = confirmation_wait(confirmations);
@@ -167,8 +170,13 @@ pub(crate) fn PaySteps(
                                 label: "Payment address",
                                 value: address.clone(),
                                 rows: 2,
+                                salt: order_ref.clone(),
                             }
-                            CopyField { label: "Amount", value: btc_amount(amount_sats) }
+                            CopyField {
+                                label: "Amount",
+                                value: btc_amount(amount_sats),
+                                salt: order_ref.clone(),
+                            }
                             p { class: "text-muted small",
                                 "Paste both into your wallet\u{2019}s Send screen. This address is only for "
                                 "this order."
@@ -201,13 +209,15 @@ fn CopyField(
     /// More than one row shows the value as a wrapping text area.
     #[props(default = 1)]
     rows: u32,
+    /// Makes the field's element id unique on the page.
+    salt: String,
 ) -> Element {
     let mut said = use_signal(|| Option::<&'static str>::None);
     // An id for the field, so the Copy button can select it when the
     // clipboard refuses: the press has moved focus off the field by then.
     let id = format!(
         "copy-{}",
-        &blake3::hash(format!("{label}\0{value}").as_bytes()).to_hex()[..12]
+        &blake3::hash(format!("{salt}\0{label}\0{value}").as_bytes()).to_hex()[..12]
     );
     rsx! {
         div { class: "copy-row",

@@ -702,21 +702,43 @@ pub(crate) fn OrderCard(
                 // of a cancelled, lapsed or settled order is not offered, so
                 // nobody sends coin the order will not recognise or does not
                 // need (harvest#53).
-            } else if destination.payable() && buyer && reading.seen_any() {
-                // A payment to this address is already on its way: no steps
-                // telling the buyer to send, which would invite paying twice.
-                // The pill above says whether it covers the amount.
+            } else if destination.payable() && buyer && reading.covers(o, tip_height) {
+                // A payment covering the amount is already in sight: the
+                // steps are folded away rather than shown, so nobody is told
+                // to send twice. Only a covering payment folds them: anyone
+                // can send dust to a published address, and that must not
+                // take the buyer's way to pay away (round 2 of harvest#187).
+                // Still reachable, because a covering payment that never
+                // confirms is possible too.
                 p {
-                    "A payment to this order\u{2019}s address has been seen. It shows as paid once it \
+                    "A payment covering this order has been seen. It shows as paid once it \
                      confirms, usually {super::pay_card::confirmation_wait(o.required_confirmations)} \
                      after it was sent. You can close Harvest while you wait."
                 }
+                details {
+                    summary { class: "text-muted small", "Didn\u{2019}t send it? Show how to pay" }
+                    super::pay_card::PaySteps {
+                        address: o.payment_address.clone(),
+                        amount_sats: o.amount_sats,
+                        network: o.network,
+                        confirmations: o.required_confirmations,
+                        order_ref: o.id.short(),
+                    }
+                }
             } else if destination.payable() && buyer {
+                if let Some(short) = reading.short_of() {
+                    p { class: "text-warning",
+                        "A payment smaller than this order\u{2019}s amount has been seen at its \
+                         address. If it was yours, send the remaining \
+                         {super::pay_card::amount_text(short, o.network)} to the same address."
+                    }
+                }
                 super::pay_card::PaySteps {
                     address: o.payment_address.clone(),
                     amount_sats: o.amount_sats,
                     network: o.network,
                     confirmations: o.required_confirmations,
+                    order_ref: o.id.short(),
                 }
             } else if destination.payable() {
                 // A readonly input rather than a paragraph, so the address can
@@ -879,12 +901,25 @@ pub(crate) struct AddressReading {
 }
 
 impl AddressReading {
-    /// Whether a payment for this order is already in sight: confirmed
-    /// inside its window, or unconfirmed. A payment from before the order
-    /// (another order's, on a reused address) or after its window does not
-    /// count.
-    pub(crate) fn seen_any(&self) -> bool {
-        self.in_window_sats > 0 || self.pending_sats > 0
+    /// Whether a payment covering this order is in sight: confirmed inside
+    /// its window, or confirmed there plus in flight, for the full amount
+    /// ([`Self::sight`]). Dust, which anyone can send to a published
+    /// address, does not count, nor does a payment from before the order or
+    /// after its window.
+    pub(crate) fn covers(
+        &self,
+        order: &harvest_common::payment::Order,
+        tip_height: Option<u32>,
+    ) -> bool {
+        let sight = self.sight(order, tip_height);
+        sight.covered || sight.in_flight
+    }
+
+    /// How much is still to send when something short of the amount is in
+    /// sight (confirmed in the window plus in flight), else `None`.
+    pub(crate) fn short_of(&self) -> Option<u64> {
+        let seen = self.in_window_sats.saturating_add(self.unconfirmed_sats);
+        (seen > 0 && seen < self.amount_sats).then(|| self.amount_sats - seen)
     }
 
     pub(crate) fn of(order: &harvest_common::payment::Order, live: Option<&AddressView>) -> Self {
@@ -1751,15 +1786,26 @@ mod address_reading_tests {
         assert_eq!(reading.outside_note(false), None);
     }
 
-    /// The buyer's pay steps give way once a payment is in sight, so nobody
-    /// is told to send twice; a payment from before the order does not count
-    /// (review of harvest#187).
+    /// The buyer's pay steps fold away only for a payment covering the
+    /// amount in sight, so nobody is told to send twice, and dust (anyone can
+    /// send it to a published address) never takes them away; a partial
+    /// payment says what is left (round 2 of harvest#187). Red if dust or a
+    /// payment from before the order counts.
     #[test]
-    fn a_payment_in_sight_ends_the_pay_steps() {
+    fn only_a_covering_payment_folds_the_pay_steps() {
         let order = order_anchored_at(150);
-        assert!(!AddressReading::of(&order, None).seen_any());
-        assert!(AddressReading::of(&order, Some(&address_with(&[(160, 50_000)]))).seen_any());
-        assert!(!AddressReading::of(&order, Some(&address_with(&[(140, 50_000)]))).seen_any());
+        let amount = order.amount_sats;
+        let tip = Some(170);
+        let reading = |rows: &[(u32, u64)]| AddressReading::of(&order, Some(&address_with(rows)));
+        assert!(!AddressReading::of(&order, None).covers(&order, tip));
+        assert!(reading(&[(160, amount)]).covers(&order, tip));
+        assert!(!reading(&[(160, 1)]).covers(&order, tip), "dust");
+        assert_eq!(reading(&[(160, 1)]).short_of(), Some(amount - 1));
+        assert!(
+            !reading(&[(140, amount)]).covers(&order, tip),
+            "before the order"
+        );
+        assert_eq!(reading(&[(160, amount)]).short_of(), None);
     }
 
     /// **PR #83 round 2, Should Fix 5.** Dust inside the window is not a

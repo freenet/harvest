@@ -201,11 +201,13 @@ delegate:
 
 Payment details appear only once the delegate's list holds the copy (blocker `PurchaseNotKept`).
 So before any money moves, the buyer holds seller-signed terms that a complaint will verify
-against, and every later seller act on the store is irrelevant to them. The card shows those
-kept terms: a Buy now order's id comes from its request rather than its terms, so the store
-can take a second, unpaid version under the same id (a higher amount wins the merge) with
-another amount and address, and while both are unpaid the kept copy, not the store's, is what
-the buyer is shown and pays (review of harvest#187).
+against, and every later seller act on the store is irrelevant to them. A Buy now order's id
+comes from its request rather than its terms, so the store can take a second, unpaid version
+under the same id (a higher amount wins the merge) with another amount and address. Neither
+copy is then safe to pay: the store's is not what the node watches or a complaint verifies,
+and the kept one is not what the seller sees or where a payment is published. So a store copy
+whose terms differ from the kept copy is refused (`KeptTermsChanged`), and the buyer buys
+again (review of harvest#187).
 
 ### 3.2 Watching and upgrading
 

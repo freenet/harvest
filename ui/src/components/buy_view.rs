@@ -154,6 +154,7 @@ pub fn BuyForm(
                                     purchase,
                                     bitcoin,
                                     just_bought: true,
+                                    asked_sats: Some(sent.asked_sats),
                                 }
                             },
                             None => rsx! {
@@ -293,6 +294,7 @@ pub fn BuyForm(
                                 problem.set(None);
                                 sent.set(Some(Sent {
                                     at_ms: unix_millis(),
+                                    asked_sats: total,
                                     answers_before,
                                     expected: answering
                                         .answered_request(&tag)
@@ -394,6 +396,10 @@ fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
 #[derive(Clone, PartialEq, Debug)]
 struct Sent {
     at_ms: u64,
+    /// The total the form showed when Buy now was pressed: what the order
+    /// must ask, checked on its card even if the request itself is not in
+    /// this device's thread (round 2 of harvest#187).
+    asked_sats: u64,
     answers_before: Vec<[u8; 32]>,
     /// The order the store would issue for this request
     /// (`OrderId::for_request`), so an acceptance of another request is
@@ -600,8 +606,24 @@ pub(crate) fn PurchaseCard(
     /// more to press (see [`KeepBeforePaying`]).
     #[props(default)]
     just_bought: bool,
+    /// The total the Buy now form showed, when this card is under it.
+    #[props(default)]
+    asked_sats: Option<u64>,
 ) -> Element {
     let short = purchase.order_id.short();
+    // The order must ask what the form showed. `AmountNotAsked` checks the
+    // same against the request in the thread; this covers a thread that
+    // does not hold it.
+    let not_asked = asked_sats
+        .zip(purchase.commitment.as_ref())
+        .and_then(|(asked, c)| {
+            (c.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                && c.order.amount_sats != asked)
+                .then_some(PaymentBlocker::AmountNotAsked {
+                    asked_sats: asked,
+                    order_sats: c.order.amount_sats,
+                })
+        });
     let cancellable = purchase.cancellable();
     let item = APP_STATE
         .read()
@@ -650,6 +672,8 @@ pub(crate) fn PurchaseCard(
                     "The seller's record says this order is paid, but it is not a purchase this \
                      app can confirm as yours."
                 }
+            } else if let Some(blocker) = not_asked {
+                p { class: "text-warning", "{blocker.describe()}" }
             } else if purchase.ready_to_keep() {
                 // Everything checks out but this node does not keep its own
                 // copy yet. The payment details appear once the delegate says
@@ -691,12 +715,13 @@ pub(crate) fn PurchaseCard(
                             // Above asking the seller: a new request gets a
                             // new order, which puts right whatever else the
                             // seller got wrong in this one.
-                            Remedy::AskAgain => 2,
+                            Remedy::AskAgain | Remedy::BuyAgain => 2,
                             Remedy::WalkAway => 3,
                         }) {
                             Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
                             Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. The seller can fix it by issuing the order again.",
                             Some(Remedy::AskAgain) => "No payment details are shown while that is true. Send your request to buy again from this device: a request from this version of Harvest carries your key, and the seller can answer it with an order you can pay.",
+                            Some(Remedy::BuyAgain) => "No payment details are shown while that is true. Buy it again to get an order you can pay.",
                             _ => "No payment details are shown while that is true. Look again in a moment.",
                         }
                     }
@@ -1333,12 +1358,22 @@ pub fn AcceptRequest(
                 label { class: "form-label",
                     "Amount for {quantity} x {listing_title} (satoshis)"
                 }
+                // Fixed for a Buy now answer: the buyer's app pays only the
+                // total they agreed to (`PaymentBlocker::AmountNotAsked`), so
+                // any other amount would publish an order nobody can pay.
                 input {
                     class: "form-input",
                     r#type: "number",
                     min: "1",
+                    readonly: instant.is_some(),
                     value: "{amount}",
                     oninput: move |event| amount.set(event.value()),
+                }
+                if instant.is_some() {
+                    p { class: "text-muted small",
+                        "The total the buyer agreed to when they pressed Buy now. Their app pays no "
+                        "other amount."
+                    }
                 }
             }
             div { class: "form-group",
@@ -1516,6 +1551,9 @@ pub enum Remedy {
     /// the same gap from the same request. Sending the request again from
     /// this build carries it (round-3 review of harvest#136).
     AskAgain,
+    /// Only a new Buy now can put this right: this order's terms are not
+    /// what was agreed, and its id cannot take other terms.
+    BuyAgain,
     /// Nothing either party can do makes this order safe to pay.
     WalkAway,
 }
@@ -1557,9 +1595,11 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // new one.
         PaymentBlocker::ConversationForgotten => Remedy::AskAgain,
         // A Buy now order's id comes from its request, and the store merges
-        // only upwards, so the seller cannot put the amount right under this
-        // id: a new Buy now gets a new order.
-        PaymentBlocker::AmountNotAsked { .. } => Remedy::AskAgain,
+        // only upwards, so the seller cannot put these right under this id:
+        // a new Buy now gets a new order.
+        PaymentBlocker::AmountNotAsked { .. } | PaymentBlocker::KeptTermsChanged => {
+            Remedy::BuyAgain
+        }
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
