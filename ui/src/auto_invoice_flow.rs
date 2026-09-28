@@ -884,8 +884,19 @@ impl AppState {
         Some(match self.auto_invoice.status.get(store_contract_id) {
             None => "Your store is starting to take orders on this device.".into(),
             Some(Err(why)) => format!("Your store can't take orders on this device: {why}."),
-            Some(Ok(status)) => instant_checkout_status_text(status, now_ms),
+            // The state line alone: the alerts (oversold, capped) are said
+            // separately, in "Needs you", whether or not the store is open.
+            Some(Ok(status)) => instant_checkout_state_line(status, now_ms),
         })
+    }
+
+    /// [`instant_checkout_alerts`] for one of our stores; empty when it has
+    /// no status yet.
+    pub fn instant_checkout_alerts(&self, store_contract_id: &[u8]) -> Vec<String> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(status)) => instant_checkout_alerts(status),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -952,6 +963,29 @@ fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
 
 /// The store page's line for an armed store, led by any order that was paid
 /// after its item had gone to another buyer.
+/// What the seller must know about orders even while the store is open:
+/// paid orders the listing's count no longer covered (to refund or send by
+/// hand), and a buyer turned away by a cap in the last hour. Empty for none.
+pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if !status.oversold.is_empty() {
+        let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
+        alerts.push(format!(
+            "Paid when the listing's count no longer covered them (the item went to another \
+             buyer, or you marked it sold out or took it down): {}. Refund or send these by \
+             hand.",
+            orders.join(", ")
+        ));
+    }
+    if let Some(why) = &status.capped {
+        alerts.push(format!(
+            "In the last hour a buyer couldn't order because {why}; they were told to try again \
+             later."
+        ));
+    }
+    alerts
+}
+
 pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     let line = instant_checkout_state_text(status, now_ms);
     if status.oversold.is_empty() {

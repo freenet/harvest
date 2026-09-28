@@ -68,6 +68,10 @@ pub fn presence_refresh_after(misses: u32) -> u64 {
 /// most one heartbeat per [`HEARTBEAT_MIN_GAP_MS`] whoever asks.
 pub const WAKEUPS_FRESH_MS: u64 = HEARTBEAT_EVERY_MS + 30 * 1000;
 
+/// How recent a wake-up has to be for the seller to be TOLD the store stays
+/// open without Harvest open ([`AppState::wakeups_seen_recently`]).
+pub const WAKEUPS_SEEN_MS: u64 = 3 * HEARTBEAT_EVERY_MS;
+
 // The handover. The last heartbeat SENT may predate the last wake-up by up to
 // the gap (that wake-up was held back by it); the tab takes over
 // `WAKEUPS_FRESH_MS` after the wake-up, at its next minute tick. All of that
@@ -262,6 +266,19 @@ impl AppState {
 
     /// Whether this node wakes the delegate on its own, as far as the tab
     /// knows: a wake-up within [`WAKEUPS_FRESH_MS`].
+    /// Whether the delegate has woken on its own recently enough to say the
+    /// store stays open with Harvest closed. For what the seller READS only:
+    /// three heartbeat intervals, so one late wake-up does not flip the
+    /// wording back and forth (the 2026-09-27 friction report saw it flip
+    /// between two contradictory lines). What the tab DOES still follows
+    /// [`Self::wakeups_live`], whose shorter window decides whether the tab
+    /// sends heartbeats itself.
+    pub fn wakeups_seen_recently(&self, now_ms: u64) -> bool {
+        self.presence
+            .last_wakeup_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) < WAKEUPS_SEEN_MS)
+    }
+
     pub fn wakeups_live(&self, now_ms: u64) -> bool {
         self.presence
             .last_wakeup_ms
@@ -395,35 +412,61 @@ impl AppState {
     }
 }
 
-/// What the seller reads about their own store's presence.
-pub fn seller_presence_line(presence: StorePresence, wakeups: bool) -> String {
-    let state = match presence {
-        StorePresence::Open => "Buyers see your store as open.".to_string(),
-        StorePresence::Checking => "Checking whether buyers see your store as open\u{2026}".into(),
-        StorePresence::Closed(ClosedWhy::NotTakingOrders) => {
-            "Buyers see your store as closed: it can\u{2019}t take orders right now (see below)."
-                .into()
-        }
-        StorePresence::Closed(_) => "Buyers see your store as closed.".into(),
-    };
-    // Said of an open store as it is, and of any other as what will happen
-    // once it can take orders.
-    let lead = if presence.is_open() {
-        "It stays open"
-    } else {
-        "Once it can take orders, it stays open"
-    };
-    let how = if wakeups {
-        format!(
-            "{lead} while this computer is on and Freenet is running, with Harvest open or not."
-        )
-    } else {
-        format!(
-            "{lead} only while Harvest is open here. Once Freenet updates to a version that \
-             keeps stores open in the background, it will stay open while this computer is on."
-        )
-    };
-    format!("{state} {how}")
+/// The one status the seller reads about their own store, driven by what
+/// buyers see (the store's presence), never by what this device is still
+/// setting up: the friction report found "Buyers see your store as open"
+/// above "Your store is starting to take orders". `why_not` is this device's
+/// own reason, said only while buyers can't buy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SellerStatus {
+    /// "Open", "Closed" or "Checking".
+    pub pill: &'static str,
+    pub open: bool,
+    /// The line itself.
+    pub line: String,
+    /// This device's reason, when buyers can't buy and it has one.
+    pub why_not: Option<String>,
+}
+
+/// See [`SellerStatus`]. `wakeups`: the delegate has been waking on its own
+/// ([`AppState::wakeups_seen_recently`]).
+pub fn seller_status(
+    presence: StorePresence,
+    wakeups: bool,
+    why_not: Option<String>,
+) -> SellerStatus {
+    match presence {
+        StorePresence::Open => SellerStatus {
+            pill: "Open",
+            open: true,
+            line: if wakeups {
+                "Buyers can buy now. Your store stays open while this computer is on and \
+                 Freenet is running, with Harvest open or not."
+                    .to_string()
+            } else {
+                "Buyers can buy now. Your store stays open while Harvest is open here.".to_string()
+            },
+            why_not: None,
+        },
+        StorePresence::Checking => SellerStatus {
+            pill: "Checking",
+            open: false,
+            line: "Checking whether buyers can reach your store\u{2026}".to_string(),
+            why_not: None,
+        },
+        StorePresence::Closed(ClosedWhy::NotTakingOrders) => SellerStatus {
+            pill: "Closed",
+            open: false,
+            line: "Buyers can\u{2019}t buy from your store right now.".to_string(),
+            why_not,
+        },
+        StorePresence::Closed(_) => SellerStatus {
+            pill: "Closed",
+            open: false,
+            line: "Buyers can\u{2019}t reach your store right now.".to_string(),
+            why_not,
+        },
+    }
 }
 
 /// The age past which a heartbeat no longer opens a store, for display.
@@ -474,20 +517,42 @@ mod tests {
         );
     }
 
-    /// The seller's line says how the store stays open as a fact only when
-    /// it is open. Mutated red by always saying it as a fact.
+    /// ONE status, from what buyers see: open says so and nothing about
+    /// setting up; closed carries this device's reason; the wording about
+    /// staying open follows wake-ups. Red if the reason shows while open, or
+    /// is dropped while closed.
     #[test]
-    fn the_seller_is_told_how_the_store_stays_open() {
-        let open = seller_presence_line(StorePresence::Open, true);
+    fn the_seller_reads_one_status_driven_by_what_buyers_see() {
+        let why = Some("the watch lapsed".to_string());
+        let open = seller_status(StorePresence::Open, true, why.clone());
+        assert_eq!((open.pill, open.open), ("Open", true));
         assert!(
-            open.starts_with("Buyers see your store as open. It stays open while"),
-            "{open}"
+            open.line.starts_with("Buyers can buy now."),
+            "{}",
+            open.line
         );
-        let closed = seller_presence_line(StorePresence::Closed(ClosedWhy::NotTakingOrders), false);
         assert!(
-            closed.contains("Once it can take orders, it stays open only while Harvest is open"),
-            "{closed}"
+            open.line.contains("with Harvest open or not"),
+            "{}",
+            open.line
         );
+        assert_eq!(open.why_not, None, "no setting-up line under an open store");
+        let tab = seller_status(StorePresence::Open, false, None);
+        assert!(
+            tab.line.contains("while Harvest is open here"),
+            "{}",
+            tab.line
+        );
+        let closed = seller_status(
+            StorePresence::Closed(ClosedWhy::NotTakingOrders),
+            true,
+            why.clone(),
+        );
+        assert_eq!((closed.pill, closed.open), ("Closed", false));
+        assert_eq!(closed.why_not, why);
+        let checking = seller_status(StorePresence::Checking, false, why);
+        assert_eq!(checking.pill, "Checking");
+        assert_eq!(checking.why_not, None);
     }
 
     #[test]

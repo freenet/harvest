@@ -645,8 +645,10 @@ pub(crate) fn OrderCard(
     };
     let stage = crate::fulfilment::order_stage(&order, despatch.as_ref(), tip_height, sight);
     let stage_note = stage
-        .describe(tip_height, order.status)
-        .or_else(|| crate::fulfilment::closed_window_note(&order, tip_height, sight));
+        .describe(tip_height, order.status, crate::state::now_ms())
+        .or_else(|| {
+            crate::fulfilment::closed_window_note(&order, tip_height, sight, crate::state::now_ms())
+        });
     let offers_address = crate::fulfilment::offers_payment_address(&order, tip_height);
     let (status_class, status_text) = card_pill(order.status, &reading, hold.is_some(), stage);
     let order_id = o.id.clone();

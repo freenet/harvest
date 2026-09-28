@@ -780,16 +780,51 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
     let instant_checkout = APP_STATE
         .read()
         .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
-    // Whether buyers see this store open, and what keeps it so. Only for a
-    // store that sells (the notice above is `None` otherwise).
-    let presence_line = instant_checkout.as_ref().map(|_| {
+    // ONE status, from what buyers see; this device's own reason only while
+    // they can't buy. Only for a store that sells (the notice is `None`
+    // otherwise).
+    let status = instant_checkout.clone().map(|notice| {
         let state = APP_STATE.read();
         let now = crate::state::now_ms();
-        crate::presence_flow::seller_presence_line(
+        crate::presence_flow::seller_status(
             state.store_presence(&store.contract_id, now),
-            state.wakeups_live(now),
+            state.wakeups_seen_recently(now),
+            Some(notice),
         )
     });
+    let alerts = APP_STATE.read().instant_checkout_alerts(&store.contract_id);
+    // The paid orders to send, each on its own row with Mark as sent.
+    let to_send: Vec<harvest_common::payment::AuthorizedOrder> = {
+        let state = APP_STATE.read();
+        state
+            .browsing_stores
+            .get(&store.contract_id)
+            .map(|s| {
+                s.orders
+                    .iter()
+                    .filter(|o| o.order.seller_fingerprint == store.fingerprint)
+                    .filter(|o| {
+                        let tip = state
+                            .bitcoin
+                            .tips
+                            .get(&o.order.network)
+                            .and_then(|t| t.tip_height);
+                        matches!(
+                            crate::fulfilment::order_stage(
+                                o,
+                                state.despatch_of(o).as_ref(),
+                                tip,
+                                state.payment_sight(o),
+                            ),
+                            crate::fulfilment::OrderStage::AwaitingDespatch { .. }
+                                | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
     let needs: bool = store.unpriced > 0
@@ -800,7 +835,8 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         || store.expired_invoices > 0
         || store.requests > 0
         || store.to_send > 0
-        || store.to_confirm > 0;
+        || store.to_confirm > 0
+        || !alerts.is_empty();
 
     rsx! {
         section { class: "card",
@@ -857,17 +893,27 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
                 }
             }
-            if store.to_send > 0 {
+            // Each paid order to send is its own card here, with what to
+            // pack, where, by when, and Mark as sent: no trip to Orders and
+            // no hunt through messages for the address (the 2026-09-27
+            // friction report).
+            for order in to_send.iter() {
+                super::invoice_form::SellerOrderCard {
+                    key: "{order.order.id}",
+                    store_contract_id: store.contract_id.clone(),
+                    order: order.clone(),
+                }
+            }
+            if store.to_send > to_send.len() {
+                // Counted from another view than the cards above (a second
+                // Ghost Key's orders); point at the list rather than hide it.
                 div { class: "need row-between",
-                    strong {
-                        if store.to_send == 1 {
-                            "1 paid order to send."
-                        } else {
-                            "{store.to_send} paid orders to send."
-                        }
-                    }
+                    strong { "More paid orders are waiting to be sent." }
                     button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
                 }
+            }
+            for alert in alerts.iter() {
+                p { class: "text-warning", "{alert}" }
             }
             if store.requests > 0 {
                 div { class: "need row-between",
@@ -898,13 +944,16 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
         }
 
-        if let Some(notice) = instant_checkout {
+        if let Some(status) = status {
             section { class: "card",
-                h3 { "Taking orders" }
-                if let Some(ref line) = presence_line {
-                    p { "{line}" }
+                div { class: "row-between",
+                    h3 { "Your store" }
+                    span { class: if status.open { "pill pill-open" } else { "pill" }, "{status.pill}" }
                 }
-                p { class: "text-muted", "{notice}" }
+                p { "{status.line}" }
+                if let Some(why) = status.why_not {
+                    p { class: "text-muted", "{why}" }
+                }
             }
         }
 

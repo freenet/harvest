@@ -377,17 +377,58 @@ fn format_build_time() -> String {
 fn notification_bar() -> Element {
     let app_state = crate::gateway::APP_STATE.read();
     // Notices that last only while something is under way (harvest#166)
-    // come after the ones that stay.
+    // come after the ones that stay, and end by themselves.
     let progress = app_state.progress_notices();
-    if app_state.notifications.is_empty() && progress.is_empty() {
+    // Each notice once, however often it was raised, and each with a way to
+    // put it away: before, they stacked up to eight deep above every screen
+    // and never left (the 2026-09-27 friction report).
+    let notices = distinct_notices(&app_state.notifications);
+    if notices.is_empty() && progress.is_empty() {
         return rsx! {};
     }
 
     rsx! {
         div { class: "notification-bar",
-            for notification in app_state.notifications.iter().chain(progress.iter()) {
-                p { "{notification}" }
+            for notice in notices {
+                div { key: "{notice}", class: "notice-row",
+                    p { "{notice}" }
+                    button {
+                        class: "link-btn notice-dismiss",
+                        aria_label: "Dismiss this notice",
+                        onclick: {
+                            let notice = notice.clone();
+                            move |_| crate::gateway::APP_STATE.write().dismiss_notification(&notice)
+                        },
+                        "Dismiss"
+                    }
+                }
+            }
+            for notice in progress.iter() {
+                p { "{notice}" }
             }
         }
+    }
+}
+
+/// Each notice once, in the order first raised.
+fn distinct_notices(notifications: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    notifications
+        .iter()
+        .filter(|n| seen.insert(n.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod notice_tests {
+    /// A notice raised again is shown once. Red without the dedupe.
+    #[test]
+    fn a_repeated_notice_shows_once() {
+        let raised = ["a", "b", "a", "a", "c", "b"].map(String::from);
+        assert_eq!(
+            super::distinct_notices(&raised),
+            ["a", "b", "c"].map(String::from)
+        );
     }
 }

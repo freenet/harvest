@@ -17,6 +17,20 @@ use std::collections::{HashMap, HashSet};
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
+/// What a buyer asked for, as the seller's order card shows it
+/// ([`AppState::seller_order_request`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SellerOrderRequest {
+    /// The listing's title, while the store still lists it.
+    pub title: Option<String>,
+    pub quantity: u32,
+    /// Where to send it, as the buyer typed it.
+    pub shipping: String,
+    pub note: String,
+    pub region: Option<String>,
+    pub choices: Vec<String>,
+}
+
 /// Why asking the vault for a Ghost Key came back with none
 /// ([`AppState::ghostkey_access_problem`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6574,6 +6588,69 @@ impl AppState {
         self.keep_refusals.get(order_id).map(String::as_str)
     }
 
+    /// Put a notice away: every copy of it, however often it was raised.
+    /// The same thing raised again later shows again.
+    pub fn dismiss_notification(&mut self, notice: &str) {
+        self.notifications.retain(|n| n != notice);
+    }
+
+    /// What the buyer of this seller's order `order_id` asked for, read from
+    /// the Buy now request it answers in the store's mailbox: the listing's
+    /// title (while it is listed), how many, where to send it, the note, and
+    /// the delivery region and choices. What the seller's order card shows,
+    /// so the address is on the card rather than in the message thread (the
+    /// 2026-09-27 friction report). `None` when no readable request answers
+    /// it (an invoice issued by hand without one), and when requests under
+    /// the same id disagree (the buyer holds the keys and could add one):
+    /// the seller then reads the messages.
+    pub fn seller_order_request(
+        &self,
+        store_contract_id: &[u8],
+        order_id: &harvest_common::payment::OrderId,
+    ) -> Option<SellerOrderRequest> {
+        use crate::messaging::{MailboxEntry, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let asked: Vec<SellerOrderRequest> = self
+            .mailbox_entries(store_contract_id)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content:
+                        MessageContent::OrderRequest {
+                            listing_id,
+                            quantity,
+                            shipping,
+                            note,
+                            instant: Some(selection),
+                            ..
+                        },
+                    conversation,
+                    ..
+                } => {
+                    let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                    let answers = selection
+                        .answered_request(&tag)
+                        .is_some_and(|request| &request.order_id() == order_id);
+                    answers.then(|| SellerOrderRequest {
+                        title: store
+                            .listings
+                            .iter()
+                            .find(|l| l.listing.id == listing_id)
+                            .map(|l| l.listing.title.clone()),
+                        quantity,
+                        shipping,
+                        note,
+                        region: selection.region.clone(),
+                        choices: selection.choices.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let first = asked.first()?.clone();
+        asked.iter().all(|other| *other == first).then_some(first)
+    }
+
     /// What the buyer asked for in the Buy now that `purchase` answers: the
     /// listing's title (when the store still lists it) and the quantity,
     /// read from the buyer's own request in that conversation. The order
@@ -10241,16 +10318,22 @@ impl AppState {
             crate::fulfilment::OrderStage::Despatched { .. }
             | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {}
             crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. } => {
-                return Err(format!(
-                    "the seller has until block {despatch_by} to despatch, and a complaint can \
-                     be made once they record a despatch or that deadline passes"
-                ))
+                return Err(match tip_height {
+                    Some(tip) => format!(
+                        "the seller has until about {} to send it, and a problem can be \
+                         reported once they mark it as sent or that date passes",
+                        crate::fulfilment::approx_date(despatch_by, tip, now_ms())
+                    ),
+                    None => "the seller still has time to send it, and a problem can be \
+                             reported once they mark it as sent or that time passes"
+                        .to_string(),
+                });
             }
-            crate::fulfilment::OrderStage::Closed { closed_at } => {
-                return Err(format!(
-                    "the complaint window closed at block {closed_at}, and the order counts as \
-                     complete"
-                ))
+            crate::fulfilment::OrderStage::Closed { .. } => {
+                return Err(
+                    "the time to report a problem has passed, and the order counts as complete"
+                        .to_string(),
+                )
             }
             crate::fulfilment::OrderStage::Unknown => {
                 return Err(
@@ -16185,7 +16268,7 @@ mod tests {
         line(failed, "app.end_details_publishing(&store_id, version);");
         let bar = include_str!("components/app.rs");
         line(bar, "let progress = app_state.progress_notices();");
-        assert!(bar.contains(".chain(progress.iter())"));
+        assert!(bar.contains("for notice in progress.iter()"));
         let my_store = include_str!("components/my_store.rs");
         assert!(!my_store.contains("Publishing your store's details"));
         let refused = include_str!("listing_status_flow.rs");
@@ -31370,7 +31453,8 @@ mod buy_flow_tests {
         let refused = state
             .complaint_refusal(STORE, &purchase)
             .expect("too early");
-        assert!(refused.contains("despatch"), "{refused}");
+        assert!(refused.contains("to send it"), "{refused}");
+        assert!(!refused.contains("block"), "a date, not a block: {refused}");
         assert!(state
             .file_complaint(STORE, &order.order.id, FeedbackCategory::NonDelivery)
             .is_err());
@@ -31387,7 +31471,7 @@ mod buy_flow_tests {
         );
         let purchase = purchases(&state).remove(0);
         let refused = state.complaint_refusal(STORE, &purchase).expect("too late");
-        assert!(refused.contains("closed"), "{refused}");
+        assert!(refused.contains("has passed"), "{refused}");
 
         // An unpaid order takes no complaint at all.
         let (unpaid, _, _) = a_paid_order();

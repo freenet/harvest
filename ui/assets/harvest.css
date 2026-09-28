@@ -206,7 +206,7 @@ body::before {
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line) > * {
+       .pay-ways, .copy-line, .notice-row) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -867,6 +867,52 @@ h4 {
 
 .copy-value:focus {
   outline: none;
+  border-color: var(--accent);
+}
+
+/* A notice on the bar, with its Dismiss beside it. */
+.notice-row {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.notice-dismiss {
+  flex-shrink: 0;
+  font-size: 0.8rem;
+}
+
+/* A paid order to send (invoice_form::SellerOrderCard). */
+.order-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.order-ship-to {
+  white-space: pre-wrap;
+}
+
+.orders-earlier {
+  margin-top: var(--space-lg);
+}
+
+/* The store's status on the seller's Overview: outlined, colour only when
+   open (the one state that means "buyers can buy"). */
+.pill {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.pill-open {
+  color: var(--accent);
   border-color: var(--accent);
 }
 

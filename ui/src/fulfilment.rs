@@ -620,6 +620,16 @@ pub fn approx_date(height: u32, tip: u32, now_ms: u64) -> String {
         .unwrap_or_else(|| "an unknown date".to_string())
 }
 
+/// The month block `height` was mined in, roughly, as "Oct 2026": for a
+/// record, where the day would claim more than a count of blocks can.
+pub fn approx_month(height: u32, tip: u32, now_ms: u64) -> String {
+    let blocks = i64::from(height) - i64::from(tip);
+    let at_ms = (now_ms as i64).saturating_add(blocks.saturating_mul(10 * 60 * 1000));
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| at.format("%b %Y").to_string())
+        .unwrap_or_else(|| "an unknown month".to_string())
+}
+
 impl OrderStage {
     /// What an order card says about where the order stands, or `None` when
     /// the card's existing payment status already says it all.
@@ -1520,9 +1530,12 @@ mod tests {
         assert!(!offers_payment_address(&open, Some(window_end)));
         // No tip yet: an open invoice still shows its address.
         assert!(offers_payment_address(&open, None));
-        assert!(closed_window_note(&open, Some(window_end - 1), PaymentSight::default(), NOW_MS).is_none());
-        let note =
-            closed_window_note(&open, Some(window_end), PaymentSight::default(), NOW_MS).expect("said why");
+        assert!(
+            closed_window_note(&open, Some(window_end - 1), PaymentSight::default(), NOW_MS)
+                .is_none()
+        );
+        let note = closed_window_note(&open, Some(window_end), PaymentSight::default(), NOW_MS)
+            .expect("said why");
         assert!(note.contains("by about 27 Sep"), "{note}");
         assert!(!note.contains("block"), "{note}");
         // Review round 2: past the window the STAGE can still read as
@@ -1674,7 +1687,16 @@ mod tests {
         let covered = closed_window_note(&open, Some(last + 500), COVERED, NOW_MS).expect("said");
         assert!(covered.contains("still counts"), "{covered}");
         assert!(!covered.contains("block"), "{covered}");
-        assert!(closed_window_note(&open, Some(last + 1), PaymentSight::default(), NOW_MS).is_none());
+        assert!(
+            closed_window_note(&open, Some(last + 1), PaymentSight::default(), NOW_MS).is_none()
+        );
+    }
+
+    /// A record names the month, counted from the tip.
+    #[test]
+    fn a_record_names_the_month() {
+        assert_eq!(approx_month(1_000, 1_000, NOW_MS), "Sep 2026");
+        assert_eq!(approx_month(1_000 + 6 * 144, 1_000, NOW_MS), "Oct 2026");
     }
 
     #[test]
@@ -1765,7 +1787,10 @@ mod tests {
         )
         .expect("window closed");
         assert!(closed_window.contains("about 26 Sep"), "{closed_window}");
-        assert!(closed_window.contains("from about 14 Oct"), "{closed_window}");
+        assert!(
+            closed_window.contains("from about 10 Oct"),
+            "{closed_window}"
+        );
         assert!(
             closed_window.contains("not marked it as sent"),
             "a closed window with no despatch says so, now a seller can record one: \
@@ -1784,8 +1809,17 @@ mod tests {
         // "The seller says": a despatch is the seller's own statement, and
         // the card must not present it as proof the goods arrived.
         assert!(despatched.contains("seller says"), "{despatched}");
-        for stage_text in [&lapsed, &open_cancel, &despatch, &closed_window, &despatched] {
-            assert!(!stage_text.contains("block"), "{stage_text:?} names a block");
+        for stage_text in [
+            &lapsed,
+            &open_cancel,
+            &despatch,
+            &closed_window,
+            &despatched,
+        ] {
+            assert!(
+                !stage_text.contains("block"),
+                "{stage_text:?} names a block"
+            );
         }
         for stage_text in [&despatch, &closed_window, &despatched] {
             for promise in ["complain", "delivered", "received"] {

@@ -45,24 +45,16 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
     bitcoin_config::settleable_networks()
 }
 
-/// The seller-side invoices panel for one store: the form that issues an
-/// invoice against a listing, and the invoices already issued. The payment
-/// key itself is set in My store > Settings ([`PayoutWallet`]).
+/// The seller's orders at one store: first each paid order still to send, on
+/// a card that says what to pack, where to send it and by when, with Mark as
+/// sent on it (the 2026-09-27 friction report); then the rest, as issued.
+///
+/// There is no "Issue an invoice" control any more: every listing has one
+/// fixed price and buyers pay through Buy now (Ian, 2026-09-26), so an
+/// invoice with no buyer's request behind it has nobody to pay it.
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
-    let mut show_form = use_signal(|| false);
-
-    let (
-        xpub,
-        xpub_loaded,
-        store_loaded,
-        listings,
-        sold_out,
-        orders,
-        live,
-        needs_reissue,
-        has_listings,
-    ) = {
+    let (to_send, others, live, needs_reissue) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         let mine = invoices_issued_by(
@@ -78,76 +70,53 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             .filter(|order| state.needs_reissue(order))
             .map(|order| order.order.id.clone())
             .collect();
+        let stage_of = |order: &harvest_common::payment::AuthorizedOrder| {
+            let tip = state
+                .bitcoin
+                .tips
+                .get(&order.order.network)
+                .and_then(|t| t.tip_height);
+            crate::fulfilment::order_stage(
+                order,
+                state.despatch_of(order).as_ref(),
+                tip,
+                state.payment_sight(order),
+            )
+        };
+        // The same rule as "Needs you" (`my_store::paid_to_send`).
+        let (to_send, others): (Vec<_>, Vec<_>) = mine.into_iter().partition(|order| {
+            matches!(
+                stage_of(order),
+                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
+                    | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
+            )
+        });
         (
-            state.bitcoin.payment_xpub.clone(),
-            state.bitcoin.payment_xpub_loaded,
-            // "No listings" and "this store's state has not arrived" look
-            // identical through an `unwrap_or_default`, and telling a seller to
-            // add a listing they already have -- while hiding the button that
-            // would let them invoice it -- is the same trap `publish_store_details`
-            // documents at length for the store's version number.
-            state.store_details_are_resolved(&store_contract_id),
-            // Every listing except those taken down (harvest#70); a sold-out
-            // one stays, marked, so an invoice that expired unpaid for the
-            // last one can be issued again (`issuable_listings`).
-            store.map(issuable_listings).unwrap_or_default(),
-            store.map(sold_out_ids).unwrap_or_default(),
-            mine,
+            to_send,
+            others,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
             needs_reissue,
-            store.is_some_and(|s| !s.listings.is_empty()),
         )
     };
 
     rsx! {
         div { class: "card",
-            h3 { "Invoices" }
-
-            if xpub_loaded && xpub.is_none() {
-                p { class: "text-muted",
-                    "Add a payout wallet in Settings before issuing an invoice: each invoice is "
-                    "paid to a new address from it."
+            h3 { "Orders" }
+            if to_send.is_empty() && others.is_empty() {
+                p { class: "text-muted", "No orders yet. Paid orders appear here." }
+            }
+            for order in to_send.iter() {
+                SellerOrderCard {
+                    key: "{order.order.id}",
+                    store_contract_id: store_contract_id.clone(),
+                    order: order.clone(),
                 }
             }
-
-            if xpub.is_some() {
-                if !store_loaded {
-                    p { class: "text-muted text-italic",
-                        "Loading this store's listings\u{2026}"
-                    }
-                } else if listings.is_empty() && has_listings {
-                    p { class: "text-muted text-italic",
-                        "Nothing to invoice: every listing is taken down."
-                    }
-                } else if listings.is_empty() {
-                    p { class: "text-muted text-italic",
-                        "Add a listing first: an invoice is issued against one, so a \
-                         buyer can see what they are paying for."
-                    }
-                } else {
-                    button {
-                        class: if show_form() { "btn btn-sm btn-outline" } else { "btn btn-sm btn-primary" },
-                        onclick: move |_| show_form.toggle(),
-                        if show_form() { "Cancel" } else { "Issue an invoice" }
-                    }
-                    if show_form() {
-                        InvoiceForm {
-                            store_contract_id: store_contract_id.clone(),
-                            seller_fingerprint: seller_fingerprint.clone(),
-                            listings: listings.clone(),
-                            sold_out: sold_out.clone(),
-                            on_submitted: move |_| show_form.set(false),
-                        }
-                    }
-                }
-            }
-
-            if !orders.is_empty() {
-                p { class: "section-count", "{orders.len()} invoice(s) issued" }
-                PaymentWatchNote {}
-                for order in orders.iter() {
+            if !others.is_empty() {
+                h4 { class: "orders-earlier", "Earlier orders" }
+                for order in others.iter() {
                     // One keyed node per invoice, wrapping both, because a
                     // `key` is only honoured on the first node of a block.
                     div { key: "{order.order.id}",
@@ -160,10 +129,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                         // of it.
                         if needs_reissue.contains(&order.order.id) {
                             p { class: "text-warning",
-                                "Invoice {order.order.id.short()} has expired: it is anchored "
-                                "to a Bitcoin block too old for a buyer's software to accept, "
-                                "so nobody can pay it now. Issue it again if the buyer still "
-                                "wants it."
+                                "Invoice {order.order.id.short()} has expired: it is too old for a \
+                                 buyer's software to accept, so nobody can pay it now."
                             }
                         }
                         super::bitcoin_view::OrderCard {
@@ -176,14 +143,113 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                 order_id: order.order.id.clone(),
                             }
                         }
-                        if order.status == harvest_common::payment::OrderStatus::Paid {
-                            MarkDespatched {
-                                store_contract_id: store_contract_id.clone(),
-                                order_id: order.order.id.clone(),
-                            }
-                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// One paid order still to send, as the seller packs it: what, how many,
+/// where to, by when, and Mark as sent. What to pack and where come from the
+/// buyer's Buy now request (`AppState::seller_order_request`); an order
+/// without one says to read the messages.
+#[component]
+pub(crate) fn SellerOrderCard(
+    store_contract_id: Vec<u8>,
+    order: harvest_common::payment::AuthorizedOrder,
+) -> Element {
+    let (request, tip_height, stage) = {
+        let state = APP_STATE.read();
+        let tip = state
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|t| t.tip_height);
+        let stage = crate::fulfilment::order_stage(
+            &order,
+            state.despatch_of(&order).as_ref(),
+            tip,
+            state.payment_sight(&order),
+        );
+        (
+            state.seller_order_request(&store_contract_id, &order.order.id),
+            tip,
+            stage,
+        )
+    };
+    let now = crate::state::now_ms();
+    let what = match &request {
+        Some(r) => format!(
+            "{} \u{00d7} {}",
+            r.title.as_deref().unwrap_or("An item no longer listed"),
+            r.quantity
+        ),
+        None => format!("Order {}", order.order.id.short()),
+    };
+    let send_by = match (stage, tip_height) {
+        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => Some((
+            false,
+            format!(
+                "Send by about {}.",
+                crate::fulfilment::approx_date(despatch_by, tip, now)
+            ),
+        )),
+        (crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. }, Some(tip)) => {
+            Some((
+                true,
+                format!(
+                    "The date to send it by, about {}, has passed. Send it now, and mark it as \
+                     sent.",
+                    crate::fulfilment::approx_date(despatch_by, tip, now)
+                ),
+            ))
+        }
+        _ => None,
+    };
+    let amount = super::pay_card::amount_text(order.order.amount_sats, order.order.network);
+    let test = super::pay_card::is_test_network(order.order.network);
+
+    rsx! {
+        div { class: "listing-card seller-order",
+            div { class: "listing-header",
+                h4 { "{what}" }
+                span { class: "btc-pill paid", "Paid" }
+            }
+            p {
+                "{amount}"
+                if test {
+                    span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+                }
+                span { class: "text-muted small", " \u{00b7} order {order.order.id.short()}" }
+            }
+            if let Some((late, line)) = send_by {
+                p { class: if late { "text-warning" } else { "" }, strong { "{line}" } }
+            }
+            match &request {
+                Some(r) => rsx! {
+                    p { class: "order-label", "Send to" }
+                    p { class: "order-ship-to", "{r.shipping}" }
+                    if let Some(region) = &r.region {
+                        p { class: "text-muted small", "Delivery region: {region}" }
+                    }
+                    if !r.choices.is_empty() {
+                        p { class: "text-muted small", "Choices: {r.choices.join(\", \")}" }
+                    }
+                    if !r.note.trim().is_empty() {
+                        p { class: "order-label", "Note from the buyer" }
+                        p { class: "order-ship-to", "{r.note}" }
+                    }
+                },
+                None => rsx! {
+                    p { class: "text-muted",
+                        "The buyer\u{2019}s address is in their messages below."
+                    }
+                },
+            }
+            MarkDespatched {
+                store_contract_id: store_contract_id.clone(),
+                order_id: order.order.id.clone(),
             }
         }
     }
@@ -289,7 +355,7 @@ fn CancelInvoice(
 /// (`AppState::despatch_recorded`), read from the same source as the
 /// card's stage line, which then says so.
 #[component]
-fn MarkDespatched(
+pub(crate) fn MarkDespatched(
     store_contract_id: Vec<u8>,
     order_id: harvest_common::payment::OrderId,
 ) -> Element {
@@ -311,13 +377,13 @@ fn MarkDespatched(
     }
     if pending {
         return rsx! {
-            p { class: "text-muted", "Recording the despatch of order {short}\u{2026}" }
+            p { class: "text-muted", "Marking order {short} as sent\u{2026}" }
         };
     }
     if sent {
         return rsx! {
             p { class: "text-muted",
-                "Despatch of order {short} sent. It shows here once the store has it."
+                "Order {short} marked as sent. It shows here once the store has it."
             }
         };
     }
@@ -326,7 +392,7 @@ fn MarkDespatched(
     if let Some(why) = refusal {
         return rsx! {
             p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Order {short} cannot be marked despatched yet: {why}"
+                "Order {short} can\u{2019}t be marked as sent yet: {why}"
             }
         };
     }
@@ -336,8 +402,8 @@ fn MarkDespatched(
         }
         if confirming() {
             p { class: "text-warning",
-                "Mark order {short} as despatched? This is public and cannot be undone. Only "
-                "do it once the goods are on their way."
+                "Mark order {short} as sent? This is public and can\u{2019}t be undone. Only do it "
+                "once the goods are on their way."
             }
             button {
                 class: "btn btn-sm btn-primary",
@@ -366,33 +432,10 @@ fn MarkDespatched(
                     problem.set(None);
                     confirming.set(true);
                 },
-                "Mark despatched"
+                "Mark as sent"
             }
         }
     }
-}
-
-/// The listings an invoice may be issued for: every listing except those the
-/// seller took down (harvest#70). A sold-out one stays, marked, so a seller
-/// can issue again an invoice that expired for the last one they had.
-fn issuable_listings(store: &crate::state::BrowsingStore) -> Vec<AuthorizedListing> {
-    store
-        .listings
-        .iter()
-        .filter(|l| store.availability(&l.listing.id) != ListingAvailability::Withdrawn)
-        .cloned()
-        .collect()
-}
-
-/// The listings in `listings` that are sold out, to mark in the picker.
-fn sold_out_ids(store: &crate::state::BrowsingStore) -> Vec<ListingId> {
-    store
-        .listings
-        .iter()
-        .map(|l| &l.listing.id)
-        .filter(|id| !store.availability(id).is_buyable())
-        .cloned()
-        .collect()
 }
 
 /// The invoices on a store that THIS seller issued, newest first, less the
@@ -421,24 +464,6 @@ fn invoices_issued_by(
         .collect();
     mine.sort_by_key(|o| std::cmp::Reverse(o.order.created_at));
     mine
-}
-
-/// What keeps an invoice's status honest, said wherever invoices are listed.
-///
-/// Shown to buyers too: a buyer about to pay is the one who loses out if the
-/// seller has not opened Harvest in days.
-#[component]
-pub fn PaymentWatchNote() -> Element {
-    rsx! {
-        p { class: "text-warning",
-            "Harvest asks a Bitcoin bridge to watch each invoice\u{2019}s address, and the "
-            "invoice shows Paid once the bridge sees the payment confirmed. The seller\u{2019}s Harvest "
-            "renews that request while it is open, and the bridge stops watching about a "
-            "day after the last renewal. A payment made while it is not watching is not "
-            "picked up later, so a seller waiting to be paid should open Harvest more than "
-            "once a day."
-        }
-    }
 }
 
 /// The payout wallet, as My store > Settings shows it.
@@ -574,155 +599,6 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                     on_done.call(());
                 },
                 "Save payment key"
-            }
-        }
-    }
-}
-
-/// The invoice form proper: which listing, how much, and who for.
-#[component]
-fn InvoiceForm(
-    store_contract_id: Vec<u8>,
-    seller_fingerprint: String,
-    listings: Vec<AuthorizedListing>,
-    /// Listings marked sold out, labelled so in the picker.
-    sold_out: Vec<ListingId>,
-    on_submitted: EventHandler<()>,
-) -> Element {
-    // Which listing, by its display id. `ListingId` is not a form value, so
-    // the select carries its `Display` form and the submit looks it back up --
-    // rather than carrying an index, which goes wrong the moment the listing
-    // list changes under an open form.
-    let first = listings
-        .first()
-        .map(|l| l.listing.id.to_string())
-        .unwrap_or_default();
-    let mut chosen = use_signal(|| first);
-    let mut amount = use_signal(String::new);
-    let mut buyer = use_signal(String::new);
-    let mut confirmations = use_signal(|| "1".to_string());
-
-    let parsed_amount = amount().trim().parse::<u64>().ok().filter(|n| *n > 0);
-    let confirmations_read = parse_required_confirmations(&confirmations());
-    let parsed_confirmations = confirmations_read.as_ref().ok().copied();
-    let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
-
-    rsx! {
-        div { class: "form-group",
-            label { class: "form-label", "Listing" }
-            select {
-                class: "form-input",
-                value: "{chosen}",
-                onchange: move |e| chosen.set(e.value()),
-                for listing in listings.iter() {
-                    option {
-                        value: "{listing.listing.id}",
-                        if sold_out.contains(&listing.listing.id) {
-                            "{listing.listing.title} (sold out)"
-                        } else {
-                            "{listing.listing.title}"
-                        }
-                    }
-                }
-            }
-
-            label { class: "form-label", "Amount (satoshis)" }
-            input {
-                class: "form-input",
-                r#type: "text",
-                placeholder: "50000",
-                value: "{amount}",
-                oninput: move |e| amount.set(e.value()),
-            }
-            if !amount().trim().is_empty() && parsed_amount.is_none() {
-                p { class: "text-warning",
-                    "Enter the amount as a whole number of satoshis, greater than zero."
-                }
-            }
-
-            label { class: "form-label", "Buyer's Ghost Key fingerprint (optional)" }
-            input {
-                class: "form-input",
-                r#type: "text",
-                placeholder: "leave blank for an invoice anyone with the link may pay",
-                value: "{buyer}",
-                oninput: move |e| buyer.set(e.value()),
-            }
-            p { class: "text-muted",
-                "Naming a buyer records who the invoice was issued to. It does not stop "
-                "somebody else paying it \u{2014} Bitcoin has no way to tell who sent a "
-                "payment \u{2014} so treat it as a label, not a restriction."
-            }
-
-            label { class: "form-label", "Confirmations required" }
-            input {
-                class: "form-input",
-                r#type: "text",
-                value: "{confirmations}",
-                oninput: move |e| confirmations.set(e.value()),
-            }
-            if let Err(why) = confirmations_read {
-                p { class: "text-warning", "{why}" }
-            }
-
-            PaymentWatchNote {}
-
-            button {
-                class: "btn btn-primary",
-                disabled: !ready,
-                onclick: {
-                    let store_contract_id = store_contract_id.clone();
-                    let seller_fingerprint = seller_fingerprint.clone();
-                    let listings = listings.clone();
-                    move |_| {
-                        let Some(listing) = listings
-                            .iter()
-                            .find(|l| l.listing.id.to_string() == chosen())
-                        else {
-                            APP_STATE.write().notifications.push(
-                                "That listing is no longer on this store \u{2014} pick another."
-                                    .to_string(),
-                            );
-                            return;
-                        };
-                        // Both parse successfully or the button is disabled;
-                        // re-checked rather than unwrapped so a future change
-                        // to `ready` cannot turn into a panic.
-                        let (Some(amount_sats), Some(required_confirmations)) =
-                            (parsed_amount, parsed_confirmations)
-                        else {
-                            return;
-                        };
-                        issue_invoice(PendingInvoice {
-                            store_contract_id: store_contract_id.clone(),
-                            seller_fingerprint: seller_fingerprint.clone(),
-                            listing_id: listing.listing.id.clone(),
-                            listing_title: listing.listing.title.clone(),
-                            buyer_fingerprint: buyer().trim().to_string(),
-                            amount_sats,
-                            required_confirmations,
-                            // This form writes an invoice from scratch. One
-                            // answering a buyer's request is issued from the
-                            // inbox, which is where the conversation to reply
-                            // into is known -- and where the buyer's binding
-                            // is. An invoice with no binding matches no
-                            // buyer's check, so it is payable only by
-                            // somebody following the address by hand, which
-                            // is what this form is for.
-                            reply_to: None,
-                            order_binding: None,
-                            // Nor a buyer's receipt key (harvest#53 Phase B):
-                            // no buyer asked, so nobody can cancel it but the
-                            // seller or complain about it.
-                            buyer_receipt_key: None,
-                            answers_request: None,
-                        });
-                        amount.set(String::new());
-                        buyer.set(String::new());
-                        on_submitted.call(());
-                    }
-                },
-                "Issue invoice"
             }
         }
     }
@@ -946,36 +822,5 @@ mod issuable_tests {
             signature: Vec::new(),
             certificate_pem: String::new(),
         }
-    }
-
-    /// The picker offers everything but what was taken down, and marks what
-    /// is sold out. Mutated red by dropping the filter.
-    #[test]
-    fn taken_down_listings_cannot_be_invoiced_from_the_picker() {
-        let mut store = crate::state::BrowsingStore {
-            listings: vec![listing(1), listing(2), listing(3), listing(4)],
-            ..Default::default()
-        };
-        for (n, availability) in [
-            (2, ListingAvailability::SoldOut),
-            (3, ListingAvailability::Withdrawn),
-            (4, ListingAvailability::Available { quantity: Some(5) }),
-        ] {
-            store.listing_statuses.insert(
-                ListingId([n; 32]),
-                ListingStatus {
-                    listing: ListingId([n; 32]),
-                    revision: 1,
-                    availability,
-                },
-            );
-        }
-        let ids: Vec<u8> = issuable_listings(&store)
-            .iter()
-            .map(|l| l.listing.id.0[0])
-            .collect();
-        assert_eq!(ids, vec![1, 2, 4]);
-        let sold: Vec<u8> = sold_out_ids(&store).iter().map(|id| id.0[0]).collect();
-        assert_eq!(sold, vec![2, 3]);
     }
 }

@@ -147,12 +147,22 @@ fn ComplaintCard(row: ComplaintRow) -> Element {
         store_name,
     } = row;
     let short = complaint.order_id().short();
-    let block = complaint.block_height;
+    // When it was made, as a month (a person reads a date, not a block
+    // height); nothing without a tip to count from.
+    let made = APP_STATE
+        .read()
+        .bitcoin
+        .tips
+        .get(&complaint.order.order.network)
+        .and_then(|t| t.tip_height)
+        .map(|tip| {
+            crate::fulfilment::approx_month(complaint.block_height, tip, crate::state::now_ms())
+        });
     let note = match standing {
         ComplaintStanding::Counts => None,
-        ComplaintStanding::Late { closed_at } => Some(format!(
-            "Made after the complaint window closed at block {closed_at}, so it is not counted."
-        )),
+        ComplaintStanding::Late { .. } => Some(
+            "Made after the time to report a problem had passed, so it is not counted.".to_string(),
+        ),
         ComplaintStanding::PaymentReversed => Some(if standing.counts() {
             "Payment reversed on the Bitcoin chain since; still counted.".to_string()
         } else {
@@ -165,7 +175,12 @@ fn ComplaintCard(row: ComplaintRow) -> Element {
         div { class: "feedback-card",
             div { class: "feedback-header",
                 span { class: "feedback-category", "{category_label(&complaint.category)}" }
-                span { class: "feedback-time", "order {short} \u{00b7} made at or after block {block}" }
+                span { class: "feedback-time",
+                    "order {short}"
+                    if let Some(made) = made {
+                        " \u{00b7} {made}"
+                    }
+                }
             }
             if let Some(note) = note {
                 p { class: "text-muted", "{note}" }

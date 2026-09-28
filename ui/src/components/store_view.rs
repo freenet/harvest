@@ -468,7 +468,6 @@ fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>, owned: b
                     "check the evidence that settles it, so neither you nor the seller has to "
                     "be taken at their word about the payment."
                 }
-                super::invoice_form::PaymentWatchNote {}
             } else {
                 p { class: "text-muted",
                     "Settled invoices. Anyone can check the evidence that settled each one."
