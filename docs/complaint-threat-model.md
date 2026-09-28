@@ -203,9 +203,11 @@ Payment details appear only once the delegate's list holds the copy (blocker `Pu
 So before any money moves, the buyer holds seller-signed terms that a complaint will verify
 against. One exception is still open: a Buy now order's id comes from its request rather than
 its terms, so the store can take a second, unpaid version under the same id, and the card
-shows the store's copy. A higher amount (which wins the store's merge) is refused by
-`AmountNotAsked`; a second version at the SAME amount with another address, winning on
-encoding size, is not yet handled (harvest#189, found in the review of harvest#187).
+shows the store's copy. `AmountNotAsked` stops the buyer paying a higher-amount version, but
+a buyer who already paid the kept copy is then told not to pay and offered Cancel (the cancel
+check reads the store copy's address); and a version at the same amount with other terms,
+winning the merge's byte comparison, is not refused at all. Both are harvest#189, found in the
+review of harvest#187.
 
 ### 3.2 Watching and upgrading
 

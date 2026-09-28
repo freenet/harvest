@@ -642,7 +642,7 @@ pub(crate) fn PurchaseCard(
     };
     rsx! {
         div { class: "card", style: "margin-top: 0.5rem;",
-            if let Some(headline) = purchase_headline(&purchase) {
+            if let Some(headline) = purchase_headline(&purchase).filter(|_| not_asked.is_none()) {
                 p { strong { "{headline}" } }
             }
             p { class: "text-muted small", "{what}" }
