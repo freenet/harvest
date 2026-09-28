@@ -56,13 +56,7 @@ pub fn StoreView() -> Element {
 /// Whether a pasted link names a store the old way, from its fragment or
 /// query string: the same check a followed link gets.
 fn typed_is_old_format_link(typed: &str) -> bool {
-    let typed = typed.trim();
-    let fragment = typed.split_once('#').map(|(_, f)| f);
-    let query = typed
-        .split_once('?')
-        .map(|(_, q)| q.split('#').next().unwrap_or(q));
-    fragment.is_some_and(crate::store_link::is_old_format_link)
-        || query.is_some_and(crate::store_link::is_old_format_link)
+    crate::store_link::link_sections(typed.trim()).any(crate::store_link::is_old_format_link)
 }
 
 /// The stores this node has visited, a way to open one by its code, and

@@ -98,7 +98,7 @@ pub fn App() -> Element {
                 //
                 // So the list is empty only BEFORE the first approval -- when
                 // an empty answer is exactly right and the My Store empty state
-                // offers "Connect a ghostkey". Afterwards it returns the shared
+                // offers "Choose a Ghost Key". Afterwards it returns the shared
                 // key with no prompt at all.
                 //
                 // `RequestAnyAccess` raises a user prompt every single time by

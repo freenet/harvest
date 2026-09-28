@@ -859,9 +859,9 @@ Ghost Key Alice. [Use a different one]".
 |                                                                   |
 |  Share your store                                                 |
 |   Store code  Fg3fR7...Qk2m                [ Copy code ]          |
-|   Link        https://.../#store=Fg3fR...  [ Copy link ]          |
-|   Buyers need Freenet running. The link opens your store on       |
-|   their own node; the code works in Harvest's Stores tab.         |
+|   Link        https://freenet.org/open#... [ Copy link ]          |
+|   Anyone can open this link, with or without Freenet; the code    |
+|   also works in Harvest's Stores tab.                             |
 |                                                                   |
 |  Your record                                                      |
 |   1 complaint                                                     |

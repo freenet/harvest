@@ -132,15 +132,30 @@ pub fn is_old_format_link(raw: &str) -> bool {
 /// usually brings some with it. Nothing else is: a code of the wrong length
 /// opens nothing.
 ///
-/// Every `#` and `?` section of a pasted link is tried, not just the first:
-/// a freenet.org/open link carries the store in a SECOND fragment
+/// Every fragment section of a pasted link is tried, not just the first: a
+/// freenet.org/open link carries the store in a SECOND fragment
 /// (`open#<id>/#store=<code>`), and a local link carries it in the first.
+/// Fragments come before the query string, as for a followed link
+/// ([`open_store_from_url`]).
 pub fn parse_typed_store_code(typed: &str) -> Option<StoreParameters> {
     let typed = typed.trim();
     if let Some(params) = StoreParameters::from_code(typed) {
         return Some(params);
     }
-    typed.split(['#', '?']).skip(1).find_map(parse_store_code)
+    link_sections(typed).find_map(parse_store_code)
+}
+
+/// The parts of a pasted link a store could be named in, in the order they
+/// are read: each `#` section (split again at any `?` inside it), then the
+/// query string.
+pub(crate) fn link_sections(typed: &str) -> impl Iterator<Item = &str> {
+    let fragments = typed.split('#').skip(1).flat_map(|f| f.split('?'));
+    let query = typed
+        .split('#')
+        .next()
+        .and_then(|before| before.split_once('?'))
+        .map(|(_, q)| q);
+    fragments.chain(query)
 }
 
 /// The link a seller shares for the store `code` opens: Freenet's share page,
@@ -436,6 +451,20 @@ mod tests {
                 "{typed:?}"
             );
         }
+        // A link naming a store in both places opens the fragment's, as a
+        // followed link does.
+        let other = bs58::encode([9u8; 32]).into_string()[..16].to_string();
+        assert!(
+            parse_typed_store_code(&other).is_some(),
+            "a code on its own"
+        );
+        assert_eq!(
+            parse_typed_store_code(&format!(
+                "http://127.0.0.1:7651/v1/contract/web/x/?store={other}#store={code}"
+            ))
+            .map(|p| p.code().to_string()),
+            Some(code.clone())
+        );
         for typed in ["", &code[..15], "http://127.0.0.1:7509/", "#store=short"] {
             assert!(parse_typed_store_code(typed).is_none(), "{typed:?}");
         }

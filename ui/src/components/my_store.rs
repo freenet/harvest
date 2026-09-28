@@ -1184,6 +1184,7 @@ fn Settings(
                 onclick: move |_| connect_ghostkey(),
                 if in_flight { "Waiting for the vault\u{2026}" } else { "Use another Ghost Key" }
             }
+            GhostKeyAccessNote {}
         }
     }
 }
