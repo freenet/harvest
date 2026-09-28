@@ -26,7 +26,7 @@ pub(crate) struct SellerStore {
     /// The store's code (harvest#52).
     pub code: Option<String>,
     /// The link to share, built from the code: see `store_link::share_link`
-    /// for why it names the default node rather than this page's.
+    /// for why it goes through freenet.org/open rather than this page's URL.
     pub link: Option<String>,
     /// Set when another key holds this store's address: what to tell the
     /// seller. See `AppState::foreign_store_owner`.
@@ -296,7 +296,14 @@ fn NoIdentity(in_flight: bool) -> Element {
             }
             ol { class: "steps",
                 li {
-                    "Get a Ghost Key from the Ghost Key vault, if you do not have one yet."
+                    a {
+                        href: "{ghost_key_create_url()}",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        "Get a Ghost Key on freenet.org"
+                    }
+                    ", if you do not have one yet. It is a donation to Freenet, from $1. When it "
+                    "is done, press Import to Freenet on that page."
                 }
                 li {
                     "Let Harvest use it. "
@@ -307,6 +314,17 @@ fn NoIdentity(in_flight: bool) -> Element {
                         if in_flight { "Waiting for the vault\u{2026}" } else { "Choose a Ghost Key" }
                     }
                 }
+            }
+            GhostKeyAccessNote {}
+            p { class: "text-muted small",
+                "Have a Ghost Key saved in a file? Import it in your "
+                a {
+                    href: "{GHOST_KEY_VAULT_PATH}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "Ghost Key vault"
+                }
+                " first."
             }
             p { class: "text-muted small", "Only buying? You do not need one. Go to Stores." }
         }
@@ -349,7 +367,11 @@ pub(crate) fn connect_ghostkey() {
         }
     };
 
-    APP_STATE.write().request_any_access_in_flight = true;
+    {
+        let mut state = APP_STATE.write();
+        state.request_any_access_in_flight = true;
+        state.ghostkey_access_problem = None;
+    }
     spawn(async move {
         let payload = match ghostkey_common::to_cbor(&GhostkeyRequest::RequestAnyAccess) {
             Ok(p) => p,
@@ -364,6 +386,52 @@ pub(crate) fn connect_ghostkey() {
             APP_STATE.write().request_any_access_in_flight = false;
         }
     });
+}
+
+/// Where a Ghost Key comes from: freenet.org's donation page, told to hand
+/// the new key's owner back to Harvest (`return_to`, which the page carries
+/// through the payment and passes to the vault's import link).
+pub(crate) fn ghost_key_create_url() -> String {
+    format!(
+        "https://freenet.org/ghostkey/create/?return_to={}",
+        harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+    )
+}
+
+/// The Ghost Key vault's page on the reader's own node, as a path: the app
+/// is served from that node, so a path works on any port and on
+/// try.freenet.org, where a `127.0.0.1:7509` link would not. The id is the
+/// one freenet.org's "Import to Freenet" button opens
+/// (`donation-success.js` in freenet/web).
+pub(crate) const GHOST_KEY_VAULT_PATH: &str =
+    "/v1/contract/web/DLog47hEsrtuGT4N5XCeMBG45m4n1aWM89tBZXue2E1N/";
+
+/// Why the last ask for a Ghost Key came back with none, beside whichever
+/// control asked. Nothing once a key is shared or the user asks again.
+#[component]
+pub(crate) fn GhostKeyAccessNote() -> Element {
+    let problem = APP_STATE.read().ghostkey_access_problem;
+    match problem {
+        None => rsx! {},
+        Some(crate::state::GhostKeyAccessProblem::Denied) => rsx! {
+            p { class: "text-warning",
+                "Harvest wasn\u{2019}t given a Ghost Key. Try again, and approve the request when \
+                 Freenet asks."
+            }
+        },
+        Some(crate::state::GhostKeyAccessProblem::NoneInVault) => rsx! {
+            p { class: "text-warning",
+                "You don\u{2019}t have a Ghost Key yet. "
+                a {
+                    href: "{ghost_key_create_url()}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "Get one on freenet.org"
+                }
+                ", then try again."
+            }
+        },
+    }
 }
 
 fn ghost_key_name(identity: &ghostkey_common::GhostKeyInfo) -> String {
@@ -431,6 +499,7 @@ fn UseAnotherKey() -> Element {
             onclick: move |_| connect_ghostkey(),
             if in_flight { "Waiting for the vault\u{2026}" } else { "Use a different Ghost Key" }
         }
+        GhostKeyAccessNote {}
     }
 }
 
@@ -886,12 +955,15 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                         spellcheck: false,
                         aria_label: "{store.label} store link, select to copy",
                         value: "{link}",
+                        onfocus: |_| super::select_focused_field(),
+                        onclick: |_| super::select_focused_field(),
                     }
                 }
             }
             p { class: "text-muted small",
-                "Buyers need Freenet running. The link opens your store on their own node at its "
-                "usual address; a buyer whose node runs elsewhere can enter the code in Stores."
+                "Anyone can open this link, with or without Freenet: it offers to open your "
+                "store in Freenet or straight in their browser. Buyers can also type the store "
+                "code into Stores."
             }
         }
 

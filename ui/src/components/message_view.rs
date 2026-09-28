@@ -365,6 +365,8 @@ fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Eleme
                 readonly: true,
                 spellcheck: false,
                 aria_label: "Conversation backup, select to copy",
+                onfocus: |_| super::select_focused_field(),
+                onclick: |_| super::select_focused_field(),
                 rows: 3,
                 value: "{backup}",
             }
@@ -721,6 +723,7 @@ fn GhostKeyGate() -> Element {
     rsx! {
         div { class: "info-box",
             p { "{crate::voucher_flow::NEEDS_GHOST_KEY}" }
+            super::my_store::GhostKeyAccessNote {}
             div { class: "form-actions",
                 button {
                     class: "btn btn-primary",
@@ -729,7 +732,7 @@ fn GhostKeyGate() -> Element {
                 }
                 a {
                     class: "btn btn-outline",
-                    href: "https://freenet.org/ghostkey/create/",
+                    href: "{super::my_store::ghost_key_create_url()}",
                     target: "_blank",
                     rel: "noopener noreferrer",
                     "What is a Ghost Key?"

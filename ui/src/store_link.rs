@@ -16,23 +16,30 @@
 //! a different length is a different address, and a typo in a shared link
 //! should open nothing rather than something else.
 //!
-//! # What the rest of the link is (the part that must work on ANOTHER node)
+//! # What the rest of the link is (the part that must work for ANYONE)
 //!
-//! Harvest is served by the node the reader is running, at
-//! `http://<that node>/v1/contract/web/<Harvest's contract id>/`. The seller's
-//! page URL names the SELLER's node -- `http://127.0.0.1:7651/...` in the
-//! screenshot that found this (harvest#79) -- and a buyer who opens that on
-//! their own machine reaches their own loopback on the seller's port, which
-//! is nothing, or someone else's service.
+//! The link is Freenet's one share-link form (freenet.org/open, the Share
+//! Links page of the Freenet manual, spec on freenet-core#5726):
+//! `https://freenet.org/open#<Harvest's contract id>/#store=<code>`.
 //!
-//! So the shared link is not built from the page URL at all. It is
-//! [`PORTABLE_BASE`] -- `127.0.0.1:7509`, the port every Freenet node listens
-//! on by default, and the form the rest of the ecosystem hands out (`fdev`
-//! prints it after a publish, and freenet.org's River invite button uses it)
-//! -- plus Harvest's own web container id, which is the same on every node.
-//! A buyer whose node runs on the default port opens the link and lands in
-//! Harvest on their own node. A buyer on another port has the code itself,
-//! which the seller's page shows beside the link and the Browse tab accepts.
+//! That page is static and reads everything after its own `#` in the
+//! reader's browser, so freenet.org never learns which store is opened. It
+//! offers to open the target on the reader's own node, on try.freenet.org
+//! with nothing to install, or through the `freenet:` handler, and it links
+//! to the install guide for someone who has none of those. Each route lands
+//! on `/v1/contract/web/<Harvest's contract id>/#store=<code>`, which
+//! [`open_store_from_url`] reads as before.
+//!
+//! The link is still not built from the page URL. That URL names the
+//! seller's own node and port -- `http://127.0.0.1:7651/...` in the
+//! screenshot that found this (harvest#79) -- and inside the shell's iframe
+//! it also carries `__sandbox=1`. Harvest's web container id is the same on
+//! every node, so the link names nothing of the seller's.
+//!
+//! The link it replaced, `http://127.0.0.1:7509/...`, opened only for a
+//! reader already running Freenet on the default port, and was a dead end
+//! for every other buyer (the 2026-09-27 friction report). A pasted link of
+//! that older form still opens the store (see [`parse_typed_store_code`]).
 //!
 //! # Why the fragment
 //!
@@ -58,9 +65,9 @@ use harvest_common::store::StoreParameters;
 /// The parameter naming the store to open.
 const STORE_PARAM: &str = "store";
 
-/// The node address a shared link is built on: every Freenet node's default
-/// HTTP port on loopback. See the module docs for why not the page's own.
-pub const PORTABLE_BASE: &str = "http://127.0.0.1:7509";
+/// Freenet's share page, which every shared link goes through. See the module
+/// docs for why not the page's own address.
+pub const SHARE_PAGE: &str = "https://freenet.org/open";
 
 /// How long a linked store has to arrive before the user is told it could not
 /// be opened. `get_contract` reports only failures to *send* the GET; one that
@@ -124,32 +131,29 @@ pub fn is_old_format_link(raw: &str) -> bool {
 /// Surrounding whitespace is forgiven, since a code read out of a message
 /// usually brings some with it. Nothing else is: a code of the wrong length
 /// opens nothing.
+///
+/// Every `#` and `?` section of a pasted link is tried, not just the first:
+/// a freenet.org/open link carries the store in a SECOND fragment
+/// (`open#<id>/#store=<code>`), and a local link carries it in the first.
 pub fn parse_typed_store_code(typed: &str) -> Option<StoreParameters> {
     let typed = typed.trim();
     if let Some(params) = StoreParameters::from_code(typed) {
         return Some(params);
     }
-    let fragment = typed.split_once('#').map(|(_, f)| f);
-    let query = typed
-        .split_once('?')
-        .map(|(_, q)| q.split('#').next().unwrap_or(q));
-    fragment
-        .and_then(parse_store_code)
-        .or_else(|| query.and_then(parse_store_code))
+    typed.split(['#', '?']).skip(1).find_map(parse_store_code)
 }
 
-/// The link a seller shares for the store `code` opens: Harvest on the
-/// reader's own node, with the code in the fragment.
+/// The link a seller shares for the store `code` opens: Freenet's share page,
+/// carrying Harvest's contract id and the store code in its fragment.
 ///
-/// Built from [`PORTABLE_BASE`] and Harvest's web container id, never from
-/// the seller's page URL. That URL names the seller's node and port, and
-/// inside the shell's iframe it also carries `__sandbox=1`, which makes a
-/// node serve the raw contract HTML with no shell, no bridge and no
-/// websocket -- a dead page for the buyer. Neither belongs in a link handed
-/// to somebody else.
+/// Built from [`SHARE_PAGE`] and Harvest's web container id, never from the
+/// seller's page URL. That URL names the seller's node and port, and inside
+/// the shell's iframe it also carries `__sandbox=1`, which makes a node serve
+/// the raw contract HTML with no shell, no bridge and no websocket -- a dead
+/// page for the buyer. Neither belongs in a link handed to somebody else.
 pub fn share_link(code: &str) -> String {
     format!(
-        "{PORTABLE_BASE}/v1/contract/web/{}/#{STORE_PARAM}={code}",
+        "{SHARE_PAGE}#{}/#{STORE_PARAM}={code}",
         harvest_common::HARVEST_WEBAPP_CONTRACT_ID
     )
 }
@@ -365,30 +369,49 @@ mod tests {
     #[test]
     fn a_shared_link_parses_back_to_the_same_store() {
         let code = code();
-        let link = share_link(&code);
-        let fragment = link.split_once('#').expect("link should have a fragment").1;
         assert_eq!(
-            parse_store_code(fragment).map(|p| p.code().to_string()),
+            parse_typed_store_code(&share_link(&code)).map(|p| p.code().to_string()),
             Some(code)
         );
     }
 
-    /// harvest#79: the link must work on the BUYER's node. It is built from
-    /// the default node address and Harvest's own contract id, and nothing
-    /// from the seller's page -- not their port, not the `__sandbox=1` the
-    /// shell's iframe URL carries.
+    /// The link goes through freenet.org/open, in the form its spec gives
+    /// (the Share Links page of the Freenet manual): Harvest's own contract
+    /// id, then the store code in a second fragment. Nothing from the
+    /// seller's page -- not their port, not the `__sandbox=1` the shell's
+    /// iframe URL carries (harvest#79).
     #[test]
-    fn a_shared_link_names_harvest_on_the_default_node_and_nothing_of_the_sellers() {
+    fn a_shared_link_goes_through_the_share_page_and_names_nothing_of_the_sellers() {
         let code = code();
         assert_eq!(
             share_link(&code),
             format!(
-                "http://127.0.0.1:7509/v1/contract/web/{}/#store={code}",
+                "https://freenet.org/open#{}/#store={code}",
                 harvest_common::HARVEST_WEBAPP_CONTRACT_ID
             )
         );
         assert!(!share_link(&code).contains("__sandbox"));
         assert!(!share_link(&code).contains('?'));
+        assert!(!share_link(&code).contains("127.0.0.1"));
+    }
+
+    /// What freenet.org/open hands on is the part after its own `#`, put
+    /// after `/v1/contract/web/` on the reader's node (the spec's
+    /// `local_path`). That lands on a page whose fragment is `#store=<code>`,
+    /// which the page reads the way it always has.
+    #[test]
+    fn the_page_the_share_link_lands_on_opens_the_store() {
+        let code = code();
+        let link = share_link(&code);
+        let target = link
+            .strip_prefix("https://freenet.org/open#")
+            .expect("the share page's own fragment");
+        let local = format!("http://127.0.0.1:7509/v1/contract/web/{target}");
+        let (_, fragment) = local.split_once('#').expect("the app's own fragment");
+        assert_eq!(
+            parse_store_code(&format!("#{fragment}")).map(|p| p.code().to_string()),
+            Some(code)
+        );
     }
 
     #[test]
@@ -398,6 +421,12 @@ mod tests {
             code.clone(),
             format!("  {code}\n"),
             share_link(&code),
+            // The link Harvest shared before it went through freenet.org/open.
+            format!(
+                "http://127.0.0.1:7509/v1/contract/web/{}/#store={code}",
+                harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+            ),
+            format!("https://try.freenet.org/v1/contract/web/x/#store={code}"),
             format!("http://127.0.0.1:7651/v1/contract/web/x/?store={code}"),
             format!("http://127.0.0.1:7651/v1/contract/web/x/?__sandbox=1#store={code}"),
         ] {

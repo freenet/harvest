@@ -15,6 +15,33 @@ pub use app::App;
 // that first needs it; `state` calls it again whenever a ghostkey connects.
 pub(crate) use my_store::{ensure_encryption_key, mint_encryption_key};
 
+/// Select all of the field that has focus: the readonly copy fields (a share
+/// link, a payment address, a backup) call it on focus and on click, so one
+/// tap selects the whole value ready to copy. A click alone only places a
+/// caret, which left a buyer pressing Ctrl+A, Ctrl+C (the 2026-09-27 friction
+/// report). A clipboard button is not the alternative it looks like: the app
+/// runs in the gateway's sandboxed iframe, where the clipboard API is not
+/// reliably available, and selection works there.
+pub(crate) fn select_focused_field() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(field) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+        else {
+            return;
+        };
+        // `select` exists on both inputs and textareas, so it is looked up
+        // rather than cast to either.
+        if let Ok(select) = js_sys::Reflect::get(&field, &"select".into()) {
+            if let Some(select) = select.dyn_ref::<js_sys::Function>() {
+                let _ = select.call0(&field);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod css_spacing_tests {
     //! `harvest.css` puts a margin between stacked siblings, and switches it

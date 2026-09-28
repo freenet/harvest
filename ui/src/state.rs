@@ -17,6 +17,16 @@ use std::collections::{HashMap, HashSet};
 
 use freenet_bitcoin_common::BitcoinNetwork;
 
+/// Why asking the vault for a Ghost Key came back with none
+/// ([`AppState::ghostkey_access_problem`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GhostKeyAccessProblem {
+    /// The user said no to Freenet's prompt.
+    Denied,
+    /// The vault holds no Ghost Key at all: this person has never got one.
+    NoneInVault,
+}
+
 /// The main application state.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
@@ -133,6 +143,14 @@ pub struct AppState {
     /// multiple delegate prompts. Cleared on every terminal response
     /// (GhostKeyList success, AccessDenied, NoIdentityAvailable, Error).
     pub request_any_access_in_flight: bool,
+
+    /// Why the last "Choose a Ghost Key" came back empty-handed, shown beside
+    /// the control that asks (`components::my_store::GhostKeyAccessNote`)
+    /// rather than in the notice bar, where it outlived the problem: it stayed
+    /// above every seller screen after a Ghost Key was connected (harvest#124,
+    /// the 2026-09-27 friction report). Cleared when the vault shares a key
+    /// and when the user asks again.
+    pub ghostkey_access_problem: Option<GhostKeyAccessProblem>,
 
     /// The per-device RSA public keys our identities' reputation records were
     /// addressed by before harvest#93 phase 1b (fingerprint -> DER bytes),
@@ -11866,6 +11884,9 @@ impl AppState {
                 // 2026-09-06: the follow-up panicked and the user was told the
                 // vault had not replied, when it had.
                 self.request_any_access_in_flight = false;
+                if !keys.is_empty() {
+                    self.ghostkey_access_problem = None;
+                }
 
                 // If any ghostkey has verifying_key_bytes and we have a pending
                 // store creation for it, fill in the key
@@ -12119,9 +12140,7 @@ impl AppState {
             }
 
             ghostkey_common::GhostkeyResponse::AccessDenied { .. } => {
-                self.notifications.push(
-                    "Ghostkey access was denied. Click 'Connect a ghostkey' again to retry.".into(),
-                );
+                self.ghostkey_access_problem = Some(GhostKeyAccessProblem::Denied);
                 self.request_any_access_in_flight = false;
                 self.drop_vault_signatures();
                 self.pending_store_creation = None;
@@ -12139,9 +12158,7 @@ impl AppState {
             }
 
             ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
-                self.notifications.push(
-                    "No ghostkey identities found. Open the Ghostkey Vault to create one, then come back and click 'Connect a ghostkey'.".into(),
-                );
+                self.ghostkey_access_problem = Some(GhostKeyAccessProblem::NoneInVault);
                 self.request_any_access_in_flight = false;
                 self.drop_vault_signatures();
                 self.pending_store_creation = None;
@@ -16981,6 +16998,46 @@ mod tests {
     fn from_ghostkey(state: &mut AppState, response: &ghostkey_common::GhostkeyResponse) {
         let payload = harvest_common::to_cbor(response).expect("a response must serialize");
         deliver(state, &delegate_key(0xB2), &payload);
+    }
+
+    /// harvest#124: "no Ghost Key" and "denied" are said beside the control
+    /// that asked, not pushed onto the notice bar, where they stayed above
+    /// every seller screen after a key was connected. A shared key ends it.
+    #[test]
+    fn a_ghost_key_refusal_is_told_in_place_and_ends_when_a_key_arrives() {
+        for (refusal, problem) in [
+            (
+                ghostkey_common::GhostkeyResponse::NoIdentityAvailable,
+                GhostKeyAccessProblem::NoneInVault,
+            ),
+            (
+                ghostkey_common::GhostkeyResponse::AccessDenied {
+                    requestor: harvest_common::expected_harvest_requestor(),
+                },
+                GhostKeyAccessProblem::Denied,
+            ),
+        ] {
+            let mut state = state_with_delegates();
+            state.request_any_access_in_flight = true;
+            from_ghostkey(&mut state, &refusal);
+            assert_eq!(state.ghostkey_access_problem, Some(problem), "{refusal:?}");
+            assert!(state.notifications.is_empty(), "{refusal:?}: not a notice");
+            assert!(!state.request_any_access_in_flight, "{refusal:?}");
+
+            from_ghostkey(
+                &mut state,
+                &ghostkey_common::GhostkeyResponse::GhostKeyList {
+                    keys: vec![ghostkey_common::GhostKeyInfo {
+                        fingerprint: "seller-fp".to_string(),
+                        label: None,
+                        notary_info: String::new(),
+                        verifying_key_bytes: None,
+                        backed_up: false,
+                    }],
+                },
+            );
+            assert_eq!(state.ghostkey_access_problem, None, "{refusal:?}");
+        }
     }
 
     /// A vault error or a denied prompt invalidates everything the VAULT was

@@ -713,6 +713,8 @@ pub(crate) fn OrderCard(order: AuthorizedOrder, live: Option<AddressView>) -> El
                     spellcheck: false,
                     rows: 2,
                     aria_label: "Payment address, select to copy",
+                    onfocus: |_| super::select_focused_field(),
+                    onclick: |_| super::select_focused_field(),
                     // `value`, not a text child: a text child is the initial
                     // content, and this card re-renders with a different
                     // address when another invoice is issued.
@@ -1397,6 +1399,7 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
                 "just proves you've supported the network -- a bridge learns nothing else "
                 "about you. No bridge is asked anything today; see the note above the form."
             }
+            super::my_store::GhostKeyAccessNote {}
             div { class: "form-actions",
                 button {
                     class: "btn btn-primary",
@@ -1405,7 +1408,7 @@ fn GhostKeyGate(on_dismiss: EventHandler<()>) -> Element {
                 }
                 a {
                     class: "btn btn-outline",
-                    href: "https://freenet.org/ghostkey/create/",
+                    href: "{super::my_store::ghost_key_create_url()}",
                     target: "_blank",
                     rel: "noopener noreferrer",
                     "Learn more"
