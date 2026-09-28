@@ -1612,9 +1612,7 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         // A Buy now order's id comes from its request, and the store merges
         // only upwards, so the seller cannot put these right under this id:
         // a new Buy now gets a new order.
-        PaymentBlocker::AmountNotAsked { .. } | PaymentBlocker::AmountUnchecked => {
-            Remedy::BuyAgain
-        }
+        PaymentBlocker::AmountNotAsked { .. } => Remedy::BuyAgain,
         // The order is not this buyer's, not this seller's, or not payable at
         // all. None of these is a mistake anybody can undo.
         PaymentBlocker::SellerIdentityUnknown
