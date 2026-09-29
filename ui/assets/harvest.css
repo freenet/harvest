@@ -947,10 +947,6 @@ h4 {
   flex: 1;
 }
 
-.form-row > .form-narrow {
-  flex: 0 0 120px;
-}
-
 /* ---- Identity cards ---- */
 
 .identity-card {
@@ -1244,8 +1240,58 @@ h4 {
   align-items: center;
 }
 
-.form-input-short {
-  max-width: 16rem;
+/* Fields sized to what goes in them, not to the card (Ian, on the #187
+   screenshots). `ch` is the width of a digit, and the 1.5rem covers the
+   field's own padding and border. */
+.field-num {
+  width: calc(12ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-count {
+  width: calc(6ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-short-text {
+  width: calc(18ch + 1.5rem);
+  max-width: 100%;
+}
+
+.field-name {
+  max-width: 32rem;
+}
+
+/* A select as wide as its longest option. */
+.field-fit {
+  width: auto;
+  max-width: 100%;
+}
+
+.field-grow {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+/* A row of fields that keep their own widths, and wrap on a phone rather
+   than squeeze. */
+.form-row-fit {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.form-row.form-row-fit > * {
+  flex: 0 1 auto;
+}
+
+.form-row.form-row-fit > .field-grow {
+  flex: 1 1 12rem;
+}
+
+/* A text-styled button is a tap target too: at least 24 px tall (WCAG
+   2.5.8), which its bare line box was not. */
+.link-btn {
+  min-height: 24px;
 }
 
 .card h3 {

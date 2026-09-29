@@ -467,7 +467,7 @@ fn FirstStore(
                     label { class: "form-label", r#for: "backing-key", "Backed by" }
                     select {
                         id: "backing-key",
-                        class: "form-select",
+                        class: "form-select field-fit",
                         onchange: move |e| chosen.set(e.value().parse().unwrap_or(0)),
                         for (i , key) in ghostkeys.iter().enumerate() {
                             option { value: "{i}", selected: i == index,
@@ -961,27 +961,21 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
 
         section { class: "card",
             h3 { "Share your store" }
+            // Content-sized values with Copy, as on the pay card: the whole
+            // link is visible (it wraps), where the old one-line field showed
+            // only its first 80 or so characters and scrolled.
             if let Some(ref code) = store.code {
-                div { class: "share-row",
-                    span { class: "share-label", "Store code" }
-                    code { class: "share-value", "{code}" }
+                super::pay_card::CopyField {
+                    label: "Store code",
+                    value: code.clone(),
+                    salt: "share".to_string(),
                 }
             }
             if let Some(ref link) = store.link {
-                div { class: "share-row",
-                    span { class: "share-label", "Link" }
-                    // Styled as a value to copy rather than a form field: it
-                    // is readonly, and dressed as an input it read as
-                    // something to edit.
-                    input {
-                        class: "copy-field",
-                        readonly: true,
-                        spellcheck: false,
-                        aria_label: "{store.label} store link, select to copy",
-                        value: "{link}",
-                        onfocus: |_| super::select_focused_field(),
-                        onclick: |_| super::select_focused_field(),
-                    }
+                super::pay_card::CopyField {
+                    label: "Link",
+                    value: link.clone(),
+                    salt: "share".to_string(),
                 }
             }
             p { class: "text-muted small",
@@ -1236,7 +1230,7 @@ fn StoreDetailsForm(
             div { class: "form-group",
                 label { class: "form-label", "Store name" }
                 input {
-                    class: "form-input",
+                    class: "form-input field-name",
                     r#type: "text",
                     placeholder: "e.g. Mountain Valley Crafts",
                     value: "{store_name}",

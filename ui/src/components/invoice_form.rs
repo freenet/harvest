@@ -656,7 +656,7 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
 
             label { class: "form-label", "Network" }
             select {
-                class: "form-input",
+                class: "form-select field-fit",
                 value: "{network().as_str()}",
                 onchange: move |e| {
                     if let Some(picked) =

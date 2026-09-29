@@ -108,13 +108,13 @@ pub fn ListingForm(
                 label { class: "form-label", r#for: "listing-quantity", "How many you have (optional)" }
                 input {
                     id: "listing-quantity",
-                    class: "form-input form-input-short",
+                    class: "form-input field-count",
                     r#type: "text",
                     inputmode: "numeric",
-                    placeholder: "Leave blank if you don't count",
                     value: "{quantity}",
                     oninput: move |e| quantity.set(e.value()),
                 }
+                p { class: "text-muted small", "Leave it blank if you don\u{2019}t count." }
                 if quantity_error {
                     p { class: "text-warning", "A count is a whole number, like 3." }
                 }
@@ -399,7 +399,7 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
             label { class: "form-label", r#for: "listing-unit-sats", "Price, in sats" }
             input {
                 id: "listing-unit-sats",
-                class: "form-input form-input-short",
+                class: "form-input field-num",
                 r#type: "text",
                 inputmode: "numeric",
                 placeholder: "10000",
@@ -410,7 +410,7 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
         div { class: "form-group",
             label { class: "form-label", "Delivery" }
             select {
-                class: "form-select",
+                class: "form-select field-fit",
                 value: if form.by_region { "regions" } else { "included" },
                 onchange: move |e| terms.with_mut(|t| t.by_region = e.value() == "regions"),
                 option { value: "included", "Included in the price" }
@@ -423,18 +423,20 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                     "One delivery price per order, not per item. Buyers elsewhere can\u{2019}t buy this."
                 }
                 for (i, (region, sats)) in form.regions.iter().cloned().enumerate() {
-                    div { key: "region-{i}", class: "form-row",
+                    div { key: "region-{i}", class: "form-row form-row-fit",
                         input {
-                            class: "form-input",
+                            class: "form-input field-short-text",
                             r#type: "text",
+                            aria_label: "Region",
                             placeholder: "Region, like US or EU",
                             value: "{region}",
                             oninput: move |e| terms.with_mut(|t| t.regions[i].0 = e.value()),
                         }
                         input {
-                            class: "form-input form-narrow",
+                            class: "form-input field-num",
                             r#type: "text",
                             inputmode: "numeric",
+                            aria_label: "Delivery price, in sats",
                             placeholder: "sats",
                             value: "{sats}",
                             oninput: move |e| terms.with_mut(|t| t.regions[i].1 = e.value()),
@@ -461,17 +463,19 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                 "Things the buyer picks one of, like a size. Separate the options with commas."
             }
             for (i, (name, options)) in form.choices.iter().cloned().enumerate() {
-                div { key: "choice-{i}", class: "form-row",
+                div { key: "choice-{i}", class: "form-row form-row-fit",
                     input {
-                        class: "form-input form-narrow",
+                        class: "form-input field-short-text",
                         r#type: "text",
+                        aria_label: "Choice",
                         placeholder: "Size",
                         value: "{name}",
                         oninput: move |e| terms.with_mut(|t| t.choices[i].0 = e.value()),
                     }
                     input {
-                        class: "form-input",
+                        class: "form-input field-grow",
                         r#type: "text",
+                        aria_label: "Options, separated by commas",
                         placeholder: "S, M, L",
                         value: "{options}",
                         oninput: move |e| terms.with_mut(|t| t.choices[i].1 = e.value()),
