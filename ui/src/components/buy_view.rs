@@ -240,11 +240,17 @@ pub fn BuyForm(
             }
             div { class: "form-group",
                 label { class: "form-label", "Note for the seller (optional)" }
+                // One line, growing as the buyer types (Ian, 2026-09-29):
+                // most notes are a line.
                 textarea {
-                    class: "form-textarea",
+                    class: "form-textarea grow-textarea",
+                    rows: 1,
                     value: "{note}",
                     placeholder: "Delivery date, gift message...",
-                    oninput: move |event| note.set(event.value()),
+                    oninput: move |event| {
+                        note.set(event.value());
+                        super::grow_focused_textarea();
+                    },
                 }
             }
             if let Some(total) = total {

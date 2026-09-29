@@ -65,6 +65,44 @@ fn select_all_of(field: &web_sys::Element) {
     }
 }
 
+/// Grow the focused text area to fit what is typed, for a field that starts
+/// one line tall (`.grow-textarea`). Browsers that support CSS
+/// `field-sizing: content` do this themselves; this covers the rest.
+pub(crate) fn grow_focused_textarea() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(field) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+        else {
+            return;
+        };
+        // Looked up rather than typed, as in `select_all_of`: the style
+        // object would need another web-sys feature.
+        let Some(style) = js_sys::Reflect::get(&field, &"style".into()).ok() else {
+            return;
+        };
+        let set_height = |value: &str| {
+            if let Some(set) = js_sys::Reflect::get(&style, &"setProperty".into())
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            {
+                let _ = set.call2(&style, &"height".into(), &value.into());
+            }
+        };
+        set_height("auto");
+        let height = js_sys::Reflect::get(&field, &"scrollHeight".into())
+            .ok()
+            .and_then(|h| h.as_f64())
+            .unwrap_or(0.0);
+        if height > 0.0 {
+            // Plus the border, which scrollHeight leaves out.
+            set_height(&format!("{}px", height + 2.0));
+        }
+    }
+}
+
 /// Focus and select all of the field with this `id`, for a Copy button the
 /// clipboard refused.
 pub(crate) fn select_field_by_id(id: &str) {

@@ -359,16 +359,13 @@ fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Eleme
             }
             // Also a value to copy rather than a field to edit, and the one
             // here matters most: a mistyped character makes the backup
-            // useless, and nothing would say so until it was needed.
-            textarea {
-                class: "form-textarea copy-field",
-                readonly: true,
-                spellcheck: false,
-                aria_label: "Conversation backup, select to copy",
-                onfocus: |_| super::select_focused_field(),
-                onclick: |_| super::select_focused_field(),
-                rows: 3,
-                value: "{backup}",
+            // useless, and nothing would say so until it was needed. Shown
+            // whole, wrapping, with Copy (Ian, 2026-09-29): the old 3-row
+            // box scrolled, so nobody could see all 520 characters at once.
+            super::pay_card::CopyField {
+                label: "Your backup",
+                value: backup.clone(),
+                salt: "backup".to_string(),
             }
             button {
                 class: "btn btn-primary",

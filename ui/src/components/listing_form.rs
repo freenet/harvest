@@ -81,7 +81,7 @@ pub fn ListingForm(
             div { class: "form-group",
                 label { class: "form-label", "Title" }
                 input {
-                    class: "form-input",
+                    class: "form-input field-title",
                     r#type: "text",
                     placeholder: "What are you offering?",
                     value: "{title}",
