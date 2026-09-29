@@ -224,7 +224,17 @@ pub(crate) fn CopyField(
     );
     rsx! {
         div { class: "copy-row",
-            p { class: "copy-label", id: "{id}-label", "{label}" }
+            // Tapping the label selects the value too, as a `label` wrapping
+            // a field would.
+            p {
+                class: "copy-label",
+                id: "{id}-label",
+                onclick: {
+                    let id = id.clone();
+                    move |_| super::select_field_by_id(&id)
+                },
+                "{label}"
+            }
             div { class: "copy-line",
                 span {
                     id: "{id}",
