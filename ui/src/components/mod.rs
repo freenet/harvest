@@ -28,10 +28,28 @@ pub(crate) fn select_focused_field() {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsCast;
-        let Some(field) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.active_element())
-        else {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        // Only where the browser cannot size the field itself: a height set
+        // here would pin what `field-sizing: content` keeps live.
+        let supported = js_sys::Reflect::get(&window, &"CSS".into())
+            .ok()
+            .and_then(|css| {
+                let supports = js_sys::Reflect::get(&css, &"supports".into())
+                    .ok()?
+                    .dyn_into::<js_sys::Function>()
+                    .ok()?;
+                supports
+                    .call2(&css, &"field-sizing".into(), &"content".into())
+                    .ok()?
+                    .as_bool()
+            })
+            .unwrap_or(false);
+        if supported {
+            return;
+        }
+        let Some(field) = window.document().and_then(|d| d.active_element()) else {
             return;
         };
         select_all_of(&field);
@@ -72,10 +90,28 @@ pub(crate) fn grow_focused_textarea() {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsCast;
-        let Some(field) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.active_element())
-        else {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        // Only where the browser cannot size the field itself: a height set
+        // here would pin what `field-sizing: content` keeps live.
+        let supported = js_sys::Reflect::get(&window, &"CSS".into())
+            .ok()
+            .and_then(|css| {
+                let supports = js_sys::Reflect::get(&css, &"supports".into())
+                    .ok()?
+                    .dyn_into::<js_sys::Function>()
+                    .ok()?;
+                supports
+                    .call2(&css, &"field-sizing".into(), &"content".into())
+                    .ok()?
+                    .as_bool()
+            })
+            .unwrap_or(false);
+        if supported {
+            return;
+        }
+        let Some(field) = window.document().and_then(|d| d.active_element()) else {
             return;
         };
         // Looked up rather than typed, as in `select_all_of`: the style
@@ -92,13 +128,18 @@ pub(crate) fn grow_focused_textarea() {
             }
         };
         set_height("auto");
-        let height = js_sys::Reflect::get(&field, &"scrollHeight".into())
-            .ok()
-            .and_then(|h| h.as_f64())
-            .unwrap_or(0.0);
+        let number = |name: &str| {
+            js_sys::Reflect::get(&field, &name.into())
+                .ok()
+                .and_then(|h| h.as_f64())
+                .unwrap_or(0.0)
+        };
+        let height = number("scrollHeight");
         if height > 0.0 {
-            // Plus the border, which scrollHeight leaves out.
-            set_height(&format!("{}px", height + 2.0));
+            // Plus the borders, which scrollHeight leaves out and the
+            // border-box height includes.
+            let borders = (number("offsetHeight") - number("clientHeight")).max(0.0);
+            set_height(&format!("{}px", height + borders));
         }
     }
 }
