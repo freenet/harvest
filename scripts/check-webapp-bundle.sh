@@ -70,12 +70,14 @@ fail() { echo "FAILED: $*"; exit 1; }
 # Fixed-name files the app needs. index.html is first because everything else
 # is judged relative to it. harvest-logo.svg and the fonts/*.woff2 files are
 # REQUIRED rather than reachability candidates because none of them are
-# content-hashed: they are copied in by build-ui and referenced from
-# harvest.css by a fixed name (harvest#28 bundles the fonts locally so the
-# CSP no longer blocks the Google Fonts import).
+# content-hashed: they are copied in by build-ui and referenced by a fixed
+# name (harvest#28 bundles the fonts locally so the CSP no longer blocks the
+# Google Fonts import). The stylesheet is NOT here: build-ui names it
+# harvest-dxh<hash>.css (harvest#192), so it is an ordinary hashed candidate,
+# reached from index.html, and an unhashed harvest.css in the archive is a
+# stray that check 0 refuses.
 REQUIRED=(
     index.html
-    harvest.css
     harvest-logo.svg
     fonts/libre-baskerville-400.woff2
     fonts/libre-baskerville-700.woff2
@@ -204,6 +206,18 @@ for f in "${CANDIDATES[@]}"; do
 done
 [ -n "$WASM_REF" ] || fail "$JS_REF references no wasm in the bundle -- the loader has nothing to load"
 
+# index.html must link a hashed stylesheet that is in the archive
+# (harvest#192). Nothing above catches an index.html naming a stylesheet the
+# archive lacks: reachability only looks from index.html to files that exist.
+CSS_REF=""
+for f in "${CANDIDATES[@]}"; do
+    case "$f" in *.css) if grep -aqF -- "href=\"${f}\"" index.html; then CSS_REF="$f"; break; fi ;; esac
+done
+[ -n "$CSS_REF" ] || fail "index.html links no hashed stylesheet in the bundle (harvest#192)"
+if grep -aqF 'href="harvest.css"' index.html; then
+    fail "index.html still links the unhashed harvest.css (harvest#192)"
+fi
+
 # Staleness guard: if the build output this archive was made from is still on
 # disk, the archive must describe it. Catches a gate inspecting a tarball from
 # an earlier build -- a gate that ran, but not against the thing being
@@ -233,7 +247,7 @@ if [ -d "$BUILD_DIR" ]; then
         "archive contents do not match the build output at $BUILD_DIR -- this archive is stale"
 fi
 
-echo "Bundle OK: index.html -> $JS_REF -> $WASM_REF"
+echo "Bundle OK: index.html -> $JS_REF -> $WASM_REF, $CSS_REF"
 echo "  ${#ALL[@]} file(s): ${#REQUIRED[@]} required, ${#CANDIDATES[@]} reachable from index.html"
 echo "  archive:   $(du -h "$ARCHIVE" | cut -f1) compressed"
 echo "  extracted: $(du -sh . | cut -f1)"

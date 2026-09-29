@@ -125,7 +125,28 @@ fi
 # dx doesn't copy CSS from assets/ to the build output root, so copy
 # manually. Path is relative to `ui/` because we cd'd above and the
 # script runs as one shell so the cwd persists.
-cp assets/harvest.css ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest.css
+#
+# Under a CONTENT-HASHED name, like dx's own js and wasm (harvest#192). The
+# node serves contract files with an ETag and no Cache-Control, so under a
+# fixed name a returning browser could keep the previous publish's
+# stylesheet beside the new markup, and new classes rendered unstyled. The
+# `-dxh<hash>` shape is the one check-webapp-bundle.sh accepts as hashed, and
+# index.html (which dx writes pointing at `harvest.css`, from Dioxus.toml) is
+# rewritten to name the hashed file. Exactly one reference must be rewritten:
+# none means dx changed how it links the stylesheet, and the page would load
+# with no styles at all.
+CSS_HASH="$(sha256sum assets/harvest.css | cut -c1-16)"
+CSS_NAME="harvest-dxh${CSS_HASH}.css"
+OUT="../target/dx/harvest-ui/${BUILD_PROFILE}/web/public"
+cp assets/harvest.css "$OUT/$CSS_NAME"
+CSS_REFS="$(grep -c 'href="harvest.css"' "$OUT/index.html" || true)"
+if [ "$CSS_REFS" != "1" ]; then
+  echo "ERROR: expected exactly one href=\"harvest.css\" in index.html, found $CSS_REFS (harvest#192)" >&2
+  exit 1
+fi
+sed -i "s|href=\"harvest.css\"|href=\"$CSS_NAME\"|" "$OUT/index.html"
+grep -q "href=\"$CSS_NAME\"" "$OUT/index.html" || { echo "ERROR: index.html does not name $CSS_NAME" >&2; exit 1; }
+echo "Stylesheet published as $CSS_NAME"
 # The logo is referenced by harvest.css but dx does not copy it either, so the
 # published app 404s on it. Same class of gap as the CSS.
 cp assets/harvest-logo.svg ../target/dx/harvest-ui/${BUILD_PROFILE}/web/public/harvest-logo.svg
