@@ -1383,8 +1383,10 @@ pub fn AcceptRequest(
                 // any other amount would publish an order nobody can pay.
                 input {
                     class: "form-input field-num",
-                    r#type: "number",
-                    min: "1",
+                    // Text with a numeric keyboard, as every other number
+                    // field: a number input's spinner eats the width.
+                    r#type: "text",
+                    inputmode: "numeric",
                     readonly: instant.is_some(),
                     value: "{amount}",
                     oninput: move |event| amount.set(event.value()),
@@ -1400,8 +1402,8 @@ pub fn AcceptRequest(
                 label { class: "form-label", "Confirmations required" }
                 input {
                     class: "form-input field-count",
-                    r#type: "number",
-                    min: "1",
+                    r#type: "text",
+                    inputmode: "numeric",
                     value: "{confirmations}",
                     oninput: move |event| confirmations.set(event.value()),
                 }

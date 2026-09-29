@@ -1205,7 +1205,10 @@ h4 {
   flex-wrap: wrap;
 }
 
+/* min-height: a text-styled button is a tap target too, at least 24 px
+   tall (WCAG 2.5.8), which its bare line box was not. */
 .link-btn {
+  min-height: 24px;
   background: none;
   border: none;
   padding: 0;
@@ -1254,7 +1257,7 @@ h4 {
 }
 
 .field-short-text {
-  width: calc(18ch + 1.5rem);
+  width: calc(22ch + 1.5rem);
   max-width: 100%;
 }
 
@@ -1288,11 +1291,7 @@ h4 {
   flex: 1 1 12rem;
 }
 
-/* A text-styled button is a tap target too: at least 24 px tall (WCAG
-   2.5.8), which its bare line box was not. */
-.link-btn {
-  min-height: 24px;
-}
+
 
 .card h3 {
   margin-bottom: var(--space-sm);
@@ -1345,6 +1344,9 @@ h4 {
   align-items: baseline;
   gap: var(--space-sm);
   padding: 0.2rem 0;
+  /* Every row as tall as one holding a 24 px link button, so the rows
+     keep one rhythm. */
+  min-height: calc(24px + 0.4rem);
 }
 
 .checklist li::before {
