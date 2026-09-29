@@ -162,14 +162,14 @@ pub(crate) fn PaySteps(
                         }
                         div { class: "pay-way pay-way-wide",
                             p { class: "pay-way-head", "By hand" }
-                            // Two rows for the address, so the whole of it can be
-                            // checked: in a one-line field 42-62 characters scroll
-                            // sideways, and a partial selection pastes a truncated
-                            // address.
+                            // The whole address is always visible, so it can be
+                            // checked: one line at desktop width, wrapping to two
+                            // on a phone, never scrolling sideways (a partial
+                            // selection of a scrolled field pastes a truncated
+                            // address).
                             CopyField {
                                 label: "Payment address",
                                 value: address.clone(),
-                                rows: 2,
                                 salt: order_ref.clone(),
                             }
                             CopyField {
@@ -201,15 +201,18 @@ pub(crate) fn PaySteps(
 /// One labelled value to copy: selected whole on a tap, with a Copy button
 /// that uses the clipboard where the browser allows it and otherwise selects
 /// the value and says so. The app runs in the gateway's sandboxed iframe, so
-/// the clipboard may not be there; the field itself always works.
+/// the clipboard may not be there; the value itself always works.
+///
+/// The value is a box sized to its text (`.copy-value`), not a form field
+/// sized to the card: an amount is ten characters wide, and an address sits
+/// on one line at desktop width and wraps to two on a phone instead of
+/// scrolling in a tall text area (Ian, on the #187 screenshots).
+/// `user-select: all` makes one tap select the whole of it.
 #[component]
-fn CopyField(
+pub(crate) fn CopyField(
     label: &'static str,
     value: String,
-    /// More than one row shows the value as a wrapping text area.
-    #[props(default = 1)]
-    rows: u32,
-    /// Makes the field's element id unique on the page.
+    /// Makes the value's element id unique on the page.
     salt: String,
 ) -> Element {
     let mut said = use_signal(|| Option::<&'static str>::None);
@@ -221,32 +224,19 @@ fn CopyField(
     );
     rsx! {
         div { class: "copy-row",
-            label { class: "copy-label",
-                "{label}"
-                div { class: "copy-line",
-                    if rows > 1 {
-                        textarea {
-                            id: "{id}",
-                            class: "copy-field",
-                            readonly: true,
-                            spellcheck: false,
-                            rows: "{rows}",
-                            value: "{value}",
-                            onfocus: |_| super::select_focused_field(),
-                            onclick: |_| super::select_focused_field(),
-                        }
-                    } else {
-                        input {
-                            id: "{id}",
-                            class: "copy-field",
-                            readonly: true,
-                            spellcheck: false,
-                            value: "{value}",
-                            onfocus: |_| super::select_focused_field(),
-                            onclick: |_| super::select_focused_field(),
-                        }
-                    }
-                    button {
+            p { class: "copy-label", id: "{id}-label", "{label}" }
+            div { class: "copy-line",
+                span {
+                    id: "{id}",
+                    class: "copy-value",
+                    role: "textbox",
+                    aria_readonly: "true",
+                    aria_labelledby: "{id}-label",
+                    tabindex: "0",
+                    onfocus: |_| super::select_focused_field(),
+                    "{value}"
+                }
+                button {
                         class: "btn btn-sm btn-outline",
                         r#type: "button",
                         onclick: {
@@ -267,8 +257,7 @@ fn CopyField(
                                 });
                             }
                         },
-                        "Copy"
-                    }
+                    "Copy"
                 }
             }
             if let Some(what) = said() {

@@ -754,32 +754,17 @@ pub(crate) fn OrderCard(
                     order_ref: o.id.short(),
                 }
             } else if destination.payable() {
-                // A readonly input rather than a paragraph, so the address can
-                // be selected and copied without hand-transcribing 42
-                // characters -- the same thing the store share link does, and
-                // for the same reason. A clipboard button is not the
-                // alternative it looks like: the app runs in the gateway's
-                // sandboxed iframe, where the clipboard API is not reliably
-                // available, and a copy button that silently does nothing is
-                // worse than a field that visibly works.
-                // A textarea rather than an input, so the whole address is
-                // visible at once. In an input, 42-62 characters of bech32
-                // scroll sideways at this width: a buyer cannot check the
-                // destination they are paying, and a partial selection pastes
-                // a truncated address, which sends coin nowhere an order can
-                // recognise. That is the failure this panel exists to avoid.
-                textarea {
-                    class: "copy-field",
-                    readonly: true,
-                    spellcheck: false,
-                    rows: 2,
-                    aria_label: "Payment address, select to copy",
-                    onfocus: |_| super::select_focused_field(),
-                    onclick: |_| super::select_focused_field(),
-                    // `value`, not a text child: a text child is the initial
-                    // content, and this card re-renders with a different
-                    // address when another invoice is issued.
-                    value: "{o.payment_address}",
+                // The seller's own view of an unpaid invoice: the same
+                // content-sized, select-on-tap value as the buyer's pay steps,
+                // so the whole address is visible and never scrolls sideways
+                // (a partial selection of a scrolled field pastes a truncated
+                // address). Keyed by the order, so a card showing another
+                // invoice re-renders with its address.
+                super::pay_card::CopyField {
+                    key: "{o.id}",
+                    label: "Payment address",
+                    value: o.payment_address.clone(),
+                    salt: o.id.short(),
                 }
             } else {
                 p { class: "text-warning",

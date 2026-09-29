@@ -829,22 +829,45 @@ h4 {
 }
 
 .copy-label {
-  display: block;
   font-size: 0.85rem;
   font-weight: 600;
   color: var(--text-secondary);
 }
 
+/* The value and its Copy button, on one line while they fit; the button
+   drops below on a narrow phone rather than squeezing the value. */
 .copy-line {
   display: flex;
-  gap: var(--space-sm);
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-sm);
   align-items: center;
   margin-top: var(--space-xs);
 }
 
-.copy-line > .copy-field {
-  flex: 1;
-  min-width: 0;
+/* A value to copy, sized to its text rather than to the card: ten
+   characters for an amount, one line for an address at desktop width,
+   wrapping (never scrolling) where the width runs out. One tap selects the
+   whole of it. */
+.copy-value {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-card-hover);
+  overflow-wrap: anywhere;
+  -webkit-user-select: all;
+  user-select: all;
+  cursor: text;
+}
+
+.copy-value:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 /* "test coins, no value" beside a test-network amount. */

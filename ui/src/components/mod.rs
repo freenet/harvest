@@ -34,13 +34,34 @@ pub(crate) fn select_focused_field() {
         else {
             return;
         };
-        // `select` exists on both inputs and textareas, so it is looked up
-        // rather than cast to either.
-        if let Ok(select) = js_sys::Reflect::get(&field, &"select".into()) {
-            if let Some(select) = select.dyn_ref::<js_sys::Function>() {
-                let _ = select.call0(&field);
-            }
-        }
+        select_all_of(&field);
+    }
+}
+
+/// Select the whole of `field`: an input or textarea by its own `select`,
+/// anything else (a `.copy-value` box) by selecting its contents.
+#[cfg(target_arch = "wasm32")]
+fn select_all_of(field: &web_sys::Element) {
+    use wasm_bindgen::JsCast;
+    let call = |target: &wasm_bindgen::JsValue, name: &str, arg: Option<&wasm_bindgen::JsValue>| {
+        js_sys::Reflect::get(target, &name.into())
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .map(|f| match arg {
+                Some(arg) => f.call1(target, arg),
+                None => f.call0(target),
+            })
+    };
+    // `select` exists on inputs and textareas, so it is looked up rather
+    // than cast to either.
+    if call(field, "select", None).is_some() {
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    if let Some(Ok(selection)) = call(&window, "getSelection", None) {
+        let _ = call(&selection, "selectAllChildren", Some(field));
     }
 }
 
@@ -56,13 +77,12 @@ pub(crate) fn select_field_by_id(id: &str) {
         else {
             return;
         };
-        for method in ["focus", "select"] {
-            if let Ok(f) = js_sys::Reflect::get(&field, &method.into()) {
-                if let Some(f) = f.dyn_ref::<js_sys::Function>() {
-                    let _ = f.call0(&field);
-                }
+        if let Ok(f) = js_sys::Reflect::get(&field, &"focus".into()) {
+            if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+                let _ = f.call0(&field);
             }
         }
+        select_all_of(&field);
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = id;
