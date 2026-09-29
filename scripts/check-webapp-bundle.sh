@@ -211,7 +211,7 @@ done
 # archive lacks: reachability only looks from index.html to files that exist.
 CSS_REF=""
 for f in "${CANDIDATES[@]}"; do
-    case "$f" in *.css) if grep -aqF -- "href=\"${f}\"" index.html; then CSS_REF="$f"; break; fi ;; esac
+    case "$f" in *-dxh[0-9a-f]*.css) if grep -aqF -- "href=\"${f}\"" index.html; then CSS_REF="$f"; break; fi ;; esac
 done
 [ -n "$CSS_REF" ] || fail "index.html links no hashed stylesheet in the bundle (harvest#192)"
 if grep -aqF 'href="harvest.css"' index.html; then
