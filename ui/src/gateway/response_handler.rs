@@ -186,7 +186,7 @@ fn handle_contract_response(response: ContractResponse) {
             #[cfg(target_arch = "wasm32")]
             {
                 let mut state = APP_STATE.write();
-                if state.on_address_vet_absent(instance_id.as_bytes()) {
+                if state.on_address_vet_absent(instance_id.as_bytes(), crate::state::now_ms()) {
                     state.send_due_auto_invoice();
                 }
             }

@@ -4533,7 +4533,7 @@ impl AppState {
         // so a check never swallows an update a watch was waiting for.
         // Likewise an upcoming address instant checkout is reading before it
         // may be watched (harvest#183). Both are asked, whichever matched.
-        let vetted = self.on_address_vet_state(&contract_id, &state_bytes);
+        let vetted = self.on_address_vet_state(&contract_id, &state_bytes, now_ms());
         #[cfg(target_arch = "wasm32")]
         if vetted {
             self.send_due_auto_invoice();
@@ -10858,6 +10858,13 @@ impl AppState {
         }
     }
 
+    /// Forget a raise past used addresses whose request could not be sent.
+    pub fn abandon_raise_request(&mut self, request_id: u64) {
+        self.auto_invoice.raise_requests.remove(&request_id);
+        self.bitcoin.in_flight.remove(&request_id);
+        self.bitcoin.scripts_in_flight.remove(&request_id);
+    }
+
     /// Forget everything held for an address request that will never be
     /// answered usefully (PR #83 round 2, Should Fix 6).
     pub fn abandon_address_request(&mut self, request_id: u64) {
@@ -12559,6 +12566,38 @@ impl AppState {
                 matched_scripts,
             } => {
                 self.bitcoin.in_flight.remove(&request_id);
+                // A raise past used addresses (harvest#183), not an invoice:
+                // the address is dropped, and it is enough that the counter
+                // moved. The re-read below brings the new count, which makes
+                // the next window be read.
+                if self.auto_invoice.raise_requests.remove(&request_id) {
+                    match result {
+                        Ok(derived) => {
+                            info!(
+                                "Moved the payment counter past used addresses; index {} set aside",
+                                derived.index
+                            );
+                            self.note_scripts_answered(
+                                request_id,
+                                matched_scripts,
+                                derived.index.saturating_add(1),
+                            );
+                        }
+                        Err(e) => {
+                            self.bitcoin.scripts_in_flight.remove(&request_id);
+                            warn!("Could not move the payment counter past used addresses: {e}");
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+                            dioxus::logger::tracing::error!(
+                                "Failed to refresh the payment key: {e}"
+                            );
+                        }
+                    });
+                    return;
+                }
                 match result {
                     Ok(derived) => {
                         // The counter the delegate had once it had scanned:
@@ -31720,10 +31759,14 @@ mod buy_flow_tests {
             .map(|a| a.script_pubkey.clone())
             .collect();
         for script in scripts {
-            state
-                .auto_invoice
-                .vets
-                .insert(script, crate::auto_invoice_flow::AddressVet::Clear);
+            state.auto_invoice.vets.insert(
+                script,
+                crate::auto_invoice_flow::AddressVet {
+                    contract_id: [0xcc; 32],
+                    verdict: crate::auto_invoice_flow::VetVerdict::Clear,
+                    at_ms: 1,
+                },
+            );
         }
         state
     }
@@ -31751,31 +31794,66 @@ mod buy_flow_tests {
         )
     }
 
-    /// harvest#183: a delegate that lost its counter and is given the same
-    /// payment key starts at 0 while 0, 1 and 2 are already paid. Nothing
-    /// is watched, armed or delegated until every upcoming address has been
-    /// read; the paid ones are filed as published with the same key, which
-    /// moves the delegate past them; and only a window with no payment in it
-    /// reaches the bridge and the arm. Mutated red by dropping the gate in
-    /// `current_upcoming`, by counting scan watermarks as use, by dropping
-    /// the used scripts from `published_payment_scripts`, and by never
-    /// planning the raise.
-    #[test]
-    fn a_lost_counter_is_moved_past_paid_addresses_before_anything_is_watched() {
-        use crate::auto_invoice_flow::AddressVet;
-        let gk = inbox::authority().mint();
-        let mut state = an_instant_seller(&gk);
-        let registration = state.my_stores["seller-fp"][0].clone();
-        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
-        let address = |i: u32| harvest_common::DerivedAddress {
+    /// A seller whose delegate lost its counter: it reports 0 under the
+    /// same key, and lists addresses 0..10 (scripts `[0,0x14,0xa0,i]`).
+    fn a_seller_with_a_lost_counter(
+        gk: &freenet_bitcoin_inbox::test_support::TestGhostkey,
+    ) -> AppState {
+        let mut state = an_instant_seller(gk);
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 0;
+        state.on_upcoming_addresses(Ok((0..10).map(lost_address).collect()), 100);
+        state
+    }
+
+    fn lost_address(i: u32) -> harvest_common::DerivedAddress {
+        harvest_common::DerivedAddress {
             index: i,
             network: BitcoinNetwork::Signet,
             script_pubkey: vec![0x00, 0x14, 0xa0, i as u8],
             address: format!("tb1qlost{i}"),
-        };
-        // The counter was lost: the delegate reports 0 under the same key.
-        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 0;
-        state.on_upcoming_addresses(Ok((0..10).map(address).collect()), 100);
+        }
+    }
+
+    /// The contract id and token the read of address `i` went out under.
+    fn vet_of(work: &crate::auto_invoice_flow::AutoInvoiceWork, i: u8) -> ([u8; 32], u64) {
+        work.vets
+            .iter()
+            .find(|(_, script, _)| script[3] == i)
+            .map(|(id, _, token)| (*id, *token))
+            .expect("asked")
+    }
+
+    /// Settle every read in `work` as `NotFound` except the listed ones.
+    fn settle_absent_except(
+        state: &mut AppState,
+        work: &crate::auto_invoice_flow::AutoInvoiceWork,
+        except: &[u8],
+        now_ms: u64,
+    ) {
+        for (id, script, _) in &work.vets {
+            if !except.contains(&script[3]) {
+                assert!(state.on_address_vet_absent(id, now_ms));
+            }
+        }
+    }
+
+    /// harvest#183: a delegate that lost its counter and is given the same
+    /// payment key starts at 0 while 0, 1 and 2 are already paid. Nothing
+    /// is watched, armed or delegated until every upcoming address has been
+    /// read; the paid ones go out as published on an address request (which
+    /// floors the key the delegate holds, and names no key), whose answer is
+    /// dropped quietly; and only a window with no payment in it reaches the
+    /// bridge and the arm. Mutated red by dropping the gate in
+    /// `current_upcoming`, by counting scan watermarks as use, by dropping
+    /// the used scripts from `published_payment_scripts`, by never planning
+    /// the raise, and by letting the raise's answer reach `complete_invoice`.
+    #[test]
+    fn a_lost_counter_is_moved_past_paid_addresses_before_anything_is_watched() {
+        use crate::auto_invoice_flow::VetVerdict;
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let registration = state.my_stores["seller-fp"][0].clone();
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
 
         // Before any read: nothing goes to the bridge or into an arm.
         assert!(
@@ -31789,89 +31867,208 @@ mod buy_flow_tests {
         assert!(work.arms.is_empty());
         assert_eq!(work.delegation, Default::default());
         assert_eq!(work.vets.len(), 10, "every upcoming address is read");
-        assert!(work.raise.is_none(), "nothing is known used yet");
+        assert!(!work.raise, "nothing is known used yet");
         // Asked once: the next plan does not ask again.
         assert!(state.plan_auto_invoice(200).vets.is_empty());
 
         let (paid, scanned_only) = address_states_paid_and_scanned();
-        let id_of = |work: &crate::auto_invoice_flow::AutoInvoiceWork, i: u8| {
-            work.vets
-                .iter()
-                .find(|(_, script, _)| script[3] == i)
-                .map(|(id, _, token)| (*id, *token))
-                .expect("asked")
-        };
         for i in 0..3 {
-            assert!(state.on_address_vet_state(&id_of(&work, i).0, &paid));
+            assert!(state.on_address_vet_state(&vet_of(&work, i).0, &paid, 200));
         }
         // An address this tab (or an earlier device) only watched carries a
         // scan watermark and no payment: clear.
-        assert!(state.on_address_vet_state(&id_of(&work, 3).0, &scanned_only));
-        assert!(state.on_address_vet_absent(&id_of(&work, 4).0));
+        assert!(state.on_address_vet_state(&vet_of(&work, 3).0, &scanned_only, 200));
         // A stale timer does not settle a read; the right one does.
-        let (id5, token5) = id_of(&work, 5);
-        assert!(!state.on_address_vet_timeout(&id5, token5 + 1000));
-        assert!(state.on_address_vet_timeout(&id5, token5));
-        for i in 6..10 {
-            assert!(state.on_address_vet_state(&id_of(&work, i).0, &[]));
-        }
+        let (id5, token5) = vet_of(&work, 5);
+        assert!(!state.on_address_vet_timeout(&id5, token5 + 1000, 200));
+        assert!(state.on_address_vet_timeout(&id5, token5, 200));
+        settle_absent_except(&mut state, &work, &[0, 1, 2, 3, 5], 200);
         assert_eq!(
-            state.auto_invoice.vets.get(&address(1).script_pubkey),
-            Some(&AddressVet::Used)
+            state
+                .auto_invoice
+                .vets
+                .get(&lost_address(1).script_pubkey)
+                .map(|v| v.verdict.clone()),
+            Some(VetVerdict::Used)
         );
-        // Used addresses ahead: still nothing watched, and the key is filed
-        // again with the used scripts among the published ones.
+        // Used addresses ahead: still nothing watched, and a raise goes out.
         assert!(state.prewatch_wanted(bridge).is_none());
         let work = state.queue_auto_invoice(300);
         assert!(work.arms.is_empty());
-        assert_eq!(
-            work.raise,
-            Some(("vpub-placeholder".to_string(), BitcoinNetwork::Signet))
-        );
+        assert!(work.raise);
+        let raise = work.raise_request.expect("a request id");
         assert!(
-            state.queue_auto_invoice(400).raise.is_none(),
-            "not filed again while the first is on its way"
+            !state.queue_auto_invoice(400).raise,
+            "not asked again while the first is on its way"
         );
-        let request =
-            state.set_payment_xpub_request(7, "vpub-placeholder".into(), BitcoinNetwork::Signet);
-        let harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+        // The raise is an address request carrying the used scripts, and no
+        // key: it can only floor the key the delegate holds.
+        let harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
             published_scripts, ..
-        } = request
+        } = state.order_address_request(raise)
         else {
-            panic!("a SetPaymentXpub");
+            panic!("a DeriveOrderAddress");
         };
         for i in 0..3 {
-            assert!(published_scripts.contains(&address(i).script_pubkey));
+            assert!(published_scripts.contains(&lost_address(i).script_pubkey));
         }
-        assert!(!published_scripts.contains(&address(3).script_pubkey));
-
-        // The delegate moved its counter to 3 and lists 3..13: 3..9 were read
-        // already, 10..12 are read now, and once they are clear the window
-        // is watched and armed.
-        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
-            request_id: 7,
-            result: Ok(harvest_common::PaymentXpubStatus {
-                xpub: "vpub-placeholder".into(),
-                network: BitcoinNetwork::Signet,
-                next_index: 3,
-            }),
-            matched_scripts: (0..3).map(|i| address(i).script_pubkey).collect(),
+        assert!(!published_scripts.contains(&lost_address(3).script_pubkey));
+        // Its answer (index 3, set aside) is not an invoice and says nothing.
+        let notes_before = state.notifications.len();
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: raise,
+            result: Ok(lost_address(3)),
+            matched_scripts: (0..3).map(|i| lost_address(i).script_pubkey).collect(),
         });
+        assert_eq!(state.notifications.len(), notes_before);
+        assert!(state.pending_signatures.is_empty());
+        assert!(state.auto_invoice.raise_requests.is_empty());
+
+        // The delegate's count is now 4 and it lists 4..14: 4..9 were read
+        // already, 10..13 are read now, and once they are clear the window
+        // is watched and armed.
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 4;
         assert!(
-            state.queue_auto_invoice(500).raise.is_none(),
+            !state.queue_auto_invoice(500).raise,
             "nothing used ahead now"
         );
-        state.on_upcoming_addresses(Ok((3..13).map(address).collect()), 600);
+        state.on_upcoming_addresses(Ok((4..14).map(lost_address).collect()), 600);
         let work = state.queue_auto_invoice(600);
-        assert_eq!(work.vets.len(), 3, "only the new addresses are read");
+        assert_eq!(work.vets.len(), 4, "only the new addresses are read");
         assert!(state.prewatch_wanted(bridge).is_none());
-        for (id, _, _) in &work.vets {
-            assert!(state.on_address_vet_absent(id));
-        }
+        settle_absent_except(&mut state, &work, &[], 600);
         let (_, _, wanted) = state.prewatch_wanted(bridge).expect("watched now");
         let indexes: Vec<u8> = wanted.iter().map(|w| w.script[3]).collect();
-        assert_eq!(indexes, (3..13).collect::<Vec<u8>>());
-        assert!(!wanted.iter().any(|w| w.script == address(0).script_pubkey));
+        assert_eq!(indexes, (4..14).collect::<Vec<u8>>());
+    }
+
+    /// One used address anywhere in the window keeps the whole window out,
+    /// not only the addresses after it: a delegation would let the delegate
+    /// watch the used one by itself. Mutated red by gating on the leading
+    /// clear run.
+    #[test]
+    fn a_used_address_in_the_middle_of_the_window_holds_back_all_of_it() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let work = state.queue_auto_invoice(100);
+        let (paid, _) = address_states_paid_and_scanned();
+        assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 100));
+        settle_absent_except(&mut state, &work, &[5], 100);
+        assert!(state.prewatch_wanted(bridge).is_none());
+        let work = state.queue_auto_invoice(200);
+        assert!(work.arms.is_empty() && work.raise);
+    }
+
+    /// A payment seen after an address was cleared, by a late answer to its
+    /// read or by any later state of its contract, makes it used; a clear
+    /// verdict is read again after `VET_REFRESH_MS` without closing the gate
+    /// meanwhile; and an address that leaves the window and comes back (a
+    /// counter that fell) is read afresh. Mutated red by settling only reads
+    /// that are out, by never refreshing, and by not pruning.
+    #[test]
+    fn a_clear_address_is_not_trusted_for_ever() {
+        use crate::auto_invoice_flow::VET_REFRESH_MS;
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let work = state.queue_auto_invoice(100);
+        let (id2, token2) = vet_of(&work, 2);
+        // Timed out: clear. Then the real answer arrives, showing a payment.
+        assert!(state.on_address_vet_timeout(&id2, token2, 100));
+        settle_absent_except(&mut state, &work, &[2], 100);
+        assert!(state.prewatch_wanted(bridge).is_some(), "all clear");
+        let (paid, scanned_only) = address_states_paid_and_scanned();
+        assert!(state.on_address_vet_state(&id2, &paid, 150));
+        assert!(state.prewatch_wanted(bridge).is_none(), "late payment seen");
+        assert!(state.queue_auto_invoice(160).raise);
+
+        // A fresh seller, all clear; the refresh reads again but keeps the
+        // window open while it does.
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        assert!(state
+            .plan_auto_invoice(100 + VET_REFRESH_MS - 1)
+            .vets
+            .is_empty());
+        let refresh = state.queue_auto_invoice(100 + VET_REFRESH_MS);
+        assert_eq!(refresh.vets.len(), 10, "every clear verdict is read again");
+        assert!(state.prewatch_wanted(bridge).is_some(), "open meanwhile");
+        let (id7, _) = vet_of(&refresh, 7);
+        assert!(state.on_address_vet_state(&id7, &scanned_only, 100 + VET_REFRESH_MS));
+        assert!(state.prewatch_wanted(bridge).is_some());
+        assert!(state.on_address_vet_state(&id7, &paid, 100 + VET_REFRESH_MS));
+        assert!(state.prewatch_wanted(bridge).is_none(), "paid since");
+
+        // Leaving the window forgets a clear verdict: back in it, it is read.
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 10;
+        state.on_upcoming_addresses(Ok((10..20).map(lost_address).collect()), 200);
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 0;
+        state.on_upcoming_addresses(Ok((0..10).map(lost_address).collect()), 300);
+        assert_eq!(state.queue_auto_invoice(300).vets.len(), 10);
+    }
+
+    /// A state that does not decode neither clears an address nor files it
+    /// as used (a format drift would otherwise move the counter on every
+    /// visit): the address stays out and is read again. A read that could
+    /// not be sent is asked again too, rather than timing out into clear.
+    /// Mutated red by counting an undecodable state as used, and by leaving
+    /// an unsent read to its timer.
+    #[test]
+    fn an_unreadable_or_unsent_read_is_asked_again() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let work = state.queue_auto_invoice(100);
+        let (id4, _) = vet_of(&work, 4);
+        let (id6, token6) = vet_of(&work, 6);
+        assert!(state.on_address_vet_state(&id4, &[0xff, 0x00, 0x13], 100));
+        state.on_address_vet_unsent(&id6, token6);
+        assert!(
+            !state.on_address_vet_timeout(&id6, token6, 100),
+            "forgotten"
+        );
+        settle_absent_except(&mut state, &work, &[4, 6], 100);
+        assert!(state.prewatch_wanted(bridge).is_none());
+        let again = state.queue_auto_invoice(200);
+        assert!(!again.raise, "nothing is filed as used");
+        let mut asked: Vec<u8> = again.vets.iter().map(|(_, s, _)| s[3]).collect();
+        asked.sort();
+        assert_eq!(asked, vec![4, 6]);
+        assert_eq!(state.vetted_used_scripts().count(), 0);
+    }
+
+    /// Past `MANY_VETTED_USED` used addresses the seller is told, once, and
+    /// the raises go on: a paid address must never go on an invoice.
+    /// Mutated red by telling every time, and by stopping the raises.
+    #[test]
+    fn many_used_addresses_are_moved_past_and_the_seller_told_once() {
+        use crate::auto_invoice_flow::{AddressVet, VetVerdict, MANY_VETTED_USED};
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        for i in 0..MANY_VETTED_USED {
+            state.auto_invoice.vets.insert(
+                vec![0x51, i as u8],
+                AddressVet {
+                    contract_id: [0x51; 32],
+                    verdict: VetVerdict::Used,
+                    at_ms: 1,
+                },
+            );
+        }
+        let (paid, _) = address_states_paid_and_scanned();
+        let work = state.queue_auto_invoice(100);
+        let before = state.notifications.len();
+        assert!(state.on_address_vet_state(&vet_of(&work, 0).0, &paid, 100));
+        assert_eq!(state.notifications.len(), before + 1);
+        assert!(state.notifications.last().unwrap().contains("gap limit"));
+        assert!(state.on_address_vet_state(&vet_of(&work, 1).0, &paid, 100));
+        assert_eq!(state.notifications.len(), before + 1, "told once");
+        assert!(state.queue_auto_invoice(200).raise, "and still moved past");
     }
 
     /// An arm names the store's presence contract, and the horizon the
