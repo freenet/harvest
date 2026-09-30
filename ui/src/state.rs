@@ -3808,6 +3808,12 @@ impl AppState {
     /// its way, with a subscription. `false` when one already is: the store
     /// is only shown, and the GET already out keeps its own wait rather than
     /// a second one cutting it short.
+    ///
+    /// Only an open the user made counts here, not a background load that
+    /// happens to be out (round 3 of #197): a background GET may not
+    /// subscribe, and one that does ends in a retry, not in the "didn't
+    /// load" the page needs. Opening a store while its background GET is out
+    /// costs one extra round trip, no more.
     pub fn begin_foreground_load(&mut self, store_contract_id: &[u8]) -> bool {
         if self.foreground_loads.contains(store_contract_id) {
             return false;
@@ -5026,7 +5032,9 @@ impl AppState {
         }
         if state_bytes.is_empty() {
             // A store asked for in the background that answered with
-            // nothing: a failed try, not one still loading.
+            // nothing: a failed try, not one still loading. A store the user
+            // opened ends on its own timer (`store_link::open_store_id`),
+            // which says "didn't load".
             if background {
                 self.light_upgrading.remove(&contract_id);
                 self.note_store_load_failed(&contract_id);
