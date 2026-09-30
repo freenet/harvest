@@ -902,11 +902,11 @@ pub struct AppState {
     /// every keystroke in a reply box, and each verdict is an RSA chain check.
     /// See [`AppState::voucher_verifies`].
     pub voucher_verdicts: std::cell::RefCell<HashMap<[u8; 32], bool>>,
-    /// Each of our stores' seller inbox, remembered against a fingerprint of
-    /// what it reads (`components::message_view::seller_inbox`): the header,
-    /// the Stores row and the Orders tab ask on every render.
-    pub seller_inbox_cache:
-        std::cell::RefCell<HashMap<Vec<u8>, (u64, crate::components::message_view::SellerInbox)>>,
+    /// When this session first saw each mailbox entry, by digest: the
+    /// arrival time `components::message_view::awaiting_reply` caps a buyer
+    /// line's own claimed time at. Per session: after a reload it starts
+    /// again, which errs toward "waiting".
+    pub mailbox_first_seen: std::cell::RefCell<HashMap<[u8; 32], chrono::DateTime<chrono::Utc>>>,
 
     /// The master key vouchers are checked against in tests; production
     /// always uses Freenet's (`ghostkey_cert`).
@@ -9915,6 +9915,23 @@ impl AppState {
                 ));
             }
         }
+    }
+
+    /// When this session first saw the mailbox entry with `digest`: `now`,
+    /// the first time it is asked, and the same answer after
+    /// ([`Self::mailbox_first_seen`]). Bounded; a clear starts every entry
+    /// again at the time of the next ask, which errs toward "waiting".
+    pub fn first_seen(
+        &self,
+        digest: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let mut seen = self.mailbox_first_seen.borrow_mut();
+        // A mailbox holds at most `MAX_MESSAGES` entries; far past honest use.
+        if seen.len() >= 16_384 && !seen.contains_key(digest) {
+            seen.clear();
+        }
+        *seen.entry(*digest).or_insert(now)
     }
 
     /// Whether THIS browser wrote the message with this digest.
@@ -26361,6 +26378,23 @@ mod buy_flow_tests {
         // The forged line is not counted as a message (review after
         // b9c727f): the buyer's and the seller's confirmed reply are.
         assert_eq!(inbox.for_order(&order.order.id).unwrap().chat_count(), 2);
+
+        // An input a hand-picked cache key once missed (review after
+        // 9417fbf): the order's listing tag changes under the same id and
+        // status between two reads, and the inbox follows it. Red with any
+        // cache keyed only on id and status.
+        state.browsing_stores.get_mut(STORE).unwrap().orders[0]
+            .order
+            .listing_tag = Some([0x77; 32]);
+        let moved = seller_inbox(&state, STORE);
+        assert!(
+            moved.for_order(&order.order.id).is_none(),
+            "the order no longer belongs to the conversation"
+        );
+        assert!(
+            moved.threads.iter().all(|thread| !thread.open),
+            "nothing paid opens it now"
+        );
         assert_eq!(
             label("Agreed, full refund"),
             Some((crate::components::message_view::UNCONFIRMED, false))
@@ -33398,6 +33432,17 @@ mod buy_flow_tests {
             label("I'll pay double"),
             Some((crate::components::message_view::UNCONFIRMED, false))
         );
+        // Counted: only the buyer's own confirmed line, not the forged one
+        // (review after 9417fbf); shown: yes.
+        assert_eq!(
+            crate::components::message_view::buyer_thread_count(&state, STORE, Some(tag)),
+            1
+        );
+        assert!(crate::components::message_view::buyer_thread_has_messages(
+            &state,
+            STORE,
+            Some(tag)
+        ));
     }
 
     /// **The buyer's rule is a strict subset of the seller's.** Over the
