@@ -16311,11 +16311,10 @@ mod tests {
         }
     }
 
-    /// The record key's arrival. Since harvest#93 phase 1b it is the
-    /// `StoreSubkeys` answer for the store key the creation made, not a
-    /// per-Ghost-Key RSA key; "someone else" is an answer about another
-    /// store key.
-    fn rsa_keys_initialized(fingerprint: &str) -> HarvestDelegateResponse {
+    /// The subkeys' arrival: the `StoreSubkeys` answer for the store key the
+    /// creation made, which since harvest#203 carries the inbox key only;
+    /// "someone else" is an answer about another store key.
+    fn store_subkeys_answer(fingerprint: &str) -> HarvestDelegateResponse {
         let store = if fingerprint == FINGERPRINT {
             crate::state::test_store_key()
         } else {
@@ -16356,12 +16355,12 @@ mod tests {
     /// empty and thrown away -- and the store went onto the network with no
     /// certificate for a buyer to check the seller against.
     ///
-    /// The RSA answer must therefore leave the creation waiting.
+    /// The subkeys answer must therefore leave the creation waiting.
     #[test]
-    fn the_rsa_key_alone_does_not_start_store_creation() {
+    fn the_subkeys_alone_do_not_start_store_creation() {
         let mut state = state_awaiting_creation();
 
-        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+        state.on_delegate_response(store_subkeys_answer(FINGERPRINT));
 
         let pending = state
             .pending_store_creation
@@ -16380,7 +16379,7 @@ mod tests {
     fn the_certificate_arriving_second_is_not_lost() {
         let mut state = state_awaiting_creation();
 
-        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+        state.on_delegate_response(store_subkeys_answer(FINGERPRINT));
         assert!(state.pending_store_creation.is_some());
 
         state.on_ghostkey_response(certificate(FINGERPRINT));
@@ -16394,7 +16393,7 @@ mod tests {
     /// And the other order works too: neither response is privileged, so
     /// whichever lands second is the one that releases the creation.
     #[test]
-    fn the_rsa_key_arriving_second_is_not_lost() {
+    fn the_subkeys_arriving_second_are_not_lost() {
         let mut state = state_awaiting_creation();
 
         state.on_ghostkey_response(certificate(FINGERPRINT));
@@ -16404,7 +16403,7 @@ mod tests {
             .expect("creation must wait for the RSA key");
         assert!(!pending.certificate_pem.is_empty(), "the cert was recorded");
 
-        state.on_delegate_response(rsa_keys_initialized(FINGERPRINT));
+        state.on_delegate_response(store_subkeys_answer(FINGERPRINT));
         assert!(state.pending_store_creation.is_none());
     }
 
@@ -16414,7 +16413,7 @@ mod tests {
     fn another_identitys_answers_do_not_start_this_creation() {
         let mut state = state_awaiting_creation();
 
-        state.on_delegate_response(rsa_keys_initialized("someone-else"));
+        state.on_delegate_response(store_subkeys_answer("someone-else"));
         state.on_ghostkey_response(certificate("someone-else"));
 
         let pending = state

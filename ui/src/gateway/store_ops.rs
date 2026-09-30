@@ -470,6 +470,8 @@ pub async fn create_store_contracts(
         // `HarvestDelegateRequest::GetStoreSubkeys`).
         record_public_key: None,
     };
+    // Unreachable since harvest#203 (creation waits on the inbox key), kept
+    // as a loud trace should that gate ever be loosened.
     if encryption_public_key.is_none() {
         warn!(
             "Publishing this store with no encryption key -- buyers will be told they cannot \

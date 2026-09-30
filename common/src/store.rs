@@ -229,17 +229,16 @@ pub struct StoreInfoV1 {
     /// on 2026-09-05, `missing field `encryption_public_key``.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_public_key: Option<[u8; 32]>,
-    /// The store's record (legacy RSA) public key, PKCS#1 DER, derived
-    /// from the store key (harvest#93 phase 1b,
-    /// `custody::record_public_key_der`).
+    /// The store's record (legacy RSA) public key, PKCS#1 DER, for a store
+    /// that published one between harvest#93 phase 1b and harvest#203.
     ///
-    /// Published so every device holding the store key can CHECK its own
-    /// derivation against it rather than trust it silently: RSA key
-    /// generation is not a function the `rsa` crate promises to keep stable,
-    /// so a crate bump could derive a different key from the same seed, and
-    /// the record contract's address depends on it. `None` for a store
-    /// published before this existed. Skipped when absent for the reason
-    /// `encryption_public_key` is.
+    /// Only readers locating a store's reputation records from before
+    /// harvest#53 Phase C use it (the UI's `reputation_locators`). Nothing is
+    /// derived from the store key any more: deriving it was an RSA-2048 key
+    /// generation that overran the node's 5 s limit on a delegate call
+    /// (harvest#203). A new store publishes `None`, and an edit carries over
+    /// whatever the store already publishes. Skipped when absent for the
+    /// reason `encryption_public_key` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_public_key: Option<Vec<u8>>,
 }

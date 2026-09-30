@@ -91,6 +91,13 @@ pub enum CustodyPurpose {
 /// requests and every other custody request.
 pub(crate) const CUSTODY_TIMEOUT_MS: u64 = crate::bitcoin_inbox::SIGNATURE_TIMEOUT_MS;
 
+/// How long a `GetStoreSubkeys` may go unanswered before everything waiting
+/// on it is released (harvest#203). The node stops one delegate call after
+/// 5 s and answers that as an error naming no request, so the UI cannot tell
+/// which of its requests died (harvest#204): without a deadline a creation
+/// or an edit waiting on the answer hangs for the session.
+pub(crate) const SUBKEYS_TIMEOUT_MS: u32 = 30_000;
+
 /// How many times a custody request may fail to SEND before this session
 /// stops retrying it and tells the seller.
 const MAX_CUSTODY_SEND_ATTEMPTS: u8 = 3;
@@ -162,8 +169,7 @@ impl AppState {
         };
         let store = store.to_bytes();
         // A store's own key: ask for its subkeys too, so its details can be
-        // published with them and a device can check them (see
-        // `on_store_subkeys`).
+        // published with them (see `on_store_subkeys`).
         if matches!(request.purpose, CustodyPurpose::Wrap) {
             self.request_store_subkeys(store);
         }
@@ -664,8 +670,9 @@ impl AppState {
         self.merge_store_registrations(&pending.fingerprint, vec![registration.clone()]);
         self.notifications
             .push("Recovered your store's key from your Ghost Key.".into());
-        // Check what this device derives against what the store publishes
-        // before anything is published from here (#99 review).
+        // Fetched now so an edit from this device does not wait on it: the
+        // store's inbox key, which its details publish (harvest#203 removed
+        // the record-key check this used to run).
         self.request_store_subkeys(store);
         #[cfg(target_arch = "wasm32")]
         crate::state::spawn_harvest_request(
@@ -841,6 +848,19 @@ impl AppState {
         said
     }
 
+    /// No answer to `GetStoreSubkeys` for `store` in [`SUBKEYS_TIMEOUT_MS`]:
+    /// release what waits on it, and let a retry ask again. Nothing if the
+    /// answer came meanwhile. A late answer is still recorded when it comes.
+    pub(crate) fn on_subkeys_unanswered(&mut self, store: [u8; 32]) {
+        if self.store_subkeys.contains_key(&store) || !self.store_subkeys_requested.contains(&store)
+        {
+            return;
+        }
+        if !self.release_waiters_on_subkeys(store, "the Harvest delegate did not answer in time") {
+            self.store_subkeys_requested.remove(&store);
+        }
+    }
+
     /// The `GetStoreSubkeys` request could not be SENT.
     ///
     /// Split out of `spawn_subkeys_request` so the state change is testable
@@ -909,7 +929,12 @@ fn spawn_subkeys_request(store: [u8; 32], request: harvest_common::HarvestDelega
                 if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await
                 {
                     fail(format!("could not reach the Harvest delegate: {e}"));
+                    return;
                 }
+                gloo_timers::future::TimeoutFuture::new(SUBKEYS_TIMEOUT_MS).await;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_subkeys_unanswered(store);
             }
             Err(e) => fail(format!("could not encode the request: {e}")),
         }
@@ -2019,7 +2044,7 @@ mod tests {
             state
                 .store_subkeys_requested
                 .contains(&store_vk().to_bytes()),
-            "the recovered key's record key is checked against the published one"
+            "the recovered key's subkeys are fetched for later edits"
         );
     }
 
@@ -2065,6 +2090,58 @@ mod tests {
             .notifications
             .iter()
             .any(|n| n.contains("not registered")));
+    }
+
+    /// A `GetStoreSubkeys` nobody answers (the node killed the call, and its
+    /// error names no request: harvest#204) releases the creation waiting on
+    /// it after the deadline, so the seller can try again; an answer that
+    /// came first is left alone. Mutated red by a no-op deadline, and by
+    /// releasing even when the answer arrived.
+    #[test]
+    fn an_unanswered_subkeys_request_releases_the_creation() {
+        let waiting = || {
+            let mut state = AppState::default();
+            state.store_creation_in_flight = Some("fp".to_string());
+            state.pending_store_creation = Some(crate::state::PendingStoreCreation {
+                another_store: false,
+                ghostkey_fingerprint: FINGERPRINT.to_string(),
+                seller_verifying_key_bytes: backer_vk().to_bytes(),
+                certificate_pem: String::new(),
+                store_name: "Bean Shop".into(),
+                description: String::new(),
+                encryption_public_key: None,
+                store_verifying_key: Some(store_vk().to_bytes()),
+                store_key_request: Some(1),
+                carried_listings: Vec::new(),
+            });
+            state.store_subkeys_requested.insert(store_vk().to_bytes());
+            state
+        };
+        let mut state = waiting();
+        state.on_subkeys_unanswered(store_vk().to_bytes());
+        assert!(state.store_creation_in_flight.is_none(), "released");
+        assert!(!state
+            .store_subkeys_requested
+            .contains(&store_vk().to_bytes()));
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("did not answer in time")));
+
+        let mut state = waiting();
+        state.on_store_subkeys(
+            store_vk().to_bytes(),
+            Ok(harvest_common::delegate::StoreSubkeyInfo {
+                inbox_public_key: [7; 32],
+            }),
+        );
+        let before = state.notifications.len();
+        state.on_subkeys_unanswered(store_vk().to_bytes());
+        assert_eq!(
+            state.notifications.len(),
+            before,
+            "answered: nothing to release"
+        );
     }
 
     /// The same failure with no creation waiting says so and asks nothing
