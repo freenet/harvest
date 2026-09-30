@@ -38,15 +38,13 @@ pub(crate) fn nav_tab(route: Route) -> Option<Route> {
     }
 }
 
-/// The Stores tab's label: with the count of what needs the seller
-/// (`my_store::requests_needing_seller`) when there is any, so a buyer's
+/// The count beside "Stores" of what needs the seller
+/// (`my_store::requests_needing_seller`), when there is any, so a buyer's
 /// order is visible from every page. It rode on "My store (n)" until that
-/// tab went.
-pub(crate) fn stores_tab_label(needs_seller: usize) -> String {
-    match needs_seller {
-        0 => "Stores".to_string(),
-        n => format!("Stores ({n})"),
-    }
+/// tab went. Shown in the one warm colour, as on the Orders tab, so it does
+/// not read as a count of stores.
+pub(crate) fn needs_count(needs_seller: usize) -> Option<String> {
+    (needs_seller > 0).then(|| format!("({needs_seller})"))
 }
 
 /// Which of the seller's pages [`Route::MyStore`] opens on. Set by whatever
@@ -75,6 +73,27 @@ pub(crate) fn show_store(store_contract_id: Vec<u8>) {
     *ROUTE.write() = Route::Store;
 }
 
+/// Show a store's own page from a button that names it by id (Purchases'
+/// "Open store", "See your store as buyers do"). A store whose state is not
+/// here is opened by its code (`store_link::open_store`), which asks for it
+/// and gives up after a while, so the page never says "Loading" for good.
+pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
+    let code = {
+        let state = crate::gateway::APP_STATE.peek();
+        let loaded = state
+            .browsing_stores
+            .get(&store_contract_id)
+            .is_some_and(|store| store.info.is_some());
+        (!loaded)
+            .then(|| state.store_codes.get(&store_contract_id).cloned())
+            .flatten()
+    };
+    match code.and_then(|code| harvest_common::store::StoreParameters::from_code(&code)) {
+        Some(params) => crate::store_link::open_store(params),
+        None => show_store(store_contract_id),
+    }
+}
+
 /// A followed link named a store the old way: the store page says so.
 pub(crate) fn show_old_format_link() {
     crate::gateway::APP_STATE.write().note_old_format_link();
@@ -94,7 +113,7 @@ pub fn App() -> Element {
     // A buyer's request arriving is the one thing a seller must not miss, so
     // its count rides on the navigation, visible from every page.
     let waiting = super::my_store::requests_needing_seller(&crate::gateway::APP_STATE.read());
-    let stores_label = stores_tab_label(waiting);
+    let stores_count = needs_count(waiting);
     let current_tab = nav_tab(current_route);
 
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
@@ -281,9 +300,9 @@ pub fn App() -> Element {
                 span { class: "{status_class}", "{connection_status}" }
             }
             nav { class: "harvest-nav", aria_label: "Main",
-                for (route , label) in [
-                    (Route::Stores, stores_label.clone()),
-                    (Route::Purchases, "Purchases".to_string()),
+                for (route , label , count) in [
+                    (Route::Stores, "Stores", stores_count.clone()),
+                    (Route::Purchases, "Purchases", None),
                 ]
                 {
                     button {
@@ -291,6 +310,14 @@ pub fn App() -> Element {
                         aria_current: if current_route == route { "page" } else if current_tab == Some(route) { "true" } else { "false" },
                         onclick: move |_| *ROUTE.write() = route,
                         "{label}"
+                        if let Some(count) = count {
+                            " "
+                            span {
+                                class: "tab-needs",
+                                title: "Things that need you in your stores",
+                                "{count}"
+                            }
+                        }
                     }
                 }
             }
@@ -570,14 +597,28 @@ mod route_tests {
                 );
             }
 
-            // Back to Stores, then a loaded store opened from Purchases or
-            // from the seller's own pages.
+            // Back to Stores, then a store opened from Purchases or from
+            // the seller's own pages, by its id.
             *ROUTE.write() = Route::Stores;
-            show_store(vec![9u8; 32]);
+            open_store_page(vec![9u8; 32]);
             assert_eq!(*ROUTE.peek(), Route::Store);
             assert_eq!(
                 crate::gateway::APP_STATE.peek().active_store_id,
                 Some(vec![9u8; 32])
+            );
+            // One whose state is not here but whose code is known is opened
+            // by its code, which asks for it (and, on wasm, gives up after a
+            // while) rather than waiting on nothing.
+            let known = params(10);
+            crate::gateway::APP_STATE
+                .write()
+                .note_store_code(id_of(&known), known.code().to_string());
+            *ROUTE.write() = Route::Stores;
+            open_store_page(id_of(&known));
+            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(
+                crate::gateway::APP_STATE.peek().active_store_id,
+                Some(id_of(&known))
             );
 
             // A link from before store codes: the store page says why.
@@ -623,7 +664,7 @@ mod route_tests {
     /// only when there is some.
     #[test]
     fn the_stores_tab_carries_what_needs_the_seller() {
-        assert_eq!(stores_tab_label(0), "Stores");
-        assert_eq!(stores_tab_label(2), "Stores (2)");
+        assert_eq!(needs_count(0), None);
+        assert_eq!(needs_count(2).as_deref(), Some("(2)"));
     }
 }

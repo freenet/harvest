@@ -129,6 +129,23 @@ impl SellerStore {
     }
 }
 
+/// Whether this store's "Needs you" card (`Overview`) holds anything: what
+/// [`SellerStore::needs_you`] counts, and the rest it lists (a listing with
+/// no price, a wallet gap, another key on the store's address, details to
+/// repair, a backing buyers do not believe, expired invoices, instant
+/// checkout alerts). The store's card on Stores reads the same, so it never
+/// says "up to date" over a card that lists something.
+pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
+    store.needs_you() > 0
+        || store.unpriced > 0
+        || state.wallet_gap_note_due(&store.contract_id).is_some()
+        || store.foreign_owner.is_some()
+        || (store.details_resolved && store.gap.is_some())
+        || (store.details_resolved && !store.certificate.is_verified())
+        || store.expired_invoices > 0
+        || !state.instant_checkout_alerts(&store.contract_id).is_empty()
+}
+
 /// What needs the seller across every store this device manages
 /// ([`SellerStore::needs_you`]): the number beside "Stores" in the
 /// navigation, visible from every page.
@@ -869,16 +886,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
         .seller_orders_to_send(&store.contract_id, &store.fingerprint);
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
-    let needs: bool = store.unpriced > 0
-        || wallet_gap.is_some()
-        || store.foreign_owner.is_some()
-        || (store.details_resolved && store.gap.is_some())
-        || !store.certificate.is_verified()
-        || store.expired_invoices > 0
-        || store.requests > 0
-        || store.to_send > 0
-        || store.to_confirm > 0
-        || !alerts.is_empty();
+    let needs = overview_needs(&store, &APP_STATE.read());
 
     rsx! {
         section { class: "card",
@@ -1051,7 +1059,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                 class: "btn btn-sm btn-outline",
                 onclick: {
                     let id = store.contract_id.clone();
-                    move |_| super::app::show_store(id.clone())
+                    move |_| super::app::open_store_page(id.clone())
                 },
                 "See your store as buyers do"
             }

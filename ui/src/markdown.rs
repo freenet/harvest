@@ -837,7 +837,11 @@ pub fn first_line(source: &str) -> Option<String> {
             Block::Paragraph(children) | Block::Heading { children, .. } => {
                 inline_text(children, out);
             }
-            Block::Code(text) => out.push_str(text.lines().next().unwrap_or_default()),
+            Block::Code(text) => out.push_str(
+                text.lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default(),
+            ),
             Block::Quote(blocks) => {
                 if let Some(first) = blocks.first() {
                     block_text(first, out);
@@ -1605,6 +1609,10 @@ mod tests {
             Some("Line one".to_string())
         );
         assert_eq!(first_line("<b>raw</b>"), Some("<b>raw</b>".to_string()));
+        assert_eq!(
+            first_line("```\n\nfresh bread\nmore\n```"),
+            Some("fresh bread".to_string())
+        );
         assert_eq!(first_line(""), None);
         assert_eq!(first_line("   \n\n---\n"), None);
         let long = "word ".repeat(100);

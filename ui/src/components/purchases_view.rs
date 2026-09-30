@@ -94,7 +94,7 @@ pub fn MyPurchases() -> Element {
                             class: "btn btn-sm btn-outline",
                             onclick: {
                                 let id = row.store_contract_id.clone();
-                                move |_| super::app::show_store(id.clone())
+                                move |_| super::app::open_store_page(id.clone())
                             },
                             "Open store"
                         }
@@ -201,6 +201,15 @@ mod tests {
         assert!(state.begin_background_load(vec![1u8; 32], "code".into()));
         assert!(!state.begin_background_load(vec![1u8; 32], "code".into()));
         state.end_background_load_failed(&[1u8; 32]);
+        // Not straight away: with the connection down, every retry is a
+        // change of state that asks again (review of the Stores page).
+        assert!(!state.begin_background_load(vec![1u8; 32], "code".into()));
+        assert!(!state.background_load_due(&[1u8; 32], crate::state::now_ms()));
+        // Once the wait is over, it is sent again.
+        *state
+            .background_load_failed_at
+            .get_mut(&vec![1u8; 32])
+            .unwrap() -= crate::state::BACKGROUND_LOAD_RETRY_MS;
         assert!(state.begin_background_load(vec![1u8; 32], "code".into()));
 
         state.browsing_stores.insert(vec![2u8; 32], named("Loaded"));

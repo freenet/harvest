@@ -288,15 +288,14 @@ pub fn load_remembered_store(code: &str) {
         return;
     };
     let contract_id = store_id.as_bytes().to_vec();
-    // Checked under a READ first: My purchases calls this from an effect
-    // that reads the app state, and a write, even one that changes nothing,
+    // Checked under a READ first: Stores and Purchases call this from an
+    // effect that reads the app state, and a write, even one that changes nothing,
     // would re-run that effect for ever.
     {
         use dioxus::prelude::ReadableExt;
-        if crate::gateway::APP_STATE
+        if !crate::gateway::APP_STATE
             .read()
-            .browsing_stores
-            .contains_key(&contract_id)
+            .background_load_due(&contract_id, crate::state::now_ms())
         {
             return;
         }

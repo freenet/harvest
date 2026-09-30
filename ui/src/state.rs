@@ -720,9 +720,16 @@ pub struct AppState {
     /// The UI should pick these up and send them as contract updates.
     pub signed_listings_ready: Vec<AuthorizedListing>,
 
-    /// Remembered stores My purchases is loading in the background: GET out,
-    /// state not yet arrived. See `store_link::load_remembered_store`.
+    /// Remembered stores Stores and Purchases are loading in the background:
+    /// GET out, state not yet arrived. See `store_link::load_remembered_store`.
     pub background_loads: HashSet<Vec<u8>>,
+
+    /// When a background load's GET last failed to go out, per store: it is
+    /// not tried again for [`BACKGROUND_LOAD_RETRY_MS`]. The pages that load
+    /// stores ask again on every change of state, and with the connection
+    /// down a failed send is itself a change, so without this they would
+    /// send, fail and send again without end.
+    pub background_load_failed_at: HashMap<Vec<u8>, u64>,
 
     /// Listing statuses the store key has signed, with the store each is for.
     /// Filled only off wasm, where nothing publishes them, so a test can see
@@ -3196,6 +3203,10 @@ const MAX_MAILBOX_SUBSCRIBE_ATTEMPTS: u8 = 3;
 /// hammering the same failure immediately.
 const SUBSCRIBE_RETRY_DELAY_MS: u32 = 5_000;
 
+/// How long a background load whose GET failed to go out waits before it is
+/// sent again. See [`AppState::background_load_failed_at`].
+pub const BACKGROUND_LOAD_RETRY_MS: u64 = 30_000;
+
 /// GET-and-subscribe a store's mailbox contract, learned from the delegate's
 /// `StoreRegistration`, OR from a buyer sending a message or recalling a kept
 /// conversation (`register_store_mailbox` has both kinds of caller).
@@ -3544,11 +3555,23 @@ impl AppState {
         self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
     }
 
+    /// Whether a background load of this store should be sent now: nothing
+    /// is held for it yet (loaded, or its GET out), and its last send did not
+    /// fail within [`BACKGROUND_LOAD_RETRY_MS`]. Changes nothing, so a page
+    /// can ask under a read.
+    pub fn background_load_due(&self, store_contract_id: &[u8], now_ms: u64) -> bool {
+        !self.browsing_stores.contains_key(store_contract_id)
+            && self
+                .background_load_failed_at
+                .get(store_contract_id)
+                .is_none_or(|at| now_ms.saturating_sub(*at) >= BACKGROUND_LOAD_RETRY_MS)
+    }
+
     /// Mark a remembered store as being loaded in the background, unless it is
     /// already loaded or loading. `true` when the caller should send the GET.
     /// See `store_link::load_remembered_store`.
     pub fn begin_background_load(&mut self, store_contract_id: Vec<u8>, code: String) -> bool {
-        if self.browsing_stores.contains_key(&store_contract_id) {
+        if !self.background_load_due(&store_contract_id, now_ms()) {
             return false;
         }
         self.browsing_stores
@@ -3566,6 +3589,8 @@ impl AppState {
         if !self.background_loads.remove(store_contract_id) {
             return;
         }
+        self.background_load_failed_at
+            .insert(store_contract_id.to_vec(), now_ms());
         if self
             .browsing_stores
             .get(store_contract_id)
@@ -3771,6 +3796,13 @@ impl AppState {
             return StoreName::Unreachable;
         }
         if !self.browsing_stores.contains_key(store_contract_id) {
+            // Its last GET failed to go out, and waits to be sent again.
+            if self
+                .background_load_failed_at
+                .contains_key(store_contract_id)
+            {
+                return StoreName::Unreachable;
+            }
             return StoreName::Loading;
         }
         let active = self.active_store_id.as_deref() == Some(store_contract_id);
@@ -33877,6 +33909,12 @@ mod store_code_tests {
         assert_eq!(state.store_name_of(&other), StoreName::Loading);
         state.end_background_load_timed_out(&other);
         assert_eq!(state.store_name_of(&other), StoreName::Unreachable);
+        // Or whose GET failed to go out: unreachable while it waits to be
+        // sent again, not "Loading" for as long as the connection is down.
+        let unsent = vec![9u8; 32];
+        assert!(state.begin_background_load(unsent.clone(), "3Bn8xWqLd6Tz9Kf3".into()));
+        state.end_background_load_failed(&unsent);
+        assert_eq!(state.store_name_of(&unsent), StoreName::Unreachable);
 
         // Its state arrives: its own name, trimmed; an empty one says so.
         state.browsing_stores.get_mut(&other).unwrap().info = Some(StoreInfoV1 {

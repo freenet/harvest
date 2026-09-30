@@ -80,6 +80,9 @@ pub(crate) struct OwnStoreRow {
     /// Whether `label` is the store's own name, rather than words standing
     /// in for it.
     pub named: bool,
+    /// Its code: the second line while it has no name, since nothing else
+    /// tells two such cards apart. Never the name.
+    pub code: Option<String>,
     /// The first line of its description.
     pub tagline: Option<String>,
     pub status: OwnStoreStatus,
@@ -91,6 +94,9 @@ pub(crate) enum OwnStoreStatus {
     /// Something needs the seller (`my_store::SellerStore::needs_you`, the
     /// count on the Stores tab): "<n> need(s) you".
     NeedsYou(usize),
+    /// Nothing counted, but the Overview's "Needs you" card lists something
+    /// all the same (`my_store::overview_needs`): "Needs you".
+    NeedsALook,
     /// Open, and nothing waiting: "up to date".
     UpToDate,
     /// Buyers cannot buy: the seller's own status pill ("Closed", or "Not
@@ -105,6 +111,7 @@ impl OwnStoreStatus {
         match self {
             OwnStoreStatus::NeedsYou(1) => "1 needs you".to_string(),
             OwnStoreStatus::NeedsYou(n) => format!("{n} need you"),
+            OwnStoreStatus::NeedsALook => "Needs you".to_string(),
             OwnStoreStatus::UpToDate => "up to date".to_string(),
             OwnStoreStatus::NotOpen(pill) => pill.to_string(),
             OwnStoreStatus::Checking => "Checking\u{2026}".to_string(),
@@ -112,18 +119,24 @@ impl OwnStoreStatus {
     }
 }
 
-/// The status on an own store's row card, from what needs the seller and
-/// the ONE status the seller's Overview reads (`presence_flow::
-/// seller_status`, `None` for a store that sells nothing here) or, failing
-/// that, what buyers see (`presence`). Nothing new is judged here: a store
-/// is "up to date" only where the Overview would say Open.
+/// The status on an own store's row card, from what needs the seller
+/// (`needs_you` counted, `needs_a_look` anything else the Overview's "Needs
+/// you" card lists) and the ONE status the seller's Overview reads
+/// (`presence_flow::seller_status`, `None` for a store that sells nothing
+/// here) or, failing that, what buyers see (`presence`). Nothing new is
+/// judged here: a store is "up to date" only where the Overview would say
+/// Open and "Nothing needs you right now".
 pub(crate) fn own_store_status(
     needs_you: usize,
+    needs_a_look: bool,
     seller: Option<&SellerStatus>,
     presence: StorePresence,
 ) -> OwnStoreStatus {
     if needs_you > 0 {
         return OwnStoreStatus::NeedsYou(needs_you);
+    }
+    if needs_a_look {
+        return OwnStoreStatus::NeedsALook;
     }
     match (seller, presence) {
         (Some(status), _) if status.open => OwnStoreStatus::UpToDate,
@@ -150,13 +163,19 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
                 )
             });
             OwnStoreRow {
-                status: own_store_status(store.needs_you(), seller.as_ref(), presence),
+                status: own_store_status(
+                    store.needs_you(),
+                    super::my_store::overview_needs(&store, state),
+                    seller.as_ref(),
+                    presence,
+                ),
                 tagline: state
                     .browsing_stores
                     .get(&id)
                     .and_then(|b| b.info.as_ref())
                     .and_then(|info| crate::markdown::first_line(&info.description)),
                 named: state.store_name_of(&id).name().is_some(),
+                code: store.code.clone(),
                 label: store.label,
                 contract_id: id,
             }
@@ -180,11 +199,13 @@ fn OwnStoreCard(row: OwnStoreRow) -> Element {
                 span { class: if row.named { "rc-name" } else { "rc-name rc-pending" }, "{row.label}" }
                 if let Some(ref tagline) = row.tagline {
                     span { class: "rc-sub", "{tagline}" }
+                } else if let (false, Some(code)) = (row.named, row.code.as_ref()) {
+                    span { class: "rc-sub", "Store code {code}" }
                 }
             }
             span { class: "rc-r",
                 match row.status {
-                    OwnStoreStatus::NeedsYou(_) => rsx! { span { class: "pill pill-needs", "{status}" } },
+                    OwnStoreStatus::NeedsYou(_) | OwnStoreStatus::NeedsALook => rsx! { span { class: "pill pill-needs", "{status}" } },
                     OwnStoreStatus::NotOpen(_) => rsx! { span { class: "pill", "{status}" } },
                     _ => rsx! { span { class: "text-muted small", "{status}" } },
                 }
@@ -366,11 +387,20 @@ pub fn StorePage() -> Element {
         .map(|(id, store)| (id.clone(), store.clone()));
 
     // A store was opened but its state hasn't come back yet. Once
-    // `store_link_error` is set the wait is over and the message changes --
-    // otherwise this reads "Loading store…" for the rest of the session.
+    // `store_link_error` is set, or the store is otherwise known not to have
+    // arrived (`AppState::store_name_of`), the wait is over and the message
+    // changes -- otherwise this reads "Loading store…" for the rest of the
+    // session.
     let link_error = app_state.store_link_error.clone();
-    let awaiting =
-        store_entry.is_none() && app_state.active_store_id.is_some() && link_error.is_none();
+    let unreachable = store_entry.is_none()
+        && app_state
+            .active_store_id
+            .as_ref()
+            .is_some_and(|id| app_state.store_name_of(id) == StoreName::Unreachable);
+    let awaiting = store_entry.is_none()
+        && app_state.active_store_id.is_some()
+        && link_error.is_none()
+        && !unreachable;
     drop(app_state);
 
     rsx! {
@@ -393,6 +423,11 @@ pub fn StorePage() -> Element {
                     match link_error {
                         Some(message) => rsx! {
                             p { class: "text-warning", "{message}" }
+                        },
+                        None if unreachable => rsx! {
+                            p { class: "text-warning",
+                                "That store didn\u{2019}t load. It may not be reachable right now."
+                            }
                         },
                         None => rsx! {
                             p { class: "text-muted text-italic", "No store is open." }
@@ -470,7 +505,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 }
             }
 
-            div { class: if pill_open { "store-header" } else { "store-header store-header-closed" },
+            div { class: if store.closed || presence.is_closed() { "store-header store-header-closed" } else { "store-header" },
                 // Open or Closed beside the name, as buyers see it
                 // (`presence_flow`; the 2026-09-26 decision, critique S2-3).
                 div { class: "store-status",
@@ -1295,41 +1330,56 @@ mod stores_page_tests {
 
         // Something waiting wins, whatever else is true.
         assert_eq!(
-            own_store_status(2, Some(&status(closed, blocked())), closed),
+            own_store_status(2, false, Some(&status(closed, blocked())), closed),
             OwnStoreStatus::NeedsYou(2)
         );
         assert_eq!(
-            own_store_status(0, Some(&status(open, ready())), open),
+            own_store_status(0, false, Some(&status(open, ready())), open),
             OwnStoreStatus::UpToDate
         );
         assert_eq!(
-            own_store_status(0, Some(&status(open, blocked())), open),
+            own_store_status(0, false, Some(&status(open, blocked())), open),
             OwnStoreStatus::NotOpen("Not taking orders"),
             "buyers see it open, but nobody answers their orders"
         );
         assert_eq!(
-            own_store_status(0, Some(&status(closed, ready())), closed),
+            own_store_status(0, false, Some(&status(closed, ready())), closed),
             OwnStoreStatus::NotOpen("Closed")
         );
         assert_eq!(
             own_store_status(
                 0,
+                false,
                 Some(&status(StorePresence::Checking, ready())),
                 StorePresence::Checking
             ),
             OwnStoreStatus::Checking
         );
         // A store that sells nothing here: what buyers see.
-        assert_eq!(own_store_status(0, None, open), OwnStoreStatus::UpToDate);
         assert_eq!(
-            own_store_status(0, None, closed),
+            own_store_status(0, false, None, open),
+            OwnStoreStatus::UpToDate
+        );
+        assert_eq!(
+            own_store_status(0, false, None, closed),
             OwnStoreStatus::NotOpen("Closed")
         );
         assert_eq!(
-            own_store_status(0, None, StorePresence::Checking),
+            own_store_status(0, false, None, StorePresence::Checking),
             OwnStoreStatus::Checking
         );
 
+        // Nothing counted, but the Overview's card lists something (an
+        // unpriced listing, say): never "up to date". Red without the flag.
+        assert_eq!(
+            own_store_status(0, true, Some(&status(open, ready())), open),
+            OwnStoreStatus::NeedsALook
+        );
+        assert_eq!(
+            own_store_status(0, true, None, open),
+            OwnStoreStatus::NeedsALook
+        );
+        assert_eq!(OwnStoreStatus::NeedsALook.text(), "Needs you");
         assert_eq!(OwnStoreStatus::NeedsYou(1).text(), "1 needs you");
         assert_eq!(OwnStoreStatus::NeedsYou(3).text(), "3 need you");
         assert_eq!(OwnStoreStatus::UpToDate.text(), "up to date");
