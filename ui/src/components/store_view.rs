@@ -77,6 +77,9 @@ pub(crate) struct OwnStoreRow {
     pub contract_id: Vec<u8>,
     /// Its name, or "Loading…" (`my_store::SellerStore::label`).
     pub label: String,
+    /// Whether `label` is the store's own name, rather than words standing
+    /// in for it.
+    pub named: bool,
     /// The first line of its description.
     pub tagline: Option<String>,
     pub status: OwnStoreStatus,
@@ -153,6 +156,7 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
                     .get(&id)
                     .and_then(|b| b.info.as_ref())
                     .and_then(|info| crate::markdown::first_line(&info.description)),
+                named: state.store_name_of(&id).name().is_some(),
                 label: store.label,
                 contract_id: id,
             }
@@ -173,7 +177,7 @@ fn OwnStoreCard(row: OwnStoreRow) -> Element {
                 move |_| open_seller_page(SellerPage::Store(id.clone()))
             },
             span { class: "rc-main",
-                span { class: "rc-name", "{row.label}" }
+                span { class: if row.named { "rc-name" } else { "rc-name rc-pending" }, "{row.label}" }
                 if let Some(ref tagline) = row.tagline {
                     span { class: "rc-sub", "{tagline}" }
                 }

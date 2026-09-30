@@ -439,7 +439,7 @@ h4 {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: var(--space-xl);
-  margin-bottom: var(--space-xl);
+  margin-bottom: var(--space-lg);
 }
 
 /* The store's name, and beside it Open or Closed. */
@@ -1616,6 +1616,11 @@ h4 {
   color: var(--accent);
 }
 
+/* The page's heading sits just under the way back, not a section away. */
+.crumb + h2 {
+  margin-top: var(--space-sm);
+}
+
 /* ---- Store page ---- */
 
 .own-store-banner {
@@ -1740,19 +1745,19 @@ h4 {
     padding: var(--space-lg);
   }
 
-  /* The status goes under the name, right-aligned, and may wrap. */
+  /* The status keeps to at most half the card, and may wrap. */
   .rowcard {
-    align-items: flex-start;
+    padding: var(--space-md);
+    gap: var(--space-sm);
   }
 
   .rc-r {
-    flex-direction: column;
-    align-items: flex-end;
     gap: var(--space-xs);
     max-width: 50%;
   }
 
-  .rc-r .pill {
+  .rc-r .pill,
+  .rc-r .small {
     text-align: right;
   }
 
