@@ -119,17 +119,25 @@ impl ConversationClaims {
 /// request (rule 1 of the module docs) or its listing tag (rule 2). Nothing
 /// else is read: not its binding, not any message naming it.
 pub(crate) fn order_in_conversation(order: &AuthorizedOrder, claims: &ConversationClaims) -> bool {
-    let by_request = order.order.request_id.is_some_and(|request_id| {
-        claims
-            .answered
-            .iter()
-            .any(|(asked, id)| *asked == request_id && *id == order.order.id)
-    });
     let by_listing_tag = order
         .order
         .listing_tag
         .is_some_and(|tag| claims.listing_tags.contains(&tag));
-    by_request || by_listing_tag
+    order_by_request(order, claims) || by_listing_tag
+}
+
+/// Whether `order` belongs to the conversation `claims` describes by rule 1
+/// alone: a Buy now request read there gives the order's request id and id.
+/// The request id hashes the conversation's own tag, so no other tag,
+/// however it shares the conversation's keys, can make this true: the
+/// strongest evidence of which conversation an order is in.
+pub(crate) fn order_by_request(order: &AuthorizedOrder, claims: &ConversationClaims) -> bool {
+    order.order.request_id.is_some_and(|request_id| {
+        claims
+            .answered
+            .iter()
+            .any(|(asked, id)| *asked == request_id && *id == order.order.id)
+    })
 }
 
 /// The seller's half of the rule: whether one of `orders` is paid (or was,

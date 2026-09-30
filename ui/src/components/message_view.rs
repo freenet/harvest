@@ -1200,6 +1200,10 @@ pub(crate) struct SellerThread {
     /// (`order_threads::order_in_conversation`), whatever their status: the
     /// order cards it is shown under.
     pub orders: Vec<harvest_common::payment::OrderId>,
+    /// Those of [`Self::orders`] a request in it names
+    /// (`order_threads::order_by_request`), which binds the conversation's
+    /// tag: what [`SellerInbox::for_order`] prefers.
+    pub by_request: Vec<harvest_common::payment::OrderId>,
 }
 
 impl SellerThread {
@@ -1242,17 +1246,28 @@ pub(crate) struct SellerInbox {
 impl SellerInbox {
     /// The conversation order `id` belongs to, if this device can read it.
     ///
-    /// Only one conversation can hold an order's claims: its request id
-    /// hashes the conversation's tag, its listing tag needs that
-    /// conversation's keys, and twin tags that share those keys are never
-    /// read (`messaging::is_canonical_tag`). Should two ever claim one order,
-    /// the lowest tag wins: a rule no writer's timestamp or arrival order
-    /// can steer.
+    /// A conversation whose request names the order comes first
+    /// (`order_threads::order_by_request`): the request id hashes that
+    /// conversation's own tag, so no other tag can claim it, even one that
+    /// shares its keys. Only when none does (a quote invoice, or a Buy now
+    /// whose request has left the mailbox) is the order matched by its
+    /// listing tag, which every tag sharing the conversation's keys would
+    /// match; those twins are never read (`messaging::is_canonical_tag`:
+    /// canonical, in the prime-order subgroup), so one conversation holds the
+    /// claim, and should two ever hold it the lowest tag wins, which no
+    /// writer's timestamp or arrival order steers.
     pub(crate) fn for_order(&self, id: &harvest_common::payment::OrderId) -> Option<&SellerThread> {
-        self.threads
+        let by_request = self
+            .threads
             .iter()
-            .filter(|thread| thread.orders.contains(id))
-            .min_by_key(|thread| thread.tag)
+            .filter(|thread| thread.by_request.contains(id))
+            .min_by_key(|thread| thread.tag);
+        by_request.or_else(|| {
+            self.threads
+                .iter()
+                .filter(|thread| thread.orders.contains(id))
+                .min_by_key(|thread| thread.tag)
+        })
     }
 }
 
@@ -1347,6 +1362,12 @@ pub(crate) fn seller_inbox(
                     .orders
                     .iter()
                     .filter(|order| crate::order_threads::order_in_conversation(order, claims))
+                    .map(|order| order.order.id.clone())
+                    .collect(),
+                by_request: store
+                    .orders
+                    .iter()
+                    .filter(|order| crate::order_threads::order_by_request(order, claims))
                     .map(|order| order.order.id.clone())
                     .collect(),
             }
@@ -2626,7 +2647,16 @@ mod inbox_tests {
     #[test]
     fn only_a_paid_order_opens_its_conversation() {
         use harvest_common::payment::OrderStatus;
-        let tag = [1u8; 32];
+        // A real buyer key: the inbox reads only tags in the prime-order
+        // subgroup (`messaging::is_canonical_tag`).
+        let tag =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([8u8; 32])).as_bytes();
+        let under_tag = |mut entry: MailboxEntry| {
+            if let MailboxEntry::Readable { conversation, .. } = &mut entry {
+                *conversation = tag.to_vec();
+            }
+            entry
+        };
         let selection = crate::messaging::InstantSelection {
             requested_at_ms: 1_700_000_000_000,
             nonce: [4; 16],
@@ -2656,7 +2686,7 @@ mod inbox_tests {
                     entries: &[MailboxEntry]| {
             paid_conversations(entries, orders, &[], |_| Some(&k))
         };
-        let entries = [buy_now];
+        let entries = [under_tag(buy_now)];
         assert!(paid(&[order.clone()], &entries).is_empty(), "unpaid");
         order.status = OrderStatus::Cancelled;
         assert!(paid(&[order.clone()], &entries).is_empty(), "cancelled");
@@ -2673,7 +2703,7 @@ mod inbox_tests {
 
         // A paid quote invoice, by its listing tag under THIS
         // conversation's keys.
-        let quote = request(id.clone(), 1, [2u8; 32]);
+        let quote = under_tag(request(id.clone(), 1, [2u8; 32]));
         let mut invoice = published(2, Some(BINDING), Some(k.listing_tag(&id)));
         invoice.status = OrderStatus::Paid;
         assert_eq!(
@@ -2791,6 +2821,7 @@ mod inbox_tests {
                 .iter()
                 .map(|n| harvest_common::payment::OrderId([*n; 32]))
                 .collect(),
+            by_request: Vec::new(),
         }
     }
 
@@ -2859,6 +2890,29 @@ mod inbox_tests {
             Some(&newer.order.id),
             "whatever the order given"
         );
+    }
+
+    /// **An order goes under the conversation whose request names it**,
+    /// even when another conversation also matches it by listing tag and
+    /// has the lower tag: the request id binds the tag (review round 2 of
+    /// #205, B1). With no request match, the lowest listing-tag match. Red
+    /// with the request preference dropped.
+    #[test]
+    fn an_order_goes_under_the_conversation_whose_request_names_it() {
+        let mut low = thread(1, true, true, 0, &[7]);
+        let mut high = thread(2, true, true, 0, &[7]);
+        high.by_request = vec![harvest_common::payment::OrderId([7; 32])];
+        low.by_request = Vec::new();
+        let inbox = SellerInbox {
+            threads: vec![low, high],
+            unreadable: 0,
+            held_back: 0,
+        };
+        let id = harvest_common::payment::OrderId([7; 32]);
+        assert_eq!(inbox.for_order(&id).map(|t| t.tag), Some([2; 32]));
+        let mut none_by_request = inbox.clone();
+        none_by_request.threads[1].by_request.clear();
+        assert_eq!(none_by_request.for_order(&id).map(|t| t.tag), Some([1; 32]));
     }
 
     /// A question's preview is the buyer's newest text by its timestamp,

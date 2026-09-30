@@ -797,31 +797,75 @@ impl MailboxEntry {
     }
 }
 
-/// Whether `tag` is the canonical 32-byte encoding of an X25519 public key:
-/// bit 255 clear and the u-coordinate below p = 2^255 - 19.
+/// Whether `tag` is a conversation tag this app will read: the canonical
+/// 32-byte encoding (bit 255 clear, u below p = 2^255 - 19) of a point on
+/// Curve25519 in its prime-order subgroup.
 ///
-/// X25519 ignores bit 255 and reduces u modulo p, so every key has twins
-/// (the same bytes with bit 255 set, and for u < 19 also u + p) that give the
-/// SAME shared secret, and so the same conversation keys. Whoever holds a
-/// conversation's keys could otherwise write under a twin tag, and a reader
-/// keyed by tag would see a second conversation with the first one's keys:
-/// one that claims the first one's paid orders (`crate::order_threads`) and
-/// can take its place under an order card. A buyer's own tag is always
-/// canonical (x25519 never outputs a twin), so refusing twins costs nobody
-/// anything. The harvest delegate does not check this yet; the UI does not
-/// ask it for a twin's keys (`AppState::conversation_keys_to_request`) and
-/// never reads one ([`read_mailbox`]).
+/// X25519 gives every buyer key twins with the SAME shared secret, and so
+/// the same conversation keys and listing tags:
+///
+/// * encoding twins: X25519 ignores bit 255 and reduces u modulo p, so the
+///   same bytes with bit 255 set (and, for u < 19, u + p) are the same key;
+/// * torsion twins: the seller's scalar is clamped to a multiple of 8, so
+///   for each of the 7 non-trivial points Q of order dividing 8, P + Q gives
+///   the same secret as P. These are canonical and pass the delegate's
+///   contributory check (review round 2 of #205, confirmed on the Cargo.lock
+///   versions of curve25519-dalek and x25519-dalek).
+///
+/// Whoever holds a conversation's keys could write under any twin, and a
+/// reader keyed by tag would see a second conversation with the first one's
+/// keys: one that claims the first one's paid orders (`crate::order_threads`)
+/// and could take its place under an order card. An honest buyer's tag is
+/// always b·G, canonical and torsion-free, so refusing twins costs nobody
+/// anything; the prime-order check also refuses points on the twist. The
+/// harvest delegate does not check either yet; the UI does not ask it for a
+/// twin's keys (`AppState::conversation_keys_to_request`) and never reads
+/// one ([`read_mailbox`]).
+///
+/// The subgroup check costs a scalar multiplication and a mailbox holds up
+/// to 512 entries read on every render, so each tag's verdict is remembered.
 pub fn is_canonical_tag(tag: &[u8]) -> bool {
     let Ok(key) = <[u8; 32]>::try_from(tag) else {
         return false;
     };
-    if key[31] & 0x80 != 0 {
+    if !canonical_encoding(&key) {
         return false;
     }
-    // Below 2^255, the values at or above p are p..=2^255-1: 0x7f in the top
-    // byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+    thread_local! {
+        static VERDICTS: std::cell::RefCell<std::collections::HashMap<[u8; 32], bool>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(verdict) = VERDICTS.with(|v| v.borrow().get(&key).copied()) {
+        return verdict;
+    }
+    let verdict = in_prime_order_subgroup(&key);
+    VERDICTS.with(|v| {
+        let mut verdicts = v.borrow_mut();
+        // Far past honest use (a mailbox holds 512 entries); bounds a
+        // session watching a mailbox churn.
+        if verdicts.len() >= 4096 {
+            verdicts.clear();
+        }
+        verdicts.insert(key, verdict);
+    });
+    verdict
+}
+
+/// Whether `key` is the canonical encoding of a u-coordinate: bit 255 clear
+/// and below p. Below 2^255, the values at or above p are p..=2^255-1: 0x7f
+/// in the top byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+fn canonical_encoding(key: &[u8; 32]) -> bool {
     let at_least_p = key[31] == 0x7f && key[1..31].iter().all(|b| *b == 0xff) && key[0] >= 0xed;
-    !at_least_p
+    key[31] & 0x80 == 0 && !at_least_p
+}
+
+/// Whether the canonical u-coordinate `key` is a point of Curve25519 (not
+/// its twist) in the prime-order subgroup. Either Edwards sign serves: the
+/// two differ by negation, which keeps a point in or out of the subgroup.
+fn in_prime_order_subgroup(key: &[u8; 32]) -> bool {
+    curve25519_dalek::montgomery::MontgomeryPoint(*key)
+        .to_edwards(0)
+        .is_some_and(|point| point.is_torsion_free())
 }
 
 /// What an entry that did not open says, whatever the decoder said: see
@@ -940,8 +984,41 @@ mod tests {
         assert!(!is_canonical_tag(&p), "p itself reduces to 0");
         let mut below_p = p;
         below_p[0] = 0xec;
-        assert!(is_canonical_tag(&below_p));
+        assert!(
+            canonical_encoding(&below_p),
+            "p - 1 is a canonical encoding"
+        );
+        assert!(!canonical_encoding(&p) && !canonical_encoding(&twin));
         assert!(!is_canonical_tag(&real[..31]));
+
+        // Torsion twins (review round 2 of #205): canonical bytes, same
+        // shared secret with any clamped scalar, outside the prime-order
+        // subgroup. Red with the subgroup check dropped.
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .expect("a real key is on the curve");
+        let seller = StaticSecret::from([9u8; 32]);
+        let secret = |key: [u8; 32]| {
+            seller
+                .diffie_hellman(&x25519_dalek::PublicKey::from(key))
+                .to_bytes()
+        };
+        let mut twins = 0;
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            if twin == real {
+                continue;
+            }
+            assert_eq!(secret(twin), secret(real), "precondition: the same secret");
+            assert!(twin[31] & 0x80 == 0, "precondition: canonical bytes");
+            assert!(!is_canonical_tag(&twin), "a torsion twin is refused");
+            twins += 1;
+        }
+        assert!(twins > 0);
+        // A point on the twist is refused too: u = 2 is not on Curve25519.
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(!is_canonical_tag(&twist));
     }
     use aes_gcm::{Aes256Gcm, Nonce};
     use harvest_common::mailbox::MAX_MESSAGES;

@@ -404,13 +404,22 @@ can close it: the request gone AND the listing not in the store's listings
 of the order dropping from `Paid`. Then the seller's inbox holds the buyer's
 plain text back, and says it could not match it to a paid order.
 
-**Conversation tags must be canonical.** X25519 ignores bit 255 and reduces
-the u-coordinate modulo p, so a tag has twins that derive the same keys. A
-twin written by the buyer would read as a second conversation with the
-first one's keys, claiming its paid orders and able to take its place under
-an order card. The UI reads only canonical tags (`messaging::is_canonical_tag`)
-and never asks the delegate for a twin's keys; the delegate itself does not
-check yet.
+**Conversation tags must be canonical and torsion-free.** A tag has twins
+that give the same shared secret, and so the same keys and listing tags:
+the same bytes with bit 255 set (X25519 ignores it), u + p for small u
+(X25519 reduces modulo p), and seven torsion twins P + Q for the points Q of
+order dividing 8 (the seller's scalar is clamped to a multiple of 8, so the
+torsion part vanishes). The torsion twins are canonical bytes and pass the
+delegate's contributory check. A twin written by the buyer would read as a
+second conversation with the first one's keys, claiming its paid orders and
+able to take its place under an order card. The UI reads only tags that are
+canonical encodings of a point in Curve25519's prime-order subgroup
+(`messaging::is_canonical_tag`; an honest tag is b·G, so always is), and never
+asks the delegate for another tag's keys; the delegate itself does not check
+yet. An order is also filed first under the conversation whose request names
+it, since the request id hashes that conversation's own tag; only a quote
+invoice, or a Buy now whose request has left the mailbox, is matched by its
+listing tag alone.
 
 In a conversation that is not open the seller still sees every step (a
 request, a decline, an acceptance), so buying needs no Ghost Key, but not the
