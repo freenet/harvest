@@ -679,6 +679,7 @@ mod tests {
             |v, t| crate::ghostkey_cert::verify_voucher_under(v, t, &test_master()).is_ok(),
             |_| false,
             |_| false,
+            |_| false,
         )
     }
 

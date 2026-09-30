@@ -26,8 +26,9 @@ pub enum SellerRequest {
     /// No readable request of the buyer's agrees with the order (another
     /// device, keys not here, or it left the mailbox).
     NotFound,
-    /// More than one does, and they differ (another address, say).
-    Conflict,
+    /// More than one does, and they differ (another address, say): each
+    /// distinct version, so the seller can see what to ask the buyer about.
+    Conflict(Vec<SellerOrderRequest>),
 }
 
 /// What a buyer asked for, as the seller's order card shows it
@@ -7672,21 +7673,42 @@ impl AppState {
         self.notifications.retain(|n| n != notice);
     }
 
-    /// What the buyer of this seller's `order` asked for, read from the Buy
-    /// now request it answers in the store's mailbox: the listing's title
-    /// (while it is listed), how many, where to send it, the note, and the
-    /// delivery region and choices. What the seller's order card shows, so
-    /// the address is on the card rather than in the message thread (the
-    /// 2026-09-27 friction report).
+    /// Whether the seller's app still shows the ship-to address of `order`
+    /// (`fulfilment::address_retained`), judged against this node's own tip
+    /// for the order's network and the store's despatch of it.
+    pub fn address_retained_for(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|t| t.tip_height);
+        crate::fulfilment::address_retained(order, self.despatch_of(order).as_ref(), tip)
+    }
+
+    /// What the buyer of this seller's `order` asked for, read from the
+    /// request it answers in the store's mailbox: the listing's title (while
+    /// it is listed), how many, where to send it, the note, and the delivery
+    /// region and choices. What the seller's order card shows, so the address
+    /// is on the card rather than in the message thread (the 2026-09-27
+    /// friction report).
     ///
     /// A request counts only if it is the buyer's (addressed to the seller)
     /// and agrees with the order the seller's store published for it: the
-    /// same listing (the order's tag) and the total the order asks. The
-    /// order's id binds the request's nonce and date, not its terms, so a
-    /// second request under the same id naming another quantity or listing
-    /// is possible (review of #190). Requests that agree with the order but
-    /// not with each other are a [`SellerRequest::Conflict`]: the seller asks
-    /// the buyer before sending.
+    /// same listing (the order's tag), and for a Buy now the total the order
+    /// asks. The order's id binds the request's nonce and date, not its
+    /// terms, so a second request under the same id naming another quantity
+    /// or listing is possible (review of #190). A quote request (from before
+    /// fixed prices, answered by hand) has no id to match: it counts when the
+    /// order carries its listing's tag under this conversation, its binding
+    /// and its receipt key, and it was made no later than the order was
+    /// issued (a later ask is for another order; a buyer's clock far ahead
+    /// can hide theirs, which reads as "not found"). Requests that agree with
+    /// the order but not with each other are a [`SellerRequest::Conflict`]:
+    /// the seller asks the buyer before sending.
+    ///
+    /// Once the order's complaint window has closed the address and note are
+    /// replaced by [`crate::fulfilment::ADDRESS_HIDDEN`]
+    /// ([`Self::address_retained_for`]): hidden, not deleted.
     pub fn seller_order_request(
         &self,
         store_contract_id: &[u8],
@@ -7715,7 +7737,8 @@ impl AppState {
         orders
             .iter()
             .map(|order| {
-                let asked: Vec<SellerOrderRequest> = entries
+                let retained = self.address_retained_for(order);
+                let mut asked: Vec<SellerOrderRequest> = entries
                     .iter()
                     .filter_map(|entry| match entry {
                         MailboxEntry::Readable {
@@ -7725,40 +7748,56 @@ impl AppState {
                                     quantity,
                                     shipping,
                                     note,
-                                    instant: Some(selection),
-                                    ..
+                                    instant,
+                                    order_binding,
+                                    buyer_receipt_key,
                                 },
                             conversation,
                             addressing: Addressing::ToSeller,
+                            timestamp,
                             ..
                         } => {
                             let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-                            let answers = selection
-                                .answered_request(&tag)
-                                .is_some_and(|request| request.order_id() == order.order.id);
                             let same_listing = self
                                 .conversation_keys
                                 .get(conversation.as_slice())
                                 .is_some_and(|keys| {
                                     order.order.listing_tag == Some(keys.listing_tag(listing_id))
                                 });
-                            let same_total =
-                                selection.expected_total_sats == order.order.amount_sats;
-                            (answers && same_listing && same_total).then(|| {
+                            let answers = match instant {
+                                Some(selection) => {
+                                    selection
+                                        .answered_request(&tag)
+                                        .is_some_and(|request| request.order_id() == order.order.id)
+                                        && selection.expected_total_sats == order.order.amount_sats
+                                }
+                                None => {
+                                    order.order.request_id.is_none()
+                                        && order.order.order_binding == Some(*order_binding)
+                                        && (buyer_receipt_key.is_none()
+                                            || order.order.buyer_receipt_key == *buyer_receipt_key)
+                                        && *timestamp <= order.order.created_at
+                                }
+                            };
+                            (answers && same_listing).then(|| {
                                 let listing = store
                                     .listings
                                     .iter()
                                     .find(|l| l.listing.id == *listing_id)
                                     .map(|l| &l.listing);
+                                let (region, picks) = instant
+                                    .as_ref()
+                                    .map(|s| (s.region.clone(), s.choices.as_slice()))
+                                    .unwrap_or_default();
                                 SellerOrderRequest {
                                     title: listing.map(|l| l.title.clone()),
                                     quantity: *quantity,
                                     shipping: shipping.clone(),
                                     note: note.clone(),
-                                    region: selection.region.clone(),
+                                    region,
                                     choices: labelled_choices(
                                         listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
-                                        &selection.choices,
+                                        picks,
                                     ),
                                 }
                             })
@@ -7766,12 +7805,22 @@ impl AppState {
                         _ => None,
                     })
                     .collect();
-                match asked.first() {
-                    None => SellerRequest::NotFound,
-                    Some(first) if asked.iter().all(|other| other == first) => {
-                        SellerRequest::Found(first.clone())
+                if !retained {
+                    for request in asked.iter_mut() {
+                        request.shipping = crate::fulfilment::ADDRESS_HIDDEN.to_string();
+                        request.note.clear();
                     }
-                    Some(_) => SellerRequest::Conflict,
+                }
+                let mut versions: Vec<SellerOrderRequest> = Vec::new();
+                for request in asked.drain(..) {
+                    if !versions.contains(&request) {
+                        versions.push(request);
+                    }
+                }
+                match versions.len() {
+                    0 => SellerRequest::NotFound,
+                    1 => SellerRequest::Found(versions.remove(0)),
+                    _ => SellerRequest::Conflict(versions),
                 }
             })
             .collect()
@@ -25898,13 +25947,15 @@ mod buy_flow_tests {
             .order_id();
         // The order the store published for it: this listing's tag, the
         // total the buyer agreed. Unsigned: the card reads terms only.
-        let mut order = commitment(
-            &seller_signing_key(),
-            Some(anchor(TIP_HEIGHT - 1)),
-            OrderStatus::Paid,
-        );
+        // Genuinely paid, so its complaint window has an end to hide the
+        // address after.
+        let (unpaid, claims, tip) = a_paid_order_where(|o| o.amount_sats = 12_000);
+        let mut order = unpaid;
+        order.status = OrderStatus::Paid;
+        order.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims, tip,
+        ));
         order.order.id = order_id.clone();
-        order.order.amount_sats = 12_000;
         order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
         let ask = |listing: u8, quantity: u32, shipping: &str, total: u64| {
             buyer
@@ -25961,10 +26012,100 @@ mod buy_flow_tests {
                 ask(3, 2, "Elsewhere", 12_000),
             ],
         );
+        let SellerRequest::Conflict(versions) = state.seller_order_request(STORE, &order) else {
+            panic!("two versions: ask the buyer");
+        };
+        let mut shipped: Vec<&str> = versions.iter().map(|v| v.shipping.as_str()).collect();
+        shipped.sort();
         assert_eq!(
-            state.seller_order_request(STORE, &order),
-            SellerRequest::Conflict,
-            "two versions: ask the buyer"
+            shipped,
+            vec!["Elsewhere", "Jo Buyer\n1 Lane"],
+            "each version, once"
+        );
+
+        // Once the complaint window has closed, the card hides the address
+        // and the note (Ian, 2026-09-30); with no tip it cannot tell, and
+        // shows them. Red with the retention check dropped.
+        set(&mut state, vec![ask(3, 2, "Jo Buyer\n1 Lane", 12_000)]);
+        let closed = crate::fulfilment::complaint_window_end(&order, None)
+            .expect("a paid order's window has an end");
+        let SellerRequest::Found(open) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(open.shipping, "Jo Buyer\n1 Lane", "inside the window");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(closed + 1));
+        let SellerRequest::Found(hidden) = state.seller_order_request(STORE, &order) else {
+            panic!("still found");
+        };
+        assert_eq!(hidden.shipping, crate::fulfilment::ADDRESS_HIDDEN);
+        assert_eq!(hidden.note, "");
+        assert_eq!(hidden.quantity, 2, "what to send stays");
+        state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
+        let SellerRequest::Found(shown) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(shown.shipping, "Jo Buyer\n1 Lane");
+    }
+
+    /// **A paid invoice answering a QUOTE request names what to send and
+    /// where**: now that requests are not shown as messages, the card is the
+    /// only place the seller reads the address. Matched by the order's
+    /// binding and listing tag, and only for an ask made before the order
+    /// was issued. Red with the quote arm dropped (not found), and with the
+    /// binding check dropped.
+    #[test]
+    fn the_sellers_card_reads_a_quote_request_its_invoice_answers() {
+        let (state, tag, _) = seller_holding_a_request();
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let entries =
+            crate::messaging::read_mailbox(&state.browsing_stores[STORE].mailbox_messages, &keys);
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            timestamp,
+            ..
+        } = entries[0].clone()
+        else {
+            panic!("the fixture's request reads");
+        };
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+        let SellerRequest::Found(asked) = state.seller_order_request(STORE, &order) else {
+            panic!("the quote request answers the invoice");
+        };
+        assert_eq!(
+            (asked.quantity, asked.shipping.as_str()),
+            (2, "12 Example St")
+        );
+
+        let mut other = order.clone();
+        other.order.order_binding = Some([0x11; 32]);
+        assert_eq!(
+            state.seller_order_request(STORE, &other),
+            SellerRequest::NotFound
+        );
+        let mut earlier = order;
+        earlier.order.created_at = timestamp - chrono::Duration::minutes(5);
+        assert_eq!(
+            state.seller_order_request(STORE, &earlier),
+            SellerRequest::NotFound,
+            "an ask after the invoice is for another order"
         );
     }
 
@@ -32755,6 +32896,7 @@ mod buy_flow_tests {
             entries,
             |_, _| false,
             |t| paid && t == tag,
+            |_| false,
             |_| false,
         )
     }
