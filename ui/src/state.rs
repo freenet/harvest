@@ -7709,9 +7709,9 @@ impl AppState {
     /// or listing is possible (review of #190). A quote request (from before
     /// fixed prices, answered by hand) has no id to match: it counts when the
     /// order carries its listing's tag under this conversation, its binding
-    /// and its receipt key, and it was made no later than the order was
-    /// issued (a later ask is for another order; a buyer's clock far ahead
-    /// can hide theirs, which reads as "not found"). Requests that agree with
+    /// and its receipt key, and it was made after the previous such order and
+    /// no later than this one (`message_view::quote_order_answers`; a buyer's
+    /// clock far off can misplace theirs, which reads as "not found"). Requests that agree with
     /// the order but not with each other are a [`SellerRequest::Conflict`]:
     /// the seller asks the buyer before sending.
     ///
@@ -7767,12 +7767,12 @@ impl AppState {
                             ..
                         } => {
                             let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-                            let same_listing = self
+                            let listing_tag = self
                                 .conversation_keys
                                 .get(conversation.as_slice())
-                                .is_some_and(|keys| {
-                                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
-                                });
+                                .map(|keys| keys.listing_tag(listing_id));
+                            let same_listing =
+                                listing_tag.is_some() && order.order.listing_tag == listing_tag;
                             let answers = match instant {
                                 Some(selection) => {
                                     selection
@@ -7780,13 +7780,18 @@ impl AppState {
                                         .is_some_and(|request| request.order_id() == order.order.id)
                                         && selection.expected_total_sats == order.order.amount_sats
                                 }
-                                None => {
-                                    order.order.request_id.is_none()
-                                        && order.order.order_binding == Some(*order_binding)
-                                        && (buyer_receipt_key.is_none()
-                                            || order.order.buyer_receipt_key == *buyer_receipt_key)
-                                        && *timestamp <= order.order.created_at
-                                }
+                                // One ask per order, placed in time (review
+                                // of #205, L1).
+                                None => listing_tag.is_some_and(|listing_tag| {
+                                    crate::components::message_view::quote_order_answers(
+                                        order,
+                                        &store.orders,
+                                        *timestamp,
+                                        order_binding,
+                                        buyer_receipt_key,
+                                        &listing_tag,
+                                    )
+                                }),
                             };
                             (answers && same_listing).then(|| {
                                 let listing = store
@@ -26110,6 +26115,17 @@ mod buy_flow_tests {
             state.seller_order_request(STORE, &other),
             SellerRequest::NotFound
         );
+        assert!(
+            buyer_receipt_key.is_some(),
+            "precondition: the ask names a receipt key"
+        );
+        let mut unkeyed = order.clone();
+        unkeyed.order.buyer_receipt_key = Some([0x22; 32]);
+        assert_eq!(
+            state.seller_order_request(STORE, &unkeyed),
+            SellerRequest::NotFound,
+            "an order carrying another receipt key answers nothing"
+        );
         let mut earlier = order;
         earlier.order.created_at = timestamp - chrono::Duration::minutes(5);
         assert_eq!(
@@ -26149,7 +26165,7 @@ mod buy_flow_tests {
         let thread = &inbox.threads[0];
         assert!(!thread.open);
         assert_eq!(thread.chat_count(), 0, "a request is not a message");
-        assert!(is_question(&state, STORE, thread));
+        assert!(is_question(thread));
 
         let keys: HashMap<Vec<u8>, ConversationKeys> =
             [(tag.to_vec(), seller_keys_for(&tag))].into();

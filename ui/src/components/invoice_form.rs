@@ -59,7 +59,7 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
     // One buyer conversation open at a time, so the guidance line above its
     // reply box is on screen once (`message_view::SELLER_GUIDANCE`).
     let open_thread = use_signal(|| None as super::message_view::OpenThread);
-    let (to_send, others, titles, live, needs_reissue, loaded, inbox, questions) = {
+    let (to_send, others, titles, requests, live, needs_reissue, loaded, inbox, questions, homes) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         // The same list as "Needs you" (`AppState::seller_orders_to_send`).
@@ -81,13 +81,23 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             .map(|order| order.order.id.clone())
             .collect();
         // What each other order was for, from the buyer's request, so a row
-        // names the item rather than only a reference.
-        let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = others
+        // names the item rather than only a reference; and, for a paid one,
+        // where it went (review of #205, U1: after Mark as sent the address
+        // was on no screen, in exactly the window a buyer may say it never
+        // arrived). Hidden once the complaint window closes.
+        let requests: std::collections::HashMap<
+            harvest_common::payment::OrderId,
+            crate::state::SellerRequest,
+        > = others
             .iter()
             .zip(state.seller_order_requests(&store_contract_id, &others))
-            .filter_map(|(order, request)| match request {
+            .map(|(order, request)| (order.order.id.clone(), request))
+            .collect();
+        let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = requests
+            .iter()
+            .filter_map(|(id, request)| match request {
                 crate::state::SellerRequest::Found(r) => Some((
-                    order.order.id.clone(),
+                    id.clone(),
                     format!(
                         "{} \u{00d7} {}",
                         r.title.as_deref().unwrap_or("An item no longer listed"),
@@ -102,22 +112,17 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         // answer, goes under Questions (the round-6 critique: no mailbox
         // dump under the orders).
         let inbox = super::message_view::seller_inbox(&state, &store_contract_id);
-        let listed: Vec<&harvest_common::payment::OrderId> = to_send
-            .iter()
-            .chain(others.iter())
-            .map(|order| &order.order.id)
-            .collect();
-        let questions: Vec<super::message_view::SellerThread> = inbox
-            .threads
-            .iter()
-            .filter(|thread| !thread.orders.iter().any(|id| listed.contains(&id)))
-            .filter(|thread| super::message_view::is_question(&state, &store_contract_id, thread))
-            .cloned()
-            .collect();
+        let listed: Vec<&harvest_common::payment::AuthorizedOrder> =
+            to_send.iter().chain(others.iter()).collect();
+        let listed_ids: Vec<&harvest_common::payment::OrderId> =
+            listed.iter().map(|order| &order.order.id).collect();
+        let questions = super::message_view::seller_questions(&inbox, &listed_ids);
+        let homes = super::message_view::thread_homes(&inbox, &listed);
         (
             to_send,
             others,
             titles,
+            requests,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
@@ -127,7 +132,15 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             state.store_details_are_resolved(&store_contract_id),
             inbox,
             questions,
+            homes,
         )
+    };
+    // This order's conversation, if it is shown under this card; else
+    // whether it is shown under another (the newest order in it).
+    let thread_for = |id: &harvest_common::payment::OrderId| {
+        inbox
+            .for_order(id)
+            .map(|thread| (thread.clone(), homes.get(&thread.tag) == Some(id)))
     };
 
     rsx! {
@@ -143,7 +156,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                     key: "{order.order.id}",
                     store_contract_id: store_contract_id.clone(),
                     order: order.clone(),
-                    thread: inbox.for_order(&order.order.id).cloned(),
+                    thread: thread_for(&order.order.id).filter(|(_, home)| *home).map(|(t, _)| t),
+                    thread_elsewhere: thread_for(&order.order.id).is_some_and(|(_, home)| !home),
                     open_thread,
                 }
             }
@@ -174,6 +188,15 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                             order: order.clone(),
                             live: super::bitcoin_view::live_address_for_order(&live, &order.order),
                         }
+                        if matches!(
+                            order.status,
+                            harvest_common::payment::OrderStatus::Paid
+                                | harvest_common::payment::OrderStatus::PaymentReversed
+                        ) {
+                            if let Some(request) = requests.get(&order.order.id) {
+                                SellerRequestView { request: request.clone(), quiet_when_missing: true }
+                            }
+                        }
                         if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
                             CancelInvoice {
                                 store_contract_id: store_contract_id.clone(),
@@ -190,13 +213,19 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                 order_id: order.order.id.clone(),
                             }
                         }
-                        if let Some(thread) = inbox.for_order(&order.order.id) {
-                            super::message_view::SellerThreadToggle {
-                                store_contract_id: store_contract_id.clone(),
-                                thread: thread.clone(),
-                                under: Some(order.order.id.clone()),
-                                open_thread,
-                            }
+                        match thread_for(&order.order.id) {
+                            Some((thread, true)) => rsx! {
+                                super::message_view::SellerThreadToggle {
+                                    store_contract_id: store_contract_id.clone(),
+                                    thread,
+                                    under: Some(order.order.id.clone()),
+                                    open_thread,
+                                }
+                            },
+                            Some((_, false)) => rsx! {
+                                p { class: "text-muted small", "{THREAD_ELSEWHERE}" }
+                            },
+                            None => rsx! {},
                         }
                     }
                 }
@@ -242,6 +271,10 @@ pub(crate) fn SellerOrderCard(
     /// where the card is shown without its conversation.
     #[props(default)]
     open_thread: Option<Signal<super::message_view::OpenThread>>,
+    /// The buyer's conversation is shown under another card: their newest
+    /// order (`message_view::thread_homes`).
+    #[props(default)]
+    thread_elsewhere: bool,
 ) -> Element {
     use crate::state::SellerRequest;
     let (request, tip_height, stage, twins, oversold) = {
@@ -355,41 +388,13 @@ pub(crate) fn SellerOrderCard(
             if let Some((late, line)) = send_by {
                 p { class: if late { "text-warning" } else { "" }, strong { "{line}" } }
             }
-            match &request {
-                SellerRequest::Found(r) => rsx! {
-                    p { class: "order-label", "Send to" }
-                    p { class: "order-ship-to", "{r.shipping}" }
-                    if let Some(region) = &r.region {
-                        p { class: "text-muted small", "Delivery region: {region}" }
-                    }
-                    if !r.choices.is_empty() {
-                        p { class: "text-muted small", "{r.choices.join(\" \u{00b7} \")}" }
-                    }
-                    if !r.note.trim().is_empty() {
-                        p { class: "order-label", "Note from the buyer" }
-                        p { class: "order-ship-to", "{r.note}" }
-                    }
-                },
-                SellerRequest::Conflict(versions) => rsx! {
-                    p { class: "text-warning",
-                        "The buyer sent more than one version of this order. Ask them which is \
-                         right before sending."
-                    }
-                    for (i , v) in versions.iter().enumerate() {
-                        p { class: "order-label", "Version {i + 1}: {v.quantity}" }
-                        p { class: "order-ship-to", "{v.shipping}" }
-                    }
-                },
-                SellerRequest::NotFound => rsx! {
-                    p { class: "text-muted",
-                        "This order\u{2019}s details can\u{2019}t be read on this device. Open \
-                         Harvest where you set up the store, or ask the buyer."
-                    }
-                },
-            }
+            SellerRequestView { request: request.clone() }
             MarkDespatched {
                 store_contract_id: store_contract_id.clone(),
                 order_id: order.order.id.clone(),
+            }
+            if thread_elsewhere {
+                p { class: "text-muted small", "{THREAD_ELSEWHERE}" }
             }
             if let (Some(thread), Some(open_thread)) = (thread, open_thread) {
                 super::message_view::SellerThreadToggle {
@@ -399,6 +404,68 @@ pub(crate) fn SellerOrderCard(
                     open_thread,
                 }
             }
+        }
+    }
+}
+
+/// Said on an order card whose conversation is shown under the buyer's
+/// newer order (review of #205, U3).
+const THREAD_ELSEWHERE: &str = "Messages with this buyer are under their newest order.";
+
+/// What the buyer asked for, as an order card shows it
+/// (`AppState::seller_order_request`): the request, each version of it when
+/// they differ, or where to look when it can't be read here.
+/// `quiet_when_missing` says nothing in that last case (an older order).
+#[component]
+pub(crate) fn SellerRequestView(
+    request: crate::state::SellerRequest,
+    #[props(default)] quiet_when_missing: bool,
+) -> Element {
+    use crate::state::SellerRequest;
+    match request {
+        SellerRequest::Found(request) => rsx! {
+            RequestView { request }
+        },
+        SellerRequest::Conflict(versions) => rsx! {
+            p { class: "text-warning",
+                "The buyer sent more than one version of this order. Ask them which is right \
+                 before sending."
+            }
+            for (i , version) in versions.into_iter().enumerate() {
+                div { key: "{i}", class: "request-card",
+                    p { class: "order-label", "Version {i + 1}: {version.quantity}" }
+                    RequestView { request: version }
+                }
+            }
+        },
+        SellerRequest::NotFound if quiet_when_missing => rsx! {},
+        SellerRequest::NotFound => rsx! {
+            p { class: "text-muted",
+                "This order\u{2019}s details can\u{2019}t be read on this device. Open Harvest \
+                 where you set up the store, or ask the buyer."
+            }
+        },
+    }
+}
+
+/// Where to send it, the buyer's picks named by their group, and the note:
+/// every field a version of an order can differ in (review of #205, L2).
+/// After the complaint window the address reads
+/// [`crate::fulfilment::ADDRESS_HIDDEN`] and the note is gone.
+#[component]
+pub(crate) fn RequestView(request: crate::state::SellerOrderRequest) -> Element {
+    rsx! {
+        p { class: "order-label", "Send to" }
+        p { class: "order-ship-to", "{request.shipping}" }
+        if let Some(region) = &request.region {
+            p { class: "text-muted small", "Delivery region: {region}" }
+        }
+        if !request.choices.is_empty() {
+            p { class: "text-muted small", "{request.choices.join(\" \u{00b7} \")}" }
+        }
+        if !request.note.trim().is_empty() {
+            p { class: "order-label", "Note from the buyer" }
+            p { class: "order-ship-to", "{request.note}" }
         }
     }
 }

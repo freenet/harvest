@@ -1155,6 +1155,10 @@ pub(crate) struct SellerThread {
     /// Its chat lines, oldest first by the writer's timestamp, worked out
     /// once in [`seller_inbox`] (the authorship check needs the state).
     pub lines: Vec<ChatLine>,
+    /// Requests in it waiting for the seller's hand answer
+    /// (`offered_requests`), so an order card can say one waits without
+    /// opening the conversation.
+    pub waiting: usize,
     /// The store's orders that belong to it
     /// (`order_threads::order_in_conversation`), whatever their status: the
     /// order cards it is shown under.
@@ -1301,6 +1305,7 @@ pub(crate) fn seller_inbox(
                 open: open.contains(tag.as_slice()),
                 entries,
                 lines: timed.into_iter().map(|(_, line)| line).collect(),
+                waiting: 0,
                 orders: store
                     .orders
                     .iter()
@@ -1310,6 +1315,10 @@ pub(crate) fn seller_inbox(
             }
         })
         .filter(|thread| !thread.entries.is_empty())
+        .map(|mut thread| {
+            thread.waiting = offered_requests(state, &thread, &store.listings, &store.orders).len();
+            thread
+        })
         .collect();
     SellerInbox {
         threads,
@@ -1342,21 +1351,54 @@ fn offered_requests(
 }
 
 /// Whether a seller conversation with no order card of its own is worth a
-/// row among the questions: something a person wrote, or a request waiting
-/// for the seller's answer. An unpaid Buy now alone is neither: the store
-/// answers it itself, and the seller hears of it once it is paid.
-pub(crate) fn is_question(
-    state: &crate::state::AppState,
-    store_contract_id: &[u8],
-    thread: &SellerThread,
-) -> bool {
-    if thread.chat_count() > 0 && thread.open {
-        return true;
-    }
-    let Some(store) = state.browsing_stores.get(store_contract_id) else {
-        return false;
-    };
-    !offered_requests(state, thread, &store.listings, &store.orders).is_empty()
+/// row among the questions: something a person wrote in an open
+/// conversation, or a request waiting for the seller's answer. An unpaid
+/// Buy now alone is neither: the store answers it itself, and the seller
+/// hears of it once it is paid.
+pub(crate) fn is_question(thread: &SellerThread) -> bool {
+    (thread.open && thread.chat_count() > 0) || thread.waiting > 0
+}
+
+/// The questions on the Orders tab: the conversations in `inbox` that hold
+/// none of the orders listed there (`listed`), and are questions
+/// ([`is_question`]); newest activity first, by the writers' own timestamps
+/// (a display order, deciding nothing).
+pub(crate) fn seller_questions(
+    inbox: &SellerInbox,
+    listed: &[&harvest_common::payment::OrderId],
+) -> Vec<SellerThread> {
+    let mut questions: Vec<SellerThread> = inbox
+        .threads
+        .iter()
+        .filter(|thread| !thread.orders.iter().any(|id| listed.contains(&id)))
+        .filter(|thread| is_question(thread))
+        .cloned()
+        .collect();
+    questions.sort_by_key(|thread| {
+        std::cmp::Reverse(thread.entries.iter().map(MailboxEntry::timestamp).max())
+    });
+    questions
+}
+
+/// Under which listed order each conversation is shown, by tag: the newest
+/// of its listed orders by the order's own signed `created_at` (review of
+/// #205, U3). A conversation holding two orders is shown once, and the
+/// other cards point to it, as the buyer's side groups by conversation.
+pub(crate) fn thread_homes(
+    inbox: &SellerInbox,
+    listed: &[&harvest_common::payment::AuthorizedOrder],
+) -> std::collections::HashMap<[u8; 32], harvest_common::payment::OrderId> {
+    inbox
+        .threads
+        .iter()
+        .filter_map(|thread| {
+            listed
+                .iter()
+                .filter(|order| thread.orders.contains(&order.order.id))
+                .max_by_key(|order| (order.order.created_at, order.order.id.0))
+                .map(|order| (thread.tag, order.order.id.clone()))
+        })
+        .collect()
 }
 
 /// The Messages button under an order card (or a question), and the
@@ -1377,6 +1419,11 @@ pub(crate) fn SellerThreadToggle(
         (false, n) => format!("Messages ({n})"),
     };
     rsx! {
+        // Said on the card, so a request waiting for a hand answer is not
+        // buried behind the button (review of #205, U2).
+        if thread.waiting > 0 && !shown {
+            p { class: "text-warning small", "This buyer has a request waiting for your answer." }
+        }
         div { class: "thread-toggle",
             button {
                 class: "btn btn-sm btn-outline",
@@ -1440,7 +1487,11 @@ fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Eleme
                 // its own accept control's state when an earlier one drops
                 // out of the list.
                 div { key: "{bs58::encode(request.digest).into_string()}", class: "request-card",
-                    RequestDetails { thread: thread.clone(), digest: request.digest }
+                    RequestDetails {
+                        store_contract_id: store_contract_id.clone(),
+                        thread: thread.clone(),
+                        digest: request.digest,
+                    }
                     // A request made before the listing sold out, or for a
                     // listing since replaced by an edit (harvest#70), can
                     // still be answered: the buyer asked while it was on
@@ -1507,12 +1558,14 @@ fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Eleme
 
 /// What a request still waiting for the seller asks for, read from its entry
 /// in the conversation: the address (or why it is not shown), the buyer's
-/// picks, and the note.
+/// picks named by their group, and the note.
 #[component]
-fn RequestDetails(thread: SellerThread, digest: [u8; 32]) -> Element {
+fn RequestDetails(store_contract_id: Vec<u8>, thread: SellerThread, digest: [u8; 32]) -> Element {
     let Some(MailboxEntry::Readable {
         content:
             MessageContent::OrderRequest {
+                listing_id,
+                quantity,
                 shipping,
                 note,
                 instant,
@@ -1523,24 +1576,29 @@ fn RequestDetails(thread: SellerThread, digest: [u8; 32]) -> Element {
     else {
         return rsx! {};
     };
-    let region = instant.as_ref().and_then(|s| s.region.clone());
-    let choices = instant
-        .as_ref()
-        .map(|s| s.choices.join(" \u{00b7} "))
+    let groups = APP_STATE
+        .read()
+        .browsing_stores
+        .get(&store_contract_id)
+        .and_then(|store| store.listings.iter().find(|l| l.listing.id == *listing_id))
+        .map(|l| l.listing.choices.clone())
         .unwrap_or_default();
+    let request = crate::state::SellerOrderRequest {
+        title: None,
+        quantity: *quantity,
+        shipping: shipping.clone(),
+        note: note.clone(),
+        region: instant.as_ref().and_then(|s| s.region.clone()),
+        choices: crate::state::labelled_choices(
+            &groups,
+            instant
+                .as_ref()
+                .map(|s| s.choices.as_slice())
+                .unwrap_or_default(),
+        ),
+    };
     rsx! {
-        p { class: "order-label", "Send to" }
-        p { class: "order-ship-to", "{shipping}" }
-        if let Some(region) = region {
-            p { class: "text-muted small", "Delivery region: {region}" }
-        }
-        if !choices.is_empty() {
-            p { class: "text-muted small", "{choices}" }
-        }
-        if !note.trim().is_empty() {
-            p { class: "order-label", "Note from the buyer" }
-            p { class: "order-ship-to", "{note}" }
-        }
+        super::invoice_form::RequestView { request }
     }
 }
 
@@ -1590,12 +1648,18 @@ pub(crate) fn SellerQuestions(
 /// messages left out, and notes and reasons blanked in a conversation that
 /// is not open.
 pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
+    // "couldn't match to a paid order", not "came without one": a paid
+    // order's conversation can close if its request leaves the mailbox and
+    // its listing is not in the store (`order_threads`), and the line must
+    // stay true then.
     if hidden == 1 {
-        "1 message was held back because it came without a Ghost Key or a paid order.".to_string()
+        "1 message was held back: it came without a Ghost Key, and Harvest couldn't match it \
+         to a paid order."
+            .to_string()
     } else {
         format!(
-            "{hidden} messages were held back because they came without a Ghost Key or a paid \
-             order."
+            "{hidden} messages were held back: they came without a Ghost Key, and Harvest \
+             couldn't match them to a paid order."
         )
     }
 }
@@ -1629,7 +1693,7 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 /// * a buyer's plain [`MessageContent::Text`] is left out (a buyer with a
 ///   Ghost Key sends `VouchedText`), and so is text addressed to the BUYER:
 ///   that is the seller's reply direction, but both parties hold both keys
-///   (`attribution`), so a script can flip the direction;
+///   (`who`), so a script can flip the direction;
 /// * the free text inside other steps is blanked rather than the step left
 ///   out, so what a request or a decline DOES (answering, counting) is
 ///   unchanged: a request's `note`, `shipping` (the address shows once it is
@@ -1679,9 +1743,11 @@ pub(crate) fn request_address_hidden(
             MessageContent::OrderRequest {
                 listing_id,
                 order_binding,
+                buyer_receipt_key,
                 instant,
                 ..
             },
+        timestamp,
         ..
     } = entry
     else {
@@ -1694,13 +1760,16 @@ pub(crate) fn request_address_hidden(
         Some(selection) => selection
             .answered_request(&tag)
             .is_some_and(|request| request.order_id() == order.order.id),
-        None => {
-            order.order.request_id.is_none()
-                && order.order.order_binding == Some(*order_binding)
-                && keys.is_some_and(|keys| {
-                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
-                })
-        }
+        None => keys.is_some_and(|keys| {
+            quote_order_answers(
+                order,
+                published,
+                *timestamp,
+                order_binding,
+                buyer_receipt_key,
+                &keys.listing_tag(listing_id),
+            )
+        }),
     };
     published
         .iter()
@@ -1819,7 +1888,11 @@ fn shown_given(
                     selection.choices.clear();
                     had
                 });
-                if !note.trim().is_empty() || picks == Some(true) {
+                // Counted only for a quote request, the one kind the
+                // seller is asked to answer. An unpaid Buy now is answered by
+                // the store, and the seller never sees it: counting its note
+                // would grow the line with every abandoned checkout.
+                if instant.is_none() && (!note.trim().is_empty() || picks == Some(true)) {
                     hidden += 1;
                 }
                 note.clear();
@@ -1847,9 +1920,47 @@ fn shown_given(
     (shown, hidden)
 }
 
+/// Whether the quote order `order` is the one answering a quote request made
+/// at `asked_at` carrying `binding` and `receipt_key`, for the listing whose
+/// tag in this conversation is `listing_tag`.
+///
+/// An order does not say which ask it answered (it carries no quantity and
+/// no request digest), and the binding, listing tag and receipt key are the
+/// same for every ask for that listing in a conversation. So the ask is
+/// placed in time: an order answers the asks made after the previous such
+/// order was issued and no later than it was (its signed `created_at`). One
+/// ask, one order, so a later order never shows an earlier order's address,
+/// and a closed earlier order never hides a later one's. The ask's time is
+/// its writer's clock, the same caveat `unanswered_requests` gives.
+pub(crate) fn quote_order_answers(
+    order: &harvest_common::payment::AuthorizedOrder,
+    published: &[harvest_common::payment::AuthorizedOrder],
+    asked_at: chrono::DateTime<chrono::Utc>,
+    binding: &[u8; 32],
+    receipt_key: &Option<[u8; 32]>,
+    listing_tag: &[u8; 32],
+) -> bool {
+    let same = |o: &harvest_common::payment::AuthorizedOrder| {
+        o.order.request_id.is_none()
+            && o.order.order_binding == Some(*binding)
+            && o.order.listing_tag == Some(*listing_tag)
+            && (receipt_key.is_none() || o.order.buyer_receipt_key == *receipt_key)
+    };
+    if !same(order) || asked_at > order.order.created_at {
+        return false;
+    }
+    published
+        .iter()
+        .filter(|o| same(o) && o.order.id != order.order.id)
+        .filter(|o| o.order.created_at < order.order.created_at)
+        .map(|o| o.order.created_at)
+        .max()
+        .is_none_or(|previous| asked_at > previous)
+}
+
 /// Whether the seller's inbox offers to answer `request` by hand. A Buy now
 /// only in an open conversation ([`open_conversations`]: a verified voucher
-/// or a paid Buy now in it): elsewhere its picks are blanked, so the seller
+/// or a paid order of the store's in it): elsewhere its picks are blanked, so the seller
 /// could not check the total against them, and a Buy now from a buyer who
 /// has neither vouched nor paid is not the seller's to answer (the store
 /// answers it itself). Openness is per conversation on purpose: only the
@@ -2594,8 +2705,12 @@ mod inbox_tests {
             |_| false
         ));
 
-        let quote = request(id.clone(), 1, [2u8; 32]);
+        let mut quote = request(id.clone(), 1, [2u8; 32]);
         let invoice = published(3, Some(BINDING), Some(k.listing_tag(&id)));
+        // Asked before the invoice was issued, as an answered ask is.
+        if let MailboxEntry::Readable { timestamp, .. } = &mut quote {
+            *timestamp = invoice.order.created_at - chrono::Duration::minutes(1);
+        }
         assert!(request_address_hidden(
             &quote,
             std::slice::from_ref(&invoice),
@@ -2616,6 +2731,186 @@ mod inbox_tests {
             Some(&k),
             |_| false
         ));
+    }
+
+    fn thread(tag: u8, open: bool, said: bool, waiting: usize, orders: &[u8]) -> SellerThread {
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let mut text = readable(MessageContent::Text(format!("from {tag}")), [tag; 32]);
+        if let MailboxEntry::Readable { timestamp, .. } = &mut text {
+            *timestamp = at(1_700_000_000 + i64::from(tag));
+        }
+        SellerThread {
+            tag: [tag; 32],
+            open,
+            entries: vec![text],
+            lines: if said {
+                vec![ChatLine {
+                    who: "Buyer",
+                    mine: false,
+                    trusted: true,
+                    when: String::new(),
+                    item: ChatItem::Said("hi".into()),
+                }]
+            } else {
+                Vec::new()
+            },
+            waiting,
+            orders: orders
+                .iter()
+                .map(|n| harvest_common::payment::OrderId([*n; 32]))
+                .collect(),
+        }
+    }
+
+    /// **Questions are the conversations no listed order holds, that hold a
+    /// question**: something said in an open conversation, or a request
+    /// waiting for the seller; newest activity first. A conversation holding
+    /// a listed order is under that order instead. Red with the listed
+    /// filter dropped, with `is_question` always true, and with the sort
+    /// dropped.
+    #[test]
+    fn questions_are_unlisted_conversations_with_something_to_answer() {
+        let inbox = SellerInbox {
+            threads: vec![
+                thread(1, true, true, 0, &[]),
+                thread(2, true, true, 0, &[9]),
+                thread(3, false, true, 0, &[]),
+                thread(4, true, false, 0, &[]),
+                thread(5, false, false, 1, &[]),
+            ],
+            unreadable: 0,
+            held_back: 0,
+        };
+        let listed = harvest_common::payment::OrderId([9; 32]);
+        let questions: Vec<u8> = seller_questions(&inbox, &[&listed])
+            .iter()
+            .map(|t| t.tag[0])
+            .collect();
+        assert_eq!(questions, vec![5, 1], "newest first");
+        assert!(
+            !is_question(&thread(3, false, true, 0, &[])),
+            "said, but not open"
+        );
+        assert!(
+            !is_question(&thread(4, true, false, 0, &[])),
+            "open, nothing said"
+        );
+        assert!(
+            is_question(&thread(5, false, false, 1, &[])),
+            "a request waits"
+        );
+    }
+
+    /// A conversation holding two listed orders is shown under the newest
+    /// by its signed date; one holding none has no home. Red with the
+    /// newest-wins choice replaced by the first found.
+    #[test]
+    fn a_conversation_is_shown_under_its_newest_order() {
+        let inbox = SellerInbox {
+            threads: vec![
+                thread(1, true, true, 0, &[1, 2]),
+                thread(3, true, true, 0, &[]),
+            ],
+            unreadable: 0,
+            held_back: 0,
+        };
+        let mut older = published(1, Some(BINDING), None);
+        let mut newer = published(2, Some(BINDING), None);
+        older.order.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        newer.order.created_at = chrono::DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+        let homes = thread_homes(&inbox, &[&older, &newer]);
+        assert_eq!(homes.get(&[1; 32]), Some(&newer.order.id));
+        assert_eq!(homes.get(&[3; 32]), None);
+        let homes = thread_homes(&inbox, &[&newer, &older]);
+        assert_eq!(
+            homes.get(&[1; 32]),
+            Some(&newer.order.id),
+            "whatever the order given"
+        );
+    }
+
+    /// A question's preview is the buyer's newest text by its timestamp,
+    /// whatever order the entries come in. Red taking the first entry.
+    #[test]
+    fn a_questions_preview_is_the_newest_buyer_text() {
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let text = |words: &str, secs: i64| {
+            let mut entry = readable(MessageContent::Text(words.into()), [secs as u8; 32]);
+            if let MailboxEntry::Readable { timestamp, .. } = &mut entry {
+                *timestamp = at(secs);
+            }
+            entry
+        };
+        let mut t = thread(1, true, true, 0, &[]);
+        t.entries = vec![text("older", 10), text("newest", 30), text("middle", 20)];
+        assert_eq!(t.latest_from_buyer(), Some(("newest".into(), at(30))));
+    }
+
+    /// **A quote order answers the asks made after the previous such order
+    /// and no later than itself** (review of #205, L1): a later order never
+    /// takes an earlier order's ask, and a closed earlier order never hides
+    /// a later order's address. An order carrying another receipt key
+    /// answers nothing. Red with the previous-order bound dropped, and with
+    /// the receipt-key clause dropped.
+    #[test]
+    fn each_quote_order_answers_its_own_ask() {
+        let id = ListingId([9u8; 32]);
+        let k = keys();
+        let tag = k.listing_tag(&id);
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let order = |n: u8, issued: i64| {
+            let mut o = published(n, Some(BINDING), Some(tag));
+            o.order.created_at = at(issued);
+            o.order.buyer_receipt_key = Some([0x33; 32]);
+            o
+        };
+        let first = order(1, 100);
+        let second = order(2, 300);
+        let both = [first.clone(), second.clone()];
+        let key = Some([0x33; 32]);
+        let answers = |o: &harvest_common::payment::AuthorizedOrder, asked: i64| {
+            quote_order_answers(o, &both, at(asked), &BINDING, &key, &tag)
+        };
+        assert!(answers(&first, 50));
+        assert!(
+            !answers(&second, 50),
+            "the earlier ask is the first order's"
+        );
+        assert!(answers(&second, 200));
+        assert!(!answers(&first, 200), "made after the first was issued");
+        assert!(!answers(&second, 400), "made after the second was issued");
+        let mut other_key = second.clone();
+        other_key.order.buyer_receipt_key = Some([0x44; 32]);
+        assert!(!quote_order_answers(
+            &other_key,
+            &[first.clone(), other_key.clone()],
+            at(200),
+            &BINDING,
+            &key,
+            &tag
+        ));
+
+        // The first order's window has closed; the second order's ask keeps
+        // its address.
+        let ask = |secs: i64| {
+            let mut entry = request(id.clone(), 1, [secs as u8; 32]);
+            if let MailboxEntry::Readable {
+                timestamp,
+                content:
+                    MessageContent::OrderRequest {
+                        buyer_receipt_key, ..
+                    },
+                ..
+            } = &mut entry
+            {
+                *timestamp = at(secs);
+                *buyer_receipt_key = key;
+            }
+            entry
+        };
+        let closed = |o: &harvest_common::payment::AuthorizedOrder| o.order.id != first.order.id;
+        assert!(request_address_hidden(&ask(50), &both, Some(&k), closed));
+        assert!(!request_address_hidden(&ask(200), &both, Some(&k), closed));
     }
 
     /// **Order requests and the store's automatic answers are not chat**
@@ -3386,8 +3681,20 @@ mod voucher_view_tests {
             (String::new(), SHIPPING_SHOWN_ONCE_PAID.to_string())
         );
         assert_eq!(free_text(&shown_entries[2]).0, "");
-        // The note; an address or a decline held back is not counted.
-        assert_eq!(hidden, 1);
+        // An unpaid Buy now's note is not counted (the seller never sees an
+        // unpaid Buy now), nor is an address or a decline held back.
+        assert_eq!(hidden, 0);
+        // A quote request's note is: the seller is asked to answer it.
+        // Mutated red by counting only Buy nows, or both.
+        let mut noted = order_request(TAG);
+        if let MailboxEntry::Readable {
+            content: MessageContent::OrderRequest { note, .. },
+            ..
+        } = &mut noted
+        {
+            *note = "call me first".into();
+        }
+        assert_eq!(shown(vec![noted]).1, 1);
 
         // A Buy now's picks are the buyer's text too.
         let (shown_entries, hidden) = shown(vec![buy_now_picking(
@@ -3396,7 +3703,7 @@ mod voucher_view_tests {
             Some("cheap pills at spam.example"),
             vec!["visit spam.example".into()],
         )]);
-        assert_eq!(hidden, 1);
+        assert_eq!(hidden, 0, "an unpaid Buy now's picks are not counted");
         let MailboxEntry::Readable {
             content:
                 MessageContent::OrderRequest {
@@ -3459,11 +3766,13 @@ mod voucher_view_tests {
     fn the_hidden_count_line_says_how_many() {
         assert_eq!(
             hidden_unvouched_line(1),
-            "1 message was held back because it came without a Ghost Key or a paid order."
+            "1 message was held back: it came without a Ghost Key, and Harvest couldn't match it \
+             to a paid order."
         );
         assert_eq!(
             hidden_unvouched_line(3),
-            "3 messages were held back because they came without a Ghost Key or a paid order."
+            "3 messages were held back: they came without a Ghost Key, and Harvest couldn't \
+             match them to a paid order."
         );
     }
 }
