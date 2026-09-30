@@ -588,6 +588,9 @@ pub(crate) fn OrderCard(
     order: AuthorizedOrder,
     live: Option<AddressView>,
     #[props(default)] buyer: bool,
+    /// Read by someone who is neither party (a store's public order list).
+    #[props(default)]
+    onlooker: bool,
 ) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
@@ -645,7 +648,18 @@ pub(crate) fn OrderCard(
     };
     let stage = crate::fulfilment::order_stage(&order, despatch.as_ref(), tip_height, sight);
     let stage_note = stage
-        .describe(tip_height, order.status, crate::state::now_ms())
+        .describe(
+            tip_height,
+            order.status,
+            crate::state::now_ms(),
+            if buyer {
+                crate::fulfilment::Reader::Buyer
+            } else if onlooker {
+                crate::fulfilment::Reader::Onlooker
+            } else {
+                crate::fulfilment::Reader::Seller
+            },
+        )
         .or_else(|| {
             crate::fulfilment::closed_window_note(&order, tip_height, sight, crate::state::now_ms())
         });

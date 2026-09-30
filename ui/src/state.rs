@@ -41,7 +41,25 @@ pub struct SellerOrderRequest {
     pub shipping: String,
     pub note: String,
     pub region: Option<String>,
+    /// The buyer's picks, each named by its group ("Size: M").
     pub choices: Vec<String>,
+}
+
+/// The buyer's picks named by their group, "Size: M", in the listing's group
+/// order; a pick whose group the listing no longer has shows alone. The
+/// 2026-09-30 critique: a bare "Choices: M" doesn't say what M is.
+pub(crate) fn labelled_choices(
+    groups: &[harvest_common::listing::ChoiceGroup],
+    picks: &[String],
+) -> Vec<String> {
+    picks
+        .iter()
+        .enumerate()
+        .map(|(i, pick)| match groups.get(i) {
+            Some(group) => format!("{}: {pick}", group.name),
+            None => pick.clone(),
+        })
+        .collect()
 }
 
 /// Why asking the vault for a Ghost Key came back with none
@@ -6712,17 +6730,23 @@ impl AppState {
                             order.order.listing_tag == Some(keys.listing_tag(&listing_id))
                         });
                     let same_total = selection.expected_total_sats == order.order.amount_sats;
-                    (answers && same_listing && same_total).then(|| SellerOrderRequest {
-                        title: store
+                    (answers && same_listing && same_total).then(|| {
+                        let listing = store
                             .listings
                             .iter()
                             .find(|l| l.listing.id == listing_id)
-                            .map(|l| l.listing.title.clone()),
-                        quantity,
-                        shipping,
-                        note,
-                        region: selection.region.clone(),
-                        choices: selection.choices.clone(),
+                            .map(|l| &l.listing);
+                        SellerOrderRequest {
+                            title: listing.map(|l| l.title.clone()),
+                            quantity,
+                            shipping,
+                            note,
+                            region: selection.region.clone(),
+                            choices: labelled_choices(
+                                listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                                &selection.choices,
+                            ),
+                        }
                     })
                 }
                 _ => None,
@@ -22925,6 +22949,27 @@ mod buy_flow_tests {
     /// and total, and a conflict when two such requests differ (the buyer
     /// holds the keys and could write a second). Red without the id match,
     /// without the listing or total check, and taking the first of two.
+    /// A pick reads with its group's name; one past the listing's groups
+    /// (the listing changed) still shows, alone.
+    #[test]
+    fn a_buyers_picks_are_named_by_their_group() {
+        let groups = vec![
+            harvest_common::listing::ChoiceGroup {
+                name: "Size".into(),
+                options: vec!["S".into(), "M".into()],
+            },
+            harvest_common::listing::ChoiceGroup {
+                name: "Colour".into(),
+                options: vec!["Blue".into()],
+            },
+        ];
+        assert_eq!(
+            labelled_choices(&groups, &["M".into(), "Blue".into(), "Extra".into()]),
+            vec!["Size: M", "Colour: Blue", "Extra"]
+        );
+        assert!(labelled_choices(&[], &[]).is_empty());
+    }
+
     #[test]
     fn the_sellers_order_card_reads_the_buyers_request() {
         use crate::messaging::BuyerConversation;

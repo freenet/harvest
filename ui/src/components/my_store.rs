@@ -742,12 +742,15 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -
                         fingerprint: store.fingerprint.clone(),
                     }
                 },
+                // Orders first: the tab is named for them, and the buyers'
+                // messages under them can run to many screens (the
+                // 2026-09-30 critique found the orders ~9,700px down).
                 Tab::Orders => rsx! {
-                    super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                     super::invoice_form::StorePayments {
                         store_contract_id: store.contract_id.clone(),
                         seller_fingerprint: store.fingerprint.clone(),
                     }
+                    super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                 },
                 Tab::Settings => rsx! {
                     Settings { store: store.clone(), editing_details, has_harvest_delegate }

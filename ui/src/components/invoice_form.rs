@@ -56,7 +56,7 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
 /// invoice with no buyer's request behind it has nobody to pay it.
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
-    let (to_send, others, live, needs_reissue, loaded) = {
+    let (to_send, others, titles, live, needs_reissue, loaded) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         // The same list as "Needs you" (`AppState::seller_orders_to_send`).
@@ -77,9 +77,28 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             .filter(|order| state.needs_reissue(order))
             .map(|order| order.order.id.clone())
             .collect();
+        // What each other order was for, from the buyer's request, so a row
+        // names the item rather than only a reference.
+        let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = others
+            .iter()
+            .filter_map(
+                |order| match state.seller_order_request(&store_contract_id, order) {
+                    crate::state::SellerRequest::Found(r) => Some((
+                        order.order.id.clone(),
+                        format!(
+                            "{} \u{00d7} {}",
+                            r.title.as_deref().unwrap_or("An item no longer listed"),
+                            r.quantity
+                        ),
+                    )),
+                    _ => None,
+                },
+            )
+            .collect();
         (
             to_send,
             others,
+            titles,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
@@ -124,6 +143,9 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                  buyer's software to accept, so nobody can pay it now. Cancel it; \
                                  the buyer can order again."
                             }
+                        }
+                        if let Some(what) = titles.get(&order.order.id) {
+                            h4 { class: "order-title", "{what}" }
                         }
                         super::bitcoin_view::OrderCard {
                             order: order.clone(),
@@ -203,7 +225,7 @@ pub(crate) fn SellerOrderCard(
         format!(
             "{} ({})",
             crate::fulfilment::approx_date(height, tip, now),
-            crate::fulfilment::approx_duration(height.saturating_sub(tip))
+            crate::fulfilment::time_left(height.saturating_sub(tip))
         )
     };
     let send_by = match (stage, tip_height) {
@@ -271,7 +293,7 @@ pub(crate) fn SellerOrderCard(
                         p { class: "text-muted small", "Delivery region: {region}" }
                     }
                     if !r.choices.is_empty() {
-                        p { class: "text-muted small", "Choices: {r.choices.join(\", \")}" }
+                        p { class: "text-muted small", "{r.choices.join(\" \u{00b7} \")}" }
                     }
                     if !r.note.trim().is_empty() {
                         p { class: "order-label", "Note from the buyer" }
@@ -356,9 +378,9 @@ fn CancelInvoice(
         }
         if confirming() {
             p { class: "text-warning",
-                "Cancel invoice {short}? This is public and cannot be undone. If the buyer "
-                "has already paid, or pays anyway, their payment still counts and you owe "
-                "them the goods."
+                "Cancel this invoice? The buyer will see that it\u{2019}s cancelled, and you "
+                "can\u{2019}t undo it. If they have already paid, or pay anyway, the payment "
+                "still counts and you owe them the goods."
             }
             button {
                 class: "btn btn-sm btn-primary",
@@ -438,7 +460,7 @@ pub(crate) fn MarkDespatched(
     if let Some(why) = refusal {
         return rsx! {
             p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Order {short} can\u{2019}t be marked as sent yet: {why}"
+                "This order can\u{2019}t be marked as sent yet: {why}"
             }
         };
     }
@@ -448,8 +470,9 @@ pub(crate) fn MarkDespatched(
         }
         if confirming() {
             p { class: "text-warning",
-                "Mark order {short} as sent? This is public and can\u{2019}t be undone. Only do it "
-                "once the goods are on their way."
+                "Mark this order as sent? The buyer will see it, and it goes on your store\u{2019}s "
+                "public record. You can\u{2019}t undo it, so only do it once the goods are on "
+                "their way."
             }
             button {
                 class: "btn btn-sm btn-primary",

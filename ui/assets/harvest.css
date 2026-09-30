@@ -898,6 +898,11 @@ h4 {
   margin-top: var(--space-lg);
 }
 
+/* An earlier order's item, named above its card. */
+.order-title {
+  margin: var(--space-md) 0 var(--space-xs);
+}
+
 /* The store's status on the seller's Overview: outlined, colour only when
    open (the one state that means "buyers can buy"). */
 .pill {

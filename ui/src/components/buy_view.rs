@@ -1279,7 +1279,12 @@ fn SettledPurchase(
     // Every status that reaches here is past AwaitingPayment, and `describe`
     // has a sentence for each of those; the fallback is for safety only.
     let note = stage
-        .describe(tip_height, order.status, crate::state::now_ms())
+        .describe(
+            tip_height,
+            order.status,
+            crate::state::now_ms(),
+            crate::fulfilment::Reader::Buyer,
+        )
         .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
     let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
     rsx! {

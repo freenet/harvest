@@ -478,6 +478,7 @@ fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>, owned: b
                     key: "{order.order.id}",
                     order: order.clone(),
                     live: super::bitcoin_view::live_address_for_order(&bitcoin, &order.order),
+                    onlooker: !owned,
                 }
             }
         }
