@@ -949,6 +949,13 @@ h4 {
   }
 }
 
+/* An earlier order: its title, card, address and controls as one group. */
+.earlier-order {
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-md);
+  margin-top: var(--space-lg);
+}
+
 /* An earlier order's item, named above its card. */
 .order-title {
   margin: var(--space-md) 0 var(--space-xs);
