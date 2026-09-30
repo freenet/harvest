@@ -46,8 +46,11 @@ pub struct SellerOrderRequest {
 }
 
 /// The buyer's picks named by their group, "Size: M", in the listing's group
-/// order; a pick whose group the listing no longer has shows alone. The
-/// 2026-09-30 critique: a bare "Choices: M" doesn't say what M is.
+/// order. The listing is today's, not the one the buyer read, so a pick is
+/// named only when it is one of that group's options: after the seller
+/// removes or reorders a group, a pick shows alone rather than under the
+/// wrong name (review). The 2026-09-30 critique: a bare "Choices: M"
+/// doesn't say what M is.
 pub(crate) fn labelled_choices(
     groups: &[harvest_common::listing::ChoiceGroup],
     picks: &[String],
@@ -56,8 +59,8 @@ pub(crate) fn labelled_choices(
         .iter()
         .enumerate()
         .map(|(i, pick)| match groups.get(i) {
-            Some(group) => format!("{}: {pick}", group.name),
-            None => pick.clone(),
+            Some(group) if group.options.contains(pick) => format!("{}: {pick}", group.name),
+            _ => pick.clone(),
         })
         .collect()
 }
@@ -6697,68 +6700,88 @@ impl AppState {
         store_contract_id: &[u8],
         order: &harvest_common::payment::AuthorizedOrder,
     ) -> SellerRequest {
+        self.seller_order_requests(store_contract_id, std::slice::from_ref(order))
+            .pop()
+            .unwrap_or(SellerRequest::NotFound)
+    }
+
+    /// [`AppState::seller_order_request`] for each of `orders`, in order,
+    /// reading (and decrypting) the store's mailbox once for all of them
+    /// rather than once per order: the Orders tab asks it for the whole
+    /// order history on every render.
+    pub fn seller_order_requests(
+        &self,
+        store_contract_id: &[u8],
+        orders: &[harvest_common::payment::AuthorizedOrder],
+    ) -> Vec<SellerRequest> {
         use crate::messaging::{Addressing, MailboxEntry, MessageContent};
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
-            return SellerRequest::NotFound;
+            return orders.iter().map(|_| SellerRequest::NotFound).collect();
         };
-        let asked: Vec<SellerOrderRequest> = self
-            .mailbox_entries(store_contract_id)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                MailboxEntry::Readable {
-                    content:
-                        MessageContent::OrderRequest {
-                            listing_id,
-                            quantity,
-                            shipping,
-                            note,
-                            instant: Some(selection),
+        let entries = self.mailbox_entries(store_contract_id);
+        orders
+            .iter()
+            .map(|order| {
+                let asked: Vec<SellerOrderRequest> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        MailboxEntry::Readable {
+                            content:
+                                MessageContent::OrderRequest {
+                                    listing_id,
+                                    quantity,
+                                    shipping,
+                                    note,
+                                    instant: Some(selection),
+                                    ..
+                                },
+                            conversation,
+                            addressing: Addressing::ToSeller,
                             ..
-                        },
-                    conversation,
-                    addressing: Addressing::ToSeller,
-                    ..
-                } => {
-                    let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-                    let answers = selection
-                        .answered_request(&tag)
-                        .is_some_and(|request| request.order_id() == order.order.id);
-                    let same_listing = self
-                        .conversation_keys
-                        .get(conversation.as_slice())
-                        .is_some_and(|keys| {
-                            order.order.listing_tag == Some(keys.listing_tag(&listing_id))
-                        });
-                    let same_total = selection.expected_total_sats == order.order.amount_sats;
-                    (answers && same_listing && same_total).then(|| {
-                        let listing = store
-                            .listings
-                            .iter()
-                            .find(|l| l.listing.id == listing_id)
-                            .map(|l| &l.listing);
-                        SellerOrderRequest {
-                            title: listing.map(|l| l.title.clone()),
-                            quantity,
-                            shipping,
-                            note,
-                            region: selection.region.clone(),
-                            choices: labelled_choices(
-                                listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
-                                &selection.choices,
-                            ),
+                        } => {
+                            let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                            let answers = selection
+                                .answered_request(&tag)
+                                .is_some_and(|request| request.order_id() == order.order.id);
+                            let same_listing = self
+                                .conversation_keys
+                                .get(conversation.as_slice())
+                                .is_some_and(|keys| {
+                                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
+                                });
+                            let same_total =
+                                selection.expected_total_sats == order.order.amount_sats;
+                            (answers && same_listing && same_total).then(|| {
+                                let listing = store
+                                    .listings
+                                    .iter()
+                                    .find(|l| l.listing.id == *listing_id)
+                                    .map(|l| &l.listing);
+                                SellerOrderRequest {
+                                    title: listing.map(|l| l.title.clone()),
+                                    quantity: *quantity,
+                                    shipping: shipping.clone(),
+                                    note: note.clone(),
+                                    region: selection.region.clone(),
+                                    choices: labelled_choices(
+                                        listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                                        &selection.choices,
+                                    ),
+                                }
+                            })
                         }
+                        _ => None,
                     })
+                    .collect();
+                match asked.first() {
+                    None => SellerRequest::NotFound,
+                    Some(first) if asked.iter().all(|other| other == first) => {
+                        SellerRequest::Found(first.clone())
+                    }
+                    Some(_) => SellerRequest::Conflict,
                 }
-                _ => None,
             })
-            .collect();
-        match asked.first() {
-            None => SellerRequest::NotFound,
-            Some(first) if asked.iter().all(|other| other == first) => {
-                SellerRequest::Found(first.clone())
-            }
-            Some(_) => SellerRequest::Conflict,
-        }
+            .collect()
     }
 
     /// What the buyer asked for in the Buy now that `purchase` answers: the
@@ -22966,6 +22989,11 @@ mod buy_flow_tests {
         assert_eq!(
             labelled_choices(&groups, &["M".into(), "Blue".into(), "Extra".into()]),
             vec!["Size: M", "Colour: Blue", "Extra"]
+        );
+        // The seller removed Size after the order: "M" is not a Colour.
+        assert_eq!(
+            labelled_choices(&groups[1..], &["M".into(), "Blue".into()]),
+            vec!["M", "Blue"]
         );
         assert!(labelled_choices(&[], &[]).is_empty());
     }

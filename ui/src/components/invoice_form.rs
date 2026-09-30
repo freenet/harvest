@@ -81,19 +81,18 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         // names the item rather than only a reference.
         let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = others
             .iter()
-            .filter_map(
-                |order| match state.seller_order_request(&store_contract_id, order) {
-                    crate::state::SellerRequest::Found(r) => Some((
-                        order.order.id.clone(),
-                        format!(
-                            "{} \u{00d7} {}",
-                            r.title.as_deref().unwrap_or("An item no longer listed"),
-                            r.quantity
-                        ),
-                    )),
-                    _ => None,
-                },
-            )
+            .zip(state.seller_order_requests(&store_contract_id, &others))
+            .filter_map(|(order, request)| match request {
+                crate::state::SellerRequest::Found(r) => Some((
+                    order.order.id.clone(),
+                    format!(
+                        "{} \u{00d7} {}",
+                        r.title.as_deref().unwrap_or("An item no longer listed"),
+                        r.quantity
+                    ),
+                )),
+                _ => None,
+            })
             .collect();
         (
             to_send,
@@ -378,9 +377,10 @@ fn CancelInvoice(
         }
         if confirming() {
             p { class: "text-warning",
-                "Cancel this invoice? The buyer will see that it\u{2019}s cancelled, and you "
-                "can\u{2019}t undo it. If they have already paid, or pay anyway, the payment "
-                "still counts and you owe them the goods."
+                "Cancel this invoice? The buyer will see that it\u{2019}s cancelled, and it "
+                "goes on your store\u{2019}s public record. You can\u{2019}t undo it. If they "
+                "have already paid, or pay anyway, the payment still counts and you owe them "
+                "the goods."
             }
             button {
                 class: "btn btn-sm btn-primary",

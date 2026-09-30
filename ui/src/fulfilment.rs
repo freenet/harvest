@@ -660,8 +660,10 @@ impl OrderStage {
     /// the card's existing payment status already says it all.
     ///
     /// Worded for whoever reads it (`reader`): the seller is told what to do
-    /// ("Send it by ..."), the buyer what the seller has said and until when
-    /// they can report a problem. The 2026-09-30 whole-screen critique found
+    /// ("Send it by ..."), the buyer what the seller has said, and everyone
+    /// until when a problem can be reported. That is said as the window, not
+    /// as "you can": the buyer may already have reported one (one per order)
+    /// or lack the key to (review). The 2026-09-30 whole-screen critique found
     /// the one shared wording talking to a seller about "the seller".
     ///
     /// `status` is the order's published status, which [`OrderStage::Unknown`]
@@ -675,7 +677,7 @@ impl OrderStage {
     /// is said and styled as one. A buyer can report a problem while the
     /// report window is open (Phase C: `AppState::complaint_gate`), which
     /// opens once the order is marked as sent or its send-by date passes and
-    /// closes at `complaint_until`, so the buyer's wording names that date.
+    /// closes at `complaint_until`, so the wording names that date.
     /// A despatch is the seller's own statement, never proof of arrival, so
     /// the buyer reads "the seller says".
     pub fn describe(
@@ -709,11 +711,6 @@ impl OrderStage {
                 .map(|tip| format!("until about {}", approx_date(until, tip, now_ms)))
                 .unwrap_or_else(|| "until its report window closes".to_string())
         };
-        let can_report = if reader == Reader::Buyer {
-            "You can"
-        } else {
-            "The buyer can"
-        };
         let owes = if seller {
             "you owe the goods"
         } else {
@@ -724,8 +721,11 @@ impl OrderStage {
             // invoice.
             OrderStage::AwaitingPayment { .. } => None,
             OrderStage::Unknown => (status == OrderStatus::Paid).then(|| {
-                "Paid. The date to send it by shows once this node has caught up with Bitcoin."
-                    .to_string()
+                if seller {
+                    "Paid. The date to send it by isn't known yet.".to_string()
+                } else {
+                    "Paid. The date the seller should send it by isn't known yet.".to_string()
+                }
             }),
             OrderStage::Lapsed { .. } => Some(
                 "No payment was recorded for this invoice before its payment window closed, so \
@@ -780,12 +780,12 @@ impl OrderStage {
                 complaint_until, ..
             } => Some(if seller {
                 format!(
-                    "Paid and sent. The buyer can report a problem {}.",
+                    "Paid and sent. A problem can be reported {}.",
                     report_until(complaint_until)
                 )
             } else {
                 format!(
-                    "Paid, and the seller says it has been sent. {can_report} report a problem {}.",
+                    "Paid, and the seller says it has been sent. A problem can be reported {}.",
                     report_until(complaint_until)
                 )
             }),
@@ -799,13 +799,13 @@ impl OrderStage {
                 Some(if seller {
                     format!(
                         "Paid, and the date to send it by{passed} has passed. Send it now and \
-                         mark it as sent. The buyer can report a problem {}.",
+                         mark it as sent. A problem can be reported {}.",
                         report_until(complaint_until)
                     )
                 } else {
                     format!(
                         "Paid, but the seller has not marked it as sent, and the date to send \
-                         it by{passed} has passed. {can_report} report a problem {}.",
+                         it by{passed} has passed. A problem can be reported {}.",
                         report_until(complaint_until)
                     )
                 })
@@ -1937,11 +1937,12 @@ mod tests {
                 "{stage_text:?} names a block"
             );
         }
+        // A despatch is the seller's word, never proof the goods arrived.
         for stage_text in [&despatch, &closed_window, &despatched] {
-            for promise in ["complain", "delivered", "received"] {
+            for promise in ["delivered", "received", "arrived"] {
                 assert!(
                     !stage_text.contains(promise),
-                    "{stage_text:?} promises something this build cannot do ({promise})"
+                    "{stage_text:?} claims the goods arrived ({promise})"
                 );
             }
         }
@@ -1989,13 +1990,33 @@ mod tests {
         );
         assert_eq!(
             say(sent, Reader::Seller),
-            "Paid and sent. The buyer can report a problem until about 11 Oct."
+            "Paid and sent. A problem can be reported until about 11 Oct."
         );
         assert!(say(missed, Reader::Seller).contains("Send it now and mark it as sent"));
         assert!(say(paid_cancel, Reader::Seller).contains("you owe the goods"));
-        for stage in [despatch, sent, missed, paid_cancel] {
+        let maybe_cancel = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: false,
+            payment_maybe: true,
+        };
+        let open_cancel = OrderStage::Cancelled {
+            settle_until: Some(1_144),
+            payment_seen: false,
+            payment_maybe: false,
+        };
+        assert!(say(maybe_cancel, Reader::Seller).contains("check your wallet"));
+        assert!(say(open_cancel, Reader::Seller).contains("you would then owe the goods"));
+        for stage in [
+            despatch,
+            sent,
+            missed,
+            paid_cancel,
+            maybe_cancel,
+            open_cancel,
+            OrderStage::Unknown,
+        ] {
             let seller = say(stage, Reader::Seller);
-            assert!(!seller.contains("the seller"), "{seller}");
+            assert!(!seller.to_lowercase().contains("the seller"), "{seller}");
             assert_eq!(
                 seller.matches("about").count(),
                 seller.matches(" Oct").count() + seller.matches(" Sep").count(),
@@ -2007,8 +2028,16 @@ mod tests {
                 "{onlooker}"
             );
         }
-        assert!(say(sent, Reader::Buyer).contains("You can report a problem until about 11 Oct"));
-        assert!(say(sent, Reader::Onlooker).contains("The buyer can report a problem"));
+        // Said as the window, never "you can": the buyer may already have
+        // reported one, or not hold the key to.
+        for reader in [Reader::Buyer, Reader::Onlooker] {
+            let said = say(sent, reader);
+            assert!(
+                said.contains("A problem can be reported until about 11 Oct"),
+                "{said}"
+            );
+            assert!(!said.contains("You can"), "{said}");
+        }
         assert!(say(sent, Reader::Buyer).contains("seller says"));
     }
 
