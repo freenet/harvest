@@ -33003,7 +33003,7 @@ mod buy_flow_tests {
         };
         let hosted = instant_checkout_status_text(&status(None, None), NO_BACKGROUND_RUN_AFTER_MS);
         assert!(
-            hosted.starts_with("Your store can't take orders on this node"),
+            hosted.starts_with("This device hasn\u{2019}t been seen running"),
             "{hosted}"
         );
         // A node that did run is not told it does not, however long ago it armed.
@@ -33074,7 +33074,7 @@ mod buy_flow_tests {
             .insert(instant_store(), Ok(status(None, None)));
         assert!(matches!(
             state.instant_checkout_local(&instant_store(), NO_BACKGROUND_RUN_AFTER_MS),
-            Some(LocalSelling::Unconfirmed(why)) if why.contains("can't take orders on this node")
+            Some(LocalSelling::Unconfirmed(why)) if why.contains("been seen running")
         ));
         assert_eq!(
             state.instant_checkout_local(&instant_store(), 1),

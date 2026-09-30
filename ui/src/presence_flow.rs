@@ -428,8 +428,8 @@ pub enum LocalSelling {
     /// closes, looks like this, and so does a quiet stretch on a real node.
     /// Said as a warning, not as closed.
     Unconfirmed(String),
-    /// It cannot, and this is why (no payout wallet, paused, a hosted node
-    /// where nothing runs while the seller is away, ...).
+    /// It cannot, and this is why (no payout wallet, paused, a delegate
+    /// error).
     Blocked(String),
 }
 
@@ -437,8 +437,9 @@ pub enum LocalSelling {
 /// report found "Buyers see your store as open" above "Your store is
 /// starting to take orders"). It says what happens to a buyer: open only
 /// when buyers see the store open AND this device answers their orders, and
-/// otherwise the one reason that matters (review of #190: a hosted node read
-/// "Open" while no order would ever be answered).
+/// otherwise the one reason that matters (review of #190: the device's
+/// reason was hidden under an Open pill; a device that may be a hosted node
+/// is now a warning under it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SellerStatus {
     /// "Open", "Closed", "Checking" or "Not taking orders".

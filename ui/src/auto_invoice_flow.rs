@@ -1032,16 +1032,20 @@ pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
 /// seller_status`). The alerts that stand whether or not the store is open
 /// are [`instant_checkout_alerts`].
 pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+    // A pause is certain and says what to do, so it comes before the guess
+    // below (round 3 of #190).
+    if let Some(why) = &status.paused {
+        return format!("Your store isn't taking orders right now: {why}.");
+    }
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {
-        return "Your store can't take orders on this node. This happens when you use Harvest \
-                through a hosted service such as try.freenet.org, where nothing runs while you \
-                are away. Run Harvest on your own Freenet node to sell."
+        // A guess, and worded as one: a quiet half hour on a real node looks
+        // the same as a hosted service (round 3 of #190).
+        return "This device hasn\u{2019}t been seen running your store in the background yet. \
+                If you use Harvest through a hosted service such as try.freenet.org, orders stop \
+                when you close Harvest: run Harvest on your own Freenet node to stay open."
             .into();
-    }
-    if let Some(why) = &status.paused {
-        return format!("Your store isn't taking orders right now: {why}.");
     }
     // Ready, but this node has not yet shown it runs in the background: the
     // tip read on arming (harvest#162) is answered even on a hosted gateway,

@@ -671,10 +671,18 @@ pub(crate) fn OrderCard(
                 p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
             }
             // Seller's notes (what to cancel, what not to ship against): not
-            // on a buyer's card.
+            // on a buyer's card, which gets its own words for the one case a
+            // buyer acts on: a payment seen after the window.
             if order.status == OrderStatus::AwaitingPayment && !buyer {
                 if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
+                }
+            }
+            if order.status == OrderStatus::AwaitingPayment && buyer && reading.after_window.is_some() {
+                p { class: "text-warning",
+                    "A payment to this order\u{2019}s address arrived after the time to pay \
+                     had passed, so it can\u{2019}t mark the order paid. If it was yours, \
+                     message the seller: they can see it in their wallet."
                 }
             }
             if let Some(hold) = hold {
