@@ -26259,13 +26259,14 @@ mod buy_flow_tests {
     }
 
     /// **A twin tag cannot take a paid order's conversation** (review of
-    /// #205, S1). X25519 ignores bit 255, so the buyer of a paid order can
-    /// write under the same tag with bit 255 set and the delegate would
-    /// derive the same keys; with the twin read, it claims the same order
-    /// and can stand under its card with whatever the buyer wrote. It is
-    /// never read, never filed, never asked keys for, only counted as
-    /// unreadable. Red with the canonical check dropped from `read_mailbox`
-    /// and `seller_claims`.
+    /// #205, S1 and round 2 B1). X25519 ignores bit 255, and the seller's
+    /// clamped scalar kills any torsion component, so the buyer of a paid
+    /// order can write under the same tag with bit 255 set, or under any of
+    /// its torsion twins, and the delegate would derive the same keys; with a
+    /// twin read, it claims the same order and can stand under its card with
+    /// whatever the buyer wrote. None is read, filed or asked keys for, only
+    /// counted as unreadable. Red with the canonical check dropped from
+    /// `read_mailbox`, and with its subgroup check dropped.
     #[test]
     fn a_twin_tag_cannot_take_a_paid_orders_conversation() {
         use crate::components::message_view::seller_inbox;
@@ -26301,65 +26302,94 @@ mod buy_flow_tests {
         order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
         order.order.created_at = timestamp + chrono::Duration::minutes(5);
 
-        let mut twin = tag;
-        twin[31] |= 0x80;
-        assert_eq!(
-            seller_keys_for(&twin),
-            seller_keys_for(&tag),
-            "precondition: the twin derives the same keys"
-        );
-        // Written under the twin, with the conversation's own keys, naming
-        // the same listing so it would claim the same order.
-        let request = crate::messaging::seal_for_test(
-            &seller_keys_for(&twin).to_seller,
-            &twin,
-            &conversation_id,
-            crate::messaging::MessageContent::OrderRequest {
-                listing_id: ListingId([3u8; 32]),
-                quantity: 1,
-                shipping: "Elsewhere".into(),
-                note: String::new(),
-                order_binding,
-                buyer_receipt_key,
-                instant: None,
-            },
-        )
-        .unwrap();
-        let fake = crate::messaging::seal_for_test(
-            &seller_keys_for(&twin).from_seller,
-            &twin,
-            &conversation_id,
-            crate::messaging::MessageContent::Text("Agreed, full refund".into()),
-        )
-        .unwrap();
+        // Every twin: bit 255 set, and the torsion twins P + Q for the
+        // points Q of order dividing 8 (review round 2 of #205), which are
+        // canonical bytes and pass the delegate's contributory check. The
+        // exploit picks whichever sorts lowest; all of them are tried.
+        let mut twins: Vec<[u8; 32]> = Vec::new();
+        let mut high_bit = tag;
+        high_bit[31] |= 0x80;
+        twins.push(high_bit);
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(tag)
+            .to_edwards(0)
+            .expect("a real tag is on the curve");
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            if twin != tag && !twins.contains(&twin) {
+                twins.push(twin);
+            }
+        }
+        assert!(twins.len() > 1, "precondition: torsion twins exist");
         let store = state.browsing_stores.get_mut(STORE).unwrap();
         store.orders = vec![order.clone()];
-        store.mailbox_messages.extend([request, fake]);
+        for twin in &twins {
+            assert_eq!(
+                seller_keys_for(twin),
+                seller_keys_for(&tag),
+                "precondition: the twin derives the same keys"
+            );
+            // Written under the twin, with the conversation's own keys,
+            // naming the same listing so it would claim the same order.
+            let request = crate::messaging::seal_for_test(
+                &seller_keys_for(twin).to_seller,
+                twin,
+                &conversation_id,
+                crate::messaging::MessageContent::OrderRequest {
+                    listing_id: ListingId([3u8; 32]),
+                    quantity: 1,
+                    shipping: "Elsewhere".into(),
+                    note: String::new(),
+                    order_binding,
+                    buyer_receipt_key,
+                    instant: None,
+                },
+            )
+            .unwrap();
+            let fake = crate::messaging::seal_for_test(
+                &seller_keys_for(twin).from_seller,
+                twin,
+                &conversation_id,
+                crate::messaging::MessageContent::Text("Agreed, full refund".into()),
+            )
+            .unwrap();
+            store.mailbox_messages.extend([request, fake]);
+        }
 
-        // Asked for: the twin is not, even with nothing cached.
+        // Asked for: no twin is, even with nothing cached.
         let asked = state.conversation_keys_to_request(STORE);
         if let Some(harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
             peer_public_keys,
             ..
         }) = asked
         {
-            assert!(!peer_public_keys.contains(&twin.to_vec()));
+            assert!(twins
+                .iter()
+                .all(|twin| !peer_public_keys.contains(&twin.to_vec())));
         }
-        // And if a delegate answered for it anyway, it is still not read.
-        state
-            .conversation_keys
-            .insert(twin.to_vec(), seller_keys_for(&twin));
+        // And if a delegate answered for them anyway, none is read.
+        for twin in &twins {
+            state
+                .conversation_keys
+                .insert(twin.to_vec(), seller_keys_for(twin));
+        }
         let inbox = seller_inbox(&state, STORE);
         assert!(
-            inbox.threads.iter().all(|thread| thread.tag != twin),
-            "the twin is not a conversation"
+            inbox
+                .threads
+                .iter()
+                .all(|thread| !twins.contains(&thread.tag)),
+            "no twin is a conversation"
         );
         assert_eq!(
             inbox.for_order(&order.order.id).map(|thread| thread.tag),
             Some(tag),
             "the real conversation stays under the order"
         );
-        assert_eq!(inbox.unreadable, 2, "the twin's entries are only counted");
+        assert_eq!(
+            inbox.unreadable,
+            2 * twins.len(),
+            "the twins' entries are only counted"
+        );
     }
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {

@@ -50,6 +50,11 @@ blake3 = { workspace = true }
 # P2PKH/P2SH address string into its scriptPubKey (see gateway/bitcoin_address.rs).
 bs58 = { workspace = true, features = ["check"] }
 x25519-dalek = { workspace = true }
+# The prime-order-subgroup check on a conversation tag
+# (`messaging::is_canonical_tag`): x25519-dalek exposes no Edwards point.
+# Already in Cargo.lock at this version as x25519-dalek's own dependency, so
+# no version moves; only the UI takes it, never a contract or the delegate.
+curve25519-dalek = { version = "4.1.3", default-features = false }
 aes-gcm = { workspace = true }
 # Ghost Key certificate parsing and chain verification.
 #
