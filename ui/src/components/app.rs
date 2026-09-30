@@ -38,13 +38,17 @@ pub(crate) fn nav_tab(route: Route) -> Option<Route> {
     }
 }
 
-/// The count beside "Stores" of what needs the seller
+/// The pill at the top right that says what needs the seller
 /// (`my_store::requests_needing_seller`), when there is any, so a buyer's
-/// order is visible from every page. It rode on "My store (n)" until that
-/// tab went. Shown in the one warm colour, as on the Orders tab, so it does
-/// not read as a count of stores.
-pub(crate) fn needs_count(needs_seller: usize) -> Option<String> {
-    (needs_seller > 0).then(|| format!("({needs_seller})"))
+/// order is seen from every page (mockup `header()`). On the Stores tab as
+/// "Stores (2)" it read as two stores (critique C-1), so the tabs carry no
+/// count.
+pub(crate) fn needs_you_pill(needs_seller: usize) -> Option<String> {
+    match needs_seller {
+        0 => None,
+        1 => Some("1 needs you".to_string()),
+        n => Some(format!("{n} need you")),
+    }
 }
 
 /// Which of the seller's pages [`Route::MyStore`] opens on. Set by whatever
@@ -174,7 +178,7 @@ pub fn App() -> Element {
     // A buyer's request arriving is the one thing a seller must not miss, so
     // its count rides on the navigation, visible from every page.
     let waiting = super::my_store::requests_needing_seller(&crate::gateway::APP_STATE.read());
-    let stores_count = needs_count(waiting);
+    let needs_pill = needs_you_pill(waiting);
     let current_tab = nav_tab(current_route);
 
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
@@ -360,27 +364,32 @@ pub fn App() -> Element {
                     }
                     h1 { class: "harvest-title", "Harvest" }
                 }
-                span { class: "{status_class}", "{connection_status}" }
+                div { class: "harvest-header-right",
+                    // To the store that needs the seller (the first, when
+                    // several do), on its Overview, whose first card is
+                    // "Needs you".
+                    if let Some(ref pill) = needs_pill {
+                        button {
+                            class: "needs-pill",
+                            onclick: move |_| {
+                                let first = super::my_store::first_store_needing_seller(
+                                    &crate::gateway::APP_STATE.peek(),
+                                );
+                                open_seller_page(first.map_or(SellerPage::First, SellerPage::Store));
+                            },
+                            "{pill}"
+                        }
+                    }
+                    span { class: "{status_class}", "{connection_status}" }
+                }
             }
             nav { class: "harvest-nav", aria_label: "Main",
-                for (route , label , count) in [
-                    (Route::Stores, "Stores", stores_count.clone()),
-                    (Route::Purchases, "Purchases", None),
-                ]
-                {
+                for (route , label) in [(Route::Stores, "Stores"), (Route::Purchases, "Purchases")] {
                     button {
                         class: if current_tab == Some(route) { "nav-btn active" } else { "nav-btn" },
                         aria_current: if current_tab == Some(route) { "page" } else { "false" },
                         onclick: move |_| *ROUTE.write() = route,
                         "{label}"
-                        if let Some(count) = count {
-                            " "
-                            span {
-                                class: "tab-needs",
-                                title: "Things that need you in your stores",
-                                "{count}"
-                            }
-                        }
                     }
                 }
             }
@@ -726,9 +735,10 @@ mod route_tests {
     /// What needs the seller rides on the Stores tab, from every page, and
     /// only when there is some.
     #[test]
-    fn the_stores_tab_carries_what_needs_the_seller() {
-        assert_eq!(needs_count(0), None);
-        assert_eq!(needs_count(2).as_deref(), Some("(2)"));
+    fn the_header_pill_says_what_needs_the_seller() {
+        assert_eq!(needs_you_pill(0), None);
+        assert_eq!(needs_you_pill(1).as_deref(), Some("1 needs you"));
+        assert_eq!(needs_you_pill(2).as_deref(), Some("2 need you"));
     }
 
     fn loaded() -> crate::state::BrowsingStore {

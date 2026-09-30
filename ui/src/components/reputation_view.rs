@@ -193,6 +193,31 @@ fn ComplaintCard(row: ComplaintRow) -> Element {
     }
 }
 
+/// One line per complaint that counts against this store, for the seller's
+/// own record card: its category and, where a tip is known to count from,
+/// the month it was made ("Not as described, Sep 2026"). `tip_of` gives
+/// this reader's tip for a network.
+pub(crate) fn counted_complaint_lines(
+    store: &crate::state::BrowsingStore,
+    tip_of: impl Fn(freenet_bitcoin_common::BitcoinNetwork) -> Option<u32>,
+    now_ms: u64,
+) -> Vec<String> {
+    store
+        .complaint_standings()
+        .filter(|(_, standing)| standing.counts())
+        .map(|(complaint, _)| {
+            let what = category_label(&complaint.category);
+            match tip_of(complaint.order.order.network) {
+                Some(tip) => format!(
+                    "{what}, {}",
+                    crate::fulfilment::approx_month(complaint.block_height, tip, now_ms)
+                ),
+                None => what.to_string(),
+            }
+        })
+        .collect()
+}
+
 /// What a category is called wherever a complaint is shown or offered.
 pub(crate) fn category_label(category: &FeedbackCategory) -> &'static str {
     match category {

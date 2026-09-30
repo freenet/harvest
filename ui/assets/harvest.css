@@ -95,6 +95,10 @@
   --accent: var(--color-moss);
   --accent-warm: var(--color-terracotta);
   --border: #d8cfbe;
+  /* Amber: only for what needs the seller (the mockup's, 2026-09-30). */
+  --amber: #9a5b00;
+  --amber-bg: #fcefd6;
+  --amber-line: #e6c07a;
 
   /* Typography */
   --font-display: 'Libre Baskerville', Georgia, serif;
@@ -206,8 +210,8 @@ body::before {
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-r,
-       .find-store, .vrow, .crumb) > * {
+       .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
+       .find-store, .vrow, .crumb, .harvest-header-right, .record-head) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -464,18 +468,10 @@ h4 {
   color: var(--text-secondary);
 }
 
+/* The record's count: one neutral link colour, whatever it says. */
 .trust .trust-record {
   font: inherit;
   color: inherit;
-}
-
-.trust .text-muted {
-  color: var(--text-muted);
-}
-
-.trust .reputation-negative,
-.trust .text-warning {
-  color: var(--accent-warm);
 }
 
 .trust-why {
@@ -856,19 +852,21 @@ h4 {
 /* The store's status on the seller's Overview: outlined, colour only when
    open (the one state that means "buyers can buy"). */
 .pill {
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.2rem 0.6rem;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--color-parchment);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
+/* Open: the one state that means "buyers can buy". */
 .pill-open {
-  color: var(--accent);
-  border-color: var(--accent);
+  background: #e3ecdf;
+  color: var(--color-moss-dark);
 }
 
 /* "test coins, no value" beside a test-network amount. */
@@ -1053,37 +1051,37 @@ h4 {
 
 /* ---- Payment status pills ---- */
 
+/* An order's status: the same soft, sentence-case pill as a store's. */
 .btc-pill {
+  display: inline-block;
   font-family: var(--font-body);
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0.2rem 0.6rem;
-  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--color-parchment);
+  color: var(--text-secondary);
 }
 
 .btc-pill.paid {
-  background: var(--accent);
-  color: var(--color-cream);
+  background: #e3ecdf;
+  color: var(--color-moss-dark);
 }
 
 .btc-pill.pending,
 .btc-pill.waiting {
-  background: transparent;
-  border: 1px solid var(--accent-warm);
-  color: var(--accent-warm);
+  background: var(--amber-bg);
+  color: var(--amber);
 }
 
 .btc-pill.reversed {
-  background: #b44;
-  color: white;
+  background: #f6dcd8;
+  color: #9b2c22;
 }
 
 .btc-pill.cancelled,
 .btc-pill.done {
-  background: transparent;
-  border: 1px solid var(--border);
   color: var(--text-muted);
 }
 
@@ -1471,6 +1469,7 @@ h4 {
 
 .rc-main {
   display: block;
+  flex: 1;
   min-width: 0;
 }
 
@@ -1499,10 +1498,13 @@ h4 {
   text-overflow: ellipsis;
 }
 
-.rc-r {
+/* What needs the seller, and whether buyers can buy: one pill each. */
+.rc-status {
   display: flex;
   align-items: center;
-  gap: 0.7rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-xs) var(--space-sm);
   flex-shrink: 0;
 }
 
@@ -1512,16 +1514,43 @@ h4 {
   line-height: 1;
 }
 
-/* Something needs the seller: the one warm pill. */
+/* Something needs the seller: the one amber pill. */
 .pill-needs {
-  color: var(--accent-warm);
-  border-color: var(--accent-warm);
+  background: var(--amber-bg);
+  color: var(--amber);
+  box-shadow: inset 0 0 0 1px var(--amber-line);
+  font-weight: 600;
 }
 
 /* A count on a tab that needs the seller ("Orders (2)"). */
 .tab-needs {
-  color: var(--accent-warm);
+  color: var(--amber);
   font-weight: 600;
+}
+
+/* The header's "2 need you", top right: to what needs the seller. */
+.harvest-header-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.needs-pill {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--amber-line);
+  background: var(--amber-bg);
+  color: var(--amber);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.needs-pill:hover {
+  border-color: var(--amber);
 }
 
 .find-store {
@@ -1542,13 +1571,21 @@ h4 {
   overflow: hidden;
 }
 
+/* The name and tagline (the row's button), then "Remove from list" and
+   the chevron on the right. */
 .vrow {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas: "go remove chev";
   align-items: center;
-  gap: var(--space-md);
+  column-gap: var(--space-md);
   padding: 0.8rem 1.1rem;
   border-top: 1px solid var(--color-parchment);
+}
+
+.vrow-chev {
+  grid-area: chev;
+  cursor: pointer;
 }
 
 .vrow:first-child {
@@ -1566,7 +1603,7 @@ h4 {
 }
 
 .vrow-go {
-  flex: 1;
+  grid-area: go;
   min-width: 0;
   background: none;
   border: 0;
@@ -1582,6 +1619,7 @@ h4 {
 }
 
 .vrow-remove {
+  grid-area: remove;
   font-size: 0.8rem;
   color: var(--text-muted);
   white-space: nowrap;
@@ -1637,8 +1675,16 @@ h4 {
   color: var(--text-secondary);
 }
 
-/* The store's record, opened from the trust line, under its own heading. */
-.store-record-card .row-between h3 {
+/* The store's record, opened from the trust line: "Record" and Hide on
+   one line, at any width. */
+.record-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.record-head h3 {
   margin: 0;
 }
 
@@ -1648,7 +1694,11 @@ h4 {
 }
 
 .store-ask {
-  margin-bottom: var(--space-lg);
+  margin-top: var(--space-lg);
+}
+
+.buy-control {
+  margin-top: 0.75rem;
 }
 
 /* A listing's price, and its delivery under it. */
@@ -1696,7 +1746,8 @@ h4 {
   .nav-btn,
   .tab,
   .form-select,
-  .vrow-go {
+  .vrow-go,
+  .needs-pill {
     min-height: 44px;
   }
 
@@ -1745,20 +1796,27 @@ h4 {
     padding: var(--space-lg);
   }
 
-  /* The status keeps to at most half the card, and may wrap. */
+  /* The status goes under the name, the chevron stays on the right
+     (critique 01s-3). */
   .rowcard {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "main chev" "status chev";
+    row-gap: var(--space-xs);
     padding: var(--space-md);
-    gap: var(--space-sm);
   }
 
-  .rc-r {
-    gap: var(--space-xs);
-    max-width: 50%;
+  .rc-main {
+    grid-area: main;
   }
 
-  .rc-r .pill,
-  .rc-r .small {
-    text-align: right;
+  .rc-status {
+    grid-area: status;
+    justify-content: flex-start;
+  }
+
+  .rowcard > .chev {
+    grid-area: chev;
   }
 
   /* The field above its Open button, both full width. */
@@ -1766,19 +1824,23 @@ h4 {
     flex-direction: column;
   }
 
-  /* The store's name and tagline on a line of their own, the pill and
-     "Remove from list" under them. */
+  /* The name with the chevron, then the tagline with "Remove from list"
+     right-aligned on its line (critique 01-2). */
   .vrow {
-    flex-wrap: wrap;
-    row-gap: var(--space-xs);
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "go chev" "go remove";
   }
 
   .vrow-go {
-    flex: 1 1 100%;
+    grid-row: 1 / span 2;
+  }
+
+  .vrow-chev {
+    align-self: start;
   }
 
   .vrow-remove {
-    margin-left: auto;
+    align-self: end;
   }
 }
 

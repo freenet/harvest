@@ -146,6 +146,15 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         || !state.instant_checkout_alerts(&store.contract_id).is_empty()
 }
 
+/// The first store this device manages that something needs the seller at
+/// (`SellerStore::needs_you`): where the header's "needs you" pill goes.
+pub(crate) fn first_store_needing_seller(state: &AppState) -> Option<Vec<u8>> {
+    seller_stores(state)
+        .into_iter()
+        .find(|s| s.needs_you() > 0)
+        .map(|s| s.contract_id)
+}
+
 /// What needs the seller across every store this device manages
 /// ([`SellerStore::needs_you`]): the number beside "Stores" in the
 /// navigation, visible from every page.
@@ -497,7 +506,7 @@ pub(crate) fn GhostKeyAccessNote() -> Element {
 fn ghost_key_name(identity: &ghostkey_common::GhostKeyInfo) -> String {
     match identity.label.as_deref().map(str::trim) {
         Some(label) if !label.is_empty() => format!("Ghost Key \u{201c}{label}\u{201d}"),
-        _ => format!("Ghost Key {}", truncate_fingerprint(&identity.fingerprint)),
+        _ => format!("Ghost Key {}", short_fingerprint(&identity.fingerprint)),
     }
 }
 
@@ -733,7 +742,7 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
     // waiting for an invoice, or a paid order waiting to be sent. Never an
     // unpaid Buy now.
     let orders_needs = store.needs_you();
-    let listings_label = format!("Listings ({})", store.listings);
+
     let current = tab();
 
     rsx! {
@@ -761,7 +770,9 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
         div { class: "tabs", role: "tablist",
             for (t , label) in [
                 (Tab::Overview, "Overview".to_string()),
-                (Tab::Listings, listings_label.clone()),
+                // No count: beside the Orders tab's, which is what needs the
+                // seller, a total read as one too (critique C-1).
+                (Tab::Listings, "Listings".to_string()),
                 (Tab::Orders, "Orders".to_string()),
                 (Tab::Settings, "Settings".to_string()),
             ]
@@ -858,6 +869,26 @@ pub(crate) fn wallet_gap_note(limit: u32) -> String {
 #[component]
 fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>) -> Element {
     let has_wallet = APP_STATE.read().bitcoin.payment_xpub.is_some();
+    let (buyers_see, complaint_lines) = {
+        let state = APP_STATE.read();
+        let loaded = state
+            .browsing_stores
+            .get(&store.contract_id)
+            .filter(|b| b.info.is_some());
+        let tip_of = |network| state.tip_height(network);
+        (
+            loaded.map(super::store_view::trust_line),
+            loaded
+                .map(|b| {
+                    super::reputation_view::counted_complaint_lines(
+                        b,
+                        tip_of,
+                        crate::state::now_ms(),
+                    )
+                })
+                .unwrap_or_default(),
+        )
+    };
     let wallet_known = APP_STATE.read().bitcoin.payment_xpub_loaded;
     let details_done = store.details_resolved && store.gap.is_none();
     let setup_done = details_done && has_wallet && store.listings > 0;
@@ -1054,7 +1085,16 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
 
         section { class: "card",
             h3 { "Your record" }
-            p { "{store.record}" }
+            // What buyers read, from the same function the store page says it
+            // with, and each complaint that counts (critique 09-8).
+            if let Some(ref buyers_see) = buyers_see {
+                p { class: "text-muted small", "Buyers see: {buyers_see}" }
+            } else {
+                p { "{store.record}" }
+            }
+            for line in complaint_lines.iter() {
+                p { "Complaint: {line}" }
+            }
             button {
                 class: "btn btn-sm btn-outline",
                 onclick: {
@@ -1136,6 +1176,12 @@ fn StoreDetailsButton(
 /// (wireframe E). Opening another store is its own page (`AnotherStore`).
 #[component]
 fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
+    let buyers_see = APP_STATE
+        .read()
+        .browsing_stores
+        .get(&store.contract_id)
+        .filter(|b| b.info.is_some())
+        .map(super::store_view::trust_line);
     let identity = APP_STATE
         .read()
         .ghostkeys
@@ -1200,8 +1246,12 @@ fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
                     "{ghost_key_name(identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
                 }
             }
-            p { class: if store.certificate.is_verified() { "text-muted small" } else { "text-warning" },
-                "Buyers see: {store.certificate.label()}."
+            // What buyers read on the store page, from the same function, so
+            // this cannot say something else again (critique 12-2).
+            if let Some(ref buyers_see) = buyers_see {
+                p { class: if store.certificate.is_verified() { "text-muted small" } else { "text-warning" },
+                    "Buyers see: {buyers_see}"
+                }
             }
             p { class: "text-muted small", "Buyers see this as what you have at stake." }
         }
@@ -1280,11 +1330,28 @@ fn AnotherStore(has_harvest_delegate: bool) -> Element {
         }
     });
 
+    // Which Ghost Key backs which store already (mockup C4).
+    let backed = {
+        let state = APP_STATE.read();
+        let pairs: Vec<(String, String)> = seller_stores(&state)
+            .into_iter()
+            .map(|store| {
+                let key = state
+                    .ghostkeys
+                    .iter()
+                    .find(|k| k.fingerprint == store.fingerprint)
+                    .map(ghost_key_name)
+                    .unwrap_or_else(|| "A Ghost Key".to_string());
+                (key, store.label)
+            })
+            .collect();
+        already_backs(&pairs)
+    };
+
     rsx! {
-        p { class: "text-muted small",
-            "A new store starts with its own name, link and an empty record. Use a different "
-            "Ghost Key to keep the two apart."
-        }
+        // A rule, said as one where it applies (critique 14-2), with who
+        // backs what.
+        p { "Each store needs its own Ghost Key. {backed}" }
         for other in others {
             div { class: "other-key", key: "{other.fingerprint}",
                 div { class: "row-between",
@@ -1305,13 +1372,51 @@ fn AnotherStore(has_harvest_delegate: bool) -> Element {
                 }
             }
         }
-        button {
-            class: "btn btn-sm btn-outline",
-            disabled: in_flight,
-            onclick: move |_| connect_ghostkey(),
-            if in_flight { "Waiting for the vault\u{2026}" } else { "Use another Ghost Key" }
+        // What the button does, and the way to get a key for someone who
+        // has none, up front (critique 14-1, mockup C4).
+        div { class: "form-actions",
+            button {
+                class: "btn btn-primary",
+                disabled: in_flight,
+                onclick: move |_| connect_ghostkey(),
+                if in_flight { "Waiting for the vault\u{2026}" } else { "Use a Ghost Key I have" }
+            }
+            a {
+                class: "link-btn",
+                href: "{ghost_key_create_url()}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                "Get another Ghost Key \u{2197}"
+            }
         }
         GhostKeyAccessNote {}
+        p { class: "text-muted small",
+            "A new store starts with its own name, link and an empty record."
+        }
+    }
+}
+
+/// "Alice already backs Pots." for the stores a Ghost Key already backs,
+/// from (key, store) pairs: one sentence, whatever the count.
+pub(crate) fn already_backs(pairs: &[(String, String)]) -> String {
+    match pairs {
+        [] => String::new(),
+        [(key, store)] => format!("{key} already backs {store}."),
+        many => {
+            let mut keys: Vec<&str> = Vec::new();
+            for (key, _) in many {
+                if !keys.contains(&key.as_str()) {
+                    keys.push(key);
+                }
+            }
+            let named = match keys.as_slice() {
+                [one] => one.to_string(),
+                [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                [] => String::new(),
+            };
+            let verb = if keys.len() == 1 { "backs" } else { "back" };
+            format!("{named} already {verb} your {} stores.", many.len())
+        }
     }
 }
 
@@ -1845,11 +1950,12 @@ fn extract_json_field<'a>(info: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn truncate_fingerprint(fp: &str) -> String {
-    if fp.len() > 12 {
-        format!("{}...", &fp[..12])
-    } else {
-        fp.to_string()
+/// A Ghost Key's fingerprint, short: enough to tell one of the seller's
+/// keys from another, not a key id to read out (critique 12-2).
+fn short_fingerprint(fp: &str) -> String {
+    match fp.char_indices().nth(6) {
+        Some((cut, _)) => format!("{}\u{2026}", &fp[..cut]),
+        None => fp.to_string(),
     }
 }
 
@@ -2154,6 +2260,28 @@ mod seller_stores_tests {
         loading.certificate = crate::ghostkey_cert::CertificateStatus::Absent;
         loading.gap = Some(StoreDetailsGap::NeverPublished);
         assert!(!overview_needs(&loading, &state));
+    }
+
+    /// "Open another store" says which Ghost Key backs which store, in one
+    /// sentence, and a Ghost Key is named short, never by its whole id.
+    #[test]
+    fn the_open_another_store_page_says_who_backs_what() {
+        let pair = |k: &str, s: &str| (k.to_string(), s.to_string());
+        assert_eq!(already_backs(&[]), "");
+        assert_eq!(
+            already_backs(&[pair("Alice", "Pots")]),
+            "Alice already backs Pots."
+        );
+        assert_eq!(
+            already_backs(&[pair("Alice", "Pots"), pair("Bob", "Wool")]),
+            "Alice and Bob already back your 2 stores."
+        );
+        assert_eq!(
+            already_backs(&[pair("Alice", "Pots"), pair("Alice", "Cups")]),
+            "Alice already backs your 2 stores."
+        );
+        assert_eq!(short_fingerprint("XpmTN6FBHAmQ9"), "XpmTN6\u{2026}");
+        assert_eq!(short_fingerprint("Xpm"), "Xpm");
     }
 
     /// The store that appears after "Open another store" was pressed is
