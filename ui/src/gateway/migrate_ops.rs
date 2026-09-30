@@ -848,6 +848,17 @@ fn finish(mut probe: Probe) {
         probe.fingerprint
     );
 
+    // My Store waits for the Ghost Key's index walk before offering "Create a
+    // store" (harvest#181). Deferred: this runs inside a response handler's
+    // call chain, and APP_STATE may be borrowed there.
+    if matches!(probe.session, Session::Index(_)) {
+        let fingerprint = probe.fingerprint.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            use dioxus::prelude::WritableExt;
+            super::APP_STATE.write().on_index_walk_done(&fingerprint);
+        });
+    }
+
     // Tell the seller what the migration could not carry, BEFORE the early
     // return below. That return is the nothing-was-recovered path, which is
     // precisely the case this reports -- draining after it would mean the one
