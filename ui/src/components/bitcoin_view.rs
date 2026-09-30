@@ -994,24 +994,23 @@ impl AddressReading {
             );
         }
         let paid_in_window = self.in_window_sats > 0 && self.in_window_sats >= self.amount_sats;
-        if let Some(height) = self.before_order {
+        // Said without the block it confirmed in: a person reads "before
+        // this invoice", not a block height.
+        if self.before_order.is_some() {
             return Some(if paid_in_window {
                 // A valid payment is also here: no reason to reissue.
-                format!(
-                    "This address also holds an older payment, confirmed in block {height} \
-                     before this invoice was made. That one paid for something else; only the \
-                     payment made after this invoice counts for it."
-                )
+                "This address also holds an older payment, confirmed before this invoice \
+                 was made. That one paid for something else; only the payment made after \
+                 this invoice counts for it."
+                    .to_string()
             } else {
-                format!(
-                    "This address already holds a payment that confirmed in block {height}, \
-                     before this invoice was made. It paid for something else and does not \
-                     settle this invoice, so do not ship against it. Issue a new invoice, \
-                     which gets a new address."
-                )
+                "This address already holds a payment that confirmed before this invoice \
+                 was made. It paid for something else and does not settle this invoice, so \
+                 do not ship against it. Issue a new invoice, which gets a new address."
+                    .to_string()
             });
         }
-        self.after_window.map(|height| {
+        self.after_window.map(|_| {
             let whose = if late_is_another_orders {
                 "It falls inside another of your invoices' windows on this address, so it may \
                  be that invoice's payment."
@@ -1020,8 +1019,8 @@ impl AddressReading {
                  with them directly."
             };
             format!(
-                "A payment to this address confirmed in block {height}, after this invoice's \
-                 payment window closed, so Harvest will not mark it paid. {whose}"
+                "A payment to this address confirmed after this invoice's payment window \
+                 closed, so Harvest will not mark it paid. {whose}"
             )
         })
     }
@@ -1728,7 +1727,11 @@ mod address_reading_tests {
         let note = reading
             .outside_note(false)
             .expect("the seller must be told");
-        assert!(note.contains("block 100"), "{note}");
+        assert!(note.contains("before this invoice was made"), "{note}");
+        assert!(
+            !note.contains("block 100"),
+            "a person reads no block height: {note}"
+        );
         assert!(note.contains("do not ship"), "{note}");
     }
 

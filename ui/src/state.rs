@@ -2476,20 +2476,20 @@ impl PaymentBlocker {
             PaymentBlocker::AnchorAheadOfTip {
                 anchor_height,
                 tip_height,
-            } => format!(
-                "The published order names block {anchor_height}, which is ahead of the \
-                 {tip_height} your node has seen. Either your node is behind or the order is \
-                 not genuine; wait before paying."
-            ),
+            } => {
+                let _ = (anchor_height, tip_height);
+                "The published order names a Bitcoin block your node hasn\u{2019}t seen yet. \
+                 Either your node is behind or the order is not genuine; wait before paying."
+                    .to_string()
+            }
             PaymentBlocker::AnchorStale {
                 anchor_height,
                 tip_height,
             } => format!(
-                "This order has expired. It was declared against Bitcoin block \
-                 {anchor_height}, which is {} blocks behind the {tip_height} your node sees, \
-                 and an order that old stops counting as something the seller openly owes. \
-                 Ask the seller to issue it again.",
-                tip_height.saturating_sub(*anchor_height)
+                "This order has expired: it was made {} ago, and an order that old stops \
+                 counting as something the seller openly owes. Ask the seller to issue it \
+                 again.",
+                crate::fulfilment::approx_duration(tip_height.saturating_sub(*anchor_height))
             ),
             PaymentBlocker::UnfitForComplaint(why) => format!(
                 "If this order went wrong you could not complain about it on the seller's \
@@ -22832,6 +22832,68 @@ mod buy_flow_tests {
             .conversation_keys
             .insert(tag.to_vec(), seller_keys_for(&tag));
         (state, tag, request)
+    }
+
+    /// **The seller's order card names what to send and where**, from the
+    /// buyer's Buy now request that the order answers (the 2026-09-27
+    /// friction report); nothing for an order no request answers, and
+    /// nothing when two requests under the same id disagree (the buyer holds
+    /// the keys and could write a second). Red without the id match, and red
+    /// taking the first of two disagreeing requests.
+    #[test]
+    fn the_sellers_order_card_reads_the_buyers_request() {
+        use crate::messaging::BuyerConversation;
+        let (mut state, _, _) = seller_holding_a_request();
+        let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        let tag = buyer.buyer_public_key;
+        state
+            .conversation_keys
+            .insert(tag.to_vec(), seller_keys_for(&tag));
+        let instant = crate::messaging::InstantSelection {
+            nonce: [4u8; 16],
+            region: Some("EU".into()),
+            choices: vec!["Blue".into()],
+            expected_total_sats: 12_000,
+            requested_at_ms: 1_700_000_000_000,
+        };
+        let order_id = instant.answered_request(&tag).expect("dated").order_id();
+        let ask = |quantity: u32| {
+            buyer
+                .request_order(
+                    &ListingId([3u8; 32]),
+                    quantity,
+                    "Jo Buyer\n1 Lane".into(),
+                    "gift wrap".into(),
+                    Some(instant.clone()),
+                )
+                .expect("sealed")
+        };
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        store.mailbox_messages.push(ask(2));
+        let asked = state
+            .seller_order_request(STORE, &order_id)
+            .expect("the request answers the order");
+        assert_eq!(asked.quantity, 2);
+        assert_eq!(asked.shipping, "Jo Buyer\n1 Lane");
+        assert_eq!(asked.note, "gift wrap");
+        assert_eq!(asked.region.as_deref(), Some("EU"));
+        assert_eq!(asked.choices, vec!["Blue".to_string()]);
+        assert_eq!(
+            state.seller_order_request(STORE, &harvest_common::payment::OrderId([9; 32])),
+            None,
+            "an order no request answers"
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .mailbox_messages
+            .push(ask(5));
+        assert_eq!(
+            state.seller_order_request(STORE, &order_id),
+            None,
+            "two requests under one id that disagree name nothing"
+        );
     }
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
