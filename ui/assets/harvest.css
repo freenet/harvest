@@ -875,6 +875,13 @@ h4 {
   background: var(--color-parchment);
 }
 
+/* In this side's direction, not sent from this device: set apart, dashed,
+   claiming nothing (message_view::UNCONFIRMED). */
+.bubble.unconfirmed {
+  border-style: dashed;
+  color: var(--text-secondary);
+}
+
 .bubble-who,
 .bubble-note {
   display: block;
