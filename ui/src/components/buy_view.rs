@@ -615,7 +615,11 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
         .iter()
         .filter(|tag| !groups.iter().any(|(held, _)| held == *tag))
         .filter(|tag| {
-            super::message_view::buyer_thread_count(&app_state, &store_contract_id, Some(**tag)) > 0
+            super::message_view::buyer_thread_has_messages(
+                &app_state,
+                &store_contract_id,
+                Some(**tag),
+            )
         })
         .copied()
         .collect();
@@ -1123,7 +1127,7 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
     // The refusal is read only when there is no complaint on record: it ends
     // in a full verification of the complaint (memoised, review round 3
     // P2-D), which a card with nothing to offer does not need.
-    let (on_record, sent, refusal, message_to, store_page) = {
+    let (on_record, sent, refusal, message_to, store_page, paid_there) = {
         let state = APP_STATE.read();
         let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
@@ -1136,6 +1140,15 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
             refusal,
             target.conversation(&state),
             target.store_page(&state),
+            // Whether a message from the store page would go into a paid
+            // conversation, needing no Ghost Key (`compose_tag` continues
+            // the last conversation).
+            target.store_page(&state).is_some_and(|id| {
+                matches!(
+                    state.compose_gate_in(&id, None),
+                    crate::voucher_flow::ComposeGate::PaidOrder { .. }
+                )
+            }),
         )
     };
     let short = order_id.short();
@@ -1248,8 +1261,14 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                     // one, which needs a Ghost Key (review after b9c727f).
                     (None, _) => rsx! {
                         p { class: "text-muted small",
-                            "This order's messages aren't on this device. You can ask the seller \
-                             a new question from their store page; that needs a Ghost Key."
+                            if paid_there {
+                                "This order's messages aren't on this device. You can message the \
+                                 seller from their store page, in your conversation about another \
+                                 order there."
+                            } else {
+                                "This order's messages aren't on this device. You can ask the \
+                                 seller a new question from their store page; that needs a Ghost Key."
+                            }
                         }
                         if let Some(id) = store_page.clone().filter(|_| {
                             super::app::ROUTE() != super::app::Route::Store

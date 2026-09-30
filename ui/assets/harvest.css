@@ -876,9 +876,10 @@ h4 {
   background: var(--color-parchment);
 }
 
-/* In this side's direction, not sent from this device: in its place on
-   this side, but dashed and unfilled, never the filled "You" bubble
-   (message_view::UNCONFIRMED, msg1 critique MSG-1/MSG-15). */
+/* In this side's direction, not sent from this device: in its place in
+   time, but on neither side (full width, dashed, neutral), never the filled
+   "You" bubble (message_view::UNCONFIRMED; msg1 critique MSG-1, and the
+   review after b9c727f). */
 .bubble.unconfirmed {
   justify-self: stretch;
   max-width: none;
