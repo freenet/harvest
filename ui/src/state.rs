@@ -34130,6 +34130,17 @@ mod buy_flow_tests {
             archived: true,
         }]);
         assert!(removed.presence_reads_due(now).is_empty());
+        // Another listed store of the same key keeps the key read.
+        removed.browsing_stores.insert(
+            vec![6; 32],
+            BrowsingStore {
+                owner: Some(other.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
+        removed.browsing_stores.remove(&vec![6u8; 32]);
+        assert!(removed.presence_reads_due(now).is_empty());
         removed.active_store_id = Some(vec![7; 32]);
         assert_eq!(removed.presence_reads_due(now).len(), 1);
         removed.active_store_id = None;

@@ -174,7 +174,12 @@ impl AppState {
     }
 
     /// Whether `store_contract_id` is a store the user removed from their
-    /// Stores list ("Remove from list") and is not looking at now.
+    /// Stores list ("Remove from list"), other than the store opened last
+    /// (its page may be on screen) and never one of our own.
+    ///
+    /// A purchase from a removed store stays payable on Purchases: the pay
+    /// card rests on the store's own state (`payment_blockers`), not on its
+    /// presence, which here only stops being refreshed.
     pub fn removed_from_list(&self, store_contract_id: &[u8]) -> bool {
         if self.active_store_id.as_deref() == Some(store_contract_id) {
             return false;
@@ -182,6 +187,9 @@ impl AppState {
         let Some(code) = self.store_codes.get(store_contract_id) else {
             return false;
         };
+        if self.own_store_codes().contains(code) {
+            return false;
+        }
         self.remembered_stores.as_ref().is_some_and(|stores| {
             stores
                 .iter()
@@ -197,7 +205,7 @@ impl AppState {
         // Not a store the user removed from their list (Ian, 2026-09-30:
         // "Remove from list" stops following it). Its presence is still
         // read if another store of the same key is on the list, or while
-        // the removed store's own page is open.
+        // it is the store opened last.
         let keys: std::collections::BTreeSet<[u8; 32]> = self
             .browsing_stores
             .iter()
