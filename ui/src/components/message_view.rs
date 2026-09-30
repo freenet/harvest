@@ -1745,11 +1745,12 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 /// written: it is the seller's own text.
 ///
 /// The count is of buyer text the seller did not see: buyer-direction
-/// messages left out, and requests whose note or picks were blanked. Not
-/// counted: a blanked address (a seller is not told about an unpaid Buy now
-/// at all), a blanked decline (mostly the store's own answer to one), and
-/// reply-direction text left out (as likely the seller's own, after a reload,
-/// as anyone's).
+/// messages left out, and quote requests whose note or picks were blanked.
+/// Not counted: an unpaid Buy now's blanked note or picks and a blanked
+/// address (a seller is not told about an unpaid Buy now at all, so the
+/// count would grow with every abandoned checkout), a blanked decline
+/// (mostly the store's own answer to one), and reply-direction text left out
+/// (as likely the seller's own, after a reload, as anyone's).
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,

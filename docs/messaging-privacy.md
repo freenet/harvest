@@ -383,13 +383,53 @@ unlimited plain text in that conversation, bounded only by the mailbox caps.
 from a faucet. So until mainnet the paid path is not a spam cost at all: a
 spammer can buy a cheap listing with test coins and write freely in that
 one conversation (one conversation per paid order; they still cannot write
-in anyone else's). Money is the bar only once orders are in real bitcoin. In a conversation that is not open the seller still
-sees every step (a request, a decline, an acceptance), so buying needs no
-Ghost Key, but not the free text in them: a request's note and shipping
-address (the address shows once it is paid) and a decline's reason are
-blanked, and text in either direction is left out (both parties hold both
-keys, so direction alone cannot be trusted). The count the seller is shown
-is of buyer text left out or blanked; a blanked address is not counted.
+in anyone else's). Money is the bar only once orders are in real bitcoin.
+
+**"Paid" means the order's address was paid, not that this buyer paid.**
+The evidence is the payment proof on the store's own order: some output to
+the order's address covered its amount inside its window. On a reused
+address (harvest#77) one payment can fall inside two orders' windows, so a
+second order can read as paid on another order's money; the seller's card
+warns about that twin. A buyer with such an order can write without a Ghost
+Key in its conversation, which costs them what the order would have cost
+nobody.
+
+**What closes an opened conversation again.** Rule (ii) matches the order's
+listing tag against listings named by requests in the conversation and
+listings the store lists. A store's listings set is grow-only (an edited or
+withdrawn listing stays in it), so an order stays matched after its request
+leaves the bounded mailbox, even if the mailbox is flooded to evict it. What
+can close it: the request gone AND the listing not in the store's listings
+(a store whose listings did not come across a migration), or the store's copy
+of the order dropping from `Paid`. Then the seller's inbox holds the buyer's
+plain text back, and says it could not match it to a paid order.
+
+**Conversation tags must be canonical.** X25519 ignores bit 255 and reduces
+the u-coordinate modulo p, so a tag has twins that derive the same keys. A
+twin written by the buyer would read as a second conversation with the
+first one's keys, claiming its paid orders and able to take its place under
+an order card. The UI reads only canonical tags (`messaging::is_canonical_tag`)
+and never asks the delegate for a twin's keys; the delegate itself does not
+check yet.
+
+In a conversation that is not open the seller still sees every step (a
+request, a decline, an acceptance), so buying needs no Ghost Key, but not the
+free text in them: a request's note and shipping address (the address shows
+once it is paid) and a decline's reason are blanked, and text in either
+direction is left out (both parties hold both keys, so direction alone cannot
+be trusted). The count the seller is shown is of buyer text left out, and of
+notes or picks blanked on a quote request (the one kind the seller is asked
+to answer); an unpaid Buy now's blanked note is not counted, since the store
+answers it and the seller never sees it, and a blanked address is not
+counted.
+
+**After the complaint window the seller's app hides the buyer's address**
+(Ian, 2026-09-30): the order card and any request of that order read
+"Address hidden: the time to report a problem with this order has passed.",
+and the note goes too. Hidden, not deleted: it stays encrypted in the store's
+mailbox contract (no owner delete; entries leave only by its caps), the store
+key can decrypt it for the store's life, and a mailbox migration copies it.
+With no chain tip the window can't be judged and the address stays.
 
 A buyer's plain text sealed before the gate existed, and the seller's own
 replies in a conversation nothing opens, are no longer shown to the seller.
