@@ -593,15 +593,16 @@ impl AppState {
         if let Ok(id) = <[u8; 32]>::try_from(contract_id) {
             if let Some(script) = self.auto_invoice.retired_reads.remove(&id) {
                 if address_state_payments(state_bytes) == Some(true) {
-                    dioxus::logger::tracing::warn!(
-                        "An upcoming payment address (script {}) was paid under an earlier \
-                         address-contract build; moving the delegate's counter past it",
-                        hex::encode(&script)
-                    );
                     // Its current read may be gone (a send that failed):
                     // recorded used whatever is held.
                     let held = self.auto_invoice.vets.get(&script);
                     if held.is_none_or(|v| v.verdict != VetVerdict::Used) {
+                        dioxus::logger::tracing::warn!(
+                            "An upcoming payment address (script {}) was paid under an \
+                             earlier address-contract build; moving the delegate's counter \
+                             past it",
+                            hex::encode(&script)
+                        );
                         let contract_id = held.map_or(id, |v| v.contract_id);
                         self.auto_invoice.vets.insert(
                             script,
@@ -1426,7 +1427,10 @@ impl AppState {
             _ => false,
         };
         if changed {
-            self.auto_invoice.key_floor_peek = Some(self.bitcoin.next_request_id + 1);
+            let floor = self.bitcoin.next_request_id + 1;
+            self.auto_invoice.key_floor_peek = Some(floor);
+            // Read the new key's window at once, not after the retry minute.
+            self.auto_invoice.stale_from_peek = Some(floor);
             self.auto_invoice.upcoming_for = None;
         }
     }
@@ -1446,10 +1450,12 @@ impl AppState {
         result: Result<Vec<DerivedAddress>, String>,
         now_ms: u64,
     ) {
-        if self
-            .auto_invoice
-            .stale_from_peek
-            .is_some_and(|first| request_id < first)
+        // An id this tab never issued would hold every later answer out.
+        if request_id > self.bitcoin.next_request_id
+            || self
+                .auto_invoice
+                .stale_from_peek
+                .is_some_and(|first| request_id < first)
             || self
                 .auto_invoice
                 .last_answered_peek

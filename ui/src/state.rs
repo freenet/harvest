@@ -32332,6 +32332,12 @@ mod buy_flow_tests {
             state.auto_invoice.upcoming_for.is_none(),
             "the old key's window"
         );
+        // Asked again at once, not after the retry minute.
+        state.auto_invoice.peek_sent_ms = Some(299);
+        assert!(state.queue_auto_invoice(300).peek);
+        // An answer under an id never issued is not taken.
+        state.on_upcoming_answer(u64::MAX, Ok((0..10).map(lost_address).collect()), 305);
+        assert!(state.auto_invoice.upcoming_for.is_none());
         let new_peek = state.bitcoin.next_request_id();
         state.note_peek_sent(new_peek);
         state.on_upcoming_answer(new_peek, Ok((0..10).map(lost_address).collect()), 310);
