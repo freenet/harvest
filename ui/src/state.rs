@@ -4531,7 +4531,15 @@ impl AppState {
         // itself an answer to a reuse check (nothing registered there). An id
         // that is ALSO a watched address goes on to the ordinary path below,
         // so a check never swallows an update a watch was waiting for.
-        if self.on_address_reuse_state(&contract_id, &state_bytes)
+        // Likewise an upcoming address instant checkout is reading before it
+        // may be watched (harvest#183). Both are asked, whichever matched.
+        let vetted = self.on_address_vet_state(&contract_id, &state_bytes);
+        #[cfg(target_arch = "wasm32")]
+        if vetted {
+            self.send_due_auto_invoice();
+        }
+        let reuse_checked = self.on_address_reuse_state(&contract_id, &state_bytes);
+        if (vetted || reuse_checked)
             && !self
                 .bitcoin
                 .address_contract_network
@@ -10942,6 +10950,10 @@ impl AppState {
                 }
             }
         }
+        // And every address instant checkout found already paid
+        // (harvest#183): no loaded order may name it, but it is used all the
+        // same, and this is how the counter is moved past it.
+        scripts.extend(self.vetted_used_scripts().cloned());
         scripts.into_iter().collect()
     }
 
@@ -12509,6 +12521,10 @@ impl AppState {
                         );
                         self.bitcoin.payment_xpub = Some(status);
                         self.bitcoin.payment_xpub_loaded = true;
+                        // A counter moved past used addresses (harvest#183)
+                        // wants its next ones read at once.
+                        #[cfg(target_arch = "wasm32")]
+                        self.send_due_auto_invoice();
                     }
                     // Every rejection here names something the seller can act
                     // on -- the wrong export, the wrong network, the wrong
@@ -12531,6 +12547,10 @@ impl AppState {
             BitcoinDelegateResponse::UpcomingAddresses { result, .. } => {
                 self.on_upcoming_addresses(result, now_ms());
                 self.send_due_watch_requests();
+                // Their address contracts are read before any is watched
+                // (harvest#183): start now rather than at the next tick.
+                #[cfg(target_arch = "wasm32")]
+                self.send_due_auto_invoice();
             }
 
             BitcoinDelegateResponse::OrderAddress {
@@ -18406,6 +18426,31 @@ mod invoice_tests {
             .next()
             .cloned()
             .expect("one check")
+    }
+
+    /// The id an upcoming address is read under is the one an order on that
+    /// address, with the same bridges and build, would watch. Mutated red by
+    /// leaving out the work floor.
+    #[test]
+    fn an_upcoming_address_is_read_under_its_orders_contract_id() {
+        let probe = order_for_invoice(
+            &invoice(),
+            &derived(3),
+            Some(anchor(TIP_HEIGHT)),
+            chrono::Utc::now(),
+            &resolved_address_generation(),
+            None,
+        )
+        .expect("order");
+        assert_eq!(
+            crate::auto_invoice_flow::address_instance_id(
+                probe.network,
+                &probe.payment_script_pubkey,
+                &probe.trusted_bridges,
+                probe.bitcoin_address_code_hash.expect("names a build"),
+            ),
+            probe.bitcoin_address_instance_id().expect("names a build")
+        );
     }
 
     /// An address contract state holding one claim: a bridge's scan
@@ -31667,7 +31712,166 @@ mod buy_flow_tests {
                 .collect()),
             1,
         );
+        // Their address contracts read and found unpaid (harvest#183).
+        let scripts: Vec<Vec<u8>> = state
+            .auto_invoice
+            .upcoming
+            .iter()
+            .map(|a| a.script_pubkey.clone())
+            .collect();
+        for script in scripts {
+            state
+                .auto_invoice
+                .vets
+                .insert(script, crate::auto_invoice_flow::AddressVet::Clear);
+        }
         state
+    }
+
+    /// An address state holding a payment claim next to a scan watermark,
+    /// and one holding only the watermark. Unsigned: the read looks at what
+    /// kind of claims are there, not at their validity.
+    fn address_states_paid_and_scanned() -> (Vec<u8>, Vec<u8>) {
+        let bridge = freenet_bitcoin_common::BridgeId([7u8; 32]);
+        let claim = freenet_bitcoin_common::SignedClaim {
+            body_cbor: vec![1, 2, 3],
+            bridge,
+            signature: vec![4, 5, 6],
+        };
+        let mut scanned_only = freenet_bitcoin_common::BitcoinAddressStateV1::default();
+        scanned_only.claims.scanned.insert(bridge, claim.clone());
+        let mut paid = scanned_only.clone();
+        paid.claims.claims.insert(
+            freenet_bitcoin_common::address_state::ClaimKey([9u8; 32]),
+            claim,
+        );
+        (
+            freenet_bitcoin_common::to_cbor(&paid).expect("encode"),
+            freenet_bitcoin_common::to_cbor(&scanned_only).expect("encode"),
+        )
+    }
+
+    /// harvest#183: a delegate that lost its counter and is given the same
+    /// payment key starts at 0 while 0, 1 and 2 are already paid. Nothing
+    /// is watched, armed or delegated until every upcoming address has been
+    /// read; the paid ones are filed as published with the same key, which
+    /// moves the delegate past them; and only a window with no payment in it
+    /// reaches the bridge and the arm. Mutated red by dropping the gate in
+    /// `current_upcoming`, by counting scan watermarks as use, by dropping
+    /// the used scripts from `published_payment_scripts`, and by never
+    /// planning the raise.
+    #[test]
+    fn a_lost_counter_is_moved_past_paid_addresses_before_anything_is_watched() {
+        use crate::auto_invoice_flow::AddressVet;
+        let gk = inbox::authority().mint();
+        let mut state = an_instant_seller(&gk);
+        let registration = state.my_stores["seller-fp"][0].clone();
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let address = |i: u32| harvest_common::DerivedAddress {
+            index: i,
+            network: BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xa0, i as u8],
+            address: format!("tb1qlost{i}"),
+        };
+        // The counter was lost: the delegate reports 0 under the same key.
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 0;
+        state.on_upcoming_addresses(Ok((0..10).map(address).collect()), 100);
+
+        // Before any read: nothing goes to the bridge or into an arm.
+        assert!(
+            state.prewatch_wanted(bridge).is_none(),
+            "unread: not watched"
+        );
+        assert!(state
+            .auto_invoice_arm("seller-fp", &registration, 100)
+            .is_none());
+        let work = state.queue_auto_invoice(100);
+        assert!(work.arms.is_empty());
+        assert_eq!(work.delegation, Default::default());
+        assert_eq!(work.vets.len(), 10, "every upcoming address is read");
+        assert!(work.raise.is_none(), "nothing is known used yet");
+        // Asked once: the next plan does not ask again.
+        assert!(state.plan_auto_invoice(200).vets.is_empty());
+
+        let (paid, scanned_only) = address_states_paid_and_scanned();
+        let id_of = |work: &crate::auto_invoice_flow::AutoInvoiceWork, i: u8| {
+            work.vets
+                .iter()
+                .find(|(_, script, _)| script[3] == i)
+                .map(|(id, _, token)| (*id, *token))
+                .expect("asked")
+        };
+        for i in 0..3 {
+            assert!(state.on_address_vet_state(&id_of(&work, i).0, &paid));
+        }
+        // An address this tab (or an earlier device) only watched carries a
+        // scan watermark and no payment: clear.
+        assert!(state.on_address_vet_state(&id_of(&work, 3).0, &scanned_only));
+        assert!(state.on_address_vet_absent(&id_of(&work, 4).0));
+        // A stale timer does not settle a read; the right one does.
+        let (id5, token5) = id_of(&work, 5);
+        assert!(!state.on_address_vet_timeout(&id5, token5 + 1000));
+        assert!(state.on_address_vet_timeout(&id5, token5));
+        for i in 6..10 {
+            assert!(state.on_address_vet_state(&id_of(&work, i).0, &[]));
+        }
+        assert_eq!(
+            state.auto_invoice.vets.get(&address(1).script_pubkey),
+            Some(&AddressVet::Used)
+        );
+        // Used addresses ahead: still nothing watched, and the key is filed
+        // again with the used scripts among the published ones.
+        assert!(state.prewatch_wanted(bridge).is_none());
+        let work = state.queue_auto_invoice(300);
+        assert!(work.arms.is_empty());
+        assert_eq!(
+            work.raise,
+            Some(("vpub-placeholder".to_string(), BitcoinNetwork::Signet))
+        );
+        assert!(
+            state.queue_auto_invoice(400).raise.is_none(),
+            "not filed again while the first is on its way"
+        );
+        let request =
+            state.set_payment_xpub_request(7, "vpub-placeholder".into(), BitcoinNetwork::Signet);
+        let harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+            published_scripts, ..
+        } = request
+        else {
+            panic!("a SetPaymentXpub");
+        };
+        for i in 0..3 {
+            assert!(published_scripts.contains(&address(i).script_pubkey));
+        }
+        assert!(!published_scripts.contains(&address(3).script_pubkey));
+
+        // The delegate moved its counter to 3 and lists 3..13: 3..9 were read
+        // already, 10..12 are read now, and once they are clear the window
+        // is watched and armed.
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: 7,
+            result: Ok(harvest_common::PaymentXpubStatus {
+                xpub: "vpub-placeholder".into(),
+                network: BitcoinNetwork::Signet,
+                next_index: 3,
+            }),
+            matched_scripts: (0..3).map(|i| address(i).script_pubkey).collect(),
+        });
+        assert!(
+            state.queue_auto_invoice(500).raise.is_none(),
+            "nothing used ahead now"
+        );
+        state.on_upcoming_addresses(Ok((3..13).map(address).collect()), 600);
+        let work = state.queue_auto_invoice(600);
+        assert_eq!(work.vets.len(), 3, "only the new addresses are read");
+        assert!(state.prewatch_wanted(bridge).is_none());
+        for (id, _, _) in &work.vets {
+            assert!(state.on_address_vet_absent(id));
+        }
+        let (_, _, wanted) = state.prewatch_wanted(bridge).expect("watched now");
+        let indexes: Vec<u8> = wanted.iter().map(|w| w.script[3]).collect();
+        assert_eq!(indexes, (3..13).collect::<Vec<u8>>());
+        assert!(!wanted.iter().any(|w| w.script == address(0).script_pubkey));
     }
 
     /// An arm names the store's presence contract, and the horizon the

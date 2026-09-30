@@ -114,6 +114,101 @@ pub struct AutoInvoiceUi {
     /// Doubling from `UNANSWERED_BACKOFF_MS`, so a delegate that is simply
     /// unreachable does not bring a vault prompt every few minutes.
     pub delegation_unanswered: HashMap<(GhostkeyId, BridgeId), (u32, u64)>,
+    /// What each of the delegate's next addresses' address contract showed,
+    /// by payment script ([`AddressVet`], harvest#183). None of them goes
+    /// to the bridge or into an arm before it is [`AddressVet::Clear`].
+    pub vets: HashMap<Vec<u8>, AddressVet>,
+    /// The token the next address-contract read is started under, so a
+    /// timer left from an earlier read cannot end a later one.
+    pub next_vet_token: u64,
+    /// When the payment key was last filed again to move the delegate's
+    /// counter past used addresses, and the counter it was filed at.
+    pub raise_sent: Option<(u32, u64)>,
+    /// Whether the seller has been told that addresses keep turning out used.
+    pub vets_gave_up_told: bool,
+}
+
+/// What an upcoming address's address contract showed (harvest#183).
+///
+/// # Why instant checkout reads it before watching
+///
+/// The delegate's address counter is floored only by the scripts on orders
+/// the seller's LOADED stores hold (harvest#77). A delegate that lost its
+/// counter (a re-key with no migration row, a new device) and is given the
+/// same payment key starts again at the lowest index that no loaded order
+/// names, and orders on another store, on an earlier store generation, or
+/// pruned from the store are invisible to that floor. Invoices by hand read
+/// the address contract before signing (`check_address_before_signing`);
+/// instant checkout, which invoices with no tab, had nothing, and in the
+/// 0.2.139 release E2E it put already-paid addresses 0, 1 and 2 on the first
+/// three buyers' invoices.
+///
+/// So the tab reads each of the delegate's next addresses' address contract
+/// first. Only PAYMENT history counts ([`address_state_has_payments`]): a
+/// scan watermark alone is what this tab's own watch (or an earlier
+/// device's) leaves on every upcoming address, and counting it would burn the
+/// whole pool on every visit. An address with history makes the tab file the
+/// payment key again with that script among the published ones, which moves
+/// the delegate's counter past it (the same key keeps its count, and the
+/// floor never lowers it), and then read the next ones.
+///
+/// Silence for [`ADDRESS_VET_TIMEOUT_MS`], or `NotFound`, counts as
+/// clear: a fresh address's contract does not exist, and Freenet reports
+/// absence slowly or not at all (see `AppState::on_address_reuse_timeout`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddressVet {
+    /// Its contract was asked for under this id and token.
+    Asking { contract_id: [u8; 32], token: u64 },
+    /// No payment was ever recorded there, or nothing answered in time.
+    Clear,
+    /// A payment (or a retraction of one) is recorded there.
+    Used,
+}
+
+/// How long an upcoming address's contract read may go unanswered before
+/// the address counts as clear. The same wait an invoice by hand gives.
+pub const ADDRESS_VET_TIMEOUT_MS: u32 = crate::state::ADDRESS_REUSE_CHECK_TIMEOUT_MS;
+
+/// How many used addresses one session moves the counter past before it
+/// stops and tells the seller. A stale counter recovers in a few windows;
+/// far more than that means something else is issuing from the key.
+pub const MAX_VETTED_USED: usize = crate::state::MAX_REUSED_ADDRESS_SKIPS as usize * 5;
+
+/// Whether an address contract's state records any payment: a payment or
+/// retraction claim, not merely a bridge's scan watermark. A state that does
+/// not decode counts as used, which costs one index; the other way could put
+/// a paid address on an invoice.
+pub fn address_state_has_payments(state_bytes: &[u8]) -> bool {
+    if state_bytes.is_empty() {
+        return false;
+    }
+    freenet_bitcoin_common::from_cbor::<freenet_bitcoin_common::BitcoinAddressStateV1>(state_bytes)
+        .map(|state| !state.claims.claims.is_empty())
+        .unwrap_or(true)
+}
+
+/// The instance id of the address contract build `code_hash` for `script`
+/// on `network`, watched by `trusted_bridges`: what an order naming that
+/// address, those bridges and that build would watch
+/// (`Order::bitcoin_address_instance_id_under`, which a test holds this to).
+pub fn address_instance_id(
+    network: BitcoinNetwork,
+    script: &[u8],
+    trusted_bridges: &[BridgeId],
+    code_hash: [u8; 32],
+) -> [u8; 32] {
+    let params = freenet_bitcoin_common::BitcoinAddressParameters {
+        network,
+        script_pubkey: script.to_vec(),
+        trusted_bridges: trusted_bridges.to_vec(),
+        pow_floor: network.default_pow_floor(),
+    };
+    let params = harvest_common::to_cbor(&params)
+        .expect("BitcoinAddressParameters always serializes to CBOR");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&code_hash);
+    hasher.update(&params);
+    *hasher.finalize().as_bytes()
 }
 
 /// The first wait before the vault is asked again after a signed delegation
@@ -184,6 +279,12 @@ pub struct AutoInvoiceWork {
     pub lapses_at_ms: Vec<u64>,
     /// The delegation of watch requests to the delegate's watch key.
     pub delegation: DelegationWork,
+    /// Upcoming addresses whose address contract to read: its id, the
+    /// address's script, and the token the read runs under.
+    pub vets: Vec<([u8; 32], Vec<u8>, u64)>,
+    /// File the payment key again, so the delegate moves past the used
+    /// addresses among its next ones.
+    pub raise: Option<(String, BitcoinNetwork)>,
 }
 
 impl AppState {
@@ -227,13 +328,155 @@ impl AppState {
     }
 
     /// The delegate's next addresses, if they were read under the payment key
-    /// and counter the delegate now reports.
+    /// and counter the delegate now reports, and every one of them has been
+    /// read and found to hold no payment ([`AddressVet`], harvest#183).
+    ///
+    /// Everything that puts an upcoming address in play goes through this:
+    /// the prewatch, the arm and the watch delegation. So until the whole
+    /// window is clear none of them happens, and the delegate, which invoices
+    /// only on an address the bridge was asked to watch, cannot put an address
+    /// with history on an invoice. Not only the clear addresses before the
+    /// first used one: a delegation would let the delegate watch from its
+    /// counter by itself, used address included.
     fn current_upcoming(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
+        let (network, upcoming) = self.upcoming_unvetted()?;
+        upcoming
+            .iter()
+            .all(|a| self.auto_invoice.vets.get(&a.script_pubkey) == Some(&AddressVet::Clear))
+            .then_some((network, upcoming))
+    }
+
+    /// [`Self::current_upcoming`] before the address-contract reads.
+    fn upcoming_unvetted(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let xpub = self.bitcoin.payment_xpub.as_ref()?;
         let (key, _) = self.auto_invoice.upcoming_for.as_ref()?;
         let first = self.auto_invoice.upcoming.first()?;
         (*key == xpub.xpub && first.index >= xpub.next_index)
             .then_some((xpub.network, self.auto_invoice.upcoming.as_slice()))
+    }
+
+    /// The upcoming addresses whose address contract has not been asked for
+    /// yet, with the id to ask and the token each read will run under. Empty
+    /// until the address generation has resolved: the id depends on it.
+    fn vets_due(&self) -> Vec<([u8; 32], Vec<u8>, u64)> {
+        let Some((network, upcoming)) = self.upcoming_unvetted() else {
+            return Vec::new();
+        };
+        let Some(code_hash) = self.bitcoin.address_generation.code_hash() else {
+            return Vec::new();
+        };
+        let Ok(bridges) = crate::gateway::bitcoin_config::default_trusted_bridges(network) else {
+            return Vec::new();
+        };
+        upcoming
+            .iter()
+            .filter(|a| !self.auto_invoice.vets.contains_key(&a.script_pubkey))
+            .enumerate()
+            .map(|(i, a)| {
+                (
+                    address_instance_id(network, &a.script_pubkey, &bridges, code_hash),
+                    a.script_pubkey.clone(),
+                    self.auto_invoice.next_vet_token + i as u64,
+                )
+            })
+            .collect()
+    }
+
+    /// The payment key to file again, when an upcoming address turned out
+    /// used and the delegate has not been asked to move past it recently.
+    /// Stops once [`MAX_VETTED_USED`] addresses have turned out used.
+    fn raise_due(&self, now_ms: u64) -> Option<(String, BitcoinNetwork)> {
+        let xpub = self.bitcoin.payment_xpub.as_ref()?;
+        let (_, upcoming) = self.upcoming_unvetted()?;
+        let used_ahead = upcoming
+            .iter()
+            .any(|a| self.auto_invoice.vets.get(&a.script_pubkey) == Some(&AddressVet::Used));
+        if !used_ahead || self.vetted_used_count() > MAX_VETTED_USED {
+            return None;
+        }
+        let recent = self.auto_invoice.raise_sent.is_some_and(|(counter, at)| {
+            counter == xpub.next_index && now_ms.saturating_sub(at) < PEEK_RETRY_MS
+        });
+        (!recent).then(|| (xpub.xpub.clone(), xpub.network))
+    }
+
+    /// How many addresses this session found used.
+    fn vetted_used_count(&self) -> usize {
+        self.auto_invoice
+            .vets
+            .values()
+            .filter(|v| **v == AddressVet::Used)
+            .count()
+    }
+
+    /// The scripts of addresses found used by [`AddressVet`]: published as
+    /// far as the counter is concerned (`AppState::published_payment_scripts`).
+    pub(crate) fn vetted_used_scripts(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.auto_invoice
+            .vets
+            .iter()
+            .filter(|(_, v)| **v == AddressVet::Used)
+            .map(|(script, _)| script)
+    }
+
+    /// A state arrived for `contract_id`: settle an upcoming address's read
+    /// that was waiting on it. Returns whether one was.
+    pub(crate) fn on_address_vet_state(&mut self, contract_id: &[u8], state_bytes: &[u8]) -> bool {
+        let verdict = if address_state_has_payments(state_bytes) {
+            AddressVet::Used
+        } else {
+            AddressVet::Clear
+        };
+        self.settle_vet(contract_id, None, verdict)
+    }
+
+    /// The node answered `NotFound`: nothing was ever published there, as
+    /// far as it can tell. Clear, like silence.
+    pub(crate) fn on_address_vet_absent(&mut self, contract_id: &[u8]) -> bool {
+        self.settle_vet(contract_id, None, AddressVet::Clear)
+    }
+
+    /// No answer in [`ADDRESS_VET_TIMEOUT_MS`] to the read started under
+    /// `token`: clear (see [`AddressVet`] on why silence is).
+    pub(crate) fn on_address_vet_timeout(&mut self, contract_id: &[u8], token: u64) -> bool {
+        self.settle_vet(contract_id, Some(token), AddressVet::Clear)
+    }
+
+    fn settle_vet(&mut self, contract_id: &[u8], token: Option<u64>, verdict: AddressVet) -> bool {
+        let mut settled = false;
+        for (script, vet) in self.auto_invoice.vets.iter_mut() {
+            let AddressVet::Asking {
+                contract_id: asked,
+                token: asked_token,
+            } = vet
+            else {
+                continue;
+            };
+            if asked.as_slice() != contract_id || token.is_some_and(|t| t != *asked_token) {
+                continue;
+            }
+            if verdict == AddressVet::Used {
+                dioxus::logger::tracing::warn!(
+                    "An upcoming payment address (script {}) has been paid before; moving the \
+                     delegate's counter past it",
+                    hex::encode(script)
+                );
+            }
+            *vet = verdict.clone();
+            settled = true;
+        }
+        if settled
+            && self.vetted_used_count() > MAX_VETTED_USED
+            && !self.auto_invoice.vets_gave_up_told
+        {
+            self.auto_invoice.vets_gave_up_told = true;
+            self.notifications.push(format!(
+                "Your store can't take instant orders: more than {MAX_VETTED_USED} payment \
+                 addresses from your key had already been paid. Is another device issuing \
+                 invoices from the same key?"
+            ));
+        }
+        settled
     }
 
     /// Whether the next addresses should be read again.
@@ -417,6 +660,8 @@ impl AppState {
             return work;
         }
         work.peek = self.peek_due(now_ms);
+        work.vets = self.vets_due();
+        work.raise = self.raise_due(now_ms);
         for (fingerprint, registration) in stores {
             let Some((arm, lapses_at)) = self.auto_invoice_arm(&fingerprint, &registration, now_ms)
             else {
@@ -704,6 +949,24 @@ impl AppState {
         if work.peek {
             self.auto_invoice.peek_sent_ms = Some(now_ms);
         }
+        for (contract_id, script, token) in &work.vets {
+            self.auto_invoice.vets.insert(
+                script.clone(),
+                AddressVet::Asking {
+                    contract_id: *contract_id,
+                    token: *token,
+                },
+            );
+            self.auto_invoice.next_vet_token = self.auto_invoice.next_vet_token.max(token + 1);
+        }
+        if work.raise.is_some() {
+            let counter = self
+                .bitcoin
+                .payment_xpub
+                .as_ref()
+                .map_or(0, |x| x.next_index);
+            self.auto_invoice.raise_sent = Some((counter, now_ms));
+        }
         if work.delegation.get_watch_key {
             self.auto_invoice.watch_key_asked_ms = Some(now_ms);
         }
@@ -797,6 +1060,20 @@ impl AppState {
             if let Some(pending) = work.delegation.delegate.clone() {
                 spawn_delegation_signature(pending);
             }
+            for (contract_id, _, token) in work.vets.iter().cloned() {
+                spawn_address_vet(contract_id, token);
+            }
+            if let Some((xpub, network)) = work.raise.clone() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) =
+                        crate::gateway::bitcoin_ops::set_payment_xpub(xpub, network).await
+                    {
+                        dioxus::logger::tracing::warn!(
+                            "could not move the payment counter past used addresses: {e}"
+                        );
+                    }
+                });
+            }
             if work.peek || !work.arms.is_empty() {
                 wasm_bindgen_futures::spawn_local(async move {
                     if work.peek {
@@ -887,6 +1164,24 @@ impl AppState {
             Some(Ok(status)) => instant_checkout_status_text(status, now_ms),
         })
     }
+}
+
+/// Read an upcoming address's contract ([`AddressVet`]), and count it clear
+/// if nothing answers in time.
+#[cfg(target_arch = "wasm32")]
+fn spawn_address_vet(contract_id: [u8; 32], token: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(contract_id);
+        if let Err(e) = crate::gateway::get_contract(&id, false).await {
+            dioxus::logger::tracing::warn!("could not ask about an upcoming payment address: {e}");
+        }
+        gloo_timers::future::TimeoutFuture::new(ADDRESS_VET_TIMEOUT_MS).await;
+        let mut state = crate::gateway::APP_STATE.write();
+        if state.on_address_vet_timeout(&contract_id, token) {
+            state.send_due_auto_invoice();
+        }
+    });
 }
 
 /// Ask the Ghost Key vault to sign a delegation queued by
