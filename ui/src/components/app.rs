@@ -775,11 +775,13 @@ mod route_tests {
         state.store_codes.insert(id.clone(), p.code().to_string());
         assert_eq!(opening_for(&state, &id), Opening::ByCode(p.clone()));
 
-        let mut state = AppState::default();
-        state.remembered_stores = Some(vec![harvest_common::RememberedStore {
-            store_code: p.code().to_string(),
-            archived: true,
-        }]);
+        let state = AppState {
+            remembered_stores: Some(vec![harvest_common::RememberedStore {
+                store_code: p.code().to_string(),
+                archived: true,
+            }]),
+            ..Default::default()
+        };
         assert_eq!(
             opening_for(&state, &id),
             Opening::ByCode(p.clone()),

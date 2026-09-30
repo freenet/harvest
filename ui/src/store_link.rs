@@ -236,35 +236,39 @@ pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
     use dioxus::prelude::WritableExt;
     let contract_id = store_id.as_bytes().to_vec();
     crate::components::show_store(contract_id.clone());
-    if !crate::gateway::APP_STATE
+    // `false` when its GET is already out, with its own wait: only shown.
+    let started = crate::gateway::APP_STATE
         .write()
-        .begin_foreground_load(&contract_id)
-    {
-        // Its GET is already out, with its own wait: only shown.
-        return;
-    }
+        .begin_foreground_load(&contract_id);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = started;
 
     #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
-            let mut state = crate::gateway::APP_STATE.write();
-            state.note_store_link_failed(&contract_id, &format!("Couldn't open that store: {e}"));
-            state.end_foreground_load(&contract_id);
-            return;
-        }
+    if started {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::gateway::get_contract(&store_id, true).await {
+                let mut state = crate::gateway::APP_STATE.write();
+                state.note_store_link_failed(
+                    &contract_id,
+                    &format!("Couldn't open that store: {e}"),
+                );
+                state.end_foreground_load(&contract_id);
+                return;
+            }
 
-        // The GET is out. Nothing will report back if it dead-ends -- a
-        // contract nobody holds simply never answers -- so give it a
-        // deadline and say so if it passes.
-        gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
-        let mut state = crate::gateway::APP_STATE.write();
-        state.note_store_link_failed(
-            &contract_id,
-            "That store didn't load. The code may be wrong, or the store may \
+            // The GET is out. Nothing will report back if it dead-ends -- a
+            // contract nobody holds simply never answers -- so give it a
+            // deadline and say so if it passes.
+            gloo_timers::future::TimeoutFuture::new(LINK_LOAD_TIMEOUT_MS).await;
+            let mut state = crate::gateway::APP_STATE.write();
+            state.note_store_link_failed(
+                &contract_id,
+                "That store didn't load. The code may be wrong, or the store may \
              not be reachable right now.",
-        );
-        state.end_foreground_load(&contract_id);
-    });
+            );
+            state.end_foreground_load(&contract_id);
+        });
+    }
 }
 
 /// Load, in the background, every store this node remembers visiting that

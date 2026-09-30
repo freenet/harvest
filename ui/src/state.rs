@@ -34488,8 +34488,10 @@ mod store_code_tests {
 
         // A refusal answers the list only while no "Choose a Ghost Key" is
         // waiting; any other vault error does not answer it.
-        let mut state = AppState::default();
-        state.request_any_access_in_flight = true;
+        let mut state = AppState {
+            request_any_access_in_flight: true,
+            ..Default::default()
+        };
         state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
         assert!(!state.ghostkeys_answered, "that answered the choice");
         state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
