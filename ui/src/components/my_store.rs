@@ -75,26 +75,48 @@ pub(crate) struct SellerStore {
     pub unpriced: usize,
 }
 
-/// How many of `fingerprint`'s orders are paid and waiting to be sent, each
-/// judged by `stage_of` (`fulfilment::order_stage` against this node's view).
+/// Whether an order at `stage` is paid and waiting to be sent: the one rule
+/// the "Needs you" count, the Overview's order cards and the Orders tab all
+/// use. Past its send-by date and still unsent it needs the seller all the
+/// more (`OrderStage::needs_attention`, codex on harvest#177), and so does a
+/// Paid order this node cannot yet place against the chain (`Unknown`):
+/// without it, such an order lost its card and Mark as sent (review of #190).
+pub(crate) fn needs_sending(
+    order: &harvest_common::payment::AuthorizedOrder,
+    stage: crate::fulfilment::OrderStage,
+) -> bool {
+    match stage {
+        crate::fulfilment::OrderStage::AwaitingDespatch { .. }
+        | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => true,
+        crate::fulfilment::OrderStage::Unknown => {
+            order.status == harvest_common::payment::OrderStatus::Paid
+        }
+        _ => false,
+    }
+}
+
+/// `fingerprint`'s orders that are paid and waiting to be sent, each judged
+/// by `stage_of` (`fulfilment::order_stage` against this node's view).
+pub(crate) fn orders_to_send(
+    orders: &[harvest_common::payment::AuthorizedOrder],
+    fingerprint: &str,
+    stage_of: impl Fn(&harvest_common::payment::AuthorizedOrder) -> crate::fulfilment::OrderStage,
+) -> Vec<harvest_common::payment::AuthorizedOrder> {
+    orders
+        .iter()
+        .filter(|o| o.order.seller_fingerprint == fingerprint)
+        .filter(|o| needs_sending(o, stage_of(o)))
+        .cloned()
+        .collect()
+}
+
+/// How many of [`orders_to_send`] there are.
 pub(crate) fn paid_to_send(
     orders: &[harvest_common::payment::AuthorizedOrder],
     fingerprint: &str,
     stage_of: impl Fn(&harvest_common::payment::AuthorizedOrder) -> crate::fulfilment::OrderStage,
 ) -> usize {
-    orders
-        .iter()
-        .filter(|o| o.order.seller_fingerprint == fingerprint)
-        // Past its despatch window and still unsent it needs them all the
-        // more (`OrderStage::needs_attention`, codex on harvest#177).
-        .filter(|o| {
-            matches!(
-                stage_of(o),
-                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
-                    | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
-            )
-        })
-        .count()
+    orders_to_send(orders, fingerprint, stage_of).len()
 }
 
 /// What needs the seller across every store this device manages: requests
@@ -777,54 +799,27 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
     let setup_done = details_done && has_wallet && store.listings > 0;
     let mut go = move |t: Tab| tab.set(t);
 
-    let instant_checkout = APP_STATE
-        .read()
-        .instant_checkout_notice(&store.contract_id, crate::state::now_ms());
-    // ONE status, from what buyers see; this device's own reason only while
-    // they can't buy. Only for a store that sells (the notice is `None`
-    // otherwise).
-    let status = instant_checkout.clone().map(|notice| {
+    // ONE status, saying what happens to a buyer (`presence_flow::
+    // seller_status`). Only for a store that sells here.
+    let status = {
         let state = APP_STATE.read();
         let now = crate::state::now_ms();
-        crate::presence_flow::seller_status(
-            state.store_presence(&store.contract_id, now),
-            state.wakeups_seen_recently(now),
-            Some(notice),
-        )
-    });
-    let alerts = APP_STATE.read().instant_checkout_alerts(&store.contract_id);
-    // The paid orders to send, each on its own row with Mark as sent.
-    let to_send: Vec<harvest_common::payment::AuthorizedOrder> = {
-        let state = APP_STATE.read();
         state
-            .browsing_stores
-            .get(&store.contract_id)
-            .map(|s| {
-                s.orders
-                    .iter()
-                    .filter(|o| o.order.seller_fingerprint == store.fingerprint)
-                    .filter(|o| {
-                        let tip = state
-                            .bitcoin
-                            .tips
-                            .get(&o.order.network)
-                            .and_then(|t| t.tip_height);
-                        matches!(
-                            crate::fulfilment::order_stage(
-                                o,
-                                state.despatch_of(o).as_ref(),
-                                tip,
-                                state.payment_sight(o),
-                            ),
-                            crate::fulfilment::OrderStage::AwaitingDespatch { .. }
-                                | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
-                        )
-                    })
-                    .cloned()
-                    .collect()
+            .instant_checkout_local(&store.contract_id, now)
+            .map(|local| {
+                crate::presence_flow::seller_status(
+                    state.store_presence(&store.contract_id, now),
+                    state.wakeups_seen_recently(now),
+                    &local,
+                )
             })
-            .unwrap_or_default()
     };
+    let alerts = APP_STATE.read().instant_checkout_alerts(&store.contract_id);
+    // The paid orders to send, each on its own card with Mark as sent: the
+    // same list the count and the Orders tab use (`orders_to_send`).
+    let to_send = APP_STATE
+        .read()
+        .seller_orders_to_send(&store.contract_id, &store.fingerprint);
 
     let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
     let needs: bool = store.unpriced > 0
@@ -904,14 +899,6 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     order: order.clone(),
                 }
             }
-            if store.to_send > to_send.len() {
-                // Counted from another view than the cards above (a second
-                // Ghost Key's orders); point at the list rather than hide it.
-                div { class: "need row-between",
-                    strong { "More paid orders are waiting to be sent." }
-                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
-                }
-            }
             for alert in alerts.iter() {
                 p { class: "text-warning", "{alert}" }
             }
@@ -931,9 +918,9 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                 div { class: "need row-between",
                     span {
                         if store.expired_invoices == 1 {
-                            "1 unpaid invoice is too old for a buyer to start paying. Issue it again if they still want it."
+                            "1 unpaid invoice is too old for a buyer to start paying. Cancel it under Orders; the buyer can order again."
                         } else {
-                            "{store.expired_invoices} unpaid invoices are too old for a buyer to start paying. Issue them again if the buyers still want them."
+                            "{store.expired_invoices} unpaid invoices are too old for a buyer to start paying. Cancel them under Orders; the buyers can order again."
                         }
                     }
                     button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Orders), "Open orders" }
@@ -2061,8 +2048,12 @@ mod seller_stores_tests {
             order("fp", 2),
             order("other", 3),
             order("fp", 4),
+            order("fp", 5),
         ];
         let stage = |o: &AuthorizedOrder| match o.order.id.0[0] {
+            // Paid, but this node cannot place it against the chain yet: it
+            // still needs sending (review of #190).
+            5 => OrderStage::Unknown,
             1 | 3 => OrderStage::AwaitingDespatch {
                 paid_at: 1,
                 despatch_by: 2,
@@ -2078,8 +2069,8 @@ mod seller_stores_tests {
         };
         assert_eq!(
             paid_to_send(&orders, "fp", stage),
-            2,
-            "overdue still counts"
+            3,
+            "overdue and not-yet-placed paid orders still count"
         );
     }
 

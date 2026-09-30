@@ -890,6 +890,41 @@ impl AppState {
         })
     }
 
+    /// Whether this device answers buyers' orders for one of our stores, for
+    /// the seller's one status (`presence_flow::seller_status`). `None` for a
+    /// store that is not selling here.
+    pub fn instant_checkout_local(
+        &self,
+        store_contract_id: &[u8],
+        now_ms: u64,
+    ) -> Option<crate::presence_flow::LocalSelling> {
+        use crate::presence_flow::LocalSelling;
+        let notice = self.instant_checkout_notice(store_contract_id, now_ms)?;
+        if self.bitcoin.payment_xpub.is_none() {
+            return Some(LocalSelling::Blocked(notice));
+        }
+        Some(match self.auto_invoice.status.get(store_contract_id) {
+            None => LocalSelling::Starting,
+            Some(Err(_)) => LocalSelling::Blocked(notice),
+            Some(Ok(status)) => {
+                let hosted = status.last_background_run_ms.is_none()
+                    && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS;
+                if hosted || status.paused.is_some() {
+                    LocalSelling::Blocked(notice)
+                } else if status.last_background_run_ms.is_none() {
+                    LocalSelling::Starting
+                } else {
+                    LocalSelling::Ready {
+                        delegated: status
+                            .watch_delegation
+                            .as_ref()
+                            .is_some_and(|delegation| !delegation.stalled),
+                    }
+                }
+            }
+        })
+    }
+
     /// [`instant_checkout_alerts`] for one of our stores; empty when it has
     /// no status yet.
     pub fn instant_checkout_alerts(&self, store_contract_id: &[u8]) -> Vec<String> {
@@ -961,8 +996,6 @@ fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
     }
 }
 
-/// The store page's line for an armed store, led by any order that was paid
-/// after its item had gone to another buyer.
 /// What the seller must know about orders even while the store is open:
 /// paid orders the listing's count no longer covered (to refund or send by
 /// hand), and a buyer turned away by a cap in the last hour. Empty for none.
@@ -986,32 +1019,11 @@ pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
     alerts
 }
 
-pub fn instant_checkout_status_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
-    let line = instant_checkout_state_text(status, now_ms);
-    if status.oversold.is_empty() {
-        return line;
-    }
-    let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
-    format!(
-        "Paid when the listing's count no longer covered them (the item went to another \
-         buyer, or you marked it sold out or took it down): {}. Refund or fulfil these by \
-         hand. {line}",
-        orders.join(", ")
-    )
-}
-
-fn instant_checkout_state_text(status: &AutoInvoiceStatus, now_ms: u64) -> String {
-    let line = instant_checkout_state_line(status, now_ms);
-    match &status.capped {
-        Some(why) => format!(
-            "In the last hour a buyer couldn't order because {why}; they were told to try again \
-             later. {line}"
-        ),
-        None => line,
-    }
-}
-
-fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
+/// This device's line about taking orders: the reason buyers can't buy,
+/// said under the store's status while they can't (`presence_flow::
+/// seller_status`). The alerts that stand whether or not the store is open
+/// are [`instant_checkout_alerts`].
+pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> String {
     if status.last_background_run_ms.is_none()
         && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS
     {

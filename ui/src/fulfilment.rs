@@ -1692,6 +1692,42 @@ mod tests {
         );
     }
 
+    /// With no tip, no stage names a date or a duration it would have to
+    /// make up.
+    #[test]
+    fn with_no_tip_no_date_is_made_up() {
+        for stage in [
+            OrderStage::AwaitingDespatch {
+                paid_at: 1,
+                despatch_by: 1_000,
+            },
+            OrderStage::Despatched {
+                despatched_at: 1,
+                complaint_until: 3_000,
+            },
+            OrderStage::DespatchWindowClosed {
+                despatch_by: 1_000,
+                complaint_until: 3_000,
+            },
+        ] {
+            let said = stage
+                .describe(None, OrderStatus::Paid, NOW_MS)
+                .expect("said");
+            for made_up in ["Sep", "Oct", "about", "under"] {
+                assert!(!said.contains(made_up), "{stage:?}: {said}");
+            }
+        }
+    }
+
+    /// Dates across a month and a year, and in the past.
+    #[test]
+    fn a_date_is_counted_from_the_tip() {
+        assert_eq!(approx_date(1_000, 1_000, NOW_MS), "27 Sep");
+        assert_eq!(approx_date(1_000 + 144 * 4, 1_000, NOW_MS), "1 Oct");
+        assert_eq!(approx_date(1_000 - 144, 1_000, NOW_MS), "26 Sep");
+        assert_eq!(approx_date(1_000 + 144 * 100, 1_000, NOW_MS), "5 Jan");
+    }
+
     /// A record names the month, counted from the tip.
     #[test]
     fn a_record_names_the_month() {

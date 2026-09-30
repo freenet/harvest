@@ -410,15 +410,22 @@ fn notification_bar() -> Element {
     }
 }
 
-/// Each notice once, in the order first raised.
+/// Each notice once, in the order first raised; at most the latest
+/// [`NOTICES_SHOWN`] distinct ones.
 fn distinct_notices(notifications: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    notifications
+    let distinct: Vec<String> = notifications
         .iter()
         .filter(|n| seen.insert(n.as_str()))
         .cloned()
-        .collect()
+        .collect();
+    let skip = distinct.len().saturating_sub(NOTICES_SHOWN);
+    distinct.into_iter().skip(skip).collect()
 }
+
+/// How many distinct notices the bar shows at once: the latest. Nothing is
+/// dropped from the list itself; the bar just never becomes a wall again.
+const NOTICES_SHOWN: usize = 5;
 
 #[cfg(test)]
 mod notice_tests {
@@ -429,6 +436,12 @@ mod notice_tests {
         assert_eq!(
             super::distinct_notices(&raised),
             ["a", "b", "c"].map(String::from)
+        );
+        // Past the cap, the latest are shown.
+        let many: Vec<String> = (0..9).map(|n| n.to_string()).collect();
+        assert_eq!(
+            super::distinct_notices(&many),
+            ["4", "5", "6", "7", "8"].map(String::from)
         );
     }
 }

@@ -725,7 +725,7 @@ pub(crate) fn PurchaseCard(
                             Remedy::WalkAway => 3,
                         }) {
                             Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
-                            Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. The seller can fix it by issuing the order again.",
+                            Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. Buy it again to get an order you can pay, or ask the seller.",
                             Some(Remedy::AskAgain) => "No payment details are shown while that is true. Send your request to buy again from this device: a request from this version of Harvest carries your key, and the seller can answer it with an order you can pay.",
                             Some(Remedy::BuyAgain) => "No payment details are shown while that is true. Buy it again to get an order you can pay.",
                             _ => "No payment details are shown while that is true. Look again in a moment.",
@@ -1559,7 +1559,8 @@ struct BuyerValues {
 pub enum Remedy {
     /// Nothing is wrong; this node is not ready yet. Look again shortly.
     Wait,
-    /// The seller can put this right by issuing the order again.
+    /// The seller got this order wrong; a new order (the buyer buys again,
+    /// or asks the seller) puts it right.
     AskTheSeller,
     /// Only a new request can put this right: the order answers a request
     /// that did not carry what it lacks, and a seller reissuing it would copy

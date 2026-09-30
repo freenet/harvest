@@ -1,5 +1,8 @@
-//! Issuing invoices: the seller's payment key, and the form that turns a
-//! listing into a signed order on their store contract.
+//! The seller's orders at a store, the payout wallet (payment key) form, and
+//! the controls on an order: Mark as sent, and cancelling an unpaid invoice.
+//! Invoices are no longer issued from a form here: buyers pay through Buy
+//! now, and a request the store did not answer is answered by hand from the
+//! message thread (`buy_view::AcceptRequest`).
 //!
 //! # Why the seller issues the invoice
 //!
@@ -19,15 +22,14 @@
 //! drops a watch about a day after the request that last asked for it, and it
 //! does not look back over blocks it scanned while not watching
 //! (freenet-bitcoin#7), so a payment made during a lapse is never picked up.
-//! [`PaymentWatchNote`] says that, because otherwise an invoice stuck at
-//! "Awaiting payment" would read as a payment that never came.
+//! Since harvest#179 the seller's delegate renews its own watches on its
+//! wake-ups, with no tab open, so the page no longer warns the seller to
+//! open Harvest more than once a day.
 
 use dioxus::prelude::*;
 use freenet_bitcoin_common::BitcoinNetwork;
-use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingId};
 
 use crate::gateway::{bitcoin_config, bitcoin_ops, APP_STATE};
-use crate::state::PendingInvoice;
 
 /// The networks the picker offers.
 ///
@@ -54,43 +56,27 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
 /// invoice with no buyer's request behind it has nobody to pay it.
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
-    let (to_send, others, live, needs_reissue) = {
+    let (to_send, others, live, needs_reissue, loaded) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
-        let mine = invoices_issued_by(
+        // The same list as "Needs you" (`AppState::seller_orders_to_send`).
+        let to_send = state.seller_orders_to_send(&store_contract_id, &seller_fingerprint);
+        let others: Vec<_> = invoices_issued_by(
             store.map(|s| s.orders.as_slice()).unwrap_or_default(),
             &seller_fingerprint,
             |id| state.withheld_settlements.contains_key(id),
-        );
+        )
+        .into_iter()
+        .filter(|o| !to_send.iter().any(|t| t.order.id == o.order.id))
+        .collect();
         // Decided once, here, against this node's own view of the chain --
         // the same read `payment_blockers` makes on the buyer's side, so the
         // two cannot disagree about whether an order has aged out.
-        let needs_reissue: std::collections::HashSet<harvest_common::payment::OrderId> = mine
+        let needs_reissue: std::collections::HashSet<harvest_common::payment::OrderId> = others
             .iter()
             .filter(|order| state.needs_reissue(order))
             .map(|order| order.order.id.clone())
             .collect();
-        let stage_of = |order: &harvest_common::payment::AuthorizedOrder| {
-            let tip = state
-                .bitcoin
-                .tips
-                .get(&order.order.network)
-                .and_then(|t| t.tip_height);
-            crate::fulfilment::order_stage(
-                order,
-                state.despatch_of(order).as_ref(),
-                tip,
-                state.payment_sight(order),
-            )
-        };
-        // The same rule as "Needs you" (`my_store::paid_to_send`).
-        let (to_send, others): (Vec<_>, Vec<_>) = mine.into_iter().partition(|order| {
-            matches!(
-                stage_of(order),
-                crate::fulfilment::OrderStage::AwaitingDespatch { .. }
-                    | crate::fulfilment::OrderStage::DespatchWindowClosed { .. }
-            )
-        });
         (
             to_send,
             others,
@@ -98,13 +84,18 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
             needs_reissue,
+            // "No orders yet" and "this store's state has not arrived" look
+            // alike through an empty list.
+            state.store_details_are_resolved(&store_contract_id),
         )
     };
 
     rsx! {
         div { class: "card",
             h3 { "Orders" }
-            if to_send.is_empty() && others.is_empty() {
+            if !loaded {
+                p { class: "text-muted text-italic", "Loading this store\u{2019}s orders\u{2026}" }
+            } else if to_send.is_empty() && others.is_empty() {
                 p { class: "text-muted", "No orders yet. Paid orders appear here." }
             }
             for order in to_send.iter() {
@@ -115,7 +106,7 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 }
             }
             if !others.is_empty() {
-                h4 { class: "orders-earlier", "Earlier orders" }
+                h4 { class: "orders-earlier", "Other orders" }
                 for order in others.iter() {
                     // One keyed node per invoice, wrapping both, because a
                     // `key` is only honoured on the first node of a block.
@@ -130,7 +121,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                         if needs_reissue.contains(&order.order.id) {
                             p { class: "text-warning",
                                 "Invoice {order.order.id.short()} has expired: it is too old for a \
-                                 buyer's software to accept, so nobody can pay it now."
+                                 buyer's software to accept, so nobody can pay it now. Cancel it; \
+                                 the buyer can order again."
                             }
                         }
                         super::bitcoin_view::OrderCard {
@@ -139,6 +131,16 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                         }
                         if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
                             CancelInvoice {
+                                store_contract_id: store_contract_id.clone(),
+                                order_id: order.order.id.clone(),
+                            }
+                        }
+                        // A paid order past every window can still be marked
+                        // as sent late, which extends the buyer's time to
+                        // report a problem (`despatch_preconditions`); the
+                        // control hides itself once a despatch is recorded.
+                        if order.status == harvest_common::payment::OrderStatus::Paid {
+                            MarkDespatched {
                                 store_contract_id: store_contract_id.clone(),
                                 order_id: order.order.id.clone(),
                             }
@@ -153,13 +155,17 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
 /// One paid order still to send, as the seller packs it: what, how many,
 /// where to, by when, and Mark as sent. What to pack and where come from the
 /// buyer's Buy now request (`AppState::seller_order_request`); an order
-/// without one says to read the messages.
+/// without one, or with two that differ, says where to look instead. The
+/// warnings a seller needs before sending stay on the card: one payment
+/// that may also have settled another order (harvest#77), and an order
+/// paid after it sold out.
 #[component]
 pub(crate) fn SellerOrderCard(
     store_contract_id: Vec<u8>,
     order: harvest_common::payment::AuthorizedOrder,
 ) -> Element {
-    let (request, tip_height, stage) = {
+    use crate::state::SellerRequest;
+    let (request, tip_height, stage, twins, oversold) = {
         let state = APP_STATE.read();
         let tip = state
             .bitcoin
@@ -172,29 +178,39 @@ pub(crate) fn SellerOrderCard(
             tip,
             state.payment_sight(&order),
         );
+        let oversold = matches!(
+            state.auto_invoice.status.get(&store_contract_id),
+            Some(Ok(status)) if status.oversold.contains(&order.order.id)
+        );
         (
-            state.seller_order_request(&store_contract_id, &order.order.id),
+            state.seller_order_request(&store_contract_id, &order),
             tip,
             stage,
+            state.paid_twins(&order),
+            oversold,
         )
     };
     let now = crate::state::now_ms();
     let what = match &request {
-        Some(r) => format!(
+        SellerRequest::Found(r) => format!(
             "{} \u{00d7} {}",
             r.title.as_deref().unwrap_or("An item no longer listed"),
             r.quantity
         ),
-        None => format!("Order {}", order.order.id.short()),
+        _ => format!("Order {}", order.order.id.short()),
+    };
+    let when = |height: u32, tip: u32| {
+        format!(
+            "{} ({})",
+            crate::fulfilment::approx_date(height, tip, now),
+            crate::fulfilment::approx_duration(height.saturating_sub(tip))
+        )
     };
     let send_by = match (stage, tip_height) {
-        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => Some((
-            false,
-            format!(
-                "Send by about {}.",
-                crate::fulfilment::approx_date(despatch_by, tip, now)
-            ),
-        )),
+        _ if oversold => None,
+        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => {
+            Some((false, format!("Send by about {}.", when(despatch_by, tip))))
+        }
         (crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. }, Some(tip)) => {
             Some((
                 true,
@@ -205,7 +221,11 @@ pub(crate) fn SellerOrderCard(
                 ),
             ))
         }
-        _ => None,
+        _ => Some((
+            false,
+            "Paid. The date to send it by shows once your node has caught up with Bitcoin."
+                .to_string(),
+        )),
     };
     let amount = super::pay_card::amount_text(order.order.amount_sats, order.order.network);
     let test = super::pay_card::is_test_network(order.order.network);
@@ -223,11 +243,27 @@ pub(crate) fn SellerOrderCard(
                 }
                 span { class: "text-muted small", " \u{00b7} order {order.order.id.short()}" }
             }
+            if oversold {
+                p { class: "text-warning",
+                    strong { "Paid after it sold out. " }
+                    "The item went to another buyer, or you marked it sold out or took it down, \
+                     before this payment arrived. Refund the buyer, or make one and send it. \
+                     Message them either way."
+                }
+            }
+            if !twins.is_empty() {
+                p { class: "text-warning",
+                    "Your order {twins.join(\", \")} uses this same payment address, and the \
+                     payment that settled this one also falls inside its window. One payment \
+                     can\u{2019}t pay for both: check your wallet for a separate payment per \
+                     order before sending both."
+                }
+            }
             if let Some((late, line)) = send_by {
                 p { class: if late { "text-warning" } else { "" }, strong { "{line}" } }
             }
             match &request {
-                Some(r) => rsx! {
+                SellerRequest::Found(r) => rsx! {
                     p { class: "order-label", "Send to" }
                     p { class: "order-ship-to", "{r.shipping}" }
                     if let Some(region) = &r.region {
@@ -241,9 +277,17 @@ pub(crate) fn SellerOrderCard(
                         p { class: "order-ship-to", "{r.note}" }
                     }
                 },
-                None => rsx! {
+                SellerRequest::Conflict => rsx! {
+                    p { class: "text-warning",
+                        "The buyer sent more than one version of this order. Read their messages \
+                         on the Orders tab, and ask them which address to use before sending."
+                    }
+                },
+                SellerRequest::NotFound => rsx! {
                     p { class: "text-muted",
-                        "The buyer\u{2019}s address is in their messages below."
+                        "What to send and where is in the buyer\u{2019}s messages on the Orders \
+                         tab. If they can\u{2019}t be read on this device, open Harvest where you \
+                         set up the store."
                     }
                 },
             }
@@ -619,32 +663,9 @@ fn save_payment_key(xpub: String, network: BitcoinNetwork) {
     let _ = (xpub, network, bitcoin_ops::set_payment_xpub);
 }
 
-/// Start issuing an invoice, and say why if nothing happens.
-///
-/// `AppState::issue_invoice` owns every check -- the store has to be one of
-/// ours, signed by the identity that owns it, for a real amount, with a
-/// payment key set -- so this is only the reporting.
-fn issue_invoice(invoice: PendingInvoice) {
-    let title = invoice.listing_title.clone();
-    let outcome = APP_STATE.write().issue_invoice(invoice);
-    match outcome {
-        Ok(()) => APP_STATE
-            .write()
-            .notifications
-            .push(format!("Issuing an invoice for '{title}'\u{2026}")),
-        Err(e) => {
-            dioxus::logger::tracing::error!("Could not issue an invoice: {e}");
-            APP_STATE
-                .write()
-                .notifications
-                .push(format!("Could not issue an invoice: {e}"));
-        }
-    }
-}
-
 /// The confirmations a seller typed, or why an order may not require that
-/// many. Shared by this form and the accept control in `buy_view`, so both
-/// refuse the same values.
+/// many. Used by the accept control in `buy_view`, so every hand-issued
+/// order refuses the same values.
 ///
 /// At least one: accepting zero would count a payment as settled while it is
 /// still only in the mempool. At most
@@ -797,30 +818,6 @@ mod tests {
         for refused in ["0", "", "two", "-1"] {
             let why = parse_required_confirmations(refused).expect_err(refused);
             assert!(why.contains("At least one"), "{refused}: {why}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod issuable_tests {
-    use super::*;
-    use harvest_common::listing::{Listing, ListingKind, ListingStatus};
-
-    fn listing(n: u8) -> AuthorizedListing {
-        AuthorizedListing {
-            listing: Listing {
-                checkout: None,
-                choices: Vec::new(),
-                id: ListingId([n; 32]),
-                title: format!("Item {n}"),
-                description: String::new(),
-                kind: ListingKind::Sale,
-                price: None,
-                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-            },
-            scoped_payload: Vec::new(),
-            signature: Vec::new(),
-            certificate_pem: String::new(),
         }
     }
 }

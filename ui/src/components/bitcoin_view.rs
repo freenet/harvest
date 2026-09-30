@@ -989,7 +989,7 @@ impl AddressReading {
         if self.no_anchor {
             return Some(
                 "This invoice names no Bitcoin block it was made at, so no payment can ever \
-                 settle it. Issue a new invoice."
+                 settle it. Cancel it; the buyer can order again."
                     .to_string(),
             );
         }
@@ -1006,7 +1006,8 @@ impl AddressReading {
             } else {
                 "This address already holds a payment that confirmed before this invoice \
                  was made. It paid for something else and does not settle this invoice, so \
-                 do not ship against it. Issue a new invoice, which gets a new address."
+                 do not ship against it. Cancel it; the buyer can order again, which gets a \
+                 new address."
                     .to_string()
             });
         }
