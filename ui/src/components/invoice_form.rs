@@ -312,18 +312,20 @@ pub(crate) fn SellerOrderCard(
                         p { class: "order-ship-to", "{r.note}" }
                     }
                 },
-                SellerRequest::Conflict => rsx! {
+                SellerRequest::Conflict(versions) => rsx! {
                     p { class: "text-warning",
-                        "The buyer sent more than one version of this order (a different address, \
-                         quantity or choice). Read their messages on the Orders tab, and ask them \
-                         which is right before sending."
+                        "The buyer sent more than one version of this order. Ask them which is \
+                         right before sending."
+                    }
+                    for (i , v) in versions.iter().enumerate() {
+                        p { class: "order-label", "Version {i + 1}: {v.quantity}" }
+                        p { class: "order-ship-to", "{v.shipping}" }
                     }
                 },
                 SellerRequest::NotFound => rsx! {
                     p { class: "text-muted",
-                        "What to send and where is in the buyer\u{2019}s messages on the Orders \
-                         tab. If they can\u{2019}t be read on this device, open Harvest where you \
-                         set up the store."
+                        "This order\u{2019}s details can\u{2019}t be read on this device. Open \
+                         Harvest where you set up the store, or ask the buyer."
                     }
                 },
             }

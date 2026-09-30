@@ -96,6 +96,14 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
             all,
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
             |tag| paid.contains(tag),
+            |entry| {
+                request_address_hidden(
+                    entry,
+                    published_orders,
+                    app_state.conversation_keys.get(entry.conversation()),
+                    |order| app_state.address_retained_for(order),
+                )
+            },
             |digest| app_state.authored_here(&store_contract_id, digest),
         );
         // The only authorship this client can establish: what it sent itself.
@@ -1202,6 +1210,10 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 ///   paid, [`SHIPPING_SHOWN_ONCE_PAID`]) and Buy now picks (region, choices),
 ///   and a decline's `reason`.
 ///
+/// A request whose order's complaint window has closed (`address_hidden`,
+/// [`request_address_hidden`]) shows [`crate::fulfilment::ADDRESS_HIDDEN`] in
+/// place of its address, and no note, wherever it is.
+///
 /// Whatever this tab wrote itself (`authored_here`, by digest) is shown as
 /// written: it is the seller's own text.
 ///
@@ -1215,10 +1227,58 @@ pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
     paid: impl Fn(&[u8; 32]) -> bool,
+    address_hidden: impl Fn(&MailboxEntry) -> bool,
     authored_here: impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
     let (verdicts, opened) = verdicts_and_open(&entries, &verifies, &paid);
-    shown_given(entries, verdicts, &opened, authored_here)
+    shown_given(entries, verdicts, &opened, address_hidden, authored_here)
+}
+
+/// Whether the request `entry` is answered by one of the store's orders
+/// whose ship-to address the seller's app no longer shows (`retained` false,
+/// `AppState::address_retained_for`: its complaint window has closed). A Buy
+/// now is matched by its request id, a quote request by the order carrying
+/// its binding and its listing's tag under this conversation's keys.
+/// [`shown_to_seller`] then shows [`crate::fulfilment::ADDRESS_HIDDEN`] in
+/// place of the address and blanks the note.
+pub(crate) fn request_address_hidden(
+    entry: &MailboxEntry,
+    published: &[harvest_common::payment::AuthorizedOrder],
+    keys: Option<&crate::messaging::ConversationKeys>,
+    retained: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+) -> bool {
+    let MailboxEntry::Readable {
+        conversation,
+        content:
+            MessageContent::OrderRequest {
+                listing_id,
+                order_binding,
+                instant,
+                ..
+            },
+        ..
+    } = entry
+    else {
+        return false;
+    };
+    let Ok(tag) = <[u8; 32]>::try_from(conversation.as_slice()) else {
+        return false;
+    };
+    let answering = |order: &harvest_common::payment::AuthorizedOrder| match instant {
+        Some(selection) => selection
+            .answered_request(&tag)
+            .is_some_and(|request| request.order_id() == order.order.id),
+        None => {
+            order.order.request_id.is_none()
+                && order.order.order_binding == Some(*order_binding)
+                && keys.is_some_and(|keys| {
+                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
+                })
+        }
+    };
+    published
+        .iter()
+        .any(|order| answering(order) && !retained(order))
 }
 
 /// The conversations a seller's inbox shows free text in (see
@@ -1264,6 +1324,7 @@ fn shown_given(
     entries: Vec<MailboxEntry>,
     verdicts: Vec<bool>,
     opened: &std::collections::HashSet<Vec<u8>>,
+    address_hidden: impl Fn(&MailboxEntry) -> bool,
     authored_here: impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
     use crate::messaging::Addressing;
@@ -1277,7 +1338,18 @@ fn shown_given(
             continue;
         }
         let open = opened.contains(entry.conversation());
+        let hide_address = address_hidden(&entry);
         let keep = match &mut entry {
+            // Past the order's complaint window: hidden, not counted (it is
+            // no buyer's message held back, and nothing is deleted).
+            MailboxEntry::Readable {
+                content: MessageContent::OrderRequest { note, shipping, .. },
+                ..
+            } if hide_address => {
+                note.clear();
+                *shipping = crate::fulfilment::ADDRESS_HIDDEN.to_string();
+                true
+            }
             MailboxEntry::Readable {
                 content: MessageContent::VouchedText { .. },
                 ..
@@ -2111,6 +2183,77 @@ mod inbox_tests {
         );
     }
 
+    /// A request's address is hidden only when the order answering IT is
+    /// past its window: a Buy now's own order by request id, a quote's by
+    /// binding and listing tag under this conversation's keys. Another
+    /// order, another binding, or no keys hides nothing. Red with the
+    /// binding check dropped, and with the retention verdict ignored.
+    #[test]
+    fn only_the_answering_orders_window_hides_a_requests_address() {
+        let id = ListingId([9u8; 32]);
+        let selection = crate::messaging::InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [4; 16],
+            region: None,
+            choices: vec![],
+            expected_total_sats: 12_000,
+        };
+        let buy_now = readable(
+            MessageContent::OrderRequest {
+                instant: Some(selection.clone()),
+                listing_id: id.clone(),
+                quantity: 1,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+                order_binding: BINDING,
+                buyer_receipt_key: None,
+            },
+            [1u8; 32],
+        );
+        let mut own = published(1, Some(BINDING), None);
+        own.order.id = selection.answered_request(&[1u8; 32]).unwrap().order_id();
+        let k = keys();
+        assert!(request_address_hidden(
+            &buy_now,
+            &[own.clone()],
+            Some(&k),
+            |_| false
+        ));
+        assert!(!request_address_hidden(&buy_now, &[own], Some(&k), |_| {
+            true
+        }));
+        let other = published(2, Some(BINDING), None);
+        assert!(!request_address_hidden(
+            &buy_now,
+            &[other],
+            Some(&k),
+            |_| false
+        ));
+
+        let quote = request(id.clone(), 1, [2u8; 32]);
+        let invoice = published(3, Some(BINDING), Some(k.listing_tag(&id)));
+        assert!(request_address_hidden(
+            &quote,
+            std::slice::from_ref(&invoice),
+            Some(&k),
+            |_| false
+        ));
+        assert!(!request_address_hidden(
+            &quote,
+            std::slice::from_ref(&invoice),
+            None,
+            |_| false
+        ));
+        let mut elsewhere = invoice;
+        elsewhere.order.order_binding = Some([0x11; 32]);
+        assert!(!request_address_hidden(
+            &quote,
+            &[elsewhere],
+            Some(&k),
+            |_| false
+        ));
+    }
+
     /// The count beside Orders is the number of accept controls the inbox
     /// would show, summed over conversations, each judged with its OWN keys,
     /// less requests for a listing not on sale or not in the store.
@@ -2669,6 +2812,7 @@ mod voucher_view_tests {
                 crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
             },
             |tag| *tag == PAID,
+            |entry| entry.digest() == [CLOSED; 32],
             |digest| *digest == [AUTHORED; 32],
         )
     }
@@ -2676,6 +2820,44 @@ mod voucher_view_tests {
     /// The first byte of the digest of what this tab wrote itself, in these
     /// tests (`entry` makes a digest of the tag's first byte).
     const AUTHORED: u8 = 7;
+
+    /// The first byte of the digest of a request whose order's complaint
+    /// window has closed, in these tests.
+    const CLOSED: u8 = 8;
+
+    /// A request whose order is past its complaint window shows the hidden
+    /// line in place of its address, and no note, in a conversation that is
+    /// open; nothing is counted as held back. Mutated red by dropping the
+    /// arm.
+    #[test]
+    fn a_closed_orders_address_is_hidden() {
+        let mut closed = buy_now([CLOSED; 32], "flat 3, side door");
+        let entries = vec![closed.clone()];
+        let (shown_entries, hidden) = shown_to_seller(
+            entries,
+            |_, _| false,
+            |_| true,
+            |entry| entry.digest() == [CLOSED; 32],
+            |_| false,
+        );
+        assert_eq!(hidden, 0);
+        assert_eq!(
+            free_text(&shown_entries[0]),
+            (String::new(), crate::fulfilment::ADDRESS_HIDDEN.to_string())
+        );
+        // Any other request in the same open conversation keeps its address.
+        if let MailboxEntry::Readable { digest, .. } = &mut closed {
+            *digest = [9; 32];
+        }
+        let (kept, _) = shown_to_seller(
+            vec![closed],
+            |_, _| false,
+            |_| true,
+            |e| e.digest() == [CLOSED; 32],
+            |_| false,
+        );
+        assert_eq!(free_text(&kept[0]).1, "12 Example St");
+    }
 
     fn buy_now(tag: [u8; 32], note: &str) -> MailboxEntry {
         buy_now_picking(tag, note, None, vec![])
