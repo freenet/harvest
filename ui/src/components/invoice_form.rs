@@ -117,7 +117,9 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         let listed_ids: Vec<&harvest_common::payment::OrderId> =
             listed.iter().map(|order| &order.order.id).collect();
         let questions = super::message_view::seller_questions(&inbox, &listed_ids);
-        let homes = super::message_view::thread_homes(&inbox, &listed);
+        let homes = super::message_view::thread_homes(&inbox, &listed, |order| {
+            to_send.iter().any(|t| t.order.id == order.order.id)
+        });
         (
             to_send,
             others,

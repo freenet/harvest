@@ -400,8 +400,9 @@ listings the store lists. A store's listings set is grow-only (an edited or
 withdrawn listing stays in it), so an order stays matched after its request
 leaves the bounded mailbox, even if the mailbox is flooded to evict it. What
 can close it: the request gone AND the listing not in the store's listings
-(a store whose listings did not come across a migration), or the store's copy
-of the order dropping from `Paid`. Then the seller's inbox holds the buyer's
+(a store whose listings did not come across a migration), the order pruned
+from the store by its order cap (`MAX_ORDERS`, oldest out), or the store's copy of
+the order dropping from `Paid`. Then the seller's inbox holds the buyer's
 plain text back, and says it could not match it to a paid order.
 
 **Conversation tags must be canonical and torsion-free.** A tag has twins
@@ -438,7 +439,9 @@ counted.
 and the note goes too. Hidden, not deleted: it stays encrypted in the store's
 mailbox contract (no owner delete; entries leave only by its caps), the store
 key can decrypt it for the store's life, and a mailbox migration copies it.
-With no chain tip the window can't be judged and the address stays.
+With no chain tip the window can't be judged and the address stays, and a
+paid order never marked as sent keeps it too: the seller still owes it and
+may send it late, which extends the buyer's window.
 
 A buyer's plain text sealed before the gate existed, and the seller's own
 replies in a conversation nothing opens, are no longer shown to the seller.
