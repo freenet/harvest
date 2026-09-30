@@ -491,9 +491,17 @@ pub enum HarvestDelegateRequest {
         wrapped: crate::custody::WrappedStoreKey,
     },
 
-    /// The public halves of the keys that derive from a store key: its inbox
-    /// (X25519) key and its record (RSA) key. Answered with
-    /// [`HarvestDelegateResponse::StoreSubkeys`].
+    /// The public half of the inbox (X25519) key that derives from a store
+    /// key. Answered with [`HarvestDelegateResponse::StoreSubkeys`].
+    ///
+    /// It no longer answers the store's RSA record key. Deriving that key is
+    /// an RSA-2048 key generation, which in the delegate took 1 to over 5
+    /// seconds depending on the store key and the machine's load, past the
+    /// node's 5 s limit on one delegate call; and the key a store key
+    /// derives is fixed, so a store key over the limit failed on every
+    /// retry. Nothing a store makes today is addressed by that key
+    /// (harvest#53 Phase C addresses the reputation record by the store key
+    /// alone), so it is no longer derived at all.
     GetStoreSubkeys {
         request_id: RequestId,
         store_verifying_key: [u8; 32],
@@ -1535,12 +1543,13 @@ impl core::fmt::Debug for WrapSignature {
 }
 
 /// The public halves of the keys a store key derives (harvest#93 phase 1b).
+///
+/// The RSA record key is not among them any more: see
+/// [`HarvestDelegateRequest::GetStoreSubkeys`] for why.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct StoreSubkeyInfo {
     /// X25519: what buyers encrypt to (`StoreInfoV1::encryption_public_key`).
     pub inbox_public_key: [u8; 32],
-    /// RSA-2048, PKCS#1 DER (`StoreInfoV1::record_public_key`).
-    pub record_public_key: Vec<u8>,
 }
 
 /// A store-key signature: the envelope and the Ed25519 signature over it, the
@@ -1976,7 +1985,6 @@ mod tests {
                 store_verifying_key: [17u8; 32],
                 result: Ok(StoreSubkeyInfo {
                     inbox_public_key: [20u8; 32],
-                    record_public_key: vec![21u8; 8],
                 }),
             },
             R::KeptPurchases {

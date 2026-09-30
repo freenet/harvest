@@ -158,7 +158,6 @@ impl AppState {
             certificate_pem: String::new(),
             store_name: details.store_name,
             description: details.description,
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: None,
             store_key_request: Some(store_key_request),
@@ -862,8 +861,7 @@ pub(crate) mod tests {
             certificate_pem: "CERT".to_string(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            rsa_public_key_der: Some(vec![1, 2, 3]),
-            encryption_public_key: None,
+            encryption_public_key: Some([0x1b; 32]),
             store_verifying_key: Some(store_key().verifying_key().to_bytes()),
             store_key_request: Some(1),
             carried_listings: Vec::new(),
@@ -954,7 +952,7 @@ pub(crate) mod tests {
         {
             let pending = state.pending_store_creation.as_mut().unwrap();
             pending.certificate_pem = "CERT".to_string();
-            pending.rsa_public_key_der = Some(vec![1]);
+            pending.encryption_public_key = Some([1; 32]);
         }
         state.start_store_creation_if_ready();
         assert!(queued_statement(&state).is_none(), "no store key yet");
@@ -1062,14 +1060,13 @@ pub(crate) mod tests {
 
     /// The Harvest delegate's answer to `GetStoreSubkeys` for `store_key()`,
     /// as the real path receives it (#99 re-check: a retry must not depend
-    /// on a hand-filled record key).
+    /// on a hand-filled inbox key).
     fn answer_subkeys(state: &mut AppState) {
         state.on_delegate_response(HarvestDelegateResponse::StoreSubkeys {
             request_id: 0,
             store_verifying_key: store_key().verifying_key().to_bytes(),
             result: Ok(harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: [0x1b; 32],
-                record_public_key: vec![0x2e; 4],
             }),
         });
     }
@@ -1231,7 +1228,7 @@ pub(crate) mod tests {
         {
             let pending = state.pending_store_creation.as_mut().unwrap();
             pending.certificate_pem = "CERT".to_string();
-            pending.rsa_public_key_der = Some(vec![1]);
+            pending.encryption_public_key = Some([1; 32]);
         }
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
             request_id: request,

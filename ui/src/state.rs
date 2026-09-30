@@ -436,12 +436,6 @@ pub struct AppState {
     /// and then on the Harvest delegate's answer. See `custody_flow`.
     pub pending_custody: std::collections::BTreeMap<[u8; 32], crate::custody_flow::CustodyRequest>,
 
-    /// Store keys whose record key, as this device derives it, differs from
-    /// the one the store publishes (#99 review). No edit is published from
-    /// this device for such a store: it would publish a record key that is
-    /// not the store's.
-    pub record_key_mismatch: HashSet<[u8; 32]>,
-
     /// When each `pending_custody` request started, for its timeout
     /// (`custody_flow::CUSTODY_TIMEOUT_MS`).
     pub custody_started_ms: std::collections::BTreeMap<[u8; 32], u64>,
@@ -884,23 +878,19 @@ pub struct PendingStoreCreation {
     pub certificate_pem: String,
     pub store_name: String,
     pub description: String,
-    /// The store's record public key, from `StoreSubkeys` (harvest#93 phase
-    /// 1b), published in `StoreInfoV1::record_public_key` so another device
-    /// can check its own derivation. No longer a reputation parameter
-    /// (harvest#53 Phase C). `None` until it arrives.
-    pub rsa_public_key_der: Option<Vec<u8>>,
     /// Filled from the store key's inbox key (`custody_flow`'s
     /// `fill_creation_from_subkeys`, harvest#93 phase 1b); the per-Ghost-Key
     /// key `EncryptionKeyReady` answers is only for stores made before store
     /// keys.
     ///
-    /// **Not** part of the readiness gate, unlike the two above. Creation
-    /// waits on the certificate and the RSA key because a store without
-    /// either is broken in ways only a fresh signature can repair; a store
-    /// without an encryption key is one buyers cannot message, which
-    /// `store_details_gap` reports and re-publishing fixes. Adding a third
-    /// thing to wait on would add a third way for a creation to hang
-    /// forever, and this one has a recovery path that those do not.
+    /// Part of the readiness gate: it is how creation knows the store key's
+    /// subkeys arrived. Creation used to wait on the RSA record key from the
+    /// same answer instead, and publish this if it happened to be there; the
+    /// record key is no longer derived (see
+    /// `HarvestDelegateRequest::GetStoreSubkeys`), so this is what the
+    /// answer now brings, and waiting on it adds no new way to hang: it
+    /// arrives, or `release_waiters_on_subkeys` fails the creation, exactly
+    /// as the record key did.
     ///
     pub encryption_public_key: Option<[u8; 32]>,
     /// The new store's own key (harvest#93), filled by the harvest delegate's
@@ -5377,10 +5367,6 @@ impl AppState {
                     // Key, or recover it here if this device has lost it
                     // (harvest#93 phase 1b). See `custody_flow`.
                     self.start_custody_for(&contract_id);
-                    // Details that arrive after this device derived the
-                    // store's keys are checked too, and a block lifts when a
-                    // later check agrees (#99 re-check).
-                    self.recheck_record_key(&contract_id);
                     // The backer's index, for the one-store-per-key rule and
                     // to keep our own index complete (harvest#93 phase 1c).
                     self.on_store_state_for_index(&contract_id);
@@ -10077,29 +10063,27 @@ impl AppState {
         let Some(edit) = self.pending_store_edit.take() else {
             return false;
         };
-        if self
-            .work_store_key(&edit.store_contract_id)
-            .is_some_and(|key| self.record_key_mismatch.contains(&key.to_bytes()))
-        {
-            self.notifications.push(
-                "Not published: this device derives a different record key for this store than \
-                 the one it publishes. Publish from a device that agrees."
-                    .to_string(),
-            );
-            return false;
-        }
-
-        // A store with its own key publishes the keys it derives (harvest#93
-        // phase 1b), so every device agrees on them; wait for them if this
-        // device has not asked yet. A store made before store keys keeps the
-        // per-device key of its Ghost Key.
+        // A store with its own key publishes the inbox key it derives
+        // (harvest#93 phase 1b), so every device agrees on it; wait for it if
+        // this device has not asked yet. A store made before store keys keeps
+        // the per-device key of its Ghost Key.
+        //
+        // The record key is carried over from what the store already
+        // publishes, never derived: nothing a store makes today is addressed
+        // by it (harvest#53 Phase C), but a store that published one before
+        // then keeps it, since it is how the reputation migration finds that
+        // store's older records (`reputation_locators`). Deriving it was an
+        // RSA-2048 key generation that could run past the node's 5 s limit on
+        // a delegate call (see `HarvestDelegateRequest::GetStoreSubkeys`).
+        let published_record_key = self
+            .browsing_stores
+            .get(&edit.store_contract_id)
+            .and_then(|s| s.info.as_ref())
+            .and_then(|i| i.record_public_key.clone());
         let (encryption_public_key, record_public_key) =
             match self.work_store_key(&edit.store_contract_id) {
                 Some(store_key) => match self.store_subkeys.get(&store_key.to_bytes()) {
-                    Some(sub) => (
-                        Some(sub.inbox_public_key),
-                        Some(sub.record_public_key.clone()),
-                    ),
+                    Some(sub) => (Some(sub.inbox_public_key), published_record_key),
                     None => {
                         self.pending_store_edit = Some(edit);
                         self.request_store_subkeys(store_key.to_bytes());
@@ -11944,7 +11928,7 @@ impl AppState {
             self.pending_store_creation.as_ref(),
             Some(pending)
                 if !pending.certificate_pem.is_empty()
-                    && pending.rsa_public_key_der.is_some()
+                    && pending.encryption_public_key.is_some()
                     && pending.store_verifying_key.is_some()
         );
         if !ready {
@@ -15088,7 +15072,6 @@ mod tests {
             test_store_key(),
             harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: STORE_INBOX_KEY,
-                record_public_key: STORE_RECORD_KEY.to_vec(),
             },
         );
         let held = |version: u32| {
@@ -16321,7 +16304,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: Some(crate::state::test_store_key()),
             store_key_request: None,
@@ -16346,7 +16328,6 @@ mod tests {
             store_verifying_key: store,
             result: Ok(harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: [4u8; 32],
-                record_public_key: vec![9u8; 8],
             }),
         }
     }
@@ -16387,7 +16368,10 @@ mod tests {
             .as_ref()
             .expect("creation must wait for the certificate, not publish without it");
         assert!(pending.certificate_pem.is_empty());
-        assert!(pending.rsa_public_key_der.is_some(), "the key was recorded");
+        assert!(
+            pending.encryption_public_key.is_some(),
+            "the store key's subkeys were recorded"
+        );
     }
 
     /// The certificate landing second completes the inputs and releases the
@@ -16438,44 +16422,34 @@ mod tests {
             .as_ref()
             .expect("this creation is still waiting on its own answers");
         assert!(pending.certificate_pem.is_empty());
-        assert!(pending.rsa_public_key_der.is_none());
+        assert!(pending.encryption_public_key.is_none());
     }
 
     const STORE_ID: [u8; 32] = [1u8; 32];
     const STORE_INBOX_KEY: [u8; 32] = [0x1b; 32];
     const STORE_RECORD_KEY: [u8; 4] = [0x2e; 4];
 
-    /// A pending edit of a store whose derived record key disagrees with
-    /// the published one is refused, not published (#99 re-check). Mutated
-    /// red by removing the check in `start_store_edit_if_ready`.
+    /// An edit carries over the record key the store already publishes,
+    /// and never derives one: the delegate no longer derives it (an RSA-2048
+    /// key generation that could run past the node's 5 s limit on a delegate
+    /// call), and a store that published one before harvest#53 Phase C keeps
+    /// it, since the reputation migration finds that store's older records
+    /// by it. Mutated red by publishing `None` whatever the store published.
     #[test]
-    fn an_edit_is_refused_while_the_record_key_disagrees() {
-        let mut state = seller_with_store(Some(published_info(1, "Bean Shop", REPUTATION_ID)));
-        state
-            .certificates
-            .insert(FINGERPRINT.to_string(), "CERT".to_string());
-        state.record_key_mismatch.insert(test_store_key());
-        state
-            .publish_store_details(&STORE_ID, typed_details())
-            .expect("the seller owns this store");
-        assert!(queued_store_info(&state).is_none(), "nothing published");
-        assert!(
-            state.pending_store_edit.is_none(),
-            "and nothing left waiting"
-        );
-        assert!(state
-            .notifications
-            .iter()
-            .any(|n| n.contains("different record key")));
-
-        state.record_key_mismatch.clear();
-        state
-            .publish_store_details(&STORE_ID, typed_details())
-            .expect("the seller owns this store");
-        assert!(
-            queued_store_info(&state).is_some(),
-            "published once it agrees"
-        );
+    fn an_edit_carries_the_published_record_key_over() {
+        for published in [Some(STORE_RECORD_KEY.to_vec()), None] {
+            let mut info = published_info(1, "Bean Shop", REPUTATION_ID);
+            info.record_public_key = published.clone();
+            let mut state = seller_with_store(Some(info));
+            state
+                .certificates
+                .insert(FINGERPRINT.to_string(), "CERT".to_string());
+            state
+                .publish_store_details(&STORE_ID, typed_details())
+                .expect("the seller owns this store");
+            let queued = queued_store_info(&state).expect("published");
+            assert_eq!(queued.record_public_key, published);
+        }
     }
 
     /// A store with its own key publishes the keys its store key derives
@@ -16509,8 +16483,8 @@ mod tests {
         let info = queued_store_info(&state).expect("published once they arrive");
         assert_eq!(info.encryption_public_key, Some(STORE_INBOX_KEY));
         assert_eq!(
-            info.record_public_key.as_deref(),
-            Some(&STORE_RECORD_KEY[..])
+            info.record_public_key, None,
+            "none was published, and none is derived"
         );
     }
     /// **An edit parked on the store's keys while the session moves is still
@@ -16903,7 +16877,6 @@ mod tests {
             test_store_key(),
             harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: STORE_INBOX_KEY,
-                record_public_key: STORE_RECORD_KEY.to_vec(),
             },
         );
         let mut held = loaded_store("Jam");
@@ -16988,7 +16961,6 @@ mod tests {
             test_store_key(),
             harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: STORE_INBOX_KEY,
-                record_public_key: STORE_RECORD_KEY.to_vec(),
             },
         );
         if let Some(info) = published {
@@ -18215,7 +18187,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: Some(crate::state::test_store_key()),
             store_key_request: None,
@@ -18252,7 +18223,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".to_string(),
             description: String::new(),
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: Some(crate::state::test_store_key()),
             store_key_request: None,
@@ -20918,7 +20888,6 @@ mod mailbox_read_tests {
                 certificate_pem: String::new(),
                 store_name: String::new(),
                 description: String::new(),
-                rsa_public_key_der: None,
                 encryption_public_key: None,
                 store_verifying_key: Some(crate::state::test_store_key()),
                 store_key_request: None,
@@ -21272,7 +21241,6 @@ mod delegate_correlation_tests {
                 certificate_pem: String::new(),
                 store_name: "Theirs".to_string(),
                 description: String::new(),
-                rsa_public_key_der: None,
                 encryption_public_key: None,
                 store_verifying_key: Some(crate::state::test_store_key()),
                 store_key_request: None,
@@ -21282,10 +21250,9 @@ mod delegate_correlation_tests {
         }
     }
 
-    /// A creation never adopts a per-device RSA key, for its own identity or
-    /// another's: `start_store_creation_if_ready` gates on this field, and
-    /// since harvest#93 phase 1b the record key a store publishes derives
-    /// from its store key.
+    /// A creation never takes a per-device RSA key as its store key's
+    /// subkeys, for its own identity or another's: `start_store_creation_if_ready`
+    /// gates on the inbox key those subkeys bring.
     #[test]
     fn a_creation_does_not_adopt_a_per_device_rsa_key() {
         let mut state = with_another_creation_in_flight();
@@ -21303,9 +21270,9 @@ mod delegate_correlation_tests {
             state
                 .pending_store_creation
                 .as_ref()
-                .and_then(|p| p.rsa_public_key_der.clone()),
+                .and_then(|p| p.encryption_public_key),
             None,
-            "a creation adopted an RSA key answered about a different identity"
+            "a per-device RSA key filled the creation's subkeys"
         );
 
         // The creation's own store key's subkeys ARE adopted, so the
@@ -21315,15 +21282,14 @@ mod delegate_correlation_tests {
             store_verifying_key: crate::state::test_store_key(),
             result: Ok(harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: [1u8; 32],
-                record_public_key: vec![8u8; 16],
             }),
         });
         assert_eq!(
             state
                 .pending_store_creation
                 .as_ref()
-                .and_then(|p| p.rsa_public_key_der.clone()),
-            Some(vec![8u8; 16])
+                .and_then(|p| p.encryption_public_key),
+            Some([1u8; 32])
         );
     }
 

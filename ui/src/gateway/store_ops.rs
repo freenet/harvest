@@ -275,14 +275,11 @@ pub async fn create_store_contracts(
         certificate_pem,
         store_name,
         description,
-        rsa_public_key_der,
         encryption_public_key,
         store_verifying_key: _,
         store_key_request: _,
         carried_listings,
     } = creation;
-    let rsa_public_key_der =
-        rsa_public_key_der.ok_or("the store's record key had not arrived; nothing was created")?;
     use dioxus::logger::tracing::{info, warn};
     use dioxus::prelude::{ReadableExt, WritableExt};
     use freenet_stdlib::prelude::*;
@@ -467,9 +464,11 @@ pub async fn create_store_contracts(
         // The inbox key the store key derives (harvest#93 phase 1b,
         // `StoreSubkeys`), the same on every device holding the store key.
         encryption_public_key,
-        // And the record key, derived the same way and published so another
-        // device can check its own derivation.
-        record_public_key: Some(rsa_public_key_der.clone()),
+        // No record key: nothing a new store makes is addressed by one
+        // (harvest#53 Phase C), and deriving it could run past the node's
+        // 5 s limit on a delegate call (see
+        // `HarvestDelegateRequest::GetStoreSubkeys`).
+        record_public_key: None,
     };
     if encryption_public_key.is_none() {
         warn!(

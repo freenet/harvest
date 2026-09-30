@@ -238,3 +238,10 @@ description = "Superseded by the delegated watch key (harvest#179): the delegate
 date = "2026-09-27"
 code_hash = "6973d27838d0e512de90917621c4ac78dd78bc004914e3dbd6edc4f2fd4e14e4"
 delegate_key = "1303939ef49623c1497b713bde85564a71472996f8db39ac2bab6c5c22d24695"
+
+[[entry]]
+version = "V28"
+description = "Superseded by store subkeys without the RSA record key: `GetStoreSubkeys` derived the store's RSA-2048 record key on every call, a key generation that took 1 to over 5 seconds in the delegate (fixed per store key, and slower under load), past the node's 5 s limit on one delegate call, so a new seller whose store key was over it could never finish creating a store. `StoreSubkeyInfo` lost `record_public_key`. No secret family and no import family changed. The parameters are unchanged (empty). The generation the delegated watch key shipped (harvest#179)."
+date = "2026-09-30"
+code_hash = "d8088bf5f99b0fa8ea415a256482945d28572e643d6a85536663551bbe4a1e2c"
+delegate_key = "959b5b786380d1c7a609e00355a69e8d6e2ed05865b9fdfe918b0e381a24c3a8"

@@ -332,6 +332,13 @@ pub(crate) fn unwrap<S: SecretStore>(
 }
 
 /// The public halves of a store's derived keys (harvest#93 phase 1b).
+///
+/// Only cheap derivations belong here: the whole call runs inside one
+/// delegate execution, which the node stops after 5 seconds of wall-clock
+/// time. The RSA-2048 record key this used to derive as well took 1 to over
+/// 5 seconds, fixed per store key, so a new seller whose store key was over
+/// the limit could never finish creating a store (see
+/// `HarvestDelegateRequest::GetStoreSubkeys`).
 pub(crate) fn subkeys<S: SecretStore>(
     secrets: &S,
     request_id: RequestId,
@@ -343,10 +350,8 @@ pub(crate) fn subkeys<S: SecretStore>(
         let key =
             load(secrets, &store).ok_or("this device does not hold the key for that store")?;
         let inbox = custody::inbox_secret(&key);
-        let record_public_key = custody::record_public_key_der(&key).map_err(|e| e.to_string())?;
-        Ok(harvest_common::delegate::StoreSubkeyInfo {
+        Ok::<_, String>(harvest_common::delegate::StoreSubkeyInfo {
             inbox_public_key: x25519_dalek::PublicKey::from(&inbox).to_bytes(),
-            record_public_key,
         })
     })();
     HarvestDelegateResponse::StoreSubkeys {
@@ -771,7 +776,7 @@ mod tests {
     }
 
     /// The published subkeys are the ones the store key derives: the inbox
-    /// key every device decrypts with, and the record key.
+    /// key every device decrypts with.
     #[test]
     fn the_subkeys_are_the_store_keys_derivations() {
         let mut device = MemSecrets::default();
@@ -784,10 +789,6 @@ mod tests {
                 assert_eq!(
                     info.inbox_public_key,
                     x25519_dalek::PublicKey::from(&custody::inbox_secret(&key)).to_bytes()
-                );
-                assert_eq!(
-                    info.record_public_key,
-                    custody::record_public_key_der(&key).unwrap()
                 );
             }
             other => panic!("expected subkeys, got {other:?}"),

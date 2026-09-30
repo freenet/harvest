@@ -762,9 +762,8 @@ impl AppState {
         let _ = request_id;
     }
 
-    /// The delegate derived a store key's subkeys: record them, finish a
-    /// creation or an edit that waits on them, and check them against what
-    /// the store has published.
+    /// The delegate derived a store key's subkeys: record them, and finish a
+    /// creation or an edit that waits on them.
     pub(crate) fn on_store_subkeys(
         &mut self,
         store: [u8; 32],
@@ -786,7 +785,6 @@ impl AppState {
                 return;
             }
         };
-        self.check_published_record_key(&store, &info);
         self.store_subkeys.insert(store, info);
         self.fill_creation_from_subkeys(store);
         self.start_store_creation_if_ready();
@@ -864,22 +862,6 @@ impl AppState {
         }
     }
 
-    /// Check the record key again for the store `store_contract_id`, if this
-    /// device has derived its store's subkeys.
-    pub(crate) fn recheck_record_key(&mut self, store_contract_id: &[u8]) {
-        let Some(owner) = self
-            .browsing_stores
-            .get(store_contract_id)
-            .and_then(|s| s.backing_state.owner)
-            .map(|k| k.to_bytes())
-        else {
-            return;
-        };
-        if let Some(info) = self.store_subkeys.get(&owner).cloned() {
-            self.check_published_record_key(&owner, &info);
-        }
-    }
-
     /// Fill the pending creation for the store key `store` from the subkeys
     /// this session holds for it.
     ///
@@ -897,41 +879,8 @@ impl AppState {
         if pending.store_verifying_key != Some(store) {
             return false;
         }
-        pending.rsa_public_key_der = Some(info.record_public_key);
         pending.encryption_public_key = Some(info.inbox_public_key);
         true
-    }
-
-    /// The record key a store publishes must be the one this device derives
-    /// from its store key (harvest#93 phase 1b). RSA key generation is not a
-    /// function the `rsa` crate promises to keep stable, so a mismatch is
-    /// said out loud rather than trusted silently.
-    fn check_published_record_key(
-        &mut self,
-        store: &[u8; 32],
-        info: &harvest_common::delegate::StoreSubkeyInfo,
-    ) {
-        let published = self.browsing_stores.values().find_map(|loaded| {
-            (loaded.backing_state.owner.map(|k| k.to_bytes()) == Some(*store))
-                .then(|| loaded.info.as_ref()?.record_public_key.clone())
-                .flatten()
-        });
-        if published.is_some_and(|published| published != info.record_public_key) {
-            // Blocked, not only reported (#99 review): an edit from here
-            // would publish a record key that is not the store's. Said once,
-            // not on every state arrival.
-            if !self.record_key_mismatch.insert(*store) {
-                return;
-            }
-            self.notifications.push(
-                "This device derives a different record key for your store than the one it \
-                 publishes, so it will not publish the store's details: its build of Harvest \
-                 may generate keys differently. Publish from a device that agrees."
-                    .into(),
-            );
-        } else {
-            self.record_key_mismatch.remove(store);
-        }
     }
 }
 
@@ -1847,40 +1796,6 @@ mod tests {
             .any(|n| n.contains("did not finish")));
     }
 
-    /// Store details that arrive after the subkeys are checked too, and the
-    /// block lifts when a later check agrees (#99 re-check). Mutated red by
-    /// not re-checking, and by never clearing the block.
-    #[test]
-    fn a_record_key_block_follows_the_published_details() {
-        let mut state = backed_store();
-        state.on_delegate_response(subkeys(vec![9, 9, 9]));
-        assert!(
-            state.record_key_mismatch.is_empty(),
-            "nothing published yet"
-        );
-
-        let set_published = |state: &mut AppState, key: Vec<u8>| {
-            state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
-                Some(harvest_common::store::StoreInfoV1 {
-                    version: 1,
-                    certificate_pem: String::new(),
-                    seller_fingerprint: FINGERPRINT.to_string(),
-                    reputation_contract_id: [0x0e; 32],
-                    store_name: "Bean Shop".to_string(),
-                    description: String::new(),
-                    encryption_public_key: None,
-                    record_public_key: Some(key),
-                });
-        };
-        set_published(&mut state, vec![1, 2, 3]);
-        state.recheck_record_key(&[ID; 32]);
-        assert!(state.record_key_mismatch.contains(&store_vk().to_bytes()));
-
-        set_published(&mut state, vec![9, 9, 9]);
-        state.recheck_record_key(&[ID; 32]);
-        assert!(state.record_key_mismatch.is_empty(), "lifted");
-    }
-
     /// `fill_creation_from_subkeys` says whether it FILLED a creation, not
     /// whether the subkeys exist (#101 review): a creation for another
     /// store is not filled, and the caller must go on to ask. Mutated red
@@ -1895,7 +1810,6 @@ mod tests {
             other,
             harvest_common::delegate::StoreSubkeyInfo {
                 inbox_public_key: [0x1b; 32],
-                record_public_key: vec![0x2e; 4],
             },
         );
         assert!(
@@ -1910,7 +1824,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".into(),
             description: String::new(),
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: Some(store_vk().to_bytes()),
             store_key_request: Some(1),
@@ -1924,7 +1837,7 @@ mod tests {
             .pending_store_creation
             .as_ref()
             .unwrap()
-            .rsa_public_key_der
+            .encryption_public_key
             .is_none());
     }
 
@@ -2128,7 +2041,6 @@ mod tests {
             certificate_pem: String::new(),
             store_name: "Bean Shop".into(),
             description: String::new(),
-            rsa_public_key_der: None,
             encryption_public_key: None,
             store_verifying_key: Some(store_vk().to_bytes()),
             store_key_request: Some(1),
@@ -2468,50 +2380,5 @@ mod tests {
             result: Ok(Box::new(copy.clone())),
         });
         assert_eq!(state.copies_to_publish, vec![(vec![ID; 32], copy)]);
-    }
-
-    fn subkeys(record: Vec<u8>) -> HarvestDelegateResponse {
-        HarvestDelegateResponse::StoreSubkeys {
-            request_id: 0,
-            store_verifying_key: store_vk().to_bytes(),
-            result: Ok(harvest_common::delegate::StoreSubkeyInfo {
-                inbox_public_key: [0x1b; 32],
-                record_public_key: record,
-            }),
-        }
-    }
-
-    /// A device that derives a different record key from the one the store
-    /// publishes says so; one that agrees says nothing. Mutated red by
-    /// removing the comparison.
-    #[test]
-    fn a_record_key_that_disagrees_with_the_published_one_is_reported() {
-        for (derived, warned) in [(vec![1, 2, 3], false), (vec![9, 9, 9], true)] {
-            let mut state = backed_store();
-            state.browsing_stores.get_mut(&vec![ID; 32]).unwrap().info =
-                Some(harvest_common::store::StoreInfoV1 {
-                    version: 1,
-                    certificate_pem: String::new(),
-                    seller_fingerprint: FINGERPRINT.to_string(),
-                    reputation_contract_id: [0x0e; 32],
-                    store_name: "Bean Shop".to_string(),
-                    description: String::new(),
-                    encryption_public_key: None,
-                    record_public_key: Some(vec![1, 2, 3]),
-                });
-            state.on_delegate_response(subkeys(derived));
-            assert_eq!(
-                state
-                    .notifications
-                    .iter()
-                    .any(|n| n.contains("different record key")),
-                warned
-            );
-            assert_eq!(
-                state.record_key_mismatch.contains(&store_vk().to_bytes()),
-                warned,
-                "and a mismatch blocks publishing (#99 review)"
-            );
-        }
     }
 }
