@@ -1021,10 +1021,12 @@ pub(crate) fn is_store_decline_reason(reason: &str) -> bool {
     let only_n_left = reason
         .strip_prefix("Only ")
         .and_then(|rest| rest.strip_suffix(" left"))
+        // Exactly how the delegate writes a u32 count: ASCII digits, no
+        // sign, no leading zero, within u32 (review round 4 of #205).
         .is_some_and(|n| {
-            (1..=10).contains(&n.len())
-                && n.bytes().all(|b| b.is_ascii_digit())
+            n.bytes().all(|b| b.is_ascii_digit())
                 && (n == "0" || !n.starts_with('0'))
+                && n.parse::<u32>().is_ok()
         });
     STORE_DECLINE_REASONS.contains(&reason)
         || reason == harvest_common::delegate::TOO_MANY_UNPAID
@@ -3285,16 +3287,22 @@ mod inbox_tests {
         // Joined across `\` line continuations, as the compiler reads them.
         let mut joined = String::new();
         let mut lines = delegate.lines();
-        while let Some(line) = lines.next() {
-            if let Some(head) = line.trim_end().strip_suffix('\\') {
-                joined.push_str(head);
-                if let Some(next) = lines.next() {
-                    joined.push_str(next.trim_start());
+        // Joins a string continued over any number of lines (`\` at the
+        // end of each).
+        let mut carrying = false;
+        for line in lines.by_ref() {
+            let piece = if carrying { line.trim_start() } else { line };
+            match piece.trim_end().strip_suffix('\\') {
+                Some(head) => {
+                    joined.push_str(head);
+                    carrying = true;
                 }
-            } else {
-                joined.push_str(line);
+                None => {
+                    joined.push_str(piece);
+                    joined.push('\n');
+                    carrying = false;
+                }
             }
-            joined.push('\n');
         }
         for reason in STORE_DECLINE_REASONS {
             assert!(
@@ -3306,12 +3314,16 @@ mod inbox_tests {
         assert!(joined.contains("format!(\"Only {left} left\")"));
         assert!(joined.contains("reason: harvest_common::delegate::TOO_MANY_UNPAID"));
         assert!(is_store_decline_reason("Only 3 left"));
+        assert!(is_store_decline_reason("Only 4294967295 left"));
         assert!(is_store_decline_reason(
             harvest_common::delegate::TOO_MANY_UNPAID
         ));
         for loose in [
             "Only three left",
             "Only 03 left",
+            "Only 4294967296 left",
+            "Only 9999999999 left",
+            "Only +3 left",
             "Only  left",
             "sold out",
             "Sold out.",

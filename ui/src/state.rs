@@ -7376,17 +7376,25 @@ impl AppState {
                 _ => None,
             })
             .collect();
+        // Grouped by the order each answers, once, so each order below reads
+        // only its own requests (review round 4 of #205).
+        let mut by_order: HashMap<
+            harvest_common::payment::OrderId,
+            Vec<(SellerOrderRequest, Option<u64>)>,
+        > = HashMap::new();
+        for (id, request, total) in requests {
+            by_order.entry(id).or_default().push((request, total));
+        }
         orders
             .iter()
             .map(|order| {
                 let retained = self.address_retained_for(order);
-                let mut asked: Vec<SellerOrderRequest> = requests
-                    .iter()
-                    .filter(|(id, _, total)| {
-                        *id == order.order.id
-                            && total.is_none_or(|total| total == order.order.amount_sats)
-                    })
-                    .map(|(_, request, _)| request.clone())
+                let mut asked: Vec<SellerOrderRequest> = by_order
+                    .get(&order.order.id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, total)| total.is_none_or(|total| total == order.order.amount_sats))
+                    .map(|(request, _)| request.clone())
                     .collect();
                 if !retained {
                     for request in asked.iter_mut() {
