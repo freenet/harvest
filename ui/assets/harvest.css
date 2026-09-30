@@ -371,9 +371,14 @@ h4 {
   transition: all 0.15s ease;
 }
 
-.listing-card:hover {
-  border-color: var(--accent);
-  box-shadow: 0 2px 12px rgba(74, 103, 65, 0.08);
+/* Only where a pointer can hover: on a touch screen :hover sticks after a
+   tap, so a tapped order card stayed green at 390 and not at 1280 (msg1
+   critique MSG-15). A seller's order card is not a link: no highlight. */
+@media (hover: hover) {
+  .listing-card:not(.seller-order):hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(74, 103, 65, 0.08);
+  }
 }
 
 .listing-header {
@@ -876,11 +881,21 @@ h4 {
   background: var(--color-parchment);
 }
 
-/* In this side's direction, not sent from this device: set apart, dashed,
-   claiming nothing (message_view::UNCONFIRMED). */
+/* In this side's direction, not sent from this device: in its place on
+   this side, but dashed and unfilled, never the filled "You" bubble
+   (message_view::UNCONFIRMED, msg1 critique MSG-1/MSG-15). */
 .bubble.unconfirmed {
+  justify-self: end;
   border-style: dashed;
+  background: transparent;
   color: var(--text-secondary);
+}
+
+/* The complaint step's question, a heading rather than a footnote (msg1
+   critique MSG-12). */
+.complaint-question {
+  font-size: 0.95rem;
+  margin: var(--space-md) 0 var(--space-xs);
 }
 
 .bubble-who,
@@ -953,6 +968,11 @@ h4 {
 .earlier-order {
   border-left: 2px solid var(--border);
   padding-left: var(--space-md);
+}
+
+/* Between groups only, as the sibling-margin rules do: not under the
+   "Other orders" heading. */
+.earlier-order + .earlier-order {
   margin-top: var(--space-lg);
 }
 

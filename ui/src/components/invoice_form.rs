@@ -146,6 +146,13 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             .for_order(id)
             .map(|thread| (thread.clone(), homes.get(&thread.tag) == Some(id)))
     };
+    // Where a card's conversation is shown under another order: that
+    // conversation and the order it is under, for the pointer button.
+    let elsewhere = |id: &harvest_common::payment::OrderId| {
+        thread_for(id)
+            .filter(|(_, home)| !home)
+            .and_then(|(thread, _)| homes.get(&thread.tag).cloned().map(|home| (thread, home)))
+    };
 
     rsx! {
         div { class: "card",
@@ -161,7 +168,7 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                     store_contract_id: store_contract_id.clone(),
                     order: order.clone(),
                     thread: thread_for(&order.order.id).filter(|(_, home)| *home).map(|(t, _)| t),
-                    thread_elsewhere: thread_for(&order.order.id).is_some_and(|(_, home)| !home),
+                    elsewhere: elsewhere(&order.order.id),
                     open_thread,
                 }
             }
@@ -220,8 +227,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                 order_id: order.order.id.clone(),
                             }
                         }
-                        match thread_for(&order.order.id) {
-                            Some((thread, true)) => rsx! {
+                        match (thread_for(&order.order.id), elsewhere(&order.order.id)) {
+                            (Some((thread, true)), _) => rsx! {
                                 super::message_view::SellerThreadToggle {
                                     store_contract_id: store_contract_id.clone(),
                                     thread,
@@ -229,12 +236,24 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                     open_thread,
                                 }
                             },
-                            Some((_, false)) => rsx! {
-                                p { class: "text-muted small", "{THREAD_ELSEWHERE}" }
+                            (_, Some((thread, home))) => rsx! {
+                                super::message_view::SellerThreadPointer { thread, home, open_thread }
                             },
-                            None => rsx! {},
+                            _ => rsx! {},
                         }
                     }
+                }
+            }
+            // At most two quiet lines, never a card per entry (round-6
+            // critique 10-3), inside the card they are about (msg1 critique
+            // MSG-9): what could not be read, and buyer text held back for
+            // coming with neither a Ghost Key nor a paid order.
+            if inbox.unreadable > 0 {
+                p { class: "text-muted small", "{super::message_view::SOME_UNREADABLE}" }
+            }
+            if inbox.held_back > 0 {
+                p { class: "text-muted small",
+                    "{super::message_view::hidden_unvouched_line(inbox.held_back)}"
                 }
             }
         }
@@ -243,17 +262,6 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 store_contract_id: store_contract_id.clone(),
                 threads: questions,
                 open_thread,
-            }
-        }
-        // At most two quiet lines, never a card per entry (round-6 critique
-        // 10-3): what this device could not read, and buyer text held back
-        // for coming with neither a Ghost Key nor a paid order.
-        if inbox.unreadable > 0 {
-            p { class: "text-muted small", "{super::message_view::SOME_UNREADABLE}" }
-        }
-        if inbox.held_back > 0 {
-            p { class: "text-muted small",
-                "{super::message_view::hidden_unvouched_line(inbox.held_back)}"
             }
         }
     }
@@ -278,11 +286,14 @@ pub(crate) fn SellerOrderCard(
     /// where the card is shown without its conversation.
     #[props(default)]
     open_thread: Option<Signal<super::message_view::OpenThread>>,
-    /// The buyer's conversation is shown under another of their order cards
-    /// (`message_view::thread_homes`: one that needs the seller, then the
-    /// newest).
+    /// The buyer's conversation, when it is shown under another of their
+    /// order cards (`message_view::thread_homes`: one that needs the seller,
+    /// then the newest), and that order: the card shows a button naming it.
     #[props(default)]
-    thread_elsewhere: bool,
+    elsewhere: Option<(
+        super::message_view::SellerThread,
+        harvest_common::payment::OrderId,
+    )>,
 ) -> Element {
     use crate::state::SellerRequest;
     let (request, tip_height, stage, twins, oversold) = {
@@ -401,8 +412,8 @@ pub(crate) fn SellerOrderCard(
                 store_contract_id: store_contract_id.clone(),
                 order_id: order.order.id.clone(),
             }
-            if thread_elsewhere {
-                p { class: "text-muted small", "{THREAD_ELSEWHERE}" }
+            if let (Some((thread, home)), Some(open_thread)) = (elsewhere, open_thread) {
+                super::message_view::SellerThreadPointer { thread, home, open_thread }
             }
             if let (Some(thread), Some(open_thread)) = (thread, open_thread) {
                 super::message_view::SellerThreadToggle {
@@ -415,11 +426,6 @@ pub(crate) fn SellerOrderCard(
         }
     }
 }
-
-/// Said on an order card whose conversation is shown under another of the
-/// buyer's orders (review of #205, U3). Not "newest": the one needing the
-/// seller comes first (`message_view::thread_homes`).
-const THREAD_ELSEWHERE: &str = "Messages with this buyer are under another of their orders.";
 
 /// What the buyer asked for, as an order card shows it
 /// (`AppState::seller_order_request`): the request, each version of it when

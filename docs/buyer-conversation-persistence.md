@@ -665,9 +665,10 @@ change; in Phase 2 they will.
   tab sent are the only authorship this browser can establish, and they are
   not kept. "You" is given only to a message whose digest this tab holds
   (`components::message_view::who`), so after a reload the buyer's own
-  earlier messages move into a separate "Not confirmed as yours" group, with
-  one line saying they may be from before the reload, another device, or
-  someone else writing in the buyer's name. The seller's replies keep their
+  earlier messages stay in their place in time but are drawn dashed and
+  labelled "Not confirmed as yours", with one line under the conversation
+  saying they may be the buyer's own from earlier or another device, and that
+  one they don't recognise isn't theirs. The seller's replies keep their
   "Seller" label. Keeping the digests across a reload would need the delegate
   to keep them with the conversation, which is a wire change and not made.
   What is at stake in this change is the ability to READ the thread, which is

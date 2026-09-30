@@ -3301,8 +3301,8 @@ pub struct BrowsingStore {
     /// a tab, since the messages themselves come back out of the mailbox
     /// after a reload. What IS lost is the label: "You" is given only to a
     /// message this record holds (`message_view::who`), so after a reload
-    /// this side's own earlier messages move into the "Not confirmed as
-    /// yours" group, out of the timeline, on both screens. Keeping the
+    /// this side's own earlier messages stay in time order but are drawn
+    /// dashed as "Not confirmed as yours", on both screens. Keeping the
     /// digests across a reload would need the delegate to keep them with the
     /// conversation (a wire change, not made). The record also decides which
     /// messages the seller's inbox exempts from its gate as the seller's own
@@ -26251,6 +26251,13 @@ mod buy_flow_tests {
         assert!(!thread.open);
         assert_eq!(thread.chat_count(), 0, "a request is not a message");
         assert!(is_question(thread));
+        // Junk and an unopened request never ask for the seller's reply
+        // (msg1 critique MSG-3): the count cannot be inflated for free.
+        assert!(!thread.awaiting_reply);
+        assert_eq!(
+            crate::components::message_view::replies_awaited(&state, STORE),
+            0
+        );
 
         let keys: HashMap<Vec<u8>, ConversationKeys> =
             [(tag.to_vec(), seller_keys_for(&tag))].into();
@@ -26300,6 +26307,14 @@ mod buy_flow_tests {
         assert!(thread.open, "a paid order opens it");
         assert_eq!(thread.chat_count(), 1, "the buyer's plain text is shown");
         assert_eq!(inbox.held_back, 0);
+        // The buyer wrote last in an open conversation: it waits for the
+        // seller, and "need you" counts it (msg1 critique MSG-3).
+        assert!(thread.awaiting_reply);
+        assert_eq!(
+            crate::components::message_view::replies_awaited(&state, STORE),
+            1
+        );
+        assert_eq!(thread.order_refs, vec![order.order.id.short()]);
 
         // Review of #205, S2: the paid buyer, needing no Ghost Key, seals a
         // "reply" in the seller's direction. It is not the seller's "You";
@@ -26336,6 +26351,8 @@ mod buy_flow_tests {
                 .map(|line| (line.who, line.trusted))
         };
         assert_eq!(label("Posting today"), Some(("You", true)));
+        // The seller has replied since: no longer waiting.
+        assert!(!inbox.for_order(&order.order.id).unwrap().awaiting_reply);
         assert_eq!(
             label("Agreed, full refund"),
             Some((crate::components::message_view::UNCONFIRMED, false))
