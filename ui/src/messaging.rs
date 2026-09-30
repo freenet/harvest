@@ -431,11 +431,11 @@ impl BuyerConversation {
         )
     }
 
-    /// Seal one plain-text message for the seller: the pre-voucher format,
-    /// which a seller no longer shows. For this crate's tests of the
-    /// conversation mechanics; a buyer's message goes out through
-    /// [`Self::seal_vouched`].
-    #[cfg(test)]
+    /// Seal one plain-text message for the seller, with no voucher. A seller
+    /// shows it only in a conversation one of their store's paid orders
+    /// opens (`crate::order_threads`), so a buyer's message goes out this way
+    /// only from `AppState::compose_plain_to_seller`, which checks that
+    /// first; anywhere else it goes through [`Self::seal_vouched`].
     pub fn seal(&self, text: String) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
