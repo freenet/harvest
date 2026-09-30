@@ -860,6 +860,11 @@ pub struct AppState {
     /// every keystroke in a reply box, and each verdict is an RSA chain check.
     /// See [`AppState::voucher_verifies`].
     pub voucher_verdicts: std::cell::RefCell<HashMap<[u8; 32], bool>>,
+    /// Each of our stores' seller inbox, remembered against a fingerprint of
+    /// what it reads (`components::message_view::seller_inbox`): the header,
+    /// the Stores row and the Orders tab ask on every render.
+    pub seller_inbox_cache:
+        std::cell::RefCell<HashMap<Vec<u8>, (u64, crate::components::message_view::SellerInbox)>>,
 
     /// The master key vouchers are checked against in tests; production
     /// always uses Freenet's (`ghostkey_cert`).
@@ -24055,6 +24060,9 @@ mod buy_flow_tests {
         assert_eq!(label("Posting today"), Some(("You", true)));
         // The seller has replied since: no longer waiting.
         assert!(!inbox.for_order(&order.order.id).unwrap().awaiting_reply);
+        // The forged line is not counted as a message (review after
+        // b9c727f): the buyer's and the seller's confirmed reply are.
+        assert_eq!(inbox.for_order(&order.order.id).unwrap().chat_count(), 2);
         assert_eq!(
             label("Agreed, full refund"),
             Some((crate::components::message_view::UNCONFIRMED, false))

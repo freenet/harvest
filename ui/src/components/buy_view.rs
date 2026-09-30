@@ -1184,9 +1184,9 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
             Some(category) => rsx! {
                 p { class: "text-warning",
                     "Report order {short} as {super::reputation_view::category_label(&category)}? \
-                     It goes on the seller's public record for good and shows only that one \
-                     choice, with no names or messages. You can't withdraw it, and there's one \
-                     per order."
+                     It goes on the seller's public record for good, showing that choice, the \
+                     order's reference and the month, with no names or messages. You can't \
+                     withdraw it, and there's one per order."
                 }
                 button {
                     class: "btn btn-sm btn-primary",
@@ -1243,11 +1243,17 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                     // No conversation held here: the line still says to
                     // message the seller first, so say where (msg1 critique
                     // MSG-11).
+                    // Said as it is: this order's conversation is not on this
+                    // device, so a question from the store page starts a new
+                    // one, which needs a Ghost Key (review after b9c727f).
                     (None, _) => rsx! {
                         p { class: "text-muted small",
-                            "Message them from their store page, under Ask the seller a question."
+                            "This order's messages aren't on this device. You can ask the seller \
+                             a new question from their store page; that needs a Ghost Key."
                         }
-                        if let Some(id) = store_page.clone() {
+                        if let Some(id) = store_page.clone().filter(|_| {
+                            super::app::ROUTE() != super::app::Route::Store
+                        }) {
                             div { class: "form-actions",
                                 button {
                                     class: "btn btn-sm btn-primary",
