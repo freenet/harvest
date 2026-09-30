@@ -899,6 +899,13 @@ h4 {
   margin-top: var(--space-lg);
 }
 
+/* The seller card's short pill never breaks inside ("Send by 4 / Oct",
+   round-6 critique); the card's header wraps instead. Longer pills
+   elsewhere may still wrap on a narrow phone. */
+.seller-order .btc-pill {
+  white-space: nowrap;
+}
+
 /* An earlier order's item, named above its card. */
 .order-title {
   margin: var(--space-md) 0 var(--space-xs);
@@ -1129,8 +1136,6 @@ h4 {
 /* ---- Payment status pills ---- */
 
 .btc-pill {
-  /* A pill never breaks inside ("Send by 4 / Oct", round-6 critique). */
-  white-space: nowrap;
   font-family: var(--font-body);
   font-size: 0.7rem;
   font-weight: 600;
