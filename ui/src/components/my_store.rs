@@ -1209,9 +1209,23 @@ fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
     }
 }
 
-/// The store in `now` that was not in `before`: one just opened.
-pub(crate) fn new_store(before: &[Vec<u8>], now: &[Vec<u8>]) -> Option<Vec<u8>> {
-    now.iter().find(|id| !before.contains(id)).cloned()
+/// What tells one of the seller's stores from another across its
+/// generations: its code, which a migration keeps
+/// (`AppState::adopt_migrated_contract_id` changes the contract id, round 2
+/// of #197), or its id if it has no code.
+fn store_identity(store: &SellerStore) -> String {
+    store
+        .code
+        .clone()
+        .unwrap_or_else(|| bs58::encode(&store.contract_id).into_string())
+}
+
+/// The store in `now` whose identity (`store_identity`) was not in
+/// `before`: one just opened, not one that moved to a new generation.
+pub(crate) fn new_store(before: &[String], now: &[(String, Vec<u8>)]) -> Option<Vec<u8>> {
+    now.iter()
+        .find(|(identity, _)| !before.contains(identity))
+        .map(|(_, id)| id.clone())
 }
 
 /// Opening another store: each connected Ghost Key that has no store here
@@ -1250,16 +1264,16 @@ fn AnotherStore(has_harvest_delegate: bool) -> Element {
     // The stores this device manages as the page opened. One that appears
     // after is the store just opened here, and the seller is taken to it
     // rather than left on this page with its row gone (review of #197).
-    let before: Signal<Vec<Vec<u8>>> = use_signal(|| {
+    let before: Signal<Vec<String>> = use_signal(|| {
         seller_stores(&APP_STATE.peek())
-            .into_iter()
-            .map(|s| s.contract_id)
+            .iter()
+            .map(store_identity)
             .collect()
     });
     use_effect(move || {
-        let now: Vec<Vec<u8>> = seller_stores(&APP_STATE.read())
+        let now: Vec<(String, Vec<u8>)> = seller_stores(&APP_STATE.read())
             .into_iter()
-            .map(|s| s.contract_id)
+            .map(|s| (store_identity(&s), s.contract_id))
             .collect();
         if let Some(new) = new_store(&before.peek(), &now) {
             super::app::open_seller_page(super::app::SellerPage::Store(new));
@@ -2146,10 +2160,19 @@ mod seller_stores_tests {
     /// the one just opened.
     #[test]
     fn the_store_just_opened_is_the_new_one() {
-        let before = vec![vec![1u8; 32]];
-        assert_eq!(new_store(&before, &before), None);
+        let before = vec!["CodeA".to_string()];
+        assert_eq!(new_store(&before, &[("CodeA".into(), vec![1u8; 32])]), None);
+        // The same store moved to a new generation (a new contract id, the
+        // same code) is not a new store. Red comparing contract ids.
+        assert_eq!(new_store(&before, &[("CodeA".into(), vec![9u8; 32])]), None);
         assert_eq!(
-            new_store(&before, &[vec![1u8; 32], vec![2u8; 32]]),
+            new_store(
+                &before,
+                &[
+                    ("CodeA".into(), vec![1u8; 32]),
+                    ("CodeB".into(), vec![2u8; 32])
+                ]
+            ),
             Some(vec![2u8; 32])
         );
     }

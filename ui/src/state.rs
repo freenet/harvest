@@ -747,9 +747,21 @@ pub struct AppState {
     /// page review, item 5). Their presence is still followed as any loaded
     /// store's is: read once and never again, a row would call an open store
     /// closed ten minutes later, when the heartbeat it read goes stale.
-    /// Leaves the set when the store is opened or Purchases loads it, which
-    /// subscribe.
+    /// Leaves the set only when a subscribed GET's state arrives (opening
+    /// the store, Purchases, or our own store's subscribe): one that fails
+    /// leaves it here, so it is asked again. Never holds one of our own.
     pub light_stores: HashSet<Vec<u8>>,
+
+    /// Stores in `light_stores` whose subscribed GET is out
+    /// ([`AppState::follows_record`]): their answer is followed like any
+    /// other's, and takes them out of `light_stores` when it arrives.
+    pub light_upgrading: HashSet<Vec<u8>>,
+
+    /// When this session's state was made, which is when the app started.
+    /// The Stores page waits for `seller_known` until
+    /// [`SELLER_ANSWER_WAIT_MS`] after it, and no longer, however often the
+    /// page is opened (round 2 of #197: the wait was per mount).
+    pub session_started: SessionStart,
 
     /// Whether the ghostkey delegate has answered what identities this app
     /// may use (a list, empty or not, or a refusal). Until it has, and each
@@ -3005,6 +3017,22 @@ impl StoreName {
     }
 }
 
+/// When the app started: see [`AppState::session_started`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionStart(pub u64);
+
+impl Default for SessionStart {
+    fn default() -> Self {
+        SessionStart(now_ms())
+    }
+}
+
+/// How long after the app starts the Stores page waits to learn which stores
+/// are this node's own (`AppState::seller_known`) before showing the lists
+/// anyway: a ghostkey delegate that never answers must not hide them for
+/// good.
+pub const SELLER_ANSWER_WAIT_MS: u64 = 10_000;
+
 /// Whether a buyer can buy from a store now. See [`AppState::buyer_open`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuyerOpen {
@@ -3645,20 +3673,59 @@ impl AppState {
         {
             return false;
         }
-        let loaded = self
-            .browsing_stores
-            .get(store_contract_id)
-            .is_some_and(|store| store.info.is_some());
-        if loaded {
-            return subscribe && self.light_stores.contains(store_contract_id);
-        }
-        match self.store_load_failures.get(store_contract_id) {
+        // The wait after a failure holds for a subscribed re-load of a
+        // listed store too, or a failing one would be sent again on every
+        // change of state.
+        let waited = match self.store_load_failures.get(store_contract_id) {
             None => true,
             Some((attempts, at)) => {
                 *attempts < MAX_STORE_LOAD_ATTEMPTS
                     && now_ms.saturating_sub(*at) >= store_load_retry_after(*attempts)
             }
+        };
+        if !waited {
+            return false;
         }
+        let loaded = self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.info.is_some());
+        !loaded || (subscribe && self.light_stores.contains(store_contract_id))
+    }
+
+    /// Whether the answer to a GET for this store is followed through to its
+    /// record (`gateway::response_handler`): not for a store loaded only to
+    /// be listed, unless a subscribed GET for it is out; always for one of
+    /// our own.
+    pub fn follows_record(&self, store_contract_id: &[u8]) -> bool {
+        !self.light_stores.contains(store_contract_id)
+            || self.light_upgrading.contains(store_contract_id)
+            || self.store_owner_fingerprint(store_contract_id).is_some()
+    }
+
+    /// A subscribed GET for this store is going out: a store listed only
+    /// stays listed only until its answer arrives
+    /// ([`Self::on_subscribed_state`]), so a GET that fails leaves it to be
+    /// asked again.
+    fn note_subscribing(&mut self, store_contract_id: &[u8]) {
+        if self.light_stores.contains(store_contract_id) {
+            self.light_upgrading.insert(store_contract_id.to_vec());
+        }
+    }
+
+    /// A store's state arrived: if a subscribed GET for it was out, it is no
+    /// longer a store loaded only to be listed.
+    fn on_subscribed_state(&mut self, store_contract_id: &[u8]) {
+        if self.light_upgrading.remove(store_contract_id) {
+            self.light_stores.remove(store_contract_id);
+        }
+    }
+
+    /// Whether the Stores page may show its lists: this node knows which
+    /// stores are its own, or has waited long enough since the app started.
+    pub fn seller_known_or_waited(&self, now_ms: u64) -> bool {
+        self.seller_known()
+            || now_ms.saturating_sub(self.session_started.0) >= SELLER_ANSWER_WAIT_MS
     }
 
     /// Mark a remembered store as being loaded in the background, unless it is
@@ -3678,8 +3745,10 @@ impl AppState {
             .entry(store_contract_id.clone())
             .or_default();
         if subscribe {
-            self.light_stores.remove(&store_contract_id);
-        } else {
+            self.note_subscribing(&store_contract_id);
+        } else if self.store_owner_fingerprint(&store_contract_id).is_none() {
+            // One of our own is never only listed: it is subscribed to when
+            // its store list arrives (round 2 of #197).
             self.light_stores.insert(store_contract_id.clone());
         }
         self.background_loads.insert(store_contract_id.clone());
@@ -3713,6 +3782,7 @@ impl AppState {
         if !self.background_loads.remove(store_contract_id) {
             return;
         }
+        self.light_upgrading.remove(store_contract_id);
         self.note_store_load_failed(store_contract_id);
         if self
             .browsing_stores
@@ -3729,16 +3799,23 @@ impl AppState {
     /// sent again after its wait, while it has tries left.
     pub fn end_background_load_timed_out(&mut self, store_contract_id: &[u8]) {
         if self.background_loads.remove(store_contract_id) {
+            self.light_upgrading.remove(store_contract_id);
             self.note_store_load_failed(store_contract_id);
         }
     }
 
     /// The user opened this store (`store_link::open_store`): its GET is on
-    /// its way, with a subscription.
-    pub fn begin_foreground_load(&mut self, store_contract_id: &[u8]) {
+    /// its way, with a subscription. `false` when one already is: the store
+    /// is only shown, and the GET already out keeps its own wait rather than
+    /// a second one cutting it short.
+    pub fn begin_foreground_load(&mut self, store_contract_id: &[u8]) -> bool {
+        if self.foreground_loads.contains(store_contract_id) {
+            return false;
+        }
         self.store_load_failures.remove(store_contract_id);
         self.foreground_loads.insert(store_contract_id.to_vec());
-        self.light_stores.remove(store_contract_id);
+        self.note_subscribing(store_contract_id);
+        true
     }
 
     /// A store the user opened did not load: its GET did not go out, or its
@@ -3748,6 +3825,7 @@ impl AppState {
         if !self.foreground_loads.remove(store_contract_id) {
             return;
         }
+        self.light_upgrading.remove(store_contract_id);
         let loaded = self
             .browsing_stores
             .get(store_contract_id)
@@ -4689,6 +4767,12 @@ impl AppState {
     /// notification -- contradicting `on_own_store_subscribe_send_failed`'s
     /// doc comment, which promises a fresh start.
     pub fn note_store_subscribed(&mut self, store_contract_id: &[u8]) -> bool {
+        // Ours, and subscribed to: never a store loaded only to be listed,
+        // even if the Stores page listed it before our store list arrived
+        // (round 2 of #197). Its answer, and every later one, follows its
+        // record.
+        self.light_stores.remove(store_contract_id);
+        self.light_upgrading.remove(store_contract_id);
         let fresh = self.subscribed_stores.insert(store_contract_id.to_vec());
         if fresh {
             self.own_store_subscribe_failures.remove(store_contract_id);
@@ -4941,6 +5025,12 @@ impl AppState {
             return;
         }
         if state_bytes.is_empty() {
+            // A store asked for in the background that answered with
+            // nothing: a failed try, not one still loading.
+            if background {
+                self.light_upgrading.remove(&contract_id);
+                self.note_store_load_failed(&contract_id);
+            }
             return;
         }
         if self.bitcoin.retired_contracts.contains(&contract_id) {
@@ -5136,6 +5226,7 @@ impl AppState {
                     self.store_state_unavailable.remove(&contract_id);
                     self.store_load_failures.remove(&contract_id);
                     self.foreground_loads.remove(&contract_id);
+                    self.on_subscribed_state(&contract_id);
                     // A genuine arrival is success: forget any past send
                     // failures so a later transient failure gets its own
                     // full retry budget rather than inheriting a lifetime
@@ -12573,13 +12664,19 @@ impl AppState {
 
     /// Handle a response from the ghostkey delegate.
     pub fn on_ghostkey_response(&mut self, response: ghostkey_common::GhostkeyResponse) {
-        if matches!(
-            response,
-            ghostkey_common::GhostkeyResponse::GhostKeyList { .. }
-                | ghostkey_common::GhostkeyResponse::Error { .. }
-                | ghostkey_common::GhostkeyResponse::AccessDenied { .. }
-                | ghostkey_common::GhostkeyResponse::NoIdentityAvailable
-        ) {
+        // The answer to `ListGhostKeys`: a list, or a refusal while no
+        // "Choose a Ghost Key" is waiting (that one answers the choice). Any
+        // other error does not count; the Stores page's wait covers a list
+        // that never comes.
+        let answers_the_list = match &response {
+            ghostkey_common::GhostkeyResponse::GhostKeyList { .. } => true,
+            ghostkey_common::GhostkeyResponse::AccessDenied { .. }
+            | ghostkey_common::GhostkeyResponse::NoIdentityAvailable => {
+                !self.request_any_access_in_flight
+            }
+            _ => false,
+        };
+        if answers_the_list {
             self.ghostkeys_answered = true;
         }
         match response {
@@ -34380,6 +34477,22 @@ mod store_code_tests {
         assert!(!state.seller_known(), "its store list is not in yet");
         state.store_lists_answered.insert("fp".into());
         assert!(state.seller_known());
+
+        // A refusal answers the list only while no "Choose a Ghost Key" is
+        // waiting; any other vault error does not answer it.
+        let mut state = AppState::default();
+        state.request_any_access_in_flight = true;
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
+        assert!(!state.ghostkeys_answered, "that answered the choice");
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::NoIdentityAvailable);
+        assert!(state.ghostkeys_answered);
+
+        // The page stops waiting a fixed time after the app started, however
+        // often it is opened (round 2 of #197).
+        let state = AppState::default();
+        let now = now_ms();
+        assert!(!state.seller_known_or_waited(now));
+        assert!(state.seller_known_or_waited(state.session_started.0 + SELLER_ANSWER_WAIT_MS));
     }
 
     /// A closed store is greyed and listed after the open ones, whatever its

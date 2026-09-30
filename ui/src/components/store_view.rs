@@ -6,11 +6,6 @@ use crate::gateway::APP_STATE;
 use crate::presence_flow::SellerStatus;
 use crate::state::{AppState, BuyerOpen, StoreListRow, StoreName};
 
-/// How long the Stores page waits for this node to say which stores are its
-/// own (`AppState::seller_known`) before showing the lists anyway: a
-/// ghostkey delegate that never answers must not hide them for good.
-const SELLER_ANSWER_WAIT_MS: u32 = 10_000;
-
 /// The Stores page (the 2026-09-30 redesign, after the mockup's
 /// `scrStores()`): the seller's own stores, if any, each opening its
 /// seller pages; a way to open a store by its link or code; the stores this
@@ -19,32 +14,52 @@ const SELLER_ANSWER_WAIT_MS: u32 = 10_000;
 #[component]
 pub fn StoresPage() -> Element {
     let show_archived = use_signal(|| false);
-    // The visited stores are asked for in the background, so each row can
-    // carry the store's own name rather than its code. An effect, so it runs
-    // again when the delegate's list arrives after this page opened. Only
-    // what the rows show: no subscription (`AppState::light_stores`).
-    use_effect(move || crate::store_link::load_visited_stores(show_archived(), false));
     // Whether a store is open is judged against the clock (`presence_flow`),
-    // so this re-renders every half minute, as the store page does.
+    // so this re-renders every half minute, as the store page does; and
+    // once when the wait for `seller_known` runs out, which is kept from the
+    // app's start (`AppState::session_started`), not from this page's.
     #[allow(unused_mut)]
     let mut clock = use_signal(|| 0u32);
-    #[allow(unused_mut)]
-    let mut waited = use_signal(|| false);
     #[cfg(target_arch = "wasm32")]
     use_future(move || async move {
-        gloo_timers::future::TimeoutFuture::new(SELLER_ANSWER_WAIT_MS).await;
-        waited.set(true);
+        let deadline = crate::gateway::APP_STATE
+            .peek()
+            .session_started
+            .0
+            .saturating_add(crate::state::SELLER_ANSWER_WAIT_MS);
+        let left = deadline.saturating_sub(crate::state::now_ms());
+        if left > 0 {
+            gloo_timers::future::TimeoutFuture::new(left.saturating_add(50).min(60_000) as u32)
+                .await;
+            clock += 1;
+        }
         loop {
             gloo_timers::future::TimeoutFuture::new(30_000).await;
             clock += 1;
         }
     });
-    let _ = (clock(), SELLER_ANSWER_WAIT_MS);
+    let _ = clock();
 
     // Until this node knows which stores are its own, a seller's store would
     // flash up as "Sell on Harvest" and as a store they visited (review of
-    // #197), so neither list is shown yet.
-    let known = APP_STATE.read().seller_known() || waited();
+    // #197), so neither list is shown yet, and the visited stores are not
+    // asked for yet either: one of ours would be loaded as only listed.
+    let known = APP_STATE
+        .read()
+        .seller_known_or_waited(crate::state::now_ms());
+    // The visited stores are asked for in the background, so each row can
+    // carry the store's own name rather than its code. An effect, so it runs
+    // again when the delegate's list arrives after this page opened. Only
+    // what the rows show: no subscription (`AppState::light_stores`).
+    use_effect(move || {
+        let _ = clock();
+        if APP_STATE
+            .read()
+            .seller_known_or_waited(crate::state::now_ms())
+        {
+            crate::store_link::load_visited_stores(show_archived(), false);
+        }
+    });
     let own = own_store_rows(&APP_STATE.read(), crate::state::now_ms());
     let one = own.len() == 1;
 
@@ -537,12 +552,10 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     let pill = buyer_open.pill();
     let pill_open = buyer_open == BuyerOpen::Open;
     let is_closed = buyer_open == BuyerOpen::Closed;
-    // Presence says open, and yet no order can be taken: why, unless a
-    // warning below already says (an identity that does not check out).
-    let not_set_up = !store.closed
-        && presence.is_open()
-        && store.certificate_status.is_verified()
-        && !store.takes_orders();
+    // Presence says open, and yet no order can be taken: why, beside the
+    // Closed pill (round 2 of #197: an unbacked store read Closed with no
+    // reason given).
+    let cannot_take = !store.closed && presence.is_open() && !store.takes_orders();
     let name = match info.store_name.trim() {
         "" => StoreName::Unnamed.label(),
         name => name.to_string(),
@@ -645,11 +658,8 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                          in someone else's hands, so nothing here can be bought. Its record \
                          stays visible."
                     }
-                } else if not_set_up {
-                    p { class: "text-warning",
-                        "This store can\u{2019}t take orders yet: its seller hasn\u{2019}t finished \
-                         setting it up. You can look, but not buy."
-                    }
+                } else if cannot_take {
+                    p { class: "text-warning", "{cannot_take_orders_line(&store.certificate_status)}" }
                 } else if !owned {
                     if let Some(line) = presence.buyer_line() {
                         p { class: if presence.is_closed() { "text-warning" } else { "text-muted" },
@@ -768,6 +778,24 @@ pub(crate) fn backing_words(status: &crate::ghostkey_cert::CertificateStatus) ->
         CertificateStatus::Verified => "Backed by a donation to Freenet",
         CertificateStatus::Absent => "Not backed by a donation",
         CertificateStatus::Invalid(_) => "Its backing doesn\u{2019}t check out",
+    }
+}
+
+/// Why a store whose seller is online still cannot take an order, beside its
+/// Closed pill: its backing does not hold up, or (backed) it publishes no
+/// key to seal a buyer's address to (`BrowsingStore::takes_orders`).
+pub(crate) fn cannot_take_orders_line(status: &crate::ghostkey_cert::CertificateStatus) -> String {
+    use crate::ghostkey_cert::CertificateStatus;
+    match status {
+        CertificateStatus::Verified => "This store can\u{2019}t take orders yet: its seller \
+             hasn\u{2019}t finished setting it up. You can look, but not buy."
+            .to_string(),
+        CertificateStatus::Absent => "This store can\u{2019}t take orders: nothing shows its \
+             seller has anything at stake. You can look, but not buy."
+            .to_string(),
+        CertificateStatus::Invalid(_) => "This store can\u{2019}t take orders: the donation it \
+             claims doesn\u{2019}t check out. You can look, but not buy."
+            .to_string(),
     }
 }
 
@@ -1680,6 +1708,7 @@ mod store_page_tests {
             for text in [
                 backing_words(&status).to_string(),
                 certificate_warning(&status),
+                cannot_take_orders_line(&status),
             ] {
                 let lower = text.to_lowercase();
                 assert!(

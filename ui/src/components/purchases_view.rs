@@ -274,30 +274,92 @@ mod tests {
     }
 
     /// A store loaded only to be listed is loaded again, with a
-    /// subscription, when Purchases wants it, and once opened it is no longer
-    /// "light". Red if Purchases skips a store the Stores page loaded.
+    /// subscription, when Purchases wants it or the user opens it, and it
+    /// stops being "light" only when that subscribed state arrives: a
+    /// subscribed GET that fails leaves it light, so it is asked again after
+    /// the wait (round 2 of #197). Its answer is followed to its record
+    /// while that GET is out. Red if Purchases skips a store the Stores page
+    /// loaded, and red dropping the flag before the answer.
     #[test]
-    fn a_listed_store_is_subscribed_when_purchases_or_the_user_wants_it() {
-        let id = vec![4u8; 32];
+    fn a_listed_store_stays_listed_until_a_subscribed_answer_arrives() {
+        use crate::state::store_load_retry_after;
+        let id = vec![0x34u8; 32];
         let mut state = AppState::default();
         assert!(state.begin_background_load(id.clone(), "code".into(), false));
-        assert!(state.light_stores.contains(&id));
-        state.browsing_stores.insert(id.clone(), named("Listed"));
-        state.background_loads.remove(&id);
+        state.on_contract_state(id.clone(), super::background_tests::some_store_state());
+        assert!(state.light_stores.contains(&id), "loaded, listed only");
+        assert!(!state.follows_record(&id));
         assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
         assert!(state.background_load_due(&id, crate::state::now_ms(), true));
-        assert!(state.begin_background_load(id.clone(), "code".into(), true));
-        assert!(!state.light_stores.contains(&id));
 
-        let other = vec![5u8; 32];
-        assert!(state.begin_background_load(other.clone(), "code".into(), false));
-        state.background_loads.remove(&other);
-        state.begin_foreground_load(&other);
-        assert!(!state.light_stores.contains(&other));
-        assert!(
-            !state.background_load_due(&other, crate::state::now_ms(), true),
-            "its own GET is out"
+        // Purchases' subscribed GET fails to go out: still listed only, and
+        // asked again once the wait is over, not before.
+        assert!(state.begin_background_load(id.clone(), "code".into(), true));
+        assert!(state.follows_record(&id), "its answer is followed");
+        state.end_background_load_failed(&id);
+        assert!(state.light_stores.contains(&id));
+        assert!(!state.follows_record(&id));
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), true));
+        state.store_load_failures.get_mut(&id).unwrap().1 -= store_load_retry_after(1);
+        assert!(state.background_load_due(&id, crate::state::now_ms(), true));
+
+        // The user opens it: one GET, and a second open does not add a
+        // second wait; its answer takes it off the list-only set.
+        assert!(state.begin_foreground_load(&id));
+        assert!(!state.begin_foreground_load(&id), "its GET is already out");
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), true));
+        state.on_contract_state(id.clone(), super::background_tests::some_store_state());
+        assert!(!state.light_stores.contains(&id));
+        assert!(state.follows_record(&id));
+    }
+
+    /// A background load's timer that fires after the store's state arrived
+    /// changes nothing: no failure counted, no retry. An answer with nothing
+    /// in it is a failed try.
+    #[test]
+    fn a_late_timer_does_nothing_once_the_store_is_in() {
+        let id = vec![0x35u8; 32];
+        let mut state = AppState::default();
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        state.on_contract_state(id.clone(), super::background_tests::some_store_state());
+        state.end_background_load_timed_out(&id);
+        state.end_background_load_failed(&id);
+        assert!(state.store_load_failures.is_empty());
+        assert_eq!(state.background_retry_after(&id), None);
+
+        let empty = vec![0x36u8; 32];
+        assert!(state.begin_background_load(empty.clone(), "code".into(), false));
+        state.on_contract_state(empty.clone(), Vec::new());
+        assert_eq!(state.store_load_failures.get(&empty).map(|f| f.0), Some(1));
+    }
+
+    /// One of our own is never loaded as only listed, and if the Stores page
+    /// listed it before our store list arrived, subscribing to it as ours
+    /// ends that, so its record is followed (round 2 of #197). Red without
+    /// the clear in `note_store_subscribed`.
+    #[test]
+    fn our_own_store_is_never_only_listed() {
+        let id = vec![0x37u8; 32];
+        let mut state = AppState::default();
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        assert!(state.light_stores.contains(&id), "not known to be ours yet");
+        state.route_own_store(&id, &[0x38u8; 32]);
+        assert!(!state.light_stores.contains(&id));
+        assert!(state.follows_record(&id));
+
+        let ours = vec![0x39u8; 32];
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: ours.clone(),
+                reputation_contract_id: Vec::new(),
+                mailbox_contract_id: Vec::new(),
+                store_contract_key: None,
+                store_verifying_key: None,
+            }],
         );
+        assert!(state.begin_background_load(ours.clone(), "code".into(), false));
+        assert!(!state.light_stores.contains(&ours));
     }
 
     #[test]

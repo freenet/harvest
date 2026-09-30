@@ -121,11 +121,11 @@ fn handle_contract_response(response: ContractResponse) {
             // the reputation contract link. Not for a store loaded only to be
             // listed on the Stores page (`AppState::light_stores`): its row
             // shows no record, and opening it loads it again.
-            let light = APP_STATE.read().light_stores.contains(&contract_id);
-            let reputation_to_subscribe = if light {
-                None
-            } else {
+            let follows = APP_STATE.read().follows_record(&contract_id);
+            let reputation_to_subscribe = if follows {
                 check_for_reputation_link(&state_bytes)
+            } else {
+                None
             };
 
             {

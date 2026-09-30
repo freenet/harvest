@@ -370,7 +370,7 @@ pub fn App() -> Element {
                 {
                     button {
                         class: if current_tab == Some(route) { "nav-btn active" } else { "nav-btn" },
-                        aria_current: if current_route == route { "page" } else if current_tab == Some(route) { "true" } else { "false" },
+                        aria_current: if current_tab == Some(route) { "page" } else { "false" },
                         onclick: move |_| *ROUTE.write() = route,
                         "{label}"
                         if let Some(count) = count {

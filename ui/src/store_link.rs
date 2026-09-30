@@ -236,9 +236,13 @@ pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
     use dioxus::prelude::WritableExt;
     let contract_id = store_id.as_bytes().to_vec();
     crate::components::show_store(contract_id.clone());
-    crate::gateway::APP_STATE
+    if !crate::gateway::APP_STATE
         .write()
-        .begin_foreground_load(&contract_id);
+        .begin_foreground_load(&contract_id)
+    {
+        // Its GET is already out, with its own wait: only shown.
+        return;
+    }
 
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
@@ -340,12 +344,16 @@ pub fn load_remembered_store(code: &str, subscribe: bool) {
         }
         // Sent again on its own timer: the pages ask only when the state
         // changes, and nothing may change when the wait is over (codex on
-        // #197). `None` once it has arrived or has no tries left.
+        // #197). `None` once it has arrived or has no tries left, and not
+        // for a store taken off the list meanwhile.
         let retry = {
             use dioxus::prelude::ReadableExt;
-            crate::gateway::APP_STATE
-                .read()
-                .background_retry_after(&contract_id)
+            let state = crate::gateway::APP_STATE.read();
+            state
+                .visited_store_codes(false)
+                .contains(&code)
+                .then(|| state.background_retry_after(&contract_id))
+                .flatten()
         };
         if let Some(wait) = retry {
             // A little past the wait, so the check it meets is not a
