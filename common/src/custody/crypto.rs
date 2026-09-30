@@ -241,6 +241,8 @@ pub fn record_key_seed(store_sk: &SigningKey) -> Zeroizing<[u8; 32]> {
 /// limit. Kept, with its known-answer test, as the record of how the keys
 /// stores published between harvest#93 phase 1b and harvest#203 were made.
 /// Do not call it from a delegate request handler.
+///
+/// (Kept at this length: this file compiles into the contracts.)
 pub fn record_rsa_key(store_sk: &SigningKey) -> Result<rsa::RsaPrivateKey, CustodyError> {
     use rand_chacha::rand_core::SeedableRng;
     let seed = record_key_seed(store_sk);

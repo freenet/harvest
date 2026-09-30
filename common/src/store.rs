@@ -238,7 +238,8 @@ pub struct StoreInfoV1 {
     /// generation that overran the node's 5 s limit on a delegate call
     /// (harvest#203). A new store publishes `None`, and an edit carries over
     /// whatever the store already publishes. Skipped when absent for the
-    /// reason `encryption_public_key` is.
+    /// reason `encryption_public_key` is. (Kept at this length: this file
+    /// compiles into the contracts, and a line count change moves them.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_public_key: Option<Vec<u8>>,
 }

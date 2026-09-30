@@ -24,11 +24,9 @@
 //!    ([`unwrap_store_key`]) the seed. Unwrap checks the recovered seed really
 //!    is the store's key. The UI never holds the seed.
 //!
-//! The store's inbox X25519 key derives from the store key
-//! ([`inbox_secret`]), so every device agrees on it. The record (legacy RSA)
-//! key's derivation ([`record_rsa_key`]) is kept only for its known-answer
-//! test: nothing derives it since harvest#203 (see
-//! `StoreInfoV1::record_public_key`).
+//! The store's inbox X25519 key derives from the store key ([`inbox_secret`]);
+//! the record (legacy RSA) key's derivation ([`record_rsa_key`]) is kept only
+//! for its known-answer test, as nothing derives it since harvest#203.
 //!
 //! # What lives where
 //!
