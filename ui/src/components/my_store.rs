@@ -4,7 +4,8 @@ use harvest_common::listing::Listing;
 use crate::gateway::APP_STATE;
 use crate::state::{AppState, StoreDetails, StoreDetailsGap};
 
-/// The pages of My store (harvest#93 phase 2, entity model section 4).
+/// The seller's pages for one store (harvest#93 phase 2, entity model
+/// section 4), reached from the Stores page's "Your store" cards.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Overview,
@@ -21,7 +22,8 @@ pub(crate) struct SellerStore {
     pub contract_id: Vec<u8>,
     /// The Ghost Key this store is registered under on this device.
     pub fingerprint: String,
-    /// The store's name, or "Store <code>" before it has one.
+    /// The store's name, or "Loading…" before it has one: never its code
+    /// (`state::StoreName`).
     pub label: String,
     /// The store's code (harvest#52).
     pub code: Option<String>,
@@ -118,13 +120,22 @@ pub(crate) fn orders_to_send(
         .collect()
 }
 
-/// What needs the seller across every store this device manages: requests
-/// waiting for an invoice, and paid orders waiting to be sent. The number
-/// beside "My store" in the navigation.
+impl SellerStore {
+    /// What needs the seller at this store: requests waiting for an invoice,
+    /// paid orders waiting to be sent, and payments to confirm. Never an
+    /// unpaid Buy now. The count on its Orders tab and its card on Stores.
+    pub(crate) fn needs_you(&self) -> usize {
+        self.requests + self.to_send + self.to_confirm
+    }
+}
+
+/// What needs the seller across every store this device manages
+/// ([`SellerStore::needs_you`]): the number beside "Stores" in the
+/// navigation, visible from every page.
 pub(crate) fn requests_needing_seller(state: &AppState) -> usize {
     seller_stores(state)
         .iter()
-        .map(|s| s.requests + s.to_send + s.to_confirm)
+        .map(SellerStore::needs_you)
         .sum()
 }
 
@@ -152,7 +163,6 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
             let id = &registration.store_contract_id;
             let browsing = state.browsing_stores.get(id);
             let info = browsing.and_then(|b| b.info.as_ref());
-            let name = info.map(|info| info.store_name.clone());
             let code = ed25519_dalek::VerifyingKey::from_bytes(&store_key)
                 .ok()
                 .map(|key| harvest_common::store::store_code(&key));
@@ -201,9 +211,10 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
             Some(SellerStore {
                 contract_id: id.clone(),
                 fingerprint: fingerprint.clone(),
-                label: match code.as_deref() {
-                    Some(code) => crate::store_link::store_label(code, name.as_deref()),
-                    None => name.clone().unwrap_or_else(|| "Your store".to_string()),
+                label: match state.store_name_of(id) {
+                    // Given up on: it is still the seller's store.
+                    crate::state::StoreName::Unreachable => "Your store".to_string(),
+                    name => name.label(),
                 },
                 link: code.as_deref().map(crate::store_link::share_link),
                 foreign_owner: state.foreign_store_owner(id).map(|held| {
@@ -268,6 +279,10 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
     stores
 }
 
+/// The seller's pages, reached from the Stores page: a store's dashboard,
+/// or opening a first or another store (`app::SellerPage`). The pages that
+/// open a store have a way back to Stores; the dashboard is under the Stores
+/// tab, which stays lit.
 #[component]
 pub fn MyStore() -> Element {
     let app_state = APP_STATE.read();
@@ -276,18 +291,39 @@ pub fn MyStore() -> Element {
     let has_harvest_delegate = app_state.harvest_delegate_key.is_some();
     let stores = seller_stores(&app_state);
     drop(app_state);
+    let another = super::app::SELLER_PAGE() == super::app::SellerPage::AnotherStore;
 
     rsx! {
         div { class: "my-store",
             if ghostkeys.is_empty() {
-                h2 { "My store" }
+                BackToStores {}
+                h2 { "Open a store" }
                 NoIdentity { in_flight }
             } else if stores.is_empty() {
-                h2 { "My store" }
+                BackToStores {}
+                h2 { "Open a store" }
                 FirstStore { ghostkeys, has_harvest_delegate }
+            } else if another {
+                BackToStores {}
+                h2 { "Open another store" }
+                section { class: "card",
+                    AnotherStore { has_harvest_delegate }
+                }
             } else {
-                StoreDashboard { stores, has_harvest_delegate }
+                StoreDashboard { stores }
             }
+        }
+    }
+}
+
+/// "‹ Stores", above a page reached from the Stores page.
+#[component]
+pub(crate) fn BackToStores() -> Element {
+    rsx! {
+        button {
+            class: "crumb",
+            onclick: move |_| *super::app::ROUTE.write() = super::app::Route::Stores,
+            "\u{2039} Stores"
         }
     }
 }
@@ -643,14 +679,34 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
     }
 }
 
+/// The store the dashboard opens on: the one the seller opened from Stores
+/// (`SellerPage::Store`), or the first. `stores` is never empty here.
+pub(crate) fn dashboard_store<'a>(
+    stores: &'a [SellerStore],
+    page: &super::app::SellerPage,
+) -> &'a SellerStore {
+    match page {
+        super::app::SellerPage::Store(id) => stores.iter().find(|s| &s.contract_id == id),
+        _ => None,
+    }
+    .unwrap_or(&stores[0])
+}
+
 /// The seller's dashboard: one store at a time, titled by its name, with a
 /// switcher when there is more than one (entity model, wireframe C).
 #[component]
-fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Element {
+fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
     // Pinned to the store first shown, so a store arriving later, or a name
     // arriving that reorders the list, does not switch the page under the
-    // seller (and remount it, losing an open form).
-    let mut selected = use_signal(|| Some(stores[0].contract_id.clone()));
+    // seller (and remount it, losing an open form). The store first shown is
+    // the one the seller opened from Stores, if they opened one.
+    let mut selected = use_signal(|| {
+        Some(
+            dashboard_store(&stores, &super::app::SELLER_PAGE.peek())
+                .contract_id
+                .clone(),
+        )
+    });
     let tab = use_signal(|| Tab::Overview);
     let store = selected()
         .and_then(|id| stores.iter().find(|s| s.contract_id == id).cloned())
@@ -659,10 +715,7 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
     // Counts what needs the seller, not everything there is: a request
     // waiting for an invoice, or a paid order waiting to be sent. Never an
     // unpaid Buy now.
-    let orders_label = match store.requests + store.to_send + store.to_confirm {
-        0 => "Orders".to_string(),
-        n => format!("Orders ({n})"),
-    };
+    let orders_needs = store.needs_you();
     let listings_label = format!("Listings ({})", store.listings);
     let current = tab();
 
@@ -692,7 +745,7 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
             for (t , label) in [
                 (Tab::Overview, "Overview".to_string()),
                 (Tab::Listings, listings_label.clone()),
-                (Tab::Orders, orders_label.clone()),
+                (Tab::Orders, "Orders".to_string()),
                 (Tab::Settings, "Settings".to_string()),
             ]
             {
@@ -705,6 +758,13 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
                         move |_| tab.set(t)
                     },
                     "{label}"
+                    // What needs the seller, in the one colour that means
+                    // it, so it does not read as a count of orders beside
+                    // "Listings (n)" (critique S9-10).
+                    if t == Tab::Orders && orders_needs > 0 {
+                        " "
+                        span { class: "tab-needs", "({orders_needs})" }
+                    }
                 }
             }
         }
@@ -718,7 +778,6 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
                 key: "{bs58::encode(&body.contract_id).into_string()}",
                 store: body.clone(),
                 tab,
-                has_harvest_delegate,
             }
         }
         }
@@ -727,7 +786,7 @@ fn StoreDashboard(stores: Vec<SellerStore>, has_harvest_delegate: bool) -> Eleme
 
 /// The page of My store that is showing, for one store.
 #[component]
-fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -> Element {
+fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
     // Whether the details form is open, shared by Overview (whose repair
     // prompt opens it) and Settings (where it lives). Per store, because this
     // component is remounted when the store changes.
@@ -753,7 +812,7 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>, has_harvest_delegate: bool) -
                     super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                 },
                 Tab::Settings => rsx! {
-                    Settings { store: store.clone(), editing_details, has_harvest_delegate }
+                    Settings { store: store.clone(), editing_details }
                 },
             }
         }
@@ -992,7 +1051,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                 class: "btn btn-sm btn-outline",
                 onclick: {
                     let id = store.contract_id.clone();
-                    move |_| super::app::open_store_page(id.clone())
+                    move |_| super::app::show_store(id.clone())
                 },
                 "See your store as buyers do"
             }
@@ -1065,47 +1124,16 @@ fn StoreDetailsButton(
     }
 }
 
-/// Store details, payout wallet, the Ghost Key behind the store, and other
-/// stores (wireframe E).
+/// Store details, payout wallet and the Ghost Key behind the store
+/// (wireframe E). Opening another store is its own page (`AnotherStore`).
 #[component]
-fn Settings(
-    store: SellerStore,
-    editing_details: Signal<bool>,
-    has_harvest_delegate: bool,
-) -> Element {
-    let (identity, others, in_flight, busy) = {
-        let state = APP_STATE.read();
-        let identity = state
-            .ghostkeys
-            .iter()
-            .find(|k| k.fingerprint == store.fingerprint)
-            .cloned();
-        // Connected Ghost Keys with no store this device can manage: each can
-        // open one, or move one made before revision 2.
-        let others: Vec<ghostkey_common::GhostKeyInfo> = state
-            .ghostkeys
-            .iter()
-            .filter(|k| state.signable_store_for(&k.fingerprint).is_none())
-            .cloned()
-            .collect();
-        // A key whose creation is under way, or waiting on the seller's
-        // answer about a second store, stays open when the seller comes back
-        // to this tab, so its progress, Cancel and question are not hidden.
-        let busy: Vec<String> = state
-            .store_creation_in_flight
-            .iter()
-            .cloned()
-            .chain(
-                state
-                    .second_store_offer
-                    .iter()
-                    .map(|o| o.fingerprint.clone()),
-            )
-            .collect();
-        (identity, others, state.request_any_access_in_flight, busy)
-    };
-    let mut other_open = use_signal(|| Option::<String>::None);
-
+fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
+    let identity = APP_STATE
+        .read()
+        .ghostkeys
+        .iter()
+        .find(|k| k.fingerprint == store.fingerprint)
+        .cloned();
     rsx! {
         section { class: "card",
             div { class: "row-between",
@@ -1170,40 +1198,75 @@ fn Settings(
             p { class: "text-muted small", "Buyers see this as what you have at stake." }
         }
 
-        section { class: "card",
-            h3 { "Another store" }
-            p { class: "text-muted small",
-                "A new store starts with its own name, link and an empty record. Use a different "
-                "Ghost Key to keep the two apart."
-            }
-            for other in others {
-                div { class: "other-key", key: "{other.fingerprint}",
-                    div { class: "row-between",
-                        span { "{ghost_key_name(&other)} \u{00b7} {describe_notary_info(&other.notary_info)}" }
-                        if other_open() != Some(other.fingerprint.clone()) && !busy.contains(&other.fingerprint) {
-                            button {
-                                class: "btn btn-sm btn-outline",
-                                onclick: {
-                                    let fp = other.fingerprint.clone();
-                                    move |_| other_open.set(Some(fp.clone()))
-                                },
-                                "Open a store with it"
-                            }
+    }
+}
+
+/// Opening another store: each connected Ghost Key that has no store here
+/// can open one (or move one made before revision 2), and another key can
+/// be connected. Its own page, reached from "Open another store" on Stores
+/// (critique S12-10: it used to sit at the bottom of one store's Settings).
+#[component]
+fn AnotherStore(has_harvest_delegate: bool) -> Element {
+    let (others, in_flight, busy) = {
+        let state = APP_STATE.read();
+        // Connected Ghost Keys with no store this device can manage: each can
+        // open one, or move one made before revision 2.
+        let others: Vec<ghostkey_common::GhostKeyInfo> = state
+            .ghostkeys
+            .iter()
+            .filter(|k| state.signable_store_for(&k.fingerprint).is_none())
+            .cloned()
+            .collect();
+        // A key whose creation is under way, or waiting on the seller's
+        // answer about a second store, stays open when the seller comes back
+        // to this page, so its progress, Cancel and question are not hidden.
+        let busy: Vec<String> = state
+            .store_creation_in_flight
+            .iter()
+            .cloned()
+            .chain(
+                state
+                    .second_store_offer
+                    .iter()
+                    .map(|o| o.fingerprint.clone()),
+            )
+            .collect();
+        (others, state.request_any_access_in_flight, busy)
+    };
+    let mut other_open = use_signal(|| Option::<String>::None);
+
+    rsx! {
+        p { class: "text-muted small",
+            "A new store starts with its own name, link and an empty record. Use a different "
+            "Ghost Key to keep the two apart."
+        }
+        for other in others {
+            div { class: "other-key", key: "{other.fingerprint}",
+                div { class: "row-between",
+                    span { "{ghost_key_name(&other)} \u{00b7} {describe_notary_info(&other.notary_info)}" }
+                    if other_open() != Some(other.fingerprint.clone()) && !busy.contains(&other.fingerprint) {
+                        button {
+                            class: "btn btn-sm btn-outline",
+                            onclick: {
+                                let fp = other.fingerprint.clone();
+                                move |_| other_open.set(Some(fp.clone()))
+                            },
+                            "Open a store with it"
                         }
                     }
-                    if other_open() == Some(other.fingerprint.clone()) || busy.contains(&other.fingerprint) {
-                        StoreSetup { identity: other.clone(), has_harvest_delegate }
-                    }
+                }
+                if other_open() == Some(other.fingerprint.clone()) || busy.contains(&other.fingerprint) {
+                    StoreSetup { identity: other.clone(), has_harvest_delegate }
                 }
             }
-            button {
-                class: "btn btn-sm btn-outline",
-                disabled: in_flight,
-                onclick: move |_| connect_ghostkey(),
-                if in_flight { "Waiting for the vault\u{2026}" } else { "Use another Ghost Key" }
-            }
-            GhostKeyAccessNote {}
         }
+        button {
+            class: "btn btn-sm btn-outline",
+            disabled: in_flight,
+            onclick: move |_| connect_ghostkey(),
+            if in_flight { "Waiting for the vault\u{2026}" } else { "Use another Ghost Key" }
+        }
+        GhostKeyAccessNote {}
     }
 }
 
@@ -1989,6 +2052,52 @@ mod seller_stores_tests {
         assert_eq!(stores[0].requests, 0);
         assert!(stores[0].code.is_some() && stores[0].link.is_some());
         assert_eq!(requests_needing_seller(&state), 0);
+    }
+
+    /// An own store is named by its name, "Loading…" until it arrives, and
+    /// never by its code (the 2026-09-30 Stores page); its card on Stores
+    /// opens the seller pages on that store. Red with the old
+    /// `store_label`, which fell back to "Store <code>".
+    #[test]
+    fn an_own_store_is_never_named_by_its_code_and_its_card_opens_it() {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![
+                registration(1, Some(crate::state::test_store_key())),
+                registration(2, Some(crate::state::test_store_key())),
+            ],
+        );
+        let stores = seller_stores(&state);
+        assert_eq!(stores.len(), 2);
+        for store in &stores {
+            assert_eq!(store.label, "Loading\u{2026}");
+            let code = store.code.as_deref().expect("a code");
+            assert!(!store.label.contains(code));
+        }
+        state.store_state_unavailable.insert(vec![2u8; 32]);
+        let stores = seller_stores(&state);
+        let given_up = stores
+            .iter()
+            .find(|s| s.contract_id == vec![2u8; 32])
+            .unwrap();
+        assert_eq!(given_up.label, "Your store");
+
+        use super::super::app::SellerPage;
+        assert_eq!(
+            dashboard_store(&stores, &SellerPage::Store(vec![2u8; 32])).contract_id,
+            vec![2u8; 32],
+            "the store whose card was pressed"
+        );
+        assert_eq!(
+            dashboard_store(&stores, &SellerPage::First).contract_id,
+            stores[0].contract_id
+        );
+        assert_eq!(
+            dashboard_store(&stores, &SellerPage::Store(vec![9u8; 32])).contract_id,
+            stores[0].contract_id,
+            "a store no longer here falls back to the first"
+        );
     }
 
     /// Paid orders waiting to be sent are what a Buy now first needs the

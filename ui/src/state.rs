@@ -1174,9 +1174,9 @@ pub(crate) const PAYMENT_ON_ITS_WAY_BUYER: &str =
 /// no store key for (harvest#93).
 pub(crate) const NO_STORE_KEY_MESSAGE: &str =
     "this store has no store key on this device. A store made before stores had their own \
-     keys has to be moved to one first (My store offers it); for a store created on another \
-     device, open its link here with the Ghost Key that backs it connected, and Harvest \
-     recovers the key from the store.";
+     keys has to be moved to one first (open a store with its Ghost Key, from Stores, and \
+     Harvest offers the move); for a store created on another device, open its link here \
+     with the Ghost Key that backs it connected, and Harvest recovers the key from the store.";
 
 /// What a seller is told when their store's key is registered on this device
 /// but the delegate does not hold it (harvest#138): after a delegate re-key,
@@ -2904,15 +2904,57 @@ impl RecordLoad {
     }
 }
 
-/// One row of the store list. See [`AppState::store_list_rows`].
+/// One row of "Stores you've visited". See [`AppState::store_list_rows`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoreListRow {
     pub code: String,
-    pub label: String,
+    /// What the row is called. Never the store's code (see [`StoreName`]).
+    pub name: StoreName,
+    /// The first line of the store's description, plain
+    /// (`markdown::first_line`), once its state has arrived.
+    pub tagline: Option<String>,
     pub archived: bool,
     /// The store is closed (`presence_flow`): greyed, and listed after the
     /// open ones.
     pub closed: bool,
+}
+
+/// What a store is called on screen.
+///
+/// Never its code. A code is what a seller hands out and what a link
+/// carries, and shown as a name it read as a label on a button ("Store
+/// Hyqno9kqmxYLezD1"), which Ian called out on the 2026-09-30 Stores page.
+/// Until the store's own name arrives it is "Loading…", and a store that
+/// did not arrive says so.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StoreName {
+    Named(String),
+    /// Its state arrived with an empty name.
+    Unnamed,
+    /// Its state has not arrived yet, or not been asked for yet.
+    Loading,
+    /// It was asked for and did not arrive.
+    Unreachable,
+}
+
+impl StoreName {
+    /// The words shown for it.
+    pub fn label(&self) -> String {
+        match self {
+            StoreName::Named(name) => name.clone(),
+            StoreName::Unnamed => "Unnamed store".to_string(),
+            StoreName::Loading => "Loading\u{2026}".to_string(),
+            StoreName::Unreachable => "Couldn\u{2019}t load this store".to_string(),
+        }
+    }
+
+    /// The store's own name, if it has arrived.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            StoreName::Named(name) => Some(name),
+            _ => None,
+        }
+    }
 }
 
 /// What a seller is told when their store's address is held by another key
@@ -3484,7 +3526,8 @@ fn send_remember_store_request(
 
 impl AppState {
     /// Start browsing a store: prepare its state and make it the store the
-    /// Browse tab shows. The caller is responsible for the GET/subscribe.
+    /// store page shows. The caller is responsible for the GET/subscribe,
+    /// and for showing the page (`components::app::show_store`).
     pub fn begin_browsing(&mut self, store_contract_id: Vec<u8>) {
         self.browsing_stores
             .entry(store_contract_id.clone())
@@ -3494,7 +3537,7 @@ impl AppState {
     }
 
     /// A link named a store the old way (a whole contract id): say so on the
-    /// Browse tab instead of showing nothing. See
+    /// store page instead of showing nothing. See
     /// `store_link::is_old_format_link`.
     pub fn note_old_format_link(&mut self) {
         self.store_link_error = Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string());
@@ -3704,47 +3747,108 @@ impl AppState {
         self.send_to_harvest_delegate("archive this store", &request);
     }
 
-    /// The rows of the store list, and how many archived ones it is not
-    /// showing.
+    /// What the store `store_contract_id` is called on screen: see
+    /// [`StoreName`].
     ///
-    /// Labelled by name wherever the store's state has arrived this session,
-    /// by code otherwise. Archived stores are included only when asked for,
-    /// and come after the others.
+    /// A store with no entry at all has not been asked for yet, and is
+    /// loading: the pages that list stores ask for each one
+    /// (`store_link::load_visited_stores`, and a seller's own stores are
+    /// subscribed to when the Ghost Key connects). An entry with no state is
+    /// loading while its GET is out, and unreachable once it has given up.
+    pub fn store_name_of(&self, store_contract_id: &[u8]) -> StoreName {
+        let info = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.info.as_ref());
+        if let Some(info) = info {
+            return match info.store_name.trim() {
+                "" => StoreName::Unnamed,
+                name => StoreName::Named(name.to_string()),
+            };
+        }
+        if self.store_state_unavailable.contains(store_contract_id) {
+            return StoreName::Unreachable;
+        }
+        if !self.browsing_stores.contains_key(store_contract_id) {
+            return StoreName::Loading;
+        }
+        let active = self.active_store_id.as_deref() == Some(store_contract_id);
+        if active && self.store_link_error.is_some() {
+            return StoreName::Unreachable;
+        }
+        // Still out: a background load (`begin_background_load`), the store a
+        // link just opened, or one of our own being subscribed to.
+        if self.background_loads.contains(store_contract_id)
+            || active
+            || self.store_owner_fingerprint(store_contract_id).is_some()
+        {
+            return StoreName::Loading;
+        }
+        // A background load that timed out (its placeholder stays for the
+        // session), or a store opened and left before it answered.
+        StoreName::Unreachable
+    }
+
+    /// The rows of "Stores you've visited", and how many archived ones it is
+    /// not showing.
+    ///
+    /// Every store this node remembers except its own, which the Stores page
+    /// lists on their own above. Each is named by [`Self::store_name_of`],
+    /// never by its code. Archived stores ("Remove from list") are included
+    /// only when asked for, and come after the others; then closed ones
+    /// after open ones; then stores with no name yet; then by name.
     pub fn store_list_rows(&self, show_archived: bool) -> (Vec<StoreListRow>, usize) {
         let Some(remembered) = self.remembered_stores.as_ref() else {
             return (Vec::new(), 0);
         };
+        let visited: Vec<(&harvest_common::RememberedStore, Option<Vec<u8>>)> = remembered
+            .iter()
+            .map(|s| {
+                let id = StoreParameters::from_code(&s.store_code)
+                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                    .map(|id| id.as_bytes().to_vec());
+                (s, id)
+            })
+            .filter(|(_, id)| {
+                id.as_ref()
+                    .is_none_or(|id| self.store_owner_fingerprint(id).is_none())
+            })
+            .collect();
         let hidden = if show_archived {
             0
         } else {
-            remembered.iter().filter(|s| s.archived).count()
+            visited.iter().filter(|(s, _)| s.archived).count()
         };
         let now_ms = now_ms();
-        let mut rows: Vec<StoreListRow> = remembered
-            .iter()
-            .filter(|s| show_archived || !s.archived)
-            .map(|s| {
-                let id = StoreParameters::from_code(&s.store_code)
-                    .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok());
-                let name = id
+        let mut rows: Vec<StoreListRow> = visited
+            .into_iter()
+            .filter(|(s, _)| show_archived || !s.archived)
+            .map(|(s, id)| {
+                let info = id
                     .as_ref()
-                    .and_then(|id| self.browsing_stores.get(id.as_bytes()))
-                    .and_then(|store| store.info.as_ref())
-                    .map(|info| info.store_name.clone());
+                    .and_then(|id| self.browsing_stores.get(id))
+                    .and_then(|store| store.info.as_ref());
                 StoreListRow {
-                    label: crate::store_link::store_label(&s.store_code, name.as_deref()),
+                    name: id
+                        .as_ref()
+                        .map_or(StoreName::Unreachable, |id| self.store_name_of(id)),
+                    tagline: info.and_then(|info| crate::markdown::first_line(&info.description)),
                     code: s.store_code.clone(),
                     archived: s.archived,
                     closed: id
-                        .is_some_and(|id| self.store_presence(id.as_bytes(), now_ms).is_closed()),
+                        .as_ref()
+                        .is_some_and(|id| self.store_presence(id, now_ms).is_closed()),
                 }
             })
             .collect();
         rows.sort_by(|a, b| {
+            let name = |row: &StoreListRow| row.name.name().map(str::to_lowercase);
             a.archived
                 .cmp(&b.archived)
                 .then(a.closed.cmp(&b.closed))
-                .then(a.label.cmp(&b.label))
+                .then(name(a).is_none().cmp(&name(b).is_none()))
+                .then(name(a).cmp(&name(b)))
+                .then(a.code.cmp(&b.code))
         });
         (rows, hidden)
     }
@@ -4301,17 +4405,18 @@ impl AppState {
         }
     }
 
-    /// The store the Browse tab is showing.
+    /// The store the store page is showing: the one last opened
+    /// (`active_store_id`), once its state has arrived.
     ///
-    /// Prefer the store a link named; fall back to any store whose state has
-    /// actually arrived. `browsing_stores` also holds placeholder entries --
-    /// one is created the moment a link is opened, before any state arrives,
-    /// and another whenever reputation state turns up for a store we haven't
-    /// loaded -- so "whichever entry the map iterates first" picks
-    /// arbitrarily among them and can show "no store" while a perfectly good
-    /// one is loaded.
+    /// Only that one. `browsing_stores` also holds placeholder entries (one
+    /// is created the moment a store is opened, before any state arrives)
+    /// and every other store loaded this session. This used to fall back to
+    /// any loaded store while the opened one was still a placeholder, which
+    /// on a page of its own (the 2026-09-30 Stores page) would show one
+    /// store under the name of another the user had just asked for. Until
+    /// the opened store arrives the page says it is loading.
     ///
-    /// Both `StoreView` and the document title resolve the shown store, and
+    /// Both `StorePage` and the document title resolve the shown store, and
     /// they answered differently until they shared this: the title took the
     /// map's first loaded entry, so with two stores open the page was titled
     /// after one the user was not looking at.
@@ -4320,11 +4425,6 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.browsing_stores.get_key_value(id))
             .filter(|(_, store)| store.info.is_some())
-            .or_else(|| {
-                self.browsing_stores
-                    .iter()
-                    .find(|(_, store)| store.info.is_some())
-            })
     }
 
     /// Record that we have asked the gateway for a store contract. Returns
@@ -15166,18 +15266,25 @@ mod tests {
         assert_eq!(store.info.as_ref().unwrap().store_name, "store 5");
     }
 
-    /// A placeholder entry -- created the moment a link is opened -- is not a
-    /// loaded store, and must not shadow one that is.
+    /// A placeholder entry -- created the moment a store is opened -- is not
+    /// a loaded store, and no other loaded store stands in for it: the store
+    /// page says "Loading" rather than showing a store the user did not ask
+    /// for. (Until the 2026-09-30 Stores page this fell back to the loaded
+    /// one, which on a page of the store's own is the wrong store.)
     #[test]
-    fn a_placeholder_active_store_falls_back_to_a_loaded_one() {
+    fn a_placeholder_active_store_is_not_replaced_by_another() {
         let mut state = AppState::default();
         state
             .browsing_stores
             .insert(vec![1u8; 32], loaded_store("loaded"));
         state.begin_browsing(vec![2u8; 32]);
+        assert!(state.displayed_store().is_none());
 
-        let (id, _) = state.displayed_store().expect("the loaded store");
-        assert_eq!(id, &vec![1u8; 32]);
+        state
+            .browsing_stores
+            .insert(vec![2u8; 32], loaded_store("opened"));
+        let (id, _) = state.displayed_store().expect("the opened store");
+        assert_eq!(id, &vec![2u8; 32]);
     }
 
     #[test]
@@ -33770,7 +33877,8 @@ mod store_code_tests {
             rows,
             vec![StoreListRow {
                 code: named.clone(),
-                label: "Bean Shop".to_string(),
+                name: StoreName::Named("Bean Shop".to_string()),
+                tagline: None,
                 archived: false,
                 closed: false,
             }]
@@ -33779,8 +33887,146 @@ mod store_code_tests {
         assert_eq!(hidden, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].code, plain, "archived after the rest");
-        assert_eq!(rows[1].label, format!("Store {plain}"), "labelled by code");
+        assert_eq!(
+            rows[1].name,
+            StoreName::Loading,
+            "not asked for yet: loading, never its code"
+        );
         assert!(rows[1].archived);
+    }
+
+    /// **A store's code is never its name** (the 2026-09-30 Stores page):
+    /// "Loading…" until its state arrives, and "Couldn't load this store"
+    /// once the wait is over, whichever way it was opened. Red with the old
+    /// `store_label`, which fell back to "Store <code>".
+    #[test]
+    fn a_store_is_never_named_by_its_code() {
+        let mut state = AppState::default();
+        let id = vec![7u8; 32];
+        assert_eq!(
+            state.store_name_of(&id),
+            StoreName::Loading,
+            "not asked yet"
+        );
+
+        // Opened by a link or a typed code: loading until the link fails.
+        state.begin_browsing(id.clone());
+        assert_eq!(state.store_name_of(&id), StoreName::Loading);
+        assert!(state.note_store_link_failed(&id, "didn't load"));
+        assert_eq!(state.store_name_of(&id), StoreName::Unreachable);
+
+        // Loaded in the background for a list: loading, then unreachable
+        // once it times out.
+        let other = vec![8u8; 32];
+        assert!(state.begin_background_load(other.clone(), "3Bn8xWqLd6Tz9Kf2".into()));
+        assert_eq!(state.store_name_of(&other), StoreName::Loading);
+        state.end_background_load_timed_out(&other);
+        assert_eq!(state.store_name_of(&other), StoreName::Unreachable);
+
+        // Its state arrives: its own name, trimmed; an empty one says so.
+        state.browsing_stores.get_mut(&other).unwrap().info = Some(StoreInfoV1 {
+            version: 1,
+            certificate_pem: String::new(),
+            seller_fingerprint: String::new(),
+            reputation_contract_id: [0u8; 32],
+            store_name: "  Bean Shop ".to_string(),
+            description: String::new(),
+            encryption_public_key: None,
+            record_public_key: None,
+        });
+        assert_eq!(
+            state.store_name_of(&other),
+            StoreName::Named("Bean Shop".to_string())
+        );
+        state
+            .browsing_stores
+            .get_mut(&other)
+            .unwrap()
+            .info
+            .as_mut()
+            .unwrap()
+            .store_name = " ".to_string();
+        assert_eq!(state.store_name_of(&other), StoreName::Unnamed);
+
+        for name in [
+            StoreName::Loading,
+            StoreName::Unreachable,
+            StoreName::Unnamed,
+        ] {
+            let label = name.label();
+            assert!(
+                !label.contains("3Bn8") && !label.contains("Store "),
+                "{label:?}"
+            );
+        }
+        assert_eq!(StoreName::Loading.label(), "Loading\u{2026}");
+    }
+
+    /// "Stores you've visited" leaves out this node's own stores (they are
+    /// listed above it, as "Your store"), and names the rest by their own
+    /// name with the first line of their description under it; stores with
+    /// no name yet come after named ones. Red without the own-store filter.
+    #[test]
+    fn visited_stores_leave_out_our_own_and_name_the_rest() {
+        let mut state = AppState::default();
+        let code =
+            |k: &ed25519_dalek::SigningKey| harvest_common::store::store_code(&k.verifying_key());
+        let id_of = |k: &ed25519_dalek::SigningKey| {
+            crate::gateway::store_ops::store_instance_id(
+                &StoreParameters::from_code(&code(k)).expect("a code"),
+            )
+            .expect("derive")
+            .as_bytes()
+            .to_vec()
+        };
+        let mine = seller();
+        let theirs = other();
+        let unnamed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        state.on_delegate_response(HarvestDelegateResponse::RememberedStores {
+            stores: [&unnamed, &mine, &theirs]
+                .iter()
+                .map(|k| harvest_common::RememberedStore {
+                    store_code: code(k),
+                    archived: false,
+                })
+                .collect(),
+        });
+        state.my_stores.insert(
+            "my-ghost-key".to_string(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: id_of(&mine),
+                reputation_contract_id: Vec::new(),
+                mailbox_contract_id: Vec::new(),
+                store_contract_key: None,
+                store_verifying_key: Some(mine.verifying_key().to_bytes()),
+            }],
+        );
+        for (key, name) in [(&mine, "Mine"), (&theirs, "Theirs")] {
+            state.browsing_stores.entry(id_of(key)).or_default().info = Some(StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: name.to_string(),
+                description: "Hand-thrown **stoneware**.\n\nMore about it.".to_string(),
+                encryption_public_key: None,
+                record_public_key: None,
+            });
+        }
+        let (rows, hidden) = state.store_list_rows(false);
+        assert_eq!(hidden, 0);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.name.label(), r.tagline.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Theirs".to_string(),
+                    Some("Hand-thrown stoneware.".to_string())
+                ),
+                ("Loading\u{2026}".to_string(), None),
+            ]
+        );
     }
 
     /// A closed store is greyed and listed after the open ones, whatever its
@@ -33841,9 +34087,12 @@ mod store_code_tests {
         let (rows, _) = state.store_list_rows(false);
         assert_eq!(
             rows.iter()
-                .map(|r| (r.label.as_str(), r.closed))
+                .map(|r| (r.name.label(), r.closed))
                 .collect::<Vec<_>>(),
-            vec![("Z open", false), ("A closed", true)]
+            vec![
+                ("Z open".to_string(), false),
+                ("A closed".to_string(), true)
+            ]
         );
     }
 }

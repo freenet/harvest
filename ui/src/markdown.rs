@@ -803,6 +803,70 @@ pub fn parse(source: &str) -> Vec<Block> {
     b.finish()
 }
 
+/// The most characters [`first_line`] keeps. The row it goes in shows one
+/// line and cuts the rest off with an ellipsis; this only bounds the text.
+pub const FIRST_LINE_CHARS: usize = 160;
+
+/// The first line of a seller's description as plain text: the one line
+/// under a store's name in a list. The first block that has any text, up to
+/// its first line break, with the markup dropped (never rendered: a link
+/// reads as its words) and runs of whitespace made one space. `None` when
+/// the description has no text at all.
+pub fn first_line(source: &str) -> Option<String> {
+    fn inline_text(inlines: &[Inline], out: &mut String) -> bool {
+        for inline in inlines {
+            match inline {
+                Inline::Text(text) | Inline::Code(text) => out.push_str(text),
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Link { children, .. } => {
+                    if inline_text(children, out) {
+                        return true;
+                    }
+                }
+                // A hard line break ends the line.
+                Inline::Break => return true,
+                // The app's own words, not the seller's.
+                Inline::Note(_) => {}
+            }
+        }
+        false
+    }
+    fn block_text(block: &Block, out: &mut String) {
+        match block {
+            Block::Paragraph(children) | Block::Heading { children, .. } => {
+                inline_text(children, out);
+            }
+            Block::Code(text) => out.push_str(text.lines().next().unwrap_or_default()),
+            Block::Quote(blocks) => {
+                if let Some(first) = blocks.first() {
+                    block_text(first, out);
+                }
+            }
+            Block::List { items, .. } => {
+                if let Some(first) = items.first().and_then(|item| item.first()) {
+                    block_text(first, out);
+                }
+            }
+            Block::Rule => {}
+        }
+    }
+    parse(source).iter().find_map(|block| {
+        let mut raw = String::new();
+        block_text(block, &mut raw);
+        // A soft line break is already a space (see `parse`); any newline
+        // left in the text still ends the line.
+        let line = raw.lines().find(|l| !l.trim().is_empty())?;
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut text = words.join(" ");
+        if text.chars().count() > FIRST_LINE_CHARS {
+            text = text.chars().take(FIRST_LINE_CHARS).collect::<String>();
+            text.push('\u{2026}');
+        }
+        Some(text)
+    })
+}
+
 /// Render a seller's description.
 #[component]
 pub fn Markdown(source: String, class: String) -> Element {
@@ -1518,5 +1582,34 @@ mod tests {
                 Block::Rule,
             ]
         );
+    }
+
+    /// The line under a store's name in a list: the description's first
+    /// text as plain words, markup dropped, never a link, cut at a hard break.
+    #[test]
+    fn the_first_line_is_plain_text_from_the_first_block_with_any() {
+        assert_eq!(
+            first_line("Hand-thrown **stoneware**, from [Vermont](https://x.example).\n\nMore."),
+            Some("Hand-thrown stoneware, from Vermont.".to_string())
+        );
+        assert_eq!(
+            first_line("---\n\n# Cards  and\tnotebooks\n\nMore"),
+            Some("Cards and notebooks".to_string())
+        );
+        assert_eq!(
+            first_line("- Wool hats\n- Scarves"),
+            Some("Wool hats".to_string())
+        );
+        assert_eq!(
+            first_line("Line one  \nline two"),
+            Some("Line one".to_string())
+        );
+        assert_eq!(first_line("<b>raw</b>"), Some("<b>raw</b>".to_string()));
+        assert_eq!(first_line(""), None);
+        assert_eq!(first_line("   \n\n---\n"), None);
+        let long = "word ".repeat(100);
+        let cut = first_line(&long).expect("text");
+        assert_eq!(cut.chars().count(), FIRST_LINE_CHARS + 1);
+        assert!(cut.ends_with('\u{2026}'));
     }
 }

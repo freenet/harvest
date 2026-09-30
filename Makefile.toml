@@ -182,15 +182,15 @@ echo "CSS and fonts copied to build output"
 # --- Development tasks ---
 
 [tasks.dev]
-description = "Run UI in development mode with example data"
+description = "Run UI in development mode"
 command = "dx"
-args = ["serve", "--features", "example-data"]
+args = ["serve"]
 cwd = "./ui"
 
 [tasks.dev-no-sync]
 description = "Run UI without Freenet connection"
 command = "dx"
-args = ["serve", "--features", "example-data,no-sync"]
+args = ["serve", "--features", "no-sync"]
 cwd = "./ui"
 
 [tasks.compress-webapp]

@@ -60,18 +60,7 @@ pub fn MyPurchases() -> Element {
     // a loaded store recalls this device's conversations with it.
     // An effect, so it runs again when the delegate's list of remembered
     // stores arrives after this page opened; loading is idempotent per store.
-    use_effect(|| {
-        let codes: Vec<String> = APP_STATE
-            .read()
-            .store_list_rows(false)
-            .0
-            .into_iter()
-            .map(|row| row.code)
-            .collect();
-        for code in codes {
-            crate::store_link::load_remembered_store(&code);
-        }
-    });
+    use_effect(|| crate::store_link::load_visited_stores(false));
     let rows = purchase_rows(&APP_STATE.read());
     let loading = !APP_STATE.read().background_loads.is_empty();
     let any_kept = !APP_STATE.read().kept_purchases.is_empty();
@@ -81,7 +70,7 @@ pub fn MyPurchases() -> Element {
 
     rsx! {
         div {
-            h2 { "My purchases" }
+            h2 { "Purchases" }
             p { class: "text-muted small",
                 "Kept by the Freenet node on this device, not in the network, so they do not follow "
                 "you to another computer. A conversation can be backed up from inside it."
@@ -105,7 +94,7 @@ pub fn MyPurchases() -> Element {
                             class: "btn btn-sm btn-outline",
                             onclick: {
                                 let id = row.store_contract_id.clone();
-                                move |_| super::app::open_store_page(id.clone())
+                                move |_| super::app::show_store(id.clone())
                             },
                             "Open store"
                         }

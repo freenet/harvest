@@ -1,53 +1,190 @@
 use dioxus::prelude::*;
-use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingKind, PriceInfo};
+use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingKind};
 
+use super::app::{open_seller_page, Route, SellerPage, ROUTE};
 use crate::gateway::APP_STATE;
+use crate::presence_flow::{SellerStatus, StorePresence};
+use crate::state::{AppState, StoreListRow, StoreName};
 
+/// The Stores page (the 2026-09-30 redesign, after the mockup's
+/// `scrStores()`): the seller's own stores, if any, each opening its
+/// seller pages; a way to open a store by its link or code; the stores this
+/// node has visited; and, for someone with no store, a quiet way into
+/// selling. Opening any store goes to its own page ([`StorePage`]).
 #[component]
-pub fn StoreView() -> Element {
-    let app_state = APP_STATE.read();
+pub fn StoresPage() -> Element {
+    let show_archived = use_signal(|| false);
+    // The visited stores are asked for in the background, so each row can
+    // carry the store's own name rather than its code. An effect, so it runs
+    // again when the delegate's list arrives after this page opened.
+    use_effect(move || crate::store_link::load_visited_stores(show_archived()));
+    // Whether a store is open is judged against the clock (`presence_flow`),
+    // so this re-renders every half minute, as the store page does.
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(30_000).await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
 
-    // `AppState::displayed_store` owns this choice, so the document title
-    // (see `components::App`) cannot answer it differently.
-    let store_entry = app_state
-        .displayed_store()
-        .map(|(id, store)| (id.clone(), store.clone()));
-
-    // A link was followed but the store's state hasn't come back yet. Once
-    // `store_link_error` is set the wait is over and the message changes --
-    // otherwise this reads "Loading store..." for the rest of the session.
-    let link_error = app_state.store_link_error.clone();
-    let awaiting_link =
-        store_entry.is_none() && app_state.active_store_id.is_some() && link_error.is_none();
+    let own = own_store_rows(&APP_STATE.read(), crate::state::now_ms());
+    let one = own.len() == 1;
 
     rsx! {
-        StoreList {}
-        div {
-            h2 { "Store" }
+        div { class: "stores-page",
+            h2 { "Stores" }
+            if !own.is_empty() {
+                h3 { class: "sec-lbl sec-lbl-first",
+                    if one { "Your store" } else { "Your stores" }
+                }
+                for row in own.iter() {
+                    OwnStoreCard { key: "{bs58::encode(&row.contract_id).into_string()}", row: row.clone() }
+                }
+                button {
+                    class: "link-btn",
+                    onclick: move |_| open_seller_page(SellerPage::AnotherStore),
+                    "Open another store"
+                }
+            }
+            h3 { class: if own.is_empty() { "sec-lbl sec-lbl-first" } else { "sec-lbl" }, "Find a store" }
+            FindStore {}
+            VisitedStores { show_archived }
+            if own.is_empty() {
+                div { class: "card card-quiet sell-card",
+                    h3 { "Sell on Harvest" }
+                    p { class: "text-muted",
+                        "Open a store. Harvest takes no cut, needs no account, and nobody can take "
+                        "your store down."
+                    }
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| open_seller_page(SellerPage::First),
+                        "Open a store \u{203a}"
+                    }
+                }
+            }
+        }
+    }
+}
 
-            match store_entry {
-                Some((contract_id, store)) => {
-                    rsx! { LoadedStore { store: store, contract_id: contract_id } }
+/// One of this node's own stores on the Stores page. See [`own_store_rows`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnStoreRow {
+    pub contract_id: Vec<u8>,
+    /// Its name, or "Loading…" (`my_store::SellerStore::label`).
+    pub label: String,
+    /// The first line of its description.
+    pub tagline: Option<String>,
+    pub status: OwnStoreStatus,
+}
+
+/// What an own store's row card says on the right.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnStoreStatus {
+    /// Something needs the seller (`my_store::SellerStore::needs_you`, the
+    /// count on the Stores tab): "<n> need(s) you".
+    NeedsYou(usize),
+    /// Open, and nothing waiting: "up to date".
+    UpToDate,
+    /// Buyers cannot buy: the seller's own status pill ("Closed", or "Not
+    /// taking orders" when buyers see it open but this device cannot answer).
+    NotOpen(&'static str),
+    /// Too soon to say whether buyers can reach it.
+    Checking,
+}
+
+impl OwnStoreStatus {
+    fn text(&self) -> String {
+        match self {
+            OwnStoreStatus::NeedsYou(1) => "1 needs you".to_string(),
+            OwnStoreStatus::NeedsYou(n) => format!("{n} need you"),
+            OwnStoreStatus::UpToDate => "up to date".to_string(),
+            OwnStoreStatus::NotOpen(pill) => pill.to_string(),
+            OwnStoreStatus::Checking => "Checking\u{2026}".to_string(),
+        }
+    }
+}
+
+/// The status on an own store's row card, from what needs the seller and
+/// the ONE status the seller's Overview reads (`presence_flow::
+/// seller_status`, `None` for a store that sells nothing here) or, failing
+/// that, what buyers see (`presence`). Nothing new is judged here: a store
+/// is "up to date" only where the Overview would say Open.
+pub(crate) fn own_store_status(
+    needs_you: usize,
+    seller: Option<&SellerStatus>,
+    presence: StorePresence,
+) -> OwnStoreStatus {
+    if needs_you > 0 {
+        return OwnStoreStatus::NeedsYou(needs_you);
+    }
+    match (seller, presence) {
+        (Some(status), _) if status.open => OwnStoreStatus::UpToDate,
+        (_, StorePresence::Checking) => OwnStoreStatus::Checking,
+        (Some(status), _) => OwnStoreStatus::NotOpen(status.pill),
+        (None, StorePresence::Open) => OwnStoreStatus::UpToDate,
+        (None, StorePresence::Closed(_)) => OwnStoreStatus::NotOpen("Closed"),
+    }
+}
+
+/// This node's own stores, as the Stores page lists them: every store the
+/// seller pages manage (`my_store::seller_stores`), in the same order.
+pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> {
+    super::my_store::seller_stores(state)
+        .into_iter()
+        .map(|store| {
+            let id = store.contract_id.clone();
+            let presence = state.store_presence(&id, now_ms);
+            let seller = state.instant_checkout_local(&id, now_ms).map(|local| {
+                crate::presence_flow::seller_status(
+                    presence,
+                    state.wakeups_seen_recently(now_ms),
+                    &local,
+                )
+            });
+            OwnStoreRow {
+                status: own_store_status(store.needs_you(), seller.as_ref(), presence),
+                tagline: state
+                    .browsing_stores
+                    .get(&id)
+                    .and_then(|b| b.info.as_ref())
+                    .and_then(|info| crate::markdown::first_line(&info.description)),
+                label: store.label,
+                contract_id: id,
+            }
+        })
+        .collect()
+}
+
+/// A row card for one of the seller's own stores: the whole card opens its
+/// seller pages, on the Overview, whose first card is "Needs you".
+#[component]
+fn OwnStoreCard(row: OwnStoreRow) -> Element {
+    let status = row.status.text();
+    rsx! {
+        button {
+            class: "rowcard",
+            onclick: {
+                let id = row.contract_id.clone();
+                move |_| open_seller_page(SellerPage::Store(id.clone()))
+            },
+            span { class: "rc-main",
+                span { class: "rc-name", "{row.label}" }
+                if let Some(ref tagline) = row.tagline {
+                    span { class: "rc-sub", "{tagline}" }
                 }
-                None if awaiting_link => {
-                    rsx! {
-                        p { class: "text-muted text-italic", "Loading store..." }
-                    }
+            }
+            span { class: "rc-r",
+                match row.status {
+                    OwnStoreStatus::NeedsYou(_) => rsx! { span { class: "pill pill-needs", "{status}" } },
+                    OwnStoreStatus::NotOpen(_) => rsx! { span { class: "pill", "{status}" } },
+                    _ => rsx! { span { class: "text-muted small", "{status}" } },
                 }
-                None if link_error.is_some() => {
-                    let message = link_error.clone().unwrap_or_default();
-                    rsx! {
-                        p { class: "text-warning", "{message}" }
-                    }
-                }
-                None => {
-                    rsx! {
-                        p { class: "text-muted text-italic",
-                            "No store open. Follow a seller's link, or enter their store code above."
-                        }
-                        {example_listings_section()}
-                    }
-                }
+                span { class: "chev", aria_hidden: "true", "\u{203a}" }
             }
         }
     }
@@ -59,27 +196,23 @@ fn typed_is_old_format_link(typed: &str) -> bool {
     crate::store_link::link_sections(typed.trim()).any(crate::store_link::is_old_format_link)
 }
 
-/// The stores this node has visited, a way to open one by its code, and
-/// archiving (harvest#52).
-///
-/// # Archive, and why it says what it does not do
-///
-/// Archiving hides a row and deletes nothing: a buyer's history with a store
-/// IS its conversations, so a "remove" that removed would take them with it.
-/// Deleting a conversation is `ForgetBuyerConversation`, inside the thread.
-/// And archiving a store you own is a view preference, not closing the shop,
-/// so the text beside the control says both.
+/// What someone who typed `typed` into "Find a store" is told when it opens
+/// nothing.
+fn not_a_store_message(typed: &str) -> String {
+    if typed_is_old_format_link(typed) {
+        crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string()
+    } else {
+        "That is not a store code. A store code is 16 letters and digits, the part of a \
+         store link after \"store=\"."
+            .to_string()
+    }
+}
+
+/// "Find a store": a link or a code, opened on the store's own page.
 #[component]
-fn StoreList() -> Element {
-    let mut show_archived = use_signal(|| false);
+fn FindStore() -> Element {
     let mut typed = use_signal(String::new);
     let mut typed_error = use_signal(|| Option::<String>::None);
-
-    let app_state = APP_STATE.read();
-    let remembered = app_state.remembered_stores.is_some();
-    let (rows, hidden) = app_state.store_list_rows(show_archived());
-    let any_archived = hidden > 0 || rows.iter().any(|row| row.archived);
-    drop(app_state);
 
     let mut open_typed = move || match crate::store_link::parse_typed_store_code(&typed()) {
         Some(params) => {
@@ -87,93 +220,180 @@ fn StoreList() -> Element {
             typed.set(String::new());
             crate::store_link::open_store(params);
         }
-        None => typed_error.set(Some(if typed_is_old_format_link(&typed()) {
-            crate::store_link::OLD_FORMAT_LINK_MESSAGE.to_string()
-        } else {
-            "That is not a store code. A store code is 16 letters and digits, the part of a \
-             store link after \"store=\"."
-                .to_string()
-        })),
+        None => typed_error.set(Some(not_a_store_message(&typed()))),
     };
 
     rsx! {
-        div { class: "store-list",
-            h2 { "Stores" }
-            div { class: "store-share-row",
-                input {
-                    class: "form-input",
-                    r#type: "text",
-                    spellcheck: false,
-                    aria_label: "Store code or link",
-                    placeholder: "Store code or link",
-                    value: "{typed}",
-                    oninput: move |e| typed.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter {
-                            open_typed();
-                        }
-                    },
-                }
-                button {
-                    class: "btn btn-sm btn-primary",
-                    onclick: move |_| open_typed(),
-                    "Open"
-                }
+        div { class: "find-store",
+            input {
+                class: "form-input",
+                r#type: "text",
+                spellcheck: false,
+                aria_label: "Store link or store code",
+                placeholder: "Paste a link or store code",
+                value: "{typed}",
+                oninput: move |e| typed.set(e.value()),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        open_typed();
+                    }
+                },
             }
-            if let Some(ref why) = typed_error() {
-                p { class: "text-warning", "{why}" }
-            }
+            button { class: "btn btn-primary", onclick: move |_| open_typed(), "Open" }
+        }
+        if let Some(ref why) = typed_error() {
+            p { class: "text-warning", "{why}" }
+        }
+    }
+}
 
-            if remembered && rows.is_empty() && hidden == 0 {
-                p { class: "text-muted text-italic", "Stores you open are listed here." }
+/// The main and second line of a visited store's row.
+fn visited_row_lines(row: &StoreListRow) -> (String, Option<String>) {
+    let second = if row.closed {
+        Some("Closed right now".to_string())
+    } else {
+        match row.name {
+            // Nothing else tells two unreachable rows apart, so the code is
+            // given, as the second line and never as the name.
+            StoreName::Unreachable => Some(format!("Store code {}", row.code)),
+            _ => row.tagline.clone(),
+        }
+    };
+    (row.name.label(), second)
+}
+
+/// "Stores you've visited" (harvest#52): every store this node remembers
+/// but its own, each opening its page, with "Remove from list".
+///
+/// # Remove from list, and why it says what it does not do
+///
+/// Removing hides a row and deletes nothing (it is the delegate's
+/// `SetStoreArchived`, "Archive" until the 2026-09-30 Stores page): a
+/// buyer's history with a store IS its conversations, so a "remove" that
+/// removed would take them with it. Deleting a conversation is
+/// `ForgetBuyerConversation`, inside the thread. So the text beside the
+/// control says so, and removed stores can be shown and put back.
+#[component]
+fn VisitedStores(show_archived: Signal<bool>) -> Element {
+    let (rows, hidden) = APP_STATE.read().store_list_rows(show_archived());
+    let any_archived = hidden > 0 || rows.iter().any(|row| row.archived);
+    if rows.is_empty() && !any_archived {
+        return rsx! {};
+    }
+
+    rsx! {
+        h3 { class: "sec-lbl", "Stores you\u{2019}ve visited" }
+        if !rows.is_empty() {
+            div { class: "vlist",
+                for row in rows {
+                    VisitedRow { key: "{row.code}", row }
+                }
             }
-            for row in rows {
-                div { class: if row.closed { "form-actions store-row-closed" } else { "form-actions" }, key: "{row.code}",
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: {
-                            let code = row.code.clone();
-                            move |_| {
-                                if let Some(params) = harvest_common::StoreParameters::from_code(&code) {
-                                    crate::store_link::open_store(params);
-                                }
-                            }
+        }
+        if hidden > 0 {
+            button {
+                class: "link-btn",
+                onclick: move |_| show_archived.set(true),
+                if hidden == 1 { "Show 1 removed store" } else { "Show {hidden} removed stores" }
+            }
+        } else if show_archived() && any_archived {
+            button {
+                class: "link-btn",
+                onclick: move |_| show_archived.set(false),
+                "Hide removed stores"
+            }
+        }
+        if any_archived {
+            p { class: "text-muted small",
+                "Removing a store only hides it from this list. Your conversations with it are kept."
+            }
+        }
+    }
+}
+
+#[component]
+fn VisitedRow(row: StoreListRow) -> Element {
+    let (main, second) = visited_row_lines(&row);
+    rsx! {
+        div { class: if row.closed || row.archived { "vrow vrow-off" } else { "vrow" },
+            button {
+                class: "vrow-go",
+                onclick: {
+                    let code = row.code.clone();
+                    move |_| {
+                        if let Some(params) = harvest_common::StoreParameters::from_code(&code) {
+                            crate::store_link::open_store(params);
+                        }
+                    }
+                },
+                span { class: if row.name.name().is_some() { "rc-name" } else { "rc-name rc-pending" }, "{main}" }
+                if let Some(ref second) = second {
+                    span { class: "rc-sub", "{second}" }
+                }
+            }
+            if row.closed {
+                span { class: "pill", "Closed" }
+            }
+            button {
+                class: "link-btn vrow-remove",
+                title: if row.archived { "" } else { "Hides it from this list. Your conversations with it are kept." },
+                onclick: {
+                    let code = row.code.clone();
+                    let archive = !row.archived;
+                    move |_| APP_STATE.write().set_store_archived(&code, archive)
+                },
+                if row.archived { "Put back on the list" } else { "Remove from list" }
+            }
+        }
+    }
+}
+
+/// A store's own page (the 2026-09-30 redesign, after the mockup's
+/// `scrStore()`): only that store, with a way back to Stores. Loading and a
+/// link that opened nothing are said here, where the store would be.
+#[component]
+pub fn StorePage() -> Element {
+    let app_state = APP_STATE.read();
+
+    // `AppState::displayed_store` owns this choice, so the document title
+    // (see `components::App`) cannot answer it differently.
+    let store_entry = app_state
+        .displayed_store()
+        .map(|(id, store)| (id.clone(), store.clone()));
+
+    // A store was opened but its state hasn't come back yet. Once
+    // `store_link_error` is set the wait is over and the message changes --
+    // otherwise this reads "Loading store…" for the rest of the session.
+    let link_error = app_state.store_link_error.clone();
+    let awaiting =
+        store_entry.is_none() && app_state.active_store_id.is_some() && link_error.is_none();
+    drop(app_state);
+
+    rsx! {
+        div { class: "store-page",
+            button {
+                class: "crumb",
+                onclick: move |_| *ROUTE.write() = Route::Stores,
+                "\u{2039} Stores"
+            }
+            match store_entry {
+                Some((contract_id, store)) => {
+                    rsx! { LoadedStore { store: store, contract_id: contract_id } }
+                }
+                None if awaiting => {
+                    rsx! {
+                        p { class: "text-muted text-italic", "Loading store\u{2026}" }
+                    }
+                }
+                None => {
+                    match link_error {
+                        Some(message) => rsx! {
+                            p { class: "text-warning", "{message}" }
                         },
-                        "{row.label}"
-                    }
-                    span { class: "text-muted", " {row.code} " }
-                    if row.closed {
-                        span { class: "text-muted small", "Closed " }
-                    }
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: {
-                            let code = row.code.clone();
-                            let archive = !row.archived;
-                            move |_| APP_STATE.write().set_store_archived(&code, archive)
+                        None => rsx! {
+                            p { class: "text-muted text-italic", "No store is open." }
                         },
-                        if row.archived { "Unarchive" } else { "Archive" }
                     }
-                }
-            }
-            if hidden > 0 {
-                button {
-                    class: "btn btn-sm btn-outline",
-                    onclick: move |_| show_archived.set(true),
-                    "Show {hidden} archived store(s)"
-                }
-            } else if show_archived() && any_archived {
-                button {
-                    class: "btn btn-sm btn-outline",
-                    onclick: move |_| show_archived.set(false),
-                    "Hide archived stores"
-                }
-            }
-            if any_archived || show_archived() {
-                p { class: "text-muted",
-                    "Archiving only hides a store from this list. Its conversations are kept, and "
-                    "archiving a store of your own does not close it: buyers can still open it "
-                    "and order."
                 }
             }
         }
@@ -224,7 +444,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             div { class: "store-header",
                 div { class: "store-header-inner",
                     div {
-                        h3 { class: "store-name", "{info.store_name}" }
+                        h2 { class: "store-name", "{info.store_name}" }
                         crate::markdown::Markdown {
                             source: info.description.clone(),
                             class: "store-desc",
@@ -303,15 +523,18 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             }
 
             // A seller looking at their own store sees it as a buyer would,
-            // and is sent to My store to manage it rather than offered a way
-            // to message themselves (entity model, wireframe F).
+            // and is sent back to its seller pages to manage it rather than
+            // offered a way to message themselves (entity model, wireframe F).
             if owned {
                 div { class: "own-store-banner",
-                    span { "This is your store as buyers see it." }
+                    span { "This is your store, as buyers see it." }
                     button {
                         class: "btn btn-sm btn-outline",
-                        onclick: move |_| *super::app::ROUTE.write() = super::app::Route::MyStore,
-                        "Manage it in My store"
+                        onclick: {
+                            let id = contract_id.clone();
+                            move |_| open_seller_page(SellerPage::Store(id.clone()))
+                        },
+                        "Back to managing it"
                     }
                 }
             } else {
@@ -742,61 +965,6 @@ fn kind_label(kind: &ListingKind) -> &'static str {
     }
 }
 
-fn example_listings_section() -> Element {
-    #[cfg(not(feature = "example-data"))]
-    {
-        rsx! {}
-    }
-
-    #[cfg(feature = "example-data")]
-    {
-        let examples = vec![
-            (
-                "Handmade Ceramic Mug",
-                "Beautiful hand-thrown stoneware mug, holds 12oz.",
-                ListingKind::Sale,
-                Some(PriceInfo {
-                    amount: "0.001".into(),
-                    currency: "BTC".into(),
-                }),
-            ),
-            (
-                "Sourdough Starter",
-                "Active 3-year-old starter, ready to bake.",
-                ListingKind::Gift,
-                None,
-            ),
-            (
-                "Looking for: Bicycle Parts",
-                "Need a rear derailleur, Shimano compatible.",
-                ListingKind::Request,
-                None,
-            ),
-        ];
-
-        rsx! {
-            div {
-                h3 { "Example Listings" }
-                for (title, desc, kind, price) in examples {
-                    div { class: "listing-card",
-                        div { class: "listing-header",
-                            h4 { "{title}" }
-                            span { class: "badge {kind_badge_class(&kind)}", "{kind_label(&kind)}" }
-                        }
-                        crate::markdown::Markdown {
-                            source: desc,
-                            class: "listing-desc",
-                        }
-                        if let Some(ref p) = price {
-                            p { class: "listing-price", "{p.amount} {p.currency}" }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod buy_control_tests {
     use super::*;
@@ -1106,5 +1274,122 @@ mod availability_tests {
         assert_eq!(sats_text(0), "0 sats");
         assert_eq!(sats_text(999), "999 sats");
         assert_eq!(sats_text(1_000), "1,000 sats");
+    }
+}
+
+#[cfg(test)]
+mod stores_page_tests {
+    use super::*;
+    use crate::presence_flow::LocalSelling;
+    use harvest_common::presence::ClosedWhy;
+
+    /// An own store's card says what the seller's Overview would: the
+    /// count of what needs them first, "up to date" only where the Overview
+    /// reads Open, the Overview's own pill where buyers cannot buy, and
+    /// "Checking" while it is too soon to say. Red if a store whose device
+    /// cannot answer orders reads "up to date".
+    #[test]
+    fn an_own_store_card_reads_the_sellers_own_status() {
+        let open = StorePresence::Open;
+        let closed = StorePresence::Closed(ClosedWhy::NoHeartbeat);
+        let status = |presence, local: LocalSelling| {
+            crate::presence_flow::seller_status(presence, false, &local)
+        };
+        let ready = || LocalSelling::Ready { delegated: false };
+        let blocked = || LocalSelling::Blocked("no wallet".to_string());
+
+        // Something waiting wins, whatever else is true.
+        assert_eq!(
+            own_store_status(2, Some(&status(closed, blocked())), closed),
+            OwnStoreStatus::NeedsYou(2)
+        );
+        assert_eq!(
+            own_store_status(0, Some(&status(open, ready())), open),
+            OwnStoreStatus::UpToDate
+        );
+        assert_eq!(
+            own_store_status(0, Some(&status(open, blocked())), open),
+            OwnStoreStatus::NotOpen("Not taking orders"),
+            "buyers see it open, but nobody answers their orders"
+        );
+        assert_eq!(
+            own_store_status(0, Some(&status(closed, ready())), closed),
+            OwnStoreStatus::NotOpen("Closed")
+        );
+        assert_eq!(
+            own_store_status(
+                0,
+                Some(&status(StorePresence::Checking, ready())),
+                StorePresence::Checking
+            ),
+            OwnStoreStatus::Checking
+        );
+        // A store that sells nothing here: what buyers see.
+        assert_eq!(own_store_status(0, None, open), OwnStoreStatus::UpToDate);
+        assert_eq!(
+            own_store_status(0, None, closed),
+            OwnStoreStatus::NotOpen("Closed")
+        );
+        assert_eq!(
+            own_store_status(0, None, StorePresence::Checking),
+            OwnStoreStatus::Checking
+        );
+
+        assert_eq!(OwnStoreStatus::NeedsYou(1).text(), "1 needs you");
+        assert_eq!(OwnStoreStatus::NeedsYou(3).text(), "3 need you");
+        assert_eq!(OwnStoreStatus::UpToDate.text(), "up to date");
+    }
+
+    fn row(name: StoreName, closed: bool) -> StoreListRow {
+        StoreListRow {
+            code: "3Bn8xWqLd6Tz9Kf2".to_string(),
+            name,
+            tagline: Some("Hand-thrown stoneware".to_string()),
+            archived: false,
+            closed,
+        }
+    }
+
+    /// A visited store's row: its name, then its tagline, or "Closed right
+    /// now" when closed. The code appears only as the second line of a store
+    /// that could not be loaded, where nothing else tells two rows apart,
+    /// and never as the name.
+    #[test]
+    fn a_visited_row_names_the_store_and_never_by_its_code() {
+        let named = StoreName::Named("Bean Shop".to_string());
+        assert_eq!(
+            visited_row_lines(&row(named.clone(), false)),
+            (
+                "Bean Shop".to_string(),
+                Some("Hand-thrown stoneware".to_string())
+            )
+        );
+        assert_eq!(
+            visited_row_lines(&row(named, true)),
+            (
+                "Bean Shop".to_string(),
+                Some("Closed right now".to_string())
+            )
+        );
+        let (main, second) = visited_row_lines(&row(StoreName::Unreachable, false));
+        assert!(!main.contains("3Bn8"), "{main:?}");
+        assert_eq!(second.as_deref(), Some("Store code 3Bn8xWqLd6Tz9Kf2"));
+        let (main, _) = visited_row_lines(&row(StoreName::Loading, false));
+        assert_eq!(main, "Loading\u{2026}");
+    }
+
+    /// "Find a store" keeps today's two messages: an old-format link is
+    /// told it cannot be opened any more, anything else is told what a store
+    /// code looks like.
+    #[test]
+    fn find_a_store_says_why_nothing_opened() {
+        let old = bs58::encode([5u8; 32]).into_string();
+        assert_eq!(
+            not_a_store_message(&format!(
+                "http://127.0.0.1:7509/v1/contract/web/x/#store={old}"
+            )),
+            crate::store_link::OLD_FORMAT_LINK_MESSAGE
+        );
+        assert!(not_a_store_message("hello").starts_with("That is not a store code."));
     }
 }

@@ -12,6 +12,8 @@ mod seller_listings;
 mod store_view;
 
 pub use app::App;
+// Where opening a store lands (`store_link::open_store`).
+pub(crate) use app::{show_old_format_link, show_store};
 // Minting the seller's messaging key. Lives beside the store-creation flow
 // that first needs it; `state` calls it again whenever a ghostkey connects.
 pub(crate) use my_store::{ensure_encryption_key, mint_encryption_key};

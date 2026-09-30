@@ -206,7 +206,8 @@ body::before {
        .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line, .notice-row, .link-btn) > * {
+       .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-r,
+       .find-store, .vrow, .crumb) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -248,7 +249,7 @@ body::before {
   letter-spacing: -0.02em;
 }
 
-/* Top-level pages: Stores / My purchases / My store (harvest#93 phase 2).
+/* Top-level pages: Stores / Purchases (the 2026-09-30 Stores page).
    A row of text tabs under the title, underlined when current: the
    difference is carried by weight and a rule, not by colour. */
 .harvest-nav {
@@ -934,26 +935,6 @@ h4 {
   margin-bottom: var(--space-sm);
 }
 
-.store-share {
-  margin: 0 0 var(--space-md);
-}
-
-.store-share p {
-  margin-bottom: var(--space-xs);
-  font-size: 0.85rem;
-}
-
-.store-share-row + .store-share-row {
-  margin-top: var(--space-xs);
-}
-
-.store-share-label {
-  display: block;
-  margin-bottom: 2px;
-  font-size: 0.8rem;
-  font-weight: 600;
-}
-
 .identity-name {
   font-family: var(--font-display);
   font-weight: 700;
@@ -1477,6 +1458,196 @@ h4 {
   flex: none;
 }
 
+/* ---- Stores page (the 2026-09-30 redesign, after the mockup) ---- */
+
+/* A section's label: small capitals, muted. The headings of the page's
+   parts ("Your store", "Find a store", "Stores you've visited"). */
+.sec-lbl {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: var(--space-xl) 0 var(--space-sm);
+}
+
+.sec-lbl-first {
+  margin-top: 0;
+}
+
+/* A whole card that is one button: a store, with its status and a chevron
+   on the right. */
+.rowcard {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-md);
+  text-align: left;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md) 1.25rem;
+  margin: 0 0 var(--space-sm);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.rowcard:hover {
+  border-color: var(--accent);
+}
+
+.rc-main {
+  display: block;
+  min-width: 0;
+}
+
+.rc-name {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+/* "Loading…" or "Couldn't load this store" in place of a name. */
+.rc-pending {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* One line under the name: the store's tagline, cut with an ellipsis. */
+.rc-sub {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rc-r {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-shrink: 0;
+}
+
+.chev {
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+/* Something needs the seller: the one warm pill. */
+.pill-needs {
+  color: var(--accent-warm);
+  border-color: var(--accent-warm);
+}
+
+/* A count on a tab that needs the seller ("Orders (2)"). */
+.tab-needs {
+  color: var(--accent-warm);
+  font-weight: 600;
+}
+
+.find-store {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.find-store .form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The stores visited: one white box, a row per store. */
+.vlist {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.vrow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 0.8rem 1.1rem;
+  border-top: 1px solid var(--color-parchment);
+}
+
+.vrow:first-child {
+  border-top: 0;
+}
+
+/* Closed, or removed from the list and being shown: switched off, like a
+   sold-out listing. */
+.vrow-off {
+  opacity: 0.6;
+}
+
+.vrow-off .rc-name {
+  color: var(--text-muted);
+}
+
+.vrow-go {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.vrow-go:hover .rc-name {
+  color: var(--accent);
+}
+
+.vrow-remove {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* A quiet invitation rather than a card of its own weight: selling, for
+   someone with no store. */
+.card-quiet {
+  background: transparent;
+  border-style: dashed;
+}
+
+.sell-card {
+  margin-top: var(--space-xl);
+}
+
+/* "‹ Stores": the way back from a page reached from Stores. */
+.crumb {
+  display: inline-block;
+  min-height: 24px;
+  margin: 0 0 var(--space-sm);
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.crumb:hover {
+  color: var(--accent);
+}
+
 /* ---- Store page ---- */
 
 .own-store-banner {
@@ -1500,12 +1671,6 @@ h4 {
 .listing-stock {
   font-size: 0.85rem;
   color: var(--text-secondary);
-}
-
-/* A closed store (presence_flow): its row in the store list reads as
-   switched off, like a sold-out listing. */
-.store-row-closed {
-  opacity: 0.55;
 }
 
 .listing-sold-out {
@@ -1533,11 +1698,13 @@ h4 {
   .btn-sm,
   .nav-btn,
   .tab,
-  .form-select {
+  .form-select,
+  .vrow-go {
     min-height: 44px;
   }
 
-  .link-btn {
+  .link-btn,
+  .crumb {
     display: inline-flex;
     align-items: center;
     min-height: 44px;
@@ -1579,5 +1746,41 @@ h4 {
 
   .store-header-inner {
     flex-direction: column;
+  }
+
+  /* The status goes under the name, right-aligned, and may wrap. */
+  .rowcard {
+    align-items: flex-start;
+  }
+
+  .rc-r {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--space-xs);
+    max-width: 50%;
+  }
+
+  .rc-r .pill {
+    text-align: right;
+  }
+
+  /* The field above its Open button, both full width. */
+  .find-store {
+    flex-direction: column;
+  }
+
+  /* The store's name and tagline on a line of their own, the pill and
+     "Remove from list" under them. */
+  .vrow {
+    flex-wrap: wrap;
+    row-gap: var(--space-xs);
+  }
+
+  .vrow-go {
+    flex: 1 1 100%;
+  }
+
+  .vrow-remove {
+    margin-left: auto;
   }
 }

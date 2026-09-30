@@ -8,7 +8,6 @@ description = "Harvest decentralized marketplace UI"
 
 [features]
 default = []
-example-data = []
 no-sync = []
 
 [dependencies]
