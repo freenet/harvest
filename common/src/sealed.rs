@@ -151,13 +151,13 @@ pub enum MessageContent {
     /// not. The mailbox is open-write, so a gate in the buyer's UI alone is
     /// no gate: a script writes past it. The seller's side therefore shows
     /// free text only in a conversation that a voucher verifying for it, or
-    /// a paid Buy now, has opened (`harvest-ui`'s
-    /// `components::message_view::shown_to_seller`).
+    /// a paid order of the store's, has opened (`harvest-ui`'s
+    /// `order_threads` and `components::message_view::shown_to_seller`).
     ///
-    /// [`Self::Text`] stays for the seller's replies, which need no voucher
-    /// (the buyer chose to write to this store), and so that messages sealed
-    /// before this existed still decode. A buyer's plain text from before is
-    /// no longer shown to the seller, nor the seller's replies in a
+    /// [`Self::Text`] carries the seller's replies, and a paid buyer's text
+    /// in that order's conversation (no voucher is needed there), and still
+    /// decodes messages sealed before this existed. Elsewhere a buyer's
+    /// plain text is not shown to the seller, nor the seller's replies in a
     /// conversation nothing opens.
     VouchedText {
         text: String,
