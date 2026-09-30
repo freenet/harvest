@@ -18430,7 +18430,7 @@ mod invoice_tests {
 
     /// The id an upcoming address is read under is the one an order on that
     /// address, with the same bridges and build, would watch. Mutated red by
-    /// leaving out the work floor.
+    /// leaving the build out of the hash.
     #[test]
     fn an_upcoming_address_is_read_under_its_orders_contract_id() {
         let probe = order_for_invoice(

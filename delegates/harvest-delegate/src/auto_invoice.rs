@@ -3167,6 +3167,38 @@ mod tests {
         assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(1));
     }
 
+    /// harvest#183, the delegate's half. A counter lost at 0, with the arm
+    /// still naming addresses 0 to 4 and nothing on this store naming 0 to
+    /// 2 (they were paid through another store): the tab finds 0 to 2 paid
+    /// in their address contracts and files the SAME key again with them as
+    /// published, and the next instant invoice goes on index 3, not 0.
+    /// Mutated red by dropping the floor from the `SetPaymentXpub` handler.
+    #[test]
+    fn a_key_filed_again_with_paid_addresses_moves_instant_checkout_past_them() {
+        let mut f = fixture();
+        assert_eq!(counter(&f), 0);
+        let answer = crate::bitcoin::handle(
+            &mut f.secrets,
+            Some(&crate::origin::test_origins::harvest()),
+            harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: 1,
+                xpub: signet_vpub(),
+                network: BitcoinNetwork::Signet,
+                published_scripts: (0..3).map(script_at).collect(),
+            },
+        )
+        .expect("authorized");
+        assert!(matches!(
+            answer,
+            harvest_common::BitcoinDelegateResponse::PaymentXpubSet { result: Ok(ref s), .. }
+                if s.next_index == 3
+        ));
+        let decided = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.refused, vec![]);
+        assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(3));
+        assert_eq!(counter(&f), 4);
+    }
+
     /// I7. Only a watched address goes on an invoice, and only while the
     /// watch is live. Mutated red by removing the `watched_scripts` check.
     #[test]
