@@ -582,6 +582,12 @@ fn request(
 
 /// What this buyer has been accepted for at one store, and whether each is
 /// safe to pay.
+/// A buyer's purchases from one store on Purchases, each conversation's
+/// messages under the orders it holds, and any conversation with no order (a
+/// question) on its own (mockup `scrPurchase`, `scrPurchases`; round-6
+/// critique: messages move into each order's screen). One Messages button
+/// per conversation rather than per order: a buyer's next Buy now continues
+/// the same conversation, so two orders can share one thread.
 #[component]
 pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
     // The order a Buy now form on this page is already showing, in place,
@@ -593,7 +599,27 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
         .into_iter()
         .cloned()
         .collect();
-    if listed.is_empty() {
+    let held: Vec<[u8; 32]> = app_state
+        .browsing_stores
+        .get(&store_contract_id)
+        .map(|store| {
+            store
+                .conversations
+                .iter()
+                .map(|conversation| conversation.buyer_public_key)
+                .collect()
+        })
+        .unwrap_or_default();
+    let groups = by_conversation(&listed);
+    let questions: Vec<[u8; 32]> = held
+        .iter()
+        .filter(|tag| !groups.iter().any(|(held, _)| held == *tag))
+        .filter(|tag| {
+            super::message_view::buyer_thread_count(&app_state, &store_contract_id, **tag) > 0
+        })
+        .copied()
+        .collect();
+    if listed.is_empty() && questions.is_empty() {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
@@ -601,17 +627,57 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
 
     rsx! {
         div { style: "margin-top: 24px;",
-            h4 { "Your purchases" }
-            for purchase in listed.iter() {
-                PurchaseCard {
-                    key: "{purchase.order_id}",
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
-                    bitcoin: bitcoin.clone(),
+            if !listed.is_empty() {
+                h4 { "Your purchases" }
+            }
+            for (tag , group) in groups.iter() {
+                div { key: "{bs58::encode(tag).into_string()}",
+                    for purchase in group.iter() {
+                        PurchaseCard {
+                            key: "{purchase.order_id}",
+                            store_contract_id: store_contract_id.clone(),
+                            purchase: purchase.clone(),
+                            bitcoin: bitcoin.clone(),
+                        }
+                    }
+                    // A conversation this node no longer holds cannot be read
+                    // or written: nothing to open.
+                    if held.contains(tag) {
+                        super::message_view::BuyerThread {
+                            store_contract_id: store_contract_id.clone(),
+                            tag: *tag,
+                        }
+                    }
+                }
+            }
+            for tag in questions.iter() {
+                div { key: "{bs58::encode(tag).into_string()}", class: "card",
+                    p { class: "text-muted small", "Your question" }
+                    super::message_view::BuyerThread {
+                        store_contract_id: store_contract_id.clone(),
+                        tag: *tag,
+                        open: true,
+                    }
                 }
             }
         }
     }
+}
+
+/// `purchases` grouped by the conversation each is filed under, in the order
+/// the first of each appears.
+fn by_conversation(purchases: &[BuyerPurchase]) -> Vec<([u8; 32], Vec<BuyerPurchase>)> {
+    let mut groups: Vec<([u8; 32], Vec<BuyerPurchase>)> = Vec::new();
+    for purchase in purchases {
+        match groups
+            .iter_mut()
+            .find(|(tag, _)| *tag == purchase.conversation)
+        {
+            Some((_, group)) => group.push(purchase.clone()),
+            None => groups.push((purchase.conversation, vec![purchase.clone()])),
+        }
+    }
+    groups
 }
 
 #[component]
@@ -998,17 +1064,22 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
     let order_id = target.order_id();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
+    // One "Report a problem" first, then the step with the choices and the
+    // decided line (round-6 critique 06-5, mockup D4): three permanent-record
+    // buttons inline were the loudest thing on a delivered order.
+    let mut reporting = use_signal(|| false);
+    let mut messaging = use_signal(|| false);
     // The refusal is read only when there is no complaint on record: it ends
     // in a full verification of the complaint (memoised, review round 3
     // P2-D), which a card with nothing to offer does not need.
-    let (on_record, sent, refusal) = {
+    let (on_record, sent, refusal, message_to) = {
         let state = APP_STATE.read();
         let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
         let refusal = (on_record.is_none() && !sent)
             .then(|| target.refusal(&state))
             .flatten();
-        (on_record, sent, refusal)
+        (on_record, sent, refusal, target.conversation(&state))
     };
     let short = order_id.short();
     if let Some(complaint) = on_record {
@@ -1031,6 +1102,20 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
         return rsx! {
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "No complaint can be made about order {short} right now: {why}."
+            }
+        };
+    }
+    if !reporting() {
+        return rsx! {
+            div { class: "form-actions",
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| {
+                        problem.set(None);
+                        reporting.set(true);
+                    },
+                    "Report a problem"
+                }
             }
         };
     }
@@ -1064,29 +1149,56 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                 }
             },
             None => rsx! {
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "Something wrong with order {short}? You can put one complaint on the \
-                     seller's public record:"
-                }
-                for category in FeedbackCategory::ALL {
-                    {
-                        let label = super::reputation_view::category_label(&category);
-                        rsx! {
+                p { strong { "{COMPLAINT_LINE}" } }
+                // The way to message the seller, right here: the line asks for
+                // it, and a buyer with a paid order needs no Ghost Key for it.
+                if let Some((store_contract_id, tag)) = message_to.clone() {
+                    if messaging() {
+                        super::message_view::OrderCompose { store_contract_id, tag }
+                    } else {
+                        div { class: "form-actions",
                             button {
-                                class: "btn btn-sm btn-outline",
-                                onclick: move |_| {
-                                    problem.set(None);
-                                    chosen.set(Some(category.clone()));
-                                },
-                                "{label}"
+                                class: "btn btn-sm btn-primary",
+                                onclick: move |_| messaging.set(true),
+                                "Message the seller"
                             }
                         }
+                    }
+                }
+                p { class: "text-muted small", "What went wrong with order {short}?" }
+                div { class: "form-actions",
+                    for category in FeedbackCategory::ALL {
+                        {
+                            let label = super::reputation_view::category_label(&category);
+                            rsx! {
+                                button {
+                                    class: "btn btn-sm btn-outline",
+                                    onclick: move |_| {
+                                        problem.set(None);
+                                        chosen.set(Some(category.clone()));
+                                    },
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| {
+                            reporting.set(false);
+                            messaging.set(false);
+                        },
+                        "Not now"
                     }
                 }
             },
         }
     }
 }
+
+/// Said on the complaint step before any category (Ian, 2026-09-30).
+pub(crate) const COMPLAINT_LINE: &str =
+    "Complaints are permanent and can't be withdrawn. Message the seller first.";
 
 /// What a complaint control is about: a purchase on a loaded store's page,
 /// or a purchase this node keeps, judged from the kept record alone (review
@@ -1138,6 +1250,40 @@ impl ComplaintTarget {
                 order_id,
             } => state.kept_complaint_refusal(store_key, order_id),
         }
+    }
+
+    /// Where the buyer can message the seller about this purchase: its store
+    /// (loaded on this page) and the conversation it is filed under, when this
+    /// node still holds that conversation. For a kept purchase, the loaded
+    /// store whose key it is kept under, if any; otherwise nowhere to offer.
+    fn conversation(&self, state: &crate::state::AppState) -> Option<(Vec<u8>, [u8; 32])> {
+        let (store_contract_id, tag) = match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => (store_contract_id.clone(), purchase.conversation),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => {
+                let kept = state
+                    .kept_purchases
+                    .iter()
+                    .find(|k| k.store_key == *store_key && k.order.order.id == *order_id)?;
+                let (id, _) = state
+                    .browsing_stores
+                    .iter()
+                    .find(|(_, store)| store.owner == Some(*store_key))?;
+                (id.clone(), kept.conversation)
+            }
+        };
+        state
+            .browsing_stores
+            .get(&store_contract_id)?
+            .conversations
+            .iter()
+            .any(|conversation| conversation.buyer_public_key == tag)
+            .then_some((store_contract_id, tag))
     }
 
     fn file(

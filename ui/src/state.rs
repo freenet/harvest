@@ -26109,6 +26109,88 @@ mod buy_flow_tests {
         );
     }
 
+    /// **The Orders tab files each conversation where its order is**
+    /// (round-6 critique 10-3): an unanswered quote request is a question
+    /// waiting for the seller, with no chat; once a paid invoice answers it,
+    /// its conversation opens and sits under that order, with the buyer's
+    /// plain text in it; an entry nobody can read is only counted. Red with
+    /// the order mapping dropped from the inbox.
+    #[test]
+    fn the_sellers_inbox_files_each_conversation_under_its_order() {
+        use crate::components::message_view::{is_question, seller_inbox};
+        let (mut state, tag, _) = seller_holding_a_request();
+        let junk = EncryptedMessage {
+            conversation_id: harvest_common::mailbox::ConversationId([0x5a; 32]),
+            sender_public_key: vec![0x5d; 32],
+            ciphertext: vec![0x5c; 48],
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a time"),
+            nonce: [0x5b; 24],
+        };
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .push(junk);
+
+        let inbox = seller_inbox(&state, STORE);
+        assert_eq!(inbox.unreadable, 1);
+        assert_eq!(inbox.threads.len(), 1, "junk is not a conversation");
+        let thread = &inbox.threads[0];
+        assert!(!thread.open);
+        assert_eq!(thread.chat_count(), 0, "a request is not a message");
+        assert!(is_question(&state, STORE, thread));
+
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            conversation_id,
+            timestamp,
+            ..
+        } = crate::messaging::read_mailbox(
+            &state.browsing_stores[STORE].mailbox_messages[..1],
+            &keys,
+        )
+        .remove(0)
+        else {
+            panic!("the fixture's request reads");
+        };
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+        let text = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Is it on its way?".into()),
+        )
+        .unwrap();
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = vec![order.clone()];
+        store.mailbox_messages.push(text);
+
+        let inbox = seller_inbox(&state, STORE);
+        let thread = inbox
+            .for_order(&order.order.id)
+            .expect("filed under its order");
+        assert!(thread.open, "a paid order opens it");
+        assert_eq!(thread.chat_count(), 1, "the buyer's plain text is shown");
+        assert_eq!(inbox.held_back, 0);
+    }
+
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {
         PendingInvoice {
             answers_request: None,

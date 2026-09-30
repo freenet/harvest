@@ -56,7 +56,10 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
 /// invoice with no buyer's request behind it has nobody to pay it.
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
-    let (to_send, others, titles, live, needs_reissue, loaded) = {
+    // One buyer conversation open at a time, so the guidance line above its
+    // reply box is on screen once (`message_view::SELLER_GUIDANCE`).
+    let open_thread = use_signal(|| None as super::message_view::OpenThread);
+    let (to_send, others, titles, live, needs_reissue, loaded, inbox, questions) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         // The same list as "Needs you" (`AppState::seller_orders_to_send`).
@@ -94,6 +97,23 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 _ => None,
             })
             .collect();
+        // Each order's conversation goes under its card; one with no card
+        // of its own, if it holds a question or a request waiting for a hand
+        // answer, goes under Questions (the round-6 critique: no mailbox
+        // dump under the orders).
+        let inbox = super::message_view::seller_inbox(&state, &store_contract_id);
+        let listed: Vec<&harvest_common::payment::OrderId> = to_send
+            .iter()
+            .chain(others.iter())
+            .map(|order| &order.order.id)
+            .collect();
+        let questions: Vec<super::message_view::SellerThread> = inbox
+            .threads
+            .iter()
+            .filter(|thread| !thread.orders.iter().any(|id| listed.contains(&id)))
+            .filter(|thread| super::message_view::is_question(&state, &store_contract_id, thread))
+            .cloned()
+            .collect();
         (
             to_send,
             others,
@@ -105,6 +125,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // "No orders yet" and "this store's state has not arrived" look
             // alike through an empty list.
             state.store_details_are_resolved(&store_contract_id),
+            inbox,
+            questions,
         )
     };
 
@@ -121,6 +143,8 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                     key: "{order.order.id}",
                     store_contract_id: store_contract_id.clone(),
                     order: order.clone(),
+                    thread: inbox.for_order(&order.order.id).cloned(),
+                    open_thread,
                 }
             }
             if !others.is_empty() {
@@ -166,8 +190,34 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                                 order_id: order.order.id.clone(),
                             }
                         }
+                        if let Some(thread) = inbox.for_order(&order.order.id) {
+                            super::message_view::SellerThreadToggle {
+                                store_contract_id: store_contract_id.clone(),
+                                thread: thread.clone(),
+                                under: Some(order.order.id.clone()),
+                                open_thread,
+                            }
+                        }
                     }
                 }
+            }
+        }
+        if !questions.is_empty() {
+            super::message_view::SellerQuestions {
+                store_contract_id: store_contract_id.clone(),
+                threads: questions,
+                open_thread,
+            }
+        }
+        // At most two quiet lines, never a card per entry (round-6 critique
+        // 10-3): what this device could not read, and buyer text held back
+        // for coming with neither a Ghost Key nor a paid order.
+        if inbox.unreadable > 0 {
+            p { class: "text-muted small", "{super::message_view::SOME_UNREADABLE}" }
+        }
+        if inbox.held_back > 0 {
+            p { class: "text-muted small",
+                "{super::message_view::hidden_unvouched_line(inbox.held_back)}"
             }
         }
     }
@@ -184,6 +234,14 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
 pub(crate) fn SellerOrderCard(
     store_contract_id: Vec<u8>,
     order: harvest_common::payment::AuthorizedOrder,
+    /// This order's conversation with its buyer, when this device can read
+    /// it: shown under the card behind a Messages button.
+    #[props(default)]
+    thread: Option<super::message_view::SellerThread>,
+    /// Which conversation is open on this screen (`StorePayments`); `None`
+    /// where the card is shown without its conversation.
+    #[props(default)]
+    open_thread: Option<Signal<super::message_view::OpenThread>>,
 ) -> Element {
     use crate::state::SellerRequest;
     let (request, tip_height, stage, twins, oversold) = {
@@ -332,6 +390,14 @@ pub(crate) fn SellerOrderCard(
             MarkDespatched {
                 store_contract_id: store_contract_id.clone(),
                 order_id: order.order.id.clone(),
+            }
+            if let (Some(thread), Some(open_thread)) = (thread, open_thread) {
+                super::message_view::SellerThreadToggle {
+                    store_contract_id: store_contract_id.clone(),
+                    thread,
+                    under: Some(order.order.id.clone()),
+                    open_thread,
+                }
             }
         }
     }
