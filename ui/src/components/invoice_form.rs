@@ -268,7 +268,8 @@ pub(crate) fn SellerOrderCard(
         div { class: "listing-card seller-order",
             div { class: "listing-header",
                 h4 { "{what}" }
-                span { class: "btc-pill pending", "{pill}" }
+                // Amber: this is what needs the seller (round 4 of #197).
+                span { class: "btc-pill needs", "{pill}" }
             }
             p {
                 "{amount}"

@@ -382,16 +382,25 @@ fn FindStore() -> Element {
 }
 
 /// The main and second line of a visited store's row: its name (never its
-/// code), then its tagline, or "Closed right now" when closed (mockup
+/// code), then its tagline, or when closed, "Closed right now" if only for
+/// now (its seller's computer is offline) and "Closed" otherwise (mockup
 /// `vrow.closed`, critique 01-3); its code instead when nothing else tells
 /// it from another row (`collides`: another row reads the same; or no name
-/// and no tagline).
+/// and no tagline), with "Closed" after it when closed, so the row still
+/// says so.
 fn visited_row_lines(row: &StoreListRow, collides: bool) -> (String, Option<String>) {
-    let code_line = || Some(format!("Store code {}", row.code));
+    let closed = match (row.closed, row.closed_for_now) {
+        (false, _) => None,
+        (true, true) => Some("Closed right now"),
+        (true, false) => Some("Closed"),
+    };
     let second = if collides || (row.name.name().is_none() && row.tagline.is_none()) {
-        code_line()
-    } else if row.closed {
-        Some("Closed right now".to_string())
+        Some(match closed {
+            Some(_) => format!("Store code {} \u{00b7} Closed", row.code),
+            None => format!("Store code {}", row.code),
+        })
+    } else if let Some(closed) = closed {
+        Some(closed.to_string())
     } else {
         row.tagline.clone()
     };
@@ -532,11 +541,13 @@ pub fn StorePage() -> Element {
         && !unreachable;
     // On one of our own stores the banner's "Back to managing it" is the way
     // back; a crumb to Stores above it would be a second one going somewhere
-    // else (critique 02s-1).
-    let owned = app_state
-        .active_store_id
-        .as_ref()
-        .is_some_and(|id| app_state.store_owner_fingerprint(id).is_some());
+    // else (critique 02s-1). Until the store has loaded there is no banner,
+    // so the crumb stays until then.
+    let owned = store_entry.is_some()
+        && app_state
+            .active_store_id
+            .as_ref()
+            .is_some_and(|id| app_state.store_owner_fingerprint(id).is_some());
     drop(app_state);
 
     rsx! {
@@ -908,38 +919,57 @@ const TRUST_WHY: &str = "The seller donated to Freenet to open this store. Compl
 /// This buyer's orders from one store, as its page counts them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct OrdersHere {
-    /// Orders still standing: not an unpaid Buy now that expired or was
-    /// cancelled, which was never an order (critique 02-2).
+    /// Orders still standing ([`orders_here`]).
     pub live: usize,
-    /// Of those, the ones waiting for this buyer to pay.
+    /// Of those, the ones the buyer can pay now.
     pub to_pay: usize,
 }
 
 /// Count `purchases` the way a store's page speaks of them.
+///
+/// **Live**: paid (`BuyerPurchase::paid`, which includes an order this node
+/// has seen paid on chain before the seller marked it, and so never drops
+/// out for its age or a cancel the payment beat), or published, this
+/// buyer's, and neither cancelled nor too old to pay. An unpaid Buy now
+/// that expired or was cancelled was never an order (critique 02-2), and a
+/// cancelled invoice the seller issued by hand is not one either. One that
+/// is not this buyer's (`CommitmentNotForThisBuyer`) is not counted at all.
+///
+/// **To pay**: live, unpaid, awaiting payment, and nothing between the buyer
+/// and paying it but, at most, this node keeping its copy, which the pay
+/// button does (`BuyerPurchase::ready_to_keep`). An order a blocker stands
+/// in front of (a closed store, a seller whose identity cannot be read, a
+/// bridge not recognised, ...) is not one the buyer can pay now, so it is
+/// live and not "to pay".
 pub(crate) fn orders_here(purchases: &[crate::state::BuyerPurchase]) -> OrdersHere {
+    use crate::state::PaymentBlocker;
     use harvest_common::payment::OrderStatus;
     let mut counts = OrdersHere::default();
     for purchase in purchases {
-        let stale = purchase
-            .blockers
-            .iter()
-            .any(|b| matches!(b, crate::state::PaymentBlocker::AnchorStale { .. }));
-        let lapsed = purchase.commitment.as_ref().is_some_and(|order| {
-            crate::fulfilment::is_unpaid_buy_now(order)
-                && (order.status == OrderStatus::Cancelled || stale)
-        });
-        if lapsed {
+        if purchase.paid.is_some() {
+            counts.live += 1;
             continue;
         }
-        counts.live += 1;
-        // To pay: awaiting payment and not too old to pay any more.
-        if !stale
-            && purchase
-                .commitment
-                .as_ref()
-                .is_some_and(|order| order.status == OrderStatus::AwaitingPayment)
-        {
-            counts.to_pay += 1;
+        let has = |wanted: fn(&PaymentBlocker) -> bool| purchase.blockers.iter().any(wanted);
+        if has(|b| matches!(b, PaymentBlocker::CommitmentNotForThisBuyer)) {
+            continue;
+        }
+        let Some(order) = purchase.commitment.as_ref() else {
+            // Answered in the thread, not yet published: still an order.
+            counts.live += 1;
+            continue;
+        };
+        let stale = has(|b| matches!(b, PaymentBlocker::AnchorStale { .. }));
+        match order.status {
+            OrderStatus::Cancelled => continue,
+            OrderStatus::AwaitingPayment if stale => continue,
+            OrderStatus::AwaitingPayment => {
+                counts.live += 1;
+                if purchase.blockers.is_empty() || purchase.ready_to_keep() {
+                    counts.to_pay += 1;
+                }
+            }
+            OrderStatus::Paid | OrderStatus::PaymentReversed => counts.live += 1,
         }
     }
     counts
@@ -1660,6 +1690,7 @@ mod stores_page_tests {
             tagline: tagline.map(str::to_string),
             archived: false,
             closed: false,
+            closed_for_now: false,
         }
     }
 
@@ -1697,6 +1728,33 @@ mod stores_page_tests {
         assert_eq!(
             visited_row_lines(&row(StoreName::Loading, None), false).0,
             "Loading\u{2026}"
+        );
+    }
+
+    /// A closed row says so: "Closed right now" only when it is closed for
+    /// now (its seller's computer offline), "Closed" when closed for good
+    /// or unable to take an order, and "Closed" after the code when the
+    /// code is its second line. Red saying "right now" for a store closed
+    /// for good, and red with a closed row that says Closed nowhere.
+    #[test]
+    fn a_closed_row_says_why_honestly() {
+        let named = StoreName::Named("Tea".to_string());
+        let mut for_now = row(named.clone(), Some("Loose tea"));
+        for_now.closed = true;
+        for_now.closed_for_now = true;
+        assert_eq!(
+            visited_row_lines(&for_now, false).1.as_deref(),
+            Some("Closed right now")
+        );
+        let mut for_good = for_now.clone();
+        for_good.closed_for_now = false;
+        assert_eq!(
+            visited_row_lines(&for_good, false).1.as_deref(),
+            Some("Closed")
+        );
+        assert_eq!(
+            visited_row_lines(&for_good, true).1.as_deref(),
+            Some("Store code 3Bn8xWqLd6Tz9Kf2 \u{00b7} Closed")
         );
     }
 
@@ -1966,10 +2024,10 @@ mod store_page_tests {
         );
     }
 
-    /// Only live orders count: an unpaid Buy now that expired or was
-    /// cancelled was never an order (critique 02-2). A hand-issued invoice
-    /// (no request) still counts until paid or cancelled like any order.
-    /// Red counting every purchase.
+    /// Only live orders count, and "to pay" only what the buyer can pay now
+    /// (see `orders_here`). Red counting every purchase, and red on each
+    /// case round 4 of #197 found: a payment seen on chain, an early
+    /// blocker, a cancelled hand invoice.
     #[test]
     fn only_live_orders_are_counted() {
         use crate::state::{BuyerPurchase, PaymentBlocker};
@@ -2014,17 +2072,69 @@ mod store_page_tests {
             },
             paid: None,
         };
-        let purchases = vec![
-            purchase(1, true, OrderStatus::Paid, false),
-            purchase(2, true, OrderStatus::AwaitingPayment, false),
-            purchase(3, true, OrderStatus::AwaitingPayment, true),
-            purchase(4, true, OrderStatus::Cancelled, false),
-            purchase(5, false, OrderStatus::AwaitingPayment, true),
-        ];
+        let with_blocker = |mut p: BuyerPurchase, b: PaymentBlocker| {
+            p.blockers.push(b);
+            p
+        };
+        let seen_paid = |mut p: BuyerPurchase| {
+            p.paid = p.commitment.clone();
+            p
+        };
+        let count = |purchases: Vec<BuyerPurchase>| orders_here(&purchases);
+
+        // Paid, awaiting (to pay), and an expired or cancelled Buy now.
         assert_eq!(
-            orders_here(&purchases),
-            OrdersHere { live: 3, to_pay: 1 },
-            "an expired invoice is not one to pay"
+            count(vec![
+                purchase(1, true, OrderStatus::Paid, false),
+                purchase(2, true, OrderStatus::AwaitingPayment, false),
+                purchase(3, true, OrderStatus::AwaitingPayment, true),
+                purchase(4, true, OrderStatus::Cancelled, false),
+            ]),
+            OrdersHere { live: 2, to_pay: 1 }
+        );
+        // A hand invoice: expired is not one to pay, cancelled is not one at
+        // all.
+        assert_eq!(
+            count(vec![purchase(5, false, OrderStatus::AwaitingPayment, true)]),
+            OrdersHere::default()
+        );
+        assert_eq!(
+            count(vec![purchase(6, false, OrderStatus::Cancelled, false)]),
+            OrdersHere::default()
+        );
+        // Seen paid on chain before the seller marked it: an order, not one
+        // to pay, whatever its age or a cancel it beat. Red without the
+        // `paid` check.
+        assert_eq!(
+            count(vec![
+                seen_paid(purchase(7, true, OrderStatus::AwaitingPayment, true)),
+                seen_paid(purchase(8, true, OrderStatus::Cancelled, false)),
+            ]),
+            OrdersHere { live: 2, to_pay: 0 }
+        );
+        // An early blocker: an order, but not one the buyer can pay now.
+        assert_eq!(
+            count(vec![with_blocker(
+                purchase(9, true, OrderStatus::AwaitingPayment, false),
+                PaymentBlocker::StoreClosed
+            )]),
+            OrdersHere { live: 1, to_pay: 0 }
+        );
+        // Only keeping its copy stands in the way: the pay button does that.
+        assert_eq!(
+            count(vec![with_blocker(
+                purchase(10, true, OrderStatus::AwaitingPayment, false),
+                PaymentBlocker::PurchaseNotKept
+            )]),
+            OrdersHere { live: 1, to_pay: 1 }
+        );
+        // Not this buyer's order: not counted.
+        assert_eq!(
+            count(vec![with_blocker(
+                purchase(11, true, OrderStatus::AwaitingPayment, false),
+                PaymentBlocker::CommitmentNotForThisBuyer
+            )]),
+            OrdersHere::default()
         );
     }
 }

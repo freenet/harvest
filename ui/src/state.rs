@@ -2974,9 +2974,13 @@ pub struct StoreListRow {
     /// (`markdown::first_line`), once its state has arrived.
     pub tagline: Option<String>,
     pub archived: bool,
-    /// The store is closed (`presence_flow`): greyed, and listed after the
-    /// open ones.
+    /// The store is closed (`AppState::buyer_open`): greyed, and listed
+    /// after the open ones.
     pub closed: bool,
+    /// Closed only for now: its seller's computer is not online or not
+    /// taking orders (`presence_flow`), as opposed to closed for good or
+    /// unable to take an order at all. Said "Closed right now" only then.
+    pub closed_for_now: bool,
 }
 
 /// What a store is called on screen.
@@ -4106,6 +4110,26 @@ impl AppState {
             .collect()
     }
 
+    /// How the loading of the visited stores stands, for Purchases, which
+    /// lists a store only once it has loaded: how many are still being
+    /// asked for (a GET out, or a retry pending) and how many could not be
+    /// loaded at all. Neither is a confirmed empty history (codex on #197
+    /// round 4: during a retry's wait, and after the last, Purchases said
+    /// "Nothing yet").
+    pub fn visited_load_state(&self) -> (usize, usize) {
+        let mut pending = 0;
+        let mut failed = 0;
+        for (_, id) in self.visited_remembered(false) {
+            let Some(id) = id else { continue };
+            match self.store_name_of(&id) {
+                StoreName::Loading => pending += 1,
+                StoreName::Unreachable => failed += 1,
+                StoreName::Named(_) | StoreName::Unnamed => {}
+            }
+        }
+        (pending, failed)
+    }
+
     /// Whether this node knows which stores are its own: the ghostkey
     /// delegate has answered, and each identity it listed has had its
     /// `ListStores` answered (or failed to send, which a reload retries).
@@ -4173,6 +4197,12 @@ impl AppState {
                     closed: id
                         .as_ref()
                         .is_some_and(|id| self.buyer_open(id, now_ms) == BuyerOpen::Closed),
+                    closed_for_now: id.as_ref().is_some_and(|id| {
+                        self.browsing_stores
+                            .get(id)
+                            .is_some_and(|store| store.takes_orders())
+                            && self.store_presence(id, now_ms).is_closed()
+                    }),
                 }
             })
             .collect();
@@ -5018,6 +5048,20 @@ impl AppState {
         // it, whatever it turns out to hold (see `store_link::
         // load_remembered_store`).
         let background = self.background_loads.remove(&contract_id);
+        // Counted as a failed try from the start, and forgiven where the
+        // state turns out to be a store's (`store_load_failures` is cleared
+        // there). Any other answer -- empty, or bytes that are not a store --
+        // stays a failure, with its wait and its end (codex on #197 round 4:
+        // undecodable bytes ended the load with nothing counted, so the page
+        // asked again at once, without end). A store the user opened ends on
+        // its own timer (`store_link::open_store_id`), which says "didn't
+        // load".
+        // Whether this was a listed store's subscribed re-load: it stops
+        // being only listed if this turns out to be its state.
+        let upgraded = background && self.light_upgrading.remove(&contract_id);
+        if background {
+            self.note_store_load_failed(&contract_id);
+        }
         // Before anything else, and before the empty check: an empty state is
         // itself an answer to a reuse check (nothing registered there). An id
         // that is ALSO a watched address goes on to the ordinary path below,
@@ -5031,14 +5075,8 @@ impl AppState {
             return;
         }
         if state_bytes.is_empty() {
-            // A store asked for in the background that answered with
-            // nothing: a failed try, not one still loading. A store the user
-            // opened ends on its own timer (`store_link::open_store_id`),
-            // which says "didn't load".
-            if background {
-                self.light_upgrading.remove(&contract_id);
-                self.note_store_load_failed(&contract_id);
-            }
+            // A background load's empty answer is already a failed try
+            // (above).
             return;
         }
         if self.bitcoin.retired_contracts.contains(&contract_id) {
@@ -5234,6 +5272,9 @@ impl AppState {
                     self.store_state_unavailable.remove(&contract_id);
                     self.store_load_failures.remove(&contract_id);
                     self.foreground_loads.remove(&contract_id);
+                    if upgraded {
+                        self.light_stores.remove(&contract_id);
+                    }
                     self.on_subscribed_state(&contract_id);
                     // A genuine arrival is success: forget any past send
                     // failures so a later transient failure gets its own
@@ -34202,6 +34243,7 @@ mod store_code_tests {
                 tagline: None,
                 archived: false,
                 closed: false,
+                closed_for_now: false,
             }]
         );
         let (rows, hidden) = state.store_list_rows(true);

@@ -59,7 +59,10 @@ pub fn MyPurchases() -> Element {
     // stores arrives after this page opened; loading is idempotent per store.
     use_effect(|| crate::store_link::load_visited_stores(false, true));
     let rows = purchase_rows(&APP_STATE.read());
-    let loading = !APP_STATE.read().background_loads.is_empty();
+    // Still being asked for (a GET out, or a retry waiting), and could not be
+    // loaded: neither is a confirmed empty history (codex on #197 round 4).
+    let (pending, failed) = APP_STATE.read().visited_load_state();
+    let loading = pending > 0 || !APP_STATE.read().background_loads.is_empty();
     let any_kept = !APP_STATE.read().kept_purchases.is_empty();
     // The orders the store cards below already show, so the kept list does
     // not show them a second time.
@@ -72,9 +75,13 @@ pub fn MyPurchases() -> Element {
                 "Kept by the Freenet node on this device, not in the network, so they do not follow "
                 "you to another computer. A conversation can be backed up from inside it."
             }
-            if rows.is_empty() && loading {
+            if loading {
                 p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }
-            } else if rows.is_empty() && !any_kept {
+            }
+            if let Some(note) = unreachable_note(failed) {
+                p { class: "text-warning", "{note}" }
+            }
+            if rows.is_empty() && !loading && failed == 0 && !any_kept {
                 div { class: "card empty-state",
                     p { "Nothing yet." }
                     p {
@@ -121,6 +128,23 @@ pub(crate) fn shown_order_ids(
     rows.iter()
         .flat_map(|row| state.kept_purchases_shown_at(&row.store_contract_id))
         .collect()
+}
+
+/// What Purchases says when some of the stores this device has used could
+/// not be loaded: their purchases may be missing, rather than "Nothing yet".
+fn unreachable_note(failed: usize) -> Option<String> {
+    match failed {
+        0 => None,
+        1 => Some(
+            "1 store you have used couldn\u{2019}t be reached, so purchases from it may be \
+             missing here. Reload to try again."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} stores you have used couldn\u{2019}t be reached, so purchases from them may be \
+             missing here. Reload to try again."
+        )),
+    }
 }
 
 fn summary(orders: usize, conversations: usize) -> String {
@@ -360,6 +384,31 @@ mod tests {
         );
         assert!(state.begin_background_load(ours.clone(), "code".into(), false));
         assert!(!state.light_stores.contains(&ours));
+    }
+
+    /// An unreachable store is said, never taken for an empty history.
+    #[test]
+    fn a_store_that_could_not_load_is_said() {
+        assert_eq!(unreachable_note(0), None);
+        assert!(unreachable_note(1)
+            .unwrap()
+            .starts_with("1 store you have used couldn"));
+        assert!(unreachable_note(2)
+            .unwrap()
+            .starts_with("2 stores you have used couldn"));
+    }
+
+    /// Bytes that are not a store's state are a failed try, with its wait,
+    /// like an empty answer; the page does not ask again at once (codex P1
+    /// on #197 round 4).
+    #[test]
+    fn an_answer_that_is_not_a_store_is_a_failed_try() {
+        let id = vec![0x3Au8; 32];
+        let mut state = AppState::default();
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        state.on_contract_state(id.clone(), vec![0xFF, 0x00, 0x13]);
+        assert_eq!(state.store_load_failures.get(&id).map(|f| f.0), Some(1));
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
     }
 
     #[test]
