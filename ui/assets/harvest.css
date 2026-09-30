@@ -371,15 +371,10 @@ h4 {
   transition: all 0.15s ease;
 }
 
-/* Only where a pointer can hover: on a touch screen :hover sticks after a
-   tap, so a tapped order card stayed green at 390 and not at 1280 (msg1
-   critique MSG-15). A seller's order card is not a link: no highlight. */
-@media (hover: hover) {
-  .listing-card:not(.seller-order):hover {
-    border-color: var(--accent);
-    box-shadow: 0 2px 12px rgba(74, 103, 65, 0.08);
-  }
-}
+/* No hover highlight on a listing card: none is clickable as a whole (a
+   listing's Buy is its own button; an order card is not a link), and on a
+   touch screen :hover stuck after a tap (msg1 critique MSG-15; review after
+   b9c727f). A clickable row (.rowcard) keeps its own. */
 
 .listing-header {
   display: flex;
@@ -885,9 +880,10 @@ h4 {
    this side, but dashed and unfilled, never the filled "You" bubble
    (message_view::UNCONFIRMED, msg1 critique MSG-1/MSG-15). */
 .bubble.unconfirmed {
-  justify-self: end;
+  justify-self: stretch;
+  max-width: none;
   border-style: dashed;
-  background: transparent;
+  background: var(--bg-card);
   color: var(--text-secondary);
 }
 

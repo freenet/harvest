@@ -71,8 +71,9 @@ matters must carry its own signature and must not rest on which key decrypted
 it.** The UI labels a message "You" only when this device sent it; a message
 in your own direction that this device did not send (your own from another
 device or from before a reload, or one the other party sealed as yours) is
-kept in its place in time but drawn dashed and unfilled, labelled "Not
-confirmed as yours", never as your own filled bubble; one line under the
+kept in its place in time but drawn on neither side (full width, dashed,
+on a neutral background), labelled "Not confirmed as yours", never as your
+own bubble, and never counted as a message; one line under the
 conversation says these may be yours from earlier or another device, and
 that one you don't recognise isn't yours. The other party's direction is labelled with their role ("Buyer",
 "Seller"): if you sealed one of those yourself, you are the only person it

@@ -468,7 +468,7 @@ fn Thread(store_contract_id: Vec<u8>, tag: Option<[u8; 32]>) -> Element {
                                 }
                             };
                             let label = match why {
-                                crate::state::NotArrived::Unconfirmed => "You \u{00b7} not confirmed",
+                                crate::state::NotArrived::Unconfirmed => "You \u{00b7} delivery unknown",
                                 crate::state::NotArrived::NeverReachedNode
                                 | crate::state::NotArrived::NotInMailbox => "You \u{00b7} not received",
                             };
@@ -576,7 +576,10 @@ pub(crate) fn BuyerThread(
     #[props(default)] orders: Vec<String>,
 ) -> Element {
     let mut local = use_signal(move || open);
-    let shared = try_use_context::<BuyerOpenThread>();
+    // A card opened by default (a question with no order) keeps its own
+    // state: the shared one starts closed, and a question has no complaint
+    // step to open it from (review after b9c727f).
+    let shared = try_use_context::<BuyerOpenThread>().filter(|_| !open);
     let shown = match shared {
         Some(BuyerOpenThread(open)) => open() == Some(tag),
         None => local(),
@@ -1244,11 +1247,13 @@ fn chat_lines(
 }
 
 /// How many messages `lines` shows: what people wrote, not steps (an
-/// automatic "sold out" decline is not a message to count).
+/// automatic "sold out" decline is not a message to count), and not a line
+/// [`UNCONFIRMED`] (review after b9c727f: one a forger dated can never be a
+/// thread's word in a count).
 fn said_count(lines: &[ChatLine]) -> usize {
     lines
         .iter()
-        .filter(|line| matches!(line.item, ChatItem::Said(_)))
+        .filter(|line| line.trusted && matches!(line.item, ChatItem::Said(_)))
         .count()
 }
 
@@ -1257,10 +1262,13 @@ fn said_count(lines: &[ChatLine]) -> usize {
 /// messages left a returning reader a conversation told by one side).
 ///
 /// A message in this side's direction this device did not send
-/// ([`UNCONFIRMED`]) keeps its place on this side, but is never drawn as this
-/// side's word: a dashed outline instead of the filled "You" bubble, and its
-/// own label in place of "You" ([`bubble_class`]). One line under the
-/// conversation says what that label means ([`UNCONFIRMED_WHY`]).
+/// ([`UNCONFIRMED`]) keeps its place in time, but on neither side: full
+/// width, dashed, on a neutral background, with its own label in place of
+/// "You" ([`bubble_class`]). On this side's alignment it looked exactly like
+/// the reader's own messages after a reload, and a forger picks its date, so
+/// a forged "Agreed, full refund" read as this side's reply in context
+/// (review after b9c727f). One line under the conversation says what the
+/// label means ([`UNCONFIRMED_WHY`]).
 #[component]
 fn ChatLines(lines: Vec<ChatLine>) -> Element {
     let any_unconfirmed = lines.iter().any(|line| !line.trusted);
@@ -1286,9 +1294,10 @@ fn ChatLines(lines: Vec<ChatLine>) -> Element {
     }
 }
 
-/// How a said line is drawn: the other side's plain, this side's own filled
-/// on the right, and an [`UNCONFIRMED`] one on the right but dashed and
-/// unfilled, so it can never pass for this side's word (review round 1 S2).
+/// How a said line is drawn: the other side's plain on the left, this side's
+/// own filled on the right, and an [`UNCONFIRMED`] one full width, dashed and
+/// neutral, on neither side, so it can never pass for this side's word
+/// (review round 1 S2, and after b9c727f).
 pub(crate) fn bubble_class(line: &ChatLine) -> &'static str {
     match (line.trusted, line.mine) {
         (false, _) => "bubble unconfirmed",
@@ -1402,6 +1411,11 @@ impl SellerInbox {
 /// a paid order vouches for is taken out ([`shown_to_seller`]), and the
 /// address of an order past its complaint window is hidden
 /// ([`request_address_hidden`]).
+///
+/// Remembered per store against a fingerprint of everything it reads
+/// ([`inbox_fingerprint`]): the header, the Stores row and the Orders tab
+/// each ask for it on every render, and each answer is a full decrypt of the
+/// mailbox (review after b9c727f).
 pub(crate) fn seller_inbox(
     state: &crate::state::AppState,
     store_contract_id: &[u8],
@@ -1409,6 +1423,80 @@ pub(crate) fn seller_inbox(
     let Some(store) = state.browsing_stores.get(store_contract_id) else {
         return SellerInbox::default();
     };
+    let now = chrono::Utc::now();
+    let fingerprint = inbox_fingerprint(state, store_contract_id, store, now);
+    if let Some((held, inbox)) = state.seller_inbox_cache.borrow().get(store_contract_id) {
+        if *held == fingerprint {
+            return inbox.clone();
+        }
+    }
+    let inbox = seller_inbox_uncached(state, store_contract_id, store, now);
+    let mut cache = state.seller_inbox_cache.borrow_mut();
+    // One entry per store this device manages: a handful.
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(store_contract_id.to_vec(), (fingerprint, inbox.clone()));
+    inbox
+}
+
+/// A digest of everything [`seller_inbox`] reads for one store: the
+/// mailbox's entries, the keys held for its conversations, the store's
+/// orders (id, status, date, whether proven), listings and despatches, the
+/// chain tips, what this tab sent there, and the minute (the clock bounds
+/// in [`awaiting_reply`]). Not a commitment to anything: a session-local
+/// cache key.
+fn inbox_fingerprint(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    store: &crate::state::BrowsingStore,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    store_contract_id.hash(&mut h);
+    (now.timestamp() / 60).hash(&mut h);
+    for message in &store.mailbox_messages {
+        harvest_common::mailbox::entry_digest(message).hash(&mut h);
+        state
+            .conversation_keys
+            .get(&message.sender_public_key)
+            .map(|keys| (keys.to_seller, keys.from_seller))
+            .hash(&mut h);
+    }
+    for order in &store.orders {
+        order.order.id.hash(&mut h);
+        std::mem::discriminant(&order.status).hash(&mut h);
+        order.order.created_at.timestamp_millis().hash(&mut h);
+        order.payment_proof.is_some().hash(&mut h);
+    }
+    for listing in &store.listings {
+        listing.listing.id.0.hash(&mut h);
+    }
+    for id in store.despatches.keys() {
+        id.hash(&mut h);
+    }
+    for (network, tip) in &state.bitcoin.tips {
+        std::mem::discriminant(network).hash(&mut h);
+        tip.tip_height.hash(&mut h);
+    }
+    for sent in &store.sent_messages {
+        sent.digest.hash(&mut h);
+    }
+    #[cfg(test)]
+    state
+        .voucher_master_for_tests
+        .map(|key| key.to_bytes())
+        .hash(&mut h);
+    h.finish()
+}
+
+fn seller_inbox_uncached(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    store: &crate::state::BrowsingStore,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SellerInbox {
     let all = state.mailbox_entries(store_contract_id);
     let unreadable = all
         .iter()
@@ -1479,8 +1567,7 @@ pub(crate) fn seller_inbox(
                 })
                 .collect();
             timed.sort_by_key(|(at, _)| *at);
-            let awaiting =
-                awaiting_reply(open.contains(tag.as_slice()), &entries, chrono::Utc::now());
+            let awaiting = awaiting_reply(open.contains(tag.as_slice()), &entries, now);
             SellerThread {
                 tag: *tag,
                 open: open.contains(tag.as_slice()),
@@ -1527,16 +1614,30 @@ pub(crate) fn seller_inbox(
     }
 }
 
+/// How far a writer's clock may run ahead of this reader's before its
+/// timestamp is not believed, for [`awaiting_reply`].
+pub(crate) const CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(10);
+
 /// Whether a seller conversation waits for the seller's reply (msg1 critique
 /// MSG-3): it is open (a Ghost Key's voucher or a paid order, so junk and
 /// unopened conversations never count), the buyer has written in it, and
-/// the buyer's newest text is newer than the seller's newest reply.
+/// nothing in the seller's direction answers the buyer's newest message.
 ///
-/// Read from direction, not authorship, so it survives a reload: a reply is
-/// any text in the seller's direction. Only text counts on either side: an
-/// automatic decline is not a reply. The buyer's timestamp is their own
-/// claim, so it is taken no later than `now`: a message dated in the future
-/// cannot keep a conversation waiting after the seller answers it.
+/// Every timestamp is its writer's claim, so neither side's is trusted to
+/// decide alone (review of #205 after the msg1 fixes: capping only the
+/// buyer's at `now` let a future-dated message beat every later reply):
+///
+/// * buyer text dated more than [`CLOCK_SKEW`] past `now` is not counted at
+///   all, so it cannot pin "need you" on;
+/// * the conversation is answered when anything in the seller's direction
+///   (text, confirmed as the seller's or not, or a decline with a reason) is
+///   dated no earlier than the buyer's newest counted message less
+///   [`CLOCK_SKEW`], so a buyer whose clock runs a few minutes fast is
+///   answered by a reply sent now.
+///
+/// Read from direction, not authorship, so it survives a reload. Text in
+/// the seller's direction the buyer sealed themselves only clears their own
+/// waiting, which harms nobody else.
 pub(crate) fn awaiting_reply(
     open: bool,
     entries: &[MailboxEntry],
@@ -1546,25 +1647,38 @@ pub(crate) fn awaiting_reply(
     if !open {
         return false;
     }
-    let newest = |direction: Addressing| {
-        entries
-            .iter()
-            .filter_map(|entry| match entry {
-                MailboxEntry::Readable {
-                    content: MessageContent::Text(_) | MessageContent::VouchedText { .. },
-                    addressing,
-                    timestamp,
-                    ..
-                } if *addressing == direction => Some((*timestamp).min(now)),
-                _ => None,
-            })
-            .max()
+    let newest_buyer = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            MailboxEntry::Readable {
+                content: MessageContent::Text(_) | MessageContent::VouchedText { .. },
+                addressing: Addressing::ToSeller,
+                timestamp,
+                ..
+            } if *timestamp <= now + CLOCK_SKEW => Some(*timestamp),
+            _ => None,
+        })
+        .max();
+    let Some(newest_buyer) = newest_buyer else {
+        return false;
     };
-    match (newest(Addressing::ToSeller), newest(Addressing::ToBuyer)) {
-        (Some(buyer), Some(seller)) => buyer > seller,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
+    let answered = entries.iter().any(|entry| match entry {
+        MailboxEntry::Readable {
+            content,
+            addressing: Addressing::ToBuyer,
+            timestamp,
+            ..
+        } => {
+            let replies = match content {
+                MessageContent::Text(_) | MessageContent::VouchedText { .. } => true,
+                MessageContent::Decline { reason } => !reason.trim().is_empty(),
+                MessageContent::OrderRequest { .. } | MessageContent::OrderAccepted { .. } => false,
+            };
+            replies && *timestamp >= newest_buyer - CLOCK_SKEW
+        }
+        _ => false,
+    });
+    !answered
 }
 
 /// How many of one of our stores' buyer conversations wait for the seller's
@@ -1607,10 +1721,14 @@ pub(crate) fn SellerThreadPointer(
     let dom_id = seller_thread_dom_id(&thread.tag, Some(&home));
     let short = home.short();
     let tag = thread.tag;
+    // "New message" is said once, on the card the conversation is under;
+    // here only in the button's own words (review after b9c727f).
+    let label = if thread.awaiting_reply {
+        format!("New message from this buyer, under order {short}")
+    } else {
+        format!("Messages with this buyer, under order {short}")
+    };
     rsx! {
-        if thread.awaiting_reply {
-            p { class: "text-warning small", "{NEW_MESSAGE}" }
-        }
         div { class: "thread-toggle",
             button {
                 class: "btn btn-sm btn-outline",
@@ -1619,7 +1737,7 @@ pub(crate) fn SellerThreadPointer(
                     open_thread.set(Some((tag, Some(home.clone()))));
                     super::scroll_to_id(dom_id.clone());
                 },
-                "Messages with this buyer, under order {short}"
+                "{label}"
             }
         }
     }
@@ -3270,18 +3388,20 @@ mod inbox_tests {
 
     /// **A conversation waits for the seller's reply when the buyer wrote
     /// last** (msg1 critique MSG-3), and only an open one with readable buyer
-    /// text: an unopened conversation, junk, a request or an automatic
-    /// decline never counts, so nobody can inflate "need you" for free. A
-    /// seller's reply clears it, even against a buyer message dated in the
-    /// future. Red with the open check dropped, with the clamp to now
-    /// dropped, and with declines counted as replies.
+    /// text: an unopened conversation, junk and a request never count, so
+    /// nobody can inflate "need you" for free. Neither side's clock decides
+    /// alone (review after b9c727f): a far-future buyer message is not
+    /// counted; a reply sent before the reader's `now` still answers; a
+    /// buyer whose clock runs 5 minutes fast is answered by a reply sent at
+    /// `now`; a decline with a reason answers. Red with the open check
+    /// dropped, with the future bound dropped, with the skew allowance
+    /// dropped, and with declines not counted as replies.
     #[test]
     fn a_conversation_waits_for_a_reply_only_when_the_buyer_wrote_last() {
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
         let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
-        let now = at(1_000);
         let said = |addressing, secs: i64, text: &str| {
-            let mut entry = readable(MessageContent::Text(text.into()), [secs as u8; 32]);
+            let mut entry = readable(MessageContent::Text(text.into()), [(secs % 251) as u8; 32]);
             if let MailboxEntry::Readable {
                 timestamp,
                 addressing: a,
@@ -3293,37 +3413,62 @@ mod inbox_tests {
             }
             entry
         };
-        let buyer = said(ToSeller, 500, "is it on its way?");
+        let decline = |secs: i64, reason: &str| {
+            let mut entry = said(ToBuyer, secs, "");
+            if let MailboxEntry::Readable { content, .. } = &mut entry {
+                *content = MessageContent::Decline {
+                    reason: reason.into(),
+                };
+            }
+            entry
+        };
+        // The reader's `now` is an hour after everything below.
+        let now = at(10_000);
+        let buyer = said(ToSeller, 5_000, "is it on its way?");
         assert!(awaiting_reply(true, std::slice::from_ref(&buyer), now));
         assert!(
             !awaiting_reply(false, std::slice::from_ref(&buyer), now),
             "an unopened conversation never counts"
         );
-        let reply = said(ToBuyer, 600, "posted today");
+        // Answered earlier than `now`: still answered on every later render.
+        let reply = said(ToBuyer, 6_000, "posted today");
         assert!(!awaiting_reply(true, &[buyer.clone(), reply.clone()], now));
         assert!(awaiting_reply(
             true,
-            &[buyer.clone(), reply, said(ToSeller, 700, "thanks, when?")],
+            &[
+                buyer.clone(),
+                reply.clone(),
+                said(ToSeller, 7_000, "thanks, when?")
+            ],
             now
         ));
-        // Dated in the future, answered now: not waiting.
+        // Dated far in the future: not counted, so it cannot pin the count.
         let future = said(ToSeller, 99_999, "reply to me forever");
+        assert!(!awaiting_reply(true, std::slice::from_ref(&future), now));
         assert!(!awaiting_reply(
             true,
-            &[future, said(ToBuyer, 1_000, "answered")],
+            &[buyer.clone(), reply.clone(), future],
             now
         ));
-        // A decline is not a reply; a request, junk and nothing are nothing.
-        let mut decline = said(ToBuyer, 800, "");
-        if let MailboxEntry::Readable { content, .. } = &mut decline {
-            *content = MessageContent::Decline {
-                reason: "Sold out".into(),
-            };
-        }
-        assert!(awaiting_reply(true, &[buyer, decline], now));
+        // A buyer's clock 5 minutes fast, answered at the reader's `now`.
+        let fast = said(ToSeller, 10_000 + 300, "sent just now");
+        assert!(awaiting_reply(true, std::slice::from_ref(&fast), now));
+        assert!(!awaiting_reply(
+            true,
+            &[fast, said(ToBuyer, 10_000, "on it")],
+            now
+        ));
+        // A decline with a reason answers; an empty one does not.
+        assert!(!awaiting_reply(
+            true,
+            &[buyer.clone(), decline(6_000, "Sold out")],
+            now
+        ));
+        assert!(awaiting_reply(true, &[buyer, decline(6_000, "")], now));
+        // Junk, a request and nothing are nothing.
         let junk = MailboxEntry::Unreadable {
             conversation: vec![1u8; 32],
-            timestamp: at(900),
+            timestamp: at(9_000),
             nonce: [0; 24],
             digest: [9; 32],
             why: "junk".into(),

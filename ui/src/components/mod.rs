@@ -128,8 +128,6 @@ pub(crate) fn grow_focused_textarea() {
     }
 }
 
-/// Focus and select all of the field with this `id`, for a Copy button the
-/// clipboard refused.
 /// Scroll the element with this id into view, once the render that opens
 /// it has happened: a pointer on one card opening a conversation shown under
 /// another (msg1 critique MSG-5, MSG-13). Called by name through
@@ -157,6 +155,8 @@ pub(crate) fn scroll_to_id(id: String) {
     let _ = id;
 }
 
+/// Focus and select all of the field with this `id`, for a Copy button the
+/// clipboard refused.
 pub(crate) fn select_field_by_id(id: &str) {
     #[cfg(target_arch = "wasm32")]
     {
