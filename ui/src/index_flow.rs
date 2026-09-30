@@ -54,6 +54,33 @@ pub struct IndexView {
     pub ghost_key: [u8; 32],
     /// Its state, once it has arrived and verified.
     pub index: Option<GhostKeyIndexV1>,
+    /// The node answered that nothing is stored at the current index
+    /// (harvest#181): no store yet, unless the key's index migration walk
+    /// finds an earlier generation's.
+    pub absent: bool,
+    /// [`INDEX_SETTLE_WAIT_MS`] has passed since it was asked for with no
+    /// settled answer.
+    pub waited: bool,
+}
+
+/// How long My Store waits for a Ghost Key's index to settle before it
+/// offers "Create a store" anyway, with a warning (harvest#181). An index
+/// that never answers (silence is how Freenet often reports a contract
+/// nobody published) must not keep a new seller from ever starting.
+pub const INDEX_SETTLE_WAIT_MS: u32 = 60_000;
+
+/// Whether a Ghost Key may create a store now (harvest#181, section 6.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreationGate {
+    /// Nothing says it backs a store: offer "Create a store".
+    Ready,
+    /// Still finding out whether it already backs a store.
+    Checking,
+    /// A loaded store's current backing is this key: it is recovered, not
+    /// created again.
+    BacksStore(String),
+    /// The check did not finish in time: offer it, and say so.
+    Unconfirmed,
 }
 
 /// How many times a store's index entry publish may fail before this
@@ -85,8 +112,21 @@ impl AppState {
             IndexView {
                 ghost_key,
                 index: None,
+                absent: false,
+                waited: false,
             },
         );
+        // My Store waits for the index before offering "Create a store"
+        // (harvest#181), but not for ever.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let id = id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(INDEX_SETTLE_WAIT_MS).await;
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE.write().on_index_wait_elapsed(&id);
+            });
+        }
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {
@@ -356,6 +396,85 @@ impl AppState {
         self.index_entries_published.remove(store_key);
     }
 
+    /// The node answered `NotFound` for `contract_id`. If it is a Ghost Key
+    /// index this tab follows, note it; returns whether it was.
+    pub(crate) fn on_index_absent(&mut self, contract_id: &[u8]) -> bool {
+        match self.ghostkey_indexes.get_mut(contract_id) {
+            Some(view) => {
+                view.absent = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The Ghost Key `fingerprint`'s index migration walk has finished: an
+    /// earlier generation's index, if there was one, has been carried
+    /// forward (and arrives as the current index's state).
+    pub(crate) fn on_index_walk_done(&mut self, fingerprint: &str) {
+        self.index_walks_done.insert(fingerprint.to_string());
+    }
+
+    /// The wait for an index to settle is over.
+    pub(crate) fn on_index_wait_elapsed(&mut self, contract_id: &[u8]) {
+        if let Some(view) = self.ghostkey_indexes.get_mut(contract_id) {
+            view.waited = true;
+        }
+    }
+
+    /// Whether the Ghost Key `fingerprint` (verifying key `backer`) may
+    /// create a store now (harvest#181).
+    ///
+    /// Decision 6.2 is that a Ghost Key backs one store at a time, and the
+    /// seller's other devices' stores are found through the key's index. So
+    /// "Create a store" waits until this device knows what the key already
+    /// backs: the delegate's store list has answered, the index has settled
+    /// (its state arrived, or the node found none and the key's index
+    /// migration walk found no earlier one), and every store it lists has
+    /// loaded or been given up on. A loaded store the key currently backs
+    /// is recovered by custody rather than created again.
+    pub(crate) fn store_creation_gate(&self, fingerprint: &str, backer: &[u8; 32]) -> CreationGate {
+        if let Some(name) = self.store_backed_by(backer, None) {
+            return CreationGate::BacksStore(name);
+        }
+        let view = self
+            .ghostkey_indexes
+            .values()
+            .find(|v| v.ghost_key == *backer);
+        let waited = view.is_some_and(|v| v.waited);
+        let settled = match view {
+            None => false,
+            Some(view) => match &view.index {
+                Some(index) => index
+                    .store_keys()
+                    .all(|store| self.indexed_store_settled(&store)),
+                None => view.absent && self.index_walks_done.contains(fingerprint),
+            },
+        };
+        match (
+            settled && self.store_lists_answered.contains(fingerprint),
+            waited,
+        ) {
+            (true, _) => CreationGate::Ready,
+            (false, true) => CreationGate::Unconfirmed,
+            (false, false) => CreationGate::Checking,
+        }
+    }
+
+    /// Whether a store an index lists has loaded, or its load was given up.
+    fn indexed_store_settled(&self, store_key: &ed25519_dalek::VerifyingKey) -> bool {
+        let Ok(id) =
+            crate::gateway::store_ops::store_instance_id(&crate::migrate::store_params(store_key))
+        else {
+            return true;
+        };
+        let id = id.as_bytes().to_vec();
+        self.browsing_stores
+            .get(&id)
+            .is_some_and(|store| store.info.is_some() || store.backing_state.owner.is_some())
+            || self.store_state_unavailable.contains(&id)
+    }
+
     /// The fingerprint of a connected Ghost Key whose verifying key is `key`.
     pub(crate) fn connected_ghost_key(&self, key: &[u8; 32]) -> Option<String> {
         self.ghostkeys
@@ -433,6 +552,66 @@ mod tests {
             verifying_key_bytes: Some(key.to_vec()),
             backed_up: false,
         });
+    }
+
+    /// harvest#181: "Create a store" waits until this device knows what the
+    /// Ghost Key already backs. Nothing known: checking. The delegate's list
+    /// and a `NotFound` index are not enough until the key's index migration
+    /// walk has finished (an earlier generation may hold its stores). An
+    /// index that lists a store waits for that store; the store, once loaded
+    /// and backed by the key, is recovered rather than created again; and
+    /// the wait ends in "unconfirmed", not a permanent block. Mutated red by
+    /// ignoring the walk, by ignoring unloaded listed stores, by ignoring the
+    /// delegate's list, and by never ending the wait.
+    #[test]
+    fn store_creation_waits_until_the_key_is_known() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        let checking = || CreationGate::Checking;
+        assert_eq!(state.store_creation_gate("fp", &backer_vk()), checking());
+        state.watch_ghostkey_index(backer_vk());
+        let id = index_id(backer_vk());
+        assert_eq!(state.store_creation_gate("fp", &backer_vk()), checking());
+        state.store_lists_answered.insert("fp".into());
+        assert!(state.on_index_absent(&id));
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            checking(),
+            "an earlier index generation may still hold its stores"
+        );
+        state.on_index_walk_done("fp");
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Ready
+        );
+
+        // The delegate's own list has not answered: not yet.
+        state.store_lists_answered.clear();
+        assert_eq!(state.store_creation_gate("fp", &backer_vk()), checking());
+        state.store_lists_answered.insert("fp".into());
+
+        // An index listing a store waits for it, then the store is the key's.
+        let bytes = harvest_common::to_cbor(&index_of(&[0x71])).unwrap();
+        state.on_contract_state(id.clone(), bytes);
+        assert_eq!(state.store_creation_gate("fp", &backer_vk()), checking());
+        load_backed(&mut state, 9, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state
+            .browsing_stores
+            .insert(store_id(0x71), state.browsing_stores[&vec![9; 32]].clone());
+        assert!(matches!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::BacksStore(_)
+        ));
+
+        // Silence for the whole wait: offered, with the warning.
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.watch_ghostkey_index(backer_vk());
+        state.on_index_wait_elapsed(&index_id(backer_vk()));
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Unconfirmed
+        );
     }
 
     /// A connected Ghost Key's index is read, and every store it lists is
