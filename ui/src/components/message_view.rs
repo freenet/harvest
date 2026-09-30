@@ -3,7 +3,11 @@ use dioxus::prelude::*;
 use crate::gateway::APP_STATE;
 use crate::messaging::{MailboxEntry, MessageContent};
 
-/// Buyer-to-seller messaging.
+/// Buyer-to-seller messaging: the buyer's "Ask the seller a question" card on
+/// a store's page (this component), each conversation under the orders it
+/// holds on Purchases ([`BuyerThread`]), and the seller's side on the Orders
+/// tab, each conversation under its order card or among the questions
+/// ([`seller_inbox`], [`SellerThreadToggle`], [`SellerQuestions`]).
 ///
 /// # What this component may and may not claim
 ///
@@ -39,12 +43,14 @@ use crate::messaging::{MailboxEntry, MessageContent};
 ///   local node has taken the send (after it answered for the mailbox; see
 ///   `gateway::prime`). Nothing confirms the contract took it or that the
 ///   seller ever looks. The button is an action label and says "Send";
-///   what must not claim delivery is the CONFIRMATION, and the list of what
-///   was written says "handed to your Freenet node" instead. Once the
-///   delivery check gives up (harvest#119) the card says which of three
-///   things is true -- it never reached the node, fresh reads show it is not
-///   in the mailbox, or Harvest could not confirm either way -- each with a
-///   "Send again".
+///   what must not claim delivery is the CONFIRMATION, and a message not yet
+///   seen in the mailbox says "sending" instead. Once the delivery check
+///   gives up (harvest#119) its bubble says which of three things is true --
+///   it never reached the node, fresh reads show it is not in the mailbox,
+///   or Harvest could not confirm either way -- each with a "Send again".
+///
+/// None of that is said as a caveat on screen any more (round-6 critique):
+/// the one line under the box is "Only {store} can read this."
 ///
 /// # Why a store can still be unmessageable
 ///
@@ -68,65 +74,14 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
         .unwrap_or("this store")
         .to_string();
 
-    // A store the connected identity owns is read, not written to: the
-    // seller is the mailbox's audience, and there is nobody for them to
-    // compose to.
-    let owned = app_state
+    // A seller does not message their own store: their buyers' messages are
+    // under each order on the Orders tab, and questions below them
+    // (`invoice_form::StorePayments`).
+    if app_state
         .store_owner_fingerprint(&store_contract_id)
-        .is_some();
-
-    if owned {
-        // Buyer text no Ghost Key vouches for is taken out here, before
-        // anything counts or groups it (the anti-spam gate's seller half).
-        let published_orders = store.map(|s| s.orders.as_slice()).unwrap_or_default();
-        let store_listings = store.map(|s| s.listings.as_slice()).unwrap_or_default();
-        let all = app_state.mailbox_entries(&store_contract_id);
-        let paid = paid_conversations(&all, published_orders, store_listings, |tag| {
-            app_state.conversation_keys.get(tag)
-        });
-        // `shown_to_seller` works the vouchers out again below; that is a
-        // cache hit (`voucher_verifies` remembers each verdict), not a second
-        // chain check.
-        let open = open_conversations(
-            &all,
-            |voucher, tag| app_state.voucher_verifies(voucher, tag),
-            |tag| paid.contains(tag),
-        );
-        let (entries, unvouched) = shown_to_seller(
-            all,
-            |voucher, tag| app_state.voucher_verifies(voucher, tag),
-            |tag| paid.contains(tag),
-            |entry| {
-                request_address_hidden(
-                    entry,
-                    published_orders,
-                    app_state.conversation_keys.get(entry.conversation()),
-                    |order| app_state.address_retained_for(order),
-                )
-            },
-            |digest| app_state.authored_here(&store_contract_id, digest),
-        );
-        // The only authorship this client can establish: what it sent itself.
-        let authored: Vec<[u8; 32]> = entries
-            .iter()
-            .map(|entry| entry.digest())
-            .filter(|digest| app_state.authored_here(&store_contract_id, digest))
-            .collect();
-        let (listings, published) = store
-            .map(|store| (store.listings.clone(), store.orders.clone()))
-            .unwrap_or_default();
-        drop(app_state);
-        return rsx! {
-            Inbox {
-                store_contract_id: store_contract_id.clone(),
-                entries: entries,
-                unvouched: unvouched,
-                open: open,
-                authored: authored,
-                listings: listings,
-                published: published,
-            }
-        };
+        .is_some()
+    {
+        return rsx! {};
     }
 
     let seller_key = info.and_then(|i| i.encryption_public_key);
@@ -135,8 +90,8 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     // notary signature, and this component re-renders on every keystroke in
     // the box below. See `state::BrowsingStore::seller_verifying_key`.
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
-    let thread = app_state.conversation_thread(&store_contract_id);
-    let unconfirmed = app_state.unconfirmed_sent(&store_contract_id);
+    let has_thread = !app_state.conversation_thread(&store_contract_id).is_empty()
+        || !app_state.unconfirmed_sent(&store_contract_id).is_empty();
     // What this node is keeping, which is what the buyer can ask it to
     // forget. Empty until the delegate answers, and empty for a store this
     // node has never written to.
@@ -155,17 +110,12 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 .collect()
         })
         .unwrap_or_default();
-    let authored_here: Vec<[u8; 32]> = thread
-        .iter()
-        .map(|message| message.digest)
-        .filter(|digest| app_state.authored_here(&store_contract_id, digest))
-        .collect();
     let loaded = info.is_some();
     drop(app_state);
 
     rsx! {
         div { class: "card",
-            h3 { "Contact {store_name}" }
+            h3 { "Ask {store_name} a question" }
 
             match (loaded, seller_key, seller_identity) {
                 (false, _, _) => rsx! {
@@ -176,6 +126,13 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                         store_contract_id: store_contract_id.clone(),
                         seller_encryption_key: key,
                         seller_verifying_key: identity,
+                        target: None,
+                        label: "Your question".to_string(),
+                        placeholder: "Ask about a listing.".to_string(),
+                        hint: format!(
+                            "Only {store_name} can read this. Their reply appears here and in \
+                             Purchases, on this device."
+                        ),
                     }
                 },
                 // The seller published no key. Nothing can be encrypted to
@@ -203,13 +160,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                 },
             }
 
-            if !thread.is_empty() || !unconfirmed.is_empty() {
-                Thread {
-                    store_contract_id: store_contract_id.clone(),
-                    thread: thread,
-                    unconfirmed: unconfirmed,
-                    authored_here: authored_here,
-                }
+            if has_thread {
+                h4 { "Your messages" }
+                Thread { store_contract_id: store_contract_id.clone(), tag: None }
             }
 
             KeptConversations {
@@ -455,122 +408,89 @@ fn Restore() -> Element {
     }
 }
 
-/// The buyer's conversation with one store: what they wrote, what came back,
-/// and what has not been seen landing yet.
+/// A buyer's messages with one store, as bubbles: what they wrote, what came
+/// back, and what has not been seen landing yet. `tag` narrows it to one
+/// conversation (an order's own thread); `None` is every conversation this
+/// node holds with the store.
+///
+/// Requests to buy and the seller's acceptances are not shown: the purchase
+/// card shows the order (`chat_item`). What the buyer's own node could not
+/// read is not shown either, and no crypto caveats are (round-6 critique).
 #[component]
-fn Thread(
-    store_contract_id: Vec<u8>,
-    thread: Vec<crate::messaging::ConversationMessage>,
-    unconfirmed: Vec<crate::state::SentMessage>,
-    /// Entry digests this browser wrote. The ONLY authorship anything here
-    /// can establish -- see `state::AppState::authored_here`. Digests rather
-    /// than nonces because a nonce is public and a substitute shares it.
-    authored_here: Vec<[u8; 32]>,
-) -> Element {
+fn Thread(store_contract_id: Vec<u8>, tag: Option<[u8; 32]>) -> Element {
+    let (lines, unconfirmed) = {
+        let state = APP_STATE.read();
+        let messages = buyer_messages(&state, &store_contract_id, tag);
+        let unconfirmed: Vec<crate::state::SentMessage> = state
+            .unconfirmed_sent(&store_contract_id)
+            .into_iter()
+            .filter(|sent| tag.is_none_or(|tag| sent.sealed.sender_public_key == tag))
+            .collect();
+        (chat_lines(&messages, Role::Buyer), unconfirmed)
+    };
+
     rsx! {
-        div { style: "margin-top: 1.5rem;",
-            h4 { "Your conversation" }
-            p { class: "text-muted",
-                style: "font-size: 0.85rem;",
-                "This conversation survives a reload on this device: the key that reads it is "
-                "kept by your Freenet node. It does not follow you to another browser or "
-                "another device, where the same messages cannot be read by anyone."
-            }
-            p { class: "text-muted",
-                style: "font-size: 0.85rem;",
-                "Only messages this tab sent are marked as yours. Everything else is shown "
-                "by which direction it was encrypted for, which is not proof of who wrote "
-                "it -- both sides of a conversation hold both keys."
-            }
+        if !lines.is_empty() {
+            ChatLines { lines }
+        }
 
-            for message in thread.iter() {
-                {
-                    let when = message.timestamp.format("%Y-%m-%d %H:%M UTC").to_string();
-                    let who = attribution(
-                        authored_here.contains(&message.digest),
-                        message.addressing,
-                        Role::Buyer,
-                    );
-                    rsx! {
-                        div { class: "card",
-                            style: "margin-top: 0.5rem;",
-                            p { class: "text-muted", style: "font-size: 0.8rem;", "{who}" }
-                            p { style: "white-space: pre-wrap;", "{describe(&message.content)}" }
-                            p { class: "text-muted",
-                                style: "font-size: 0.8rem;",
-                                "Sender's timestamp: {when}"
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Handed to the node, not yet seen in the seller's mailbox. Kept
-            // separate from the thread above rather than shown as sent,
-            // because "the node accepted it" and "it is in the mailbox" are
-            // different claims and only the second is evidence.
-            //
-            // Once the delivery check has given up (harvest#119) it says the
-            // seller does not have it, and offers the one thing that helps.
-            for message in unconfirmed.iter() {
-                if let Some(why) = message.not_arrived {
-                    {
-                        let store_contract_id = store_contract_id.clone();
-                        let digest = message.digest;
-                        let explanation = match why {
-                            crate::state::NotArrived::NeverReachedNode => {
-                                "The seller has not received this. It never reached your Freenet \
-                                 node, so nothing was sent."
-                            }
-                            crate::state::NotArrived::NotInMailbox => {
-                                "The seller has not received this yet. Harvest sent it more than \
-                                 once and it is still not in their mailbox. Sending it again \
-                                 cannot deliver it twice."
-                            }
-                            crate::state::NotArrived::Unconfirmed => {
-                                "Harvest could not confirm that this reached the seller's \
-                                 mailbox. It may have arrived. Sending it again cannot deliver \
-                                 it twice."
-                            }
-                        };
-                        let label = match why {
-                            crate::state::NotArrived::Unconfirmed => "You — not confirmed",
-                            crate::state::NotArrived::NeverReachedNode
-                            | crate::state::NotArrived::NotInMailbox => "You — not received",
-                        };
-                        rsx! {
-                            div { class: "card",
-                                style: "margin-top: 0.5rem;",
-                                p { class: "text-muted", style: "font-size: 0.8rem;", "{label}" }
-                                p { style: "white-space: pre-wrap;", "{message.text}" }
-                                p { class: "text-warning",
-                                    style: "font-size: 0.8rem;",
-                                    "{explanation}"
+        // Handed to the node, not yet seen in the seller's mailbox. Kept
+        // separate from the thread above rather than shown as sent,
+        // because "the node accepted it" and "it is in the mailbox" are
+        // different claims and only the second is evidence.
+        //
+        // Once the delivery check has given up (harvest#119) it says the
+        // seller does not have it, and offers the one thing that helps.
+        if !unconfirmed.is_empty() {
+            div { class: "bubbles",
+                for message in unconfirmed.iter() {
+                    if let Some(why) = message.not_arrived {
+                        {
+                            let store_contract_id = store_contract_id.clone();
+                            let digest = message.digest;
+                            let explanation = match why {
+                                crate::state::NotArrived::NeverReachedNode => {
+                                    "The seller hasn't received this. It never reached your \
+                                     Freenet node, so nothing was sent."
                                 }
-                                button {
-                                    class: "btn btn-sm",
-                                    onclick: move |_| {
-                                        if let Err(e) = resend(&store_contract_id, &digest) {
-                                            APP_STATE
-                                                .write()
-                                                .notifications
-                                                .push(format!("Your message could not be sent again: {e}"));
-                                        }
-                                    },
-                                    "Send again"
+                                crate::state::NotArrived::NotInMailbox => {
+                                    "The seller hasn't received this yet. Harvest sent it more \
+                                     than once. Sending it again can't deliver it twice."
+                                }
+                                crate::state::NotArrived::Unconfirmed => {
+                                    "Harvest couldn't confirm this reached the seller. It may \
+                                     have. Sending it again can't deliver it twice."
+                                }
+                            };
+                            let label = match why {
+                                crate::state::NotArrived::Unconfirmed => "You \u{00b7} not confirmed",
+                                crate::state::NotArrived::NeverReachedNode
+                                | crate::state::NotArrived::NotInMailbox => "You \u{00b7} not received",
+                            };
+                            rsx! {
+                                div { class: "bubble mine",
+                                    span { class: "bubble-who", "{label}" }
+                                    "{message.text}"
+                                    span { class: "bubble-note", "{explanation}" }
+                                    button {
+                                        class: "btn btn-sm btn-outline",
+                                        onclick: move |_| {
+                                            if let Err(e) = resend(&store_contract_id, &digest) {
+                                                APP_STATE
+                                                    .write()
+                                                    .notifications
+                                                    .push(format!("Your message could not be sent again: {e}"));
+                                            }
+                                        },
+                                        "Send again"
+                                    }
                                 }
                             }
                         }
-                    }
-                } else {
-                    div { class: "card",
-                        style: "margin-top: 0.5rem;",
-                        p { class: "text-muted", style: "font-size: 0.8rem;", "You — not yet visible" }
-                        p { style: "white-space: pre-wrap;", "{message.text}" }
-                        p { class: "text-warning",
-                            style: "font-size: 0.8rem;",
-                            "Handed to your Freenet node. It has not appeared in the seller's "
-                            "mailbox yet, so Harvest cannot say it arrived."
+                    } else {
+                        div { class: "bubble mine",
+                            span { class: "bubble-who", "You \u{00b7} sending" }
+                            "{message.text}"
                         }
                     }
                 }
@@ -579,56 +499,166 @@ fn Thread(
     }
 }
 
+/// The messages a buyer's node reads in its conversations with a store,
+/// oldest first: all of them, or only the conversation `tag`.
+fn buyer_messages(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    tag: Option<[u8; 32]>,
+) -> Vec<crate::messaging::ConversationMessage> {
+    match tag {
+        None => state.conversation_thread(store_contract_id),
+        Some(tag) => {
+            let Some(store) = state.browsing_stores.get(store_contract_id) else {
+                return Vec::new();
+            };
+            let mut messages: Vec<crate::messaging::ConversationMessage> = store
+                .conversations
+                .iter()
+                .filter(|conversation| conversation.buyer_public_key == tag)
+                .flat_map(|conversation| conversation.read(&store.mailbox_messages))
+                .collect();
+            messages.sort_by_key(|message| (message.timestamp, message.nonce));
+            messages
+        }
+    }
+}
+
+/// How many messages a buyer's conversation `tag` with a store shows as
+/// chat, sent-but-not-landed included: the count on its Messages button.
+pub(crate) fn buyer_thread_count(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    tag: [u8; 32],
+) -> usize {
+    let messages = buyer_messages(state, store_contract_id, Some(tag));
+    let unconfirmed = state
+        .unconfirmed_sent(store_contract_id)
+        .iter()
+        .filter(|sent| sent.sealed.sender_public_key == tag)
+        .count();
+    chat_lines(&messages, Role::Buyer).len() + unconfirmed
+}
+
+/// One of a buyer's conversations with a store, under the orders it holds
+/// (or on its own for a question), behind a Messages button: the thread and
+/// the box to write in it. The box is open without a Ghost Key once an order
+/// in it is paid (`AppState::paid_conversation`).
+#[component]
+pub(crate) fn BuyerThread(
+    store_contract_id: Vec<u8>,
+    tag: [u8; 32],
+    #[props(default)] open: bool,
+) -> Element {
+    let mut shown = use_signal(move || open);
+    let count = buyer_thread_count(&APP_STATE.read(), &store_contract_id, tag);
+    let label = match (shown(), count) {
+        (true, _) => "Hide messages".to_string(),
+        (false, 0) => "Message the seller".to_string(),
+        (false, n) => format!("Messages ({n})"),
+    };
+    rsx! {
+        div { class: "thread-toggle",
+            button {
+                class: "btn btn-sm btn-outline",
+                aria_expanded: if shown() { "true" } else { "false" },
+                onclick: move |_| shown.toggle(),
+                "{label}"
+            }
+        }
+        if shown() {
+            div { class: "thread",
+                Thread { store_contract_id: store_contract_id.clone(), tag: Some(tag) }
+                OrderCompose { store_contract_id: store_contract_id.clone(), tag }
+            }
+        }
+    }
+}
+
+/// The box to write into a buyer's conversation `tag` with a store: open
+/// without a Ghost Key where an order in it is paid, gated otherwise.
+#[component]
+pub(crate) fn OrderCompose(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element {
+    let (keys, name) = {
+        let state = APP_STATE.read();
+        let store = state.browsing_stores.get(&store_contract_id);
+        let key = store
+            .and_then(|s| s.info.as_ref())
+            .and_then(|i| i.encryption_public_key);
+        let identity = store.and_then(|s| s.seller_verifying_key);
+        (
+            key.zip(identity),
+            state.store_name_of(&store_contract_id).label(),
+        )
+    };
+    match keys {
+        Some((key, identity)) => rsx! {
+            Compose {
+                store_contract_id: store_contract_id.clone(),
+                seller_encryption_key: key,
+                seller_verifying_key: identity,
+                target: Some(tag),
+                label: "Message".to_string(),
+                placeholder: "Message the seller.".to_string(),
+                hint: format!("Only {name} can read this."),
+            }
+        },
+        None => rsx! {
+            p { class: "text-muted small",
+                "This store can't be messaged from here right now. Open its page to see why."
+            }
+        },
+    }
+}
+
 /// The compose box, shown only when a message can genuinely be sealed and
 /// addressed.
+///
+/// `target` is the conversation it writes into: an order's own thread, or
+/// (`None`) whichever conversation a new message continues. The gate is that
+/// conversation's (`AppState::compose_gate_in`): open without a Ghost Key
+/// where an order in it is paid, else a Ghost Key's.
 #[component]
 fn Compose(
     store_contract_id: Vec<u8>,
     seller_encryption_key: [u8; 32],
     seller_verifying_key: [u8; 32],
+    target: Option<[u8; 32]>,
+    label: String,
+    placeholder: String,
+    hint: String,
 ) -> Element {
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
 
-    let (gate, signing, failure) = {
+    let (gate, signing, failure, name) = {
         let state = APP_STATE.read();
         (
-            state.compose_gate_in(&store_contract_id, None),
+            state.compose_gate_in(&store_contract_id, target),
             state.texts_awaiting_voucher(&store_contract_id),
             state.voucher_failure(&store_contract_id).cloned(),
+            state.store_name_of(&store_contract_id).label(),
         )
     };
-    // No Ghost Key, no compose box: the seller would not be shown what was
-    // typed (`shown_to_seller`), so offering the box would be a dead end.
+    // No Ghost Key and nothing paid, no compose box: the seller would not be
+    // shown what was typed (`shown_to_seller`), so offering the box would be
+    // a dead end.
     if gate == crate::voucher_flow::ComposeGate::NeedsGhostKey {
         return rsx! {
-            GhostKeyGate {}
+            GhostKeyGate { after_payment: target.is_some() }
         };
     }
+    let vouched = matches!(gate, crate::voucher_flow::ComposeGate::Ready { .. });
 
     let can_send = !draft().trim().is_empty();
 
     rsx! {
-        p { class: "text-muted",
-            style: "margin-bottom: 1rem;",
-            "Your message is encrypted to this seller's published key before it leaves your "
-            "browser, and only they can read it -- the matching secret never leaves their "
-            "Harvest delegate. Anyone watching the network can still see that you wrote to "
-            "this store, just not what you said."
-        }
-        p { class: "text-muted",
-            style: "margin-bottom: 1rem;",
-            "The seller replies into the same mailbox and their answer appears here. Reading "
-            "it needs a key your node keeps for you, so it survives closing this tab but does "
-            "not follow you to another device -- come back to this one for the answer."
-        }
-
         div { class: "form-group",
-            label { class: "form-label", "Your Message" }
+            label { class: "form-label", "{label}" }
             textarea {
                 class: "form-textarea",
                 value: "{draft}",
-                placeholder: "Ask about a listing, or arrange a trade.",
+                placeholder: "{placeholder}",
                 oninput: move |event| draft.set(event.value()),
             }
         }
@@ -640,11 +670,9 @@ fn Compose(
         // Waiting on the Ghost Key's signature for this conversation. Shown
         // here rather than in the thread: nothing has been sent yet.
         for text in signing.iter() {
-            div { class: "card", style: "margin-top: 0.5rem;",
-                p { class: "text-muted", style: "font-size: 0.8rem;",
-                    "Signing with your Ghost Key..."
-                }
-                p { style: "white-space: pre-wrap;", "{text}" }
+            div { class: "bubble mine",
+                span { class: "bubble-who", "You \u{00b7} signing with your Ghost Key" }
+                "{text}"
             }
         }
         if let Some(failure) = failure {
@@ -652,35 +680,40 @@ fn Compose(
                 "Not sent: {failure.why}. Copy anything you want to keep, then send again."
             }
             for text in failure.texts.iter() {
-                div { class: "card", style: "margin-top: 0.5rem;",
-                    p { class: "text-muted", style: "font-size: 0.8rem;", "Not sent" }
-                    p { style: "white-space: pre-wrap;", "{text}" }
+                div { class: "bubble mine",
+                    span { class: "bubble-who", "You \u{00b7} not sent" }
+                    "{text}"
                 }
             }
         }
 
-        p { class: "text-muted", style: "font-size: 0.85rem;",
-            "Your first message in a conversation is signed by your Ghost Key, so the seller "
-            "knows a Ghost Key holder wrote it. They see which Ghost Key; nobody else does."
-        }
-
-        button {
-            class: "btn btn-primary",
-            disabled: !can_send,
-            onclick: move |_| {
-                let text = draft().trim().to_string();
-                if text.is_empty() {
-                    return;
-                }
-                match send(&store_contract_id, &seller_encryption_key, &seller_verifying_key, text, None) {
-                    Ok(()) => {
-                        draft.set(String::new());
-                        problem.set(None);
+        div { class: "form-actions",
+            button {
+                class: "btn btn-primary",
+                disabled: !can_send,
+                onclick: move |_| {
+                    let text = draft().trim().to_string();
+                    if text.is_empty() {
+                        return;
                     }
-                    Err(e) => problem.set(Some(e)),
-                }
-            },
-            "Send to seller"
+                    match send(&store_contract_id, &seller_encryption_key, &seller_verifying_key, text, target) {
+                        Ok(()) => {
+                            draft.set(String::new());
+                            problem.set(None);
+                        }
+                        Err(e) => problem.set(Some(e)),
+                    }
+                },
+                "Send"
+            }
+        }
+        p { class: "text-muted small", "{hint}" }
+        // What a Ghost Key's voucher shows the seller, said before the first
+        // send: it is a stable pseudonym (`docs/messaging-privacy.md`).
+        if vouched {
+            p { class: "text-muted small",
+                "Sent with your Ghost Key: {name} sees which one, and nobody else does."
+            }
         }
     }
 }
@@ -725,15 +758,23 @@ fn send(
     }
 }
 
-/// In place of the compose box for a buyer with no Ghost Key connected.
+/// In place of the compose box for a buyer with no Ghost Key connected and
+/// nothing paid in the conversation.
 ///
 /// Worded for someone who has never heard of a Ghost Key: what it is for,
-/// that buying does not need one, and where to get one.
+/// that buying does not need one, and where to get one. In an order's own
+/// thread (`after_payment`) it also says the box opens once the order is
+/// paid.
 #[component]
-fn GhostKeyGate() -> Element {
+fn GhostKeyGate(#[props(default)] after_payment: bool) -> Element {
     rsx! {
         div { class: "info-box",
             p { "{crate::voucher_flow::NEEDS_GHOST_KEY}" }
+            if after_payment {
+                p { class: "text-muted small",
+                    "Once this order is paid, you can message the seller here without one."
+                }
+            }
             super::my_store::GhostKeyAccessNote {}
             div { class: "form-actions",
                 button {
@@ -889,166 +930,429 @@ fn Unavailable(why: String) -> Element {
     }
 }
 
-/// The seller's own mailbox.
+/// What the seller reads once, where buyers' messages appear to them (Ian,
+/// 2026-09-30, after the extortion second opinion): one place per screen,
+/// above the reply box of the one conversation open, never per message.
+pub(crate) const SELLER_GUIDANCE: &str =
+    "Harvest can't hold anyone to a deal. A refund doesn't prevent or remove a complaint.";
+
+/// The one quiet line about entries this device could not read, in place of
+/// a card per entry (round-6 critique 10-3). Anyone can write to a mailbox,
+/// so some are junk; the rest were sealed to keys this device does not hold.
+pub(crate) const SOME_UNREADABLE: &str = "Some messages couldn't be read on this device.";
+
+/// What one message is, as a conversation shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChatItem {
+    /// Something a person wrote: a bubble.
+    Said(String),
+    /// A step that is not a message, said in one muted line.
+    Event(String),
+}
+
+/// How `content` appears in a conversation, or `None` where it does not.
 ///
-/// Unreadable entries are shown rather than hidden. The mailbox is
-/// open-write, so anyone may deposit bytes in it, and a seller who saw only
-/// the readable ones could not tell "nobody wrote" from "I cannot read what
-/// they wrote".
-#[component]
-fn Inbox(
-    store_contract_id: Vec<u8>,
-    entries: Vec<MailboxEntry>,
-    /// Buyer messages taken out by [`shown_to_seller`].
-    unvouched: usize,
-    /// Conversations [`open_conversations`] opened.
-    open: std::collections::HashSet<Vec<u8>>,
-    authored: Vec<[u8; 32]>,
-    listings: Vec<harvest_common::listing::AuthorizedListing>,
-    published: Vec<harvest_common::payment::AuthorizedOrder>,
-) -> Element {
-    if entries.is_empty() {
-        return rsx! {
-            div { class: "card",
-                h3 { "Messages" }
-                if unvouched == 0 {
-                    p { class: "text-muted text-italic", "No one has written to this store yet." }
-                } else {
-                    p { class: "text-muted", style: "font-size: 0.85rem;",
-                        "{hidden_unvouched_line(unvouched)}"
-                    }
-                }
-            }
-        };
-    }
-
-    let unreadable = entries
-        .iter()
-        .filter(|entry| matches!(entry, MailboxEntry::Unreadable { .. }))
-        .count();
-
-    // Grouped by conversation, newest conversation first, because a reply
-    // belongs to a conversation rather than to a message -- and because an
-    // ungrouped list of a busy mailbox gives the seller no way to see which
-    // messages are one exchange.
-    let mut conversations: Vec<(Vec<u8>, Vec<MailboxEntry>)> = Vec::new();
-    for entry in entries.iter() {
-        match conversations
-            .iter_mut()
-            .find(|(tag, _)| tag == entry.conversation())
-        {
-            Some((_, group)) => group.push(entry.clone()),
-            None => conversations.push((entry.conversation().to_vec(), vec![entry.clone()])),
+/// Requests to buy and acceptances (the store's automatic invoice answers
+/// included) are NOT chat (round-6 critique 10-6): they are shown as what
+/// they are, on the order card, the pay card, and the seller's request card
+/// for one still waiting on them. A decline is one muted line.
+pub(crate) fn chat_item(content: &MessageContent) -> Option<ChatItem> {
+    match content {
+        MessageContent::Text(text) | MessageContent::VouchedText { text, .. } => {
+            Some(ChatItem::Said(text.clone()))
         }
+        MessageContent::Decline { reason } if reason.trim().is_empty() => {
+            Some(ChatItem::Event("An order was declined.".to_string()))
+        }
+        MessageContent::Decline { reason } => Some(ChatItem::Event(format!(
+            "An order was declined: {}",
+            reason.trim()
+        ))),
+        MessageContent::OrderRequest { .. } | MessageContent::OrderAccepted { .. } => None,
     }
+}
 
+/// Which side of a conversation this browser is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Buyer,
+    Seller,
+}
+
+/// The name above a message, and whether it is drawn as this side's own.
+///
+/// By the direction key that sealed it: toward the other side is "You",
+/// toward this side is "Buyer" (on the seller's screen) or "Seller" (on the
+/// buyer's). Direction is not authorship -- both parties hold both keys, so
+/// either can seal a message that reads as the other's (a seller's inbox once
+/// showed "as agreed, I confess" as the seller's own reply, written by the
+/// buyer). It is still the right label. Only the two parties can write a
+/// readable entry at all, so the only person a mislabelled message can
+/// deceive is one of the two who were there; nobody else ever sees it, and
+/// Harvest has no arbiter to show it to. What needs real authenticity carries
+/// its own signature (`harvest_common::mailbox::MessageDirection`). The
+/// earlier wording ("Addressed to this buyer", a caveat per conversation)
+/// told the reader that, eight times a screen, and helped nobody (round-6
+/// critique 10-5).
+fn who(role: Role, addressing: crate::messaging::Addressing) -> (&'static str, bool) {
+    use crate::messaging::Addressing;
+    match (role, addressing) {
+        (Role::Buyer, Addressing::ToSeller) | (Role::Seller, Addressing::ToBuyer) => ("You", true),
+        (Role::Buyer, Addressing::ToBuyer) => ("Seller", false),
+        (Role::Seller, Addressing::ToSeller) => ("Buyer", false),
+    }
+}
+
+/// When a message says it was written, in this browser's local time: "29
+/// Sep, 18:42". The writer's own claim, like everything in the envelope; it
+/// orders the thread and dates the bubble, and decides nothing.
+fn when(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%-d %b, %H:%M")
+        .to_string()
+}
+
+/// One line of a conversation as [`ChatLines`] draws it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChatLine {
+    who: &'static str,
+    mine: bool,
+    when: String,
+    item: ChatItem,
+}
+
+/// A buyer's messages as chat lines, in the order given.
+fn chat_lines(messages: &[crate::messaging::ConversationMessage], role: Role) -> Vec<ChatLine> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let item = chat_item(&message.content)?;
+            let (who, mine) = who(role, message.addressing);
+            Some(ChatLine {
+                who,
+                mine,
+                when: when(message.timestamp),
+                item,
+            })
+        })
+        .collect()
+}
+
+/// A conversation, as bubbles (mockup `msgs()`).
+#[component]
+fn ChatLines(lines: Vec<ChatLine>) -> Element {
     rsx! {
-        div { class: "card",
-            h3 { "Messages" }
-            p { class: "section-count",
-                "{entries.len()} message(s) in {conversations.len()} conversation(s)"
-            }
-            if unreadable > 0 {
-                p { class: "text-muted",
-                    style: "font-size: 0.85rem;",
-                    "{unreadable} of these cannot be read. Anyone can write to this mailbox, "
-                    "so some entries are junk or were encrypted to a key you do not hold."
-                }
-            }
-            if unvouched > 0 {
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "{hidden_unvouched_line(unvouched)}"
-                }
-            }
-            for (tag, group) in conversations.iter() {
-                Conversation {
-                    key: "{bs58::encode(tag).into_string()}",
-                    store_contract_id: store_contract_id.clone(),
-                    open: open.contains(tag),
-                    tag: tag.clone(),
-                    entries: group.clone(),
-                    authored: authored.clone(),
-                    listings: listings.clone(),
-                    published: published.clone(),
+        div { class: "bubbles",
+            for line in lines.iter() {
+                match &line.item {
+                    ChatItem::Said(text) => rsx! {
+                        div { class: if line.mine { "bubble mine" } else { "bubble" },
+                            span { class: "bubble-who", "{line.who} \u{00b7} {line.when}" }
+                            "{text}"
+                        }
+                    },
+                    ChatItem::Event(text) => rsx! {
+                        p { class: "msg-event", "{text} \u{00b7} {line.when}" }
+                    },
                 }
             }
         }
     }
 }
 
-/// One exchange with one buyer, and the box to answer it.
+/// One conversation in a seller's mailbox, as the seller is shown it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SellerThread {
+    pub tag: [u8; 32],
+    /// Whether it is open ([`open_conversations`]): a verified voucher or a
+    /// paid order of the store's in it.
+    pub open: bool,
+    /// Its readable entries as [`shown_to_seller`] shows them, newest first.
+    pub entries: Vec<MailboxEntry>,
+    /// The store's orders that belong to it
+    /// (`order_threads::order_in_conversation`), whatever their status: the
+    /// order cards it is shown under.
+    pub orders: Vec<harvest_common::payment::OrderId>,
+}
+
+impl SellerThread {
+    /// Its chat lines, oldest first.
+    fn lines(&self) -> Vec<ChatLine> {
+        let mut lines: Vec<(chrono::DateTime<chrono::Utc>, ChatLine)> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content,
+                    addressing,
+                    timestamp,
+                    ..
+                } => {
+                    let item = chat_item(content)?;
+                    let (who, mine) = who(Role::Seller, *addressing);
+                    Some((
+                        *timestamp,
+                        ChatLine {
+                            who,
+                            mine,
+                            when: when(*timestamp),
+                            item,
+                        },
+                    ))
+                }
+                MailboxEntry::Unreadable { .. } => None,
+            })
+            .collect();
+        lines.sort_by_key(|(at, _)| *at);
+        lines.into_iter().map(|(_, line)| line).collect()
+    }
+
+    /// How many messages it shows as chat: the count on its button.
+    pub(crate) fn chat_count(&self) -> usize {
+        self.lines().len()
+    }
+
+    /// The newest thing a buyer wrote in it, for a question's row.
+    fn latest_from_buyer(&self) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
+        self.entries.iter().find_map(|entry| match entry {
+            MailboxEntry::Readable {
+                content: MessageContent::Text(text) | MessageContent::VouchedText { text, .. },
+                addressing: crate::messaging::Addressing::ToSeller,
+                timestamp,
+                ..
+            } => Some((text.clone(), *timestamp)),
+            _ => None,
+        })
+    }
+}
+
+/// A seller's mailbox at one store, as the Orders tab shows it: one
+/// [`SellerThread`] per conversation with anything readable in it, and the
+/// two counts its quiet lines say.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SellerInbox {
+    pub threads: Vec<SellerThread>,
+    /// Entries this device could not read ([`SOME_UNREADABLE`]).
+    pub unreadable: usize,
+    /// Buyer text [`shown_to_seller`] held back ([`hidden_unvouched_line`]).
+    pub held_back: usize,
+}
+
+impl SellerInbox {
+    /// The conversation order `id` belongs to, if this device can read it.
+    pub(crate) fn for_order(&self, id: &harvest_common::payment::OrderId) -> Option<&SellerThread> {
+        self.threads
+            .iter()
+            .find(|thread| thread.orders.contains(id))
+    }
+}
+
+/// [`SellerInbox`] for one of our stores. The anti-spam gate's seller half
+/// runs here, before anything is grouped: buyer text neither a Ghost Key nor
+/// a paid order vouches for is taken out ([`shown_to_seller`]), and the
+/// address of an order past its complaint window is hidden
+/// ([`request_address_hidden`]).
+pub(crate) fn seller_inbox(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+) -> SellerInbox {
+    let Some(store) = state.browsing_stores.get(store_contract_id) else {
+        return SellerInbox::default();
+    };
+    let all = state.mailbox_entries(store_contract_id);
+    let unreadable = all
+        .iter()
+        .filter(|entry| matches!(entry, MailboxEntry::Unreadable { .. }))
+        .count();
+    let claims = seller_claims(&all, &store.listings, |tag| {
+        state.conversation_keys.get(tag)
+    });
+    let paid: std::collections::HashSet<[u8; 32]> = claims
+        .iter()
+        .filter(|(_, claims)| {
+            crate::order_threads::conversation_has_paid_order(&store.orders, claims)
+        })
+        .map(|(tag, _)| *tag)
+        .collect();
+    // `shown_to_seller` works the vouchers out again below; that is a cache
+    // hit (`voucher_verifies` remembers each verdict), not a second chain
+    // check.
+    let open = open_conversations(
+        &all,
+        |voucher, tag| state.voucher_verifies(voucher, tag),
+        |tag| paid.contains(tag),
+    );
+    let (shown, held_back) = shown_to_seller(
+        all,
+        |voucher, tag| state.voucher_verifies(voucher, tag),
+        |tag| paid.contains(tag),
+        |entry| {
+            request_address_hidden(
+                entry,
+                &store.orders,
+                state.conversation_keys.get(entry.conversation()),
+                |order| state.address_retained_for(order),
+            )
+        },
+        |digest| state.authored_here(store_contract_id, digest),
+    );
+    let threads = claims
+        .iter()
+        .map(|(tag, claims)| SellerThread {
+            tag: *tag,
+            open: open.contains(tag.as_slice()),
+            entries: shown
+                .iter()
+                .filter(|entry| {
+                    entry.conversation() == tag.as_slice()
+                        && matches!(entry, MailboxEntry::Readable { .. })
+                })
+                .cloned()
+                .collect(),
+            orders: store
+                .orders
+                .iter()
+                .filter(|order| crate::order_threads::order_in_conversation(order, claims))
+                .map(|order| order.order.id.clone())
+                .collect(),
+        })
+        .filter(|thread| !thread.entries.is_empty())
+        .collect();
+    SellerInbox {
+        threads,
+        unreadable,
+        held_back,
+    }
+}
+
+/// Which seller conversation is open on the Orders tab, and under which
+/// order card (or none, a question): one at a time, so the guidance line
+/// above its reply box is said once per screen.
+pub(crate) type OpenThread = Option<([u8; 32], Option<harvest_common::payment::OrderId>)>;
+
+/// The requests in `thread` the seller is offered a hand answer for.
+fn offered_requests(
+    state: &crate::state::AppState,
+    thread: &SellerThread,
+    listings: &[harvest_common::listing::AuthorizedListing],
+    published: &[harvest_common::payment::AuthorizedOrder],
+) -> Vec<PendingRequest> {
+    unanswered_requests(
+        &thread.entries,
+        listings,
+        published,
+        state.conversation_keys.get(thread.tag.as_slice()),
+    )
+    .into_iter()
+    .filter(|request| offered_by_hand(request, thread.open))
+    .collect()
+}
+
+/// Whether a seller conversation with no order card of its own is worth a
+/// row among the questions: something a person wrote, or a request waiting
+/// for the seller's answer. An unpaid Buy now alone is neither: the store
+/// answers it itself, and the seller hears of it once it is paid.
+pub(crate) fn is_question(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    thread: &SellerThread,
+) -> bool {
+    if thread.chat_count() > 0 && thread.open {
+        return true;
+    }
+    let Some(store) = state.browsing_stores.get(store_contract_id) else {
+        return false;
+    };
+    !offered_requests(state, thread, &store.listings, &store.orders).is_empty()
+}
+
+/// The Messages button under an order card (or a question), and the
+/// conversation it opens.
 #[component]
-fn Conversation(
+pub(crate) fn SellerThreadToggle(
     store_contract_id: Vec<u8>,
-    /// Whether this conversation is open ([`open_conversations`]).
-    open: bool,
-    tag: Vec<u8>,
-    entries: Vec<MailboxEntry>,
-    authored: Vec<[u8; 32]>,
-    /// The store's own listings, so the accept control can NAME what it is
-    /// about to price. The buyer's message carries a listing id and nothing
-    /// readable; a seller typing a satoshi amount for an item the screen
-    /// never names is being asked to sign for something they cannot see.
-    listings: Vec<harvest_common::listing::AuthorizedListing>,
-    /// What this store has already published, which is how an already-
-    /// answered request is recognised after a reload.
-    published: Vec<harvest_common::payment::AuthorizedOrder>,
+    thread: SellerThread,
+    under: Option<harvest_common::payment::OrderId>,
+    open_thread: Signal<OpenThread>,
 ) -> Element {
+    let me = (thread.tag, under.clone());
+    let shown = open_thread().as_ref() == Some(&me);
+    let count = thread.chat_count();
+    let label = match (shown, count) {
+        (true, _) => "Hide messages".to_string(),
+        (false, 0) => "Message the buyer".to_string(),
+        (false, n) => format!("Messages ({n})"),
+    };
+    rsx! {
+        div { class: "thread-toggle",
+            button {
+                class: "btn btn-sm btn-outline",
+                aria_expanded: if shown { "true" } else { "false" },
+                onclick: move |_| {
+                    let mut open_thread = open_thread;
+                    let now = if shown { None } else { Some(me.clone()) };
+                    open_thread.set(now);
+                },
+                "{label}"
+            }
+        }
+        if shown {
+            SellerConversation { store_contract_id: store_contract_id.clone(), thread: thread.clone() }
+        }
+    }
+}
+
+/// One conversation with one buyer, as the seller reads it: the messages,
+/// any request still waiting for a hand answer (shown as the request it is,
+/// with its accept control), the guidance line, and the reply box.
+#[component]
+fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Element {
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
-
-    // A conversation with nothing readable in it cannot be replied to: the
-    // reply has to name the conversation id, which only a decrypted message
-    // carries. Saying so beside the exchange is better than a Send button
-    // that refuses.
-    let readable = entries
-        .iter()
-        .any(|entry| matches!(entry, MailboxEntry::Readable { .. }));
+    let (offered, availability) = {
+        let state = APP_STATE.read();
+        let store = state.browsing_stores.get(&store_contract_id);
+        let offered = store
+            .map(|store| offered_requests(&state, &thread, &store.listings, &store.orders))
+            .unwrap_or_default();
+        let availability: Vec<bool> = offered
+            .iter()
+            .map(|request| {
+                state
+                    .listing_availability(&store_contract_id, &request.listing_id)
+                    .is_buyable()
+            })
+            .collect();
+        (offered, availability)
+    };
+    let lines = thread.lines();
+    let tag = thread.tag;
 
     rsx! {
-        div { class: "card", style: "margin-top: 1rem;",
-            p { class: "text-muted", style: "font-size: 0.8rem;",
-                "Conversation {short_tag(&tag)}"
-            }
-            p { class: "text-muted", style: "font-size: 0.8rem;",
-                "Only messages this tab sent are marked as yours. Everything else is shown by "
-                "the direction it was encrypted for, which is not proof of who wrote it -- "
-                "both sides of a conversation hold both keys."
-            }
-            for entry in entries.iter() {
-                MessageCard {
-                    entry: entry.clone(),
-                    authored_here: authored.contains(&entry.digest()),
-                }
+        div { class: "thread",
+            if lines.is_empty() {
+                p { class: "text-muted small", "No messages yet." }
+            } else {
+                ChatLines { lines }
             }
 
-            // A request to buy is the one message in a seller's inbox that
-            // has an action attached, so it gets the control rather than
-            // leaving the seller to copy a listing id into the invoice form
-            // by hand -- which is also how the reply-to tag would get lost.
-            for request in unanswered_requests(
-                &entries,
-                &listings,
-                &published,
-                crate::gateway::APP_STATE.read().conversation_keys.get(&tag),
-            )
-            .into_iter()
-            .filter(|request| offered_by_hand(request, open))
-            {
+            // A request to buy is the one thing in a conversation with an
+            // action attached, so it gets the control rather than leaving
+            // the seller to copy a listing id into a form by hand -- which is
+            // also how the reply-to tag would get lost. Shown as the request
+            // it is, not as a message.
+            for (request , on_sale) in offered.iter().zip(availability) {
                 // The key sits on the first node of the loop body, the only
                 // place dioxus reads a list key from, so each request keeps
                 // its own accept control's state when an earlier one drops
                 // out of the list.
-                div { key: "{bs58::encode(request.digest).into_string()}",
+                div { key: "{bs58::encode(request.digest).into_string()}", class: "request-card",
+                    RequestDetails { thread: thread.clone(), digest: request.digest }
                     // A request made before the listing sold out, or for a
                     // listing since replaced by an edit (harvest#70), can
                     // still be answered: the buyer asked while it was on
                     // sale. The seller is told, so they decide knowingly.
-                    if !crate::gateway::APP_STATE
-                        .read()
-                        .listing_availability(&store_contract_id, &request.listing_id)
-                        .is_buyable()
-                    {
+                    if !on_sale {
                         p { class: "text-muted small",
                             "{request.listing_title} is no longer on sale in your store. You can still \
                              invoice this buyer, since they asked while it was, or reply to say it has gone."
@@ -1056,7 +1360,7 @@ fn Conversation(
                     }
                     super::buy_view::AcceptRequest {
                         store_contract_id: store_contract_id.clone(),
-                        tag: tag.clone(),
+                        tag: tag.to_vec(),
                         listing_id: request.listing_id.clone(),
                         listing_title: request.listing_title.clone(),
                         order_binding: request.order_binding,
@@ -1067,24 +1371,25 @@ fn Conversation(
                 }
             }
 
-            if readable {
-                div { class: "form-group", style: "margin-top: 0.5rem;",
-                    textarea {
-                        class: "form-textarea",
-                        value: "{draft}",
-                        placeholder: "Reply to this buyer.",
-                        oninput: move |event| draft.set(event.value()),
-                    }
+            p { class: "text-muted small", "{SELLER_GUIDANCE}" }
+            div { class: "form-group",
+                label { class: "form-label", "Reply" }
+                textarea {
+                    class: "form-textarea",
+                    value: "{draft}",
+                    placeholder: "Reply to this buyer.",
+                    oninput: move |event| draft.set(event.value()),
                 }
-                if let Some(message) = problem() {
-                    p { class: "text-warning", "{message}" }
-                }
+            }
+            if let Some(message) = problem() {
+                p { class: "text-warning", "{message}" }
+            }
+            div { class: "form-actions",
                 button {
                     class: "btn btn-primary",
                     disabled: draft().trim().is_empty(),
                     onclick: {
                         let store_contract_id = store_contract_id.clone();
-                        let tag = tag.clone();
                         move |_| {
                             let text = draft().trim().to_string();
                             if text.is_empty() {
@@ -1099,64 +1404,92 @@ fn Conversation(
                             }
                         }
                     },
-                    "Reply"
-                }
-                p { class: "text-muted", style: "font-size: 0.8rem;",
-                    "Your reply goes into this mailbox encrypted to this buyer alone. They can "
-                    "read it whenever they come back from the same device they wrote from -- "
-                    "and never from a different one, so a buyer who has changed device will "
-                    "not see it."
-                }
-            } else {
-                p { class: "text-muted text-italic", style: "font-size: 0.85rem;",
-                    "Nothing here can be read, so there is nothing to reply to."
+                    "Send reply"
                 }
             }
+            p { class: "text-muted small", "Only this buyer can read your reply." }
         }
     }
 }
 
-/// Which side of a conversation this browser is on. Decides how an
-/// unattributed message is described, and nothing else.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Buyer,
-    Seller,
+/// What a request still waiting for the seller asks for, read from its entry
+/// in the conversation: the address (or why it is not shown), the buyer's
+/// picks, and the note.
+#[component]
+fn RequestDetails(thread: SellerThread, digest: [u8; 32]) -> Element {
+    let Some(MailboxEntry::Readable {
+        content:
+            MessageContent::OrderRequest {
+                shipping,
+                note,
+                instant,
+                ..
+            },
+        ..
+    }) = thread.entries.iter().find(|entry| entry.digest() == digest)
+    else {
+        return rsx! {};
+    };
+    let region = instant.as_ref().and_then(|s| s.region.clone());
+    let choices = instant
+        .as_ref()
+        .map(|s| s.choices.join(" \u{00b7} "))
+        .unwrap_or_default();
+    rsx! {
+        p { class: "order-label", "Send to" }
+        p { class: "order-ship-to", "{shipping}" }
+        if let Some(region) = region {
+            p { class: "text-muted small", "Delivery region: {region}" }
+        }
+        if !choices.is_empty() {
+            p { class: "text-muted small", "{choices}" }
+        }
+        if !note.trim().is_empty() {
+            p { class: "order-label", "Note from the buyer" }
+            p { class: "order-ship-to", "{note}" }
+        }
+    }
 }
 
-/// What to put above a message, given what is actually known about it.
-///
-/// # Why this is not "Seller" and "You"
-///
-/// It was, and it was wrong. `Addressing` says which direction key
-/// authenticated a message, and BOTH parties hold both keys -- the buyer
-/// needs the seller-to-buyer key to read replies at all. So a buyer can place
-/// a message in the seller's mailbox that authenticates as though the seller
-/// wrote it, and the seller's own screen would have shown it as their own
-/// words. Verified: a seller's inbox displayed "as agreed, I confess" as the
-/// seller's own reply, written by the buyer.
-///
-/// Only one thing here is knowable: what this browser sent itself. That gets
-/// a name. Everything else is described by direction, in words that say
-/// direction -- "addressed to", not "from" -- and the surrounding notice says
-/// plainly that direction is not authorship.
-///
-/// Anything whose authenticity actually matters must carry its own signature;
-/// see [`harvest_common::mailbox::MessageDirection`].
-fn attribution(
-    authored_here: bool,
-    addressing: crate::messaging::Addressing,
-    role: Role,
-) -> &'static str {
-    use crate::messaging::Addressing;
-    if authored_here {
-        return "You, from this tab";
-    }
-    match (role, addressing) {
-        (Role::Buyer, Addressing::ToBuyer) => "Addressed to you",
-        (Role::Buyer, Addressing::ToSeller) => "Addressed to the seller",
-        (Role::Seller, Addressing::ToSeller) => "Addressed to you",
-        (Role::Seller, Addressing::ToBuyer) => "Addressed to this buyer",
+/// The seller's conversations with no order card of their own: questions
+/// from buyers with a Ghost Key, and requests waiting for a hand answer
+/// ([`is_question`]). Under the orders on the Orders tab, each behind its own
+/// Messages button (the mockup has no seller screen for questions; this is
+/// the closest honest place, where the seller already reads buyers).
+#[component]
+pub(crate) fn SellerQuestions(
+    store_contract_id: Vec<u8>,
+    threads: Vec<SellerThread>,
+    open_thread: Signal<OpenThread>,
+) -> Element {
+    rsx! {
+        div { class: "card",
+            h3 { "Questions" }
+            for thread in threads.iter() {
+                {
+                    let summary = thread.latest_from_buyer();
+                    rsx! {
+                        div { key: "{bs58::encode(thread.tag).into_string()}", class: "question-row",
+                            match summary {
+                                Some((text, at)) => rsx! {
+                                    p { class: "question-text", "{text}" }
+                                    p { class: "text-muted small", "Buyer \u{00b7} {when(at)}" }
+                                },
+                                None => rsx! {
+                                    p { class: "text-muted small", "A request waiting for your answer" }
+                                },
+                            }
+                            SellerThreadToggle {
+                                store_contract_id: store_contract_id.clone(),
+                                thread: thread.clone(),
+                                under: None,
+                                open_thread,
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1775,81 +2108,6 @@ fn dispatch_reply(_mailbox: Vec<u8>, _sealed: harvest_common::mailbox::Encrypted
     });
 }
 
-#[component]
-fn MessageCard(entry: MailboxEntry, authored_here: bool) -> Element {
-    let when = entry.timestamp().format("%Y-%m-%d %H:%M UTC").to_string();
-    let who = match &entry {
-        MailboxEntry::Readable { addressing, .. } => {
-            Some(attribution(authored_here, *addressing, Role::Seller))
-        }
-        MailboxEntry::Unreadable { .. } => None,
-    };
-    rsx! {
-        div { class: "card", style: "margin-top: 0.5rem;",
-            if let Some(who) = who {
-                p { class: "text-muted", style: "font-size: 0.8rem;", "{who}" }
-            }
-            match &entry {
-                MailboxEntry::Readable { content, .. } => rsx! {
-                    p { style: "white-space: pre-wrap;", "{describe(content)}" }
-                },
-                MailboxEntry::Unreadable { why, .. } => rsx! {
-                    p { class: "text-muted text-italic", "Cannot be read: {why}" }
-                },
-            }
-            p { class: "text-muted",
-                style: "font-size: 0.8rem;",
-                // Chosen by whoever wrote the message and signed by nobody
-                // (see `harvest_common::mailbox`), so it is labelled as a
-                // claim rather than shown as a fact.
-                "Sender's timestamp: {when}"
-            }
-        }
-    }
-}
-
-/// What to show for one message's content.
-///
-/// Every variant is named rather than rendered as empty, so a reader is never
-/// shown a blank message.
-fn describe(content: &MessageContent) -> String {
-    match content {
-        MessageContent::Text(text) | MessageContent::VouchedText { text, .. } => text.clone(),
-        MessageContent::Decline { reason } => format!("Declined: {reason}"),
-        MessageContent::OrderRequest {
-            quantity,
-            shipping,
-            note,
-            instant,
-            ..
-        } => {
-            let mut described = format!("Wants to buy {quantity}.\n\nShip to:\n{shipping}");
-            // The buyer's instant-checkout picks, so a seller answering the
-            // request by hand invoices the same terms their store would have.
-            if let Some(selection) = instant {
-                described.push('\n');
-                if let Some(region) = &selection.region {
-                    described.push_str(&format!("\nDelivery region: {region}"));
-                }
-                if !selection.choices.is_empty() {
-                    described.push_str(&format!("\nChoices: {}", selection.choices.join(", ")));
-                }
-                described.push_str(&format!(
-                    "\nInstant checkout total: {} sats",
-                    selection.expected_total_sats
-                ));
-            }
-            if !note.trim().is_empty() {
-                described.push_str(&format!("\n\n{note}"));
-            }
-            described
-        }
-        MessageContent::OrderAccepted { order_id } => {
-            format!("Accepted -- invoice {} is published.", order_id.short())
-        }
-    }
-}
-
 /// How many buyers' requests in one of our stores' inboxes are still waiting
 /// for an invoice: the count My store shows beside Orders and in the top
 /// navigation, so a seller sees that a request arrived without opening the
@@ -2252,6 +2510,47 @@ mod inbox_tests {
             Some(&k),
             |_| false
         ));
+    }
+
+    /// **Order requests and the store's automatic answers are not chat**
+    /// (round-6 critique 10-6): a request and an acceptance are shown as
+    /// what they are (the order card, the pay card, a request card), never as
+    /// a bubble; a decline is one muted line; text is a bubble. Red with
+    /// requests described as messages again.
+    #[test]
+    fn requests_and_acceptances_are_not_chat() {
+        let id = ListingId([9u8; 32]);
+        assert_eq!(
+            chat_item(&MessageContent::Text("hi".into())),
+            Some(ChatItem::Said("hi".into()))
+        );
+        let MailboxEntry::Readable { content, .. } = request(id, 1, [1; 32]) else {
+            unreachable!()
+        };
+        assert_eq!(chat_item(&content), None);
+        assert_eq!(
+            chat_item(&MessageContent::OrderAccepted {
+                order_id: harvest_common::payment::OrderId([3; 32])
+            }),
+            None
+        );
+        assert_eq!(
+            chat_item(&MessageContent::Decline {
+                reason: " sold out ".into()
+            }),
+            Some(ChatItem::Event("An order was declined: sold out".into()))
+        );
+    }
+
+    /// Bubbles are labelled by side, "You" for this side's direction, and
+    /// never "Addressed to" with a caveat (round-6 critique 10-5).
+    #[test]
+    fn bubbles_are_labelled_by_side() {
+        use crate::messaging::Addressing::{ToBuyer, ToSeller};
+        assert_eq!(who(Role::Seller, ToSeller), ("Buyer", false));
+        assert_eq!(who(Role::Seller, ToBuyer), ("You", true));
+        assert_eq!(who(Role::Buyer, ToBuyer), ("Seller", false));
+        assert_eq!(who(Role::Buyer, ToSeller), ("You", true));
     }
 
     /// The count beside Orders is the number of accept controls the inbox
@@ -2715,38 +3014,6 @@ mod inbox_tests {
         let found =
             unanswered_requests(&entries, &[listing(id, "Ghost Pepper")], &[], Some(&keys()));
         assert_eq!(found.len(), 1);
-    }
-
-    /// A seller reading an instant request sees the region, the picks and the
-    /// total the buyer was shown; a quote request shows none of them.
-    #[test]
-    fn an_instant_request_shows_its_terms_to_the_seller() {
-        let request = |instant| MessageContent::OrderRequest {
-            instant,
-            listing_id: ListingId([9u8; 32]),
-            quantity: 2,
-            shipping: "12 Example St".into(),
-            note: "Thanks".into(),
-            order_binding: BINDING,
-            buyer_receipt_key: None,
-        };
-        let shown = describe(&request(Some(crate::messaging::InstantSelection {
-            requested_at_ms: 1_700_000_000_000,
-            nonce: [1u8; 16],
-            region: Some("EU".into()),
-            choices: vec!["Fig".into(), "Large".into()],
-            expected_total_sats: 25_000,
-        })));
-        assert!(shown.contains("Delivery region: EU"), "{shown}");
-        assert!(shown.contains("Choices: Fig, Large"), "{shown}");
-        assert!(
-            shown.contains("Instant checkout total: 25000 sats"),
-            "{shown}"
-        );
-        assert!(shown.ends_with("Thanks"), "{shown}");
-
-        let quote = describe(&request(None));
-        assert!(!quote.contains("Instant checkout"), "{quote}");
     }
 }
 

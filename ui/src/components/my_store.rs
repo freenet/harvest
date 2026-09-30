@@ -862,15 +862,14 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
                         fingerprint: store.fingerprint.clone(),
                     }
                 },
-                // Orders first: the tab is named for them, and the buyers'
-                // messages under them can run to many screens (the
+                // Each order carries its own conversation, and questions
+                // follow the orders: no mailbox dump under them (the
                 // 2026-09-30 critique found the orders ~9,700px down).
                 Tab::Orders => rsx! {
                     super::invoice_form::StorePayments {
                         store_contract_id: store.contract_id.clone(),
                         seller_fingerprint: store.fingerprint.clone(),
                     }
-                    super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                 },
                 Tab::Settings => rsx! {
                     Settings { store: store.clone(), editing_details }
