@@ -588,6 +588,9 @@ fn request(
 /// the same conversation, so two orders can share one thread.
 #[component]
 pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
+    // Which of this store's conversations is open, shared with the
+    // complaint step (msg1 critique MSG-13). A hook, so before any return.
+    use_context_provider(|| super::message_view::BuyerOpenThread(Signal::new(None)));
     // The order a Buy now form on this page is already showing, in place,
     // right under the listing: not listed a second time here.
     let shown_above = SHOWN_IN_BUY_FORM();
@@ -620,6 +623,18 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
+    let store_name = app_state.store_name_of(&store_contract_id).label();
+    // The orders in each conversation, newest first, for its header (msg1
+    // critique MSG-14): every purchase, the one the form shows included.
+    let refs: Vec<([u8; 32], Vec<String>)> = by_conversation(&purchases)
+        .into_iter()
+        .map(|(tag, mut group)| {
+            group.sort_by_key(|p| {
+                std::cmp::Reverse(p.commitment.as_ref().map(|c| c.order.created_at))
+            });
+            (tag, group.iter().map(|p| p.order_id.short()).collect())
+        })
+        .collect();
     drop(app_state);
 
     rsx! {
@@ -629,11 +644,27 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
             }
             for (tag , group) in groups.iter() {
                 div { key: "{bs58::encode(tag).into_string()}",
-                    // Its only order is the one the Buy now form on this
-                    // page shows: say whose messages these are (round 3 of
-                    // #205).
-                    if group.is_empty() && held.contains(tag) {
-                        p { class: "text-muted small", "About the order you just placed" }
+                    // The conversation first, headed, then its orders: after
+                    // the orders it read as belonging to the last one, often
+                    // an expired order (msg1 critique MSG-6).
+                    // A conversation this node no longer holds cannot be read
+                    // or written: nothing to open.
+                    if held.contains(tag) {
+                        p { class: "order-label", "Messages with {store_name}" }
+                        // Its only order is the one the Buy now form on this
+                        // page shows (round 3 of #205).
+                        if group.is_empty() {
+                            p { class: "text-muted small", "About the order you just placed" }
+                        }
+                        super::message_view::BuyerThread {
+                            store_contract_id: store_contract_id.clone(),
+                            tag: *tag,
+                            orders: refs
+                                .iter()
+                                .find(|(t, _)| t == tag)
+                                .map(|(_, r)| r.clone())
+                                .unwrap_or_default(),
+                        }
                     }
                     for purchase in group.iter() {
                         PurchaseCard {
@@ -641,14 +672,6 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
                             store_contract_id: store_contract_id.clone(),
                             purchase: purchase.clone(),
                             bitcoin: bitcoin.clone(),
-                        }
-                    }
-                    // A conversation this node no longer holds cannot be read
-                    // or written: nothing to open.
-                    if held.contains(tag) {
-                        super::message_view::BuyerThread {
-                            store_contract_id: store_contract_id.clone(),
-                            tag: *tag,
                         }
                     }
                 }
@@ -1093,17 +1116,27 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
     // buttons inline were the loudest thing on a delivered order.
     let mut reporting = use_signal(|| false);
     let mut messaging = use_signal(|| false);
+    // The store's shared open conversation, when this card is on Purchases:
+    // "Message the seller" opens that one rather than a second copy of it
+    // (msg1 critique MSG-13).
+    let shared = try_use_context::<super::message_view::BuyerOpenThread>();
     // The refusal is read only when there is no complaint on record: it ends
     // in a full verification of the complaint (memoised, review round 3
     // P2-D), which a card with nothing to offer does not need.
-    let (on_record, sent, refusal, message_to) = {
+    let (on_record, sent, refusal, message_to, store_page) = {
         let state = APP_STATE.read();
         let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
         let refusal = (on_record.is_none() && !sent)
             .then(|| target.refusal(&state))
             .flatten();
-        (on_record, sent, refusal, target.conversation(&state))
+        (
+            on_record,
+            sent,
+            refusal,
+            target.conversation(&state),
+            target.store_page(&state),
+        )
     };
     let short = order_id.short();
     if let Some(complaint) = on_record {
@@ -1150,9 +1183,10 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
         match chosen() {
             Some(category) => rsx! {
                 p { class: "text-warning",
-                    "Complain that order {short} was \"{super::reputation_view::category_label(&category)}\"? \
-                     This goes on the seller's public record permanently, cannot be withdrawn, \
-                     and is one per order."
+                    "Report order {short} as {super::reputation_view::category_label(&category)}? \
+                     It goes on the seller's public record for good and shows only that one \
+                     choice, with no names or messages. You can't withdraw it, and there's one \
+                     per order."
                 }
                 button {
                     class: "btn btn-sm btn-primary",
@@ -1164,7 +1198,7 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                             problem.set(result.err());
                         }
                     },
-                    "Yes, complain"
+                    "Report it"
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -1176,22 +1210,55 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                 p { strong { "{COMPLAINT_LINE}" } }
                 // The way to message the seller, right here: the line asks for
                 // it, and a buyer with a paid order needs no Ghost Key for it.
-                if let Some((store_contract_id, tag)) = message_to.clone() {
-                    if messaging() {
-                        // The thread too, so what was just sent shows here
-                        // (review of #205, U6).
-                        super::message_view::OrderThreadInline { store_contract_id, tag }
-                    } else {
+                match (message_to.clone(), shared) {
+                    // On Purchases: open the store's one conversation, above
+                    // the orders, and go to it.
+                    (Some((_, tag)), Some(super::message_view::BuyerOpenThread(mut open))) => rsx! {
                         div { class: "form-actions",
                             button {
                                 class: "btn btn-sm btn-primary",
-                                onclick: move |_| messaging.set(true),
+                                onclick: move |_| {
+                                    open.set(Some(tag));
+                                    super::scroll_to_id(super::message_view::buyer_thread_dom_id(&tag));
+                                },
                                 "Message the seller"
                             }
                         }
-                    }
+                    },
+                    // Elsewhere (a kept purchase's row): inline, with the
+                    // thread, so what was just sent shows here (U6).
+                    (Some((store_contract_id, tag)), None) => rsx! {
+                        if messaging() {
+                            super::message_view::OrderThreadInline { store_contract_id, tag }
+                        } else {
+                            div { class: "form-actions",
+                                button {
+                                    class: "btn btn-sm btn-primary",
+                                    onclick: move |_| messaging.set(true),
+                                    "Message the seller"
+                                }
+                            }
+                        }
+                    },
+                    // No conversation held here: the line still says to
+                    // message the seller first, so say where (msg1 critique
+                    // MSG-11).
+                    (None, _) => rsx! {
+                        p { class: "text-muted small",
+                            "Message them from their store page, under Ask the seller a question."
+                        }
+                        if let Some(id) = store_page.clone() {
+                            div { class: "form-actions",
+                                button {
+                                    class: "btn btn-sm btn-primary",
+                                    onclick: move |_| super::app::open_store_page(id.clone()),
+                                    "Open their store"
+                                }
+                            }
+                        }
+                    },
                 }
-                p { class: "text-muted small", "What went wrong?" }
+                h4 { class: "complaint-question", "What went wrong?" }
                 div { class: "form-actions",
                     for category in FeedbackCategory::ALL {
                         {
@@ -1216,6 +1283,11 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                         },
                         "Not now"
                     }
+                }
+                // Mockup D4's answer to what a new buyer actually asks.
+                p { class: "text-muted small",
+                    "Harvest can't refund you: the payment went straight to the seller. The \
+                     record warns future buyers."
                 }
             },
         }
@@ -1275,6 +1347,23 @@ impl ComplaintTarget {
                 store_key,
                 order_id,
             } => state.kept_complaint_refusal(store_key, order_id),
+        }
+    }
+
+    /// The store page to send the buyer to when no conversation is held here
+    /// (msg1 critique MSG-11): the purchase's store, or for a kept purchase
+    /// a loaded store under its key.
+    fn store_page(&self, state: &crate::state::AppState) -> Option<Vec<u8>> {
+        match self {
+            Self::AtStore {
+                store_contract_id, ..
+            } => Some(store_contract_id.clone()),
+            Self::Kept { store_key, .. } => state
+                .browsing_stores
+                .iter()
+                .filter(|(_, store)| store.owner == Some(*store_key))
+                .map(|(id, _)| id.clone())
+                .min(),
         }
     }
 

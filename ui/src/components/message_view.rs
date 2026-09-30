@@ -132,8 +132,9 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
                         label: "Your question".to_string(),
                         placeholder: "Ask about a listing.".to_string(),
                         hint: format!(
-                            "Only {store_name} can read this. Their reply appears here and in \
-                             Purchases, on this device."
+                            "Only {store_name} can read this. They see it the next time they \
+                             open Harvest. Their reply appears here and in Purchases, on this \
+                             device."
                         ),
                     }
                 },
@@ -561,35 +562,71 @@ pub(crate) fn buyer_thread_count(
 /// (or on its own for a question), behind a Messages button: the thread and
 /// the box to write in it. The box is open without a Ghost Key once an order
 /// in it is paid (`AppState::paid_conversation`).
+///
+/// Where a [`BuyerOpenThread`] is provided (a store's purchases on
+/// Purchases), which conversation is open is shared with it, so the
+/// complaint step's "Message the seller" opens THIS conversation rather than
+/// a second copy of it (msg1 critique MSG-13). `orders` are the short refs
+/// of the orders in it, for its header (MSG-14).
 #[component]
 pub(crate) fn BuyerThread(
     store_contract_id: Vec<u8>,
     tag: [u8; 32],
     #[props(default)] open: bool,
+    #[props(default)] orders: Vec<String>,
 ) -> Element {
-    let mut shown = use_signal(move || open);
+    let mut local = use_signal(move || open);
+    let shared = try_use_context::<BuyerOpenThread>();
+    let shown = match shared {
+        Some(BuyerOpenThread(open)) => open() == Some(tag),
+        None => local(),
+    };
     let count = buyer_thread_count(&APP_STATE.read(), &store_contract_id, Some(tag));
-    let label = match (shown(), count) {
+    let label = match (shown, count) {
         (true, _) => "Hide messages".to_string(),
         (false, 0) => "Message the seller".to_string(),
         (false, n) => format!("Messages ({n})"),
     };
+    let about = match orders.as_slice() {
+        [] => None,
+        [one] => Some(format!("order {one}")),
+        many => Some(format!("orders {}", many.join(", "))),
+    };
     rsx! {
-        div { class: "thread-toggle",
+        div { class: "thread-toggle", id: "{buyer_thread_dom_id(&tag)}",
             button {
                 class: "btn btn-sm btn-outline",
-                aria_expanded: if shown() { "true" } else { "false" },
-                onclick: move |_| shown.toggle(),
+                aria_expanded: if shown { "true" } else { "false" },
+                onclick: move |_| match shared {
+                    Some(BuyerOpenThread(mut open)) => {
+                        open.set(if shown { None } else { Some(tag) })
+                    }
+                    None => local.toggle(),
+                },
                 "{label}"
             }
         }
-        if shown() {
+        if shown {
             div { class: "thread",
+                if let Some(about) = about {
+                    p { class: "order-label", "Your conversation with this store \u{00b7} {about}" }
+                }
                 Thread { store_contract_id: store_contract_id.clone(), tag: Some(tag) }
                 OrderCompose { store_contract_id: store_contract_id.clone(), tag }
             }
         }
     }
+}
+
+/// Which of a store's buyer conversations is open on Purchases, shared by
+/// its [`BuyerThread`]s and the complaint step's "Message the seller" (msg1
+/// critique MSG-13).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct BuyerOpenThread(pub Signal<Option<[u8; 32]>>);
+
+/// The DOM id of a buyer conversation's Messages button, to scroll to.
+pub(crate) fn buyer_thread_dom_id(tag: &[u8; 32]) -> String {
+    format!("buyer-thread-{}", bs58::encode(tag).into_string())
 }
 
 /// A buyer's conversation `tag` with its box, inline where a Messages button
@@ -629,7 +666,10 @@ pub(crate) fn OrderCompose(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element
                 target: Some(tag),
                 label: "Message".to_string(),
                 placeholder: "Message the seller.".to_string(),
-                hint: format!("Only {name} can read this."),
+                hint: format!(
+                    "Only {name} can read this. They see it the next time they open Harvest, and \
+                     their reply appears here."
+                ),
             }
         },
         None => rsx! {
@@ -994,7 +1034,8 @@ pub(crate) const SELLER_GUIDANCE: &str =
 /// The one quiet line about entries this device could not read, in place of
 /// a card per entry (round-6 critique 10-3). Anyone can write to a mailbox,
 /// so some are junk; the rest were sealed to keys this device does not hold.
-pub(crate) const SOME_UNREADABLE: &str = "Some messages couldn't be read on this device.";
+pub(crate) const SOME_UNREADABLE: &str = "Some messages couldn't be read and are hidden. Anyone \
+     can write to your store's mailbox, so some are junk.";
 
 /// The reasons the seller's store gives in a Decline, word for word: the
 /// harvest delegate's `Refusal::buyer_reason` and its stock check
@@ -1075,11 +1116,14 @@ enum Role {
 /// send (review of #205, S2). It claims nothing about who wrote it.
 pub(crate) const UNCONFIRMED: &str = "Not confirmed as yours";
 
-/// The one line under [`UNCONFIRMED`], so the group does not read as
-/// tampering when it is only a reload (review round 2 of #205, R4). Every
-/// case it names is possible, and this browser cannot tell them apart.
-pub(crate) const UNCONFIRMED_WHY: &str = "Sent before this page was reloaded, from another \
-     device, or by someone else in your name. This browser can't tell which.";
+/// The one line under a conversation holding [`UNCONFIRMED`] messages, so
+/// they don't read as tampering when they are only the reader's own from
+/// before (review round 2 of #205, R4; msg1 critique MSG-2). True for both
+/// sides: the only other person who can write in the reader's direction is
+/// the other party, so a message the reader doesn't recognise is theirs.
+pub(crate) const UNCONFIRMED_WHY: &str = "Messages marked \u{201c}Not confirmed as yours\u{201d} \
+     may be ones you sent earlier or from another device. If you don't recognise one, you \
+     didn't write it.";
 
 /// The name above a message: `(name, drawn as this side's own, trusted for
 /// the timeline)`.
@@ -1095,11 +1139,11 @@ pub(crate) const UNCONFIRMED_WHY: &str = "Sent before this page was reloaded, fr
 /// * this side's direction is "You" only for what THIS device sent
 ///   (`authored_here`, `AppState::authored_here`: the entry's digest, which
 ///   the other party cannot reproduce);
-/// * anything else in this side's direction is [`UNCONFIRMED`], and is not
-///   placed in the timeline as though it were this side's word
-///   ([`ChatLines`]). It includes this side's own messages from another
-///   device or from before a reload, which is the price of never putting the
-///   other party's words under "You".
+/// * anything else in this side's direction is [`UNCONFIRMED`]: it keeps its
+///   place in time on this side, but dashed and unfilled, never drawn as this
+///   side's word ([`ChatLines`], [`bubble_class`]). It includes this side's
+///   own messages from another device or from before a reload, which is the
+///   price of never putting the other party's words under "You".
 fn who(
     role: Role,
     addressing: crate::messaging::Addressing,
@@ -1135,8 +1179,8 @@ pub(crate) struct ChatLine {
 }
 
 /// One message as a chat line, or `None` where it is not chat
-/// ([`chat_item`]). A step (a decline) is always placed in the timeline: its
-/// words claim nothing about who wrote them.
+/// ([`chat_item`]). A step (a decline) is always drawn as trusted: its words
+/// claim nothing about who wrote them (and an untrusted reason is dropped).
 fn chat_line(
     role: Role,
     addressing: crate::messaging::Addressing,
@@ -1208,19 +1252,24 @@ fn said_count(lines: &[ChatLine]) -> usize {
         .count()
 }
 
-/// A conversation, as bubbles (mockup `msgs()`): the timeline, then, apart
-/// and under their own heading, messages in this side's direction this
-/// device did not send ([`UNCONFIRMED`]), so they are never read as this
-/// side's word in the flow of the conversation.
+/// A conversation, as bubbles (mockup `msgs()`), every message in time
+/// order (msg1 critique MSG-1: a separate group below the other side's
+/// messages left a returning reader a conversation told by one side).
+///
+/// A message in this side's direction this device did not send
+/// ([`UNCONFIRMED`]) keeps its place on this side, but is never drawn as this
+/// side's word: a dashed outline instead of the filled "You" bubble, and its
+/// own label in place of "You" ([`bubble_class`]). One line under the
+/// conversation says what that label means ([`UNCONFIRMED_WHY`]).
 #[component]
 fn ChatLines(lines: Vec<ChatLine>) -> Element {
-    let unconfirmed: Vec<&ChatLine> = lines.iter().filter(|line| !line.trusted).collect();
+    let any_unconfirmed = lines.iter().any(|line| !line.trusted);
     rsx! {
         div { class: "bubbles",
-            for line in lines.iter().filter(|line| line.trusted) {
+            for line in lines.iter() {
                 match &line.item {
                     ChatItem::Said(text) => rsx! {
-                        div { class: if line.mine { "bubble mine" } else { "bubble" },
+                        div { class: bubble_class(line),
                             span { class: "bubble-who", "{line.who} \u{00b7} {line.when}" }
                             "{text}"
                         }
@@ -1231,19 +1280,20 @@ fn ChatLines(lines: Vec<ChatLine>) -> Element {
                 }
             }
         }
-        if !unconfirmed.is_empty() {
-            p { class: "text-muted small", strong { "{UNCONFIRMED}" } " {UNCONFIRMED_WHY}" }
-            div { class: "bubbles",
-                for line in unconfirmed.iter() {
-                    if let ChatItem::Said(text) = &line.item {
-                        div { class: "bubble unconfirmed",
-                            span { class: "bubble-who", "{line.when}" }
-                            "{text}"
-                        }
-                    }
-                }
-            }
+        if any_unconfirmed {
+            p { class: "text-muted small", "{UNCONFIRMED_WHY}" }
         }
+    }
+}
+
+/// How a said line is drawn: the other side's plain, this side's own filled
+/// on the right, and an [`UNCONFIRMED`] one on the right but dashed and
+/// unfilled, so it can never pass for this side's word (review round 1 S2).
+pub(crate) fn bubble_class(line: &ChatLine) -> &'static str {
+    match (line.trusted, line.mine) {
+        (false, _) => "bubble unconfirmed",
+        (true, true) => "bubble mine",
+        (true, false) => "bubble",
     }
 }
 
@@ -1273,6 +1323,13 @@ pub(crate) struct SellerThread {
     /// (`order_threads::order_by_request`), which binds the conversation's
     /// tag: what [`SellerInbox::for_order`] prefers.
     pub by_request: Vec<harvest_common::payment::OrderId>,
+    /// The buyer wrote last and the seller has not replied since
+    /// ([`awaiting_reply`]): what the "need you" count and the "New message
+    /// from the buyer" line say.
+    pub awaiting_reply: bool,
+    /// The short refs of the orders in it the seller is shown (not an unpaid
+    /// Buy now), newest first: what its header names (msg1 critique MSG-4).
+    pub order_refs: Vec<String>,
 }
 
 impl SellerThread {
@@ -1422,6 +1479,8 @@ pub(crate) fn seller_inbox(
                 })
                 .collect();
             timed.sort_by_key(|(at, _)| *at);
+            let awaiting =
+                awaiting_reply(open.contains(tag.as_slice()), &entries, chrono::Utc::now());
             SellerThread {
                 tag: *tag,
                 open: open.contains(tag.as_slice()),
@@ -1440,6 +1499,19 @@ pub(crate) fn seller_inbox(
                     .filter(|order| crate::order_threads::order_by_request(order, claims))
                     .map(|order| order.order.id.clone())
                     .collect(),
+                awaiting_reply: awaiting,
+                order_refs: {
+                    let mut shown: Vec<&harvest_common::payment::AuthorizedOrder> = store
+                        .orders
+                        .iter()
+                        .filter(|order| crate::order_threads::order_in_conversation(order, claims))
+                        .filter(|order| !crate::fulfilment::is_unpaid_buy_now(order))
+                        .collect();
+                    shown.sort_by_key(|order| {
+                        std::cmp::Reverse((order.order.created_at, order.order.id.0))
+                    });
+                    shown.iter().map(|order| order.order.id.short()).collect()
+                },
             }
         })
         .filter(|thread| !thread.entries.is_empty())
@@ -1452,6 +1524,104 @@ pub(crate) fn seller_inbox(
         threads,
         unreadable,
         held_back,
+    }
+}
+
+/// Whether a seller conversation waits for the seller's reply (msg1 critique
+/// MSG-3): it is open (a Ghost Key's voucher or a paid order, so junk and
+/// unopened conversations never count), the buyer has written in it, and
+/// the buyer's newest text is newer than the seller's newest reply.
+///
+/// Read from direction, not authorship, so it survives a reload: a reply is
+/// any text in the seller's direction. Only text counts on either side: an
+/// automatic decline is not a reply. The buyer's timestamp is their own
+/// claim, so it is taken no later than `now`: a message dated in the future
+/// cannot keep a conversation waiting after the seller answers it.
+pub(crate) fn awaiting_reply(
+    open: bool,
+    entries: &[MailboxEntry],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use crate::messaging::Addressing;
+    if !open {
+        return false;
+    }
+    let newest = |direction: Addressing| {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content: MessageContent::Text(_) | MessageContent::VouchedText { .. },
+                    addressing,
+                    timestamp,
+                    ..
+                } if *addressing == direction => Some((*timestamp).min(now)),
+                _ => None,
+            })
+            .max()
+    };
+    match (newest(Addressing::ToSeller), newest(Addressing::ToBuyer)) {
+        (Some(buyer), Some(seller)) => buyer > seller,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// How many of one of our stores' buyer conversations wait for the seller's
+/// reply ([`awaiting_reply`]): counted in "need you" on the header, the
+/// store's card and its Orders tab.
+pub(crate) fn replies_awaited(state: &crate::state::AppState, store_contract_id: &[u8]) -> usize {
+    seller_inbox(state, store_contract_id)
+        .threads
+        .iter()
+        .filter(|thread| thread.awaiting_reply)
+        .count()
+}
+
+/// The DOM id of a conversation's panel under an order card (or among the
+/// questions), so a pointer on another card can open it and scroll to it.
+pub(crate) fn seller_thread_dom_id(
+    tag: &[u8; 32],
+    under: Option<&harvest_common::payment::OrderId>,
+) -> String {
+    match under {
+        Some(id) => format!("thread-{}-{}", bs58::encode(tag).into_string(), id.short()),
+        None => format!("thread-{}", bs58::encode(tag).into_string()),
+    }
+}
+
+/// Said on an order card (and on a card pointing to it) whose conversation
+/// waits for the seller's reply ([`awaiting_reply`]).
+pub(crate) const NEW_MESSAGE: &str = "New message from the buyer";
+
+/// On an order card whose conversation is shown under another of the
+/// buyer's orders: a button naming that order, which opens the conversation
+/// there and scrolls to it (msg1 critique MSG-5; "under another of their
+/// orders" said neither which nor where).
+#[component]
+pub(crate) fn SellerThreadPointer(
+    thread: SellerThread,
+    home: harvest_common::payment::OrderId,
+    open_thread: Signal<OpenThread>,
+) -> Element {
+    let dom_id = seller_thread_dom_id(&thread.tag, Some(&home));
+    let short = home.short();
+    let tag = thread.tag;
+    rsx! {
+        if thread.awaiting_reply {
+            p { class: "text-warning small", "{NEW_MESSAGE}" }
+        }
+        div { class: "thread-toggle",
+            button {
+                class: "btn btn-sm btn-outline",
+                onclick: move |_| {
+                    let mut open_thread = open_thread;
+                    open_thread.set(Some((tag, Some(home.clone()))));
+                    super::scroll_to_id(dom_id.clone());
+                },
+                "Messages with this buyer, under order {short}"
+            }
+        }
     }
 }
 
@@ -1557,13 +1727,20 @@ pub(crate) fn SellerThreadToggle(
         (false, 0) => "Message the buyer".to_string(),
         (false, n) => format!("Messages ({n})"),
     };
+    let dom_id = seller_thread_dom_id(&thread.tag, under.as_ref());
     rsx! {
         // Said on the card, so a request waiting for a hand answer is not
         // buried behind the button (review of #205, U2).
         if thread.waiting > 0 && !shown {
             p { class: "text-warning small", "This buyer has a request waiting for your answer." }
         }
-        div { class: "thread-toggle",
+        // And a message waiting for the seller's reply (msg1 critique
+        // MSG-3): the complaint line tells buyers to message the seller
+        // first, which works only if the seller notices.
+        if thread.awaiting_reply && !shown {
+            p { class: "text-warning small", "{NEW_MESSAGE}" }
+        }
+        div { class: "thread-toggle", id: "{dom_id}",
             button {
                 class: "btn btn-sm btn-outline",
                 aria_expanded: if shown { "true" } else { "false" },
@@ -1607,8 +1784,19 @@ fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Eleme
     let lines = thread.lines.clone();
     let tag = thread.tag;
 
+    let about = match thread.order_refs.as_slice() {
+        [] => None,
+        [one] => Some(format!("order {one}")),
+        many => Some(format!("orders {}", many.join(", "))),
+    };
     rsx! {
         div { class: "thread",
+            // One conversation spans all of this buyer's orders at the
+            // store; say so, since it sits under just one card (msg1
+            // critique MSG-4).
+            if let Some(about) = about {
+                p { class: "order-label", "Your conversation with this buyer \u{00b7} {about}" }
+            }
             if lines.is_empty() {
                 p { class: "text-muted small", "No messages yet." }
             } else {
@@ -2998,6 +3186,8 @@ mod inbox_tests {
                 .map(|n| harvest_common::payment::OrderId([*n; 32]))
                 .collect(),
             by_request: Vec::new(),
+            awaiting_reply: false,
+            order_refs: Vec::new(),
         }
     }
 
@@ -3070,6 +3260,93 @@ mod inbox_tests {
         let older_id = older.order.id.clone();
         let homes = thread_homes(&inbox, &[&older, &newer], |o| o.order.id == older_id);
         assert_eq!(homes.get(&[1; 32]), Some(&older.order.id));
+    }
+
+    /// **A conversation waits for the seller's reply when the buyer wrote
+    /// last** (msg1 critique MSG-3), and only an open one with readable buyer
+    /// text: an unopened conversation, junk, a request or an automatic
+    /// decline never counts, so nobody can inflate "need you" for free. A
+    /// seller's reply clears it, even against a buyer message dated in the
+    /// future. Red with the open check dropped, with the clamp to now
+    /// dropped, and with declines counted as replies.
+    #[test]
+    fn a_conversation_waits_for_a_reply_only_when_the_buyer_wrote_last() {
+        use crate::messaging::Addressing::{ToBuyer, ToSeller};
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let now = at(1_000);
+        let said = |addressing, secs: i64, text: &str| {
+            let mut entry = readable(MessageContent::Text(text.into()), [secs as u8; 32]);
+            if let MailboxEntry::Readable {
+                timestamp,
+                addressing: a,
+                ..
+            } = &mut entry
+            {
+                *timestamp = at(secs);
+                *a = addressing;
+            }
+            entry
+        };
+        let buyer = said(ToSeller, 500, "is it on its way?");
+        assert!(awaiting_reply(true, std::slice::from_ref(&buyer), now));
+        assert!(
+            !awaiting_reply(false, std::slice::from_ref(&buyer), now),
+            "an unopened conversation never counts"
+        );
+        let reply = said(ToBuyer, 600, "posted today");
+        assert!(!awaiting_reply(true, &[buyer.clone(), reply.clone()], now));
+        assert!(awaiting_reply(
+            true,
+            &[buyer.clone(), reply, said(ToSeller, 700, "thanks, when?")],
+            now
+        ));
+        // Dated in the future, answered now: not waiting.
+        let future = said(ToSeller, 99_999, "reply to me forever");
+        assert!(!awaiting_reply(
+            true,
+            &[future, said(ToBuyer, 1_000, "answered")],
+            now
+        ));
+        // A decline is not a reply; a request, junk and nothing are nothing.
+        let mut decline = said(ToBuyer, 800, "");
+        if let MailboxEntry::Readable { content, .. } = &mut decline {
+            *content = MessageContent::Decline {
+                reason: "Sold out".into(),
+            };
+        }
+        assert!(awaiting_reply(true, &[buyer, decline], now));
+        let junk = MailboxEntry::Unreadable {
+            conversation: vec![1u8; 32],
+            timestamp: at(900),
+            nonce: [0; 24],
+            digest: [9; 32],
+            why: "junk".into(),
+        };
+        assert!(!awaiting_reply(
+            true,
+            &[junk, request(ListingId([9; 32]), 1, [3; 32])],
+            now
+        ));
+        assert!(!awaiting_reply(true, &[], now));
+    }
+
+    /// **Nothing unconfirmed is drawn as this side's word** (review round 1
+    /// S2, kept by msg1 MSG-1's in-place layout): an untrusted line is the
+    /// dashed class wherever it sits, never the filled "You" bubble. Red with
+    /// untrusted lines drawn as `mine`.
+    #[test]
+    fn an_unconfirmed_line_is_never_drawn_as_yours() {
+        let line = |mine, trusted| ChatLine {
+            who: if trusted { "You" } else { UNCONFIRMED },
+            mine,
+            trusted,
+            when: String::new(),
+            item: ChatItem::Said("x".into()),
+        };
+        assert_eq!(bubble_class(&line(false, false)), "bubble unconfirmed");
+        assert_eq!(bubble_class(&line(true, false)), "bubble unconfirmed");
+        assert_eq!(bubble_class(&line(true, true)), "bubble mine");
+        assert_eq!(bubble_class(&line(false, true)), "bubble");
     }
 
     /// **An order goes under the conversation whose request names it**,
