@@ -5569,6 +5569,13 @@ impl AppState {
             if peer.len() != harvest_common::mailbox::SENDER_KEY_BYTES {
                 continue;
             }
+            // A non-canonical twin of a real tag would get the real
+            // conversation's keys from the delegate, which does not check;
+            // it is never read, so its keys are never asked for
+            // (`messaging::is_canonical_tag`).
+            if !crate::messaging::is_canonical_tag(peer) {
+                continue;
+            }
             if self.conversation_keys.contains_key(peer)
                 || self.declined_conversation_tags.contains(peer)
                 || wanted.contains(peer)
@@ -23894,6 +23901,110 @@ mod buy_flow_tests {
         assert!(thread.open, "a paid order opens it");
         assert_eq!(thread.chat_count(), 1, "the buyer's plain text is shown");
         assert_eq!(inbox.held_back, 0);
+    }
+
+    /// **A twin tag cannot take a paid order's conversation** (review of
+    /// #205, S1). X25519 ignores bit 255, so the buyer of a paid order can
+    /// write under the same tag with bit 255 set and the delegate would
+    /// derive the same keys; with the twin read, it claims the same order
+    /// and can stand under its card with whatever the buyer wrote. It is
+    /// never read, never filed, never asked keys for, only counted as
+    /// unreadable. Red with the canonical check dropped from `read_mailbox`
+    /// and `seller_claims`.
+    #[test]
+    fn a_twin_tag_cannot_take_a_paid_orders_conversation() {
+        use crate::components::message_view::seller_inbox;
+        let (mut state, tag, _) = seller_holding_a_request();
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            conversation_id,
+            timestamp,
+            ..
+        } = crate::messaging::read_mailbox(
+            &state.browsing_stores[STORE].mailbox_messages[..1],
+            &keys,
+        )
+        .remove(0)
+        else {
+            panic!("the fixture's request reads");
+        };
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+
+        let mut twin = tag;
+        twin[31] |= 0x80;
+        assert_eq!(
+            seller_keys_for(&twin),
+            seller_keys_for(&tag),
+            "precondition: the twin derives the same keys"
+        );
+        // Written under the twin, with the conversation's own keys, naming
+        // the same listing so it would claim the same order.
+        let request = crate::messaging::seal_for_test(
+            &seller_keys_for(&twin).to_seller,
+            &twin,
+            &conversation_id,
+            crate::messaging::MessageContent::OrderRequest {
+                listing_id: ListingId([3u8; 32]),
+                quantity: 1,
+                shipping: "Elsewhere".into(),
+                note: String::new(),
+                order_binding,
+                buyer_receipt_key,
+                instant: None,
+            },
+        )
+        .unwrap();
+        let fake = crate::messaging::seal_for_test(
+            &seller_keys_for(&twin).from_seller,
+            &twin,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Agreed, full refund".into()),
+        )
+        .unwrap();
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = vec![order.clone()];
+        store.mailbox_messages.extend([request, fake]);
+
+        // Asked for: the twin is not, even with nothing cached.
+        let asked = state.conversation_keys_to_request(STORE);
+        if let Some(harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+            peer_public_keys,
+            ..
+        }) = asked
+        {
+            assert!(!peer_public_keys.contains(&twin.to_vec()));
+        }
+        // And if a delegate answered for it anyway, it is still not read.
+        state
+            .conversation_keys
+            .insert(twin.to_vec(), seller_keys_for(&twin));
+        let inbox = seller_inbox(&state, STORE);
+        assert!(
+            inbox.threads.iter().all(|thread| thread.tag != twin),
+            "the twin is not a conversation"
+        );
+        assert_eq!(
+            inbox.for_order(&order.order.id).map(|thread| thread.tag),
+            Some(tag),
+            "the real conversation stays under the order"
+        );
+        assert_eq!(inbox.unreadable, 2, "the twin's entries are only counted");
     }
 
     fn invoice_answering(tag: [u8; 32]) -> PendingInvoice {

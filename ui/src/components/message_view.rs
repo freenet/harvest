@@ -1140,10 +1140,18 @@ pub(crate) struct SellerInbox {
 
 impl SellerInbox {
     /// The conversation order `id` belongs to, if this device can read it.
+    ///
+    /// Only one conversation can hold an order's claims: its request id
+    /// hashes the conversation's tag, its listing tag needs that
+    /// conversation's keys, and twin tags that share those keys are never
+    /// read (`messaging::is_canonical_tag`). Should two ever claim one order,
+    /// the lowest tag wins: a rule no writer's timestamp or arrival order
+    /// can steer.
     pub(crate) fn for_order(&self, id: &harvest_common::payment::OrderId) -> Option<&SellerThread> {
         self.threads
             .iter()
-            .find(|thread| thread.orders.contains(id))
+            .filter(|thread| thread.orders.contains(id))
+            .min_by_key(|thread| thread.tag)
     }
 }
 
@@ -1782,14 +1790,21 @@ pub(crate) fn seller_claims<'a>(
     listings: &[harvest_common::listing::AuthorizedListing],
     keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
 ) -> Vec<([u8; 32], crate::order_threads::ConversationClaims)> {
+    // Canonical tags only (`messaging::is_canonical_tag`): a twin shares its
+    // keys with a real conversation and would claim that conversation's
+    // orders. Ordered by tag, never by anything a writer chooses.
     let mut tags: Vec<[u8; 32]> = Vec::new();
     for entry in entries {
+        if !crate::messaging::is_canonical_tag(entry.conversation()) {
+            continue;
+        }
         if let Ok(tag) = <[u8; 32]>::try_from(entry.conversation()) {
             if !tags.contains(&tag) {
                 tags.push(tag);
             }
         }
     }
+    tags.sort();
     tags.into_iter()
         .map(|tag| {
             let requests = entries.iter().filter_map(|entry| match entry {
