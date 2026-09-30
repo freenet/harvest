@@ -26199,6 +26199,47 @@ mod buy_flow_tests {
         assert!(thread.open, "a paid order opens it");
         assert_eq!(thread.chat_count(), 1, "the buyer's plain text is shown");
         assert_eq!(inbox.held_back, 0);
+
+        // Review of #205, S2: the paid buyer, needing no Ghost Key, seals a
+        // "reply" in the seller's direction. It is not the seller's "You";
+        // the reply this device did send is.
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).from_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Agreed, full refund".into()),
+        )
+        .unwrap();
+        let genuine = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).from_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Posting today".into()),
+        )
+        .unwrap();
+        state.record_sent_message(STORE, "Posting today".into(), &genuine);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend([forged, genuine]);
+        let inbox = seller_inbox(&state, STORE);
+        let lines = &inbox.for_order(&order.order.id).unwrap().lines;
+        let label = |text: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.item == crate::components::message_view::ChatItem::Said(text.into())
+                })
+                .map(|line| (line.who, line.trusted))
+        };
+        assert_eq!(label("Posting today"), Some(("You", true)));
+        assert_eq!(
+            label("Agreed, full refund"),
+            Some((crate::components::message_view::UNCONFIRMED, false))
+        );
+        assert_eq!(label("Is it on its way?"), Some(("Buyer", true)));
     }
 
     /// **A twin tag cannot take a paid order's conversation** (review of
@@ -33164,9 +33205,43 @@ mod buy_flow_tests {
             panic!("a paid conversation seals at once, with no vault request");
         };
         assert!(state.pending_signatures.is_empty());
-        let (shown, hidden) = seller_is_shown(&state, &tag, &[sealed]);
+        let (shown, hidden) = seller_is_shown(&state, &tag, std::slice::from_ref(&sealed));
         assert_eq!(texts(&shown), vec!["Has it gone out yet?".to_string()]);
         assert_eq!(hidden, 0);
+
+        // Review of #205, S2, the buyer's screen: what this device sent is
+        // "You"; a message in the buyer's direction the seller sealed is not.
+        state.record_sent_message(STORE, "Has it gone out yet?".into(), &sealed);
+        let conversation_id = state.browsing_stores[STORE].conversations[0]
+            .conversation_id
+            .clone();
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("I'll pay double".into()),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend([sealed, forged]);
+        let lines = crate::components::message_view::buyer_chat_lines(&state, STORE, Some(tag));
+        let label = |text: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.item == crate::components::message_view::ChatItem::Said(text.into())
+                })
+                .map(|line| (line.who, line.trusted))
+        };
+        assert_eq!(label("Has it gone out yet?"), Some(("You", true)));
+        assert_eq!(
+            label("I'll pay double"),
+            Some((crate::components::message_view::UNCONFIRMED, false))
+        );
     }
 
     /// **The buyer's rule is a strict subset of the seller's.** Over the

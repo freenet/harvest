@@ -420,13 +420,15 @@ fn Restore() -> Element {
 fn Thread(store_contract_id: Vec<u8>, tag: Option<[u8; 32]>) -> Element {
     let (lines, unconfirmed) = {
         let state = APP_STATE.read();
-        let messages = buyer_messages(&state, &store_contract_id, tag);
         let unconfirmed: Vec<crate::state::SentMessage> = state
             .unconfirmed_sent(&store_contract_id)
             .into_iter()
             .filter(|sent| tag.is_none_or(|tag| sent.sealed.sender_public_key == tag))
             .collect();
-        (chat_lines(&messages, Role::Buyer), unconfirmed)
+        (
+            buyer_chat_lines(&state, &store_contract_id, tag),
+            unconfirmed,
+        )
     };
 
     rsx! {
@@ -524,6 +526,19 @@ fn buyer_messages(
     }
 }
 
+/// A buyer's conversations with a store (or only `tag`) as chat lines,
+/// oldest first, with "You" only for what this device sent ([`who`]).
+pub(crate) fn buyer_chat_lines(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    tag: Option<[u8; 32]>,
+) -> Vec<ChatLine> {
+    let messages = buyer_messages(state, store_contract_id, tag);
+    chat_lines(&messages, Role::Buyer, |digest| {
+        state.authored_here(store_contract_id, digest)
+    })
+}
+
 /// How many messages a buyer's conversation `tag` with a store shows as
 /// chat, sent-but-not-landed included: the count on its Messages button.
 pub(crate) fn buyer_thread_count(
@@ -537,7 +552,7 @@ pub(crate) fn buyer_thread_count(
         .iter()
         .filter(|sent| sent.sealed.sender_public_key == tag)
         .count();
-    chat_lines(&messages, Role::Buyer).len() + unconfirmed
+    said_count(&chat_lines(&messages, Role::Buyer, |_| true)) + unconfirmed
 }
 
 /// One of a buyer's conversations with a store, under the orders it holds
@@ -979,27 +994,40 @@ enum Role {
     Seller,
 }
 
-/// The name above a message, and whether it is drawn as this side's own.
+/// The label on a message in this side's direction that this device did not
+/// send (review of #205, S2). It claims nothing about who wrote it.
+pub(crate) const UNCONFIRMED: &str = "Not confirmed as yours";
+
+/// The name above a message: `(name, drawn as this side's own, trusted for
+/// the timeline)`.
 ///
-/// By the direction key that sealed it: toward the other side is "You",
-/// toward this side is "Buyer" (on the seller's screen) or "Seller" (on the
-/// buyer's). Direction is not authorship -- both parties hold both keys, so
-/// either can seal a message that reads as the other's (a seller's inbox once
-/// showed "as agreed, I confess" as the seller's own reply, written by the
-/// buyer). It is still the right label. Only the two parties can write a
-/// readable entry at all, so the only person a mislabelled message can
-/// deceive is one of the two who were there; nobody else ever sees it, and
-/// Harvest has no arbiter to show it to. What needs real authenticity carries
-/// its own signature (`harvest_common::mailbox::MessageDirection`). The
-/// earlier wording ("Addressed to this buyer", a caveat per conversation)
-/// told the reader that, eight times a screen, and helped nobody (round-6
-/// critique 10-5).
-fn who(role: Role, addressing: crate::messaging::Addressing) -> (&'static str, bool) {
+/// Direction is not authorship. Both parties hold both keys, so either can
+/// seal a message in either direction (a seller's inbox once showed "as
+/// agreed, I confess" as the seller's own reply, written by the buyer; with
+/// paid-order messaging a paid buyer needs no Ghost Key to try it). So:
+///
+/// * the other side's direction is named for the other side ("Buyer" on
+///   the seller's screen, "Seller" on the buyer's): if this side sealed it
+///   itself, the only person it can mislead is the one who wrote it;
+/// * this side's direction is "You" only for what THIS device sent
+///   (`authored_here`, `AppState::authored_here`: the entry's digest, which
+///   the other party cannot reproduce);
+/// * anything else in this side's direction is [`UNCONFIRMED`], and is not
+///   placed in the timeline as though it were this side's word
+///   ([`ChatLines`]). It includes this side's own messages from another
+///   device or from before a reload, which is the price of never putting the
+///   other party's words under "You".
+fn who(
+    role: Role,
+    addressing: crate::messaging::Addressing,
+    authored_here: bool,
+) -> (&'static str, bool, bool) {
     use crate::messaging::Addressing;
     match (role, addressing) {
-        (Role::Buyer, Addressing::ToSeller) | (Role::Seller, Addressing::ToBuyer) => ("You", true),
-        (Role::Buyer, Addressing::ToBuyer) => ("Seller", false),
-        (Role::Seller, Addressing::ToSeller) => ("Buyer", false),
+        (Role::Seller, Addressing::ToSeller) => ("Buyer", false, true),
+        (Role::Buyer, Addressing::ToBuyer) => ("Seller", false, true),
+        _ if authored_here => ("You", true, true),
+        _ => (UNCONFIRMED, false, false),
     }
 }
 
@@ -1015,35 +1043,75 @@ fn when(at: chrono::DateTime<chrono::Utc>) -> String {
 /// One line of a conversation as [`ChatLines`] draws it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChatLine {
-    who: &'static str,
-    mine: bool,
-    when: String,
-    item: ChatItem,
+    pub(crate) who: &'static str,
+    pub(crate) mine: bool,
+    /// Placed in the timeline ([`who`]); an [`UNCONFIRMED`] line is not.
+    pub(crate) trusted: bool,
+    pub(crate) when: String,
+    pub(crate) item: ChatItem,
 }
 
-/// A buyer's messages as chat lines, in the order given.
-fn chat_lines(messages: &[crate::messaging::ConversationMessage], role: Role) -> Vec<ChatLine> {
+/// One message as a chat line, or `None` where it is not chat
+/// ([`chat_item`]). A step (a decline) is always placed in the timeline: its
+/// words claim nothing about who wrote them.
+fn chat_line(
+    role: Role,
+    addressing: crate::messaging::Addressing,
+    authored_here: bool,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    content: &MessageContent,
+) -> Option<ChatLine> {
+    let item = chat_item(content)?;
+    let (who, mine, trusted) = who(role, addressing, authored_here);
+    Some(ChatLine {
+        who,
+        mine,
+        trusted: trusted || matches!(item, ChatItem::Event(_)),
+        when: when(timestamp),
+        item,
+    })
+}
+
+/// A buyer's messages as chat lines, in the order given; `authored_here`
+/// is what this device sent (`AppState::authored_here`).
+fn chat_lines(
+    messages: &[crate::messaging::ConversationMessage],
+    role: Role,
+    authored_here: impl Fn(&[u8; 32]) -> bool,
+) -> Vec<ChatLine> {
     messages
         .iter()
         .filter_map(|message| {
-            let item = chat_item(&message.content)?;
-            let (who, mine) = who(role, message.addressing);
-            Some(ChatLine {
-                who,
-                mine,
-                when: when(message.timestamp),
-                item,
-            })
+            chat_line(
+                role,
+                message.addressing,
+                authored_here(&message.digest),
+                message.timestamp,
+                &message.content,
+            )
         })
         .collect()
 }
 
-/// A conversation, as bubbles (mockup `msgs()`).
+/// How many messages `lines` shows: what people wrote, not steps (an
+/// automatic "sold out" decline is not a message to count).
+fn said_count(lines: &[ChatLine]) -> usize {
+    lines
+        .iter()
+        .filter(|line| matches!(line.item, ChatItem::Said(_)))
+        .count()
+}
+
+/// A conversation, as bubbles (mockup `msgs()`): the timeline, then, apart
+/// and under their own heading, messages in this side's direction this
+/// device did not send ([`UNCONFIRMED`]), so they are never read as this
+/// side's word in the flow of the conversation.
 #[component]
 fn ChatLines(lines: Vec<ChatLine>) -> Element {
+    let unconfirmed: Vec<&ChatLine> = lines.iter().filter(|line| !line.trusted).collect();
     rsx! {
         div { class: "bubbles",
-            for line in lines.iter() {
+            for line in lines.iter().filter(|line| line.trusted) {
                 match &line.item {
                     ChatItem::Said(text) => rsx! {
                         div { class: if line.mine { "bubble mine" } else { "bubble" },
@@ -1057,6 +1125,19 @@ fn ChatLines(lines: Vec<ChatLine>) -> Element {
                 }
             }
         }
+        if !unconfirmed.is_empty() {
+            p { class: "text-muted small", "{UNCONFIRMED}" }
+            div { class: "bubbles",
+                for line in unconfirmed.iter() {
+                    if let ChatItem::Said(text) = &line.item {
+                        div { class: "bubble unconfirmed",
+                            span { class: "bubble-who", "{line.when}" }
+                            "{text}"
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1067,8 +1148,13 @@ pub(crate) struct SellerThread {
     /// Whether it is open ([`open_conversations`]): a verified voucher or a
     /// paid order of the store's in it.
     pub open: bool,
-    /// Its readable entries as [`shown_to_seller`] shows them, newest first.
+    /// Its readable entries as [`shown_to_seller`] shows them, newest first
+    /// by each writer's own timestamp (`messaging::read_mailbox`'s display
+    /// order, never used to decide anything).
     pub entries: Vec<MailboxEntry>,
+    /// Its chat lines, oldest first by the writer's timestamp, worked out
+    /// once in [`seller_inbox`] (the authorship check needs the state).
+    pub lines: Vec<ChatLine>,
     /// The store's orders that belong to it
     /// (`order_threads::order_in_conversation`), whatever their status: the
     /// order cards it is shown under.
@@ -1076,53 +1162,27 @@ pub(crate) struct SellerThread {
 }
 
 impl SellerThread {
-    /// Its chat lines, oldest first.
-    fn lines(&self) -> Vec<ChatLine> {
-        let mut lines: Vec<(chrono::DateTime<chrono::Utc>, ChatLine)> = self
-            .entries
+    /// How many messages it shows (not steps): the count on its button.
+    pub(crate) fn chat_count(&self) -> usize {
+        said_count(&self.lines)
+    }
+
+    /// The newest thing a buyer wrote in it, by its own timestamp, for a
+    /// question's row: a display choice, decided whatever order `entries`
+    /// arrive in.
+    pub(crate) fn latest_from_buyer(&self) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
+        self.entries
             .iter()
             .filter_map(|entry| match entry {
                 MailboxEntry::Readable {
-                    content,
-                    addressing,
+                    content: MessageContent::Text(text) | MessageContent::VouchedText { text, .. },
+                    addressing: crate::messaging::Addressing::ToSeller,
                     timestamp,
                     ..
-                } => {
-                    let item = chat_item(content)?;
-                    let (who, mine) = who(Role::Seller, *addressing);
-                    Some((
-                        *timestamp,
-                        ChatLine {
-                            who,
-                            mine,
-                            when: when(*timestamp),
-                            item,
-                        },
-                    ))
-                }
-                MailboxEntry::Unreadable { .. } => None,
+                } => Some((text.clone(), *timestamp)),
+                _ => None,
             })
-            .collect();
-        lines.sort_by_key(|(at, _)| *at);
-        lines.into_iter().map(|(_, line)| line).collect()
-    }
-
-    /// How many messages it shows as chat: the count on its button.
-    pub(crate) fn chat_count(&self) -> usize {
-        self.lines().len()
-    }
-
-    /// The newest thing a buyer wrote in it, for a question's row.
-    fn latest_from_buyer(&self) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
-        self.entries.iter().find_map(|entry| match entry {
-            MailboxEntry::Readable {
-                content: MessageContent::Text(text) | MessageContent::VouchedText { text, .. },
-                addressing: crate::messaging::Addressing::ToSeller,
-                timestamp,
-                ..
-            } => Some((text.clone(), *timestamp)),
-            _ => None,
-        })
+            .max_by_key(|(_, at)| *at)
     }
 }
 
@@ -1206,23 +1266,48 @@ pub(crate) fn seller_inbox(
     );
     let threads = claims
         .iter()
-        .map(|(tag, claims)| SellerThread {
-            tag: *tag,
-            open: open.contains(tag.as_slice()),
-            entries: shown
+        .map(|(tag, claims)| {
+            let entries: Vec<MailboxEntry> = shown
                 .iter()
                 .filter(|entry| {
                     entry.conversation() == tag.as_slice()
                         && matches!(entry, MailboxEntry::Readable { .. })
                 })
                 .cloned()
-                .collect(),
-            orders: store
-                .orders
+                .collect();
+            let mut timed: Vec<(chrono::DateTime<chrono::Utc>, ChatLine)> = entries
                 .iter()
-                .filter(|order| crate::order_threads::order_in_conversation(order, claims))
-                .map(|order| order.order.id.clone())
-                .collect(),
+                .filter_map(|entry| match entry {
+                    MailboxEntry::Readable {
+                        content,
+                        addressing,
+                        timestamp,
+                        digest,
+                        ..
+                    } => chat_line(
+                        Role::Seller,
+                        *addressing,
+                        state.authored_here(store_contract_id, digest),
+                        *timestamp,
+                        content,
+                    )
+                    .map(|line| (*timestamp, line)),
+                    MailboxEntry::Unreadable { .. } => None,
+                })
+                .collect();
+            timed.sort_by_key(|(at, _)| *at);
+            SellerThread {
+                tag: *tag,
+                open: open.contains(tag.as_slice()),
+                entries,
+                lines: timed.into_iter().map(|(_, line)| line).collect(),
+                orders: store
+                    .orders
+                    .iter()
+                    .filter(|order| crate::order_threads::order_in_conversation(order, claims))
+                    .map(|order| order.order.id.clone())
+                    .collect(),
+            }
         })
         .filter(|thread| !thread.entries.is_empty())
         .collect();
@@ -1333,7 +1418,7 @@ fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Eleme
             .collect();
         (offered, availability)
     };
-    let lines = thread.lines();
+    let lines = thread.lines.clone();
     let tag = thread.tag;
 
     rsx! {
@@ -2568,10 +2653,53 @@ mod inbox_tests {
     #[test]
     fn bubbles_are_labelled_by_side() {
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
-        assert_eq!(who(Role::Seller, ToSeller), ("Buyer", false));
-        assert_eq!(who(Role::Seller, ToBuyer), ("You", true));
-        assert_eq!(who(Role::Buyer, ToBuyer), ("Seller", false));
-        assert_eq!(who(Role::Buyer, ToSeller), ("You", true));
+        for authored in [false, true] {
+            assert_eq!(
+                who(Role::Seller, ToSeller, authored),
+                ("Buyer", false, true)
+            );
+            assert_eq!(who(Role::Buyer, ToBuyer, authored), ("Seller", false, true));
+        }
+        assert_eq!(who(Role::Seller, ToBuyer, true), ("You", true, true));
+        assert_eq!(who(Role::Buyer, ToSeller, true), ("You", true, true));
+    }
+
+    /// **"You" only for what this device sent** (review of #205, S2): in
+    /// this side's direction, anything else is [`UNCONFIRMED`] and out of
+    /// the timeline, on both screens. A decline stays in the timeline, as a
+    /// step. Red with `who` labelling by direction alone.
+    #[test]
+    fn this_sides_direction_is_you_only_when_sent_from_here() {
+        use crate::messaging::Addressing::{ToBuyer, ToSeller};
+        assert_eq!(
+            who(Role::Seller, ToBuyer, false),
+            (UNCONFIRMED, false, false)
+        );
+        assert_eq!(
+            who(Role::Buyer, ToSeller, false),
+            (UNCONFIRMED, false, false)
+        );
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let forged = chat_line(
+            Role::Seller,
+            ToBuyer,
+            false,
+            at,
+            &MessageContent::Text("Agreed, full refund".into()),
+        )
+        .unwrap();
+        assert!(!forged.trusted);
+        let decline = chat_line(
+            Role::Seller,
+            ToBuyer,
+            false,
+            at,
+            &MessageContent::Decline {
+                reason: "sold out".into(),
+            },
+        )
+        .unwrap();
+        assert!(decline.trusted);
     }
 
     /// The count beside Orders is the number of accept controls the inbox

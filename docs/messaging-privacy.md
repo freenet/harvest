@@ -68,9 +68,15 @@ mailbox that authenticates exactly as the seller's own reply would.
 Only a per-message signature could distinguish two holders of one secret, and
 that is a different mechanism from this one. **Anything whose authenticity
 matters must carry its own signature and must not rest on which key decrypted
-it.** The UI reports which direction a message was addressed, names only what
-the current tab sent as authored, and says on screen that direction is not
-proof of authorship.
+it.** The UI labels a message "You" only when this device sent it; a message
+in your own direction that this device did not send (your own from another
+device or from before a reload, or one the other party sealed as yours) is
+shown apart from the conversation, under "Not confirmed as yours", never in
+its flow. The other party's direction is labelled with their role ("Buyer",
+"Seller"): if you sealed one of those yourself, you are the only person it
+can mislead. Since paid-order messaging (2026-09-30) a paid buyer needs no
+Ghost Key to try this, which is why "You" is never given by direction
+(`components::message_view::who`).
 
 "What the current tab sent" is recognised by a digest of the whole mailbox
 entry, not by its nonce. The distinction is the subject of the next section
