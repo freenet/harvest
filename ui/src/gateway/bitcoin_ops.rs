@@ -246,7 +246,10 @@ pub async fn peek_order_addresses() -> Result<(), String> {
             .harvest_delegate_key
             .clone()
             .ok_or("harvest delegate not yet registered")?;
-        (key, state.bitcoin.next_request_id())
+        let request_id = state.bitcoin.next_request_id();
+        // Recorded before the send: its answer is matched to it (harvest#183).
+        state.note_peek_sent(request_id, crate::state::now_ms());
+        (key, request_id)
     };
     let payload = to_cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
         request_id,

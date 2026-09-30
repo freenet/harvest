@@ -4536,7 +4536,9 @@ impl AppState {
         let vetted = self.on_address_vet_state(&contract_id, &state_bytes, now_ms());
         #[cfg(target_arch = "wasm32")]
         if vetted {
+            // The window may have just opened: its prewatch and arm now.
             self.send_due_auto_invoice();
+            self.send_due_watch_requests();
         }
         let reuse_checked = self.on_address_reuse_state(&contract_id, &state_bytes);
         if (vetted || reuse_checked)
@@ -12554,8 +12556,8 @@ impl AppState {
                 self.bitcoin.payment_xpub_loaded = true;
             }
 
-            BitcoinDelegateResponse::UpcomingAddresses { result, .. } => {
-                self.on_upcoming_addresses(result, now_ms());
+            BitcoinDelegateResponse::UpcomingAddresses { request_id, result } => {
+                self.on_upcoming_answer(request_id, result, now_ms());
                 self.send_due_watch_requests();
                 // Their address contracts are read before any is watched
                 // (harvest#183): start now rather than at the next tick.
@@ -32208,25 +32210,61 @@ mod buy_flow_tests {
     }
 
     /// The answer to a peek sent before a payment made the window stale can
-    /// predate the sale the payment was for: it is dropped, a new peek goes
-    /// at once, and only its answer counts. Mutated red by accepting the
-    /// earlier answer, and by making the new peek wait the retry minute.
+    /// predate the sale the payment was for: it is dropped even when it
+    /// arrives after a newer peek went out (matched by request id, not by the
+    /// latest send time), a new peek goes at once, and only its answer
+    /// counts. Mutated red by accepting the earlier answer, by matching on
+    /// the latest send time, and by making the new peek wait the retry
+    /// minute.
     #[test]
     fn a_peek_sent_before_a_payment_cannot_vouch_for_the_window() {
         use crate::auto_invoice_flow::REARM_EVERY_MS;
         let gk = inbox::authority().mint();
         let mut state = a_seller_with_a_lost_counter(&gk);
         let (paid, _) = address_states_paid_and_scanned();
+        let window = || Ok((0..10).map(lost_address).collect());
         let work = state.queue_auto_invoice(100);
         settle_absent_except(&mut state, &work, &[], 100);
         let t = 100 + REARM_EVERY_MS;
         assert!(state.queue_auto_invoice(t).peek, "the ten-minute re-read");
+        state.note_peek_sent(1, t);
         assert!(state.on_address_vet_state(&vet_of(&work, 3).0, &paid, t + 1));
-        state.on_upcoming_addresses(Ok((0..10).map(lost_address).collect()), t + 2);
+        assert!(state.queue_auto_invoice(t + 2).peek, "asked again at once");
+        state.note_peek_sent(2, t + 2);
+        // The first peek's answer lands after the second went out: dropped.
+        state.on_upcoming_answer(1, window(), t + 3);
         assert!(state.auto_invoice.upcoming_for.is_none(), "dropped");
-        assert!(state.queue_auto_invoice(t + 3).peek, "asked again at once");
-        state.on_upcoming_addresses(Ok((0..10).map(lost_address).collect()), t + 4);
+        state.on_upcoming_answer(2, window(), t + 4);
         assert!(state.auto_invoice.upcoming_for.is_some());
+    }
+
+    /// A read still out under an earlier build when the generation moves is
+    /// not forgotten: its late answer showing a payment makes the address
+    /// used, even when the new build's contract reads empty. Mutated red by
+    /// not keeping the earlier read.
+    #[test]
+    fn a_late_answer_under_an_earlier_build_still_counts() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let (paid, _) = address_states_paid_and_scanned();
+        let before = state.queue_auto_invoice(100);
+        let (old4, _) = vet_of(&before, 4);
+        settle_absent_except(&mut state, &before, &[4], 100);
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([0xc3; 32]);
+        let after = state.queue_auto_invoice(200);
+        settle_absent_except(&mut state, &after, &[], 200);
+        assert!(
+            state.prewatch_wanted(bridge).is_some(),
+            "new build reads empty"
+        );
+        assert!(state.on_address_vet_state(&old4, &paid, 300));
+        assert!(
+            state.prewatch_wanted(bridge).is_none(),
+            "the old payment counts"
+        );
+        assert_eq!(state.vetted_used_scripts().count(), 1);
     }
 
     /// The watch delegation goes to the delegate only while the window is

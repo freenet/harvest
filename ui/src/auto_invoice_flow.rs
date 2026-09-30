@@ -138,6 +138,13 @@ pub struct AutoInvoiceUi {
     /// Set when a payment turned an address used: the window must be read
     /// again, by a peek sent after this, before anything is raised on it.
     pub stale_since: Option<u64>,
+    /// The peeks out, by request id, and when each was sent: an answer is
+    /// matched to its own peek, never to a later one's time.
+    pub peeks_out: HashMap<u64, u64>,
+    /// Reads still out under an earlier address-contract build, by that
+    /// build's contract id: a late answer showing a payment still makes the
+    /// address used (a payment under any build stands).
+    pub retired_reads: HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// What an upcoming address's address contract showed (harvest#183).
@@ -547,6 +554,9 @@ impl AppState {
         self.auto_invoice
             .vets
             .retain(|script, _| window.contains(script));
+        self.auto_invoice
+            .retired_reads
+            .retain(|_, script| window.contains(script));
     }
 
     /// A state arrived for `contract_id`. It settles a read that is out: used
@@ -563,6 +573,28 @@ impl AppState {
         state_bytes: &[u8],
         now_ms: u64,
     ) -> bool {
+        if let Ok(id) = <[u8; 32]>::try_from(contract_id) {
+            if let Some(script) = self.auto_invoice.retired_reads.remove(&id) {
+                if address_state_payments(state_bytes) == Some(true) {
+                    if let Some(vet) = self.auto_invoice.vets.get_mut(&script) {
+                        if vet.verdict != VetVerdict::Used {
+                            vet.verdict = VetVerdict::Used;
+                            vet.at_ms = now_ms;
+                            self.auto_invoice.upcoming_for = None;
+                            self.auto_invoice.stale_since = Some(now_ms);
+                        }
+                    }
+                }
+                if !self
+                    .auto_invoice
+                    .vets
+                    .values()
+                    .any(|v| v.contract_id.as_slice() == contract_id)
+                {
+                    return true;
+                }
+            }
+        }
         if !self
             .auto_invoice
             .vets
@@ -601,7 +633,11 @@ impl AppState {
     /// The node answered `NotFound`: nothing was ever published there, as
     /// far as it can tell. Clear, like silence.
     pub(crate) fn on_address_vet_absent(&mut self, contract_id: &[u8], now_ms: u64) -> bool {
-        self.settle_vet(contract_id, None, false, VetVerdict::Clear, now_ms)
+        let retired = <[u8; 32]>::try_from(contract_id)
+            .ok()
+            .and_then(|id| self.auto_invoice.retired_reads.remove(&id))
+            .is_some();
+        self.settle_vet(contract_id, None, false, VetVerdict::Clear, now_ms) || retired
     }
 
     /// No answer in [`ADDRESS_VET_TIMEOUT_MS`] to the read started under
@@ -1163,6 +1199,16 @@ impl AppState {
                 _ => VetVerdict::Asking { token: *token },
             };
             let at_ms = self.auto_invoice.vets.get(script).map_or(0, |v| v.at_ms);
+            if let Some(held) = self
+                .auto_invoice
+                .vets
+                .get(script)
+                .filter(|held| held.contract_id != *contract_id && held.token().is_some())
+            {
+                self.auto_invoice
+                    .retired_reads
+                    .insert(held.contract_id, script.clone());
+            }
             self.auto_invoice.vets.insert(
                 script.clone(),
                 AddressVet {
@@ -1339,20 +1385,49 @@ impl AppState {
         let _ = work;
     }
 
-    /// The delegate's answer to `PeekOrderAddresses`.
+    /// A `PeekOrderAddresses` went out under `request_id`.
+    pub(crate) fn note_peek_sent(&mut self, request_id: u64, now_ms: u64) {
+        // Bounded: an answer that never comes is forgotten with the oldest.
+        if self.auto_invoice.peeks_out.len() >= 16 {
+            if let Some(oldest) = self
+                .auto_invoice
+                .peeks_out
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| *id)
+            {
+                self.auto_invoice.peeks_out.remove(&oldest);
+            }
+        }
+        self.auto_invoice.peeks_out.insert(request_id, now_ms);
+    }
+
+    /// The delegate's answer to the peek sent under `request_id`. One sent
+    /// before a payment made the window stale can predate the sale that
+    /// payment was for: dropped, and the next peek brings a window read after
+    /// it. Matched by id, so a later peek's time cannot vouch for it.
+    pub(crate) fn on_upcoming_answer(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<DerivedAddress>, String>,
+        now_ms: u64,
+    ) {
+        let sent = self.auto_invoice.peeks_out.remove(&request_id);
+        if let Some(since) = self.auto_invoice.stale_since {
+            if sent.is_none_or(|at| at < since) {
+                return;
+            }
+        }
+        self.on_upcoming_addresses(result, now_ms);
+    }
+
+    /// The delegate's answer to `PeekOrderAddresses`, taken as current.
     pub(crate) fn on_upcoming_addresses(
         &mut self,
         result: Result<Vec<DerivedAddress>, String>,
         now_ms: u64,
     ) {
         match (result, self.bitcoin.payment_xpub.as_ref()) {
-            // The answer to a peek sent before a payment made the window
-            // stale can predate the sale that payment was for: dropped, the
-            // next peek brings a window read after it.
-            (Ok(_), Some(_))
-                if self.auto_invoice.stale_since.is_some_and(|since| {
-                    self.auto_invoice.peek_sent_ms.is_none_or(|at| at < since)
-                }) => {}
             (Ok(upcoming), Some(xpub)) => {
                 self.auto_invoice.stale_since = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
@@ -1437,6 +1512,7 @@ fn spawn_address_vet(contract_id: [u8; 32], token: u64) {
         let mut state = crate::gateway::APP_STATE.write();
         if state.on_address_vet_timeout(&contract_id, token, crate::state::now_ms()) {
             state.send_due_auto_invoice();
+            state.send_due_watch_requests();
         }
     });
 }

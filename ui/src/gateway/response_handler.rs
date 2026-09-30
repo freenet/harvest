@@ -188,6 +188,7 @@ fn handle_contract_response(response: ContractResponse) {
                 let mut state = APP_STATE.write();
                 if state.on_address_vet_absent(instance_id.as_bytes(), crate::state::now_ms()) {
                     state.send_due_auto_invoice();
+                    state.send_due_watch_requests();
                 }
             }
             // And to a store's reputation record, so the store page says
