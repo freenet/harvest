@@ -90,8 +90,8 @@ pub fn StoresPage() -> Element {
                 div { class: "card card-quiet sell-card",
                     h3 { "Sell on Harvest" }
                     p { class: "text-muted",
-                        "Open a store. Harvest takes no cut, needs no account, and nobody can take "
-                        "your store down."
+                        "Open a store. Harvest takes no cut, needs no account, and no company can "
+                        "shut your store down."
                     }
                     button {
                         class: "link-btn",

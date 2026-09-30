@@ -173,15 +173,36 @@ impl AppState {
         store_presence(state, since, now_ms)
     }
 
+    /// Whether `store_contract_id` is a store the user removed from their
+    /// Stores list ("Remove from list") and is not looking at now.
+    pub fn removed_from_list(&self, store_contract_id: &[u8]) -> bool {
+        if self.active_store_id.as_deref() == Some(store_contract_id) {
+            return false;
+        }
+        let Some(code) = self.store_codes.get(store_contract_id) else {
+            return false;
+        };
+        self.remembered_stores.as_ref().is_some_and(|stores| {
+            stores
+                .iter()
+                .any(|store| store.archived && store.store_code == *code)
+        })
+    }
+
     /// The presence contracts to GET (and subscribe to) now, each once:
     /// every loaded store's whose key is known and that this tab has not
     /// followed yet, and again each one that does not read open, spaced by
     /// [`presence_refresh_after`]. Changes nothing.
     pub fn presence_reads_due(&self, now_ms: u64) -> Vec<([u8; 32], [u8; 32])> {
+        // Not a store the user removed from their list (Ian, 2026-09-30:
+        // "Remove from list" stops following it). Its presence is still
+        // read if another store of the same key is on the list, or while
+        // the removed store's own page is open.
         let keys: std::collections::BTreeSet<[u8; 32]> = self
             .browsing_stores
-            .values()
-            .filter_map(|s| s.owner)
+            .iter()
+            .filter(|(id, _)| !self.removed_from_list(id))
+            .filter_map(|(_, s)| s.owner)
             .collect();
         keys.into_iter()
             .filter_map(|key| {

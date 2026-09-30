@@ -34110,6 +34110,34 @@ mod buy_flow_tests {
             state.store_presence(&[8; 32], late)
         );
         assert!(state.store_presence(&[9; 32], late).is_closed());
+
+        // A store removed from the list is no longer read (Ian, 2026-09-30),
+        // unless its page is open. Red without the removed-from-list filter.
+        let mut removed = AppState::default();
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x36; 32]);
+        removed.browsing_stores.insert(
+            vec![7; 32],
+            BrowsingStore {
+                owner: Some(other.verifying_key().to_bytes()),
+                ..Default::default()
+            },
+        );
+        removed
+            .store_codes
+            .insert(vec![7; 32], "Removedstore0001".to_string());
+        removed.remembered_stores = Some(vec![harvest_common::RememberedStore {
+            store_code: "Removedstore0001".to_string(),
+            archived: true,
+        }]);
+        assert!(removed.presence_reads_due(now).is_empty());
+        removed.active_store_id = Some(vec![7; 32]);
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
+        removed.active_store_id = None;
+        removed.remembered_stores = Some(vec![harvest_common::RememberedStore {
+            store_code: "Removedstore0001".to_string(),
+            archived: false,
+        }]);
+        assert_eq!(removed.presence_reads_due(now).len(), 1);
     }
 
     /// A store found open again starts its re-read spacing afresh. Mutated
