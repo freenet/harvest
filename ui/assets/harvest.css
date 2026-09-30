@@ -837,6 +837,7 @@ h4 {
 
 .order-ship-to {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .orders-earlier {
