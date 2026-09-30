@@ -135,6 +135,9 @@ pub struct AutoInvoiceUi {
     pub moved_past: std::collections::HashSet<Vec<u8>>,
     /// Whether the seller has been told that many addresses turned out used.
     pub vets_many_used_told: bool,
+    /// Set when a payment turned an address used: the window must be read
+    /// again, by a peek sent after this, before anything is raised on it.
+    pub stale_since: Option<u64>,
 }
 
 /// What an upcoming address's address contract showed (harvest#183).
@@ -474,8 +477,11 @@ impl AppState {
             .filter(
                 |(a, id)| match self.auto_invoice.vets.get(&a.script_pubkey) {
                     None => true,
-                    // Read under another build: read again under this one.
-                    Some(vet) if vet.contract_id != *id => true,
+                    // Read under another build: read again under this one. Not a
+                    // used one: a payment recorded under any build stands, and the
+                    // new build's contract would not show it (the bridge does not
+                    // look back).
+                    Some(vet) if vet.contract_id != *id && vet.verdict != VetVerdict::Used => true,
                     Some(vet) => match vet.verdict {
                         VetVerdict::Clear => now_ms.saturating_sub(vet.at_ms) >= VET_REFRESH_MS,
                         VetVerdict::Unreadable => now_ms.saturating_sub(vet.at_ms) >= PEEK_RETRY_MS,
@@ -546,8 +552,9 @@ impl AppState {
     /// A state arrived for `contract_id`. It settles a read that is out: used
     /// when it shows a payment, clear when not, unreadable when it does not
     /// decode. A payment on an address already read clear (a late answer, or
-    /// a payment since) makes it used AND the window stale, so the window and
-    /// counter are read again before any raise: it may be an address the
+    /// a payment since) turns it used too. Any address newly found used makes
+    /// the window stale, so the window and counter are read again, by a peek
+    /// sent after the verdict, before any raise: it may be an address the
     /// delegate has since handed out and a buyer paid (see [`AddressVet`]).
     /// Returns whether `contract_id` is an upcoming address's contract.
     pub(crate) fn on_address_vet_state(
@@ -566,14 +573,15 @@ impl AppState {
         }
         match address_state_payments(state_bytes) {
             Some(true) => {
-                let was_clear = self.auto_invoice.vets.values().any(|v| {
-                    v.contract_id.as_slice() == contract_id
-                        && matches!(v.verdict, VetVerdict::Clear | VetVerdict::Rechecking { .. })
+                let newly_used = self.auto_invoice.vets.values().any(|v| {
+                    v.contract_id.as_slice() == contract_id && v.verdict != VetVerdict::Used
                 });
                 self.settle_vet(contract_id, None, true, VetVerdict::Used, now_ms);
-                if was_clear {
-                    // Read the window again before believing it.
+                if newly_used {
+                    // Read the window again, by a peek sent from now on,
+                    // before believing it.
                     self.auto_invoice.upcoming_for = None;
+                    self.auto_invoice.stale_since = Some(now_ms);
                 }
             }
             Some(false) => {
@@ -677,11 +685,18 @@ impl AppState {
                         .is_none_or(|a| a.index < xpub.next_index)
             }
         };
+        // A window made stale by a payment is read again at once, unless a
+        // peek has gone since.
+        let asked_since_stale = match self.auto_invoice.stale_since {
+            Some(since) => self.auto_invoice.peek_sent_ms.is_some_and(|at| at >= since),
+            None => true,
+        };
         stale
-            && self
-                .auto_invoice
-                .peek_sent_ms
-                .is_none_or(|at| now_ms.saturating_sub(at) >= PEEK_RETRY_MS)
+            && (!asked_since_stale
+                || self
+                    .auto_invoice
+                    .peek_sent_ms
+                    .is_none_or(|at| now_ms.saturating_sub(at) >= PEEK_RETRY_MS))
     }
 
     /// The addresses to have `bridge` watch ahead of use, and the Ghost Key
@@ -1041,17 +1056,25 @@ impl AppState {
                 last_made_at_ms: inbox.last_made_at_ms().unwrap_or(0),
             }),
         };
+        // Only while the window is clear (harvest#183): it may have closed
+        // while the vault signed. Held, unsent, for the resend to carry once
+        // it opens again.
+        let open = self.current_upcoming().is_some();
         self.auto_invoice.delegation_in_flight.insert(
             pending.bridge,
             InFlightDelegation {
                 request: request.clone(),
                 ghostkey: pending.ghostkey.0,
                 issued_mainnet_height: pending.issued_mainnet_height,
-                sent_ms: now_ms,
-                attempts: 1,
+                sent_ms: if open {
+                    now_ms
+                } else {
+                    now_ms.saturating_sub(DELEGATION_RESEND_MS)
+                },
+                attempts: u32::from(open),
             },
         );
-        Some(request)
+        open.then_some(request)
     }
 
     /// The delegate's answer to `GetWatchKey`.
@@ -1323,7 +1346,15 @@ impl AppState {
         now_ms: u64,
     ) {
         match (result, self.bitcoin.payment_xpub.as_ref()) {
+            // The answer to a peek sent before a payment made the window
+            // stale can predate the sale that payment was for: dropped, the
+            // next peek brings a window read after it.
+            (Ok(_), Some(_))
+                if self.auto_invoice.stale_since.is_some_and(|since| {
+                    self.auto_invoice.peek_sent_ms.is_none_or(|at| at < since)
+                }) => {}
             (Ok(upcoming), Some(xpub)) => {
+                self.auto_invoice.stale_since = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();
