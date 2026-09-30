@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use harvest_common::listing::{AuthorizedListing, ListingAvailability, ListingKind};
+use harvest_common::listing::{AuthorizedListing, ListingAvailability};
 
 use super::app::{open_seller_page, Route, SellerPage, ROUTE};
 use crate::gateway::APP_STATE;
@@ -404,8 +404,8 @@ pub fn StorePage() -> Element {
 fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
     let info = store.info.as_ref().unwrap();
     // Counted the way the store's record (`StoreRecord`) counts them
-    // (`BrowsingStore::complaint_standings`), so the badge and the record
-    // agree, and neither reads the store's status.
+    // (`BrowsingStore::complaint_standings`), so the trust line and the
+    // record agree, and neither reads the store's status.
     let (record_class, record_text) = store.record_badge();
     let unrecognised_complaints = store.complaints_under_unrecognised_bridges();
     let mut show_messages = use_signal(|| false);
@@ -438,51 +438,75 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     let presence = APP_STATE
         .read()
         .store_presence(&contract_id, crate::state::now_ms());
+    let (pill, pill_open) = open_pill(store.closed, presence);
+    // This buyer's orders from this store are on Purchases, once: here only
+    // a line that goes there (critique S2-10).
+    let orders_here = if owned {
+        0
+    } else {
+        APP_STATE.read().buyer_purchases(&contract_id).len()
+    };
 
     rsx! {
         div {
-            div { class: "store-header",
-                div { class: "store-header-inner",
-                    div {
-                        h2 { class: "store-name", "{info.store_name}" }
-                        crate::markdown::Markdown {
-                            source: info.description.clone(),
-                            class: "store-desc",
-                        }
-                    }
-                    div { class: "store-meta",
-                        // "Clean record" only once the record has been read
-                        // (review round 1 of #143, P1-5). Opens the store's
-                        // record below (harvest#93 phase 2).
-                        button {
-                            class: "link-btn {record_class}",
-                            aria_expanded: if show_record() { "true" } else { "false" },
-                            onclick: move |_| show_record.toggle(),
-                            "{record_text}"
-                        }
-                        p { class: "seller-id",
-                            "Seller: {truncate_fingerprint(&info.seller_fingerprint)}"
-                        }
-                        p {
-                            class: if store.certificate_status.is_verified() { "cert-verified" } else { "cert-unverified" },
-                            "{store.certificate_status.label()}"
-                        }
+            // A seller looking at their own store sees it as a buyer would,
+            // and is sent back to its seller pages to manage it rather than
+            // offered a way to message themselves (entity model, wireframe F).
+            if owned {
+                div { class: "own-store-banner",
+                    span { "This is your store, as buyers see it." }
+                    button {
+                        class: "btn btn-sm btn-outline",
+                        onclick: {
+                            let id = contract_id.clone();
+                            move |_| open_seller_page(SellerPage::Store(id.clone()))
+                        },
+                        "Back to managing it"
                     }
                 }
+            }
 
-                // The verdict, spelled out. A badge alone tells a buyer that
-                // something is wrong without telling them what it costs them,
-                // and this is the one line on the page that decides whether
-                // the seller has anything at stake.
+            div { class: if pill_open { "store-header" } else { "store-header store-header-closed" },
+                // Open or Closed beside the name, as buyers see it
+                // (`presence_flow`; the 2026-09-26 decision, critique S2-3).
+                div { class: "store-status",
+                    h2 { class: "store-name", "{info.store_name}" }
+                    span { class: if pill_open { "pill pill-open" } else { "pill" }, "{pill}" }
+                }
+                // What the seller has at stake, in a buyer's words: never a
+                // key id or "Ghost Key" (mockup decision 3, critique S2-2).
+                // No "Open since" and no amount: see `backing_words`.
+                p { class: "trust",
+                    "{backing_words(&store.certificate_status)} \u{00b7} "
+                    // "No complaints" only once the record has been read
+                    // (review round 1 of #143, P1-5). Opens the store's
+                    // record, under its own heading (critique S2-4).
+                    button {
+                        class: "link-btn trust-record {record_class}",
+                        aria_expanded: if show_record() { "true" } else { "false" },
+                        aria_controls: "store-record",
+                        onclick: move |_| show_record.toggle(),
+                        "{record_text}"
+                    }
+                }
+                if store.certificate_status.is_verified() {
+                    p { class: "trust-why", "{TRUST_WHY}" }
+                }
+                crate::markdown::Markdown {
+                    source: info.description.clone(),
+                    class: "store-desc",
+                }
+
+                // The verdict, spelled out. The trust line alone tells a
+                // buyer that something is wrong without telling them what it
+                // costs them, and this is the one line on the page that
+                // decides whether the seller has anything at stake.
                 if !store.certificate_status.is_verified() {
                     p { class: "text-warning",
                         "{certificate_warning(&store.certificate_status)}"
                     }
                 }
 
-                // Said first and plainly: a closed store's key may be in
-                // someone else's hands, so nothing on this page can be
-                // bought, and the record stays visible (harvest#93, 6.4).
                 // Round 6 of #143: past the cap the count is a floor.
                 if store.record_full() {
                     p { class: "text-warning",
@@ -503,6 +527,10 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     }
                 }
 
+                // Said plainly: a closed store's key may be in someone
+                // else's hands, so nothing on this page can be bought, and
+                // the record stays visible (harvest#93, 6.4). Otherwise why
+                // it is not open, for which Buy now is withheld below.
                 if store.closed {
                     p { class: "text-warning",
                         "This store has closed. Its seller closed it because its key may be \
@@ -511,7 +539,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     }
                 } else if !owned {
                     if let Some(line) = presence.buyer_line() {
-                        p { class: if presence.is_closed() { "text-warning store-closed-note" } else { "text-muted" },
+                        p { class: if presence.is_closed() { "text-warning" } else { "text-muted" },
                             "{line}"
                         }
                     }
@@ -519,31 +547,38 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             }
 
             if show_record() {
-                super::reputation_view::StoreRecord { store_contract_id: contract_id.clone() }
+                section {
+                    class: "card store-record-card",
+                    id: "store-record",
+                    aria_label: "{info.store_name}\u{2019}s record",
+                    div { class: "row-between",
+                        h3 { "{info.store_name}\u{2019}s record" }
+                        button {
+                            class: "link-btn",
+                            onclick: move |_| show_record.set(false),
+                            "Hide"
+                        }
+                    }
+                    super::reputation_view::StoreRecord { store_contract_id: contract_id.clone() }
+                }
             }
 
-            // A seller looking at their own store sees it as a buyer would,
-            // and is sent back to its seller pages to manage it rather than
-            // offered a way to message themselves (entity model, wireframe F).
-            if owned {
-                div { class: "own-store-banner",
-                    span { "This is your store, as buyers see it." }
+            if orders_here > 0 {
+                p { class: "store-orders-line",
                     button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: {
-                            let id = contract_id.clone();
-                            move |_| open_seller_page(SellerPage::Store(id.clone()))
-                        },
-                        "Back to managing it"
+                        class: "link-btn",
+                        onclick: move |_| *ROUTE.write() = Route::Purchases,
+                        "{orders_line(orders_here)}"
                     }
                 }
-            } else {
-                div {
-                    style: "margin-bottom: 1.5rem;",
+            }
+
+            if !owned {
+                div { class: "store-ask",
                     button {
                         class: if show_messages() { "btn btn-sm btn-outline" } else { "btn btn-primary" },
                         onclick: move |_| show_messages.toggle(),
-                        if show_messages() { "Hide messages" } else { "Ask the seller" }
+                        if show_messages() { "Hide messages" } else { "Ask the seller a question" }
                     }
                 }
 
@@ -585,38 +620,66 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // And for a listing its seller has marked sold out
                         // (harvest#70): shown, never offered.
                         buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability, presence.is_open()),
-                        closed: presence.is_closed(),
+                        closed: store.closed || presence.is_closed(),
                     }
                 }
             }
 
-            super::buy_view::Purchases { store_contract_id: contract_id.clone() }
-
-            // The seller's own invoices on their own store; on anyone
-            // else's, only the settled ones, which carry no address. A
-            // buyer's unpaid orders show on the purchase card above, which
-            // reveals an address only once the buyer's node keeps the order
-            // (review round 3 of #143, P1-A): listing every order here put
-            // any of the seller's addresses in front of a buyer who kept
-            // nothing. No payment address on a store nobody should pay:
-            // closed, or backed by nothing a reader can believe in (Must
-            // Fix 2).
-            StoreInvoices {
-                orders: APP_STATE.read().invoices_shown(&contract_id),
-                owned,
-            }
-            if owned && !store.payable()
-                && store
-                    .orders
-                    .iter()
-                    .any(|o| o.status == harvest_common::payment::OrderStatus::AwaitingPayment)
-            {
-                p { class: "text-muted",
-                    "This store's unpaid invoices are not shown: it has closed, or nothing \
-                     vouches for the key that signs them, so none of them should be paid."
-                }
-            }
+            // No list of the store's invoices here any more (critique S2-8,
+            // S2-9): it showed a buyer other people's orders, and cancelled
+            // ones under "Settled". The record is the public evidence; the
+            // seller's own orders are on their Orders tab; a buyer's are on
+            // Purchases, and the one a Buy now form just made stays under it.
         }
+    }
+}
+
+/// The pill beside a store's name, as buyers see it, and whether it reads
+/// open: "Open" only while `presence_flow` says buyers can buy, "Closed"
+/// when it says not or the seller has closed the store for good, and
+/// "Checking" while it is too soon to say.
+pub(crate) fn open_pill(closed_for_good: bool, presence: StorePresence) -> (&'static str, bool) {
+    if closed_for_good {
+        return ("Closed", false);
+    }
+    match presence {
+        StorePresence::Open => ("Open", true),
+        StorePresence::Checking => ("Checking", false),
+        StorePresence::Closed(_) => ("Closed", false),
+    }
+}
+
+/// The first half of a store's trust line: what its backing shows, in a
+/// buyer's words.
+///
+/// Built only from what a reader can check. The mockup's "Open since Aug
+/// 2026 · Backed by $20" is not here: the backing's block is chosen by the
+/// seller and not yet checked (`harvest_common::backing::BackingStatement`,
+/// "Until then it does not prove when the backing was written"), so a date
+/// from it would be the seller's word; and the donation amount is
+/// deliberately not read (`ghostkey_cert`, "What is deliberately NOT read
+/// here").
+pub(crate) fn backing_words(status: &crate::ghostkey_cert::CertificateStatus) -> &'static str {
+    use crate::ghostkey_cert::CertificateStatus;
+    match status {
+        CertificateStatus::Verified => "Backed by a donation to Freenet",
+        CertificateStatus::Absent => "Not backed by a donation",
+        CertificateStatus::Invalid(_) => "Its backing doesn\u{2019}t check out",
+    }
+}
+
+/// Under the trust line of a store whose backing checks out. After the
+/// mockup's, less "for good": a full record keeps a new complaint in place
+/// of an older one (`reputation::MAX_COMPLAINTS`), which the page says when
+/// it happens.
+const TRUST_WHY: &str = "The seller donated to Freenet to open this store under their name. \
+     Complaints stay on its record, and the seller can\u{2019}t remove them.";
+
+/// The one line on a store's page about this buyer's orders from it.
+fn orders_line(orders: usize) -> String {
+    match orders {
+        1 => "You have 1 order from this store \u{203a}".to_string(),
+        n => format!("You have {n} orders from this store \u{203a}"),
     }
 }
 
@@ -654,77 +717,23 @@ fn visible_listings(
         .collect()
 }
 
-/// The invoices the viewer's own store has issued (`AppState::invoices_shown`).
-///
-/// They are on the store contract and public, which is not an oversight:
-/// decentralized payment verification is impossible unless everyone can see
-/// what was owed and where it was to be paid. That is application semantics
-/// requiring publication, and quite different from publishing a user's private
-/// list of addresses they happen to be interested in -- which Harvest refuses
-/// to do anywhere (see `harvest_common::bitcoin_delegate`).
-///
-/// Every invoice goes through the SAME `OrderCard` the seller's own payments
-/// panel uses, so the per-invoice bridge check travels with it. That check is
-/// the one a buyer most needs and is easiest to leave out of a second copy:
-/// the trusted-bridge set moved onto the order to make rotation possible, so
-/// two invoices from one store may name different observers, and an invoice
-/// whose "Paid" verdict would rest on a stranger's signature has to say so
-/// before the buyer sends anything.
-#[component]
-fn StoreInvoices(orders: Vec<harvest_common::payment::AuthorizedOrder>, owned: bool) -> Element {
-    if orders.is_empty() {
-        return rsx! {};
-    }
-    let mut sorted = orders;
-    sorted.sort_by_key(|o| std::cmp::Reverse(o.order.created_at));
-    let bitcoin = crate::gateway::APP_STATE.read().bitcoin.clone();
-
-    rsx! {
-        div { style: "margin-top: 24px;",
-            h4 { "Invoices" }
-            // The paying instructions only where an invoice can carry an
-            // address: on the viewer's own store. Anyone else's list holds
-            // settled invoices only (review round 5, P3).
-            if owned {
-                p { class: "text-muted",
-                    "Pay the address shown on an invoice for the exact amount. Anyone can "
-                    "check the evidence that settles it, so neither you nor the seller has to "
-                    "be taken at their word about the payment."
-                }
-            } else {
-                p { class: "text-muted",
-                    "Settled invoices. Anyone can check the evidence that settled each one."
-                }
-            }
-            for order in sorted.iter() {
-                super::bitcoin_view::OrderCard {
-                    key: "{order.order.id}",
-                    order: order.clone(),
-                    live: super::bitcoin_view::live_address_for_order(&bitcoin, &order.order),
-                    onlooker: !owned,
-                }
-            }
-        }
-    }
-}
-
-/// What an unverified certificate means for the person reading the page.
+/// What an unverified backing means for the person reading the page.
 ///
 /// The two cases are genuinely different and must not be collapsed. A store
 /// with no certificate is claiming nothing; a store whose certificate fails
 /// is claiming a bond it does not have, which is worse than claiming none.
+/// In a buyer's words: no key ids, no "Ghost Key" (mockup decision 3), and
+/// so not the technical reason a certificate failed.
 fn certificate_warning(status: &crate::ghostkey_cert::CertificateStatus) -> String {
     use crate::ghostkey_cert::CertificateStatus;
     match status {
         CertificateStatus::Verified => String::new(),
-        CertificateStatus::Absent => "This store publishes no ghostkey certificate, so nothing \
-             here shows that the seller's identity cost anything to create. They can abandon it \
-             and start again for free."
+        CertificateStatus::Absent => "Nothing shows that this seller gave anything to open this \
+             store, so they could abandon it and start again for free."
             .to_string(),
-        CertificateStatus::Invalid(why) => format!(
-            "This store's ghostkey certificate does not check out ({why}). Treat the seller as \
-             anonymous: nothing here shows they have staked anything they would lose."
-        ),
+        CertificateStatus::Invalid(_) => "This store claims a donation that doesn\u{2019}t check \
+             out. Treat the seller as anonymous: nothing here shows they have anything to lose."
+            .to_string(),
     }
 }
 
@@ -791,21 +800,17 @@ fn ListingCard(
     closed: bool,
 ) -> Element {
     let l = &listing.listing;
-    let stock = match &availability {
-        ListingAvailability::Available { quantity: Some(0) } | ListingAvailability::SoldOut => {
-            Some("Sold out".to_string())
-        }
-        ListingAvailability::Available { quantity: Some(n) } => Some(format!("{n} available")),
-        _ => None,
-    };
+    let corner = availability_words(&availability, closed);
     let sold_out = !availability.is_buyable();
 
     rsx! {
         div { class: if sold_out || closed { "listing-card listing-sold-out" } else { "listing-card" },
+            // No kind badge: every listing is a sale now, and "SALE" read as
+            // "discounted" (critique S2-5). Availability in its place.
             div { class: "listing-header",
                 h4 { "{l.title}" }
-                span { class: "badge {kind_badge_class(&l.kind)}",
-                    "{kind_label(&l.kind)}"
+                if let Some(corner) = corner {
+                    span { class: "listing-stock", "{corner}" }
                 }
             }
             // The store verified, and this listing did not: it carries a
@@ -823,19 +828,12 @@ fn ListingCard(
                 source: l.description.clone(),
                 class: "listing-desc",
             }
-            div { class: "listing-footer",
-                if let Some((price, delivery)) = price_lines(l) {
+            // The price, then the delivery under it; no listed date, which a
+            // buyer does not need (critique S2-7).
+            if let Some((price, delivery)) = price_lines(l) {
+                div { class: "listing-terms",
                     span { class: "listing-price", "{price}" }
                     span { class: "listing-delivery", "{delivery}" }
-                }
-                if let Some(ref stock) = stock {
-                    span { class: "listing-stock", "{stock}" }
-                }
-                {
-                    let date = l.created_at.format("%Y-%m-%d").to_string();
-                    rsx! {
-                        span { class: "listing-date", "Listed {date}" }
-                    }
                 }
             }
             // A listing from before every listing had a sats price (a
@@ -854,11 +852,28 @@ fn ListingCard(
                 },
                 // Silence rather than a disabled button: a control that can
                 // never work is worse than none, and the reason is already on
-                // the page above -- the certificate warning, or the notice
-                // that this store publishes no key to write to.
+                // the page above -- the certificate warning, the store's
+                // Closed pill and why, or the notice that this store
+                // publishes no key to write to.
                 None => rsx! {},
             }
         }
+    }
+}
+
+/// What a listing's top corner says (after the mockup): "Closed" while the
+/// store is, "Sold out", "<n> left" when the seller counts its stock, and
+/// nothing for one on sale with no count.
+fn availability_words(availability: &ListingAvailability, store_closed: bool) -> Option<String> {
+    if store_closed {
+        return Some("Closed".to_string());
+    }
+    match availability {
+        ListingAvailability::Available { quantity: Some(0) } | ListingAvailability::SoldOut => {
+            Some("Sold out".to_string())
+        }
+        ListingAvailability::Available { quantity: Some(n) } => Some(format!("{n} left")),
+        _ => None,
     }
 }
 
@@ -938,30 +953,6 @@ fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> El
                 }
             }
         }
-    }
-}
-
-fn truncate_fingerprint(fp: &str) -> String {
-    if fp.len() > 12 {
-        format!("{}...", &fp[..12])
-    } else {
-        fp.to_string()
-    }
-}
-
-fn kind_badge_class(kind: &ListingKind) -> &'static str {
-    match kind {
-        ListingKind::Sale => "badge-sale",
-        ListingKind::Gift => "badge-gift",
-        ListingKind::Request => "badge-request",
-    }
-}
-
-fn kind_label(kind: &ListingKind) -> &'static str {
-    match kind {
-        ListingKind::Sale => "Sale",
-        ListingKind::Gift => "Gift",
-        ListingKind::Request => "Request",
     }
 }
 
@@ -1108,7 +1099,7 @@ mod typed_link_tests {
 #[cfg(test)]
 mod availability_tests {
     use super::*;
-    use harvest_common::listing::{Listing, ListingId, ListingStatus};
+    use harvest_common::listing::{Listing, ListingId, ListingKind, ListingStatus};
 
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
@@ -1391,5 +1382,89 @@ mod stores_page_tests {
             crate::store_link::OLD_FORMAT_LINK_MESSAGE
         );
         assert!(not_a_store_message("hello").starts_with("That is not a store code."));
+    }
+}
+
+#[cfg(test)]
+mod store_page_tests {
+    use super::*;
+    use crate::ghostkey_cert::CertificateStatus;
+    use harvest_common::presence::ClosedWhy;
+
+    /// Open or Closed beside the name, as buyers see it: Open only while
+    /// buyers can buy, Closed when not or when the seller closed the store
+    /// for good, whatever its presence says. Red if a store closed for good
+    /// reads Open.
+    #[test]
+    fn the_pill_says_open_only_while_buyers_can_buy() {
+        assert_eq!(open_pill(false, StorePresence::Open), ("Open", true));
+        assert_eq!(open_pill(true, StorePresence::Open), ("Closed", false));
+        assert_eq!(
+            open_pill(false, StorePresence::Closed(ClosedWhy::NoHeartbeat)),
+            ("Closed", false)
+        );
+        assert_eq!(
+            open_pill(false, StorePresence::Checking),
+            ("Checking", false)
+        );
+    }
+
+    /// **A buyer never sees "Ghost Key", a key id, or a figure the app
+    /// cannot check** (mockup decision 3, critique S2-2): the trust line and
+    /// its warnings say what the backing shows in plain words, and name no
+    /// amount and no date.
+    #[test]
+    fn the_trust_line_is_in_a_buyers_words() {
+        let invalid = CertificateStatus::Invalid(
+            "not a readable Ghost Key certificate: bad armour".to_string(),
+        );
+        for status in [
+            CertificateStatus::Verified,
+            CertificateStatus::Absent,
+            invalid,
+        ] {
+            for text in [
+                backing_words(&status).to_string(),
+                certificate_warning(&status),
+            ] {
+                let lower = text.to_lowercase();
+                assert!(
+                    !lower.contains("ghost") && !lower.contains("certificate"),
+                    "{text:?}"
+                );
+                assert!(!text.contains('$'), "no amount: {text:?}");
+            }
+        }
+        assert!(!TRUST_WHY.to_lowercase().contains("ghost"));
+        assert_eq!(
+            backing_words(&CertificateStatus::Verified),
+            "Backed by a donation to Freenet"
+        );
+    }
+
+    /// A listing's corner: Closed while the store is, else Sold out, else
+    /// how many are left when the seller counts them.
+    #[test]
+    fn a_listing_corner_says_what_a_buyer_can_get() {
+        let on_sale = ListingAvailability::Available { quantity: None };
+        let three = ListingAvailability::Available { quantity: Some(3) };
+        assert_eq!(availability_words(&three, false).as_deref(), Some("3 left"));
+        assert_eq!(availability_words(&on_sale, false), None);
+        assert_eq!(
+            availability_words(&ListingAvailability::Available { quantity: Some(0) }, false)
+                .as_deref(),
+            Some("Sold out")
+        );
+        assert_eq!(
+            availability_words(&ListingAvailability::SoldOut, false).as_deref(),
+            Some("Sold out")
+        );
+        assert_eq!(availability_words(&three, true).as_deref(), Some("Closed"));
+    }
+
+    #[test]
+    fn the_orders_line_counts_in_words() {
+        assert_eq!(orders_line(1), "You have 1 order from this store \u{203a}");
+        assert_eq!(orders_line(3), "You have 3 orders from this store \u{203a}");
     }
 }

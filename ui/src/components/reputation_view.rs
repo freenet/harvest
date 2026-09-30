@@ -58,8 +58,9 @@ impl RecordSections {
         match (total, self.counted()) {
             (0, _) => None,
             (_, 0) => Some(format!("No complaints counted, of {total} on record")),
+            (_, 1) => Some(format!("1 complaint counted, of {total} on record")),
             (_, counted) => Some(format!(
-                "{counted} complaint(s) counted, of {total} on record"
+                "{counted} complaints counted, of {total} on record"
             )),
         }
     }

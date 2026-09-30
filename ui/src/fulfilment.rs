@@ -1137,13 +1137,13 @@ mod tests {
         };
         assert_eq!(store.counted_complaints(), 1);
         assert_eq!(store.complaints_under_unrecognised_bridges(), 1);
-        assert_eq!(store.record_badge().1, "1 complaint(s)");
+        assert_eq!(store.record_badge().1, "1 complaint");
 
         let sections = RecordSections::of(&store);
         assert_eq!(sections.counted(), 1);
         assert_eq!(
             sections.headline().as_deref(),
-            Some("1 complaint(s) counted, of 2 on record"),
+            Some("1 complaint counted, of 2 on record"),
             "the total is the whole record, both sections"
         );
         assert_eq!(
@@ -1164,7 +1164,7 @@ mod tests {
         );
     }
 
-    /// **harvest#144: a full record never reads "Clean record".** A full
+    /// **harvest#144: a full record never reads "No complaints".** A full
     /// record keeps the complaints nearest their payments, and a seller can
     /// date its own-bridge complaints at their payment, so a record full of
     /// complaints nobody counts may have pushed every genuine one out. Red
@@ -1184,7 +1184,7 @@ mod tests {
         assert_eq!(store.counted_complaints(), 0);
         assert_eq!(
             store.record_badge().1,
-            "Clean record",
+            "No complaints",
             "not full: every complaint anyone made is still on it"
         );
         store.complaints.push(store.complaints[0].clone());
@@ -1236,10 +1236,7 @@ mod tests {
         assert_eq!(store.counted_complaints(), honest_count);
         assert_eq!(
             store.record_badge(),
-            (
-                "reputation-negative",
-                format!("{honest_count} complaint(s)")
-            ),
+            ("reputation-negative", format!("{honest_count} complaints")),
             "a full record with real counted complaints is not \"none counted\""
         );
     }

@@ -1527,7 +1527,7 @@ impl BrowsingStore {
     }
 
     /// The store's badge: its load state and counted complaints, except
-    /// that a FULL record never reads "Clean record" (harvest#144).
+    /// that a FULL record never reads "No complaints" (harvest#144).
     ///
     /// A full record keeps the complaints dated nearest their payments
     /// (`reputation::MAX_COMPLAINTS`), and a seller's complaints on its own
@@ -2871,7 +2871,7 @@ fn paid_on(
 /// How far a store's reputation record has loaded (harvest#53 Phase C,
 /// review round 1 of #143, P1-5).
 ///
-/// An empty complaint list reads as "Clean record" only once the record
+/// An empty complaint list reads as "No complaints" only once the record
 /// itself has been read. Before that, and when the node said it holds
 /// nothing or the fetch failed, an empty list is an absence of information,
 /// and a badge that turned it into praise would be the one thing on the page
@@ -2895,8 +2895,9 @@ impl RecordLoad {
     /// `counted` complaints that count: `(css class, text)`.
     pub fn badge(self, counted: usize) -> (&'static str, String) {
         match self {
-            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "Clean record".into()),
-            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaint(s)")),
+            RecordLoad::Loaded if counted == 0 => ("reputation-clean", "No complaints".into()),
+            RecordLoad::Loaded if counted == 1 => ("reputation-negative", "1 complaint".into()),
+            RecordLoad::Loaded => ("reputation-negative", format!("{counted} complaints")),
             RecordLoad::Loading => ("text-muted", "Record loading".into()),
             RecordLoad::NotFound => ("text-muted", "No record found".into()),
             RecordLoad::Unavailable => ("text-muted", "Record unavailable".into()),
@@ -9248,53 +9249,6 @@ impl AppState {
         }
         let held = self.browsing_stores.get(store_contract_id)?.owner?;
         ed25519_dalek::VerifyingKey::from_bytes(&held).ok()
-    }
-
-    /// The invoices the store page lists: every order of a store this node
-    /// owns, while the store is payable; for anyone else's store, only the
-    /// orders past `AwaitingPayment` (review round 3 of #143, P1-A; narrowed
-    /// in round 4, P3). A buyer sees a payment address only on their
-    /// purchase card, once their node keeps the order
-    /// (`docs/complaint-threat-model.md` section 3.1). The public record of
-    /// settled invoices stays readable to everyone, and carries no address:
-    /// the card offers one only for an order awaiting payment
-    /// (`fulfilment::offers_payment_address`).
-    pub fn invoices_shown(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
-        use harvest_common::payment::OrderStatus;
-        let Some(store) = self.browsing_stores.get(store_contract_id) else {
-            return Vec::new();
-        };
-        if self.store_owner_fingerprint(store_contract_id).is_none() {
-            return store
-                .orders
-                .iter()
-                .filter(|order| order.status != OrderStatus::AwaitingPayment)
-                .cloned()
-                .collect();
-        }
-        if store.payable() {
-            // Less the Buy now orders nobody has paid: not orders, as the
-            // seller sees them (`fulfilment::is_unpaid_buy_now`). Their
-            // buyers see them on their own purchase cards.
-            store
-                .orders
-                .iter()
-                .filter(|order| {
-                    !crate::fulfilment::is_unpaid_buy_now(order)
-                        || self.withheld_settlements.contains_key(&order.order.id)
-                })
-                .cloned()
-                .collect()
-        } else {
-            // A closed or unbacked store of the viewer's own: its settled
-            // history, as everyone else sees it (review round 5, P3).
-            store
-                .orders
-                .iter()
-                .filter(|order| order.status != OrderStatus::AwaitingPayment)
-                .cloned()
-                .collect()
-        }
     }
 
     pub fn store_owner_fingerprint(&self, store_contract_id: &[u8]) -> Option<String> {
@@ -23953,7 +23907,7 @@ mod buy_flow_tests {
         assert_eq!(stores[0].record, RecordLoad::Loading.badge(0).1);
         state.browsing_stores.get_mut(STORE).unwrap().record = RecordLoad::Loaded;
         let stores = crate::components::my_store::seller_stores(&state);
-        assert_eq!(stores[0].record, "Clean record");
+        assert_eq!(stores[0].record, "No complaints");
     }
 
     /// **A seller who cannot see the chain is not told to reissue
@@ -30258,7 +30212,7 @@ mod buy_flow_tests {
         }
     }
 
-    /// **An unread record is never "Clean record"** (review round 1 of
+    /// **An unread record is never "No complaints"** (review round 1 of
     /// #143, P1-5): loading, not found and unavailable each say so, and only
     /// a record that was read with nothing counted is clean. A NotFound or a
     /// failed fetch after the record was read does not un-read it. Red if
@@ -30270,11 +30224,12 @@ mod buy_flow_tests {
             (RecordLoad::Loading, "Record loading"),
             (RecordLoad::NotFound, "No record found"),
             (RecordLoad::Unavailable, "Record unavailable"),
-            (RecordLoad::Loaded, "Clean record"),
+            (RecordLoad::Loaded, "No complaints"),
         ] {
             assert_eq!(state.badge(0).1, text);
         }
-        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaint(s)");
+        assert_eq!(RecordLoad::Loaded.badge(1).1, "1 complaint");
+        assert_eq!(RecordLoad::Loaded.badge(2).1, "2 complaints");
         assert_eq!(RecordLoad::default(), RecordLoad::Loading);
 
         let (mut state, _) = a_paid_purchase();
@@ -30555,8 +30510,9 @@ mod buy_flow_tests {
     }
 
     /// **No view offers a buyer a payment address while `PurchaseNotKept`
-    /// holds** (review round 3 of #143, P1-A): not the store's invoice list,
-    /// and not the payment diagnostics (the Payments tab until harvest#93
+    /// holds** (review round 3 of #143, P1-A): not the store's invoice list
+    /// (gone from the store page since the 2026-09-30 Stores page), and not
+    /// the payment diagnostics (the Payments tab until harvest#93
     /// phase 2), even for an order that names one of this
     /// node's Ghost Keys as its buyer. The seller's own book still shows.
     /// Red if either view lists orders of a store this node does not own.
@@ -30575,14 +30531,15 @@ mod buy_flow_tests {
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
         assert!(state.browsing_stores[STORE].payable());
         assert!(!purchases(&state)[0].blockers.is_empty(), "not kept");
-        assert!(state.invoices_shown(STORE).is_empty(), "store page");
+        // The store page lists no invoices at all since the 2026-09-30
+        // Stores page (critique S2-8), so it offers no address either.
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "payment diagnostics"
         );
-        // Another settled order of the same store is on its public list,
-        // with no address (review round 4, P3), and NOT on the diagnostics,
-        // which lists nothing it cannot check is this buyer's (round 5).
+        // Another settled order of the same store, with no address (review
+        // round 4, P3), is NOT on the diagnostics, which lists nothing it
+        // cannot check is this buyer's (round 5).
         let mut other = unpaid.clone();
         other.order.amount_sats += 1;
         let mut settled = resigned(other, &seller_signing_key());
@@ -30598,14 +30555,13 @@ mod buy_flow_tests {
             .unwrap()
             .orders
             .push(settled.clone());
-        assert_eq!(state.invoices_shown(STORE), vec![settled.clone()]);
         assert!(
             crate::components::bitcoin_view::my_orders(&state).is_empty(),
             "payment diagnostics"
         );
         state.browsing_stores.get_mut(STORE).unwrap().orders = vec![unpaid.clone()];
 
-        // The seller's own store lists its own invoices.
+        // The seller's own diagnostics list its own invoices.
         state.my_stores.insert(
             "seller-fp".to_string(),
             vec![StoreRegistration {
@@ -30616,7 +30572,6 @@ mod buy_flow_tests {
                 store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
             }],
         );
-        assert_eq!(state.invoices_shown(STORE), vec![unpaid.clone()]);
         assert_eq!(
             crate::components::bitcoin_view::my_orders(&state),
             vec![unpaid]

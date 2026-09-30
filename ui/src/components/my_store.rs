@@ -58,9 +58,9 @@ pub(crate) struct SellerStore {
     pub listings: usize,
     /// Buyers' requests still waiting for an invoice.
     pub requests: usize,
-    /// The store's record as its badge reads (`RecordLoad::badge`): "Clean
-    /// record" only once the record has been read, and complaints counted the
-    /// way the store page counts them.
+    /// The store's record as its badge reads (`RecordLoad::badge`): "No
+    /// complaints" only once the record has been read, and complaints counted
+    /// the way the store page counts them.
     pub record: String,
     /// Invoices this seller issued, unpaid and still open, whose anchor is
     /// too old for a buyer to start paying. Never a Buy now: one nobody paid

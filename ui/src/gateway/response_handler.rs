@@ -182,7 +182,7 @@ fn handle_contract_response(response: ContractResponse) {
                 .write()
                 .on_address_reuse_absent(instance_id.as_bytes());
             // And to a store's reputation record, so the store page says
-            // "no record found" rather than "Clean record" (#143 review
+            // "no record found" rather than "No complaints" (#143 review
             // round 1, P1-5). Only a record id matches, so any other
             // contract's NotFound passes through untouched.
             #[cfg(target_arch = "wasm32")]
