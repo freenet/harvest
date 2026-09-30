@@ -415,6 +415,10 @@ pub struct AppState {
 
     /// Store keys whose subkeys have been asked for this session.
     pub store_subkeys_requested: HashSet<[u8; 32]>,
+    /// The request id of the latest `GetStoreSubkeys` per store key, so the
+    /// answer deadline (`custody_flow::SUBKEYS_TIMEOUT_MS`) acts only for the
+    /// request it was armed for (harvest#203).
+    pub subkeys_request_ids: HashMap<[u8; 32], u64>,
 
     /// Whether this device's Harvest delegate HOLDS each registered store
     /// key, as its last `StoreList` answer said (harvest#138).

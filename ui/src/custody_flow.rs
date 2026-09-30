@@ -753,6 +753,7 @@ impl AppState {
             return;
         }
         let request_id = self.next_messaging_request_id();
+        self.subkeys_request_ids.insert(store, request_id);
         // Sent through the path that clears the marker when the send fails
         // (#101 review): the marker is what stops a second ask, so leaving
         // it set after a failed send means the delegate is never asked
@@ -760,6 +761,7 @@ impl AppState {
         #[cfg(target_arch = "wasm32")]
         spawn_subkeys_request(
             store,
+            request_id,
             harvest_common::HarvestDelegateRequest::GetStoreSubkeys {
                 request_id,
                 store_verifying_key: store,
@@ -851,14 +853,23 @@ impl AppState {
     /// No answer to `GetStoreSubkeys` for `store` in [`SUBKEYS_TIMEOUT_MS`]:
     /// release what waits on it, and let a retry ask again. Nothing if the
     /// answer came meanwhile. A late answer is still recorded when it comes.
-    pub(crate) fn on_subkeys_unanswered(&mut self, store: [u8; 32]) {
-        if self.store_subkeys.contains_key(&store) || !self.store_subkeys_requested.contains(&store)
-        {
+    ///
+    /// Only for the request the timer was armed for (`request_id`): an
+    /// earlier request's timer must not end a retry's wait. Says nothing when
+    /// nothing waits: silence is not a failure, and a late answer still lands.
+    pub(crate) fn on_subkeys_unanswered(&mut self, store: [u8; 32], request_id: u64) {
+        if !self.subkeys_unanswered_due(store, request_id) {
             return;
         }
-        if !self.release_waiters_on_subkeys(store, "the Harvest delegate did not answer in time") {
-            self.store_subkeys_requested.remove(&store);
-        }
+        self.release_waiters_on_subkeys(store, "the Harvest delegate did not answer in time");
+    }
+
+    /// Whether the timer for `request_id` finds its request still unanswered
+    /// (read-only, so the timer takes the state for writing only then).
+    pub(crate) fn subkeys_unanswered_due(&self, store: [u8; 32], request_id: u64) -> bool {
+        !self.store_subkeys.contains_key(&store)
+            && self.store_subkeys_requested.contains(&store)
+            && self.subkeys_request_ids.get(&store) == Some(&request_id)
     }
 
     /// The `GetStoreSubkeys` request could not be SENT.
@@ -907,7 +918,11 @@ impl AppState {
 /// Ask the Harvest delegate for a store's derived keys; if the request
 /// cannot be sent, forget that it was asked so a retry asks again.
 #[cfg(target_arch = "wasm32")]
-fn spawn_subkeys_request(store: [u8; 32], request: harvest_common::HarvestDelegateRequest) {
+fn spawn_subkeys_request(
+    store: [u8; 32],
+    request_id: u64,
+    request: harvest_common::HarvestDelegateRequest,
+) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::{ReadableExt, WritableExt};
         let fail = |why: String| {
@@ -932,9 +947,16 @@ fn spawn_subkeys_request(store: [u8; 32], request: harvest_common::HarvestDelega
                     return;
                 }
                 gloo_timers::future::TimeoutFuture::new(SUBKEYS_TIMEOUT_MS).await;
-                crate::gateway::APP_STATE
-                    .write()
-                    .on_subkeys_unanswered(store);
+                // Read first: a write re-renders the app, and there is almost
+                // never anything to release.
+                let due = crate::gateway::APP_STATE
+                    .read()
+                    .subkeys_unanswered_due(store, request_id);
+                if due {
+                    crate::gateway::APP_STATE
+                        .write()
+                        .on_subkeys_unanswered(store, request_id);
+                }
             }
             Err(e) => fail(format!("could not encode the request: {e}")),
         }
@@ -2095,8 +2117,9 @@ mod tests {
     /// A `GetStoreSubkeys` nobody answers (the node killed the call, and its
     /// error names no request: harvest#204) releases the creation waiting on
     /// it after the deadline, so the seller can try again; an answer that
-    /// came first is left alone. Mutated red by a no-op deadline, and by
-    /// releasing even when the answer arrived.
+    /// came first, or a timer from an earlier request, is left alone.
+    /// Mutated red by a no-op deadline, by releasing even when the answer
+    /// arrived, and by ignoring the request id.
     #[test]
     fn an_unanswered_subkeys_request_releases_the_creation() {
         let waiting = || {
@@ -2115,10 +2138,14 @@ mod tests {
                 carried_listings: Vec::new(),
             });
             state.store_subkeys_requested.insert(store_vk().to_bytes());
+            state.subkeys_request_ids.insert(store_vk().to_bytes(), 5);
             state
         };
+        // A timer from an earlier request does not end this one.
         let mut state = waiting();
-        state.on_subkeys_unanswered(store_vk().to_bytes());
+        state.on_subkeys_unanswered(store_vk().to_bytes(), 4);
+        assert!(state.store_creation_in_flight.is_some(), "not its request");
+        state.on_subkeys_unanswered(store_vk().to_bytes(), 5);
         assert!(state.store_creation_in_flight.is_none(), "released");
         assert!(!state
             .store_subkeys_requested
@@ -2136,7 +2163,7 @@ mod tests {
             }),
         );
         let before = state.notifications.len();
-        state.on_subkeys_unanswered(store_vk().to_bytes());
+        state.on_subkeys_unanswered(store_vk().to_bytes(), 5);
         assert_eq!(
             state.notifications.len(),
             before,
