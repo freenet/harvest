@@ -34141,6 +34141,46 @@ mod buy_flow_tests {
         assert_eq!(removed.presence_reads_due(now).len(), 1);
         removed.browsing_stores.remove(&vec![6u8; 32]);
         assert!(removed.presence_reads_due(now).is_empty());
+        // One of our own is never muted, even marked removed. Red without
+        // the own-store check.
+        let own_key = crate::state::test_store_key();
+        let own_code = harvest_common::store::store_code(
+            &ed25519_dalek::VerifyingKey::from_bytes(&own_key).expect("key"),
+        );
+        let mut ours = removed.clone();
+        ours.browsing_stores.insert(
+            vec![5; 32],
+            BrowsingStore {
+                owner: Some(own_key),
+                ..Default::default()
+            },
+        );
+        ours.store_codes.insert(vec![5; 32], own_code.clone());
+        ours.remembered_stores = Some(vec![
+            harvest_common::RememberedStore {
+                store_code: "Removedstore0001".to_string(),
+                archived: true,
+            },
+            harvest_common::RememberedStore {
+                store_code: own_code,
+                archived: true,
+            },
+        ]);
+        // Not yet known as ours: muted like any removed store.
+        assert!(ours.presence_reads_due(now).is_empty());
+        ours.my_stores.insert(
+            "fp-own".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: vec![5; 32],
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(own_key),
+            }],
+        );
+        let due = ours.presence_reads_due(now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, own_key);
         removed.active_store_id = Some(vec![7; 32]);
         assert_eq!(removed.presence_reads_due(now).len(), 1);
         removed.active_store_id = None;

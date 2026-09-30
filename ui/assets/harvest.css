@@ -1784,7 +1784,8 @@ h4 {
   .tab,
   .form-select,
   .vrow-go,
-  .needs-hit {
+  .needs-hit,
+  .harvest-footer summary {
     min-height: 44px;
   }
 

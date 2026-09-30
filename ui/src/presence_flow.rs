@@ -181,13 +181,23 @@ impl AppState {
     /// card rests on the store's own state (`payment_blockers`), not on its
     /// presence, which here only stops being refreshed.
     pub fn removed_from_list(&self, store_contract_id: &[u8]) -> bool {
+        self.removed_from_list_given(store_contract_id, &self.own_store_codes())
+    }
+
+    /// [`Self::removed_from_list`] with our own store codes worked out once
+    /// by the caller, which asks it for every loaded store.
+    fn removed_from_list_given(
+        &self,
+        store_contract_id: &[u8],
+        own: &std::collections::HashSet<String>,
+    ) -> bool {
         if self.active_store_id.as_deref() == Some(store_contract_id) {
             return false;
         }
         let Some(code) = self.store_codes.get(store_contract_id) else {
             return false;
         };
-        if self.own_store_codes().contains(code) {
+        if own.contains(code) {
             return false;
         }
         self.remembered_stores.as_ref().is_some_and(|stores| {
@@ -206,10 +216,11 @@ impl AppState {
         // "Remove from list" stops following it). Its presence is still
         // read if another store of the same key is on the list, or while
         // it is the store opened last.
+        let own = self.own_store_codes();
         let keys: std::collections::BTreeSet<[u8; 32]> = self
             .browsing_stores
             .iter()
-            .filter(|(id, _)| !self.removed_from_list(id))
+            .filter(|(id, _)| !self.removed_from_list_given(id, &own))
             .filter_map(|(_, s)| s.owner)
             .collect();
         keys.into_iter()
