@@ -1279,6 +1279,13 @@ fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
                 "Each invoice gets a new address from this wallet. Harvest can create addresses but "
                 "can never spend your coins."
             }
+            // Where a seller checks the Bitcoin side when payments seem slow
+            // to show; it used to sit in every visitor's footer.
+            button {
+                class: "link-btn",
+                onclick: move |_| *super::app::ROUTE.write() = super::app::Route::Diagnostics,
+                "Check Harvest\u{2019}s connection to Bitcoin"
+            }
         }
 
         section { class: "card",

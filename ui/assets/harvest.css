@@ -975,6 +975,15 @@ h4 {
   font-weight: 300;
 }
 
+.harvest-footer summary {
+  cursor: pointer;
+  min-height: 24px;
+}
+
+.harvest-footer details[open] > * + * {
+  margin-top: var(--space-xs);
+}
+
 /* ---- Bitcoin / Payments ---- */
 
 .btc-status-bar {

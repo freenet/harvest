@@ -406,12 +406,20 @@ pub fn App() -> Element {
                 Route::Diagnostics => rsx! { BitcoinView {} },
             }
 
+            // Details for whoever needs them (a developer, or a seller asked
+            // which build they run), folded away: a build time and "Bitcoin
+            // bridge status" in every visitor's footer confused first-time
+            // visitors (freenet.org/open critique). Sellers reach the Bitcoin
+            // page from Settings.
             footer { class: "harvest-footer",
-                span { "Built: {format_build_time()}" }
-                button {
-                    class: "link-btn",
-                    onclick: move |_| *ROUTE.write() = Route::Diagnostics,
-                    "Bitcoin bridge status"
+                details {
+                    summary { "About this version" }
+                    p { "Built {format_build_time()}." }
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| *ROUTE.write() = Route::Diagnostics,
+                        "Harvest\u{2019}s connection to Bitcoin"
+                    }
                 }
             }
         }
