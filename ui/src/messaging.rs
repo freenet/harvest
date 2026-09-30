@@ -809,6 +809,33 @@ impl MailboxEntry {
     }
 }
 
+/// Whether `tag` is the canonical 32-byte encoding of an X25519 public key:
+/// bit 255 clear and the u-coordinate below p = 2^255 - 19.
+///
+/// X25519 ignores bit 255 and reduces u modulo p, so every key has twins
+/// (the same bytes with bit 255 set, and for u < 19 also u + p) that give the
+/// SAME shared secret, and so the same conversation keys. Whoever holds a
+/// conversation's keys could otherwise write under a twin tag, and a reader
+/// keyed by tag would see a second conversation with the first one's keys:
+/// one that claims the first one's paid orders (`crate::order_threads`) and
+/// can take its place under an order card. A buyer's own tag is always
+/// canonical (x25519 never outputs a twin), so refusing twins costs nobody
+/// anything. The harvest delegate does not check this yet; the UI does not
+/// ask it for a twin's keys (`AppState::conversation_keys_to_request`) and
+/// never reads one ([`read_mailbox`]).
+pub fn is_canonical_tag(tag: &[u8]) -> bool {
+    let Ok(key) = <[u8; 32]>::try_from(tag) else {
+        return false;
+    };
+    if key[31] & 0x80 != 0 {
+        return false;
+    }
+    // Below 2^255, the values at or above p are p..=2^255-1: 0x7f in the top
+    // byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+    let at_least_p = key[31] == 0x7f && key[1..31].iter().all(|b| *b == 0xff) && key[0] >= 0xed;
+    !at_least_p
+}
+
 /// What an entry that did not open says, whatever the decoder said: see
 /// [`read_mailbox`].
 pub(crate) const UNREADABLE_WHY: &str =
@@ -837,6 +864,19 @@ pub fn read_mailbox(
         .map(|message| {
             let conversation = message.sender_public_key.clone();
             let digest = harvest_common::mailbox::entry_digest(message);
+            // A tag that is not the canonical encoding of its X25519 key is
+            // never read, whatever keys are on hand: it shares its keys with
+            // the canonical twin, so reading it would give that conversation
+            // a second, writer-chosen routing tag ([`is_canonical_tag`]).
+            if !is_canonical_tag(&conversation) {
+                return MailboxEntry::Unreadable {
+                    conversation,
+                    nonce: message.nonce,
+                    digest,
+                    timestamp: message.timestamp,
+                    why: UNREADABLE_WHY.to_string(),
+                };
+            }
             let Some(pair) = keys.get(&conversation) else {
                 return MailboxEntry::Unreadable {
                     conversation,
@@ -894,6 +934,27 @@ pub fn read_mailbox(
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
+
+    /// **Only the canonical encoding of an X25519 key is a conversation
+    /// tag.** A real key passes; the same bytes with bit 255 set, p itself,
+    /// and anything not 32 bytes do not; p - 1 does. Red with either check
+    /// dropped.
+    #[test]
+    fn only_canonical_x25519_tags_are_tags() {
+        let real = *x25519_dalek::PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        assert!(is_canonical_tag(&real));
+        let mut twin = real;
+        twin[31] |= 0x80;
+        assert!(!is_canonical_tag(&twin));
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        assert!(!is_canonical_tag(&p), "p itself reduces to 0");
+        let mut below_p = p;
+        below_p[0] = 0xec;
+        assert!(is_canonical_tag(&below_p));
+        assert!(!is_canonical_tag(&real[..31]));
+    }
     use aes_gcm::{Aes256Gcm, Nonce};
     use harvest_common::mailbox::MAX_MESSAGES;
     use std::collections::HashMap;
