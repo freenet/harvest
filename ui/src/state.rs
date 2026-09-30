@@ -7747,81 +7747,101 @@ impl AppState {
             return orders.iter().map(|_| SellerRequest::NotFound).collect();
         };
         let entries = self.mailbox_entries(store_contract_id);
+        let index = crate::components::message_view::OrderIndex::new(&store.orders);
+        // Each request read once, with the id of the order answering it
+        // worked out once (codex on #205 round 3: per order, per request,
+        // this rescanned every order and rehashed every request). A Buy now
+        // names its order by request id, and counts only if its total
+        // agrees; a quote request is answered by the one order its binding,
+        // listing tag, receipt key and time place it with
+        // (`message_view::quote_order_answers`, review of #205 L1).
+        let requests: Vec<(
+            harvest_common::payment::OrderId,
+            SellerOrderRequest,
+            Option<u64>,
+        )> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content:
+                        MessageContent::OrderRequest {
+                            listing_id,
+                            quantity,
+                            shipping,
+                            note,
+                            instant,
+                            order_binding,
+                            buyer_receipt_key,
+                        },
+                    conversation,
+                    addressing: Addressing::ToSeller,
+                    timestamp,
+                    ..
+                } => {
+                    let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                    let listing_tag = self
+                        .conversation_keys
+                        .get(conversation.as_slice())
+                        .map(|keys| keys.listing_tag(listing_id))?;
+                    let (answering, total) = match instant {
+                        Some(selection) => {
+                            let id = selection.answered_request(&tag)?.order_id();
+                            let order = index.order(&id)?;
+                            (order, Some(selection.expected_total_sats))
+                        }
+                        None => (
+                            index.quote_answering(
+                                *timestamp,
+                                order_binding,
+                                buyer_receipt_key,
+                                &listing_tag,
+                            )?,
+                            None,
+                        ),
+                    };
+                    // Its listing: the order carries this listing's tag.
+                    if answering.order.listing_tag != Some(listing_tag) {
+                        return None;
+                    }
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == *listing_id)
+                        .map(|l| &l.listing);
+                    let (region, picks) = instant
+                        .as_ref()
+                        .map(|s| (s.region.clone(), s.choices.as_slice()))
+                        .unwrap_or_default();
+                    Some((
+                        answering.order.id.clone(),
+                        SellerOrderRequest {
+                            title: listing.map(|l| l.title.clone()),
+                            quantity: *quantity,
+                            shipping: shipping.clone(),
+                            note: note.clone(),
+                            region,
+                            choices: labelled_choices(
+                                listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                                picks,
+                            ),
+                        },
+                        total,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
         orders
             .iter()
             .map(|order| {
                 let retained = self.address_retained_for(order);
-                let mut asked: Vec<SellerOrderRequest> = entries
+                let mut asked: Vec<SellerOrderRequest> = requests
                     .iter()
-                    .filter_map(|entry| match entry {
-                        MailboxEntry::Readable {
-                            content:
-                                MessageContent::OrderRequest {
-                                    listing_id,
-                                    quantity,
-                                    shipping,
-                                    note,
-                                    instant,
-                                    order_binding,
-                                    buyer_receipt_key,
-                                },
-                            conversation,
-                            addressing: Addressing::ToSeller,
-                            timestamp,
-                            ..
-                        } => {
-                            let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-                            let listing_tag = self
-                                .conversation_keys
-                                .get(conversation.as_slice())
-                                .map(|keys| keys.listing_tag(listing_id));
-                            let same_listing =
-                                listing_tag.is_some() && order.order.listing_tag == listing_tag;
-                            let answers = match instant {
-                                Some(selection) => {
-                                    selection
-                                        .answered_request(&tag)
-                                        .is_some_and(|request| request.order_id() == order.order.id)
-                                        && selection.expected_total_sats == order.order.amount_sats
-                                }
-                                // One ask per order, placed in time (review
-                                // of #205, L1).
-                                None => listing_tag.is_some_and(|listing_tag| {
-                                    crate::components::message_view::quote_order_answers(
-                                        order,
-                                        &store.orders,
-                                        *timestamp,
-                                        order_binding,
-                                        buyer_receipt_key,
-                                        &listing_tag,
-                                    )
-                                }),
-                            };
-                            (answers && same_listing).then(|| {
-                                let listing = store
-                                    .listings
-                                    .iter()
-                                    .find(|l| l.listing.id == *listing_id)
-                                    .map(|l| &l.listing);
-                                let (region, picks) = instant
-                                    .as_ref()
-                                    .map(|s| (s.region.clone(), s.choices.as_slice()))
-                                    .unwrap_or_default();
-                                SellerOrderRequest {
-                                    title: listing.map(|l| l.title.clone()),
-                                    quantity: *quantity,
-                                    shipping: shipping.clone(),
-                                    note: note.clone(),
-                                    region,
-                                    choices: labelled_choices(
-                                        listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
-                                        picks,
-                                    ),
-                                }
-                            })
-                        }
-                        _ => None,
+                    .filter(|(id, _, total)| {
+                        *id == order.order.id
+                            && total.is_none_or(|total| total == order.order.amount_sats)
                     })
+                    .map(|(_, request, _)| request.clone())
                     .collect();
                 if !retained {
                     for request in asked.iter_mut() {
@@ -25992,7 +26012,13 @@ mod buy_flow_tests {
             .get_mut(STORE)
             .expect("the store")
             .owner = Some(seller_signing_key().verifying_key().to_bytes());
-        // (The listing tag is signed in with the terms above.)
+        // (The listing tag is signed in with the terms above.) The store's
+        // own order: the card reads the store (`OrderIndex`).
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![order.clone()];
         let ask = |listing: u8, quantity: u32, shipping: &str, total: u64| {
             buyer
                 .request_order(
@@ -26116,7 +26142,7 @@ mod buy_flow_tests {
     /// binding check dropped.
     #[test]
     fn the_sellers_card_reads_a_quote_request_its_invoice_answers() {
-        let (state, tag, _) = seller_holding_a_request();
+        let (mut state, tag, _) = seller_holding_a_request();
         let keys: HashMap<Vec<u8>, ConversationKeys> =
             [(tag.to_vec(), seller_keys_for(&tag))].into();
         let entries =
@@ -26134,6 +26160,12 @@ mod buy_flow_tests {
         else {
             panic!("the fixture's request reads");
         };
+        // The card reads the store's own orders (`OrderIndex`): each case
+        // holds the order it asks about, as a real card does.
+        fn holding<'a>(state: &'a mut AppState, order: &AuthorizedOrder) -> &'a AppState {
+            state.browsing_stores.get_mut(STORE).unwrap().orders = vec![order.clone()];
+            state
+        }
         let mut order = commitment(
             &seller_signing_key(),
             Some(anchor(TIP_HEIGHT - 1)),
@@ -26144,7 +26176,9 @@ mod buy_flow_tests {
         order.order.buyer_receipt_key = buyer_receipt_key;
         order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
         order.order.created_at = timestamp + chrono::Duration::minutes(5);
-        let SellerRequest::Found(asked) = state.seller_order_request(STORE, &order) else {
+        let SellerRequest::Found(asked) =
+            holding(&mut state, &order).seller_order_request(STORE, &order)
+        else {
             panic!("the quote request answers the invoice");
         };
         assert_eq!(
@@ -26155,7 +26189,7 @@ mod buy_flow_tests {
         let mut other = order.clone();
         other.order.order_binding = Some([0x11; 32]);
         assert_eq!(
-            state.seller_order_request(STORE, &other),
+            holding(&mut state, &other).seller_order_request(STORE, &other),
             SellerRequest::NotFound
         );
         assert!(
@@ -26165,14 +26199,14 @@ mod buy_flow_tests {
         let mut unkeyed = order.clone();
         unkeyed.order.buyer_receipt_key = Some([0x22; 32]);
         assert_eq!(
-            state.seller_order_request(STORE, &unkeyed),
+            holding(&mut state, &unkeyed).seller_order_request(STORE, &unkeyed),
             SellerRequest::NotFound,
             "an order carrying another receipt key answers nothing"
         );
         let mut earlier = order;
         earlier.order.created_at = timestamp - chrono::Duration::minutes(5);
         assert_eq!(
-            state.seller_order_request(STORE, &earlier),
+            holding(&mut state, &earlier).seller_order_request(STORE, &earlier),
             SellerRequest::NotFound,
             "an ask after the invoice is for another order"
         );

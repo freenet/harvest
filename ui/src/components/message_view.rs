@@ -1330,6 +1330,7 @@ pub(crate) fn seller_inbox(
         |voucher, tag| state.voucher_verifies(voucher, tag),
         |tag| paid.contains(tag),
     );
+    let index = OrderIndex::new(&store.orders);
     let (shown, held_back) = shown_to_seller(
         all,
         |voucher, tag| state.voucher_verifies(voucher, tag),
@@ -1337,7 +1338,7 @@ pub(crate) fn seller_inbox(
         |entry| {
             request_address_hidden(
                 entry,
-                &store.orders,
+                &index,
                 state.conversation_keys.get(entry.conversation()),
                 |order| state.address_retained_for(order),
             )
@@ -1827,7 +1828,7 @@ pub(crate) fn shown_to_seller(
 /// place of the address and blanks the note.
 pub(crate) fn request_address_hidden(
     entry: &MailboxEntry,
-    published: &[harvest_common::payment::AuthorizedOrder],
+    index: &OrderIndex<'_>,
     keys: Option<&crate::messaging::ConversationKeys>,
     retained: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
 ) -> bool {
@@ -1850,14 +1851,12 @@ pub(crate) fn request_address_hidden(
     let Ok(tag) = <[u8; 32]>::try_from(conversation.as_slice()) else {
         return false;
     };
-    let answering = |order: &harvest_common::payment::AuthorizedOrder| match instant {
+    let answering = match instant {
         Some(selection) => selection
             .answered_request(&tag)
-            .is_some_and(|request| request.order_id() == order.order.id),
-        None => keys.is_some_and(|keys| {
-            quote_order_answers(
-                order,
-                published,
+            .and_then(|request| index.order(&request.order_id())),
+        None => keys.and_then(|keys| {
+            index.quote_answering(
                 *timestamp,
                 order_binding,
                 buyer_receipt_key,
@@ -1865,9 +1864,81 @@ pub(crate) fn request_address_hidden(
             )
         }),
     };
-    published
-        .iter()
-        .any(|order| answering(order) && !retained(order))
+    answering.is_some_and(|order| !retained(order))
+}
+
+/// The store's orders, indexed once per render for matching requests to
+/// the orders answering them (codex on #205 round 3): by id, and each quote
+/// order under its (binding, listing tag), sorted by (signed date, id). A
+/// lookup then scans one buyer's orders for one listing, not all of a
+/// store's (up to `MAX_ORDERS`), for each of up to 512 mailbox entries.
+pub(crate) struct OrderIndex<'a> {
+    by_id: std::collections::HashMap<
+        &'a harvest_common::payment::OrderId,
+        &'a harvest_common::payment::AuthorizedOrder,
+    >,
+    quotes: std::collections::HashMap<
+        ([u8; 32], [u8; 32]),
+        Vec<&'a harvest_common::payment::AuthorizedOrder>,
+    >,
+}
+
+impl<'a> OrderIndex<'a> {
+    pub(crate) fn new(published: &'a [harvest_common::payment::AuthorizedOrder]) -> Self {
+        let mut quotes: std::collections::HashMap<
+            ([u8; 32], [u8; 32]),
+            Vec<&'a harvest_common::payment::AuthorizedOrder>,
+        > = std::collections::HashMap::new();
+        for order in published {
+            if order.order.request_id.is_some() {
+                continue;
+            }
+            if let (Some(binding), Some(tag)) = (order.order.order_binding, order.order.listing_tag)
+            {
+                quotes.entry((binding, tag)).or_default().push(order);
+            }
+        }
+        for group in quotes.values_mut() {
+            group.sort_by_key(|order| (order.order.created_at, order.order.id.0));
+        }
+        OrderIndex {
+            by_id: published
+                .iter()
+                .map(|order| (&order.order.id, order))
+                .collect(),
+            quotes,
+        }
+    }
+
+    /// The order with id `id`, if the store holds one.
+    pub(crate) fn order(
+        &self,
+        id: &harvest_common::payment::OrderId,
+    ) -> Option<&'a harvest_common::payment::AuthorizedOrder> {
+        self.by_id.get(id).copied()
+    }
+
+    /// The quote order answering an ask made at `asked_at` with `binding`,
+    /// `receipt_key` and `listing_tag`, by [`quote_order_answers`]'s rule:
+    /// among the orders with that binding and tag (and that receipt key, when
+    /// the ask names one), sorted by (signed date, id), the first issued at
+    /// or after the ask. Each earlier one was issued before the ask, which is
+    /// exactly "after the previous such order and no later than this one",
+    /// so at most one order answers any ask.
+    pub(crate) fn quote_answering(
+        &self,
+        asked_at: chrono::DateTime<chrono::Utc>,
+        binding: &[u8; 32],
+        receipt_key: &Option<[u8; 32]>,
+        listing_tag: &[u8; 32],
+    ) -> Option<&'a harvest_common::payment::AuthorizedOrder> {
+        self.quotes
+            .get(&(*binding, *listing_tag))?
+            .iter()
+            .filter(|order| receipt_key.is_none() || order.order.buyer_receipt_key == *receipt_key)
+            .find(|order| asked_at <= order.order.created_at)
+            .copied()
+    }
 }
 
 /// The conversations a seller's inbox shows free text in (see
@@ -2032,6 +2103,22 @@ fn shown_given(
 /// version", or the pruned order's address, on its card); nothing the reader
 /// holds says where the pruned order's asks ended.
 pub(crate) fn quote_order_answers(
+    order: &harvest_common::payment::AuthorizedOrder,
+    published: &[harvest_common::payment::AuthorizedOrder],
+    asked_at: chrono::DateTime<chrono::Utc>,
+    binding: &[u8; 32],
+    receipt_key: &Option<[u8; 32]>,
+    listing_tag: &[u8; 32],
+) -> bool {
+    OrderIndex::new(published)
+        .quote_answering(asked_at, binding, receipt_key, listing_tag)
+        .is_some_and(|answering| answering.order.id == order.order.id)
+}
+
+/// [`quote_order_answers`] as first written, one full scan per question:
+/// the reference the indexed version is checked against.
+#[cfg(test)]
+fn quote_order_answers_by_scan(
     order: &harvest_common::payment::AuthorizedOrder,
     published: &[harvest_common::payment::AuthorizedOrder],
     asked_at: chrono::DateTime<chrono::Utc>,
@@ -2506,6 +2593,16 @@ mod inbox_tests {
 
     const BINDING: [u8; 32] = [0x5a; 32];
 
+    /// [`request_address_hidden`] over `published`, indexed as a render does.
+    fn hidden_by_index(
+        entry: &MailboxEntry,
+        published: &[harvest_common::payment::AuthorizedOrder],
+        keys: Option<&crate::messaging::ConversationKeys>,
+        retained: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
+    ) -> bool {
+        request_address_hidden(entry, &OrderIndex::new(published), keys, retained)
+    }
+
     fn listing(id: ListingId, title: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
@@ -2798,22 +2895,12 @@ mod inbox_tests {
         let mut own = published(1, Some(BINDING), None);
         own.order.id = selection.answered_request(&[1u8; 32]).unwrap().order_id();
         let k = keys();
-        assert!(request_address_hidden(
-            &buy_now,
-            &[own.clone()],
-            Some(&k),
-            |_| false
-        ));
-        assert!(!request_address_hidden(&buy_now, &[own], Some(&k), |_| {
-            true
+        assert!(hidden_by_index(&buy_now, &[own.clone()], Some(&k), |_| {
+            false
         }));
+        assert!(!hidden_by_index(&buy_now, &[own], Some(&k), |_| { true }));
         let other = published(2, Some(BINDING), None);
-        assert!(!request_address_hidden(
-            &buy_now,
-            &[other],
-            Some(&k),
-            |_| false
-        ));
+        assert!(!hidden_by_index(&buy_now, &[other], Some(&k), |_| false));
 
         let mut quote = request(id.clone(), 1, [2u8; 32]);
         let invoice = published(3, Some(BINDING), Some(k.listing_tag(&id)));
@@ -2821,13 +2908,13 @@ mod inbox_tests {
         if let MailboxEntry::Readable { timestamp, .. } = &mut quote {
             *timestamp = invoice.order.created_at - chrono::Duration::minutes(1);
         }
-        assert!(request_address_hidden(
+        assert!(hidden_by_index(
             &quote,
             std::slice::from_ref(&invoice),
             Some(&k),
             |_| false
         ));
-        assert!(!request_address_hidden(
+        assert!(!hidden_by_index(
             &quote,
             std::slice::from_ref(&invoice),
             None,
@@ -2835,12 +2922,7 @@ mod inbox_tests {
         ));
         let mut elsewhere = invoice;
         elsewhere.order.order_binding = Some([0x11; 32]);
-        assert!(!request_address_hidden(
-            &quote,
-            &[elsewhere],
-            Some(&k),
-            |_| false
-        ));
+        assert!(!hidden_by_index(&quote, &[elsewhere], Some(&k), |_| false));
     }
 
     fn thread(tag: u8, open: bool, said: bool, waiting: usize, orders: &[u8]) -> SellerThread {
@@ -2984,6 +3066,73 @@ mod inbox_tests {
         assert_eq!(t.latest_from_buyer(), Some(("newest".into(), at(30))));
     }
 
+    /// **The indexed lookup gives exactly the answers the full scan did**
+    /// (codex on #205 round 3): over orders mixing two bindings, two listing
+    /// tags, three receipt keys (one absent), repeated and tied dates, and a
+    /// Buy now among them, every (order, ask time, ask receipt key) agrees.
+    /// Red with the index's receipt filter or date bound changed.
+    #[test]
+    fn the_indexed_quote_lookup_matches_the_full_scan() {
+        let k = keys();
+        let tags = [
+            k.listing_tag(&ListingId([9u8; 32])),
+            k.listing_tag(&ListingId([8u8; 32])),
+        ];
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let mut orders = Vec::new();
+        let mut n = 0u8;
+        for binding in [BINDING, [0x11; 32]] {
+            for tag in tags {
+                for (issued, receipt) in [
+                    (100, Some([0x33; 32])),
+                    (100, Some([0x44; 32])),
+                    (200, None),
+                    (200, Some([0x33; 32])),
+                    (300, Some([0x33; 32])),
+                ] {
+                    n += 1;
+                    let mut o = published(n, Some(binding), Some(tag));
+                    o.order.created_at = at(issued);
+                    o.order.buyer_receipt_key = receipt;
+                    orders.push(o);
+                }
+            }
+        }
+        let mut buy_now = published(250, Some(BINDING), Some(tags[0]));
+        buy_now.order.request_id = Some([1; 32]);
+        orders.push(buy_now);
+        for order in &orders {
+            for asked in [50, 100, 150, 200, 250, 300, 350] {
+                for receipt in [None, Some([0x33; 32]), Some([0x44; 32])] {
+                    for binding in [BINDING, [0x11; 32]] {
+                        for tag in &tags {
+                            assert_eq!(
+                                quote_order_answers(
+                                    order,
+                                    &orders,
+                                    at(asked),
+                                    &binding,
+                                    &receipt,
+                                    tag
+                                ),
+                                quote_order_answers_by_scan(
+                                    order,
+                                    &orders,
+                                    at(asked),
+                                    &binding,
+                                    &receipt,
+                                    tag
+                                ),
+                                "order {} asked {asked} receipt {receipt:?}",
+                                order.order.id.0[0]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// **A quote order answers the asks made after the previous such order
     /// and no later than itself** (review of #205, L1): a later order never
     /// takes an earlier order's ask, and a closed earlier order never hides
@@ -3055,8 +3204,8 @@ mod inbox_tests {
             entry
         };
         let closed = |o: &harvest_common::payment::AuthorizedOrder| o.order.id != first.order.id;
-        assert!(request_address_hidden(&ask(50), &both, Some(&k), closed));
-        assert!(!request_address_hidden(&ask(200), &both, Some(&k), closed));
+        assert!(hidden_by_index(&ask(50), &both, Some(&k), closed));
+        assert!(!hidden_by_index(&ask(200), &both, Some(&k), closed));
     }
 
     /// **Order requests and the store's automatic answers are not chat**
