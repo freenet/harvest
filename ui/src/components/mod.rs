@@ -28,28 +28,10 @@ pub(crate) fn select_focused_field() {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsCast;
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        // Only where the browser cannot size the field itself: a height set
-        // here would pin what `field-sizing: content` keeps live.
-        let supported = js_sys::Reflect::get(&window, &"CSS".into())
-            .ok()
-            .and_then(|css| {
-                let supports = js_sys::Reflect::get(&css, &"supports".into())
-                    .ok()?
-                    .dyn_into::<js_sys::Function>()
-                    .ok()?;
-                supports
-                    .call2(&css, &"field-sizing".into(), &"content".into())
-                    .ok()?
-                    .as_bool()
-            })
-            .unwrap_or(false);
-        if supported {
-            return;
-        }
-        let Some(field) = window.document().and_then(|d| d.active_element()) else {
+        let Some(field) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+        else {
             return;
         };
         select_all_of(&field);
