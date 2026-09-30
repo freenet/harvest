@@ -3180,11 +3180,15 @@ pub struct BrowsingStore {
     /// longer, and it is deliberately not persisted alongside the
     /// conversation secret -- it is not part of what a buyer loses by closing
     /// a tab, since the messages themselves come back out of the mailbox
-    /// after a reload. Messages are labelled by direction either way (since
-    /// 2026-09-30, `message_view::who`); what this record still decides is
-    /// which messages the seller's inbox exempts from its gate as the
-    /// seller's own (`message_view::shown_to_seller`), and which sent
-    /// messages have not landed yet.
+    /// after a reload. What IS lost is the label: "You" is given only to a
+    /// message this record holds (`message_view::who`), so after a reload
+    /// this side's own earlier messages move into the "Not confirmed as
+    /// yours" group, out of the timeline, on both screens. Keeping the
+    /// digests across a reload would need the delegate to keep them with the
+    /// conversation (a wire change, not made). The record also decides which
+    /// messages the seller's inbox exempts from its gate as the seller's own
+    /// (`message_view::shown_to_seller`), and which sent messages have not
+    /// landed yet.
     pub sent_messages: Vec<SentMessage>,
 }
 
@@ -9438,8 +9442,10 @@ impl AppState {
     /// The one thing a client can know first-hand is what it sent itself.
     /// That is this. It decides what the seller's inbox exempts from its gate
     /// as the seller's own (`components::message_view::shown_to_seller`);
-    /// the on-screen labels are by direction (`message_view::who`, which says
-    /// why that is enough).
+    /// and it is the only thing that earns a message the "You" label
+    /// (`message_view::who`), so a message this tab did not send, this
+    /// side's own from before a reload included, is shown as "Not confirmed
+    /// as yours".
     ///
     /// # The identity compared here is the DIGEST, not the nonce
     ///
@@ -23665,15 +23671,30 @@ mod buy_flow_tests {
         // The order the store published for it: this listing's tag, the
         // total the buyer agreed. Unsigned: the card reads terms only.
         // Genuinely paid, so its complaint window has an end to hide the
-        // address after.
-        let (unpaid, claims, tip) = a_paid_order_where(|o| o.amount_sats = 12_000);
+        // address after, and signed as the answer to this request (its id
+        // is derived from the request), so its despatch verifies.
+        let answered = instant(12_000).answered_request(&tag).expect("dated");
+        let (unpaid, claims, tip) = a_paid_order_where(|o| {
+            o.amount_sats = 12_000;
+            o.request_id = Some(answered.request_id);
+            o.created_at = answered.requested_at;
+            o.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        });
         let mut order = unpaid;
         order.status = OrderStatus::Paid;
         order.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
             claims, tip,
         ));
-        order.order.id = order_id.clone();
-        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        assert_eq!(
+            order.order.id, order_id,
+            "precondition: the request's order"
+        );
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .owner = Some(seller_signing_key().verifying_key().to_bytes());
+        // (The listing tag is signed in with the terms above.)
         let ask = |listing: u8, quantity: u32, shipping: &str, total: u64| {
             buyer
                 .request_order(
@@ -23744,8 +23765,30 @@ mod buy_flow_tests {
         // and the note (Ian, 2026-09-30); with no tip it cannot tell, and
         // shows them. Red with the retention check dropped.
         set(&mut state, vec![ask(3, 2, "Jo Buyer\n1 Lane", 12_000)]);
-        let closed = crate::fulfilment::complaint_window_end(&order, None)
+        // Sent: an order never sent keeps its address (review round 2 of
+        // #205).
+        let closed_unsent = crate::fulfilment::complaint_window_end(&order, None)
             .expect("a paid order's window has an end");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(closed_unsent + 1));
+        let SellerRequest::Found(unsent) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(
+            unsent.shipping, "Jo Buyer\n1 Lane",
+            "never sent: the seller may still send it late"
+        );
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        despatched(&mut state, &order);
+        assert!(state.despatch_of(&order).is_some(), "precondition: sent");
+        let closed =
+            crate::fulfilment::complaint_window_end(&order, state.despatch_of(&order).as_ref())
+                .expect("a paid order's window has an end");
         let SellerRequest::Found(open) = state.seller_order_request(STORE, &order) else {
             panic!("found");
         };

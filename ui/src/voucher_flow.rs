@@ -90,8 +90,11 @@ pub struct VoucherState {
     pub signed: HashMap<(Vec<u8>, [u8; 32]), MessageVoucher>,
     /// Texts waiting on a voucher, oldest first.
     pub awaiting: Vec<TextAwaitingVoucher>,
-    /// By store: what was handed back unsent, until the buyer sends again.
-    pub failures: HashMap<Vec<u8>, VoucherFailure>,
+    /// By (store, conversation tag): what was handed back unsent, until the
+    /// buyer sends again in THAT conversation. Per conversation because the
+    /// buyer writes in several (an order's own thread, a question), and a
+    /// send in one must not clear another's unsent text (codex on #205).
+    pub failures: HashMap<(Vec<u8>, [u8; 32]), VoucherFailure>,
 }
 
 /// Whether the compose box can be offered at all, and how what is typed
@@ -156,13 +159,7 @@ impl AppState {
         store_contract_id: &[u8],
         target: Option<[u8; 32]>,
     ) -> ComposeGate {
-        let tag = target.or_else(|| {
-            self.browsing_stores
-                .get(store_contract_id)
-                .and_then(|store| store.conversations.last())
-                .map(|conversation| conversation.buyer_public_key)
-        });
-        match tag {
+        match self.compose_tag(store_contract_id, target) {
             Some(tag) if self.paid_conversation(store_contract_id, &tag) => {
                 ComposeGate::PaidOrder { tag }
             }
@@ -224,7 +221,9 @@ impl AppState {
             })
             .ok_or("that conversation is no longer on this device")?
             .seal(text)?;
-        self.vouchers.failures.remove(store_contract_id);
+        self.vouchers
+            .failures
+            .remove(&(store_contract_id.to_vec(), *tag));
         self.keep_conversation_tagged(store_contract_id, seller_encryption_key, tag);
         Ok(sealed)
     }
@@ -265,7 +264,9 @@ impl AppState {
         // adds about 2 KB, so a text near the limit fits alone and not with it.
         conversation.seal_vouched(text.clone(), oversize_probe(), chrono::Utc::now())?;
         let tag = conversation.buyer_public_key;
-        self.vouchers.failures.remove(store_contract_id);
+        self.vouchers
+            .failures
+            .remove(&(store_contract_id.to_vec(), tag));
 
         let key = (store_contract_id.to_vec(), tag);
         if let Some(voucher) = self.vouchers.signed.get(&key).cloned() {
@@ -393,7 +394,7 @@ impl AppState {
         if !unsent.is_empty() {
             self.vouchers
                 .failures
-                .insert(store, VoucherFailure { why, texts: unsent });
+                .insert((store, tag), VoucherFailure { why, texts: unsent });
         }
         ready
     }
@@ -420,7 +421,7 @@ impl AppState {
         let failure = self
             .vouchers
             .failures
-            .entry(store_contract_id.to_vec())
+            .entry((store_contract_id.to_vec(), *tag))
             .or_default();
         failure.why = why.to_string();
         failure
@@ -451,19 +452,41 @@ impl AppState {
         }
     }
 
-    /// The texts to this store waiting on a voucher, oldest first.
-    pub fn texts_awaiting_voucher(&self, store_contract_id: &[u8]) -> Vec<String> {
+    /// The texts to this store's conversation `tag` waiting on a voucher,
+    /// oldest first.
+    pub fn texts_awaiting_voucher(&self, store_contract_id: &[u8], tag: &[u8; 32]) -> Vec<String> {
         self.vouchers
             .awaiting
             .iter()
-            .filter(|text| text.store_contract_id == store_contract_id)
+            .filter(|text| text.store_contract_id == store_contract_id && text.tag == *tag)
             .map(|text| text.text.clone())
             .collect()
     }
 
-    /// What was handed back unsent for this store, if anything.
-    pub fn voucher_failure(&self, store_contract_id: &[u8]) -> Option<&VoucherFailure> {
-        self.vouchers.failures.get(store_contract_id)
+    /// What was handed back unsent in this store's conversation `tag`.
+    pub fn voucher_failure(
+        &self,
+        store_contract_id: &[u8],
+        tag: &[u8; 32],
+    ) -> Option<&VoucherFailure> {
+        self.vouchers
+            .failures
+            .get(&(store_contract_id.to_vec(), *tag))
+    }
+
+    /// The conversation a message to this store is written into: `target`,
+    /// or (`None`) the one a new message continues, the last, if any.
+    pub fn compose_tag(
+        &self,
+        store_contract_id: &[u8],
+        target: Option<[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        target.or_else(|| {
+            self.browsing_stores
+                .get(store_contract_id)
+                .and_then(|store| store.conversations.last())
+                .map(|conversation| conversation.buyer_public_key)
+        })
     }
 
     /// Whether `voucher` vouches for the conversation `tag`, remembered: the
@@ -653,6 +676,14 @@ mod tests {
             .expect("compose")
     }
 
+    /// The tag of the store's last conversation, which a message with no
+    /// target continues.
+    fn last_tag(state: &AppState) -> [u8; 32] {
+        state
+            .compose_tag(STORE, None)
+            .expect("a conversation was opened")
+    }
+
     fn pending_vouchers(state: &AppState) -> Vec<PendingMessageVoucher> {
         state
             .pending_signatures
@@ -741,7 +772,10 @@ mod tests {
             vec![pending.clone()],
             "asked once"
         );
-        assert_eq!(state.texts_awaiting_voucher(STORE), ["one", "two", "three"]);
+        assert_eq!(
+            state.texts_awaiting_voucher(STORE, &last_tag(&state)),
+            ["one", "two", "three"]
+        );
 
         let (voucher, _, _) = vouch(&pending.tag);
         let ready =
@@ -756,7 +790,9 @@ mod tests {
                 .all(|w| w[0].sealed.timestamp < w[1].sealed.timestamp),
             "stamped in the order typed, so the thread shows them that way"
         );
-        assert!(state.texts_awaiting_voucher(STORE).is_empty());
+        assert!(state
+            .texts_awaiting_voucher(STORE, &last_tag(&state))
+            .is_empty());
 
         let sealed: Vec<EncryptedMessage> = ready.iter().map(|r| r.sealed.clone()).collect();
         let (shown, hidden) = seller_sees(&sealed);
@@ -790,7 +826,9 @@ mod tests {
             certificate_pem: voucher.certificate_pem.clone(),
         });
         assert!(pending_vouchers(&state).is_empty());
-        assert!(state.texts_awaiting_voucher(STORE).is_empty());
+        assert!(state
+            .texts_awaiting_voucher(STORE, &last_tag(&state))
+            .is_empty());
         assert_eq!(
             state.vouchers.signed.get(&(STORE.to_vec(), pending.tag)),
             Some(&voucher)
@@ -806,13 +844,56 @@ mod tests {
             message: "no".into(),
         });
         assert!(pending_vouchers(&state).is_empty());
-        assert!(state.texts_awaiting_voucher(STORE).is_empty());
-        let failure = state.voucher_failure(STORE).expect("handed back");
+        assert!(state
+            .texts_awaiting_voucher(STORE, &last_tag(&state))
+            .is_empty());
+        let failure = state
+            .voucher_failure(STORE, &last_tag(&state))
+            .expect("handed back");
         assert_eq!(failure.texts, ["a", "b"]);
         // Sending again starts over, and clears what was handed back.
         compose(&mut state, "c");
-        assert!(state.voucher_failure(STORE).is_none());
+        assert!(state.voucher_failure(STORE, &last_tag(&state)).is_none());
         assert_eq!(pending_vouchers(&state).len(), 1);
+    }
+
+    /// **A send in one conversation keeps another's unsent text** (codex on
+    /// #205 round 2): what was handed back is kept per conversation, and
+    /// sending in another conversation of the same store clears only that
+    /// one's. Red keying failures by store alone.
+    #[test]
+    fn a_send_in_one_conversation_keeps_anothers_unsent_text() {
+        let mut state = buyer();
+        compose(&mut state, "a");
+        let first = last_tag(&state);
+        state.on_ghostkey_response(ghostkey_common::GhostkeyResponse::Error {
+            message: "no".into(),
+        });
+        assert_eq!(state.voucher_failure(STORE, &first).unwrap().texts, ["a"]);
+        let other = crate::messaging::BuyerConversation::open(&seller_public()).expect("open");
+        let second = other.buyer_public_key;
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .conversations
+            .push(other);
+        state
+            .compose_vouched_to_seller(
+                STORE,
+                &seller_public(),
+                &SELLER_VK,
+                "b".into(),
+                Some(second),
+                0,
+            )
+            .expect("compose");
+        assert_eq!(
+            state.voucher_failure(STORE, &first).unwrap().texts,
+            ["a"],
+            "still there to copy"
+        );
+        assert!(state.voucher_failure(STORE, &second).is_none());
     }
 
     /// A vault that never answers hands the texts back; a timer for an
@@ -831,7 +912,13 @@ mod tests {
         );
         state.message_voucher_timed_out(STORE, &pending.tag, pending.queued_at_ms);
         assert!(pending_vouchers(&state).is_empty());
-        assert_eq!(state.voucher_failure(STORE).unwrap().texts, ["a"]);
+        assert_eq!(
+            state
+                .voucher_failure(STORE, &last_tag(&state))
+                .unwrap()
+                .texts,
+            ["a"]
+        );
     }
 
     /// A voucher the seller would refuse is not sent under: the buyer is
@@ -848,7 +935,13 @@ mod tests {
             .on_message_voucher_signed(pending, voucher, chrono::Utc::now())
             .is_empty());
         assert!(state.vouchers.signed.is_empty());
-        assert_eq!(state.voucher_failure(STORE).unwrap().texts, ["a"]);
+        assert_eq!(
+            state
+                .voucher_failure(STORE, &last_tag(&state))
+                .unwrap()
+                .texts,
+            ["a"]
+        );
     }
 
     /// A text too long to carry a voucher is refused before the vault is
@@ -861,7 +954,9 @@ mod tests {
             .compose_vouched_to_seller(STORE, &seller_public(), &SELLER_VK, long, None, 0)
             .is_err());
         assert!(pending_vouchers(&state).is_empty());
-        assert!(state.texts_awaiting_voucher(STORE).is_empty());
+        assert!(state
+            .texts_awaiting_voucher(STORE, &last_tag(&state))
+            .is_empty());
     }
 
     /// The seller's verdicts are remembered per (voucher, conversation), and

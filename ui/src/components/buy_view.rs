@@ -608,7 +608,10 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
                 .collect()
         })
         .unwrap_or_default();
-    let groups = by_conversation(&listed);
+    // Grouped over EVERY purchase, the one the Buy now form shows included,
+    // so its conversation keeps its thread here and is never taken for a
+    // question (codex on #205 round 2); only its card is left out.
+    let groups = purchase_groups(&purchases, &shown_above);
     let questions: Vec<[u8; 32]> = held
         .iter()
         .filter(|tag| !groups.iter().any(|(held, _)| held == *tag))
@@ -617,7 +620,7 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
         })
         .copied()
         .collect();
-    if listed.is_empty() && questions.is_empty() {
+    if groups.is_empty() && questions.is_empty() {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
@@ -660,6 +663,27 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
             }
         }
     }
+}
+
+/// Every conversation `purchases` are filed under, in the order the first of
+/// each appears, with the purchases to show a card for: all but those a Buy
+/// now form on the page already shows (`shown_above`). A conversation whose
+/// every purchase is shown above is still here, with no cards, so its thread
+/// stays with its orders.
+fn purchase_groups(
+    purchases: &[BuyerPurchase],
+    shown_above: &[harvest_common::payment::OrderId],
+) -> Vec<([u8; 32], Vec<BuyerPurchase>)> {
+    by_conversation(purchases)
+        .into_iter()
+        .map(|(tag, group)| {
+            let cards = group
+                .into_iter()
+                .filter(|purchase| !shown_above.contains(&purchase.order_id))
+                .collect();
+            (tag, cards)
+        })
+        .collect()
 }
 
 /// `purchases` grouped by the conversation each is filed under, in the order
@@ -1803,6 +1827,31 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A purchase the Buy now form shows keeps its conversation with its
+    /// orders** (codex, round 2 of #205): its card is left out, not its
+    /// conversation, so the thread is not lost or taken for a question.
+    /// Red grouping only the purchases listed.
+    #[test]
+    fn a_purchase_shown_in_the_buy_form_keeps_its_conversation() {
+        let purchase = |n: u8, conversation: u8| BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([n; 32]),
+            conversation: [conversation; 32],
+            commitment: None,
+            blockers: Vec::new(),
+            paid: None,
+        };
+        let all = [purchase(1, 5), purchase(2, 6), purchase(3, 6)];
+        let above = [harvest_common::payment::OrderId([1; 32])];
+        let groups = purchase_groups(&all, &above);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(tag, cards)| (tag[0], cards.len()))
+                .collect::<Vec<_>>(),
+            vec![(5, 0), (6, 2)]
+        );
+    }
 
     /// **The complaint step's "Message the seller" goes to the purchase's
     /// own conversation**, and only where this node holds it: at a loaded

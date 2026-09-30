@@ -684,10 +684,13 @@ fn Compose(
 
     let (gate, signing, failure, name, awaiting_payment) = {
         let state = APP_STATE.read();
+        // What is waiting or was handed back in THIS conversation only.
+        let tag = state.compose_tag(&store_contract_id, target);
         (
             state.compose_gate_in(&store_contract_id, target),
-            state.texts_awaiting_voucher(&store_contract_id),
-            state.voucher_failure(&store_contract_id).cloned(),
+            tag.map(|tag| state.texts_awaiting_voucher(&store_contract_id, &tag))
+                .unwrap_or_default(),
+            tag.and_then(|tag| state.voucher_failure(&store_contract_id, &tag).cloned()),
             state.store_name_of(&store_contract_id).label(),
             target.is_some_and(|tag| awaits_payment(&state, &store_contract_id, &tag)),
         )
@@ -1035,6 +1038,12 @@ enum Role {
 /// send (review of #205, S2). It claims nothing about who wrote it.
 pub(crate) const UNCONFIRMED: &str = "Not confirmed as yours";
 
+/// The one line under [`UNCONFIRMED`], so the group does not read as
+/// tampering when it is only a reload (review round 2 of #205, R4). Every
+/// case it names is possible, and this browser cannot tell them apart.
+pub(crate) const UNCONFIRMED_WHY: &str = "Sent before this page was reloaded, from another \
+     device, or by someone else in your name. This browser can't tell which.";
+
 /// The name above a message: `(name, drawn as this side's own, trusted for
 /// the timeline)`.
 ///
@@ -1098,7 +1107,22 @@ fn chat_line(
     timestamp: chrono::DateTime<chrono::Utc>,
     content: &MessageContent,
 ) -> Option<ChatLine> {
-    let item = chat_item(content)?;
+    use crate::messaging::Addressing;
+    let this_side = matches!(
+        (role, addressing),
+        (Role::Seller, Addressing::ToBuyer) | (Role::Buyer, Addressing::ToSeller)
+    );
+    // A decline in this side's direction that this device did not send
+    // keeps its place as a step but not its words: the reason is free text
+    // the other party could have written in this side's name (review round 2
+    // of #205, R5). The store's own automatic declines are among these, so a
+    // seller sees "An order was declined." for them, without the reason.
+    let item = match content {
+        MessageContent::Decline { .. } if this_side && !authored_here => {
+            ChatItem::Event("An order was declined.".to_string())
+        }
+        _ => chat_item(content)?,
+    };
     let (who, mine, trusted) = who(role, addressing, authored_here);
     Some(ChatLine {
         who,
@@ -1163,7 +1187,7 @@ fn ChatLines(lines: Vec<ChatLine>) -> Element {
             }
         }
         if !unconfirmed.is_empty() {
-            p { class: "text-muted small", "{UNCONFIRMED}" }
+            p { class: "text-muted small", strong { "{UNCONFIRMED}" } " {UNCONFIRMED_WHY}" }
             div { class: "bubbles",
                 for line in unconfirmed.iter() {
                     if let ChatItem::Said(text) = &line.item {
@@ -1440,11 +1464,16 @@ pub(crate) fn seller_questions(
 
 /// Under which listed order each conversation is shown, by tag: the newest
 /// of its listed orders by the order's own signed `created_at` (review of
-/// #205, U3). A conversation holding two orders is shown once, and the
+/// #205, U3), after those that need the seller. A conversation holding two orders is shown once, and the
 /// other cards point to it, as the buyer's side groups by conversation.
+///
+/// An order that needs the seller (`needs_seller`: still to send) comes
+/// before a newer one that does not (a sent or reversed order), so the
+/// conversation stays on the card the seller is working from.
 pub(crate) fn thread_homes(
     inbox: &SellerInbox,
     listed: &[&harvest_common::payment::AuthorizedOrder],
+    needs_seller: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
 ) -> std::collections::HashMap<[u8; 32], harvest_common::payment::OrderId> {
     inbox
         .threads
@@ -1453,7 +1482,13 @@ pub(crate) fn thread_homes(
             listed
                 .iter()
                 .filter(|order| thread.orders.contains(&order.order.id))
-                .max_by_key(|order| (order.order.created_at, order.order.id.0))
+                .max_by_key(|order| {
+                    (
+                        needs_seller(order),
+                        order.order.created_at,
+                        order.order.id.0,
+                    )
+                })
                 .map(|order| (thread.tag, order.order.id.clone()))
         })
         .collect()
@@ -1989,8 +2024,13 @@ fn shown_given(
 /// placed in time: an order answers the asks made after the previous such
 /// order was issued and no later than it was (its signed `created_at`). One
 /// ask, one order, so a later order never shows an earlier order's address,
-/// and a closed earlier order never hides a later one's. The ask's time is
-/// its writer's clock, the same caveat `unanswered_requests` gives.
+/// and a closed earlier order never hides a later one's. Two orders issued
+/// in the same instant are ordered by id. The ask's time is its writer's
+/// clock, the same caveat `unanswered_requests` gives. Residual: an order the
+/// store's order cap has pruned is no longer there to bound the next one, so
+/// that one then also claims the pruned order's asks (a false "more than one
+/// version", or the pruned order's address, on its card); nothing the reader
+/// holds says where the pruned order's asks ended.
 pub(crate) fn quote_order_answers(
     order: &harvest_common::payment::AuthorizedOrder,
     published: &[harvest_common::payment::AuthorizedOrder],
@@ -2008,10 +2048,12 @@ pub(crate) fn quote_order_answers(
     if !same(order) || asked_at > order.order.created_at {
         return false;
     }
+    // Earlier by (signed date, id): two orders issued in the same instant
+    // are ordered by id, so they cannot both claim the same asks.
+    let this = (order.order.created_at, order.order.id.0);
     published
         .iter()
-        .filter(|o| same(o) && o.order.id != order.order.id)
-        .filter(|o| o.order.created_at < order.order.created_at)
+        .filter(|o| same(o) && (o.order.created_at, o.order.id.0) < this)
         .map(|o| o.order.created_at)
         .max()
         .is_none_or(|previous| asked_at > previous)
@@ -2881,15 +2923,19 @@ mod inbox_tests {
         let mut newer = published(2, Some(BINDING), None);
         older.order.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         newer.order.created_at = chrono::DateTime::from_timestamp(1_700_000_100, 0).unwrap();
-        let homes = thread_homes(&inbox, &[&older, &newer]);
+        let homes = thread_homes(&inbox, &[&older, &newer], |_| false);
         assert_eq!(homes.get(&[1; 32]), Some(&newer.order.id));
         assert_eq!(homes.get(&[3; 32]), None);
-        let homes = thread_homes(&inbox, &[&newer, &older]);
+        let homes = thread_homes(&inbox, &[&newer, &older], |_| false);
         assert_eq!(
             homes.get(&[1; 32]),
             Some(&newer.order.id),
             "whatever the order given"
         );
+        // The older one still to send keeps it (round 2 of #205).
+        let older_id = older.order.id.clone();
+        let homes = thread_homes(&inbox, &[&older, &newer], |o| o.order.id == older_id);
+        assert_eq!(homes.get(&[1; 32]), Some(&older.order.id));
     }
 
     /// **An order goes under the conversation whose request names it**,
@@ -2965,6 +3011,14 @@ mod inbox_tests {
         assert!(answers(&second, 200));
         assert!(!answers(&first, 200), "made after the first was issued");
         assert!(!answers(&second, 400), "made after the second was issued");
+        // Two issued in the same instant: exactly one answers an ask.
+        let twin = order(3, 100);
+        let pair = [first.clone(), twin.clone()];
+        let claimed = [&first, &twin]
+            .iter()
+            .filter(|o| quote_order_answers(o, &pair, at(50), &BINDING, &key, &tag))
+            .count();
+        assert_eq!(claimed, 1, "a tie is broken by id");
         let mut other_key = second.clone();
         other_key.order.buyer_receipt_key = Some([0x44; 32]);
         assert!(!quote_order_answers(
@@ -3081,6 +3135,40 @@ mod inbox_tests {
         )
         .unwrap();
         assert!(decline.trusted);
+        assert_eq!(
+            decline.item,
+            ChatItem::Event("An order was declined.".into()),
+            "a forged reason in this side's name is not shown (R5)"
+        );
+        let own = chat_line(
+            Role::Seller,
+            ToBuyer,
+            true,
+            at,
+            &MessageContent::Decline {
+                reason: "sold out".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            own.item,
+            ChatItem::Event("An order was declined: sold out".into())
+        );
+        let theirs = chat_line(
+            Role::Buyer,
+            ToBuyer,
+            false,
+            at,
+            &MessageContent::Decline {
+                reason: "sold out".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            theirs.item,
+            ChatItem::Event("An order was declined: sold out".into()),
+            "the other side's reason stands as theirs"
+        );
     }
 
     /// The count beside Orders is the number of accept controls the inbox
