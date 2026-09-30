@@ -12530,6 +12530,7 @@ impl AppState {
                             status.network.as_str(),
                             status.next_index
                         );
+                        self.note_payment_key(Some(&status));
                         self.bitcoin.payment_xpub = Some(status);
                         self.bitcoin.payment_xpub_loaded = true;
                         // A new or re-entered key wants its next addresses
@@ -12552,6 +12553,7 @@ impl AppState {
 
             BitcoinDelegateResponse::PaymentXpub { status } => {
                 self.forget_accounted_scripts_if_counter_fell(status.as_ref());
+                self.note_payment_key(status.as_ref());
                 self.bitcoin.payment_xpub = status;
                 self.bitcoin.payment_xpub_loaded = true;
             }
@@ -32267,6 +32269,80 @@ mod buy_flow_tests {
             "the old payment counts"
         );
         assert_eq!(state.vetted_used_scripts().count(), 1);
+    }
+
+    /// A late paid answer under an earlier build still counts when the
+    /// address's current read is gone (its send failed); and an older peek
+    /// answer landing after a newer one was taken never replaces the newer
+    /// window. Mutated red by marking only a held vet, and by not keeping the
+    /// newest answered peek.
+    #[test]
+    fn late_answers_never_undo_what_is_known() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let (paid, _) = address_states_paid_and_scanned();
+        let before = state.queue_auto_invoice(100);
+        let (old4, _) = vet_of(&before, 4);
+        settle_absent_except(&mut state, &before, &[4], 100);
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([0xc3; 32]);
+        let after = state.queue_auto_invoice(200);
+        let (new4, token4) = vet_of(&after, 4);
+        state.on_address_vet_unsent(&new4, token4);
+        assert!(state.on_address_vet_state(&old4, &paid, 210));
+        let again = state.queue_auto_invoice(220);
+        assert!(
+            !again.vets.iter().any(|(_, script, _)| script[3] == 4),
+            "not re-read"
+        );
+        settle_absent_except(&mut state, &after, &[4], 230);
+        assert!(state.prewatch_wanted(bridge).is_none(), "still paid");
+
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let older = state.bitcoin.next_request_id();
+        let newer = state.bitcoin.next_request_id();
+        state.on_upcoming_answer(newer, Ok((1..11).map(lost_address).collect()), 300);
+        state.on_upcoming_answer(older, Ok((0..10).map(lost_address).collect()), 310);
+        assert_eq!(
+            state.auto_invoice.upcoming[0].index, 1,
+            "the newer window stands"
+        );
+    }
+
+    /// An answer to a peek sent under an earlier payment key lists that
+    /// key's addresses: dropped once the delegate reports another key, so the
+    /// new key's own addresses are what gets read. Mutated red by not
+    /// raising the floor on a key change.
+    #[test]
+    fn a_peek_from_before_a_key_change_is_dropped() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let old_peek = state.bitcoin.next_request_id();
+        state.note_peek_sent(old_peek);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpub {
+            status: Some(harvest_common::PaymentXpubStatus {
+                xpub: "vpub-another".into(),
+                network: BitcoinNetwork::Signet,
+                next_index: 0,
+            }),
+        });
+        state.on_upcoming_answer(old_peek, Ok((0..10).map(lost_address).collect()), 300);
+        assert!(
+            state.auto_invoice.upcoming_for.is_none(),
+            "the old key's window"
+        );
+        let new_peek = state.bitcoin.next_request_id();
+        state.note_peek_sent(new_peek);
+        state.on_upcoming_answer(new_peek, Ok((0..10).map(lost_address).collect()), 310);
+        assert_eq!(
+            state
+                .auto_invoice
+                .upcoming_for
+                .as_ref()
+                .map(|(k, _)| k.as_str()),
+            Some("vpub-another")
+        );
     }
 
     /// The watch delegation goes to the delegate only while the window is

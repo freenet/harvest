@@ -143,6 +143,13 @@ pub struct AutoInvoiceUi {
     pub stale_from_peek: Option<u64>,
     /// The request id of the last peek sent.
     pub last_peek_id: Option<u64>,
+    /// The request id of the last peek answer taken: an older answer landing
+    /// after it is dropped, never replacing a newer window.
+    pub last_answered_peek: Option<u64>,
+    /// The lowest peek request id asked under the payment key held now: an
+    /// answer to a peek sent under an earlier key lists that key's addresses
+    /// and must not be read as this key's.
+    pub key_floor_peek: Option<u64>,
     /// Reads still out under an earlier address-contract build, by that
     /// build's contract id: a late answer showing a payment still makes the
     /// address used (a payment under any build stands).
@@ -586,14 +593,26 @@ impl AppState {
         if let Ok(id) = <[u8; 32]>::try_from(contract_id) {
             if let Some(script) = self.auto_invoice.retired_reads.remove(&id) {
                 if address_state_payments(state_bytes) == Some(true) {
-                    if let Some(vet) = self.auto_invoice.vets.get_mut(&script) {
-                        if vet.verdict != VetVerdict::Used {
-                            vet.verdict = VetVerdict::Used;
-                            vet.at_ms = now_ms;
-                            self.auto_invoice.upcoming_for = None;
-                            self.auto_invoice.stale_from_peek =
-                                Some(self.bitcoin.next_request_id + 1);
-                        }
+                    dioxus::logger::tracing::warn!(
+                        "An upcoming payment address (script {}) was paid under an earlier \
+                         address-contract build; moving the delegate's counter past it",
+                        hex::encode(&script)
+                    );
+                    // Its current read may be gone (a send that failed):
+                    // recorded used whatever is held.
+                    let held = self.auto_invoice.vets.get(&script);
+                    if held.is_none_or(|v| v.verdict != VetVerdict::Used) {
+                        let contract_id = held.map_or(id, |v| v.contract_id);
+                        self.auto_invoice.vets.insert(
+                            script,
+                            AddressVet {
+                                contract_id,
+                                verdict: VetVerdict::Used,
+                                at_ms: now_ms,
+                            },
+                        );
+                        self.auto_invoice.upcoming_for = None;
+                        self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                     }
                 }
                 if !self
@@ -1396,6 +1415,22 @@ impl AppState {
         let _ = work;
     }
 
+    /// The payment key the delegate reports is about to become `new`: when it
+    /// is another key (or the first), peeks sent before now list the wrong
+    /// key's addresses, so their answers are dropped and the window is read
+    /// again.
+    pub(crate) fn note_payment_key(&mut self, new: Option<&harvest_common::PaymentXpubStatus>) {
+        let changed = match (self.bitcoin.payment_xpub.as_ref(), new) {
+            (Some(old), Some(new)) => old.xpub != new.xpub,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if changed {
+            self.auto_invoice.key_floor_peek = Some(self.bitcoin.next_request_id + 1);
+            self.auto_invoice.upcoming_for = None;
+        }
+    }
+
     /// A `PeekOrderAddresses` went out under `request_id`.
     pub(crate) fn note_peek_sent(&mut self, request_id: u64) {
         self.auto_invoice.last_peek_id = Some(request_id);
@@ -1415,8 +1450,19 @@ impl AppState {
             .auto_invoice
             .stale_from_peek
             .is_some_and(|first| request_id < first)
+            || self
+                .auto_invoice
+                .last_answered_peek
+                .is_some_and(|newest| request_id < newest)
+            || self
+                .auto_invoice
+                .key_floor_peek
+                .is_some_and(|floor| request_id < floor)
         {
             return;
+        }
+        if result.is_ok() {
+            self.auto_invoice.last_answered_peek = Some(request_id);
         }
         self.on_upcoming_addresses(result, now_ms);
     }

@@ -242,13 +242,15 @@ pub async fn derive_order_address(_request_id: u64) -> Result<(), String> {
 pub async fn peek_order_addresses() -> Result<(), String> {
     let (delegate_key, request_id) = {
         let mut state = APP_STATE.write();
+        // Recorded before the send, and before anything can fail: its answer
+        // is matched to it, and a peek that could not go counts as asked so
+        // the retry minute still applies (harvest#183).
+        let request_id = state.bitcoin.next_request_id();
+        state.note_peek_sent(request_id);
         let key = state
             .harvest_delegate_key
             .clone()
             .ok_or("harvest delegate not yet registered")?;
-        let request_id = state.bitcoin.next_request_id();
-        // Recorded before the send: its answer is matched to it (harvest#183).
-        state.note_peek_sent(request_id);
         (key, request_id)
     };
     let payload = to_cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
