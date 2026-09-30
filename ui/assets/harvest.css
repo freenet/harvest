@@ -1284,8 +1284,17 @@ h4 {
   color: var(--text-secondary);
 }
 
-.form-row-head > span {
-  padding: 0 0.75rem;
+/* At a phone's width a name and its value share one line, so the heads
+   stay over their fields (round-5 critique: the choice row wrapped, and
+   "Options" sat over "Size"). The Remove button still wraps below. */
+@media (max-width: 600px) {
+  .form-row.form-row-fit > .field-short-text {
+    width: calc(45% - var(--space-sm));
+  }
+
+  .form-row.form-row-fit > .field-grow {
+    flex: 1 1 0;
+  }
 }
 
 .card h3 {
