@@ -1,0 +1,370 @@
+//! Which conversation an order belongs to, and when a paid order opens that
+//! conversation to plain text from its buyer.
+//!
+//! # Why this exists
+//!
+//! Buyer-to-seller messages need a Ghost Key (anti-spam); buying does not.
+//! A buyer whose order is PAID may write in that order's conversation without
+//! one (Ian, 2026-09-27, confirmed 2026-09-30): money has been spent, which
+//! is no cheaper for a spammer than a Ghost Key, and a worried buyer's only
+//! other frictionless move is a permanent complaint. Before payment a Ghost
+//! Key is still required.
+//!
+//! The rule has two halves, and they must agree:
+//!
+//! * **The seller's half** ([`conversation_has_paid_order`]) decides whether
+//!   the seller's inbox shows a buyer's plain text in a conversation
+//!   (`components::message_view::shown_to_seller`). It is the one that
+//!   enforces anything: the mailbox is open-write, so a gate in the buyer's
+//!   compose box stops only a buyer using this UI.
+//! * **The buyer's half** (`AppState::paid_conversation`) decides whether the
+//!   buyer is offered a compose box without a Ghost Key. It must be a STRICT
+//!   SUBSET of the seller's half, or a buyer would be invited to send text the
+//!   seller never sees. It is built from the same predicate
+//!   ([`order_in_conversation`]) over the same kind of evidence, plus
+//!   conditions of its own, so it cannot say yes where the seller says no.
+//!
+//! # What counts as the evidence
+//!
+//! Only the seller's own published store state. An order `O` of the store
+//! opens conversation `T` when `O` is `Paid` or `PaymentReversed` (money was
+//! spent to reach that status, which is the bar; the store contract accepts
+//! `Paid` only with a payment proof) and `O` belongs to `T` by one of:
+//!
+//! 1. **Its request.** `O` answers an instant request (`O.request_id` is
+//!    set), and a Buy now request read in `T` gives that request id and that
+//!    order id under `T`'s own tag (`InstantSelection::answered_request`).
+//!    The request id hashes the tag, so a request copied into another
+//!    conversation names another id.
+//! 2. **Its listing tag.** `O.listing_tag` is `T`'s keyed tag for a listing
+//!    named by a request in `T`, or for one the store lists now. Only the two
+//!    holders of `T`'s keys can compute that tag, and only the seller can
+//!    publish an order, so an order carrying it was issued to `T`. This is
+//!    what opens a conversation for a paid invoice answering a QUOTE request
+//!    (no request id), and for a Buy now whose request has since left the
+//!    bounded mailbox.
+//!
+//! **Never** evidence, because a buyer can produce it for any order:
+//!
+//! * the order's `order_binding` alone: it is published on the order, so
+//!   anyone can copy it into a request in their own conversation;
+//! * an `OrderAccepted` message naming a paid order: both parties hold both
+//!   direction keys, so the buyer can write one naming any order id;
+//! * anything else the buyer sends. Nothing in a message is read as a
+//!   statement that something was paid.
+
+use std::collections::HashSet;
+
+use harvest_common::listing::ListingId;
+use harvest_common::payment::{AuthorizedOrder, OrderId, OrderStatus};
+
+use crate::messaging::InstantSelection;
+
+/// Whether an order in `status` can open its conversation: money was spent
+/// to reach it. `PaymentReversed` counts (a reorg took the payment back, but
+/// it was made); `AwaitingPayment` and `Cancelled` never do.
+pub(crate) fn status_opens(status: OrderStatus) -> bool {
+    match status {
+        OrderStatus::Paid | OrderStatus::PaymentReversed => true,
+        OrderStatus::AwaitingPayment | OrderStatus::Cancelled => false,
+    }
+}
+
+/// What one conversation's requests to buy, and the store's listings, let a
+/// reader match an order against: worked out once per conversation, so
+/// matching every order in a store costs one lookup each rather than a keyed
+/// hash per listing per order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ConversationClaims {
+    /// `(request id, order id)` for each Buy now request read in the
+    /// conversation, computed under the conversation's own tag.
+    answered: Vec<([u8; 32], OrderId)>,
+    /// The conversation's keyed tag for every listing its requests name and
+    /// every listing the store lists now. Empty when the reader holds no keys
+    /// for the conversation.
+    listing_tags: HashSet<[u8; 32]>,
+}
+
+impl ConversationClaims {
+    /// The claims of the conversation tagged `tag`, from the requests read in
+    /// it (`(listing, Buy now selection)` pairs), the store's current
+    /// listings, and the conversation's keyed listing tag (`None` when the
+    /// reader has no keys for it).
+    pub(crate) fn of<'a>(
+        tag: &[u8; 32],
+        requests: impl IntoIterator<Item = (&'a ListingId, Option<&'a InstantSelection>)>,
+        listings: impl IntoIterator<Item = &'a ListingId>,
+        listing_tag: impl Fn(&ListingId) -> Option<[u8; 32]>,
+    ) -> Self {
+        let mut claims = ConversationClaims::default();
+        let mut named: Vec<&ListingId> = Vec::new();
+        for (listing, selection) in requests {
+            named.push(listing);
+            if let Some(request) = selection.and_then(|s| s.answered_request(tag)) {
+                claims
+                    .answered
+                    .push((request.request_id, request.order_id()));
+            }
+        }
+        claims.listing_tags = named
+            .into_iter()
+            .chain(listings)
+            .filter_map(&listing_tag)
+            .collect();
+        claims
+    }
+}
+
+/// Whether `order` was issued to the conversation `claims` describes, by its
+/// request (rule 1 of the module docs) or its listing tag (rule 2). Nothing
+/// else is read: not its binding, not any message naming it.
+pub(crate) fn order_in_conversation(order: &AuthorizedOrder, claims: &ConversationClaims) -> bool {
+    let by_request = order.order.request_id.is_some_and(|request_id| {
+        claims
+            .answered
+            .iter()
+            .any(|(asked, id)| *asked == request_id && *id == order.order.id)
+    });
+    let by_listing_tag = order
+        .order
+        .listing_tag
+        .is_some_and(|tag| claims.listing_tags.contains(&tag));
+    by_request || by_listing_tag
+}
+
+/// The seller's half of the rule: whether one of `orders` is paid (or was,
+/// [`status_opens`]) and belongs to the conversation `claims` describes.
+pub(crate) fn conversation_has_paid_order(
+    orders: &[AuthorizedOrder],
+    claims: &ConversationClaims,
+) -> bool {
+    orders
+        .iter()
+        .any(|order| status_opens(order.status) && order_in_conversation(order, claims))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::messaging::ConversationKeys;
+
+    pub(crate) const TAG: [u8; 32] = [1; 32];
+    pub(crate) const OTHER: [u8; 32] = [2; 32];
+
+    pub(crate) fn keys(tag: &[u8; 32]) -> ConversationKeys {
+        ConversationKeys::from_shared_secret(tag)
+    }
+
+    pub(crate) fn selection(nonce: u8) -> InstantSelection {
+        InstantSelection {
+            requested_at_ms: 1_700_000_000_000,
+            nonce: [nonce; 16],
+            region: None,
+            choices: vec![],
+            expected_total_sats: 12_000,
+        }
+    }
+
+    /// An order with only the fields this rule reads set; unsigned, since
+    /// the rule reads terms and status, never the signature (the store
+    /// contract checked it).
+    pub(crate) fn order(status: OrderStatus) -> AuthorizedOrder {
+        AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: None,
+                id: OrderId([7; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: "seller-fp".to_string(),
+                amount_sats: 12_000,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: Some([5; 32]),
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// The Buy now order answering `selection` in `tag`.
+    pub(crate) fn buy_now_order(
+        tag: &[u8; 32],
+        selection: &InstantSelection,
+        status: OrderStatus,
+    ) -> AuthorizedOrder {
+        let request = selection.answered_request(tag).expect("dated");
+        let mut o = order(status);
+        o.order.id = request.order_id();
+        o.order.request_id = Some(request.request_id);
+        o
+    }
+
+    /// A quote order for `listing` issued to `tag`: no request id, the
+    /// conversation's listing tag.
+    pub(crate) fn quote_order(
+        tag: &[u8; 32],
+        listing: &ListingId,
+        status: OrderStatus,
+    ) -> AuthorizedOrder {
+        let mut o = order(status);
+        o.order.listing_tag = Some(keys(tag).listing_tag(listing));
+        o
+    }
+
+    fn claims(
+        tag: &[u8; 32],
+        requests: &[(ListingId, Option<InstantSelection>)],
+        listings: &[ListingId],
+        with_keys: bool,
+    ) -> ConversationClaims {
+        let k = keys(tag);
+        ConversationClaims::of(
+            tag,
+            requests.iter().map(|(l, s)| (l, s.as_ref())),
+            listings.iter(),
+            |l| with_keys.then(|| k.listing_tag(l)),
+        )
+    }
+
+    const L: ListingId = ListingId([9; 32]);
+
+    /// **A paid invoice answering a QUOTE request opens its conversation.**
+    /// Only a paid Buy now did before (extortion second opinion, section 4).
+    /// Unpaid or cancelled, it opens nothing; reversed, it does. Red with
+    /// the listing-tag rule dropped, and with the status check dropped.
+    #[test]
+    fn a_paid_quote_invoice_opens_its_conversation() {
+        let asked = claims(&TAG, &[(L, None)], &[], true);
+        for (status, opens) in [
+            (OrderStatus::Paid, true),
+            (OrderStatus::PaymentReversed, true),
+            (OrderStatus::AwaitingPayment, false),
+            (OrderStatus::Cancelled, false),
+        ] {
+            assert_eq!(
+                conversation_has_paid_order(&[quote_order(&TAG, &L, status)], &asked),
+                opens,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// Only its OWN conversation: the same listing's tag under another
+    /// conversation's keys matches nothing, and without the keys nothing can
+    /// be matched by tag at all.
+    #[test]
+    fn a_paid_order_opens_only_its_own_conversation() {
+        let paid = quote_order(&TAG, &L, OrderStatus::Paid);
+        assert!(!conversation_has_paid_order(
+            std::slice::from_ref(&paid),
+            &claims(&OTHER, &[(L, None)], &[], true)
+        ));
+        assert!(!conversation_has_paid_order(
+            std::slice::from_ref(&paid),
+            &claims(&TAG, &[(L, None)], &[], false)
+        ));
+        let buy_now = buy_now_order(&TAG, &selection(4), OrderStatus::Paid);
+        assert!(conversation_has_paid_order(
+            std::slice::from_ref(&buy_now),
+            &claims(&TAG, &[(L, Some(selection(4)))], &[], false)
+        ));
+        // The same selection read under another tag names another id.
+        assert!(!conversation_has_paid_order(
+            &[buy_now],
+            &claims(&OTHER, &[(L, Some(selection(4)))], &[], false)
+        ));
+    }
+
+    /// A paid Buy now opens by its request; an unpaid or cancelled one does
+    /// not, nor one whose request id differs from the order's. Red with the
+    /// request-id check dropped.
+    #[test]
+    fn a_buy_now_opens_by_its_own_request_only_once_paid() {
+        let asked = claims(&TAG, &[(L, Some(selection(4)))], &[], false);
+        for (status, opens) in [
+            (OrderStatus::Paid, true),
+            (OrderStatus::PaymentReversed, true),
+            (OrderStatus::AwaitingPayment, false),
+            (OrderStatus::Cancelled, false),
+        ] {
+            assert_eq!(
+                conversation_has_paid_order(&[buy_now_order(&TAG, &selection(4), status)], &asked),
+                opens,
+                "{status:?}"
+            );
+        }
+        let mut stray = buy_now_order(&TAG, &selection(4), OrderStatus::Paid);
+        stray.order.request_id = Some([3; 32]);
+        assert!(!conversation_has_paid_order(&[stray], &asked));
+        // Another request in the conversation names another order.
+        assert!(!conversation_has_paid_order(
+            &[buy_now_order(&TAG, &selection(5), OrderStatus::Paid)],
+            &asked
+        ));
+    }
+
+    /// **A copied order binding opens nothing.** The binding is published on
+    /// the order, so anyone can put it in a request of their own; a request
+    /// in OTHER naming the paid order's listing and carrying its binding
+    /// still opens nothing there. The claims never read the binding at all:
+    /// the request pairs carry only the listing and selection.
+    #[test]
+    fn a_copied_order_binding_opens_nothing() {
+        let paid = quote_order(&TAG, &L, OrderStatus::Paid);
+        assert_eq!(paid.order.order_binding, Some([5; 32]));
+        assert!(!conversation_has_paid_order(
+            &[paid],
+            &claims(&OTHER, &[(L, None)], &[L], true)
+        ));
+    }
+
+    /// **An OrderAccepted message naming a paid order opens nothing.** The
+    /// buyer can write one naming any id, so the claims are built from
+    /// requests and listings only; a conversation holding nothing but such a
+    /// message has no claims that match a paid order issued elsewhere.
+    #[test]
+    fn an_order_accepted_naming_a_paid_order_opens_nothing() {
+        let elsewhere = buy_now_order(&OTHER, &selection(4), OrderStatus::Paid);
+        // What TAG's claims are when all it holds is an acceptance naming
+        // `elsewhere.order.id`: no request, and TAG's own listing tags.
+        assert!(!conversation_has_paid_order(
+            std::slice::from_ref(&elsewhere),
+            &claims(&TAG, &[], &[L], true)
+        ));
+        let mut quote_elsewhere = quote_order(&OTHER, &L, OrderStatus::Paid);
+        quote_elsewhere.order.id = elsewhere.order.id;
+        assert!(!conversation_has_paid_order(
+            &[quote_elsewhere],
+            &claims(&TAG, &[], &[L], true)
+        ));
+    }
+
+    /// A request that has left the bounded mailbox does not close the
+    /// conversation again: the store's current listings still give the tag.
+    /// A listing neither named in the conversation nor listed any more gives
+    /// nothing. Red with the current listings left out of the claims.
+    #[test]
+    fn a_request_that_left_the_mailbox_still_opens_by_the_listing() {
+        let paid = quote_order(&TAG, &L, OrderStatus::Paid);
+        assert!(conversation_has_paid_order(
+            std::slice::from_ref(&paid),
+            &claims(&TAG, &[], &[L], true)
+        ));
+        assert!(!conversation_has_paid_order(
+            &[paid],
+            &claims(&TAG, &[], &[ListingId([8; 32])], true)
+        ));
+    }
+}

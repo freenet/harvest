@@ -79,19 +79,23 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
         // Buyer text no Ghost Key vouches for is taken out here, before
         // anything counts or groups it (the anti-spam gate's seller half).
         let published_orders = store.map(|s| s.orders.as_slice()).unwrap_or_default();
+        let store_listings = store.map(|s| s.listings.as_slice()).unwrap_or_default();
         let all = app_state.mailbox_entries(&store_contract_id);
+        let paid = paid_conversations(&all, published_orders, store_listings, |tag| {
+            app_state.conversation_keys.get(tag)
+        });
         // `shown_to_seller` works the vouchers out again below; that is a
         // cache hit (`voucher_verifies` remembers each verdict), not a second
         // chain check.
         let open = open_conversations(
             &all,
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
-            |tag, selection| paid_request_in(published_orders, tag, selection),
+            |tag| paid.contains(tag),
         );
         let (entries, unvouched) = shown_to_seller(
             all,
             |voucher, tag| app_state.voucher_verifies(voucher, tag),
-            |tag, selection| paid_request_in(published_orders, tag, selection),
+            |tag| paid.contains(tag),
             |digest| app_state.authored_here(&store_contract_id, digest),
         );
         // The only authorship this client can establish: what it sent itself.
@@ -1171,8 +1175,12 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 /// * a [`MessageContent::VouchedText`] whose voucher verifies for THIS
 ///   conversation's tag (`verifies`), so one copied from another
 ///   conversation vouches for nothing; or
-/// * a Buy now request whose order the seller's store has PAID
-///   (`paid_request`): money, not a Ghost Key, but no cheaper for a spammer.
+/// * one of the store's orders that is PAID and belongs to this
+///   conversation (`paid`, [`paid_conversations`]; the rule and what it
+///   refuses to count are in `crate::order_threads`): money, not a Ghost
+///   Key, but no cheaper for a spammer. A buyer's plain text in such a
+///   conversation is shown, which is what lets a buyer with a paid order
+///   write without a Ghost Key.
 ///
 /// A request to buy on its own opens nothing: it costs nothing to send.
 ///
@@ -1200,29 +1208,29 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
-    paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+    paid: impl Fn(&[u8; 32]) -> bool,
     authored_here: impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<MailboxEntry>, usize) {
-    let (verdicts, opened) = verdicts_and_open(&entries, &verifies, &paid_request);
+    let (verdicts, opened) = verdicts_and_open(&entries, &verifies, &paid);
     shown_given(entries, verdicts, &opened, authored_here)
 }
 
 /// The conversations a seller's inbox shows free text in (see
-/// [`shown_to_seller`]): those with a verified voucher, or a Buy now whose
-/// own order is paid. Also what decides whether a Buy now may be answered
-/// by hand ([`offered_by_hand`]).
+/// [`shown_to_seller`]): those with a verified voucher, or with a paid order
+/// of the store's own (`paid`). Also what decides whether a Buy now may be
+/// answered by hand ([`offered_by_hand`]).
 pub(crate) fn open_conversations(
     entries: &[MailboxEntry],
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
-    paid_request: impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+    paid: impl Fn(&[u8; 32]) -> bool,
 ) -> std::collections::HashSet<Vec<u8>> {
-    verdicts_and_open(entries, &verifies, &paid_request).1
+    verdicts_and_open(entries, &verifies, &paid).1
 }
 
 fn verdicts_and_open(
     entries: &[MailboxEntry],
     verifies: &impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
-    paid_request: &impl Fn(&[u8; 32], &crate::messaging::InstantSelection) -> bool,
+    paid: &impl Fn(&[u8; 32]) -> bool,
 ) -> (Vec<bool>, std::collections::HashSet<Vec<u8>>) {
     let tag_of = |conversation: &[u8]| <[u8; 32]>::try_from(conversation).ok();
     let vouched = |entry: &MailboxEntry| match entry {
@@ -1239,18 +1247,7 @@ fn verdicts_and_open(
         .iter()
         .zip(&verdicts)
         .filter(|(entry, verified)| {
-            **verified
-                || matches!(
-                    entry,
-                    MailboxEntry::Readable {
-                        content: MessageContent::OrderRequest {
-                            instant: Some(selection),
-                            ..
-                        },
-                        conversation,
-                        ..
-                    } if tag_of(conversation).is_some_and(|tag| paid_request(&tag, selection))
-                )
+            **verified || tag_of(entry.conversation()).is_some_and(|tag| paid(&tag))
         })
         .map(|(entry, _)| entry.conversation().to_vec())
         .collect();
@@ -1359,21 +1356,68 @@ fn offered_by_hand(request: &PendingRequest, open: bool) -> bool {
 /// conversation is not open ([`shown_to_seller`]).
 pub(crate) const SHIPPING_SHOWN_ONCE_PAID: &str = "(shown once it is paid)";
 
-/// Whether the Buy now request `selection`, in the conversation `tag`, is
-/// answered by an order in `published` that has been paid: what opens a
+/// What each conversation in a seller's inbox lets an order be matched
+/// against (`order_threads::ConversationClaims`), newest conversation first:
+/// the requests to buy read in it, in either direction (only the two holders
+/// of its keys can write a readable entry, and the order must still be the
+/// store's own), and the store's current listings, under that conversation's
+/// keys when this seller holds them.
+pub(crate) fn seller_claims<'a>(
+    entries: &[MailboxEntry],
+    listings: &[harvest_common::listing::AuthorizedListing],
+    keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
+) -> Vec<([u8; 32], crate::order_threads::ConversationClaims)> {
+    let mut tags: Vec<[u8; 32]> = Vec::new();
+    for entry in entries {
+        if let Ok(tag) = <[u8; 32]>::try_from(entry.conversation()) {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+    tags.into_iter()
+        .map(|tag| {
+            let requests = entries.iter().filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    conversation,
+                    content:
+                        MessageContent::OrderRequest {
+                            listing_id,
+                            instant,
+                            ..
+                        },
+                    ..
+                } if conversation.as_slice() == tag.as_slice() => {
+                    Some((listing_id, instant.as_ref()))
+                }
+                _ => None,
+            });
+            let keys = keys_for(&tag);
+            let claims = crate::order_threads::ConversationClaims::of(
+                &tag,
+                requests,
+                listings.iter().map(|l| &l.listing.id),
+                |listing| keys.map(|keys| keys.listing_tag(listing)),
+            );
+            (tag, claims)
+        })
+        .collect()
+}
+
+/// The conversations in a seller's inbox that one of the store's own paid
+/// orders opens (`order_threads::conversation_has_paid_order`): what opens a
 /// conversation to the seller without a voucher ([`shown_to_seller`]).
-pub(crate) fn paid_request_in(
+pub(crate) fn paid_conversations<'a>(
+    entries: &[MailboxEntry],
     published: &[harvest_common::payment::AuthorizedOrder],
-    tag: &[u8; 32],
-    selection: &crate::messaging::InstantSelection,
-) -> bool {
-    let Some(request) = selection.answered_request(tag) else {
-        return false;
-    };
-    let id = request.order_id();
-    published
-        .iter()
-        .any(|order| order.order.id == id && !crate::fulfilment::is_unpaid_buy_now(order))
+    listings: &[harvest_common::listing::AuthorizedListing],
+    keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
+) -> std::collections::HashSet<[u8; 32]> {
+    seller_claims(entries, listings, keys_for)
+        .into_iter()
+        .filter(|(_, claims)| crate::order_threads::conversation_has_paid_order(published, claims))
+        .map(|(tag, _)| tag)
+        .collect()
 }
 
 /// The request to buy this conversation is waiting on, if any.
@@ -1985,11 +2029,14 @@ mod inbox_tests {
         assert!(offered_by_hand(&quote[0], false));
     }
 
-    /// A Buy now request opens its conversation to the seller only once its
-    /// own order is paid: not unpaid, not cancelled, not another order.
-    /// Mutated red by dropping the paid check, and the id match.
+    /// A seller's inbox opens a conversation for a paid order of the
+    /// store's that belongs to it: a Buy now by its own request, a quote
+    /// invoice by its listing tag. Not unpaid, not cancelled, not another
+    /// order, not another conversation. Mutated red by dropping the paid
+    /// check, and the id match.
     #[test]
-    fn only_a_paid_buy_now_opens_its_conversation() {
+    fn only_a_paid_order_opens_its_conversation() {
+        use harvest_common::payment::OrderStatus;
         let tag = [1u8; 32];
         let selection = crate::messaging::InstantSelection {
             requested_at_ms: 1_700_000_000_000,
@@ -1998,35 +2045,59 @@ mod inbox_tests {
             choices: vec![],
             expected_total_sats: 12_000,
         };
+        let id = ListingId([9u8; 32]);
+        let buy_now = readable(
+            MessageContent::OrderRequest {
+                instant: Some(selection.clone()),
+                listing_id: id.clone(),
+                quantity: 1,
+                shipping: "12 Example St".into(),
+                note: String::new(),
+                order_binding: BINDING,
+                buyer_receipt_key: None,
+            },
+            [1u8; 32],
+        );
         let own = selection.answered_request(&tag).unwrap();
         let mut order = published(1, Some(BINDING), None);
         order.order.id = own.order_id();
         order.order.request_id = Some(own.request_id);
-        assert!(
-            !paid_request_in(&[order.clone()], &tag, &selection),
-            "unpaid"
-        );
-        order.status = harvest_common::payment::OrderStatus::Cancelled;
-        assert!(
-            !paid_request_in(&[order.clone()], &tag, &selection),
-            "cancelled"
-        );
-        order.status = harvest_common::payment::OrderStatus::Paid;
-        assert!(paid_request_in(&[order.clone()], &tag, &selection));
+        let k = keys();
+        let paid = |orders: &[harvest_common::payment::AuthorizedOrder],
+                    entries: &[MailboxEntry]| {
+            paid_conversations(entries, orders, &[], |_| Some(&k))
+        };
+        let entries = [buy_now];
+        assert!(paid(&[order.clone()], &entries).is_empty(), "unpaid");
+        order.status = OrderStatus::Cancelled;
+        assert!(paid(&[order.clone()], &entries).is_empty(), "cancelled");
+        order.status = OrderStatus::Paid;
+        assert_eq!(paid(&[order.clone()], &entries), [tag].into());
         // Paid and then reversed (a reorg) was still paid for: money was
         // spent to open it, which is the bar.
         let mut reversed = order.clone();
-        reversed.status = harvest_common::payment::OrderStatus::PaymentReversed;
-        assert!(paid_request_in(&[reversed], &tag, &selection));
+        reversed.status = OrderStatus::PaymentReversed;
+        assert_eq!(paid(&[reversed], &entries), [tag].into());
         let mut other = order.clone();
         other.order.id = harvest_common::payment::OrderId([7; 32]);
-        assert!(
-            !paid_request_in(&[other], &tag, &selection),
-            "another order"
+        assert!(paid(&[other], &entries).is_empty(), "another order");
+
+        // A paid quote invoice, by its listing tag under THIS
+        // conversation's keys.
+        let quote = request(id.clone(), 1, [2u8; 32]);
+        let mut invoice = published(2, Some(BINDING), Some(k.listing_tag(&id)));
+        invoice.status = OrderStatus::Paid;
+        assert_eq!(
+            paid(&[invoice.clone()], std::slice::from_ref(&quote)),
+            [tag].into()
         );
+        let other_keys = crate::messaging::ConversationKeys::from_shared_secret(&[6u8; 32]);
         assert!(
-            !paid_request_in(&[order], &[2u8; 32], &selection),
-            "another conversation"
+            paid_conversations(std::slice::from_ref(&quote), &[invoice], &[], |_| {
+                Some(&other_keys)
+            })
+            .is_empty(),
+            "another conversation's keys"
         );
     }
 
@@ -2587,7 +2658,7 @@ mod voucher_view_tests {
             |voucher, tag| {
                 crate::ghostkey_cert::verify_voucher_under(voucher, tag, &test_master()).is_ok()
             },
-            |tag, _| *tag == PAID,
+            |tag| *tag == PAID,
             |digest| *digest == [AUTHORED; 32],
         )
     }
