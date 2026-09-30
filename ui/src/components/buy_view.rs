@@ -593,10 +593,6 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
     let shown_above = SHOWN_IN_BUY_FORM();
     let app_state = APP_STATE.read();
     let purchases = app_state.buyer_purchases(&store_contract_id);
-    let listed: Vec<BuyerPurchase> = purchases_to_list(&purchases, &shown_above)
-        .into_iter()
-        .cloned()
-        .collect();
     let held: Vec<[u8; 32]> = app_state
         .browsing_stores
         .get(&store_contract_id)
@@ -628,11 +624,17 @@ pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
 
     rsx! {
         div { style: "margin-top: 24px;",
-            if !listed.is_empty() {
+            if !groups.is_empty() {
                 h4 { "Your purchases" }
             }
             for (tag , group) in groups.iter() {
                 div { key: "{bs58::encode(tag).into_string()}",
+                    // Its only order is the one the Buy now form on this
+                    // page shows: say whose messages these are (round 3 of
+                    // #205).
+                    if group.is_empty() && held.contains(tag) {
+                        p { class: "text-muted small", "About the order you just placed" }
+                    }
                     for purchase in group.iter() {
                         PurchaseCard {
                             key: "{purchase.order_id}",
@@ -677,9 +679,9 @@ fn purchase_groups(
     by_conversation(purchases)
         .into_iter()
         .map(|(tag, group)| {
-            let cards = group
+            let cards = purchases_to_list(&group, shown_above)
                 .into_iter()
-                .filter(|purchase| !shown_above.contains(&purchase.order_id))
+                .cloned()
                 .collect();
             (tag, cards)
         })

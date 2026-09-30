@@ -996,6 +996,41 @@ pub(crate) const SELLER_GUIDANCE: &str =
 /// so some are junk; the rest were sealed to keys this device does not hold.
 pub(crate) const SOME_UNREADABLE: &str = "Some messages couldn't be read on this device.";
 
+/// The reasons the seller's store gives in a Decline, word for word: the
+/// harvest delegate's `Refusal::buyer_reason` and its stock check
+/// (`delegates/harvest-delegate/src/auto_invoice.rs`). Copied rather than
+/// depended on (the UI takes nothing from the delegate crate); the test
+/// `the_store_decline_reasons_are_the_delegates` reads the delegate's source
+/// and fails if they drift.
+pub(crate) const STORE_DECLINE_REASONS: [&str; 6] = [
+    "What is left is held for orders not yet paid. Try again in about an hour.",
+    "This store can't take more orders right now. Please try again later.",
+    "This listing has changed since you opened it. Reload the store to see it as it is now, \
+     then try again.",
+    "This listing has been taken down.",
+    "Your computer's clock is ahead of the right time. Set it right, then try again.",
+    "Sold out",
+];
+
+/// Whether `reason` is exactly one the seller's store sends
+/// ([`STORE_DECLINE_REASONS`], "Only N left" with N a plain number, and
+/// [`harvest_common::delegate::TOO_MANY_UNPAID`]). Shown whoever sealed it:
+/// a forger copying one only repeats the store's own words, and it is what
+/// lets a seller see "Sold out" on their store's automatic declines.
+pub(crate) fn is_store_decline_reason(reason: &str) -> bool {
+    let only_n_left = reason
+        .strip_prefix("Only ")
+        .and_then(|rest| rest.strip_suffix(" left"))
+        .is_some_and(|n| {
+            (1..=10).contains(&n.len())
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && (n == "0" || !n.starts_with('0'))
+        });
+    STORE_DECLINE_REASONS.contains(&reason)
+        || reason == harvest_common::delegate::TOO_MANY_UNPAID
+        || only_n_left
+}
+
 /// What one message is, as a conversation shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ChatItem {
@@ -1112,13 +1147,21 @@ fn chat_line(
         (role, addressing),
         (Role::Seller, Addressing::ToBuyer) | (Role::Buyer, Addressing::ToSeller)
     );
-    // A decline in this side's direction that this device did not send
-    // keeps its place as a step but not its words: the reason is free text
-    // the other party could have written in this side's name (review round 2
-    // of #205, R5). The store's own automatic declines are among these, so a
-    // seller sees "An order was declined." for them, without the reason.
+    // A decline this device did not send keeps its place as a step but not
+    // its words, unless they are the store's own fixed words
+    // ([`is_store_decline_reason`]): the reason is free text another party
+    // could have written. On the seller's screen that is every decline in
+    // either direction (review rounds 2 and 3 of #205, R5): the store and
+    // its delegate address theirs to the buyer, so one addressed to the
+    // seller was written by the buyer, and "Refund sent, order closed by the
+    // seller" in a muted step reads as the seller's own record. On the
+    // buyer's screen, one in the buyer's direction; the seller's are theirs
+    // to word.
+    let reason_shown = |reason: &str| {
+        authored_here || is_store_decline_reason(reason) || (role == Role::Buyer && !this_side)
+    };
     let item = match content {
-        MessageContent::Decline { .. } if this_side && !authored_here => {
+        MessageContent::Decline { reason } if !reason_shown(reason) => {
             ChatItem::Event("An order was declined.".to_string())
         }
         _ => chat_item(content)?,
@@ -2164,8 +2207,8 @@ fn offered_by_hand(request: &PendingRequest, open: bool) -> bool {
 pub(crate) const SHIPPING_SHOWN_ONCE_PAID: &str = "(shown once it is paid)";
 
 /// What each conversation in a seller's inbox lets an order be matched
-/// against (`order_threads::ConversationClaims`), newest conversation first:
-/// the requests to buy read in it, in either direction (only the two holders
+/// against (`order_threads::ConversationClaims`), in tag order (never in
+/// any order a writer chooses): the requests to buy read in it, in either direction (only the two holders
 /// of its keys can write a readable entry, and the order must still be the
 /// store's own), and the store's current listings, under that conversation's
 /// keys when this seller holds them.
@@ -3238,6 +3281,51 @@ mod inbox_tests {
         );
     }
 
+    /// **The store decline reasons the UI shows from anyone are exactly the
+    /// delegate's** (review round 3 of #205): each is a string literal the
+    /// delegate's source sends, "Only N left" is its format string, and
+    /// nothing looser passes. Red when a copy drifts from the delegate.
+    #[test]
+    fn the_store_decline_reasons_are_the_delegates() {
+        let delegate = include_str!("../../../delegates/harvest-delegate/src/auto_invoice.rs");
+        // Joined across `\` line continuations, as the compiler reads them.
+        let mut joined = String::new();
+        let mut lines = delegate.lines();
+        while let Some(line) = lines.next() {
+            if let Some(head) = line.trim_end().strip_suffix('\\') {
+                joined.push_str(head);
+                if let Some(next) = lines.next() {
+                    joined.push_str(next.trim_start());
+                }
+            } else {
+                joined.push_str(line);
+            }
+            joined.push('\n');
+        }
+        for reason in STORE_DECLINE_REASONS {
+            assert!(
+                joined.contains(&format!("\"{reason}\"")),
+                "the delegate no longer sends {reason:?}"
+            );
+            assert!(is_store_decline_reason(reason));
+        }
+        assert!(joined.contains("format!(\"Only {left} left\")"));
+        assert!(joined.contains("reason: harvest_common::delegate::TOO_MANY_UNPAID"));
+        assert!(is_store_decline_reason("Only 3 left"));
+        assert!(is_store_decline_reason(
+            harvest_common::delegate::TOO_MANY_UNPAID
+        ));
+        for loose in [
+            "Only three left",
+            "Only 03 left",
+            "Only  left",
+            "sold out",
+            "Sold out.",
+        ] {
+            assert!(!is_store_decline_reason(loose), "{loose:?}");
+        }
+    }
+
     /// Bubbles are labelled by side, "You" for this side's direction, and
     /// never "Addressed to" with a caveat (round-6 critique 10-5).
     #[test]
@@ -3260,6 +3348,44 @@ mod inbox_tests {
     /// step. Red with `who` labelling by direction alone.
     #[test]
     fn this_sides_direction_is_you_only_when_sent_from_here() {
+        // Round 3 of #205: on the seller's screen a decline ADDRESSED TO the
+        // seller (only a buyer writes those) shows no free-text reason
+        // either; the store's exact words are shown from anyone.
+        let forged_to_seller = chat_line(
+            Role::Seller,
+            crate::messaging::Addressing::ToSeller,
+            false,
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            &MessageContent::Decline {
+                reason: "Refund of 50,000 sats sent, order closed by the seller".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            forged_to_seller.item,
+            ChatItem::Event("An order was declined.".into())
+        );
+        for (role, addressing) in [
+            (Role::Seller, crate::messaging::Addressing::ToBuyer),
+            (Role::Seller, crate::messaging::Addressing::ToSeller),
+            (Role::Buyer, crate::messaging::Addressing::ToSeller),
+        ] {
+            let store_words = chat_line(
+                role,
+                addressing,
+                false,
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                &MessageContent::Decline {
+                    reason: "Sold out".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                store_words.item,
+                ChatItem::Event("An order was declined: Sold out".into()),
+                "{role:?} {addressing:?}"
+            );
+        }
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
         assert_eq!(
             who(Role::Seller, ToBuyer, false),
