@@ -312,10 +312,12 @@ the party who can create the collision could publish the plaintext instead.
 ## A buyer who writes shows that seller a Ghost Key
 
 Added 2026-09-26. **Buyer-to-seller messages require a Ghost Key
-(anti-spam); buying itself does not.** The mailbox is open-write, so the gate
-cannot live only in the buyer's compose box: a script writes past it. The
-seller's browser therefore shows buyer text only when it carries a voucher
-that verifies for the conversation it arrived in
+(anti-spam); buying itself does not.** Since 2026-09-30 a buyer with a paid
+order writes in that order's conversation without one (below). The mailbox
+is open-write, so the gate cannot live only in the buyer's compose box: a
+script writes past it. The seller's browser therefore shows buyer text only
+when it carries a voucher that verifies for the conversation it arrived in,
+or in a conversation one of the store's paid orders opened
 (`components::message_view::shown_to_seller`), and says how many it left out.
 
 The voucher is per conversation. The buyer's Ghost Key signs, through the
@@ -353,9 +355,29 @@ fewer buyer texts, and junk written into the 4 KiB class (which costs a
 flooder nothing) evicts them sooner than it would have evicted 1 KiB text.
 
 What opens a conversation to the seller: a voucher that verifies for it, or
-a Buy now in it whose order the store has PAID (money, which no spammer
-spends to write). A request to buy on its own opens nothing, because it
-costs nothing to send. In a conversation that is not open the seller still
+one of the store's own orders that is paid (`Paid`, or `PaymentReversed`:
+money was spent) and belongs to it, by its request id (a Buy now) or by the
+conversation's keyed listing tag (a quote invoice, or a Buy now whose request
+has left the mailbox). The rule is `ui/src/order_threads.rs`. Nothing a buyer
+sends is read as evidence of payment: not the order's binding (it is
+published, so anyone can copy it), not an `OrderAccepted` message (either
+party can write one naming any order). A request to buy on its own opens
+nothing, because it costs nothing to send.
+
+In an open conversation the buyer's plain text is shown, so **a buyer whose
+order is paid writes in that order's conversation without a Ghost Key**
+(Ian, 2026-09-30). Their app offers that only by a rule that is a strict
+subset of the seller's (`AppState::paid_conversation`: their own node takes
+the order as paid, the store's copy is `Paid`), and seals the text into
+that conversation. It costs the paid buyer no pseudonym: the seller learns
+nothing new about them. What it costs the seller: one paid order opens
+unlimited plain text in that conversation, bounded only by the mailbox caps.
+
+**On signet, "paid" means paid in test coins,** which anyone can get free
+from a faucet. So until mainnet the paid path is not a spam cost at all: a
+spammer can buy a cheap listing with test coins and write freely in that
+one conversation (one conversation per paid order; they still cannot write
+in anyone else's). Money is the bar only once orders are in real bitcoin. In a conversation that is not open the seller still
 sees every step (a request, a decline, an acceptance), so buying needs no
 Ghost Key, but not the free text in them: a request's note and shipping
 address (the address shows once it is paid) and a decline's reason are

@@ -3180,9 +3180,11 @@ pub struct BrowsingStore {
     /// longer, and it is deliberately not persisted alongside the
     /// conversation secret -- it is not part of what a buyer loses by closing
     /// a tab, since the messages themselves come back out of the mailbox
-    /// after a reload. What is lost is only the "You, from this tab" label,
-    /// so a recalled thread describes its own messages by direction. Both are
-    /// truthful; the second is less specific.
+    /// after a reload. Messages are labelled by direction either way (since
+    /// 2026-09-30, `message_view::who`); what this record still decides is
+    /// which messages the seller's inbox exempts from its gate as the
+    /// seller's own (`message_view::shown_to_seller`), and which sent
+    /// messages have not landed yet.
     pub sent_messages: Vec<SentMessage>,
 }
 
@@ -9422,9 +9424,10 @@ impl AppState {
     /// [`harvest_common::mailbox::MessageDirection`].
     ///
     /// The one thing a client can know first-hand is what it sent itself.
-    /// That is this. Everything else is unattributed, and
-    /// `components::message_view` says so rather than labelling a
-    /// counterparty-written message with the counterparty's name.
+    /// That is this. It decides what the seller's inbox exempts from its gate
+    /// as the seller's own (`components::message_view::shown_to_seller`);
+    /// the on-screen labels are by direction (`message_view::who`, which says
+    /// why that is enough).
     ///
     /// # The identity compared here is the DIGEST, not the nonce
     ///
