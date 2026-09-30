@@ -422,6 +422,15 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                 p { class: "text-muted small",
                     "One delivery price per order, not per item. Buyers elsewhere can\u{2019}t buy this."
                 }
+                // Column heads, so the second box reads as a price and in
+                // what unit (2026-09-30 critique); each input keeps its own
+                // aria-label for a screen reader.
+                if !form.regions.is_empty() {
+                    div { class: "form-row form-row-fit form-row-head", aria_hidden: "true",
+                        span { class: "field-short-text", "Region" }
+                        span { class: "field-num", "Delivery, sats" }
+                    }
+                }
                 for (i, (region, sats)) in form.regions.iter().cloned().enumerate() {
                     div { key: "region-{i}", class: "form-row form-row-fit",
                         input {
@@ -461,6 +470,12 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
             label { class: "form-label", "Choices (optional)" }
             p { class: "text-muted small",
                 "Things the buyer picks one of, like a size. Separate the options with commas."
+            }
+            if !form.choices.is_empty() {
+                div { class: "form-row form-row-fit form-row-head", aria_hidden: "true",
+                    span { class: "field-short-text", "Choice" }
+                    span { class: "field-grow", "Options" }
+                }
             }
             for (i, (name, options)) in form.choices.iter().cloned().enumerate() {
                 div { key: "choice-{i}", class: "form-row form-row-fit",

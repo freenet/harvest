@@ -1276,6 +1276,18 @@ h4 {
   flex: 1 1 12rem;
 }
 
+/* Column heads over a run of such rows (a region's name and its delivery
+   price): small, muted, and as wide as the fields beneath them. */
+.form-row-head {
+  margin-bottom: calc(-1 * var(--space-xs));
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.form-row-head > span {
+  padding: 0 0.75rem;
+}
+
 .card h3 {
   margin-bottom: var(--space-sm);
 }
