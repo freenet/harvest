@@ -129,6 +129,10 @@ pub struct AutoInvoiceUi {
     /// The address requests that are such raises, not invoices: their
     /// answers are dropped quietly.
     pub raise_requests: std::collections::HashSet<u64>,
+    /// The used addresses this session has asked the delegate to move past,
+    /// recorded when each raise is sent (so a sale the delegate made
+    /// and a buyer paid, which also shows up as a payment, is not counted).
+    pub moved_past: std::collections::HashSet<Vec<u8>>,
     /// Whether the seller has been told that many addresses turned out used.
     pub vets_many_used_told: bool,
 }
@@ -156,8 +160,19 @@ pub struct AutoInvoiceUi {
 /// delegate for one address with that script among the published ones
 /// (`DeriveOrderAddress`, which floors the key the delegate HOLDS, so it can
 /// never put back a key the seller replaced), which moves the counter past
-/// it at the cost of the one address handed back and dropped. Then the tab
+/// it. That skips every index up to the highest used one, clear ones between
+/// included, and the one address handed back is dropped too. Then the tab
 /// reads the next window.
+///
+/// # A payment on an address the delegate has since spent is not reuse
+///
+/// The tab's window can be up to [`REARM_EVERY_MS`] old: the delegate hands
+/// its addresses out in the background without telling it. A buyer paying
+/// such an instant invoice shows up as a payment on an address still in the
+/// window. So a payment seen on an address already read clear only makes the
+/// window stale: it is read again (and the counter with it) before anything
+/// is raised, and a raise goes out only for a used address in a window read
+/// after the verdict.
 ///
 /// Silence for [`ADDRESS_VET_TIMEOUT_MS`], or `NotFound`, counts as clear: a
 /// fresh address's contract does not exist, and Freenet reports absence
@@ -183,6 +198,9 @@ pub enum VetVerdict {
     Rechecking { token: u64 },
     /// A payment (or a retraction of one) is recorded there.
     Used,
+    /// Its state did not decode (at `at_ms`): not clear, not filed as used,
+    /// read again after [`PEEK_RETRY_MS`].
+    Unreadable,
 }
 
 impl AddressVet {
@@ -208,6 +226,11 @@ pub const ADDRESS_VET_TIMEOUT_MS: u32 = crate::state::ADDRESS_REUSE_CHECK_TIMEOU
 /// How long a clear verdict stands before the address is read again (the
 /// address stays usable meanwhile). The same period the tab re-arms at.
 pub const VET_REFRESH_MS: u64 = REARM_EVERY_MS;
+
+/// How long after a raise before another may go at the same counter. Long
+/// enough for the answer and the refreshed count to come back: each raise
+/// burns an index.
+pub const RAISE_RETRY_MS: u64 = 5 * 60 * 1000;
 
 /// How many used addresses in one session before the seller is told: a
 /// stale counter recovers in a window or two, and far more than that means
@@ -433,10 +456,11 @@ impl AppState {
             .iter()
             .filter(|a| match self.auto_invoice.vets.get(&a.script_pubkey) {
                 None => true,
-                Some(vet) => {
-                    vet.verdict == VetVerdict::Clear
-                        && now_ms.saturating_sub(vet.at_ms) >= VET_REFRESH_MS
-                }
+                Some(vet) => match vet.verdict {
+                    VetVerdict::Clear => now_ms.saturating_sub(vet.at_ms) >= VET_REFRESH_MS,
+                    VetVerdict::Unreadable => now_ms.saturating_sub(vet.at_ms) >= PEEK_RETRY_MS,
+                    _ => false,
+                },
             })
             .enumerate()
             .map(|(i, a)| {
@@ -451,7 +475,7 @@ impl AppState {
 
     /// Whether to ask the delegate to move past used addresses now: one is
     /// in the window, and it was not asked at this counter in the last
-    /// [`PEEK_RETRY_MS`]. No limit on how many: a paid address must never go
+    /// [`RAISE_RETRY_MS`]. No limit on how many: a paid address must never go
     /// on an invoice, and only a trusted bridge's claim makes one used.
     fn raise_due(&self, now_ms: u64) -> bool {
         let Some(xpub) = self.bitcoin.payment_xpub.as_ref() else {
@@ -467,7 +491,7 @@ impl AppState {
                 .is_some_and(|v| v.verdict == VetVerdict::Used)
         });
         let recent = self.auto_invoice.raise_sent.is_some_and(|(counter, at)| {
-            counter == xpub.next_index && now_ms.saturating_sub(at) < PEEK_RETRY_MS
+            counter == xpub.next_index && now_ms.saturating_sub(at) < RAISE_RETRY_MS
         });
         used_ahead && !recent
     }
@@ -482,9 +506,10 @@ impl AppState {
             .map(|(script, _)| script)
     }
 
-    /// Keep only the reads of the current window, and every used verdict:
-    /// an address that leaves the window (spent, or a counter that moved)
-    /// and comes back is read afresh.
+    /// Keep only the reads of the current window: an address that leaves it
+    /// (spent, or moved past) and comes back after a counter fell is read
+    /// afresh. A used one below the counter has done its work: the counter is
+    /// past it.
     fn prune_vets(&mut self) {
         let window: std::collections::HashSet<Vec<u8>> = self
             .auto_invoice
@@ -494,15 +519,16 @@ impl AppState {
             .collect();
         self.auto_invoice
             .vets
-            .retain(|script, vet| vet.verdict == VetVerdict::Used || window.contains(script));
+            .retain(|script, _| window.contains(script));
     }
 
-    /// A state arrived for `contract_id`. Any state showing a payment makes
-    /// the address used, whatever was known (a late answer, or a payment
-    /// since); one showing none settles a read that is out; one that does not
-    /// decode drops the verdict so the address is read again, and keeps it
-    /// out of the gate meanwhile. Returns whether it was an upcoming
-    /// address's contract.
+    /// A state arrived for `contract_id`. It settles a read that is out: used
+    /// when it shows a payment, clear when not, unreadable when it does not
+    /// decode. A payment on an address already read clear (a late answer, or
+    /// a payment since) makes it used AND the window stale, so the window and
+    /// counter are read again before any raise: it may be an address the
+    /// delegate has since handed out and a buyer paid (see [`AddressVet`]).
+    /// Returns whether `contract_id` is an upcoming address's contract.
     pub(crate) fn on_address_vet_state(
         &mut self,
         contract_id: &[u8],
@@ -518,21 +544,29 @@ impl AppState {
             return false;
         }
         match address_state_payments(state_bytes) {
-            Some(true) => self.settle_vet(contract_id, None, true, VetVerdict::Used, now_ms),
-            Some(false) => self.settle_vet(contract_id, None, false, VetVerdict::Clear, now_ms),
+            Some(true) => {
+                let was_clear = self.auto_invoice.vets.values().any(|v| {
+                    v.contract_id.as_slice() == contract_id
+                        && matches!(v.verdict, VetVerdict::Clear | VetVerdict::Rechecking { .. })
+                });
+                self.settle_vet(contract_id, None, true, VetVerdict::Used, now_ms);
+                if was_clear {
+                    // Read the window again before believing it.
+                    self.auto_invoice.upcoming_for = None;
+                }
+            }
+            Some(false) => {
+                self.settle_vet(contract_id, None, false, VetVerdict::Clear, now_ms);
+            }
             None => {
                 dioxus::logger::tracing::warn!(
                     "An upcoming payment address's contract state did not decode; reading it \
-                     again before it may be used"
+                     again later before it may be used"
                 );
-                // Only reads that are out: a used verdict stands, and a clear
-                // one is not being re-read (its state came as an update).
-                self.auto_invoice
-                    .vets
-                    .retain(|_, v| v.contract_id.as_slice() != contract_id || v.token().is_none());
-                true
+                self.settle_vet(contract_id, None, false, VetVerdict::Unreadable, now_ms);
             }
         }
+        true
     }
 
     /// The node answered `NotFound`: nothing was ever published there, as
@@ -560,6 +594,14 @@ impl AppState {
                 && v.token() == Some(token)
                 && matches!(v.verdict, VetVerdict::Asking { .. }))
         });
+        // A refresh that could not be sent stays clear, due again.
+        for v in self.auto_invoice.vets.values_mut() {
+            if v.contract_id.as_slice() == contract_id
+                && v.verdict == (VetVerdict::Rechecking { token })
+            {
+                v.verdict = VetVerdict::Clear;
+            }
+        }
     }
 
     /// Settle the reads of `contract_id`: those still out (under `token`, if
@@ -593,20 +635,6 @@ impl AppState {
                 vet.at_ms = now_ms;
             }
             settled = true;
-        }
-        let used = self
-            .auto_invoice
-            .vets
-            .values()
-            .filter(|v| v.verdict == VetVerdict::Used)
-            .count();
-        if settled && used > MANY_VETTED_USED && !self.auto_invoice.vets_many_used_told {
-            self.auto_invoice.vets_many_used_told = true;
-            self.notifications.push(format!(
-                "Harvest skipped {used} payment addresses from your key because they had \
-                 already been paid. If another device issues invoices from this key, stop it. \
-                 Set your wallet's gap limit to at least 100 so it still sees your payments."
-            ));
         }
         settled
     }
@@ -816,7 +844,9 @@ impl AppState {
         // Only for the bridge this tab uses now: a delegation for another
         // was prepared against an inbox the tab no longer reads.
         let bridge = self.bitcoin.inbox.as_ref().map(|inbox| inbox.bridge);
+        // And only while the window is clear, like the first send.
         work.delegation.resend = bridge
+            .filter(|_| self.current_upcoming().is_some())
             .and_then(|bridge| self.auto_invoice.delegation_in_flight.get(&bridge))
             .filter(|f| {
                 f.attempts < DELEGATION_SEND_ATTEMPTS
@@ -1104,6 +1134,28 @@ impl AppState {
                 .as_ref()
                 .map_or(0, |x| x.next_index);
             self.auto_invoice.raise_sent = Some((counter, now_ms));
+            let used_ahead: Vec<Vec<u8>> = self
+                .auto_invoice
+                .upcoming
+                .iter()
+                .filter(|a| {
+                    self.auto_invoice
+                        .vets
+                        .get(&a.script_pubkey)
+                        .is_some_and(|v| v.verdict == VetVerdict::Used)
+                })
+                .map(|a| a.script_pubkey.clone())
+                .collect();
+            self.auto_invoice.moved_past.extend(used_ahead);
+            let moved = self.auto_invoice.moved_past.len();
+            if moved > MANY_VETTED_USED && !self.auto_invoice.vets_many_used_told {
+                self.auto_invoice.vets_many_used_told = true;
+                self.notifications.push(format!(
+                    "Harvest skipped {moved} payment addresses from your key because they had \
+                     already been paid. If another device issues invoices from this key, stop it. \
+                     Set your wallet's gap limit to at least 100 so it still sees your payments."
+                ));
+            }
             let request_id = self.bitcoin.next_request_id();
             self.bitcoin.in_flight.insert(request_id);
             self.auto_invoice.raise_requests.insert(request_id);
