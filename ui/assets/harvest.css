@@ -437,7 +437,7 @@ h4 {
   color: var(--text-secondary);
 }
 
-.btn-outline:hover {
+.btn-outline:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--accent);
 }
