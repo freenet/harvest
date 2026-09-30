@@ -856,7 +856,8 @@ pub(crate) fn card_pill(
         crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {
             ("btc-pill pending", "Not sent in time")
         }
-        crate::fulfilment::OrderStage::Closed { .. } => ("btc-pill done", "Complete"),
+        // Not "Complete": a stage reached by silence too, when nothing was
+        // ever marked as sent (review), so it keeps the neutral "Paid".
         _ => status_pill(status, reading, awaiting_confirmation),
     }
 }
@@ -1958,7 +1959,7 @@ mod address_reading_tests {
             }),
             "Not sent in time"
         );
-        assert_eq!(pill(OrderStage::Closed { closed_at: 2 }), "Complete");
+        assert_eq!(pill(OrderStage::Closed { closed_at: 2 }), "Paid");
     }
 
     /// Round 2, Consider: the notes say the right thing in each case. An

@@ -810,7 +810,11 @@ impl OrderStage {
                     )
                 })
             }
-            OrderStage::Closed { .. } => Some("Paid and complete.".to_string()),
+            // Reached by silence too, with nothing ever marked as sent, so it
+            // claims no more than that the time to report has passed.
+            OrderStage::Closed { .. } => {
+                Some("Paid. The time to report a problem has passed.".to_string())
+            }
             OrderStage::Reversed => Some(
                 "The payment that settled this order was reversed on the Bitcoin chain, so it no \
                  longer counts as paid."
