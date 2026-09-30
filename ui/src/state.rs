@@ -30525,7 +30525,7 @@ mod buy_flow_tests {
     /// the seller shows what comes out of it; and there are states the
     /// seller counts as paid where the buyer is still gated (a reversed
     /// payment; an order this node does not take as its own paid purchase).
-    /// Red with the buyer's `Paid`-only status check widened to the seller's.
+    /// Red with the buyer's `order_in_conversation` check dropped.
     #[test]
     fn the_buyers_rule_is_a_strict_subset_of_the_sellers() {
         let tag = the_buyers_conversation().buyer_public_key;
@@ -30567,6 +30567,30 @@ mod buy_flow_tests {
             seller_only > 0,
             "strict: the reversed payment is seller-only"
         );
+    }
+
+    /// A payment the store now records as REVERSED keeps the seller's inbox
+    /// open (money was spent) but no longer offers the buyer the box without
+    /// a Ghost Key, even while their node keeps its `Paid` copy (a kept paid
+    /// copy is never replaced). Red with the buyer's `Paid`-only check
+    /// widened to the seller's statuses.
+    #[test]
+    fn a_reversed_payment_gates_the_buyer_but_not_the_seller() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        state.on_kept_purchases(vec![kept(&paid)]);
+        let mut reversed = paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![reversed];
+        buyer_asks_for_the_widget(&mut state);
+        let tag = the_buyers_conversation().buyer_public_key;
+        assert_eq!(
+            purchases(&state).remove(0).paid.as_ref(),
+            Some(&paid),
+            "precondition: the node still takes it as paid"
+        );
+        assert!(seller_counts_paid(&state, &tag));
+        assert!(!state.paid_conversation(STORE, &tag));
     }
 
     /// Before payment a Ghost Key is still required: no plain compose, and a
