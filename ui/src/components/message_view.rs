@@ -90,8 +90,10 @@ pub fn MessageView(store_contract_id: Vec<u8>) -> Element {
     // notary signature, and this component re-renders on every keystroke in
     // the box below. See `state::BrowsingStore::seller_verifying_key`.
     let seller_identity = store.and_then(|s| s.seller_verifying_key);
-    let has_thread = !app_state.conversation_thread(&store_contract_id).is_empty()
-        || !app_state.unconfirmed_sent(&store_contract_id).is_empty();
+    // Counted as the thread shows it: requests and acceptances are not chat,
+    // so a conversation holding only those has no "Your messages" (review of
+    // #205, U4).
+    let has_thread = buyer_thread_count(&app_state, &store_contract_id, None) > 0;
     // What this node is keeping, which is what the buyer can ask it to
     // forget. Empty until the delegate answers, and empty for a store this
     // node has never written to.
@@ -215,14 +217,14 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
                 {
                     let tag = *tag;
                     let backed_up = *backed_up;
-                    let when = chrono::DateTime::from_timestamp(*created_at, 0)
-                        .map(|when| when.format("%Y-%m-%d %H:%M UTC").to_string())
+                    let started = chrono::DateTime::from_timestamp(*created_at, 0)
+                        .map(when)
                         .unwrap_or_else(|| "an unknown time".to_string());
                     let store_contract_id = store_contract_id.clone();
                     rsx! {
                         div { class: "card", style: "margin-top: 0.5rem;",
                             p { class: "text-muted", style: "font-size: 0.8rem;",
-                                "Conversation {short_tag(&tag)}, started {when}"
+                                "Started {started}"
                             }
                             if backed_up {
                                 p { class: "text-muted", style: "font-size: 0.8rem;",
@@ -544,13 +546,13 @@ pub(crate) fn buyer_chat_lines(
 pub(crate) fn buyer_thread_count(
     state: &crate::state::AppState,
     store_contract_id: &[u8],
-    tag: [u8; 32],
+    tag: Option<[u8; 32]>,
 ) -> usize {
-    let messages = buyer_messages(state, store_contract_id, Some(tag));
+    let messages = buyer_messages(state, store_contract_id, tag);
     let unconfirmed = state
         .unconfirmed_sent(store_contract_id)
         .iter()
-        .filter(|sent| sent.sealed.sender_public_key == tag)
+        .filter(|sent| tag.is_none_or(|tag| sent.sealed.sender_public_key == tag))
         .count();
     said_count(&chat_lines(&messages, Role::Buyer, |_| true)) + unconfirmed
 }
@@ -566,7 +568,7 @@ pub(crate) fn BuyerThread(
     #[props(default)] open: bool,
 ) -> Element {
     let mut shown = use_signal(move || open);
-    let count = buyer_thread_count(&APP_STATE.read(), &store_contract_id, tag);
+    let count = buyer_thread_count(&APP_STATE.read(), &store_contract_id, Some(tag));
     let label = match (shown(), count) {
         (true, _) => "Hide messages".to_string(),
         (false, 0) => "Message the seller".to_string(),
@@ -586,6 +588,18 @@ pub(crate) fn BuyerThread(
                 Thread { store_contract_id: store_contract_id.clone(), tag: Some(tag) }
                 OrderCompose { store_contract_id: store_contract_id.clone(), tag }
             }
+        }
+    }
+}
+
+/// A buyer's conversation `tag` with its box, inline where a Messages button
+/// is not wanted (the complaint step): what was just sent shows here.
+#[component]
+pub(crate) fn OrderThreadInline(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element {
+    rsx! {
+        div { class: "thread",
+            Thread { store_contract_id: store_contract_id.clone(), tag: Some(tag) }
+            OrderCompose { store_contract_id: store_contract_id.clone(), tag }
         }
     }
 }
@@ -626,6 +640,28 @@ pub(crate) fn OrderCompose(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element
     }
 }
 
+/// Whether the buyer's conversation `tag` holds an order still waiting for
+/// their payment: the one case where "once this order is paid, you can
+/// message the seller here" is what happens next (review of #205, U5). Not
+/// a question with no order, not a paid order whose conversation the seller
+/// will not count as paid, not a reversed one.
+fn awaits_payment(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    tag: &[u8; 32],
+) -> bool {
+    state
+        .buyer_purchases(store_contract_id)
+        .iter()
+        .any(|purchase| {
+            purchase.conversation == *tag
+                && purchase.paid.is_none()
+                && purchase.commitment.as_ref().is_some_and(|order| {
+                    order.status == harvest_common::payment::OrderStatus::AwaitingPayment
+                })
+        })
+}
+
 /// The compose box, shown only when a message can genuinely be sealed and
 /// addressed.
 ///
@@ -646,13 +682,14 @@ fn Compose(
     let mut draft = use_signal(String::new);
     let mut problem = use_signal(|| Option::<String>::None);
 
-    let (gate, signing, failure, name) = {
+    let (gate, signing, failure, name, awaiting_payment) = {
         let state = APP_STATE.read();
         (
             state.compose_gate_in(&store_contract_id, target),
             state.texts_awaiting_voucher(&store_contract_id),
             state.voucher_failure(&store_contract_id).cloned(),
             state.store_name_of(&store_contract_id).label(),
+            target.is_some_and(|tag| awaits_payment(&state, &store_contract_id, &tag)),
         )
     };
     // No Ghost Key and nothing paid, no compose box: the seller would not be
@@ -660,7 +697,7 @@ fn Compose(
     // a dead end.
     if gate == crate::voucher_flow::ComposeGate::NeedsGhostKey {
         return rsx! {
-            GhostKeyGate { after_payment: target.is_some() }
+            GhostKeyGate { after_payment: awaiting_payment }
         };
     }
     let vouched = matches!(gate, crate::voucher_flow::ComposeGate::Ready { .. });
@@ -777,9 +814,9 @@ fn send(
 /// nothing paid in the conversation.
 ///
 /// Worded for someone who has never heard of a Ghost Key: what it is for,
-/// that buying does not need one, and where to get one. In an order's own
-/// thread (`after_payment`) it also says the box opens once the order is
-/// paid.
+/// that buying does not need one, and where to get one. In the thread of an
+/// order still waiting for payment (`after_payment`, [`awaits_payment`]) it
+/// also says the box opens once the order is paid.
 #[component]
 fn GhostKeyGate(#[props(default)] after_payment: bool) -> Element {
     rsx! {
