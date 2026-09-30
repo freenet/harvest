@@ -48,8 +48,10 @@ pub struct SellerOrderRequest {
 /// The buyer's picks named by their group, "Size: M", in the listing's group
 /// order. The listing is today's, not the one the buyer read, so a pick is
 /// named only when it is one of that group's options: after the seller
-/// removes or reorders a group, a pick shows alone rather than under the
-/// wrong name (review). The 2026-09-30 critique: a bare "Choices: M"
+/// removes or reorders a group, a pick usually shows alone rather than under
+/// the wrong name (review). Groups still match by position, so a new group
+/// in the same place that happens to offer the same option would still name
+/// it. The 2026-09-30 critique: a bare "Choices: M"
 /// doesn't say what M is.
 pub(crate) fn labelled_choices(
     groups: &[harvest_common::listing::ChoiceGroup],
@@ -6708,7 +6710,8 @@ impl AppState {
     /// [`AppState::seller_order_request`] for each of `orders`, in order,
     /// reading (and decrypting) the store's mailbox once for all of them
     /// rather than once per order: the Orders tab asks it for the whole
-    /// order history on every render.
+    /// earlier-orders history on every render. (Each card still to send asks
+    /// for its own order, a handful at most.)
     pub fn seller_order_requests(
         &self,
         store_contract_id: &[u8],
