@@ -1209,6 +1209,11 @@ fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
     }
 }
 
+/// The store in `now` that was not in `before`: one just opened.
+pub(crate) fn new_store(before: &[Vec<u8>], now: &[Vec<u8>]) -> Option<Vec<u8>> {
+    now.iter().find(|id| !before.contains(id)).cloned()
+}
+
 /// Opening another store: each connected Ghost Key that has no store here
 /// can open one (or move one made before revision 2), and another key can
 /// be connected. Its own page, reached from "Open another store" on Stores
@@ -1242,6 +1247,24 @@ fn AnotherStore(has_harvest_delegate: bool) -> Element {
         (others, state.request_any_access_in_flight, busy)
     };
     let mut other_open = use_signal(|| Option::<String>::None);
+    // The stores this device manages as the page opened. One that appears
+    // after is the store just opened here, and the seller is taken to it
+    // rather than left on this page with its row gone (review of #197).
+    let before: Signal<Vec<Vec<u8>>> = use_signal(|| {
+        seller_stores(&APP_STATE.peek())
+            .into_iter()
+            .map(|s| s.contract_id)
+            .collect()
+    });
+    use_effect(move || {
+        let now: Vec<Vec<u8>> = seller_stores(&APP_STATE.read())
+            .into_iter()
+            .map(|s| s.contract_id)
+            .collect();
+        if let Some(new) = new_store(&before.peek(), &now) {
+            super::app::open_seller_page(super::app::SellerPage::Store(new));
+        }
+    });
 
     rsx! {
         p { class: "text-muted small",
@@ -2060,6 +2083,75 @@ mod seller_stores_tests {
         assert_eq!(stores[0].requests, 0);
         assert!(stores[0].code.is_some() && stores[0].link.is_some());
         assert_eq!(requests_needing_seller(&state), 0);
+    }
+
+    /// Every item the Overview's "Needs you" card can list makes a store's
+    /// card on Stores say so (`overview_needs`, shared by both), and a store
+    /// still loading is not flagged for what it has not read yet. Red if
+    /// any branch is dropped. (The wallet-gap and instant-checkout alerts
+    /// come from the delegate's status and are read, not set up here.)
+    #[test]
+    fn overview_needs_covers_every_item_the_needs_you_card_lists() {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![registration(1, Some(crate::state::test_store_key()))],
+        );
+        let mut base = seller_stores(&state).remove(0);
+        // A store whose details and backing have been read and hold nothing
+        // to do.
+        base.details_resolved = true;
+        base.gap = None;
+        base.certificate = crate::ghostkey_cert::CertificateStatus::Verified;
+        assert!(!overview_needs(&base, &state), "nothing to do");
+
+        type Change = fn(&mut SellerStore);
+        let cases: [(&str, Change); 9] = [
+            ("a request", |s| s.requests = 1),
+            ("an order to send", |s| s.to_send = 1),
+            ("a payment to confirm", |s| s.to_confirm = 1),
+            ("an unpriced listing", |s| s.unpriced = 1),
+            ("an expired invoice", |s| s.expired_invoices = 1),
+            ("another key on the address", |s| {
+                s.foreign_owner = Some("taken".into())
+            }),
+            ("details to repair", |s| {
+                s.gap = Some(StoreDetailsGap::NoName)
+            }),
+            ("an unbacked store", |s| {
+                s.certificate = crate::ghostkey_cert::CertificateStatus::Absent
+            }),
+            ("a backing that does not check out", |s| {
+                s.certificate = crate::ghostkey_cert::CertificateStatus::Invalid("x".into())
+            }),
+        ];
+        for (what, change) in cases {
+            let mut store = base.clone();
+            change(&mut store);
+            assert!(overview_needs(&store, &state), "{what}");
+        }
+
+        // Until the store's details have been read, its certificate reads
+        // Absent by default and its gap is unknown: neither is something
+        // to do yet, as the Overview itself does not list them (so a card
+        // does not say "Needs you" for every store still loading).
+        let mut loading = base.clone();
+        loading.details_resolved = false;
+        loading.certificate = crate::ghostkey_cert::CertificateStatus::Absent;
+        loading.gap = Some(StoreDetailsGap::NeverPublished);
+        assert!(!overview_needs(&loading, &state));
+    }
+
+    /// The store that appears after "Open another store" was pressed is
+    /// the one just opened.
+    #[test]
+    fn the_store_just_opened_is_the_new_one() {
+        let before = vec![vec![1u8; 32]];
+        assert_eq!(new_store(&before, &before), None);
+        assert_eq!(
+            new_store(&before, &[vec![1u8; 32], vec![2u8; 32]]),
+            Some(vec![2u8; 32])
+        );
     }
 
     /// An own store is named by its name, "Loading…" until it arrives, and

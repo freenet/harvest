@@ -3,8 +3,13 @@ use harvest_common::listing::{AuthorizedListing, ListingAvailability};
 
 use super::app::{open_seller_page, Route, SellerPage, ROUTE};
 use crate::gateway::APP_STATE;
-use crate::presence_flow::{SellerStatus, StorePresence};
-use crate::state::{AppState, StoreListRow, StoreName};
+use crate::presence_flow::SellerStatus;
+use crate::state::{AppState, BuyerOpen, StoreListRow, StoreName};
+
+/// How long the Stores page waits for this node to say which stores are its
+/// own (`AppState::seller_known`) before showing the lists anyway: a
+/// ghostkey delegate that never answers must not hide them for good.
+const SELLER_ANSWER_WAIT_MS: u32 = 10_000;
 
 /// The Stores page (the 2026-09-30 redesign, after the mockup's
 /// `scrStores()`): the seller's own stores, if any, each opening its
@@ -16,28 +21,37 @@ pub fn StoresPage() -> Element {
     let show_archived = use_signal(|| false);
     // The visited stores are asked for in the background, so each row can
     // carry the store's own name rather than its code. An effect, so it runs
-    // again when the delegate's list arrives after this page opened.
-    use_effect(move || crate::store_link::load_visited_stores(show_archived()));
+    // again when the delegate's list arrives after this page opened. Only
+    // what the rows show: no subscription (`AppState::light_stores`).
+    use_effect(move || crate::store_link::load_visited_stores(show_archived(), false));
     // Whether a store is open is judged against the clock (`presence_flow`),
     // so this re-renders every half minute, as the store page does.
     #[allow(unused_mut)]
     let mut clock = use_signal(|| 0u32);
+    #[allow(unused_mut)]
+    let mut waited = use_signal(|| false);
     #[cfg(target_arch = "wasm32")]
     use_future(move || async move {
+        gloo_timers::future::TimeoutFuture::new(SELLER_ANSWER_WAIT_MS).await;
+        waited.set(true);
         loop {
             gloo_timers::future::TimeoutFuture::new(30_000).await;
             clock += 1;
         }
     });
-    let _ = clock();
+    let _ = (clock(), SELLER_ANSWER_WAIT_MS);
 
+    // Until this node knows which stores are its own, a seller's store would
+    // flash up as "Sell on Harvest" and as a store they visited (review of
+    // #197), so neither list is shown yet.
+    let known = APP_STATE.read().seller_known() || waited();
     let own = own_store_rows(&APP_STATE.read(), crate::state::now_ms());
     let one = own.len() == 1;
 
     rsx! {
         div { class: "stores-page",
             h2 { "Stores" }
-            if !own.is_empty() {
+            if known && !own.is_empty() {
                 h3 { class: "sec-lbl sec-lbl-first",
                     if one { "Your store" } else { "Your stores" }
                 }
@@ -50,10 +64,14 @@ pub fn StoresPage() -> Element {
                     "Open another store"
                 }
             }
-            h3 { class: if own.is_empty() { "sec-lbl sec-lbl-first" } else { "sec-lbl" }, "Find a store" }
+            h3 { class: if known && !own.is_empty() { "sec-lbl" } else { "sec-lbl sec-lbl-first" }, "Find a store" }
             FindStore {}
-            VisitedStores { show_archived }
-            if own.is_empty() {
+            if known {
+                VisitedStores { show_archived }
+            } else {
+                p { class: "text-muted text-italic", "Checking your stores\u{2026}" }
+            }
+            if known && own.is_empty() {
                 div { class: "card card-quiet sell-card",
                     h3 { "Sell on Harvest" }
                     p { class: "text-muted",
@@ -71,6 +89,17 @@ pub fn StoresPage() -> Element {
     }
 }
 
+/// For each of `labels`, whether another one in the list reads the same
+/// (case aside): two rows that would look alike, which then carry their
+/// store code as the second line.
+pub(crate) fn colliding(labels: &[String]) -> Vec<bool> {
+    let lower: Vec<String> = labels.iter().map(|l| l.to_lowercase()).collect();
+    lower
+        .iter()
+        .map(|l| lower.iter().filter(|other| *other == l).count() > 1)
+        .collect()
+}
+
 /// One of this node's own stores on the Stores page. See [`own_store_rows`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OwnStoreRow {
@@ -80,11 +109,10 @@ pub(crate) struct OwnStoreRow {
     /// Whether `label` is the store's own name, rather than words standing
     /// in for it.
     pub named: bool,
-    /// Its code: the second line while it has no name, since nothing else
-    /// tells two such cards apart. Never the name.
-    pub code: Option<String>,
-    /// The first line of its description.
-    pub tagline: Option<String>,
+    /// The second line: the first line of its description, or its code when
+    /// nothing else tells the card from another (no name yet and no
+    /// tagline, or a name another card has too). Never the name.
+    pub sub: Option<String>,
     pub status: OwnStoreStatus,
 }
 
@@ -99,7 +127,7 @@ pub(crate) enum OwnStoreStatus {
     NeedsALook,
     /// Open, and nothing waiting: "up to date".
     UpToDate,
-    /// Buyers cannot buy: the seller's own status pill ("Closed", or "Not
+    /// Buyers cannot buy: "Closed", or the seller's own status pill ("Not
     /// taking orders" when buyers see it open but this device cannot answer).
     NotOpen(&'static str),
     /// Too soon to say whether buyers can reach it.
@@ -121,16 +149,17 @@ impl OwnStoreStatus {
 
 /// The status on an own store's row card, from what needs the seller
 /// (`needs_you` counted, `needs_a_look` anything else the Overview's "Needs
-/// you" card lists) and the ONE status the seller's Overview reads
-/// (`presence_flow::seller_status`, `None` for a store that sells nothing
-/// here) or, failing that, what buyers see (`presence`). Nothing new is
-/// judged here: a store is "up to date" only where the Overview would say
-/// Open and "Nothing needs you right now".
+/// you" card lists), whether buyers can buy (`AppState::buyer_open`, the
+/// same answer the store page's pill and the visited rows give) and the ONE
+/// status the seller's Overview reads (`presence_flow::seller_status`,
+/// `None` for a store that sells nothing here). Nothing new is judged here:
+/// a store is "up to date" only where buyers can buy, the Overview would say
+/// Open, and it would say "Nothing needs you right now".
 pub(crate) fn own_store_status(
     needs_you: usize,
     needs_a_look: bool,
     seller: Option<&SellerStatus>,
-    presence: StorePresence,
+    open: BuyerOpen,
 ) -> OwnStoreStatus {
     if needs_you > 0 {
         return OwnStoreStatus::NeedsYou(needs_you);
@@ -138,21 +167,29 @@ pub(crate) fn own_store_status(
     if needs_a_look {
         return OwnStoreStatus::NeedsALook;
     }
-    match (seller, presence) {
-        (Some(status), _) if status.open => OwnStoreStatus::UpToDate,
-        (_, StorePresence::Checking) => OwnStoreStatus::Checking,
-        (Some(status), _) => OwnStoreStatus::NotOpen(status.pill),
-        (None, StorePresence::Open) => OwnStoreStatus::UpToDate,
-        (None, StorePresence::Closed(_)) => OwnStoreStatus::NotOpen("Closed"),
+    let seller_pill = seller
+        .filter(|status| !status.open)
+        .map(|status| status.pill);
+    match open {
+        BuyerOpen::Checking => OwnStoreStatus::Checking,
+        BuyerOpen::Closed => OwnStoreStatus::NotOpen(seller_pill.unwrap_or("Closed")),
+        BuyerOpen::Open => match seller_pill {
+            Some(pill) => OwnStoreStatus::NotOpen(pill),
+            None => OwnStoreStatus::UpToDate,
+        },
     }
 }
 
 /// This node's own stores, as the Stores page lists them: every store the
 /// seller pages manage (`my_store::seller_stores`), in the same order.
 pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> {
-    super::my_store::seller_stores(state)
+    let stores = super::my_store::seller_stores(state);
+    let labels: Vec<String> = stores.iter().map(|s| s.label.clone()).collect();
+    let collides = colliding(&labels);
+    stores
         .into_iter()
-        .map(|store| {
+        .zip(collides)
+        .map(|(store, collides)| {
             let id = store.contract_id.clone();
             let presence = state.store_presence(&id, now_ms);
             let seller = state.instant_checkout_local(&id, now_ms).map(|local| {
@@ -162,20 +199,27 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
                     &local,
                 )
             });
+            let named = state.store_name_of(&id).name().is_some();
+            let tagline = state
+                .browsing_stores
+                .get(&id)
+                .and_then(|b| b.info.as_ref())
+                .and_then(|info| crate::markdown::first_line(&info.description));
+            let code_line = store.code.as_ref().map(|code| format!("Store code {code}"));
+            let sub = if collides || (!named && tagline.is_none()) {
+                code_line.or(tagline)
+            } else {
+                tagline
+            };
             OwnStoreRow {
                 status: own_store_status(
                     store.needs_you(),
                     super::my_store::overview_needs(&store, state),
                     seller.as_ref(),
-                    presence,
+                    state.buyer_open(&id, now_ms),
                 ),
-                tagline: state
-                    .browsing_stores
-                    .get(&id)
-                    .and_then(|b| b.info.as_ref())
-                    .and_then(|info| crate::markdown::first_line(&info.description)),
-                named: state.store_name_of(&id).name().is_some(),
-                code: store.code.clone(),
+                named,
+                sub,
                 label: store.label,
                 contract_id: id,
             }
@@ -197,10 +241,8 @@ fn OwnStoreCard(row: OwnStoreRow) -> Element {
             },
             span { class: "rc-main",
                 span { class: if row.named { "rc-name" } else { "rc-name rc-pending" }, "{row.label}" }
-                if let Some(ref tagline) = row.tagline {
-                    span { class: "rc-sub", "{tagline}" }
-                } else if let (false, Some(code)) = (row.named, row.code.as_ref()) {
-                    span { class: "rc-sub", "Store code {code}" }
+                if let Some(ref sub) = row.sub {
+                    span { class: "rc-sub", "{sub}" }
                 }
             }
             span { class: "rc-r",
@@ -272,17 +314,16 @@ fn FindStore() -> Element {
     }
 }
 
-/// The main and second line of a visited store's row.
-fn visited_row_lines(row: &StoreListRow) -> (String, Option<String>) {
-    let second = if row.closed {
-        Some("Closed right now".to_string())
+/// The main and second line of a visited store's row: its name (never its
+/// code), then its tagline; its code instead when nothing else tells it from
+/// another row (`collides`: another row reads the same; or no name and no
+/// tagline). Closed is said by the row's pill alone.
+fn visited_row_lines(row: &StoreListRow, collides: bool) -> (String, Option<String>) {
+    let code_line = || Some(format!("Store code {}", row.code));
+    let second = if collides || (row.name.name().is_none() && row.tagline.is_none()) {
+        code_line()
     } else {
-        match row.name {
-            // Nothing else tells two unreachable rows apart, so the code is
-            // given, as the second line and never as the name.
-            StoreName::Unreachable => Some(format!("Store code {}", row.code)),
-            _ => row.tagline.clone(),
-        }
+        row.tagline.clone()
     };
     (row.name.label(), second)
 }
@@ -305,13 +346,15 @@ fn VisitedStores(show_archived: Signal<bool>) -> Element {
     if rows.is_empty() && !any_archived {
         return rsx! {};
     }
+    let labels: Vec<String> = rows.iter().map(|row| row.name.label()).collect();
+    let collides = colliding(&labels);
 
     rsx! {
         h3 { class: "sec-lbl", "Stores you\u{2019}ve visited" }
         if !rows.is_empty() {
             div { class: "vlist",
-                for row in rows {
-                    VisitedRow { key: "{row.code}", row }
+                for (row , collides) in rows.into_iter().zip(collides) {
+                    VisitedRow { key: "{row.code}", row, collides }
                 }
             }
         }
@@ -336,20 +379,30 @@ fn VisitedStores(show_archived: Signal<bool>) -> Element {
     }
 }
 
+/// Open the store a visited row names: its page, without fetching again a
+/// store already here and followed (`app::open_store_page`).
+fn open_visited(code: &str) {
+    let Some(params) = harvest_common::StoreParameters::from_code(code) else {
+        return;
+    };
+    match crate::gateway::store_ops::store_instance_id(&params) {
+        Ok(id) => super::app::open_store_page(id.as_bytes().to_vec()),
+        Err(_) => crate::store_link::open_store(params),
+    }
+}
+
 #[component]
-fn VisitedRow(row: StoreListRow) -> Element {
-    let (main, second) = visited_row_lines(&row);
+fn VisitedRow(row: StoreListRow, collides: bool) -> Element {
+    let (main, second) = visited_row_lines(&row, collides);
+    let remove_title =
+        (!row.archived).then_some("Hides it from this list. Your conversations with it are kept.");
     rsx! {
         div { class: if row.closed || row.archived { "vrow vrow-off" } else { "vrow" },
             button {
                 class: "vrow-go",
                 onclick: {
                     let code = row.code.clone();
-                    move |_| {
-                        if let Some(params) = harvest_common::StoreParameters::from_code(&code) {
-                            crate::store_link::open_store(params);
-                        }
-                    }
+                    move |_| open_visited(&code)
                 },
                 span { class: if row.name.name().is_some() { "rc-name" } else { "rc-name rc-pending" }, "{main}" }
                 if let Some(ref second) = second {
@@ -361,7 +414,7 @@ fn VisitedRow(row: StoreListRow) -> Element {
             }
             button {
                 class: "link-btn vrow-remove",
-                title: if row.archived { "" } else { "Hides it from this list. Your conversations with it are kept." },
+                title: remove_title,
                 onclick: {
                     let code = row.code.clone();
                     let archive = !row.archived;
@@ -474,10 +527,26 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
         }
     });
     let _ = clock();
-    let presence = APP_STATE
-        .read()
-        .store_presence(&contract_id, crate::state::now_ms());
-    let (pill, pill_open) = open_pill(store.closed, presence);
+    let now = crate::state::now_ms();
+    let presence = APP_STATE.read().store_presence(&contract_id, now);
+    // Open only where a buyer can buy: the one answer the visited rows and
+    // the seller's own cards give too (`AppState::buyer_open`; codex on
+    // #197: presence alone called a store Open whose Buy controls were all
+    // hidden).
+    let buyer_open = APP_STATE.read().buyer_open(&contract_id, now);
+    let pill = buyer_open.pill();
+    let pill_open = buyer_open == BuyerOpen::Open;
+    let is_closed = buyer_open == BuyerOpen::Closed;
+    // Presence says open, and yet no order can be taken: why, unless a
+    // warning below already says (an identity that does not check out).
+    let not_set_up = !store.closed
+        && presence.is_open()
+        && store.certificate_status.is_verified()
+        && !store.takes_orders();
+    let name = match info.store_name.trim() {
+        "" => StoreName::Unnamed.label(),
+        name => name.to_string(),
+    };
     // This buyer's orders from this store are on Purchases, once: here only
     // a line that goes there (critique S2-10).
     let orders_here = if owned {
@@ -505,11 +574,11 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 }
             }
 
-            div { class: if store.closed || presence.is_closed() { "store-header store-header-closed" } else { "store-header" },
+            div { class: if is_closed { "store-header store-header-closed" } else { "store-header" },
                 // Open or Closed beside the name, as buyers see it
                 // (`presence_flow`; the 2026-09-26 decision, critique S2-3).
                 div { class: "store-status",
-                    h2 { class: "store-name", "{info.store_name}" }
+                    h2 { class: "store-name", "{name}" }
                     span { class: if pill_open { "pill pill-open" } else { "pill" }, "{pill}" }
                 }
                 // What the seller has at stake, in a buyer's words: never a
@@ -576,6 +645,11 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                          in someone else's hands, so nothing here can be bought. Its record \
                          stays visible."
                     }
+                } else if not_set_up {
+                    p { class: "text-warning",
+                        "This store can\u{2019}t take orders yet: its seller hasn\u{2019}t finished \
+                         setting it up. You can look, but not buy."
+                    }
                 } else if !owned {
                     if let Some(line) = presence.buyer_line() {
                         p { class: if presence.is_closed() { "text-warning" } else { "text-muted" },
@@ -589,9 +663,9 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                 section {
                     class: "card store-record-card",
                     id: "store-record",
-                    aria_label: "{info.store_name}\u{2019}s record",
+                    aria_label: "{name}\u{2019}s record",
                     div { class: "row-between",
-                        h3 { "{info.store_name}\u{2019}s record" }
+                        h3 { "{name}\u{2019}s record" }
                         button {
                             class: "link-btn",
                             onclick: move |_| show_record.set(false),
@@ -658,8 +732,13 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                         // and a mismatched listing is a per-listing fact.
                         // And for a listing its seller has marked sold out
                         // (harvest#70): shown, never offered.
-                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability, presence.is_open()),
-                        closed: store.closed || presence.is_closed(),
+                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability, pill_open),
+                        // A Buy now form already open stays when the store
+                        // closes under it, so the pay card of an order it
+                        // made does not vanish (review of #197); it just
+                        // cannot send another.
+                        keep_form: offered_buy(&store, &contract_id, owned, &listing.listing, availability, true),
+                        closed: is_closed,
                     }
                 }
             }
@@ -670,21 +749,6 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
             // seller's own orders are on their Orders tab; a buyer's are on
             // Purchases, and the one a Buy now form just made stays under it.
         }
-    }
-}
-
-/// The pill beside a store's name, as buyers see it, and whether it reads
-/// open: "Open" only while `presence_flow` says buyers can buy, "Closed"
-/// when it says not or the seller has closed the store for good, and
-/// "Checking" while it is too soon to say.
-pub(crate) fn open_pill(closed_for_good: bool, presence: StorePresence) -> (&'static str, bool) {
-    if closed_for_good {
-        return ("Closed", false);
-    }
-    match presence {
-        StorePresence::Open => ("Open", true),
-        StorePresence::Checking => ("Checking", false),
-        StorePresence::Closed(_) => ("Closed", false),
     }
 }
 
@@ -711,8 +775,8 @@ pub(crate) fn backing_words(status: &crate::ghostkey_cert::CertificateStatus) ->
 /// mockup's, less "for good": a full record keeps a new complaint in place
 /// of an older one (`reputation::MAX_COMPLAINTS`), which the page says when
 /// it happens.
-const TRUST_WHY: &str = "The seller donated to Freenet to open this store under their name. \
-     Complaints stay on its record, and the seller can\u{2019}t remove them.";
+const TRUST_WHY: &str = "The seller donated to Freenet to open this store. Complaints stay on \
+     its record, and the seller can\u{2019}t remove them.";
 
 /// The one line on a store's page about this buyer's orders from it.
 fn orders_line(orders: usize) -> String {
@@ -833,7 +897,13 @@ fn ListingCard(
     listing: AuthorizedListing,
     availability: ListingAvailability,
     certificate_mismatch: bool,
+    /// What a new Buy now needs, or `None` when none may start
+    /// (`offered_buy`).
     buyable: Option<Buyable>,
+    /// The same, whatever the store's presence: a form already open stays
+    /// open on it when the store closes, so its pay card stays.
+    #[props(default)]
+    keep_form: Option<Buyable>,
     /// The store is closed: greyed, as a sold-out listing is.
     #[props(default)]
     closed: bool,
@@ -882,11 +952,12 @@ fn ListingCard(
             if !l.offers_instant_checkout() {
                 p { class: "text-muted small", "{NOT_PRICED}" }
             }
-            match buyable {
-                Some(buyable) => rsx! {
+            match buyable.clone().or(keep_form) {
+                Some(form) => rsx! {
                     BuyControl {
                         listing: l.clone(),
-                        buyable: buyable,
+                        buyable: form,
+                        can_start: buyable.is_some(),
                     }
                 },
                 // Silence rather than a disabled button: a control that can
@@ -970,8 +1041,17 @@ pub(crate) fn sats_text(sats: u64) -> String {
 /// under every listing would turn a page of things to look at into a page of
 /// things to fill in.
 #[component]
-fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> Element {
+fn BuyControl(
+    listing: harvest_common::listing::Listing,
+    buyable: Buyable,
+    /// A new Buy now may start. False while the store is not open: no
+    /// button, and a form already open stays but cannot send.
+    can_start: bool,
+) -> Element {
     let mut open = use_signal(|| false);
+    if !can_start && !open() {
+        return rsx! {};
+    }
 
     rsx! {
         div { style: "margin-top: 0.75rem;",
@@ -989,6 +1069,7 @@ fn BuyControl(listing: harvest_common::listing::Listing, buyable: Buyable) -> El
                     listing: listing.clone(),
                     seller_encryption_key: buyable.seller_encryption_key,
                     seller_verifying_key: buyable.seller_verifying_key,
+                    closed: !can_start,
                 }
             }
         }
@@ -1314,36 +1395,46 @@ mod stores_page_tests {
     use harvest_common::presence::ClosedWhy;
 
     /// An own store's card says what the seller's Overview would: the
-    /// count of what needs them first, "up to date" only where the Overview
-    /// reads Open, the Overview's own pill where buyers cannot buy, and
-    /// "Checking" while it is too soon to say. Red if a store whose device
-    /// cannot answer orders reads "up to date".
+    /// count of what needs them first, "Needs you" for anything else the
+    /// Overview lists, "up to date" only where buyers can buy and the
+    /// Overview reads Open, the Overview's own pill (or "Closed") where
+    /// buyers cannot buy, and "Checking" while it is too soon to say. Red if
+    /// a store whose device cannot answer orders reads "up to date", and red
+    /// if one closed for good (whatever its presence) does.
     #[test]
     fn an_own_store_card_reads_the_sellers_own_status() {
-        let open = StorePresence::Open;
-        let closed = StorePresence::Closed(ClosedWhy::NoHeartbeat);
+        use crate::presence_flow::StorePresence;
+        let presence_open = StorePresence::Open;
+        let presence_closed = StorePresence::Closed(ClosedWhy::NoHeartbeat);
         let status = |presence, local: LocalSelling| {
             crate::presence_flow::seller_status(presence, false, &local)
         };
         let ready = || LocalSelling::Ready { delegated: false };
         let blocked = || LocalSelling::Blocked("no wallet".to_string());
+        let (open, closed, checking) = (BuyerOpen::Open, BuyerOpen::Closed, BuyerOpen::Checking);
 
         // Something waiting wins, whatever else is true.
         assert_eq!(
-            own_store_status(2, false, Some(&status(closed, blocked())), closed),
+            own_store_status(2, false, Some(&status(presence_closed, blocked())), closed),
             OwnStoreStatus::NeedsYou(2)
         );
         assert_eq!(
-            own_store_status(0, false, Some(&status(open, ready())), open),
+            own_store_status(0, false, Some(&status(presence_open, ready())), open),
             OwnStoreStatus::UpToDate
         );
         assert_eq!(
-            own_store_status(0, false, Some(&status(open, blocked())), open),
+            own_store_status(0, false, Some(&status(presence_open, blocked())), open),
             OwnStoreStatus::NotOpen("Not taking orders"),
             "buyers see it open, but nobody answers their orders"
         );
         assert_eq!(
-            own_store_status(0, false, Some(&status(closed, ready())), closed),
+            own_store_status(0, false, Some(&status(presence_closed, ready())), closed),
+            OwnStoreStatus::NotOpen("Closed")
+        );
+        // Closed for good (or unable to take an order) while its presence
+        // still reads open: closed, not "up to date".
+        assert_eq!(
+            own_store_status(0, false, Some(&status(presence_open, ready())), closed),
             OwnStoreStatus::NotOpen("Closed")
         );
         assert_eq!(
@@ -1351,7 +1442,7 @@ mod stores_page_tests {
                 0,
                 false,
                 Some(&status(StorePresence::Checking, ready())),
-                StorePresence::Checking
+                checking
             ),
             OwnStoreStatus::Checking
         );
@@ -1365,14 +1456,14 @@ mod stores_page_tests {
             OwnStoreStatus::NotOpen("Closed")
         );
         assert_eq!(
-            own_store_status(0, false, None, StorePresence::Checking),
+            own_store_status(0, false, None, checking),
             OwnStoreStatus::Checking
         );
 
         // Nothing counted, but the Overview's card lists something (an
         // unpriced listing, say): never "up to date". Red without the flag.
         assert_eq!(
-            own_store_status(0, true, Some(&status(open, ready())), open),
+            own_store_status(0, true, Some(&status(presence_open, ready())), open),
             OwnStoreStatus::NeedsALook
         );
         assert_eq!(
@@ -1383,44 +1474,137 @@ mod stores_page_tests {
         assert_eq!(OwnStoreStatus::NeedsYou(1).text(), "1 needs you");
         assert_eq!(OwnStoreStatus::NeedsYou(3).text(), "3 need you");
         assert_eq!(OwnStoreStatus::UpToDate.text(), "up to date");
+        assert_eq!(OwnStoreStatus::Checking.text(), "Checking\u{2026}");
     }
 
-    fn row(name: StoreName, closed: bool) -> StoreListRow {
+    fn row(name: StoreName, tagline: Option<&str>) -> StoreListRow {
         StoreListRow {
             code: "3Bn8xWqLd6Tz9Kf2".to_string(),
             name,
-            tagline: Some("Hand-thrown stoneware".to_string()),
+            tagline: tagline.map(str::to_string),
             archived: false,
-            closed,
+            closed: false,
         }
     }
 
-    /// A visited store's row: its name, then its tagline, or "Closed right
-    /// now" when closed. The code appears only as the second line of a store
-    /// that could not be loaded, where nothing else tells two rows apart,
-    /// and never as the name.
+    /// A visited store's row: its name, then its tagline. Its code is the
+    /// second line only where nothing else tells it from another row (no
+    /// name and no tagline, or a main line another row has too), and never
+    /// the name. Red with the code shown only for an unreachable store,
+    /// which let two "Loading…" rows look alike (review of #197).
     #[test]
     fn a_visited_row_names_the_store_and_never_by_its_code() {
         let named = StoreName::Named("Bean Shop".to_string());
+        let tagline = Some("Hand-thrown stoneware");
+        let code = Some("Store code 3Bn8xWqLd6Tz9Kf2".to_string());
         assert_eq!(
-            visited_row_lines(&row(named.clone(), false)),
+            visited_row_lines(&row(named.clone(), tagline), false),
             (
                 "Bean Shop".to_string(),
                 Some("Hand-thrown stoneware".to_string())
             )
         );
         assert_eq!(
-            visited_row_lines(&row(named, true)),
-            (
-                "Bean Shop".to_string(),
-                Some("Closed right now".to_string())
-            )
+            visited_row_lines(&row(named, tagline), true),
+            ("Bean Shop".to_string(), code.clone()),
+            "another row is called Bean Shop too"
         );
-        let (main, second) = visited_row_lines(&row(StoreName::Unreachable, false));
-        assert!(!main.contains("3Bn8"), "{main:?}");
-        assert_eq!(second.as_deref(), Some("Store code 3Bn8xWqLd6Tz9Kf2"));
-        let (main, _) = visited_row_lines(&row(StoreName::Loading, false));
-        assert_eq!(main, "Loading\u{2026}");
+        for name in [
+            StoreName::Unreachable,
+            StoreName::Loading,
+            StoreName::Unnamed,
+        ] {
+            let (main, second) = visited_row_lines(&row(name.clone(), None), false);
+            assert!(!main.contains("3Bn8"), "{main:?}");
+            assert_eq!(second, code, "{name:?}");
+        }
+        assert_eq!(
+            visited_row_lines(&row(StoreName::Loading, None), false).0,
+            "Loading\u{2026}"
+        );
+    }
+
+    /// Rows whose main lines read the same, case aside, are the ones that
+    /// collide; a line on its own does not.
+    #[test]
+    fn rows_that_read_alike_collide() {
+        let labels = ["Bean Shop", "bean shop", "Loading\u{2026}", "Tea"].map(String::from);
+        assert_eq!(colliding(&labels), vec![true, true, false, false]);
+    }
+
+    /// An own store's full row: its name, and as the second line its
+    /// tagline, or its code while it has no name and no tagline, or when
+    /// another card reads the same. Asserted as whole rows, so the tagline
+    /// and the code cannot trade places unnoticed.
+    #[test]
+    fn own_store_rows_are_named_with_a_tagline_or_their_code() {
+        use crate::state::test_store_key;
+        let registration = |id: u8| harvest_common::StoreRegistration {
+            store_contract_id: vec![id; 32],
+            reputation_contract_id: vec![0u8; 32],
+            mailbox_contract_id: vec![0u8; 32],
+            store_contract_key: None,
+            store_verifying_key: Some(test_store_key()),
+        };
+        let code = harvest_common::store::store_code(
+            &ed25519_dalek::VerifyingKey::from_bytes(&test_store_key()).unwrap(),
+        );
+        let loaded = |name: &str, description: &str| crate::state::BrowsingStore {
+            info: Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: name.to_string(),
+                description: description.to_string(),
+                encryption_public_key: None,
+                record_public_key: None,
+            }),
+            ..Default::default()
+        };
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![registration(1), registration(2), registration(3)],
+        );
+        state
+            .browsing_stores
+            .insert(vec![1u8; 32], loaded("Pots", "Hand-thrown **stoneware**."));
+        state
+            .browsing_stores
+            .insert(vec![2u8; 32], loaded("Cups", ""));
+        let rows: Vec<(String, bool, Option<String>)> =
+            own_store_rows(&state, crate::state::now_ms())
+                .into_iter()
+                .map(|r| (r.label, r.named, r.sub))
+                .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Cups".to_string(), true, None),
+                (
+                    "Loading\u{2026}".to_string(),
+                    false,
+                    Some(format!("Store code {code}"))
+                ),
+                (
+                    "Pots".to_string(),
+                    true,
+                    Some("Hand-thrown stoneware.".to_string())
+                ),
+            ]
+        );
+
+        // Two cards with one name: each carries its code, not its tagline.
+        state
+            .browsing_stores
+            .insert(vec![2u8; 32], loaded("Pots", "Cups too"));
+        let subs: Vec<Option<String>> = own_store_rows(&state, crate::state::now_ms())
+            .into_iter()
+            .filter(|r| r.label == "Pots")
+            .map(|r| r.sub)
+            .collect();
+        assert_eq!(subs, vec![Some(format!("Store code {code}")); 2]);
     }
 
     /// "Find a store" keeps today's two messages: an old-format link is
@@ -1445,22 +1629,38 @@ mod store_page_tests {
     use crate::ghostkey_cert::CertificateStatus;
     use harvest_common::presence::ClosedWhy;
 
-    /// Open or Closed beside the name, as buyers see it: Open only while
-    /// buyers can buy, Closed when not or when the seller closed the store
-    /// for good, whatever its presence says. Red if a store closed for good
-    /// reads Open.
+    /// The store-level half of the Buy control and the pill agree: a store
+    /// takes orders (`BrowsingStore::takes_orders`, which `buyer_open`
+    /// reads) exactly when `buyable` offers one to a buyer. Red if the pill
+    /// could say Open over a page whose Buy controls are all hidden.
     #[test]
-    fn the_pill_says_open_only_while_buyers_can_buy() {
-        assert_eq!(open_pill(false, StorePresence::Open), ("Open", true));
-        assert_eq!(open_pill(true, StorePresence::Open), ("Closed", false));
-        assert_eq!(
-            open_pill(false, StorePresence::Closed(ClosedWhy::NoHeartbeat)),
-            ("Closed", false)
-        );
-        assert_eq!(
-            open_pill(false, StorePresence::Checking),
-            ("Checking", false)
-        );
+    fn the_pill_and_the_buy_control_agree() {
+        for closed in [false, true] {
+            for key in [None, Some([1u8; 32])] {
+                for identity in [None, Some([2u8; 32])] {
+                    let mut store = crate::state::BrowsingStore {
+                        info: Some(harvest_common::store::StoreInfoV1 {
+                            version: 1,
+                            certificate_pem: String::new(),
+                            seller_fingerprint: String::new(),
+                            reputation_contract_id: [0u8; 32],
+                            store_name: "Pots".to_string(),
+                            description: String::new(),
+                            encryption_public_key: key,
+                            record_public_key: None,
+                        }),
+                        seller_verifying_key: identity,
+                        ..Default::default()
+                    };
+                    store.closed = closed;
+                    assert_eq!(
+                        store.takes_orders(),
+                        buyable(&store, &[4u8; 32], false).is_some(),
+                        "closed {closed}, key {key:?}, identity {identity:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// **A buyer never sees "Ghost Key", a key id, or a figure the app
@@ -1487,13 +1687,47 @@ mod store_page_tests {
                     "{text:?}"
                 );
                 assert!(!text.contains('$'), "no amount: {text:?}");
+                assert!(
+                    names_no_date(&text),
+                    "no date (a backing's date is the seller's word): {text:?}"
+                );
             }
         }
         assert!(!TRUST_WHY.to_lowercase().contains("ghost"));
+        assert!(names_no_date(TRUST_WHY));
+        assert!(
+            !TRUST_WHY.contains("their name"),
+            "a backing is pseudonymous, so no \"under their name\""
+        );
         assert_eq!(
             backing_words(&CertificateStatus::Verified),
             "Backed by a donation to Freenet"
         );
+    }
+
+    /// No digit, no month and no "since": no date, however written.
+    fn names_no_date(text: &str) -> bool {
+        const MONTHS: [&str; 12] = [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ];
+        let lower = text.to_lowercase();
+        let month = lower.split(|c: char| !c.is_alphabetic()).any(|word| {
+            MONTHS
+                .iter()
+                .any(|m| word == *m || (word.len() == 3 && m.starts_with(word)))
+        });
+        !text.chars().any(|c| c.is_ascii_digit()) && !lower.contains("since") && !month
     }
 
     /// A listing's corner: Closed while the store is, else Sold out, else

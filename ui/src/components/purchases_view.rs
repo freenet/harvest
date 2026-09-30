@@ -31,12 +31,9 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
             if orders == 0 && conversations == 0 {
                 return None;
             }
-            let name = store
-                .info
-                .as_ref()
-                .map(|info| info.store_name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "A store".to_string());
+            // Never a code, and "Loading…" or "Couldn't load this store"
+            // rather than a vague "A store" (review of #197).
+            let name = state.store_name_of(id).label();
             Some(PurchaseRow {
                 store_contract_id: id.clone(),
                 name,
@@ -60,7 +57,7 @@ pub fn MyPurchases() -> Element {
     // a loaded store recalls this device's conversations with it.
     // An effect, so it runs again when the delegate's list of remembered
     // stores arrives after this page opened; loading is idempotent per store.
-    use_effect(|| crate::store_link::load_visited_stores(false));
+    use_effect(|| crate::store_link::load_visited_stores(false, true));
     let rows = purchase_rows(&APP_STATE.read());
     let loading = !APP_STATE.read().background_loads.is_empty();
     let any_kept = !APP_STATE.read().kept_purchases.is_empty();
@@ -192,32 +189,114 @@ mod tests {
     }
 
     /// A background load is sent once per store, not for one already loaded
-    /// or loading, and a GET that fails to send is forgotten so a later visit
-    /// retries; state that arrived meanwhile is kept. Mutated red by dropping
-    /// the already-present check and the failure's removal.
+    /// or loading. One whose GET fails to go out, or times out, is sent again
+    /// only after its wait (with the connection down each retry is itself a
+    /// change of state that asks again), each wait longer, and a few times;
+    /// the store reads as loading until the last gives up. Red retrying at
+    /// once, and red never retrying a timed-out load.
     #[test]
-    fn a_remembered_store_is_loaded_once_and_retried_after_a_failed_send() {
+    fn a_remembered_store_is_retried_after_a_wait_until_it_gives_up() {
+        use crate::state::{store_load_retry_after, StoreName, MAX_STORE_LOAD_ATTEMPTS};
+        let id = vec![1u8; 32];
         let mut state = AppState::default();
-        assert!(state.begin_background_load(vec![1u8; 32], "code".into()));
-        assert!(!state.begin_background_load(vec![1u8; 32], "code".into()));
-        state.end_background_load_failed(&[1u8; 32]);
-        // Not straight away: with the connection down, every retry is a
-        // change of state that asks again (review of the Stores page).
-        assert!(!state.begin_background_load(vec![1u8; 32], "code".into()));
-        assert!(!state.background_load_due(&[1u8; 32], crate::state::now_ms()));
-        // Once the wait is over, it is sent again.
-        *state
-            .background_load_failed_at
-            .get_mut(&vec![1u8; 32])
-            .unwrap() -= crate::state::BACKGROUND_LOAD_RETRY_MS;
-        assert!(state.begin_background_load(vec![1u8; 32], "code".into()));
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        assert!(!state.begin_background_load(id.clone(), "code".into(), false));
+        state.end_background_load_failed(&id);
+        assert!(
+            !state.browsing_stores.contains_key(&id),
+            "placeholder taken out"
+        );
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
+        assert_eq!(
+            state.store_name_of(&id),
+            StoreName::Loading,
+            "a retry is pending"
+        );
+        assert_eq!(
+            state.background_retry_after(&id),
+            Some(store_load_retry_after(1))
+        );
 
-        state.browsing_stores.insert(vec![2u8; 32], named("Loaded"));
-        assert!(!state.begin_background_load(vec![2u8; 32], "code".into()));
+        let rewind = |state: &mut AppState, by: u64| {
+            state.store_load_failures.get_mut(&id).unwrap().1 -= by;
+        };
+        rewind(&mut state, store_load_retry_after(1));
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        // This one goes out and is never answered: counted too.
+        state.end_background_load_timed_out(&id);
+        assert!(
+            state.browsing_stores.contains_key(&id),
+            "a late answer is still taken"
+        );
+        assert!(store_load_retry_after(2) > store_load_retry_after(1));
+        rewind(&mut state, store_load_retry_after(1));
+        assert!(
+            !state.background_load_due(&id, crate::state::now_ms(), false),
+            "the second wait is longer"
+        );
+        for attempt in 2..MAX_STORE_LOAD_ATTEMPTS {
+            rewind(&mut state, store_load_retry_after(attempt));
+            assert!(state.begin_background_load(id.clone(), "code".into(), false));
+            state.end_background_load_timed_out(&id);
+        }
+        assert_eq!(state.background_retry_after(&id), None, "no tries left");
+        rewind(
+            &mut state,
+            100 * store_load_retry_after(MAX_STORE_LOAD_ATTEMPTS),
+        );
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
+        assert_eq!(state.store_name_of(&id), StoreName::Unreachable);
+
+        // Its state arriving clears it all.
+        state.on_contract_state(id.clone(), super::background_tests::some_store_state());
+        assert!(state.store_load_failures.is_empty());
+    }
+
+    /// A failed load takes out only a placeholder nothing else has written
+    /// into: state that arrived meanwhile is kept.
+    #[test]
+    fn a_failed_load_keeps_what_was_written_into_its_entry() {
+        let mut state = AppState::default();
+        assert!(state.begin_background_load(vec![2u8; 32], "code".into(), false));
+        state
+            .browsing_stores
+            .get_mut(&vec![2u8; 32])
+            .unwrap()
+            .reputation_contract_id = Some(vec![9u8; 32]);
         state.end_background_load_failed(&[2u8; 32]);
         assert!(
             state.browsing_stores.contains_key(&vec![2u8; 32]),
-            "arrived state kept"
+            "written-into kept"
+        );
+
+        state.browsing_stores.insert(vec![3u8; 32], named("Loaded"));
+        assert!(!state.begin_background_load(vec![3u8; 32], "code".into(), false));
+    }
+
+    /// A store loaded only to be listed is loaded again, with a
+    /// subscription, when Purchases wants it, and once opened it is no longer
+    /// "light". Red if Purchases skips a store the Stores page loaded.
+    #[test]
+    fn a_listed_store_is_subscribed_when_purchases_or_the_user_wants_it() {
+        let id = vec![4u8; 32];
+        let mut state = AppState::default();
+        assert!(state.begin_background_load(id.clone(), "code".into(), false));
+        assert!(state.light_stores.contains(&id));
+        state.browsing_stores.insert(id.clone(), named("Listed"));
+        state.background_loads.remove(&id);
+        assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
+        assert!(state.background_load_due(&id, crate::state::now_ms(), true));
+        assert!(state.begin_background_load(id.clone(), "code".into(), true));
+        assert!(!state.light_stores.contains(&id));
+
+        let other = vec![5u8; 32];
+        assert!(state.begin_background_load(other.clone(), "code".into(), false));
+        state.background_loads.remove(&other);
+        state.begin_foreground_load(&other);
+        assert!(!state.light_stores.contains(&other));
+        assert!(
+            !state.background_load_due(&other, crate::state::now_ms(), true),
+            "its own GET is out"
         );
     }
 
@@ -233,7 +312,7 @@ mod tests {
 mod background_tests {
     use super::*;
 
-    fn some_store_state() -> Vec<u8> {
+    pub(super) fn some_store_state() -> Vec<u8> {
         use ed25519_dalek::SigningKey;
         use harvest_common::listing::{
             AuthorizedListingStatus, ListingAvailability, ListingId, ListingStatus,
@@ -276,7 +355,7 @@ mod background_tests {
     #[test]
     fn a_background_arrival_does_not_become_the_open_store() {
         let mut state = AppState::default();
-        assert!(state.begin_background_load(vec![7u8; 32], "code".into()));
+        assert!(state.begin_background_load(vec![7u8; 32], "code".into(), true));
         state.on_contract_state(vec![7u8; 32], some_store_state());
         assert_eq!(state.active_store_id, None);
         assert!(state.background_loads.is_empty());

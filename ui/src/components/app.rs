@@ -73,24 +73,85 @@ pub(crate) fn show_store(store_contract_id: Vec<u8>) {
     *ROUTE.write() = Route::Store;
 }
 
-/// Show a store's own page from a button that names it by id (Purchases'
-/// "Open store", "See your store as buyers do"). A store whose state is not
-/// here is opened by its code (`store_link::open_store`), which asks for it
-/// and gives up after a while, so the page never says "Loading" for good.
-pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
-    let code = {
-        let state = crate::gateway::APP_STATE.peek();
-        let loaded = state
-            .browsing_stores
-            .get(&store_contract_id)
-            .is_some_and(|store| store.info.is_some());
-        (!loaded)
-            .then(|| state.store_codes.get(&store_contract_id).cloned())
-            .flatten()
+/// How [`open_store_page`] opens a store.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Opening {
+    /// Its state is here and followed: just show it.
+    Loaded,
+    /// Not here, or here only to be listed (`AppState::light_stores`): open
+    /// it by its code, which fetches it with a subscription and remembers it.
+    ByCode(harvest_common::store::StoreParameters),
+    /// No code known for it anywhere: fetch it by its address, which still
+    /// gives up after a while.
+    ById,
+}
+
+/// How to open the store `store_contract_id`: see [`Opening`]. Its code is
+/// looked for where this node may hold it: the codes stores were opened
+/// under, the remembered stores (removed ones too), and this node's own
+/// stores' keys.
+pub(crate) fn opening_for(state: &crate::state::AppState, store_contract_id: &[u8]) -> Opening {
+    let loaded = state
+        .browsing_stores
+        .get(store_contract_id)
+        .is_some_and(|store| store.info.is_some());
+    if loaded && !state.light_stores.contains(store_contract_id) {
+        return Opening::Loaded;
+    }
+    let id_of = |params: &harvest_common::store::StoreParameters| {
+        crate::gateway::store_ops::store_instance_id(params)
+            .ok()
+            .map(|id| id.as_bytes().to_vec())
     };
-    match code.and_then(|code| harvest_common::store::StoreParameters::from_code(&code)) {
-        Some(params) => crate::store_link::open_store(params),
-        None => show_store(store_contract_id),
+    let known = state.store_codes.get(store_contract_id).cloned();
+    let remembered = || {
+        state.remembered_stores.iter().flatten().find_map(|s| {
+            let params = harvest_common::store::StoreParameters::from_code(&s.store_code)?;
+            (id_of(&params).as_deref() == Some(store_contract_id)).then(|| s.store_code.clone())
+        })
+    };
+    let own = || {
+        state
+            .my_stores
+            .values()
+            .flatten()
+            .filter(|r| r.store_contract_id == store_contract_id)
+            .find_map(|r| r.store_verifying_key)
+            .and_then(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok())
+            .map(|key| harvest_common::store::store_code(&key))
+    };
+    match known
+        .or_else(remembered)
+        .or_else(own)
+        .and_then(|code| harvest_common::store::StoreParameters::from_code(&code))
+    {
+        Some(params) => Opening::ByCode(params),
+        None => Opening::ById,
+    }
+}
+
+/// Show a store's own page from a button that names it by id (Purchases'
+/// "Open store", a visited row, "See your store as buyers do"). A store
+/// whose state is not here is fetched (`store_link::open_store`, or by its
+/// address when no code is known), and that fetch gives up after a while, so
+/// the page never says "Loading" for good.
+pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
+    let opening = opening_for(&crate::gateway::APP_STATE.peek(), &store_contract_id);
+    match opening {
+        Opening::Loaded => show_store(store_contract_id),
+        Opening::ByCode(params) => crate::store_link::open_store(params),
+        Opening::ById => match <[u8; 32]>::try_from(store_contract_id.as_slice()) {
+            Ok(bytes) => crate::store_link::open_store_id(
+                freenet_stdlib::prelude::ContractInstanceId::new(bytes),
+            ),
+            Err(_) => {
+                show_store(store_contract_id.clone());
+                crate::gateway::APP_STATE.write().note_store_link_failed(
+                    &store_contract_id,
+                    "That store can\u{2019}t be opened.",
+                );
+            }
+        },
     }
 }
 
@@ -271,7 +332,9 @@ pub fn App() -> Element {
         let store_name = app_state
             .displayed_store()
             .and_then(|(_, store)| store.info.as_ref())
-            .map(|info| info.store_name.as_str());
+            .map(|info| info.store_name.trim())
+            // An unnamed store keeps the plain title, not "Harvest - ".
+            .filter(|name| !name.is_empty());
 
         match (&current_route, store_name) {
             (Route::Store, Some(name)) => crate::document_title::set_store_title(name),
@@ -666,5 +729,118 @@ mod route_tests {
     fn the_stores_tab_carries_what_needs_the_seller() {
         assert_eq!(needs_count(0), None);
         assert_eq!(needs_count(2).as_deref(), Some("(2)"));
+    }
+
+    fn loaded() -> crate::state::BrowsingStore {
+        crate::state::BrowsingStore {
+            info: Some(harvest_common::store::StoreInfoV1 {
+                version: 1,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Pots".to_string(),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// How a store named by its id is opened: shown as it is when its state
+    /// is here and followed (no second fetch); otherwise by its code, found
+    /// among the codes stores were opened under, the remembered stores
+    /// (removed ones too) or this node's own stores' keys; and by its address
+    /// when no code is known. Red if a store with no code in `store_codes`
+    /// is shown without anything fetching it (Gemini and skeptical on #197).
+    #[test]
+    fn a_store_named_by_id_is_opened_the_way_that_can_end() {
+        use crate::state::AppState;
+        let p = params(11);
+        let id = id_of(&p);
+
+        let mut state = AppState::default();
+        assert_eq!(opening_for(&state, &id), Opening::ById, "nothing known");
+
+        state.browsing_stores.insert(id.clone(), loaded());
+        assert_eq!(opening_for(&state, &id), Opening::Loaded, "no re-open");
+        state.light_stores.insert(id.clone());
+        assert_eq!(
+            opening_for(&state, &id),
+            Opening::ById,
+            "listed only, and no code known: fetched again, followed"
+        );
+
+        let mut state = AppState::default();
+        state.store_codes.insert(id.clone(), p.code().to_string());
+        assert_eq!(opening_for(&state, &id), Opening::ByCode(p.clone()));
+
+        let mut state = AppState::default();
+        state.remembered_stores = Some(vec![harvest_common::RememberedStore {
+            store_code: p.code().to_string(),
+            archived: true,
+        }]);
+        assert_eq!(
+            opening_for(&state, &id),
+            Opening::ByCode(p.clone()),
+            "a removed one"
+        );
+
+        let own_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: id.clone(),
+                reputation_contract_id: Vec::new(),
+                mailbox_contract_id: Vec::new(),
+                store_contract_key: None,
+                store_verifying_key: Some(own_key.to_bytes()),
+            }],
+        );
+        assert_eq!(opening_for(&state, &id), Opening::ByCode(p), "one of ours");
+    }
+
+    /// A store opened by its address alone still reaches an end: it reads
+    /// as loading while its fetch is out, and as not loaded once the fetch
+    /// gives up, never "Loading" for good.
+    #[test]
+    fn a_store_opened_by_its_address_reaches_an_end() {
+        use crate::state::StoreName;
+        in_app(|| {
+            let id = vec![12u8; 32];
+            open_store_page(id.clone());
+            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert!(crate::gateway::APP_STATE
+                .peek()
+                .foreground_loads
+                .contains(&id));
+            assert_eq!(
+                crate::gateway::APP_STATE.peek().store_name_of(&id),
+                StoreName::Loading
+            );
+            // What its timer does on wasm when the wait is over.
+            crate::gateway::APP_STATE.write().end_foreground_load(&id);
+            assert_eq!(
+                crate::gateway::APP_STATE.peek().store_name_of(&id),
+                StoreName::Unreachable
+            );
+
+            // A loaded store is only shown: nothing is fetched again.
+            let loaded_id = vec![13u8; 32];
+            crate::gateway::APP_STATE
+                .write()
+                .browsing_stores
+                .insert(loaded_id.clone(), loaded());
+            open_store_page(loaded_id.clone());
+            assert_eq!(
+                crate::gateway::APP_STATE.peek().active_store_id,
+                Some(loaded_id.clone())
+            );
+            assert!(!crate::gateway::APP_STATE
+                .peek()
+                .foreground_loads
+                .contains(&loaded_id));
+        });
     }
 }

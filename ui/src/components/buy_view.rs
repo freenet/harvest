@@ -59,6 +59,10 @@ pub fn BuyForm(
     listing: Listing,
     seller_encryption_key: [u8; 32],
     seller_verifying_key: [u8; 32],
+    /// The store closed while this form was open: an order already sent
+    /// keeps its pay card, and no new one is sent.
+    #[props(default)]
+    closed: bool,
 ) -> Element {
     let mut quantity = use_signal(|| "1".to_string());
     let mut shipping = use_signal(String::new);
@@ -108,7 +112,7 @@ pub fn BuyForm(
         unpaid_in_conversation(&state.buyer_purchases(&store_contract_id), current)
             >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
     };
-    let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid;
+    let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid && !closed;
 
     if let Some(sent) = sent() {
         let thread = APP_STATE.read().conversation_thread(&store_contract_id);
@@ -260,6 +264,11 @@ pub fn BuyForm(
             }
             if too_many_unpaid {
                 p { class: "text-warning", "{harvest_common::delegate::TOO_MANY_UNPAID}" }
+            }
+            if closed {
+                p { class: "text-warning",
+                    "This store has just closed, so this order can\u{2019}t be sent now."
+                }
             }
             if let Some(message) = problem() {
                 p { class: "text-warning", "{message}" }

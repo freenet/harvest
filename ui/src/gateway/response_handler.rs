@@ -118,8 +118,15 @@ fn handle_contract_response(response: ContractResponse) {
             }
 
             // Check if this is a store state -- if so, we need to follow
-            // the reputation contract link
-            let reputation_to_subscribe = check_for_reputation_link(&state_bytes);
+            // the reputation contract link. Not for a store loaded only to be
+            // listed on the Stores page (`AppState::light_stores`): its row
+            // shows no record, and opening it loads it again.
+            let light = APP_STATE.read().light_stores.contains(&contract_id);
+            let reputation_to_subscribe = if light {
+                None
+            } else {
+                check_for_reputation_link(&state_bytes)
+            };
 
             {
                 let mut app = APP_STATE.write();
