@@ -627,8 +627,6 @@ pub fn time_left(blocks: u32) -> String {
 pub enum Reader {
     Buyer,
     Seller,
-    /// Someone who is neither party, reading a store's public order list.
-    Onlooker,
 }
 
 /// The day block `height` is (or was) mined, roughly: counted from the
@@ -1958,8 +1956,8 @@ mod tests {
     }
 
     /// Each party reads its own words: the seller is told what to do and
-    /// never about "the seller"; a buyer reads "you can report a problem";
-    /// anyone else reads neither party's "you". One "about" per date.
+    /// never about "the seller"; the buyer reads what the seller says; neither
+    /// is told "you can" report a problem. One "about" per date.
     #[test]
     fn each_reader_is_told_in_their_own_words() {
         let tip = Some(1_000);
@@ -2023,15 +2021,10 @@ mod tests {
                 seller.matches(" Oct").count() + seller.matches(" Sep").count(),
                 "{seller}"
             );
-            let onlooker = say(stage, Reader::Onlooker);
-            assert!(
-                !onlooker.contains("You ") && !onlooker.contains("you "),
-                "{onlooker}"
-            );
         }
         // Said as the window, never "you can": the buyer may already have
         // reported one, or not hold the key to.
-        for reader in [Reader::Buyer, Reader::Onlooker] {
+        for reader in [Reader::Buyer, Reader::Seller] {
             let said = say(sent, reader);
             assert!(
                 said.contains("A problem can be reported until about 11 Oct"),
