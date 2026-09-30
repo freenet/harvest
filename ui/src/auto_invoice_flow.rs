@@ -104,7 +104,8 @@ pub struct AutoInvoiceUi {
     pub delegation_update_sent: HashMap<BridgeId, ([u8; 32], u64, u64)>,
     /// A signed delegation handed to the delegate and not yet taken, per
     /// bridge: the request, the height it was issued at, when it was last
-    /// sent, and how many times. Resent as it is (no new vault prompt) until
+    /// sent, and how many times (0, and dated a resend period back, while it
+    /// is held unsent because the address window is shut, harvest#183). Resent as it is (no new vault prompt) until
     /// the delegate's answer shows it held, so a send that never arrived or a
     /// passing refusal does not leave delegated watching off for the session
     /// behind the once-only `delegation_asked`.
@@ -117,7 +118,7 @@ pub struct AutoInvoiceUi {
     /// What each of the delegate's next addresses' address contract showed,
     /// by payment script ([`AddressVet`], harvest#183). None of them goes
     /// to the bridge or into an arm before it is clear. Pruned to the
-    /// current window (and the used ones) whenever the window is read again,
+    /// current window whenever the window is read again,
     /// so an address that leaves the window and comes back is read again.
     pub vets: HashMap<Vec<u8>, AddressVet>,
     /// The token the next address-contract read is started under, so a
@@ -135,12 +136,13 @@ pub struct AutoInvoiceUi {
     pub moved_past: std::collections::HashSet<Vec<u8>>,
     /// Whether the seller has been told that many addresses turned out used.
     pub vets_many_used_told: bool,
-    /// Set when a payment turned an address used: the window must be read
-    /// again, by a peek sent after this, before anything is raised on it.
-    pub stale_since: Option<u64>,
-    /// The peeks out, by request id, and when each was sent: an answer is
-    /// matched to its own peek, never to a later one's time.
-    pub peeks_out: HashMap<u64, u64>,
+    /// Set when a payment turned an address used: the lowest peek request
+    /// id whose answer may count. The window must be read again, by a peek
+    /// sent after the verdict, before anything is raised on it. Request ids
+    /// only grow, so this needs no clock.
+    pub stale_from_peek: Option<u64>,
+    /// The request id of the last peek sent.
+    pub last_peek_id: Option<u64>,
     /// Reads still out under an earlier address-contract build, by that
     /// build's contract id: a late answer showing a payment still makes the
     /// address used (a payment under any build stands).
@@ -179,10 +181,10 @@ pub struct AutoInvoiceUi {
 /// The tab's window can be up to [`REARM_EVERY_MS`] old: the delegate hands
 /// its addresses out in the background without telling it. A buyer paying
 /// such an instant invoice shows up as a payment on an address still in the
-/// window. So a payment seen on an address already read clear only makes the
-/// window stale: it is read again (and the counter with it) before anything
-/// is raised, and a raise goes out only for a used address in a window read
-/// after the verdict.
+/// window. So any address newly found paid only makes the window stale: it is
+/// read again (and the counter with it), by a peek sent after the verdict,
+/// before anything is raised, and a raise goes out only for a used address in
+/// that window.
 ///
 /// Silence for [`ADDRESS_VET_TIMEOUT_MS`], or `NotFound`, counts as clear: a
 /// fresh address's contract does not exist, and Freenet reports absence
@@ -425,7 +427,15 @@ impl AppState {
     /// has moved the counter past it, seconds later; an invoice in between
     /// can land on it. A delegate that lost its counter lost its arm and
     /// delegation with it (a re-key or a new device), so the case #183 hit
-    /// has nothing to withdraw.
+    /// has nothing to withdraw at first.
+    ///
+    /// Nor can it see past the window. Once the window is clear and the
+    /// delegation sent, the delegate watches and invoices from its own
+    /// counter onward, past the ten addresses read here (with the tab closed,
+    /// or between two re-reads). A lost counter whose old history has ten or
+    /// more unpaid addresses before a paid one reads clear here and the
+    /// delegate can then reach the paid one. Closing that needs the delegate
+    /// to read addresses itself: harvest#198.
     fn current_upcoming(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let (network, upcoming) = self.upcoming_unvetted()?;
         // Read under the address contract an order would name NOW: a verdict
@@ -581,7 +591,8 @@ impl AppState {
                             vet.verdict = VetVerdict::Used;
                             vet.at_ms = now_ms;
                             self.auto_invoice.upcoming_for = None;
-                            self.auto_invoice.stale_since = Some(now_ms);
+                            self.auto_invoice.stale_from_peek =
+                                Some(self.bitcoin.next_request_id + 1);
                         }
                     }
                 }
@@ -613,7 +624,7 @@ impl AppState {
                     // Read the window again, by a peek sent from now on,
                     // before believing it.
                     self.auto_invoice.upcoming_for = None;
-                    self.auto_invoice.stale_since = Some(now_ms);
+                    self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                 }
             }
             Some(false) => {
@@ -723,8 +734,8 @@ impl AppState {
         };
         // A window made stale by a payment is read again at once, unless a
         // peek has gone since.
-        let asked_since_stale = match self.auto_invoice.stale_since {
-            Some(since) => self.auto_invoice.peek_sent_ms.is_some_and(|at| at >= since),
+        let asked_since_stale = match self.auto_invoice.stale_from_peek {
+            Some(first) => self.auto_invoice.last_peek_id.is_some_and(|id| id >= first),
             None => true,
         };
         stale
@@ -1386,37 +1397,26 @@ impl AppState {
     }
 
     /// A `PeekOrderAddresses` went out under `request_id`.
-    pub(crate) fn note_peek_sent(&mut self, request_id: u64, now_ms: u64) {
-        // Bounded: an answer that never comes is forgotten with the oldest.
-        if self.auto_invoice.peeks_out.len() >= 16 {
-            if let Some(oldest) = self
-                .auto_invoice
-                .peeks_out
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(id, _)| *id)
-            {
-                self.auto_invoice.peeks_out.remove(&oldest);
-            }
-        }
-        self.auto_invoice.peeks_out.insert(request_id, now_ms);
+    pub(crate) fn note_peek_sent(&mut self, request_id: u64) {
+        self.auto_invoice.last_peek_id = Some(request_id);
     }
 
     /// The delegate's answer to the peek sent under `request_id`. One sent
     /// before a payment made the window stale can predate the sale that
     /// payment was for: dropped, and the next peek brings a window read after
-    /// it. Matched by id, so a later peek's time cannot vouch for it.
+    /// it. Matched by request id, so a later peek cannot vouch for it.
     pub(crate) fn on_upcoming_answer(
         &mut self,
         request_id: u64,
         result: Result<Vec<DerivedAddress>, String>,
         now_ms: u64,
     ) {
-        let sent = self.auto_invoice.peeks_out.remove(&request_id);
-        if let Some(since) = self.auto_invoice.stale_since {
-            if sent.is_none_or(|at| at < since) {
-                return;
-            }
+        if self
+            .auto_invoice
+            .stale_from_peek
+            .is_some_and(|first| request_id < first)
+        {
+            return;
         }
         self.on_upcoming_addresses(result, now_ms);
     }
@@ -1429,7 +1429,7 @@ impl AppState {
     ) {
         match (result, self.bitcoin.payment_xpub.as_ref()) {
             (Ok(upcoming), Some(xpub)) => {
-                self.auto_invoice.stale_since = None;
+                self.auto_invoice.stale_from_peek = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();

@@ -32227,14 +32227,16 @@ mod buy_flow_tests {
         settle_absent_except(&mut state, &work, &[], 100);
         let t = 100 + REARM_EVERY_MS;
         assert!(state.queue_auto_invoice(t).peek, "the ten-minute re-read");
-        state.note_peek_sent(1, t);
+        let first = state.bitcoin.next_request_id();
+        state.note_peek_sent(first);
         assert!(state.on_address_vet_state(&vet_of(&work, 3).0, &paid, t + 1));
         assert!(state.queue_auto_invoice(t + 2).peek, "asked again at once");
-        state.note_peek_sent(2, t + 2);
+        let second = state.bitcoin.next_request_id();
+        state.note_peek_sent(second);
         // The first peek's answer lands after the second went out: dropped.
-        state.on_upcoming_answer(1, window(), t + 3);
+        state.on_upcoming_answer(first, window(), t + 3);
         assert!(state.auto_invoice.upcoming_for.is_none(), "dropped");
-        state.on_upcoming_answer(2, window(), t + 4);
+        state.on_upcoming_answer(second, window(), t + 4);
         assert!(state.auto_invoice.upcoming_for.is_some());
     }
 
@@ -32288,6 +32290,7 @@ mod buy_flow_tests {
         // A payment shows on the first upcoming address while it signs.
         let first = state.auto_invoice.upcoming[0].script_pubkey.clone();
         state.auto_invoice.vets.get_mut(&first).unwrap().verdict = VetVerdict::Used;
+        let bridge = pending.bridge;
         let (scoped, signature) = inbox::sign_result(&gk, pending.signing_payload.clone());
         assert_eq!(
             state.on_watch_delegation_signed(
@@ -32302,8 +32305,13 @@ mod buy_flow_tests {
         );
         let t = DELEGATION_NOW + 3 + DELEGATION_RESEND_MS;
         assert_eq!(state.queue_auto_invoice(t).delegation.resend, None);
+        assert_eq!(
+            state.auto_invoice.delegation_in_flight[&bridge].attempts, 0,
+            "nothing sent yet"
+        );
         state.auto_invoice.vets.get_mut(&first).unwrap().verdict = VetVerdict::Clear;
-        let open = state.queue_auto_invoice(t + 1);
+        // Due as soon as the window opens, not a resend period later.
+        let open = state.queue_auto_invoice(DELEGATION_NOW + 4);
         assert!(open.delegation.resend.is_some(), "sent once open");
         assert_eq!(open.delegation.delegate, None, "no new vault prompt");
     }
