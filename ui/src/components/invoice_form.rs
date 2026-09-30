@@ -138,7 +138,9 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         )
     };
     // This order's conversation, if it is shown under this card; else
-    // whether it is shown under another (the newest order in it).
+    // whether it is shown under another of the buyer's orders
+    // (`message_view::thread_homes`: one that needs the seller, then the
+    // newest).
     let thread_for = |id: &harvest_common::payment::OrderId| {
         inbox
             .for_order(id)
@@ -273,8 +275,9 @@ pub(crate) fn SellerOrderCard(
     /// where the card is shown without its conversation.
     #[props(default)]
     open_thread: Option<Signal<super::message_view::OpenThread>>,
-    /// The buyer's conversation is shown under another card: their newest
-    /// order (`message_view::thread_homes`).
+    /// The buyer's conversation is shown under another of their order cards
+    /// (`message_view::thread_homes`: one that needs the seller, then the
+    /// newest).
     #[props(default)]
     thread_elsewhere: bool,
 ) -> Element {
@@ -410,9 +413,10 @@ pub(crate) fn SellerOrderCard(
     }
 }
 
-/// Said on an order card whose conversation is shown under the buyer's
-/// newer order (review of #205, U3).
-const THREAD_ELSEWHERE: &str = "Messages with this buyer are under their newest order.";
+/// Said on an order card whose conversation is shown under another of the
+/// buyer's orders (review of #205, U3). Not "newest": the one needing the
+/// seller comes first (`message_view::thread_homes`).
+const THREAD_ELSEWHERE: &str = "Messages with this buyer are under another of their orders.";
 
 /// What the buyer asked for, as an order card shows it
 /// (`AppState::seller_order_request`): the request, each version of it when
