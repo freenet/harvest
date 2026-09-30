@@ -678,7 +678,15 @@ pub(crate) fn OrderCard(
                     p { class: "text-warning", "{note}" }
                 }
             }
-            if order.status == OrderStatus::AwaitingPayment && buyer && reading.after_window.is_some() {
+            // Only when the payment is not provably another order's on a
+            // reused address (as the seller's note tells apart), and only
+            // with a tip, so it never sits beside the pay steps.
+            if order.status == OrderStatus::AwaitingPayment
+                && buyer
+                && reading.after_window.is_some()
+                && !late_is_another_orders
+                && tip_height.is_some()
+            {
                 p { class: "text-warning",
                     "A payment to this order\u{2019}s address arrived after the time to pay \
                      had passed, so it can\u{2019}t mark the order paid. If it was yours, \
