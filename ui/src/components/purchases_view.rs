@@ -12,8 +12,12 @@ use crate::state::AppState;
 pub(crate) struct PurchaseRow {
     pub store_contract_id: Vec<u8>,
     pub name: String,
-    /// Orders the seller has published for this buyer.
+    /// This buyer's orders from the store still standing, counted as its
+    /// store page counts them (`store_view::orders_here`), so the two pages
+    /// never give two numbers for one store (round-6 screenshots).
     pub orders: usize,
+    /// Orders that ended unpaid: cancelled, or too old to pay.
+    pub ended: usize,
     /// Conversations this device keeps with the store.
     pub conversations: usize,
 }
@@ -26,9 +30,10 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
         .iter()
         .filter(|(id, _)| state.store_owner_fingerprint(id).is_none())
         .filter_map(|(id, store)| {
-            let orders = state.buyer_purchases(id).len();
+            let purchases = state.buyer_purchases(id);
+            let counted = super::store_view::orders_here(&purchases);
             let conversations = store.conversations.len();
-            if orders == 0 && conversations == 0 {
+            if purchases.is_empty() && conversations == 0 {
                 return None;
             }
             // Never a code, and "Loading…" or "Couldn't load this store"
@@ -37,7 +42,8 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
             Some(PurchaseRow {
                 store_contract_id: id.clone(),
                 name,
-                orders,
+                orders: counted.live,
+                ended: counted.ended,
                 conversations,
             })
         })
@@ -104,7 +110,7 @@ pub fn MyPurchases() -> Element {
                         }
                     }
                     p { class: "text-muted small",
-                        {summary(row.orders, row.conversations)}
+                        {summary(row.orders, row.ended, row.conversations)}
                     }
                     super::buy_view::Purchases { store_contract_id: row.store_contract_id.clone() }
                 }
@@ -147,18 +153,23 @@ fn unreachable_note(failed: usize) -> Option<String> {
     }
 }
 
-fn summary(orders: usize, conversations: usize) -> String {
-    let orders = match orders {
-        0 => "No orders yet".to_string(),
-        1 => "1 order".to_string(),
-        n => format!("{n} orders"),
+fn summary(orders: usize, ended: usize, conversations: usize) -> String {
+    let orders = match (orders, ended) {
+        (0, 0) => "No orders yet".to_string(),
+        (0, _) => "No orders standing".to_string(),
+        (1, _) => "1 order".to_string(),
+        (n, _) => format!("{n} orders"),
+    };
+    let ended = match ended {
+        0 => String::new(),
+        n => format!(" · {n} ended unpaid"),
     };
     let conversations = match conversations {
         0 => String::new(),
         1 => " · 1 conversation".to_string(),
         n => format!(" · {n} conversations"),
     };
-    format!("{orders}{conversations}")
+    format!("{orders}{ended}{conversations}")
 }
 
 #[cfg(test)]
@@ -413,9 +424,14 @@ mod tests {
 
     #[test]
     fn the_summary_counts_what_there_is() {
-        assert_eq!(summary(0, 1), "No orders yet · 1 conversation");
-        assert_eq!(summary(2, 0), "2 orders");
-        assert_eq!(summary(1, 3), "1 order · 3 conversations");
+        assert_eq!(summary(0, 0, 1), "No orders yet · 1 conversation");
+        assert_eq!(summary(2, 0, 0), "2 orders");
+        assert_eq!(summary(1, 0, 3), "1 order · 3 conversations");
+        assert_eq!(
+            summary(3, 3, 1),
+            "3 orders · 3 ended unpaid · 1 conversation"
+        );
+        assert_eq!(summary(0, 2, 0), "No orders standing · 2 ended unpaid");
     }
 }
 

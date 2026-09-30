@@ -923,6 +923,8 @@ pub(crate) struct OrdersHere {
     pub live: usize,
     /// Of those, the ones the buyer can pay now.
     pub to_pay: usize,
+    /// Orders that ended unpaid: cancelled, or too old to pay.
+    pub ended: usize,
 }
 
 /// Count `purchases` the way a store's page speaks of them.
@@ -961,8 +963,8 @@ pub(crate) fn orders_here(purchases: &[crate::state::BuyerPurchase]) -> OrdersHe
         };
         let stale = has(|b| matches!(b, PaymentBlocker::AnchorStale { .. }));
         match order.status {
-            OrderStatus::Cancelled => continue,
-            OrderStatus::AwaitingPayment if stale => continue,
+            OrderStatus::Cancelled => counts.ended += 1,
+            OrderStatus::AwaitingPayment if stale => counts.ended += 1,
             OrderStatus::AwaitingPayment => {
                 counts.live += 1;
                 if purchase.blockers.is_empty() || purchase.ready_to_keep() {
@@ -2016,7 +2018,13 @@ mod store_page_tests {
 
     #[test]
     fn the_orders_line_counts_in_words() {
-        let line = |live, to_pay| orders_line(OrdersHere { live, to_pay });
+        let line = |live, to_pay| {
+            orders_line(OrdersHere {
+                live,
+                to_pay,
+                ended: 0,
+            })
+        };
         assert_eq!(line(1, 0), "You have 1 order from this store \u{203a}");
         assert_eq!(
             line(3, 1),
@@ -2090,17 +2098,27 @@ mod store_page_tests {
                 purchase(3, true, OrderStatus::AwaitingPayment, true),
                 purchase(4, true, OrderStatus::Cancelled, false),
             ]),
-            OrdersHere { live: 2, to_pay: 1 }
+            OrdersHere {
+                live: 2,
+                to_pay: 1,
+                ended: 2
+            }
         );
         // A hand invoice: expired is not one to pay, cancelled is not one at
-        // all.
+        // all; both ended unpaid.
         assert_eq!(
             count(vec![purchase(5, false, OrderStatus::AwaitingPayment, true)]),
-            OrdersHere::default()
+            OrdersHere {
+                ended: 1,
+                ..OrdersHere::default()
+            }
         );
         assert_eq!(
             count(vec![purchase(6, false, OrderStatus::Cancelled, false)]),
-            OrdersHere::default()
+            OrdersHere {
+                ended: 1,
+                ..OrdersHere::default()
+            }
         );
         // Seen paid on chain before the seller marked it: an order, not one
         // to pay, whatever its age or a cancel it beat. Red without the
@@ -2110,7 +2128,11 @@ mod store_page_tests {
                 seen_paid(purchase(7, true, OrderStatus::AwaitingPayment, true)),
                 seen_paid(purchase(8, true, OrderStatus::Cancelled, false)),
             ]),
-            OrdersHere { live: 2, to_pay: 0 }
+            OrdersHere {
+                live: 2,
+                to_pay: 0,
+                ended: 0
+            }
         );
         // An early blocker: an order, but not one the buyer can pay now.
         assert_eq!(
@@ -2118,7 +2140,11 @@ mod store_page_tests {
                 purchase(9, true, OrderStatus::AwaitingPayment, false),
                 PaymentBlocker::StoreClosed
             )]),
-            OrdersHere { live: 1, to_pay: 0 }
+            OrdersHere {
+                live: 1,
+                to_pay: 0,
+                ended: 0
+            }
         );
         // Only keeping its copy stands in the way: the pay button does that.
         assert_eq!(
@@ -2126,7 +2152,11 @@ mod store_page_tests {
                 purchase(10, true, OrderStatus::AwaitingPayment, false),
                 PaymentBlocker::PurchaseNotKept
             )]),
-            OrdersHere { live: 1, to_pay: 1 }
+            OrdersHere {
+                live: 1,
+                to_pay: 1,
+                ended: 0
+            }
         );
         // Not this buyer's order: not counted.
         assert_eq!(
