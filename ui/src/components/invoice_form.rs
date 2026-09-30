@@ -221,11 +221,12 @@ pub(crate) fn SellerOrderCard(
                 ),
             ))
         }
-        _ => Some((
+        (_, None) => Some((
             false,
             "Paid. The date to send it by shows once your node has caught up with Bitcoin."
                 .to_string(),
         )),
+        (_, Some(_)) => Some((false, "Paid. Send it soon.".to_string())),
     };
     let amount = super::pay_card::amount_text(order.order.amount_sats, order.order.network);
     let test = super::pay_card::is_test_network(order.order.network);
@@ -279,8 +280,9 @@ pub(crate) fn SellerOrderCard(
                 },
                 SellerRequest::Conflict => rsx! {
                     p { class: "text-warning",
-                        "The buyer sent more than one version of this order. Read their messages \
-                         on the Orders tab, and ask them which address to use before sending."
+                        "The buyer sent more than one version of this order (a different address, \
+                         quantity or choice). Read their messages on the Orders tab, and ask them \
+                         which is right before sending."
                     }
                 },
                 SellerRequest::NotFound => rsx! {

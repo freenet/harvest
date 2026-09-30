@@ -81,10 +81,17 @@ pub(crate) struct SellerStore {
 /// more (`OrderStage::needs_attention`, codex on harvest#177), and so does a
 /// Paid order this node cannot yet place against the chain (`Unknown`):
 /// without it, such an order lost its card and Mark as sent (review of #190).
+/// Never one whose despatch is on record (`despatched`): `Unknown` is
+/// decided before the despatch is looked at, and a recorded despatch whose
+/// terms this node cannot check still hides Mark as sent.
 pub(crate) fn needs_sending(
     order: &harvest_common::payment::AuthorizedOrder,
     stage: crate::fulfilment::OrderStage,
+    despatched: bool,
 ) -> bool {
+    if despatched {
+        return false;
+    }
     match stage {
         crate::fulfilment::OrderStage::AwaitingDespatch { .. }
         | crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => true,
@@ -101,22 +108,14 @@ pub(crate) fn orders_to_send(
     orders: &[harvest_common::payment::AuthorizedOrder],
     fingerprint: &str,
     stage_of: impl Fn(&harvest_common::payment::AuthorizedOrder) -> crate::fulfilment::OrderStage,
+    despatched: impl Fn(&harvest_common::payment::AuthorizedOrder) -> bool,
 ) -> Vec<harvest_common::payment::AuthorizedOrder> {
     orders
         .iter()
         .filter(|o| o.order.seller_fingerprint == fingerprint)
-        .filter(|o| needs_sending(o, stage_of(o)))
+        .filter(|o| needs_sending(o, stage_of(o), despatched(o)))
         .cloned()
         .collect()
-}
-
-/// How many of [`orders_to_send`] there are.
-pub(crate) fn paid_to_send(
-    orders: &[harvest_common::payment::AuthorizedOrder],
-    fingerprint: &str,
-    stage_of: impl Fn(&harvest_common::payment::AuthorizedOrder) -> crate::fulfilment::OrderStage,
-) -> usize {
-    orders_to_send(orders, fingerprint, stage_of).len()
 }
 
 /// What needs the seller across every store this device manages: requests
@@ -197,21 +196,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                 })
                 .count();
             let to_send = browsing
-                .map(|b| {
-                    paid_to_send(&b.orders, fingerprint, |o| {
-                        let tip = state
-                            .bitcoin
-                            .tips
-                            .get(&o.order.network)
-                            .and_then(|tip| tip.tip_height);
-                        crate::fulfilment::order_stage(
-                            o,
-                            state.despatch_of(o).as_ref(),
-                            tip,
-                            state.payment_sight(o),
-                        )
-                    })
-                })
+                .map(|_| state.seller_orders_to_send(id, fingerprint).len())
                 .unwrap_or(0);
             Some(SellerStore {
                 contract_id: id.clone(),
@@ -2068,9 +2053,16 @@ mod seller_stores_tests {
             },
         };
         assert_eq!(
-            paid_to_send(&orders, "fp", stage),
+            orders_to_send(&orders, "fp", stage, |_| false).len(),
             3,
             "overdue and not-yet-placed paid orders still count"
+        );
+        // One whose despatch is on record never counts, whatever its stage
+        // (round 2 of #190: an Unknown stage is decided before the despatch
+        // is read).
+        assert_eq!(
+            orders_to_send(&orders, "fp", stage, |o| o.order.id.0[0] == 5).len(),
+            2
         );
     }
 

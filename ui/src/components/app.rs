@@ -382,7 +382,7 @@ fn notification_bar() -> Element {
     // Each notice once, however often it was raised, and each with a way to
     // put it away: before, they stacked up to eight deep above every screen
     // and never left (the 2026-09-27 friction report).
-    let notices = distinct_notices(&app_state.notifications);
+    let (notices, hidden) = distinct_notices(&app_state.notifications);
     if notices.is_empty() && progress.is_empty() {
         return rsx! {};
     }
@@ -406,21 +406,30 @@ fn notification_bar() -> Element {
             for notice in progress.iter() {
                 p { "{notice}" }
             }
+            if hidden > 0 {
+                p { class: "text-muted small",
+                    if hidden == 1 { "1 older notice isn\u{2019}t shown." } else { "{hidden} older notices aren\u{2019}t shown." }
+                }
+            }
         }
     }
 }
 
-/// Each notice once, in the order first raised; at most the latest
-/// [`NOTICES_SHOWN`] distinct ones.
-fn distinct_notices(notifications: &[String]) -> Vec<String> {
+/// Each notice once, in the order last raised; at most the latest
+/// [`NOTICES_SHOWN`] distinct ones, and how many older ones are not shown.
+fn distinct_notices(notifications: &[String]) -> (Vec<String>, usize) {
+    // Deduplicated at each notice's LATEST raising, so one raised again
+    // moves to the end and is shown (codex, round 2 of #190).
     let mut seen = std::collections::HashSet::new();
-    let distinct: Vec<String> = notifications
+    let mut distinct: Vec<String> = notifications
         .iter()
+        .rev()
         .filter(|n| seen.insert(n.as_str()))
         .cloned()
         .collect();
-    let skip = distinct.len().saturating_sub(NOTICES_SHOWN);
-    distinct.into_iter().skip(skip).collect()
+    distinct.reverse();
+    let hidden = distinct.len().saturating_sub(NOTICES_SHOWN);
+    (distinct.into_iter().skip(hidden).collect(), hidden)
 }
 
 /// How many distinct notices the bar shows at once: the latest. Nothing is
@@ -434,14 +443,19 @@ mod notice_tests {
     fn a_repeated_notice_shows_once() {
         let raised = ["a", "b", "a", "a", "c", "b"].map(String::from);
         assert_eq!(
-            super::distinct_notices(&raised),
-            ["a", "b", "c"].map(String::from)
+            super::distinct_notices(&raised).0,
+            ["a", "c", "b"].map(String::from),
+            "each at its latest raising"
         );
-        // Past the cap, the latest are shown.
+        // Past the cap, the latest are shown, and the rest counted.
         let many: Vec<String> = (0..9).map(|n| n.to_string()).collect();
         assert_eq!(
             super::distinct_notices(&many),
-            ["4", "5", "6", "7", "8"].map(String::from)
+            (["4", "5", "6", "7", "8"].map(String::from).to_vec(), 4)
         );
+        // A hidden notice raised again is shown.
+        let mut again = many.clone();
+        again.push("0".into());
+        assert!(super::distinct_notices(&again).0.contains(&"0".to_string()));
     }
 }

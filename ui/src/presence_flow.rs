@@ -420,8 +420,14 @@ pub enum LocalSelling {
     /// watches going with no tab (harvest#179), so the store stays open with
     /// Harvest closed if the node also wakes it.
     Ready { delegated: bool },
-    /// Just armed, not yet shown to run in the background here.
+    /// Just armed, not yet shown to run in the background here. Orders are
+    /// answered while Harvest is open.
     Starting,
+    /// Armed a while ago and never seen to run in the background: a hosted
+    /// node such as try.freenet.org, where orders go unanswered once the tab
+    /// closes, looks like this, and so does a quiet stretch on a real node.
+    /// Said as a warning, not as closed.
+    Unconfirmed(String),
     /// It cannot, and this is why (no payout wallet, paused, a hosted node
     /// where nothing runs while the seller is away, ...).
     Blocked(String),
@@ -451,6 +457,10 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
         LocalSelling::Blocked(why) => Some(why.clone()),
         _ => None,
     };
+    let caution = match local {
+        LocalSelling::Unconfirmed(why) => Some(why.clone()),
+        _ => None,
+    };
     match presence {
         StorePresence::Open => match blocked {
             Some(why) => SellerStatus {
@@ -475,7 +485,9 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
                     "Buyers can buy now. Your store stays open while Harvest is open here."
                         .to_string()
                 },
-                why_not: None,
+                // Starting: nothing to add (the line already says "while
+                // Harvest is open here"). Unconfirmed: the warning.
+                why_not: caution,
             },
         },
         StorePresence::Checking => SellerStatus {
@@ -493,8 +505,13 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
             // This device's own reason when it has one; otherwise why buyers
             // see it closed. Never this device's "taking orders" line under
             // a closed pill (codex and review round 1 of #190).
-            let why_not = blocked.or_else(|| {
-                Some(
+            // A clock ahead of the buyers' is why they see it closed,
+            // whatever else is true here, so it wins.
+            let why_not = (why_closed != ClosedWhy::FromTheFuture)
+                .then_some(())
+                .and(blocked.or(caution))
+                .or_else(|| {
+                    Some(
                     match why_closed {
                         ClosedWhy::FromTheFuture => {
                             "This computer\u{2019}s clock is ahead of the buyers\u{2019}. Check \
@@ -512,7 +529,7 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
                     }
                     .to_string(),
                 )
-            });
+                });
             SellerStatus {
                 pill: "Closed",
                 open: false,
@@ -640,6 +657,19 @@ mod tests {
             &ready,
         );
         assert!(clock.why_not.unwrap().contains("clock"));
+        // A guess that the node never runs in the background: a warning
+        // under the Open pill, not closed (round 2 of #190).
+        let guess = LocalSelling::Unconfirmed("maybe a hosted node".into());
+        let warned = seller_status(StorePresence::Open, false, &guess);
+        assert_eq!((warned.pill, warned.open), ("Open", true));
+        assert_eq!(warned.why_not.as_deref(), Some("maybe a hosted node"));
+        // A clock ahead of the buyers' wins over the device's reason.
+        let clock_blocked = seller_status(
+            StorePresence::Closed(ClosedWhy::FromTheFuture),
+            true,
+            &hosted,
+        );
+        assert!(clock_blocked.why_not.unwrap().contains("clock"));
         let checking = seller_status(StorePresence::Checking, false, &hosted);
         assert_eq!(checking.pill, "Checking");
         assert_eq!(checking.why_not, None);

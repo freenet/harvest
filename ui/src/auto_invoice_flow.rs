@@ -900,6 +900,10 @@ impl AppState {
     ) -> Option<crate::presence_flow::LocalSelling> {
         use crate::presence_flow::LocalSelling;
         let notice = self.instant_checkout_notice(store_contract_id, now_ms)?;
+        if !self.bitcoin.payment_xpub_loaded {
+            // Not answered yet: nothing to say against the store.
+            return Some(LocalSelling::Starting);
+        }
         if self.bitcoin.payment_xpub.is_none() {
             return Some(LocalSelling::Blocked(notice));
         }
@@ -909,8 +913,12 @@ impl AppState {
             Some(Ok(status)) => {
                 let hosted = status.last_background_run_ms.is_none()
                     && now_ms.saturating_sub(status.armed_at_ms) >= NO_BACKGROUND_RUN_AFTER_MS;
-                if hosted || status.paused.is_some() {
+                if status.paused.is_some() {
                     LocalSelling::Blocked(notice)
+                } else if hosted {
+                    // Only a guess (a quiet half hour on a real node looks
+                    // the same, round 2 of #190), so a warning, not closed.
+                    LocalSelling::Unconfirmed(notice)
                 } else if status.last_background_run_ms.is_none() {
                     LocalSelling::Starting
                 } else {

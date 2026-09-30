@@ -670,7 +670,9 @@ pub(crate) fn OrderCard(
             if let Some(note) = stage_note {
                 p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
             }
-            if order.status == OrderStatus::AwaitingPayment {
+            // Seller's notes (what to cancel, what not to ship against): not
+            // on a buyer's card.
+            if order.status == OrderStatus::AwaitingPayment && !buyer {
                 if let Some(note) = reading.outside_note(late_is_another_orders) {
                     p { class: "text-warning", "{note}" }
                 }

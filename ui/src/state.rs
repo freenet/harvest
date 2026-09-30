@@ -2501,8 +2501,7 @@ impl PaymentBlocker {
                 tip_height,
             } => format!(
                 "This order has expired: it was made {} ago, and an order that old stops \
-                 counting as something the seller openly owes. Buy it again to get an \
-                 order you can pay.",
+                 counting as something the seller openly owes.",
                 crate::fulfilment::approx_duration(tip_height.saturating_sub(*anchor_height))
             ),
             PaymentBlocker::UnfitForComplaint(why) => format!(
@@ -6613,19 +6612,24 @@ impl AppState {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return Vec::new();
         };
-        crate::components::my_store::orders_to_send(&store.orders, fingerprint, |o| {
-            let tip = self
-                .bitcoin
-                .tips
-                .get(&o.order.network)
-                .and_then(|t| t.tip_height);
-            crate::fulfilment::order_stage(
-                o,
-                self.despatch_of(o).as_ref(),
-                tip,
-                self.payment_sight(o),
-            )
-        })
+        crate::components::my_store::orders_to_send(
+            &store.orders,
+            fingerprint,
+            |o| {
+                let tip = self
+                    .bitcoin
+                    .tips
+                    .get(&o.order.network)
+                    .and_then(|t| t.tip_height);
+                crate::fulfilment::order_stage(
+                    o,
+                    self.despatch_of(o).as_ref(),
+                    tip,
+                    self.payment_sight(o),
+                )
+            },
+            |o| self.despatch_recorded(store_contract_id, &o.order.id),
+        )
     }
 
     /// Other orders of this seller's paid for by the same payment as
@@ -33056,9 +33060,10 @@ mod buy_flow_tests {
 
         // What the seller's one status is told about this device (review of
         // #190: a hosted node read "Open"). Red if a never-run device past
-        // the grace time is not Blocked, or a paused one reads Ready.
+        // the grace time is not flagged, or a paused one reads Ready.
         use crate::presence_flow::LocalSelling;
         let mut state = state;
+        state.bitcoin.payment_xpub_loaded = true;
         assert_eq!(
             state.instant_checkout_local(&instant_store(), 1),
             Some(LocalSelling::Starting)
@@ -33069,7 +33074,7 @@ mod buy_flow_tests {
             .insert(instant_store(), Ok(status(None, None)));
         assert!(matches!(
             state.instant_checkout_local(&instant_store(), NO_BACKGROUND_RUN_AFTER_MS),
-            Some(LocalSelling::Blocked(why)) if why.contains("can't take orders on this node")
+            Some(LocalSelling::Unconfirmed(why)) if why.contains("can't take orders on this node")
         ));
         assert_eq!(
             state.instant_checkout_local(&instant_store(), 1),
