@@ -1027,6 +1027,14 @@ pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
     alerts
 }
 
+/// The harvest delegate's reason for a lapsed watch (`Refusal::WatchLapsed`
+/// in `delegates/harvest-delegate/src/auto_invoice.rs`), exactly as it sends
+/// it. The status carries only the text, so this is matched on; a delegate
+/// that rewords it falls back to showing its words as they are.
+pub(crate) const WATCH_LAPSED_REASON: &str =
+    "the watch on its payment addresses would lapse before a buyer could pay; open Harvest to \
+     renew it";
+
 /// This device's line about taking orders: the reason buyers can't buy,
 /// said under the store's status while they can't (`presence_flow::
 /// seller_status`). The alerts that stand whether or not the store is open
@@ -1035,6 +1043,15 @@ pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> S
     // A pause is certain and says what to do, so it comes before the guess
     // below (round 3 of #190).
     if let Some(why) = &status.paused {
+        // The delegate's own words for a lapsed watch end "open Harvest to
+        // renew it", said here to someone who has Harvest open (the
+        // 2026-09-30 critique). This tab renews it (module doc), so say that.
+        if why == WATCH_LAPSED_REASON {
+            return "Your store isn't taking orders right now: the watch on its payment \
+                    addresses has lapsed. Harvest renews it while it\u{2019}s open here, and \
+                    orders start again once it\u{2019}s renewed."
+                .into();
+        }
         return format!("Your store isn't taking orders right now: {why}.");
     }
     if status.last_background_run_ms.is_none()

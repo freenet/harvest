@@ -249,6 +249,19 @@ pub(crate) fn SellerOrderCard(
         )),
         (_, Some(_)) => Some((false, "Paid. Send it soon.".to_string())),
     };
+    // The card's one badge says what to do and by when: every card here is
+    // paid (the 2026-09-30 critique).
+    let pill = match (stage, tip_height) {
+        _ if oversold => "Sold out".to_string(),
+        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => {
+            format!(
+                "Send by {}",
+                crate::fulfilment::approx_date(despatch_by, tip, now)
+            )
+        }
+        (crate::fulfilment::OrderStage::DespatchWindowClosed { .. }, _) => "Send now".to_string(),
+        _ => "To send".to_string(),
+    };
     let amount = super::pay_card::amount_text(order.order.amount_sats, order.order.network);
     let test = super::pay_card::is_test_network(order.order.network);
 
@@ -256,7 +269,7 @@ pub(crate) fn SellerOrderCard(
         div { class: "listing-card seller-order",
             div { class: "listing-header",
                 h4 { "{what}" }
-                span { class: "btc-pill paid", "Paid" }
+                span { class: "btc-pill pending", "{pill}" }
             }
             p {
                 "{amount}"
@@ -470,9 +483,8 @@ pub(crate) fn MarkDespatched(
         }
         if confirming() {
             p { class: "text-warning",
-                "Mark this order as sent? The buyer will see it, and it goes on your store\u{2019}s "
-                "public record. You can\u{2019}t undo it, so only do it once the goods are on "
-                "their way."
+                "Mark as sent? The buyer will see that it\u{2019}s on its way. You can\u{2019}t "
+                "undo this, so only do it once it has actually gone."
             }
             button {
                 class: "btn btn-sm btn-primary",

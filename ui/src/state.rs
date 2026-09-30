@@ -33095,6 +33095,39 @@ mod buy_flow_tests {
         );
         let on = instant_checkout_status_text(&status(Some(1), None), 1);
         assert!(on.starts_with("Your store is taking orders"), "{on}");
+        // A lapsed watch is renewed by this very tab, so the seller reading
+        // it is told that, not "open Harvest" (the 2026-09-30 critique).
+        let lapsed = instant_checkout_status_text(
+            &status(Some(1), Some(crate::auto_invoice_flow::WATCH_LAPSED_REASON)),
+            1,
+        );
+        assert!(
+            lapsed.contains("renews it while it\u{2019}s open here"),
+            "{lapsed}"
+        );
+        assert!(!lapsed.contains("open Harvest"), "{lapsed}");
+        // The text matched on is the delegate's own, as it sends it.
+        let delegate = include_str!("../../delegates/harvest-delegate/src/auto_invoice.rs");
+        let mut joined = String::new();
+        let mut lines = delegate.lines();
+        while let Some(line) = lines.next() {
+            if let Some(head) = line.trim_end().strip_suffix('\\') {
+                joined.push_str(head);
+                if let Some(next) = lines.next() {
+                    joined.push_str(next.trim_start());
+                }
+            } else {
+                joined.push_str(line);
+            }
+            joined.push('\n');
+        }
+        assert!(
+            joined.contains(&format!(
+                "\"{}\"",
+                crate::auto_invoice_flow::WATCH_LAPSED_REASON
+            )),
+            "the delegate no longer sends the watch-lapsed reason Harvest matches"
+        );
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);
         assert!(

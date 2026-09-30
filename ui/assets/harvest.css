@@ -1154,7 +1154,8 @@ h4 {
   color: white;
 }
 
-.btc-pill.cancelled {
+.btc-pill.cancelled,
+.btc-pill.done {
   background: transparent;
   border: 1px solid var(--border);
   color: var(--text-muted);

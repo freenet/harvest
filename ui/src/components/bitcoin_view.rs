@@ -847,8 +847,16 @@ pub(crate) fn card_pill(
     awaiting_confirmation: bool,
     stage: crate::fulfilment::OrderStage,
 ) -> (&'static str, &'static str) {
+    // Where a paid order stands after payment, rather than "Paid" on every
+    // card (the 2026-09-30 critique: a pill that says the stage the order
+    // has left tells the reader nothing).
     match stage {
         crate::fulfilment::OrderStage::Lapsed { .. } => ("btc-pill cancelled", "Lapsed"),
+        crate::fulfilment::OrderStage::Despatched { .. } => ("btc-pill done", "Sent"),
+        crate::fulfilment::OrderStage::DespatchWindowClosed { .. } => {
+            ("btc-pill pending", "Not sent in time")
+        }
+        crate::fulfilment::OrderStage::Closed { .. } => ("btc-pill done", "Complete"),
         _ => status_pill(status, reading, awaiting_confirmation),
     }
 }
@@ -1918,6 +1926,39 @@ mod address_reading_tests {
             ),
             ("btc-pill waiting", "Awaiting payment")
         );
+    }
+
+    /// A paid order's pill says where it stands after payment, not "Paid"
+    /// on every card (the 2026-09-30 critique).
+    #[test]
+    fn a_paid_order_pills_by_where_it_stands() {
+        use crate::fulfilment::OrderStage;
+        use harvest_common::payment::OrderStatus;
+        let order = order_anchored_at(150);
+        let nothing = AddressReading::of(&order, None);
+        let pill = |stage| super::card_pill(OrderStatus::Paid, &nothing, false, stage).1;
+        assert_eq!(
+            pill(OrderStage::AwaitingDespatch {
+                paid_at: 1,
+                despatch_by: 2
+            }),
+            "Paid"
+        );
+        assert_eq!(
+            pill(OrderStage::Despatched {
+                despatched_at: 1,
+                complaint_until: 2
+            }),
+            "Sent"
+        );
+        assert_eq!(
+            pill(OrderStage::DespatchWindowClosed {
+                despatch_by: 1,
+                complaint_until: 2
+            }),
+            "Not sent in time"
+        );
+        assert_eq!(pill(OrderStage::Closed { closed_at: 2 }), "Complete");
     }
 
     /// Round 2, Consider: the notes say the right thing in each case. An
