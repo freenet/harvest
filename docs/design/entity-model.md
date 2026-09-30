@@ -1970,6 +1970,16 @@ from the phase 1 API sketch and what it leaves for later.
   derives a record key that differs from the published one, it says so and
   tells the seller not to publish from that device. The known-answer test
   in `custody/tests.rs` turns red on a crate bump that changes the output.
+- **Superseded (2026-09-30, the delegate generation after V28): the record key is no longer
+  derived.** Generating it is an RSA-2048 key generation, which in the
+  delegate took 1 to over 5 seconds per store key, past the node's 5 s
+  limit on one delegate call; since the cost is fixed per store key, a
+  seller whose key was over it could never finish creating a store. After
+  harvest#53 Phase C nothing a store makes is addressed by the record key,
+  so `GetStoreSubkeys` answers the inbox key alone, a new store publishes
+  no `record_public_key`, an edit carries over the one a store already
+  publishes (the reputation migration's locator for records from before
+  Phase C), and the derived-versus-published check above is gone.
 
 ### What phase 1b leaves where it was
 
