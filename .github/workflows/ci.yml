@@ -249,3 +249,37 @@ jobs:
             echo "has to be acknowledged, which is the intended order."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
+
+  # WHAT THIS ANSWERS: does any single delegate call do more work than the
+  # node will let it? A node stops a delegate call after 5 s of wall clock,
+  # and the web app then gets an error it cannot attribute and waits forever
+  # (harvest#204). That is how `GetStoreSubkeys` -- an RSA-2048 key generation
+  # per call, 0.85-5+ s depending on the store key -- reached the live network
+  # (fixed in harvest#203): native `cargo test` runs about 7x faster than the
+  # delegate WASM and has no limit, so nothing above could see it.
+  #
+  # The harness runs the COMMITTED `ui/public/contracts/harvest_delegate.wasm`
+  # (the bytes that ship; `wasm-staleness` above ties them to the source)
+  # under wasmtime with fuel metering, drives every handler it knows through
+  # real inputs, and fails if one call burns more than its budget. Fuel counts
+  # instructions, so this is deterministic -- NOT a timing test. The budget,
+  # and how it was calibrated against wall-clock time, is in
+  # `tests/delegate-budget/README.md`.
+  #
+  # A separate cargo workspace, like `tests/rehearsal`, so it can never move a
+  # dependency a contract compiles against.
+  delegate-budget:
+    name: every delegate handler fits the node's per-call limit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/delegate-budget -> target
+      # `cargo fmt --all` in the `check` job does not reach a separate
+      # workspace. Formatting needs no build, so it costs nothing here.
+      - name: rustfmt the harness
+        run: cargo fmt --manifest-path tests/delegate-budget/Cargo.toml -- --check
+      - name: bound each delegate call's work (fuel)
+        run: cargo run --release --locked --manifest-path tests/delegate-budget/Cargo.toml
