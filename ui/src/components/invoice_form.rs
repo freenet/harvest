@@ -220,18 +220,17 @@ pub(crate) fn SellerOrderCard(
         ),
         _ => format!("Order {}", order.order.id.short()),
     };
-    let when = |height: u32, tip: u32| {
-        format!(
-            "{} ({})",
-            crate::fulfilment::approx_date(height, tip, now),
-            crate::fulfilment::time_left(height.saturating_sub(tip))
-        )
-    };
     let send_by = match (stage, tip_height) {
         _ if oversold => None,
-        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => {
-            Some((false, format!("Send by about {}.", when(despatch_by, tip))))
-        }
+        // The date is on the pill ("Send by 4 Oct"), so the line says only
+        // how long is left (round-6 critique: the same fact twice).
+        (crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => Some((
+            false,
+            format!(
+                "{} to send it.",
+                crate::fulfilment::time_left(despatch_by.saturating_sub(tip))
+            ),
+        )),
         (crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. }, Some(tip)) => {
             Some((
                 true,

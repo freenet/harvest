@@ -368,6 +368,7 @@ h4 {
 
 .listing-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: var(--space-sm);
@@ -1128,6 +1129,8 @@ h4 {
 /* ---- Payment status pills ---- */
 
 .btc-pill {
+  /* A pill never breaks inside ("Send by 4 / Oct", round-6 critique). */
+  white-space: nowrap;
   font-family: var(--font-body);
   font-size: 0.7rem;
   font-weight: 600;
