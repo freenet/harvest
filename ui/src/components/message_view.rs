@@ -2222,8 +2222,15 @@ pub(crate) fn seller_claims<'a>(
     // Canonical tags only (`messaging::is_canonical_tag`): a twin shares its
     // keys with a real conversation and would claim that conversation's
     // orders. Ordered by tag, never by anything a writer chooses.
+    // And only tags with something readable: the mailbox is open-write, so
+    // anyone can fill it with unreadable entries under fresh tags, which
+    // must not each cost a scan of every order (review round 4 of #205).
+    // Unreadable entries are counted on their own.
     let mut tags: Vec<[u8; 32]> = Vec::new();
     for entry in entries {
+        if !matches!(entry, MailboxEntry::Readable { .. }) {
+            continue;
+        }
         if !crate::messaging::is_canonical_tag(entry.conversation()) {
             continue;
         }
@@ -4235,5 +4242,33 @@ mod voucher_view_tests {
             "3 messages were held back: they came without a Ghost Key, and Harvest couldn't \
              match them to a paid order."
         );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_claims_tests {
+    use super::*;
+
+    /// Unreadable entries under fresh tags make no conversation to match
+    /// orders against: the mailbox is open-write, and each claim costs a scan
+    /// of the store's orders (review round 4 of #205). Red without the
+    /// readable filter in `seller_claims`.
+    #[test]
+    fn unreadable_entries_make_no_claims() {
+        let entries: Vec<MailboxEntry> = (1u8..=20)
+            .map(|i| {
+                let tag =
+                    *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([i; 32]))
+                        .as_bytes();
+                MailboxEntry::Unreadable {
+                    conversation: tag.to_vec(),
+                    nonce: [i; 24],
+                    digest: [i; 32],
+                    timestamp: chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("t"),
+                    why: "no key".to_string(),
+                }
+            })
+            .collect();
+        assert!(seller_claims(&entries, &[], |_| None).is_empty());
     }
 }

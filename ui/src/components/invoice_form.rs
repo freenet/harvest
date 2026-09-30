@@ -170,7 +170,10 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 for order in others.iter() {
                     // One keyed node per invoice, wrapping both, because a
                     // `key` is only honoured on the first node of a block.
-                    div { key: "{order.order.id}",
+                    // One group per order, so its title, card, address and
+                    // controls read as one thing (the msg1 screenshots: the
+                    // address sat loose below the card).
+                    div { key: "{order.order.id}", class: "earlier-order",
                         // Said above the card rather than inside it, because
                         // it is about what the SELLER should do and
                         // `OrderCard` is shared with the buyer's view. An
