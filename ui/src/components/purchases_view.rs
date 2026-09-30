@@ -64,11 +64,38 @@ pub fn MyPurchases() -> Element {
     // An effect, so it runs again when the delegate's list of remembered
     // stores arrives after this page opened; loading is idempotent per store.
     use_effect(|| crate::store_link::load_visited_stores(false, true));
+    // Re-rendered once when the wait for the list of remembered stores runs
+    // out (from the app's start), so "Checking…" cannot outlast it.
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        let deadline = APP_STATE
+            .peek()
+            .session_started
+            .0
+            .saturating_add(crate::state::SELLER_ANSWER_WAIT_MS);
+        let left = deadline.saturating_sub(crate::state::now_ms());
+        if left > 0 {
+            gloo_timers::future::TimeoutFuture::new(left.saturating_add(50).min(60_000) as u32)
+                .await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
     let rows = purchase_rows(&APP_STATE.read());
     // Still being asked for (a GET out, or a retry waiting), and could not be
     // loaded: neither is a confirmed empty history (codex on #197 round 4).
     let (pending, failed) = APP_STATE.read().visited_load_state();
-    let loading = pending > 0 || !APP_STATE.read().background_loads.is_empty();
+    // Also while the list of remembered stores hasn't arrived: before it,
+    // nothing is being loaded yet, and "Nothing yet" would read as "my
+    // orders are gone" (round-6 critique). Bounded by the same wait as the
+    // Stores page's.
+    let loading = pending > 0
+        || !APP_STATE.read().background_loads.is_empty()
+        || APP_STATE
+            .read()
+            .remembered_stores_awaited(crate::state::now_ms());
     let any_kept = !APP_STATE.read().kept_purchases.is_empty();
     // The orders the store cards below already show, so the kept list does
     // not show them a second time.

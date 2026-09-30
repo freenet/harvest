@@ -1015,12 +1015,17 @@ fn offered_buy(
 fn visible_listings(
     store: &crate::state::BrowsingStore,
 ) -> Vec<(AuthorizedListing, ListingAvailability)> {
-    store
+    let mut shown: Vec<_> = store
         .listings
         .iter()
         .map(|l| (l.clone(), store.availability(&l.listing.id)))
         .filter(|(_, availability)| *availability != ListingAvailability::Withdrawn)
-        .collect()
+        .collect();
+    // What can be bought first, in the seller's order within each group:
+    // a sold-out listing first pushed the only Buy now below a phone's fold
+    // (round-6 critique). Stable, so the seller's order is kept.
+    shown.sort_by_key(|(_, availability)| *availability == ListingAvailability::SoldOut);
+    shown
 }
 
 /// What an unverified backing means for the person reading the page.
@@ -1493,6 +1498,18 @@ mod availability_tests {
                 (2, ListingAvailability::SoldOut),
             ]
         );
+        // A sold-out listing goes after the ones on sale, which keep the
+        // seller's order (round-6 critique). Red without the sort.
+        let mut first_sold_out = crate::state::BrowsingStore {
+            listings: vec![listing(1), listing(2), listing(3)],
+            ..Default::default()
+        };
+        with_status(&mut first_sold_out, 1, ListingAvailability::SoldOut);
+        let order: Vec<u8> = visible_listings(&first_sold_out)
+            .into_iter()
+            .map(|(l, _)| l.listing.id.0[0])
+            .collect();
+        assert_eq!(order, vec![2, 3, 1]);
     }
 
     /// The Buy control is offered only on a listing still on sale, by the

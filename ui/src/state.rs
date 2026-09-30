@@ -3727,6 +3727,15 @@ impl AppState {
 
     /// Whether the Stores page may show its lists: this node knows which
     /// stores are its own, or has waited long enough since the app started.
+    /// Whether the delegate's list of remembered stores is still awaited:
+    /// not arrived yet, and the app started less than
+    /// [`SELLER_ANSWER_WAIT_MS`] ago. Past that, a list that never comes
+    /// stops holding pages on "Checking…".
+    pub fn remembered_stores_awaited(&self, now_ms: u64) -> bool {
+        self.remembered_stores.is_none()
+            && now_ms.saturating_sub(self.session_started.0) < SELLER_ANSWER_WAIT_MS
+    }
+
     pub fn seller_known_or_waited(&self, now_ms: u64) -> bool {
         self.seller_known()
             || now_ms.saturating_sub(self.session_started.0) >= SELLER_ANSWER_WAIT_MS
@@ -34541,10 +34550,18 @@ mod store_code_tests {
 
         // The page stops waiting a fixed time after the app started, however
         // often it is opened (round 2 of #197).
-        let state = AppState::default();
+        let mut state = AppState::default();
         let now = now_ms();
         assert!(!state.seller_known_or_waited(now));
         assert!(state.seller_known_or_waited(state.session_started.0 + SELLER_ANSWER_WAIT_MS));
+        // The list of remembered stores is awaited only within that wait,
+        // and not once it has arrived.
+        let started = state.session_started.0;
+        state.remembered_stores = None;
+        assert!(state.remembered_stores_awaited(started));
+        assert!(!state.remembered_stores_awaited(started + SELLER_ANSWER_WAIT_MS));
+        state.remembered_stores = Some(Vec::new());
+        assert!(!state.remembered_stores_awaited(started));
     }
 
     /// A closed store is greyed and listed after the open ones, whatever its

@@ -211,7 +211,8 @@ body::before {
        .form-actions, .dashboard-head, .checklist li, .share-row,
        .seller-listing, .seller-listing-actions, .own-store-banner,
        .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
-       .find-store, .vrow, .crumb, .harvest-header-right, .record-head) > * {
+       .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
+       .needs-hit) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -419,7 +420,8 @@ h4 {
   background: var(--moss-dark, #3a5233);
 }
 
-.btn-primary:disabled {
+.btn-primary:disabled,
+.btn-outline:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -1551,6 +1553,16 @@ h4 {
   min-width: 0;
 }
 
+.needs-hit {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
 .needs-pill {
   font-family: var(--font-body);
   font-size: 0.85rem;
@@ -1565,7 +1577,7 @@ h4 {
   white-space: nowrap;
 }
 
-.needs-pill:hover {
+.needs-hit:hover .needs-pill {
   border-color: var(--amber);
 }
 
@@ -1763,7 +1775,7 @@ h4 {
   .tab,
   .form-select,
   .vrow-go,
-  .needs-pill {
+  .needs-hit {
     min-height: 44px;
   }
 
@@ -1844,19 +1856,17 @@ h4 {
      right-aligned on its line (critique 01-2). */
   .vrow {
     grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas: "go chev" "go remove";
+    grid-template-areas: "go chev" "remove chev";
   }
 
-  .vrow-go {
-    grid-row: 1 / span 2;
-  }
-
+  /* The chevron centred on the row, "Remove from list" under the tagline
+     (round-6 critique: at the top right it read as Remove's). */
   .vrow-chev {
-    align-self: start;
+    align-self: center;
   }
 
   .vrow-remove {
-    align-self: end;
+    justify-self: start;
   }
 }
 

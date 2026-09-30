@@ -369,15 +369,17 @@ pub fn App() -> Element {
                     // several do), on its Overview, whose first card is
                     // "Needs you".
                     if let Some(ref pill) = needs_pill {
+                        // The button is the 44px tap area on a phone; the
+                        // pill inside stays small (round-6 critique).
                         button {
-                            class: "needs-pill",
+                            class: "needs-hit",
                             onclick: move |_| {
                                 let first = super::my_store::first_store_needing_seller(
                                     &crate::gateway::APP_STATE.peek(),
                                 );
                                 open_seller_page(first.map_or(SellerPage::First, SellerPage::Store));
                             },
-                            "{pill}"
+                            span { class: "needs-pill", "{pill}" }
                         }
                     }
                     span { class: "{status_class}", "{connection_status}" }
