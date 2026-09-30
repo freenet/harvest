@@ -31765,11 +31765,14 @@ mod buy_flow_tests {
             .iter()
             .map(|a| a.script_pubkey.clone())
             .collect();
-        for script in scripts {
+        let ids = state
+            .window_contract_ids()
+            .expect("the generation is resolved");
+        for (script, id) in scripts.into_iter().zip(ids) {
             state.auto_invoice.vets.insert(
                 script,
                 crate::auto_invoice_flow::AddressVet {
-                    contract_id: [0xcc; 32],
+                    contract_id: id,
                     verdict: crate::auto_invoice_flow::VetVerdict::Clear,
                     at_ms: 1,
                 },
@@ -32129,6 +32132,32 @@ mod buy_flow_tests {
         assert_eq!(work.vets.len(), 1, "only address 10 is new");
         assert_eq!(state.vetted_used_scripts().count(), 0, "0 left the window");
         assert!(state.auto_invoice.moved_past.is_empty());
+    }
+
+    /// A clear verdict reached under one address-contract build is no
+    /// verdict on another: when the generation moves, the window closes and
+    /// is read again under the new build. Mutated red by gating on the
+    /// verdict alone.
+    #[test]
+    fn a_new_address_generation_is_read_again() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let bridge = state.bitcoin.inbox.as_ref().unwrap().bridge;
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        assert!(state.prewatch_wanted(bridge).is_some());
+        state.bitcoin.address_generation =
+            crate::bitcoin_generation::Generation::resolved([0xc3; 32]);
+        assert!(state.prewatch_wanted(bridge).is_none(), "closed until read");
+        let again = state.queue_auto_invoice(200);
+        assert_eq!(again.vets.len(), 10);
+        assert!(again
+            .vets
+            .iter()
+            .all(|(id, _, _)| *id != vet_of(&work, 0).0));
+        assert!(state.prewatch_wanted(bridge).is_none(), "still reading");
+        settle_absent_except(&mut state, &again, &[], 200);
+        assert!(state.prewatch_wanted(bridge).is_some());
     }
 
     /// A raise's request that could not be sent is forgotten and tried again

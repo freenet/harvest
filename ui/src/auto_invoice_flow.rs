@@ -418,15 +418,34 @@ impl AppState {
     /// has nothing to withdraw.
     fn current_upcoming(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let (network, upcoming) = self.upcoming_unvetted()?;
+        // Read under the address contract an order would name NOW: a verdict
+        // reached under an earlier build is no verdict on this one.
+        let ids = self.window_contract_ids()?;
         upcoming
             .iter()
-            .all(|a| {
+            .zip(ids)
+            .all(|(a, id)| {
                 self.auto_invoice
                     .vets
                     .get(&a.script_pubkey)
-                    .is_some_and(AddressVet::is_clear)
+                    .is_some_and(|v| v.is_clear() && v.contract_id == id)
             })
             .then_some((network, upcoming))
+    }
+
+    /// The address contract ids of the current window, under the address
+    /// generation and bridges an order would name now; `None` until the
+    /// generation has resolved.
+    pub(crate) fn window_contract_ids(&self) -> Option<Vec<[u8; 32]>> {
+        let (network, upcoming) = self.upcoming_unvetted()?;
+        let code_hash = self.bitcoin.address_generation.code_hash()?;
+        let bridges = crate::gateway::bitcoin_config::default_trusted_bridges(network).ok()?;
+        Some(
+            upcoming
+                .iter()
+                .map(|a| address_instance_id(network, &a.script_pubkey, &bridges, code_hash))
+                .collect(),
+        )
     }
 
     /// [`Self::current_upcoming`] before the address-contract reads.
@@ -443,29 +462,31 @@ impl AppState {
     /// token each read runs under. Empty until the address generation has
     /// resolved: the id depends on it.
     fn vets_due(&self, now_ms: u64) -> Vec<([u8; 32], Vec<u8>, u64)> {
-        let Some((network, upcoming)) = self.upcoming_unvetted() else {
+        let Some((_, upcoming)) = self.upcoming_unvetted() else {
             return Vec::new();
         };
-        let Some(code_hash) = self.bitcoin.address_generation.code_hash() else {
-            return Vec::new();
-        };
-        let Ok(bridges) = crate::gateway::bitcoin_config::default_trusted_bridges(network) else {
+        let Some(ids) = self.window_contract_ids() else {
             return Vec::new();
         };
         upcoming
             .iter()
-            .filter(|a| match self.auto_invoice.vets.get(&a.script_pubkey) {
-                None => true,
-                Some(vet) => match vet.verdict {
-                    VetVerdict::Clear => now_ms.saturating_sub(vet.at_ms) >= VET_REFRESH_MS,
-                    VetVerdict::Unreadable => now_ms.saturating_sub(vet.at_ms) >= PEEK_RETRY_MS,
-                    _ => false,
+            .zip(ids)
+            .filter(
+                |(a, id)| match self.auto_invoice.vets.get(&a.script_pubkey) {
+                    None => true,
+                    // Read under another build: read again under this one.
+                    Some(vet) if vet.contract_id != *id => true,
+                    Some(vet) => match vet.verdict {
+                        VetVerdict::Clear => now_ms.saturating_sub(vet.at_ms) >= VET_REFRESH_MS,
+                        VetVerdict::Unreadable => now_ms.saturating_sub(vet.at_ms) >= PEEK_RETRY_MS,
+                        _ => false,
+                    },
                 },
-            })
+            )
             .enumerate()
-            .map(|(i, a)| {
+            .map(|(i, (a, id))| {
                 (
-                    address_instance_id(network, &a.script_pubkey, &bridges, code_hash),
+                    id,
                     a.script_pubkey.clone(),
                     self.auto_invoice.next_vet_token + i as u64,
                 )
@@ -1113,7 +1134,9 @@ impl AppState {
         }
         for (contract_id, script, token) in &work.vets {
             let verdict = match self.auto_invoice.vets.get(script) {
-                Some(held) if held.is_clear() => VetVerdict::Rechecking { token: *token },
+                Some(held) if held.is_clear() && held.contract_id == *contract_id => {
+                    VetVerdict::Rechecking { token: *token }
+                }
                 _ => VetVerdict::Asking { token: *token },
             };
             let at_ms = self.auto_invoice.vets.get(script).map_or(0, |v| v.at_ms);
