@@ -585,7 +585,7 @@ fn Compose(
     let (gate, signing, failure) = {
         let state = APP_STATE.read();
         (
-            state.compose_gate(),
+            state.compose_gate_in(&store_contract_id, None),
             state.texts_awaiting_voucher(&store_contract_id),
             state.voucher_failure(&store_contract_id).cloned(),
         )
@@ -664,7 +664,7 @@ fn Compose(
                 if text.is_empty() {
                     return;
                 }
-                match send(&store_contract_id, &seller_encryption_key, &seller_verifying_key, text) {
+                match send(&store_contract_id, &seller_encryption_key, &seller_verifying_key, text, None) {
                     Ok(()) => {
                         draft.set(String::new());
                         problem.set(None);
@@ -690,17 +690,19 @@ fn send(
     seller_encryption_key: &[u8; 32],
     seller_verifying_key: &[u8; 32],
     text: String,
+    target: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let seller = ed25519_dalek::VerifyingKey::from_bytes(seller_verifying_key)
         .map_err(|e| format!("this store's identity key is unusable: {e}"))?;
 
     // Taken for writing only for this statement: the dispatch below writes
     // the state again.
-    let composed = APP_STATE.write().compose_vouched_to_seller(
+    let composed = APP_STATE.write().compose_message_to_seller(
         store_contract_id,
         seller_encryption_key,
         seller_verifying_key,
         text.clone(),
+        target,
         crate::state::now_ms(),
     )?;
     match composed {
@@ -1184,11 +1186,15 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 ///
 /// A request to buy on its own opens nothing: it costs nothing to send.
 ///
+/// In a conversation that is open, a buyer's plain [`MessageContent::Text`]
+/// is shown: that is how a buyer with a paid order writes without a Ghost
+/// Key.
+///
 /// In a conversation that is not open:
 ///
-/// * a buyer's plain [`MessageContent::Text`] is left out (a current buyer
-///   sends `VouchedText`), and so is text addressed to the BUYER: that is the
-///   seller's reply direction, but both parties hold both keys
+/// * a buyer's plain [`MessageContent::Text`] is left out (a buyer with a
+///   Ghost Key sends `VouchedText`), and so is text addressed to the BUYER:
+///   that is the seller's reply direction, but both parties hold both keys
 ///   (`attribution`), so a script can flip the direction;
 /// * the free text inside other steps is blanked rather than the step left
 ///   out, so what a request or a decline DOES (answering, counting) is
@@ -1276,11 +1282,15 @@ fn shown_given(
                 content: MessageContent::VouchedText { .. },
                 ..
             } => verified,
+            // A buyer's plain text: shown only where a paid order opened the
+            // conversation (a voucher opens it too, but a buyer holding one
+            // sends `VouchedText`). Elsewhere it is what a script writing
+            // past the compose gate sends.
             MailboxEntry::Readable {
                 content: MessageContent::Text(_),
                 addressing: Addressing::ToSeller,
                 ..
-            } => false,
+            } => open,
             // Left out, not counted: in the reply direction it is as likely
             // the seller's own reply (after a reload this tab no longer knows
             // it wrote it) as a buyer's, and the count's line blames buyers.
@@ -2732,10 +2742,17 @@ mod voucher_view_tests {
     }
 
     /// Plain text from a buyer, which is what a script writing past the
-    /// compose gate sends, is not shown.
+    /// compose gate sends, is not shown -- except in a conversation a paid
+    /// order opened, where it is how a buyer with a paid order writes
+    /// without a Ghost Key. Mutated red by hiding it there too (the rule
+    /// before 2026-09-30), and by showing it everywhere.
     #[test]
-    fn unvouched_buyer_text_is_hidden() {
+    fn unvouched_buyer_text_is_hidden_unless_a_paid_order_opened_it() {
         assert_eq!(shown(vec![text(TAG, Addressing::ToSeller)]), (vec![], 1));
+        assert_eq!(
+            shown(vec![text(PAID, Addressing::ToSeller)]),
+            (vec![text(PAID, Addressing::ToSeller)], 0)
+        );
     }
 
     /// A voucher copied from another conversation vouches for nothing here,

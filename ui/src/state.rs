@@ -5852,17 +5852,35 @@ impl AppState {
         // mistake -- skipping a conversation that was never actually kept,
         // which is the silent failure this whole mechanism exists to
         // prevent.
+        let tag = self
+            .browsing_stores
+            .get(store_contract_id)?
+            .conversations
+            .last()?
+            .buyer_public_key;
+        self.conversation_to_keep_tagged(store_contract_id, seller_encryption_key, &tag)
+    }
+
+    /// [`Self::conversation_to_keep`] for the conversation tagged `tag`,
+    /// which need not be the last: a message written from an order's own
+    /// thread goes into that order's conversation.
+    pub fn conversation_to_keep_tagged(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        tag: &[u8; 32],
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
         let request_id = self.next_messaging_request_id();
         let conversation = self
             .browsing_stores
             .get(store_contract_id)?
             .conversations
-            .last()?;
-        let tag = conversation.buyer_public_key;
+            .iter()
+            .find(|conversation| conversation.buyer_public_key == *tag)?;
         let request =
             conversation.to_persist(store_contract_id, seller_encryption_key, request_id)?;
         self.pending_conversation_persists
-            .insert(request_id, (store_contract_id.to_vec(), tag));
+            .insert(request_id, (store_contract_id.to_vec(), *tag));
         Some(request)
     }
 
@@ -5873,6 +5891,21 @@ impl AppState {
         seller_encryption_key: &[u8; 32],
     ) {
         let Some(request) = self.conversation_to_keep(store_contract_id, seller_encryption_key)
+        else {
+            return;
+        };
+        self.send_to_harvest_delegate("keep this conversation", &request);
+    }
+
+    /// [`Self::conversation_to_keep_tagged`], dispatched.
+    pub fn keep_conversation_tagged(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        tag: &[u8; 32],
+    ) {
+        let Some(request) =
+            self.conversation_to_keep_tagged(store_contract_id, seller_encryption_key, tag)
         else {
             return;
         };
@@ -30340,6 +30373,305 @@ mod buy_flow_tests {
         give_the_node_the_chain(&mut state, &settled, claims, tip);
         state.test_guards.push(recognised);
         (state, settled)
+    }
+
+    /// The fixtures' listing as the store lists it; unsigned, as only its id
+    /// is read here.
+    fn widget_listing() -> harvest_common::listing::AuthorizedListing {
+        harvest_common::listing::AuthorizedListing {
+            listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
+                id: widget(),
+                title: "Widget".into(),
+                description: String::new(),
+                kind: harvest_common::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::Utc::now(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// The buyer's own request to buy the fixtures' listing, sealed into
+    /// their conversation and put in `STORE`'s mailbox.
+    fn buyer_asks_for_the_widget(state: &mut AppState) {
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        let request = store.conversations[0]
+            .request_order(&widget(), 1, "Jo Buyer\n1 Lane".into(), String::new(), None)
+            .expect("sealed");
+        store.mailbox_messages.push(request);
+    }
+
+    /// Whether the SELLER's inbox counts `tag` as opened by a paid order,
+    /// reading `state`'s copy of the store with the seller's own keys.
+    fn seller_counts_paid(state: &AppState, tag: &[u8; 32]) -> bool {
+        let store = &state.browsing_stores[STORE];
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(tag))].into();
+        let entries = crate::messaging::read_mailbox(&store.mailbox_messages, &keys);
+        crate::components::message_view::paid_conversations(
+            &entries,
+            &store.orders,
+            &store.listings,
+            |t| keys.get(t),
+        )
+        .contains(tag)
+    }
+
+    /// What the seller's inbox shows of `messages` added to `state`'s
+    /// mailbox: no voucher verifies, and the paid rule is the seller's own.
+    fn seller_is_shown(
+        state: &AppState,
+        tag: &[u8; 32],
+        messages: &[EncryptedMessage],
+    ) -> (Vec<crate::messaging::MailboxEntry>, usize) {
+        let mut state = state.clone();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend_from_slice(messages);
+        let paid = seller_counts_paid(&state, tag);
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(tag))].into();
+        let entries =
+            crate::messaging::read_mailbox(&state.browsing_stores[STORE].mailbox_messages, &keys);
+        crate::components::message_view::shown_to_seller(
+            entries,
+            |_, _| false,
+            |t| paid && t == tag,
+            |_| false,
+        )
+    }
+
+    fn texts(entries: &[crate::messaging::MailboxEntry]) -> Vec<String> {
+        use crate::messaging::{MailboxEntry, MessageContent};
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content: MessageContent::Text(text),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **A buyer whose order is paid writes in its conversation without a
+    /// Ghost Key, and the seller sees it** (Ian, 2026-09-30). Read back
+    /// through the SELLER's own inbox rule over the same state, because that
+    /// is the half that decides. The acceptance alone opens nothing on
+    /// either side: it is a message the buyer could have written. Red with
+    /// the buyer's `order_in_conversation` check dropped (the acceptance-only
+    /// case then offers a box the seller hides).
+    #[test]
+    fn a_paid_buyer_writes_without_a_ghost_key_and_the_seller_sees_it() {
+        use crate::voucher_flow::{ComposeGate, VouchedCompose};
+        let (mut state, _) = a_paid_purchase();
+        let tag = the_buyers_conversation().buyer_public_key;
+        assert!(state.ghostkeys.is_empty(), "no Ghost Key anywhere here");
+        assert_eq!(
+            purchases(&state)
+                .iter()
+                .filter(|p| p.paid.is_some())
+                .count(),
+            1,
+            "precondition: the buyer's node takes the order as paid"
+        );
+
+        // Only the seller's acceptance is in the mailbox: neither side
+        // counts the conversation as paid.
+        assert!(!state.paid_conversation(STORE, &tag));
+        assert!(!seller_counts_paid(&state, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::NeedsGhostKey
+        );
+
+        // The buyer's request for the listing the order carries the tag of.
+        buyer_asks_for_the_widget(&mut state);
+        assert!(state.paid_conversation(STORE, &tag));
+        assert!(seller_counts_paid(&state, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::PaidOrder { tag }
+        );
+        let VouchedCompose::Sealed(sealed) = state
+            .compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &seller_signing_key().verifying_key().to_bytes(),
+                "Has it gone out yet?".into(),
+                Some(tag),
+                0,
+            )
+            .expect("composed")
+        else {
+            panic!("a paid conversation seals at once, with no vault request");
+        };
+        assert!(state.pending_signatures.is_empty());
+        let (shown, hidden) = seller_is_shown(&state, &tag, &[sealed]);
+        assert_eq!(texts(&shown), vec!["Has it gone out yet?".to_string()]);
+        assert_eq!(hidden, 0);
+    }
+
+    /// **The buyer's rule is a strict subset of the seller's.** Over the
+    /// same state, whenever the buyer is offered a box without a Ghost Key,
+    /// the seller shows what comes out of it; and there are states the
+    /// seller counts as paid where the buyer is still gated (a reversed
+    /// payment; an order this node does not take as its own paid purchase).
+    /// Red with the buyer's `Paid`-only status check widened to the seller's.
+    #[test]
+    fn the_buyers_rule_is_a_strict_subset_of_the_sellers() {
+        let tag = the_buyers_conversation().buyer_public_key;
+        let mut seller_only = 0;
+        for status in [
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+        ] {
+            for asked in [false, true] {
+                for listed in [false, true] {
+                    let (mut state, _) = a_paid_purchase();
+                    if asked {
+                        buyer_asks_for_the_widget(&mut state);
+                    }
+                    let store = state.browsing_stores.get_mut(STORE).unwrap();
+                    store.orders[0].status = status;
+                    if listed {
+                        store.listings = vec![widget_listing()];
+                    }
+                    let buyer = state.paid_conversation(STORE, &tag);
+                    let seller = seller_counts_paid(&state, &tag);
+                    assert!(
+                        !buyer || seller,
+                        "{status:?} asked={asked} listed={listed}: the buyer may write \
+                         where the seller would hide it"
+                    );
+                    if seller && !buyer {
+                        seller_only += 1;
+                    }
+                    if buyer {
+                        assert_eq!(status, OrderStatus::Paid);
+                    }
+                }
+            }
+        }
+        assert!(
+            seller_only > 0,
+            "strict: the reversed payment is seller-only"
+        );
+    }
+
+    /// Before payment a Ghost Key is still required: no plain compose, and a
+    /// plain text a script writes into the conversation anyway is hidden
+    /// from the seller.
+    #[test]
+    fn before_payment_a_ghost_key_is_still_required() {
+        use crate::voucher_flow::{ComposeGate, NEEDS_GHOST_KEY};
+        let unpaid = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, tag) = buyer_after_acceptance(&unpaid);
+        buyer_asks_for_the_widget(&mut state);
+        assert!(!state.paid_conversation(STORE, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::NeedsGhostKey
+        );
+        assert_eq!(
+            state.compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "hi".into(),
+                Some(tag),
+                0
+            ),
+            Err(NEEDS_GHOST_KEY.to_string())
+        );
+        assert_eq!(
+            state.compose_plain_to_seller(STORE, &seller_encryption_key(), &tag, "hi".into()),
+            Err(NEEDS_GHOST_KEY.to_string()),
+            "the plain path checks again rather than trusting its caller"
+        );
+        let scripted = state.browsing_stores[STORE].conversations[0]
+            .seal("pay me".into())
+            .unwrap();
+        let (shown, hidden) = seller_is_shown(&state, &tag, &[scripted]);
+        assert!(texts(&shown).is_empty());
+        assert_eq!(hidden, 1);
+    }
+
+    /// The message goes into the PAID order's conversation, not the one a
+    /// new message would continue; and a message aimed at that newer
+    /// conversation still needs a Ghost Key. A Ghost Key held does not turn
+    /// the paid path into a vault request. Red sealing into
+    /// `conversations.last()`.
+    #[test]
+    fn a_paid_message_goes_into_that_conversation_not_the_last() {
+        use crate::voucher_flow::{ComposeGate, VouchedCompose};
+        let (mut state, _) = a_paid_purchase();
+        buyer_asks_for_the_widget(&mut state);
+        let tag = the_buyers_conversation().buyer_public_key;
+        let newer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        let newer_tag = newer.buyer_public_key;
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .conversations
+            .push(newer);
+        assert_eq!(
+            state.compose_gate_in(STORE, None),
+            ComposeGate::NeedsGhostKey
+        );
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(newer_tag)),
+            ComposeGate::NeedsGhostKey
+        );
+        state.ghostkeys = vec![ghostkey_common::GhostKeyInfo {
+            fingerprint: "buyer-fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        }];
+        let VouchedCompose::Sealed(sealed) = state
+            .compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "about my order".into(),
+                Some(tag),
+                0,
+            )
+            .expect("composed")
+        else {
+            panic!("paid: sealed at once");
+        };
+        assert_eq!(sealed.sender_public_key, tag.to_vec());
+        assert!(state.pending_signatures.is_empty(), "no vault prompt");
+        // The newer conversation, with the Ghost Key, asks the vault.
+        assert!(matches!(
+            state.compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "a question".into(),
+                None,
+                0,
+            ),
+            Ok(VouchedCompose::AwaitingSignature(Some(_)))
+        ));
     }
 
     /// The seller's despatch of `order`, recorded in `STORE`.

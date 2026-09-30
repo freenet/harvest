@@ -143,6 +143,73 @@ pub(crate) fn conversation_has_paid_order(
         .any(|order| status_opens(order.status) && order_in_conversation(order, claims))
 }
 
+impl crate::state::AppState {
+    /// The buyer's half of the rule: whether this buyer may write in their
+    /// conversation `tag` with `store_contract_id` without a Ghost Key.
+    ///
+    /// A STRICT subset of the seller's half ([`conversation_has_paid_order`]),
+    /// evaluated over the same store state and the same conversation. Every
+    /// one of these must hold:
+    ///
+    /// * the conversation is one this node still holds, so it can seal into
+    ///   it;
+    /// * one of this buyer's purchases filed under it is paid by this node's
+    ///   own judgement (`BuyerPurchase::paid`: the kept `Paid` copy, or a
+    ///   store copy that passes every check the buyer's own would);
+    /// * the store's own copy of that order is `Paid` (the seller also counts
+    ///   `PaymentReversed`; the buyer does not);
+    /// * that order belongs to the conversation by [`order_in_conversation`],
+    ///   over the requests the BUYER wrote in it (the seller counts requests
+    ///   in either direction) and the store's current listings.
+    ///
+    /// Nothing the buyer holds is sent as evidence: the seller decides from
+    /// their own store state. What this guards is only that the buyer is not
+    /// offered a box whose text the seller would hide.
+    pub fn paid_conversation(&self, store_contract_id: &[u8], tag: &[u8; 32]) -> bool {
+        use crate::messaging::{Addressing, MessageContent};
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return false;
+        };
+        let Some(conversation) = store
+            .conversations
+            .iter()
+            .find(|conversation| conversation.buyer_public_key == *tag)
+        else {
+            return false;
+        };
+        let requests: Vec<(ListingId, Option<InstantSelection>)> = conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    instant,
+                    ..
+                } if message.addressing == Addressing::ToSeller => Some((listing_id, instant)),
+                _ => None,
+            })
+            .collect();
+        let claims = ConversationClaims::of(
+            tag,
+            requests
+                .iter()
+                .map(|(listing, selection)| (listing, selection.as_ref())),
+            store.listings.iter().map(|listing| &listing.listing.id),
+            |listing| Some(conversation.listing_tag(listing)),
+        );
+        self.buyer_purchases(store_contract_id)
+            .iter()
+            .filter(|purchase| purchase.conversation == *tag && purchase.paid.is_some())
+            .any(|purchase| {
+                store.orders.iter().any(|order| {
+                    order.order.id == purchase.order_id
+                        && order.status == OrderStatus::Paid
+                        && order_in_conversation(order, &claims)
+                })
+            })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

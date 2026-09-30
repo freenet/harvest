@@ -7,6 +7,14 @@
 //! it is scarce, and a seller's inbox that shows only text a Ghost Key vouches
 //! for costs a spammer one donation per key rather than nothing.
 //!
+//! One exception: a buyer whose order is PAID writes in that order's
+//! conversation without a Ghost Key (Ian, 2026-09-30), because money was
+//! spent to get there. The gate says so ([`ComposeGate::PaidOrder`]) only
+//! where the seller's inbox will show the text, by a rule that is a strict
+//! subset of the seller's (`crate::order_threads`), and the message is
+//! sealed into THAT conversation, whichever one the buyer's newest message
+//! would otherwise continue.
+//!
 //! # Why both sides
 //!
 //! The mailbox is open-write, so the compose gate below stops only a buyer
@@ -86,13 +94,20 @@ pub struct VoucherState {
     pub failures: HashMap<Vec<u8>, VoucherFailure>,
 }
 
-/// Whether the compose box can be offered at all.
+/// Whether the compose box can be offered at all, and how what is typed
+/// will be sent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComposeGate {
-    /// No Ghost Key is connected: show [`NEEDS_GHOST_KEY`] instead.
+    /// No Ghost Key is connected and nothing is paid: show
+    /// [`NEEDS_GHOST_KEY`] instead.
     NeedsGhostKey,
     /// Messages will be vouched for by this Ghost Key.
     Ready { fingerprint: String },
+    /// The conversation `tag` has a paid order of this buyer's that the
+    /// seller's inbox will also count (`AppState::paid_conversation`):
+    /// messages go into it with no voucher, Ghost Key or not, so the buyer
+    /// is not asked for a vault signature they do not need.
+    PaidOrder { tag: [u8; 32] },
 }
 
 /// The gate for a buyer holding `ghostkeys`. The first connected key vouches.
@@ -126,28 +141,126 @@ pub struct VouchedDelivery {
 }
 
 impl AppState {
-    /// [`compose_gate`] over the connected Ghost Keys.
+    /// [`compose_gate`] over the connected Ghost Keys, whatever is paid.
     pub fn compose_gate(&self) -> ComposeGate {
         compose_gate(&self.ghostkeys)
+    }
+
+    /// The gate for a message to this store written into the conversation
+    /// `target`, or (`None`) into whichever conversation a new message
+    /// continues: the last one, if there is one. A paid order there
+    /// ([`Self::paid_conversation`]) comes first, so a buyer holding a Ghost
+    /// Key is not asked to sign for a conversation that needs no voucher.
+    pub fn compose_gate_in(
+        &self,
+        store_contract_id: &[u8],
+        target: Option<[u8; 32]>,
+    ) -> ComposeGate {
+        let tag = target.or_else(|| {
+            self.browsing_stores
+                .get(store_contract_id)
+                .and_then(|store| store.conversations.last())
+                .map(|conversation| conversation.buyer_public_key)
+        });
+        match tag {
+            Some(tag) if self.paid_conversation(store_contract_id, &tag) => {
+                ComposeGate::PaidOrder { tag }
+            }
+            _ => self.compose_gate(),
+        }
+    }
+
+    /// Seal a buyer's message to a store the way [`Self::compose_gate_in`]
+    /// says: plain into a paid order's conversation, else under a Ghost Key's
+    /// voucher, else not at all.
+    pub fn compose_message_to_seller(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        seller_verifying_key: &[u8; 32],
+        text: String,
+        target: Option<[u8; 32]>,
+        now_ms: u64,
+    ) -> Result<VouchedCompose, String> {
+        match self.compose_gate_in(store_contract_id, target) {
+            ComposeGate::PaidOrder { tag } => self
+                .compose_plain_to_seller(store_contract_id, seller_encryption_key, &tag, text)
+                .map(VouchedCompose::Sealed),
+            ComposeGate::Ready { .. } => self.compose_vouched_to_seller(
+                store_contract_id,
+                seller_encryption_key,
+                seller_verifying_key,
+                text,
+                target,
+                now_ms,
+            ),
+            ComposeGate::NeedsGhostKey => Err(NEEDS_GHOST_KEY.to_string()),
+        }
+    }
+
+    /// Seal a buyer's text to a store with no voucher, into the conversation
+    /// `tag`, which must have a paid order the seller will also count
+    /// ([`Self::paid_conversation`], checked here again rather than trusted
+    /// from the caller: a plain text anywhere else is hidden from the
+    /// seller). Keeps the conversation, as every buyer message does.
+    pub fn compose_plain_to_seller(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        tag: &[u8; 32],
+        text: String,
+    ) -> Result<EncryptedMessage, String> {
+        if !self.paid_conversation(store_contract_id, tag) {
+            return Err(NEEDS_GHOST_KEY.to_string());
+        }
+        let sealed = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| {
+                store
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation.buyer_public_key == *tag)
+            })
+            .ok_or("that conversation is no longer on this device")?
+            .seal(text)?;
+        self.vouchers.failures.remove(store_contract_id);
+        self.keep_conversation_tagged(store_contract_id, seller_encryption_key, tag);
+        Ok(sealed)
     }
 
     /// Seal a buyer's text to a store under its conversation's voucher, or
     /// queue it behind the voucher's signature.
     ///
-    /// Continues the store's last conversation, opening one if there is none,
-    /// as every buyer message does.
+    /// Into the conversation `target` when one is named (an order's own
+    /// thread), which must still be on this device; otherwise continues the
+    /// store's last conversation, opening one if there is none, as every
+    /// buyer message does.
     pub fn compose_vouched_to_seller(
         &mut self,
         store_contract_id: &[u8],
         seller_encryption_key: &[u8; 32],
         seller_verifying_key: &[u8; 32],
         text: String,
+        target: Option<[u8; 32]>,
         now_ms: u64,
     ) -> Result<VouchedCompose, String> {
         let ComposeGate::Ready { fingerprint } = self.compose_gate() else {
             return Err(NEEDS_GHOST_KEY.to_string());
         };
-        let conversation = self.conversation_with(store_contract_id, seller_encryption_key)?;
+        let conversation = match target {
+            Some(tag) => self
+                .browsing_stores
+                .get(store_contract_id)
+                .and_then(|store| {
+                    store
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.buyer_public_key == tag)
+                })
+                .ok_or("that conversation is no longer on this device")?,
+            None => self.conversation_with(store_contract_id, seller_encryption_key)?,
+        };
         // Refused now rather than after the vault has been asked: the voucher
         // adds about 2 KB, so a text near the limit fits alone and not with it.
         conversation.seal_vouched(text.clone(), oversize_probe(), chrono::Utc::now())?;
@@ -157,9 +270,17 @@ impl AppState {
         let key = (store_contract_id.to_vec(), tag);
         if let Some(voucher) = self.vouchers.signed.get(&key).cloned() {
             let sealed = self
-                .conversation_with(store_contract_id, seller_encryption_key)?
+                .browsing_stores
+                .get(store_contract_id)
+                .and_then(|store| {
+                    store
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.buyer_public_key == tag)
+                })
+                .ok_or("that conversation is no longer on this device")?
                 .seal_vouched(text, voucher, chrono::Utc::now())?;
-            self.keep_this_conversation(store_contract_id, seller_encryption_key);
+            self.keep_conversation_tagged(store_contract_id, seller_encryption_key, &tag);
             return Ok(VouchedCompose::Sealed(sealed));
         }
 
@@ -267,7 +388,7 @@ impl AppState {
             }
         }
         if let Some(seller_encryption_key) = keep {
-            self.keep_this_conversation(&store, &seller_encryption_key);
+            self.keep_conversation_tagged(&store, &seller_encryption_key, &tag);
         }
         if !unsent.is_empty() {
             self.vouchers
@@ -521,7 +642,14 @@ mod tests {
 
     fn compose(state: &mut AppState, text: &str) -> VouchedCompose {
         state
-            .compose_vouched_to_seller(STORE, &seller_public(), &SELLER_VK, text.into(), 1_000)
+            .compose_vouched_to_seller(
+                STORE,
+                &seller_public(),
+                &SELLER_VK,
+                text.into(),
+                None,
+                1_000,
+            )
             .expect("compose")
     }
 
@@ -561,7 +689,14 @@ mod tests {
         state.browsing_stores.entry(STORE.to_vec()).or_default();
         assert_eq!(state.compose_gate(), ComposeGate::NeedsGhostKey);
         assert_eq!(
-            state.compose_vouched_to_seller(STORE, &seller_public(), &SELLER_VK, "hi".into(), 0),
+            state.compose_vouched_to_seller(
+                STORE,
+                &seller_public(),
+                &SELLER_VK,
+                "hi".into(),
+                None,
+                0
+            ),
             Err(NEEDS_GHOST_KEY.to_string())
         );
         assert!(state.pending_signatures.is_empty());
@@ -722,7 +857,7 @@ mod tests {
         let mut state = buyer();
         let long = "x".repeat(harvest_common::mailbox::LARGEST_BUCKET - 1000);
         assert!(state
-            .compose_vouched_to_seller(STORE, &seller_public(), &SELLER_VK, long, 0)
+            .compose_vouched_to_seller(STORE, &seller_public(), &SELLER_VK, long, None, 0)
             .is_err());
         assert!(pending_vouchers(&state).is_empty());
         assert!(state.texts_awaiting_voucher(STORE).is_empty());
