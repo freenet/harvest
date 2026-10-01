@@ -12,11 +12,13 @@
 //!
 //! The rule has two halves, and they must agree:
 //!
-//! * **The seller's half** ([`conversation_has_paid_order`]) decides whether
-//!   the seller's inbox shows a buyer's plain text in a conversation
-//!   (`components::message_view::shown_to_seller`). It is the one that
-//!   enforces anything: the mailbox is open-write, so a gate in the buyer's
-//!   compose box stops only a buyer using this UI.
+//! * **The seller's half** ([`conversation_has_paid_order`] over the
+//!   conversation's orders from [`OrderLookup::in_conversation`], through
+//!   `components::message_view::paid_set`, which the seller's inbox runs)
+//!   decides whether the seller's inbox shows a buyer's plain text in a
+//!   conversation (`components::message_view::shown_to_seller`). It is the
+//!   one that enforces anything: the mailbox is open-write, so a gate in the
+//!   buyer's compose box stops only a buyer using this UI.
 //! * **The buyer's half** (`AppState::paid_conversation`) decides whether the
 //!   buyer is offered a compose box without a Ghost Key. It must be a STRICT
 //!   SUBSET of the seller's half, or a buyer would be invited to send text the
@@ -189,18 +191,22 @@ impl<'a> OrderLookup<'a> {
         claims: &ConversationClaims,
     ) -> Vec<(&'a AuthorizedOrder, bool)> {
         let mut found: Vec<(&'a AuthorizedOrder, bool)> = Vec::new();
+        // Only the request pass can repeat an order (two identical asks name
+        // one order), and the tag pass can meet one it found; each order has
+        // one listing tag and the tags are a set, so the tag pass meets any
+        // order at most once.
+        let mut by_request: std::collections::HashSet<&'a OrderId> =
+            std::collections::HashSet::new();
         for (request_id, order_id) in &claims.answered {
             for order in self.by_request_id.get(request_id).into_iter().flatten() {
-                if order.order.id == *order_id
-                    && !found.iter().any(|(o, _)| o.order.id == order.order.id)
-                {
+                if order.order.id == *order_id && by_request.insert(&order.order.id) {
                     found.push((order, true));
                 }
             }
         }
         for tag in &claims.listing_tags {
             for order in self.by_listing_tag.get(tag).into_iter().flatten() {
-                if !found.iter().any(|(o, _)| o.order.id == order.order.id) {
+                if !by_request.contains(&order.order.id) {
                     found.push((order, false));
                 }
             }
@@ -209,15 +215,15 @@ impl<'a> OrderLookup<'a> {
     }
 }
 
-/// The seller's half of the rule: whether one of `orders` is paid (or was,
-/// [`status_opens`]) and belongs to the conversation `claims` describes.
-pub(crate) fn conversation_has_paid_order(
-    orders: &[AuthorizedOrder],
-    claims: &ConversationClaims,
-) -> bool {
-    orders
-        .iter()
-        .any(|order| status_opens(order.status) && order_in_conversation(order, claims))
+/// The seller's half of the rule: whether one of a conversation's orders
+/// (`members`, [`OrderLookup::in_conversation`]) is paid, or was
+/// ([`status_opens`]). The ONE place the seller's inbox decides this
+/// (`components::message_view::paid_set`, used by `seller_inbox` and
+/// `paid_conversations` alike), so every test of the rule tests what the
+/// inbox runs (review after 6c61839: a copy only tests called let a
+/// mutation of the inbox's own check pass every test).
+pub(crate) fn conversation_has_paid_order(members: &[(&AuthorizedOrder, bool)]) -> bool {
+    members.iter().any(|(order, _)| status_opens(order.status))
 }
 
 impl crate::state::AppState {
@@ -367,6 +373,12 @@ pub(crate) mod tests {
         o
     }
 
+    /// The seller's rule as the inbox runs it: the conversation's orders
+    /// through the lookup, then `conversation_has_paid_order`.
+    fn paid_through_lookup(orders: &[AuthorizedOrder], claims: &ConversationClaims) -> bool {
+        conversation_has_paid_order(&OrderLookup::new(orders).in_conversation(claims))
+    }
+
     fn claims(
         tag: &[u8; 32],
         requests: &[(ListingId, Option<InstantSelection>)],
@@ -450,7 +462,7 @@ pub(crate) mod tests {
             (OrderStatus::Cancelled, false),
         ] {
             assert_eq!(
-                conversation_has_paid_order(&[quote_order(&TAG, &L, status)], &asked),
+                paid_through_lookup(&[quote_order(&TAG, &L, status)], &asked),
                 opens,
                 "{status:?}"
             );
@@ -463,21 +475,21 @@ pub(crate) mod tests {
     #[test]
     fn a_paid_order_opens_only_its_own_conversation() {
         let paid = quote_order(&TAG, &L, OrderStatus::Paid);
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             std::slice::from_ref(&paid),
             &claims(&OTHER, &[(L, None)], &[], true)
         ));
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             std::slice::from_ref(&paid),
             &claims(&TAG, &[(L, None)], &[], false)
         ));
         let buy_now = buy_now_order(&TAG, &selection(4), OrderStatus::Paid);
-        assert!(conversation_has_paid_order(
+        assert!(paid_through_lookup(
             std::slice::from_ref(&buy_now),
             &claims(&TAG, &[(L, Some(selection(4)))], &[], false)
         ));
         // The same selection read under another tag names another id.
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             &[buy_now],
             &claims(&OTHER, &[(L, Some(selection(4)))], &[], false)
         ));
@@ -496,16 +508,16 @@ pub(crate) mod tests {
             (OrderStatus::Cancelled, false),
         ] {
             assert_eq!(
-                conversation_has_paid_order(&[buy_now_order(&TAG, &selection(4), status)], &asked),
+                paid_through_lookup(&[buy_now_order(&TAG, &selection(4), status)], &asked),
                 opens,
                 "{status:?}"
             );
         }
         let mut stray = buy_now_order(&TAG, &selection(4), OrderStatus::Paid);
         stray.order.request_id = Some([3; 32]);
-        assert!(!conversation_has_paid_order(&[stray], &asked));
+        assert!(!paid_through_lookup(&[stray], &asked));
         // Another request in the conversation names another order.
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             &[buy_now_order(&TAG, &selection(5), OrderStatus::Paid)],
             &asked
         ));
@@ -520,7 +532,7 @@ pub(crate) mod tests {
     fn a_copied_order_binding_opens_nothing() {
         let paid = quote_order(&TAG, &L, OrderStatus::Paid);
         assert_eq!(paid.order.order_binding, Some([5; 32]));
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             &[paid],
             &claims(&OTHER, &[(L, None)], &[L], true)
         ));
@@ -535,13 +547,13 @@ pub(crate) mod tests {
         let elsewhere = buy_now_order(&OTHER, &selection(4), OrderStatus::Paid);
         // What TAG's claims are when all it holds is an acceptance naming
         // `elsewhere.order.id`: no request, and TAG's own listing tags.
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             std::slice::from_ref(&elsewhere),
             &claims(&TAG, &[], &[L], true)
         ));
         let mut quote_elsewhere = quote_order(&OTHER, &L, OrderStatus::Paid);
         quote_elsewhere.order.id = elsewhere.order.id;
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             &[quote_elsewhere],
             &claims(&TAG, &[], &[L], true)
         ));
@@ -554,11 +566,11 @@ pub(crate) mod tests {
     #[test]
     fn a_request_that_left_the_mailbox_still_opens_by_the_listing() {
         let paid = quote_order(&TAG, &L, OrderStatus::Paid);
-        assert!(conversation_has_paid_order(
+        assert!(paid_through_lookup(
             std::slice::from_ref(&paid),
             &claims(&TAG, &[], &[L], true)
         ));
-        assert!(!conversation_has_paid_order(
+        assert!(!paid_through_lookup(
             &[paid],
             &claims(&TAG, &[], &[ListingId([8; 32])], true)
         ));

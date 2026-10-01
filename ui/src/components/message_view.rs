@@ -1462,35 +1462,20 @@ pub(crate) fn seller_inbox(
         return SellerInbox::default();
     };
     let now = chrono::Utc::now();
+    state.prune_first_seen();
     let all = state.mailbox_entries(store_contract_id);
     let unreadable = all
         .iter()
         .filter(|entry| matches!(entry, MailboxEntry::Unreadable { .. }))
         .count();
-    let claims = seller_claims(&all, &store.listings, |tag| {
-        state.conversation_keys.get(tag)
-    });
     // Each conversation's orders through one lookup, so each costs what its
     // own claims hold, never claims × orders (review after 1bd9bcd: with
-    // free junk conversations that froze the Orders tab and the header).
-    let lookup = crate::order_threads::OrderLookup::new(&store.orders);
-    type Members<'o> = Vec<(
-        [u8; 32],
-        Vec<(&'o harvest_common::payment::AuthorizedOrder, bool)>,
-    )>;
-    let members: Members<'_> = claims
-        .iter()
-        .map(|(tag, claims)| (*tag, lookup.in_conversation(claims)))
-        .collect();
-    let paid: std::collections::HashSet<[u8; 32]> = members
-        .iter()
-        .filter(|(_, orders)| {
-            orders
-                .iter()
-                .any(|(order, _)| crate::order_threads::status_opens(order.status))
-        })
-        .map(|(tag, _)| *tag)
-        .collect();
+    // free junk conversations that froze the Orders tab and the header); and
+    // the paid set through the one function the tests also run.
+    let members = seller_members(&all, &store.orders, &store.listings, |tag| {
+        state.conversation_keys.get(tag)
+    });
+    let paid = paid_set(&members);
     // `shown_to_seller` works the vouchers out again below; that is a cache
     // hit (`voucher_verifies` remembers each verdict), not a second chain
     // check.
@@ -1560,21 +1545,27 @@ pub(crate) fn seller_inbox(
                 .collect();
             seen_orders
                 .sort_by_key(|order| std::cmp::Reverse((order.order.created_at, order.order.id.0)));
+            // Sorted, so a thread's props compare equal from one render to
+            // the next (the lookup returns them in hash order).
+            let mut ids: Vec<harvest_common::payment::OrderId> = orders
+                .iter()
+                .map(|(order, _)| order.order.id.clone())
+                .collect();
+            ids.sort();
+            let mut by_request: Vec<harvest_common::payment::OrderId> = orders
+                .iter()
+                .filter(|(_, by_request)| *by_request)
+                .map(|(order, _)| order.order.id.clone())
+                .collect();
+            by_request.sort();
             Some(SellerThread {
                 tag,
                 open: open.contains(tag.as_slice()),
                 entries,
                 lines: timed.into_iter().map(|(_, line)| line).collect(),
                 waiting: 0,
-                orders: orders
-                    .iter()
-                    .map(|(order, _)| order.order.id.clone())
-                    .collect(),
-                by_request: orders
-                    .iter()
-                    .filter(|(_, by_request)| *by_request)
-                    .map(|(order, _)| order.order.id.clone())
-                    .collect(),
+                orders: ids,
+                by_request,
                 awaiting_reply: awaiting,
                 order_refs: seen_orders
                     .iter()
@@ -1583,7 +1574,7 @@ pub(crate) fn seller_inbox(
             })
         })
         .map(|mut thread| {
-            thread.waiting = offered_requests(state, &thread, &store.listings, &store.orders).len();
+            thread.waiting = offered_requests(state, &thread, &store.listings, &index).len();
             thread
         })
         .collect();
@@ -1610,15 +1601,20 @@ pub(crate) fn seller_inbox(
 ///   clock says, fast or slow, and a reply dated in the future answers only
 ///   what was seen before it;
 /// * two first seen together (the mailbox as it stood when the page opened,
-///   or arriving in one update) are ordered by their own timestamps, each
-///   capped at when it was seen, so no date in the future wins.
+///   or arriving in one update) are ordered by their own timestamps; a buyer
+///   line dated after it was first seen (in the future when the page opened)
+///   is answered by any reply in the conversation, since its date cannot be
+///   true and nothing says where it falls (review after 6c61839: capped at
+///   the page's opening, it beat every reply on every reload, a permanent
+///   "need you" any paid buyer or Ghost Key holder could set). With no reply
+///   at all it still waits.
 ///
-/// What is left when the page opens: the timestamps decide, as written. A
-/// conversation answered by a reply dated before a buyer line with a
-/// fast clock reads as waiting again, and a buyer line dated in the future
-/// is capped only at the page's opening, so it re-raises "waiting" on every
-/// reload until the seller replies again: both err toward "need you". A
-/// buyer line dated before a reply by a slow clock reads as answered.
+/// What is left when the page opens, where the timestamps decide: a buyer
+/// line from a fast clock that a reply answered reads as waiting again, an
+/// error toward "need you"; a buyer line backdated before a reply by a slow
+/// clock reads as answered; and a buyer line still dated in the future at the
+/// opening (a fast clock, sent minutes before) is taken as answered by any
+/// earlier reply for that session.
 ///
 /// A reply is text in the seller's direction (confirmed as the seller's or
 /// not: text the buyer sealed there clears only their own waiting), or a
@@ -1665,15 +1661,23 @@ pub(crate) fn awaiting_reply(
         }
     }
     // Whether buyer line `b` comes after reply `r`, by first sight when they
-    // were seen at different moments, else by their capped timestamps. (The
-    // reply's cap cannot change an outcome: seen together, both share one
-    // first-seen moment, which the buyer's capped time never exceeds. It is
-    // kept for symmetry, and its mutation survives for that reason.)
+    // were seen at different moments, else by their timestamps. (The reply's
+    // cap at first sight cannot change an outcome: seen together, both share
+    // one first-seen moment, which a believable buyer date never exceeds. It
+    // is kept for symmetry, and its mutation survives for that reason.)
     let after = |(b_stamp, b_seen): &Seen, (r_stamp, r_seen): &Seen| {
         if b_seen != r_seen {
             b_seen > r_seen
+        } else if b_stamp > b_seen {
+            // Dated after it was first seen, so after the page opened: its
+            // date can't be true, and nothing says where it falls, so any
+            // reply answers it. Capped at the page's opening instead, it
+            // beat every reply on every reload: a permanent "need you" any
+            // paid buyer or Ghost Key holder could set (review after
+            // 6c61839).
+            false
         } else {
-            (*b_stamp).min(*b_seen) > (*r_stamp).min(*r_seen)
+            *b_stamp > (*r_stamp).min(*r_seen)
         }
     };
     buyer.iter().any(|b| replies.iter().all(|r| after(b, r)))
@@ -1751,12 +1755,12 @@ fn offered_requests(
     state: &crate::state::AppState,
     thread: &SellerThread,
     listings: &[harvest_common::listing::AuthorizedListing],
-    published: &[harvest_common::payment::AuthorizedOrder],
+    index: &OrderIndex<'_>,
 ) -> Vec<PendingRequest> {
-    unanswered_requests(
+    unanswered_requests_in(
         &thread.entries,
         listings,
-        published,
+        index,
         state.conversation_keys.get(thread.tag.as_slice()),
     )
     .into_iter()
@@ -1885,7 +1889,14 @@ fn SellerConversation(store_contract_id: Vec<u8>, thread: SellerThread) -> Eleme
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         let offered = store
-            .map(|store| offered_requests(&state, &thread, &store.listings, &store.orders))
+            .map(|store| {
+                offered_requests(
+                    &state,
+                    &thread,
+                    &store.listings,
+                    &OrderIndex::new(&store.orders),
+                )
+            })
             .unwrap_or_default();
         let availability: Vec<bool> = offered
             .iter()
@@ -2216,6 +2227,13 @@ pub(crate) fn request_address_hidden(
     answering.is_some_and(|order| !retained(order))
 }
 
+// How many `OrderIndex`es this thread has built: lets a test prove the
+// seller's inbox builds one per read, never one per conversation.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ORDER_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The store's orders, indexed once per render for matching requests to
 /// the orders answering them (codex on #205 round 3): by id, and each quote
 /// order under its (binding, listing tag), sorted by (signed date, id). A
@@ -2230,33 +2248,58 @@ pub(crate) struct OrderIndex<'a> {
         ([u8; 32], [u8; 32]),
         Vec<&'a harvest_common::payment::AuthorizedOrder>,
     >,
+    /// Every order, a Buy now's too, by (binding, listing tag): what
+    /// `unanswered_requests_in` matches a quote request against.
+    by_binding_and_tag: std::collections::HashMap<
+        ([u8; 32], [u8; 32]),
+        Vec<&'a harvest_common::payment::AuthorizedOrder>,
+    >,
 }
 
 impl<'a> OrderIndex<'a> {
     pub(crate) fn new(published: &'a [harvest_common::payment::AuthorizedOrder]) -> Self {
+        #[cfg(test)]
+        ORDER_INDEX_BUILDS.with(|n| n.set(n.get() + 1));
         let mut quotes: std::collections::HashMap<
             ([u8; 32], [u8; 32]),
             Vec<&'a harvest_common::payment::AuthorizedOrder>,
         > = std::collections::HashMap::new();
+        let mut by_binding_and_tag: std::collections::HashMap<
+            ([u8; 32], [u8; 32]),
+            Vec<&'a harvest_common::payment::AuthorizedOrder>,
+        > = std::collections::HashMap::new();
         for order in published {
-            if order.order.request_id.is_some() {
+            let Some(key) = order.order.order_binding.zip(order.order.listing_tag) else {
                 continue;
-            }
-            if let (Some(binding), Some(tag)) = (order.order.order_binding, order.order.listing_tag)
-            {
-                quotes.entry((binding, tag)).or_default().push(order);
+            };
+            by_binding_and_tag.entry(key).or_default().push(order);
+            if order.order.request_id.is_none() {
+                quotes.entry(key).or_default().push(order);
             }
         }
         for group in quotes.values_mut() {
             group.sort_by_key(|order| (order.order.created_at, order.order.id.0));
         }
         OrderIndex {
+            by_binding_and_tag,
             by_id: published
                 .iter()
                 .map(|order| (&order.order.id, order))
                 .collect(),
             quotes,
         }
+    }
+
+    /// Every order (a Buy now's too) carrying `binding` and `listing_tag`.
+    pub(crate) fn with_binding_and_tag(
+        &self,
+        binding: &[u8; 32],
+        listing_tag: &[u8; 32],
+    ) -> &[&'a harvest_common::payment::AuthorizedOrder] {
+        self.by_binding_and_tag
+            .get(&(*binding, *listing_tag))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// The order with id `id`, if the store holds one.
@@ -2567,32 +2610,62 @@ pub(crate) fn seller_claims<'a>(
     by_tag
         .into_iter()
         .map(|(tag, requests)| {
-            let keys = keys_for(&tag);
+            // The tag key derived once per conversation, not per listing.
+            let tagger = keys_for(&tag).map(|keys| keys.listing_tagger());
             let claims = crate::order_threads::ConversationClaims::of(
                 &tag,
                 requests,
                 listings.iter().map(|l| &l.listing.id),
-                |listing| keys.map(|keys| keys.listing_tag(listing)),
+                |listing| tagger.as_ref().map(|tagger| tagger.tag(listing)),
             );
             (tag, claims)
         })
         .collect()
 }
 
-/// The conversations in a seller's inbox that one of the store's own paid
-/// orders opens (`order_threads::conversation_has_paid_order`): what opens a
-/// conversation to the seller without a voucher ([`shown_to_seller`]).
+/// Each readable conversation in a seller's inbox with the store's orders
+/// belonging to it ([`seller_claims`] matched through
+/// `order_threads::OrderLookup`, never conversation by order), each with
+/// whether by its request: what [`paid_set`] and the threads read.
+pub(crate) type Members<'o> = Vec<(
+    [u8; 32],
+    Vec<(&'o harvest_common::payment::AuthorizedOrder, bool)>,
+)>;
+
+pub(crate) fn seller_members<'a, 'o>(
+    entries: &[MailboxEntry],
+    published: &'o [harvest_common::payment::AuthorizedOrder],
+    listings: &[harvest_common::listing::AuthorizedListing],
+    keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
+) -> Members<'o> {
+    let lookup = crate::order_threads::OrderLookup::new(published);
+    seller_claims(entries, listings, keys_for)
+        .iter()
+        .map(|(tag, claims)| (*tag, lookup.in_conversation(claims)))
+        .collect()
+}
+
+/// The conversations one of the store's own paid orders opens
+/// (`order_threads::conversation_has_paid_order`): THE seller's paid set,
+/// which `seller_inbox` and [`paid_conversations`] both take, so a test of
+/// either tests the gate the inbox runs (review after 6c61839).
+pub(crate) fn paid_set(members: &Members<'_>) -> std::collections::HashSet<[u8; 32]> {
+    members
+        .iter()
+        .filter(|(_, orders)| crate::order_threads::conversation_has_paid_order(orders))
+        .map(|(tag, _)| *tag)
+        .collect()
+}
+
+/// [`paid_set`] over a mailbox: what opens a conversation to the seller
+/// without a voucher ([`shown_to_seller`]).
 pub(crate) fn paid_conversations<'a>(
     entries: &[MailboxEntry],
     published: &[harvest_common::payment::AuthorizedOrder],
     listings: &[harvest_common::listing::AuthorizedListing],
     keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
 ) -> std::collections::HashSet<[u8; 32]> {
-    seller_claims(entries, listings, keys_for)
-        .into_iter()
-        .filter(|(_, claims)| crate::order_threads::conversation_has_paid_order(published, claims))
-        .map(|(tag, _)| tag)
-        .collect()
+    paid_set(&seller_members(entries, published, listings, keys_for))
 }
 
 /// The request to buy this conversation is waiting on, if any.
@@ -2618,10 +2691,26 @@ pub(crate) fn paid_conversations<'a>(
 /// the two holders of the conversation key can produce a readable entry at
 /// all. What protects the BUYER is not this filter but the binding: accepting
 /// publishes a commitment carrying a value only the real buyer can match.
+/// [`unanswered_requests_in`] over `published`, indexed: the shape this
+/// module's tests ask in.
+#[cfg(test)]
 fn unanswered_requests(
     entries: &[MailboxEntry],
     listings: &[harvest_common::listing::AuthorizedListing],
     published: &[harvest_common::payment::AuthorizedOrder],
+    keys: Option<&crate::messaging::ConversationKeys>,
+) -> Vec<PendingRequest> {
+    unanswered_requests_in(entries, listings, &OrderIndex::new(published), keys)
+}
+
+/// The requests to buy in a conversation still waiting for the seller's
+/// answer, matched against the store's orders through `index` (review after
+/// 6c61839: a scan of every order per request was requests × orders on
+/// each read of the inbox, and requests in unopened conversations reach it).
+fn unanswered_requests_in(
+    entries: &[MailboxEntry],
+    listings: &[harvest_common::listing::AuthorizedListing],
+    index: &OrderIndex<'_>,
     keys: Option<&crate::messaging::ConversationKeys>,
 ) -> Vec<PendingRequest> {
     let mut requests: Vec<PendingRequest> = Vec::new();
@@ -2660,16 +2749,17 @@ fn unanswered_requests(
             selection.answered_request(&tag)
         });
         if let Some(request) = request {
-            let id = request.order_id();
-            if published.iter().any(|order| order.order.id == id) {
+            if index.order(&request.order_id()).is_some() {
                 continue;
             }
         }
         let answered = request.is_none()
             && keys.is_some_and(|keys| {
                 let tag = keys.listing_tag(listing_id);
-                let answers: Vec<&harvest_common::payment::AuthorizedOrder> = published
+                let answers: Vec<&harvest_common::payment::AuthorizedOrder> = index
+                    .with_binding_and_tag(order_binding, &tag)
                     .iter()
+                    .copied()
                     .filter(|order| {
                         order.order.order_binding == Some(*order_binding)
                         && order.order.listing_tag == Some(tag)
@@ -2912,20 +3002,21 @@ fn count_unanswered<'a>(
     keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
     on_sale: impl Fn(&harvest_common::listing::ListingId) -> bool,
 ) -> usize {
-    let mut conversations: Vec<(Vec<u8>, Vec<MailboxEntry>)> = Vec::new();
+    // Grouped in one pass, and matched through one index (review after
+    // 6c61839): the header asks for this on every state change.
+    let index = OrderIndex::new(published);
+    let mut conversations: std::collections::BTreeMap<Vec<u8>, Vec<MailboxEntry>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
-        match conversations
-            .iter_mut()
-            .find(|(tag, _)| tag.as_slice() == entry.conversation())
-        {
-            Some((_, group)) => group.push(entry),
-            None => conversations.push((entry.conversation().to_vec(), vec![entry])),
-        }
+        conversations
+            .entry(entry.conversation().to_vec())
+            .or_default()
+            .push(entry);
     }
     conversations
         .iter()
         .map(|(tag, group)| {
-            unanswered_requests(group, listings, published, keys_for(tag))
+            unanswered_requests_in(group, listings, &index, keys_for(tag))
                 .iter()
                 // Not a Buy now: an unpaid one is not an order and does not
                 // need the seller (Ian, 2026-09-26). The seller's store
@@ -3394,11 +3485,12 @@ mod inbox_tests {
     /// text: an unopened conversation, junk and a request never count. Seen
     /// live at different moments, a buyer line and a reply are ordered by
     /// first sight, whatever either clock says; seen together (when the page
-    /// opened), by their timestamps capped at first sight (reviews after
-    /// 9417fbf and 1bd9bcd). Red with the open check dropped, with first
-    /// sight ignored, with the cap on a buyer line's timestamp dropped, and
-    /// with the store's automatic declines counted as replies. (The cap on a
-    /// reply's timestamp cannot change an outcome; see `awaiting_reply`.)
+    /// opened), by their timestamps, a buyer line dated in the future being
+    /// answered by any reply (reviews after 9417fbf, 1bd9bcd and 6c61839).
+    /// Red with the open check dropped, with first sight ignored, with the
+    /// future-dated rule dropped, and with the store's automatic declines
+    /// counted as replies. (The cap on a reply's timestamp cannot change an
+    /// outcome; see `awaiting_reply`.)
     #[test]
     fn a_conversation_waits_for_a_reply_only_when_the_buyer_wrote_last() {
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
@@ -3488,7 +3580,19 @@ mod inbox_tests {
             &[future.clone(), reply.clone()],
             seen(vec![(&future, 5_000), (&reply, 6_000)])
         ));
-        assert!(awaiting_reply(true, &[future, reply.clone()], seen(vec![])));
+        // ... and after a reload too (review after 6c61839): a date that
+        // cannot be true is answered by the reply, so the count can't be
+        // pinned on. With no reply at all, it waits.
+        assert!(!awaiting_reply(
+            true,
+            &[future.clone(), reply.clone()],
+            seen(vec![])
+        ));
+        assert!(awaiting_reply(
+            true,
+            std::slice::from_ref(&future),
+            seen(vec![])
+        ));
 
         // Both dated in the future and on the page when it opened: each is
         // capped at the opening, so the buyer's later date does not win.

@@ -123,6 +123,39 @@ impl ConversationKeys {
     pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
         harvest_common::mailbox::listing_tag(&self.from_seller, listing)
     }
+
+    /// [`Self::listing_tag`] for many listings: the conversation's tag key
+    /// derived once, then one keyed hash per listing (review after 6c61839:
+    /// the seller's inbox tags every listing in every conversation, and a
+    /// store's listings are grow-only and uncapped, so deriving the key again
+    /// per listing doubled the work). Checked equal to
+    /// `harvest_common::mailbox::listing_tag` by
+    /// `a_listing_tagger_gives_the_shared_tags`.
+    pub fn listing_tagger(&self) -> ListingTagger {
+        let mut hasher = blake3::Hasher::new_derive_key(LISTING_TAG_CONTEXT);
+        hasher.update(&harvest_common::mailbox::listing_tag_key(&self.from_seller));
+        ListingTagger(hasher)
+    }
+}
+
+/// The derivation context of `harvest_common::mailbox::listing_tag`, which
+/// [`ConversationKeys::listing_tagger`] repeats so it can derive the tag key
+/// once; the test `a_listing_tagger_gives_the_shared_tags` fails if the two
+/// drift.
+const LISTING_TAG_CONTEXT: &str = "harvest/listing-tag/v1";
+
+/// One conversation's listing tags, its tag key already derived
+/// ([`ConversationKeys::listing_tagger`]).
+#[derive(Clone)]
+pub struct ListingTagger(blake3::Hasher);
+
+impl ListingTagger {
+    /// The tag a published order carries for `listing` in this conversation.
+    pub fn tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        let mut hasher = self.0.clone();
+        hasher.update(&listing.0);
+        *hasher.finalize().as_bytes()
+    }
 }
 
 /// Deliberately opaque: a `Debug` that printed these would put both
@@ -978,6 +1011,22 @@ pub fn read_mailbox(
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
+
+    /// **The listing tagger gives exactly the shared derivation's tags**
+    /// (review after 6c61839), for several keys and listings. Red if the
+    /// context string or the order of inputs drifts from
+    /// `harvest_common::mailbox::listing_tag`.
+    #[test]
+    fn a_listing_tagger_gives_the_shared_tags() {
+        for secret in [[1u8; 32], [7u8; 32], [0xab; 32]] {
+            let keys = ConversationKeys::from_shared_secret(&secret);
+            let tagger = keys.listing_tagger();
+            for listing in [[0u8; 32], [9u8; 32], [0xfe; 32]] {
+                let id = harvest_common::listing::ListingId(listing);
+                assert_eq!(tagger.tag(&id), keys.listing_tag(&id));
+            }
+        }
+    }
 
     /// **Only the canonical encoding of an X25519 key is a conversation
     /// tag.** A real key passes; the same bytes with bit 255 set, p itself,

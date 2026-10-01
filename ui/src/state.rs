@@ -9919,21 +9919,31 @@ impl AppState {
 
     /// When this session first saw the mailbox entry with `digest`: `now`,
     /// the first time it is asked, and the same answer after
-    /// ([`Self::mailbox_first_seen`]). Bounded: past 16,384 distinct entries
-    /// in one session (a mailbox holds 512 at a time) the record is cleared
-    /// whole, and every entry is first seen again at the next ask, as after
-    /// a reload: the timestamps decide, which errs toward "waiting".
+    /// ([`Self::mailbox_first_seen`]). Bounded by
+    /// [`Self::prune_first_seen`], which the seller's inbox runs before it
+    /// reads, never in the middle of a read.
     pub fn first_seen(
         &self,
         digest: &[u8; 32],
         now: chrono::DateTime<chrono::Utc>,
     ) -> chrono::DateTime<chrono::Utc> {
+        *self
+            .mailbox_first_seen
+            .borrow_mut()
+            .entry(*digest)
+            .or_insert(now)
+    }
+
+    /// Past 16,384 distinct entries in one session (a mailbox holds 512 at
+    /// a time) the first-seen record is cleared whole, and every entry is
+    /// first seen again, as after a reload: the timestamps decide, which
+    /// errs toward "waiting". Run at the start of a read of the seller's
+    /// inbox, so one read never sees half a record (review after 6c61839).
+    pub fn prune_first_seen(&self) {
         let mut seen = self.mailbox_first_seen.borrow_mut();
-        // A mailbox holds at most `MAX_MESSAGES` entries; far past honest use.
-        if seen.len() >= 16_384 && !seen.contains_key(digest) {
+        if seen.len() >= 16_384 {
             seen.clear();
         }
-        *seen.entry(*digest).or_insert(now)
     }
 
     /// Whether THIS browser wrote the message with this digest.
@@ -26324,6 +26334,22 @@ mod buy_flow_tests {
         store.orders = vec![order.clone()];
         store.mailbox_messages.push(text);
 
+        // Through the inbox itself (review after 6c61839: the paid set was
+        // computed by a copy only tests called): an order awaiting payment,
+        // or cancelled, opens nothing, so the buyer's plain text is held
+        // back. Red with the inbox's paid check made always true.
+        for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+            state.browsing_stores.get_mut(STORE).unwrap().orders[0].status = status;
+            let unpaid = seller_inbox(&state, STORE);
+            let thread = unpaid
+                .for_order(&order.order.id)
+                .expect("still its conversation");
+            assert!(!thread.open, "{status:?} opens nothing");
+            assert_eq!(thread.chat_count(), 0, "{status:?}: text held back");
+            assert_eq!(unpaid.held_back, 1, "{status:?}");
+        }
+        state.browsing_stores.get_mut(STORE).unwrap().orders[0].status = OrderStatus::Paid;
+
         let inbox = seller_inbox(&state, STORE);
         let thread = inbox
             .for_order(&order.order.id)
@@ -26543,8 +26569,12 @@ mod buy_flow_tests {
     /// and get keys for them, at no cost; with 512 of them (the mailbox's
     /// cap) and 4096 orders (the store's), matching each conversation against
     /// every order took tenths of a second natively and more in wasm, on
-    /// every state change, from the header. Bounded generously here; red
-    /// with the order lookup replaced by a scan of every order.
+    /// every state change, from the header. Counted, not timed: no order is
+    /// matched one by one, and one order index serves every conversation's
+    /// requests (review after 6c61839: a scan of every order per request was
+    /// still conversations × orders). The junk carries quote requests and
+    /// Buy nows, which reach per-thread work even unopened. Red with the
+    /// order lookup replaced by a scan, and with an index built per thread.
     #[test]
     fn the_sellers_inbox_does_not_scan_every_order_per_conversation() {
         use crate::components::message_view::seller_inbox;
@@ -26571,29 +26601,48 @@ mod buy_flow_tests {
             })
             .collect();
         let mut junk = Vec::new();
-        for _ in 0..511 {
+        for i in 0..511u32 {
             let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
             let tag = buyer.buyer_public_key;
             state
                 .conversation_keys
                 .insert(tag.to_vec(), seller_keys_for(&tag));
             junk.push(buyer.seal("junk".into()).expect("sealed"));
+            // A request in each: a quote request, or a Buy now.
+            let instant = (i % 2 == 1).then(|| crate::messaging::InstantSelection {
+                requested_at_ms: 1_700_000_000_000,
+                nonce: [i as u8; 16],
+                region: None,
+                choices: vec![],
+                expected_total_sats: 12_000,
+            });
+            junk.push(
+                buyer
+                    .request_order(&ListingId([3u8; 32]), 1, "x".into(), String::new(), instant)
+                    .expect("sealed"),
+            );
         }
         let store = state.browsing_stores.get_mut(STORE).unwrap();
         store.orders = orders;
         store.mailbox_messages.extend(junk);
         crate::order_threads::FULL_MATCHES.with(|n| n.set(0));
+        crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.set(0));
         // No wall-clock bound: it would be flaky on a slow CI runner, and
-        // the count below pins the property deterministically.
+        // the counts below pin the property deterministically.
         let inbox = seller_inbox(&state, STORE);
         assert_eq!(
             crate::order_threads::FULL_MATCHES.with(|n| n.get()),
             0,
             "orders are matched through the lookup, never one by one"
         );
+        assert_eq!(
+            crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.get()),
+            1,
+            "one order index for every conversation's requests"
+        );
         assert!(
-            inbox.threads.len() <= 1,
-            "junk conversations show nothing: {}",
+            inbox.threads.len() >= 511,
+            "the request-bearing conversations reach per-thread work: {}",
             inbox.threads.len()
         );
     }
