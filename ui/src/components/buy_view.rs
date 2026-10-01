@@ -408,9 +408,6 @@ pub(crate) fn pending_answer(
     }
 }
 
-/// How long the order page waits before saying the store is not answering.
-pub(crate) const PENDING_WAIT_MS: u64 = INSTANT_WAIT_MS;
-
 /// [`open_unpaid_orders`] in the conversation tagged `current` alone: the
 /// one a Buy now goes out in, and what the store counts per. None before a
 /// conversation exists.

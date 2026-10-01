@@ -187,7 +187,7 @@ body::before {
   margin-top: var(--space-lg);
 }
 
-:where(*) + :where(.card, .listing-card, .info-box, .store-header, .seller-listing) {
+:where(*) + :where(.card, .listing-card, .info-box, .seller-listing) {
   margin-top: var(--space-md);
 }
 
@@ -205,18 +205,18 @@ body::before {
       makes a container `display: flex` or `display: grid` must name the
       container here too. A test in ui/src/components/mod.rs checks it. */
 :where(.harvest-header, .harvest-title-group, .harvest-nav, .tabs,
-       .listing-header, .listing-terms, .store-status, .feedback-header,
-       .form-row, .identity-card, .btc-status-bar, .btc-block-list,
-       .btc-block-row, .btc-tx-row, .row-between, .harvest-footer,
-       .form-actions, .dashboard-head, .checklist li, .share-row,
-       .seller-listing, .seller-listing-actions, .own-store-banner,
-       .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
-       .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
-       .needs-hit, .bubbles, .harvest-status, .page-head, .page-title,
-       .store-head, .store-head-title, .store-head-acts, .chips, .two-col,
-       .item-grid, .item-card, .item-page, .bill, .amount-field, .progress,
-       .side-row, .switch-menu, .row-more-menu, .needs-menu, .modal-actions,
-       .open-steps > li, .todo-note, .row-more > summary.btn) > * {
+       .listing-header, .feedback-header, .form-row, .identity-card,
+       .btc-status-bar, .btc-block-list, .btc-block-row, .btc-tx-row,
+       .row-between, .harvest-footer, .form-actions, .checklist li,
+       .share-row, .seller-listing, .seller-listing-actions,
+       .own-store-banner, .pay-ways, .copy-line, .notice-row, .link-btn,
+       .rowcard, .rc-status, .find-store, .vrow, .crumb,
+       .harvest-header-right, .needs-hit, .bubbles, .harvest-status,
+       .page-head, .page-title, .store-head, .store-head-title,
+       .store-head-acts, .chips, .two-col, .item-grid, .item-card,
+       .item-page, .bill, .amount-field, .progress, .side-row, .switch-menu,
+       .row-more-menu, .needs-menu, .open-steps > li, .todo-note,
+       .row-more > summary.btn) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -446,31 +446,6 @@ h4 {
   color: var(--accent);
 }
 
-/* ---- Store header ---- */
-
-.store-header {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-xl);
-  margin-bottom: var(--space-lg);
-}
-
-/* The store's name, and beside it Open or Closed. */
-.store-status {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--space-xs) var(--space-md);
-}
-
-/* Closed: switched off, like a sold-out listing, with its text left at
-   full contrast since it says why. */
-.store-header-closed {
-  background: transparent;
-}
-
 /* What the seller has at stake, and the store's record, in one line. */
 .trust {
   font-size: 0.92rem;
@@ -482,17 +457,6 @@ h4 {
 .trust .trust-record {
   font: inherit;
   color: inherit;
-}
-
-.trust-why {
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
-.store-name {
-  font-family: var(--font-display);
-  font-size: 1.3rem;
-  margin-bottom: var(--space-xs);
 }
 
 .store-desc {
@@ -844,17 +808,6 @@ h4 {
   overflow-wrap: anywhere;
 }
 
-.orders-earlier {
-  margin-top: var(--space-lg);
-}
-
-/* The seller card's short pill never breaks inside ("Send by 4 / Oct",
-   round-6 critique); the card's header wraps instead. Longer pills
-   elsewhere may still wrap on a narrow phone. */
-.seller-order .btc-pill {
-  white-space: nowrap;
-}
-
 /* Messages: one conversation, as bubbles (mockup msgs(); message_view
    ChatLines). Near-monochrome: your own on parchment, the other side on the
    page colour. Long words wrap rather than widen the page at 390 px. */
@@ -931,10 +884,6 @@ h4 {
   border-top: 1px solid var(--border);
 }
 
-.thread-toggle {
-  margin-top: var(--space-sm);
-}
-
 /* A request waiting for the seller's hand answer, inside its thread. */
 .request-card {
   border: 1px solid var(--border);
@@ -943,43 +892,10 @@ h4 {
   margin: var(--space-sm) 0;
 }
 
-/* A question from a buyer with no order card of its own. */
-.question-row + .question-row {
-  margin-top: var(--space-md);
-  padding-top: var(--space-md);
-  border-top: 1px solid var(--border);
-}
-
-.question-text {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
 @media (max-width: 600px) {
   .bubble {
     max-width: 92%;
   }
-}
-
-/* An earlier order: its title, card, address and controls as one group. */
-.earlier-order {
-  border-left: 2px solid var(--border);
-  padding-left: var(--space-md);
-}
-
-/* Between groups only, as the sibling-margin rules do: not under the
-   "Other orders" heading. */
-.earlier-order + .earlier-order {
-  margin-top: var(--space-lg);
-}
-
-/* An earlier order's item, named above its card. */
-.order-title {
-  margin: var(--space-md) 0 var(--space-xs);
 }
 
 /* The store's status on the seller's Overview: outlined, colour only when
@@ -1065,20 +981,6 @@ h4 {
 
 .text-italic {
   font-style: italic;
-}
-
-/* ---- Empty states ---- */
-
-.empty-state {
-  text-align: center;
-  padding: var(--space-2xl) var(--space-xl);
-}
-
-.empty-state p {
-  color: var(--text-muted);
-  max-width: 400px;
-  margin: 0 auto;
-  line-height: 1.6;
 }
 
 /* ---- Section label ---- */
@@ -1400,25 +1302,6 @@ h4 {
   margin-bottom: var(--space-sm);
 }
 
-/* ---- My store ---- */
-
-.dashboard-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-md);
-  flex-wrap: wrap;
-}
-
-.dashboard-title {
-  margin-bottom: var(--space-sm);
-}
-
-.store-switcher {
-  width: auto;
-  max-width: 100%;
-}
-
 .tabs {
   display: flex;
   gap: var(--space-lg);
@@ -1480,17 +1363,6 @@ h4 {
   align-items: center;
   gap: var(--space-sm);
   margin-bottom: var(--space-xs);
-}
-
-.share-label {
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
-.share-value {
-  font-family: var(--font-mono);
-  font-size: 0.9rem;
-  word-break: break-all;
 }
 
 .steps {
@@ -1556,16 +1428,6 @@ h4 {
 
 .seller-listing-meta .sep {
   color: var(--border);
-}
-
-.status-on {
-  color: var(--text-secondary);
-  font-weight: 500;
-}
-
-.status-off {
-  color: var(--text-muted);
-  font-weight: 500;
 }
 
 .seller-listing-actions {
@@ -1840,64 +1702,9 @@ h4 {
   color: var(--text-secondary);
 }
 
-/* The store's record, opened from the trust line: "Record" and Hide on
-   one line, at any width. */
-.record-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-.record-head h3 {
-  margin: 0;
-}
-
 /* "You have 1 order from this store ›", and "Ask the seller a question". */
 .store-orders-line {
   margin-bottom: var(--space-sm);
-}
-
-.store-ask {
-  margin-top: var(--space-lg);
-}
-
-.buy-control {
-  margin-top: 0.75rem;
-}
-
-/* A listing's price, and its delivery under it. */
-.listing-terms {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-top: var(--space-sm);
-}
-
-.listing-delivery {
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
-.listing-stock {
-  font-size: 0.85rem;
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-
-.listing-sold-out {
-  background: transparent;
-}
-
-.listing-sold-out h4,
-.listing-sold-out .listing-price {
-  color: var(--text-muted);
-}
-
-/* ---- My purchases ---- */
-
-.purchase-store-name {
-  margin-bottom: 0;
 }
 
 /* ---- Narrow screens ---- */
@@ -1958,10 +1765,6 @@ h4 {
     gap: var(--space-xs);
   }
 
-  .store-header {
-    padding: var(--space-lg);
-  }
-
   /* The status goes under the name, the chevron stays on the right
      (critique 01s-3). */
   .rowcard {
@@ -2007,15 +1810,6 @@ h4 {
     justify-self: start;
   }
 }
-
-/* A phone's width: the store's header gives its text the room (critique
-   S2-12). */
-@media (max-width: 480px) {
-  .store-header {
-    padding: var(--space-md);
-  }
-}
-
 
 /* ---- Page structure (2026-10-01, "Harvest, page by page") ----
    Every page has a title, at most one primary button, and its status in its
@@ -2234,12 +2028,6 @@ h4 {
   color: var(--text-secondary);
 }
 
-/* Words standing where a control would be, for one's own store. */
-.link-off {
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
 /* The test-coin note, once per store page; the backup banner. */
 .coin-note {
   border: 1px dashed var(--border);
@@ -2455,10 +2243,6 @@ h4 {
 .panel-h {
   font-size: 1.15rem;
   margin: 0;
-}
-
-.stage-line {
-  color: var(--text-secondary);
 }
 
 /* The four steps an order goes through. */

@@ -137,33 +137,6 @@ pub(crate) fn grow_focused_textarea() {
     }
 }
 
-/// Scroll the element with this id into view, once the render that opens
-/// it has happened: a pointer on one card opening a conversation shown under
-/// another (msg1 critique MSG-5, MSG-13). Called by name through
-/// `Reflect`, as `select_field_by_id` calls `focus`, so no web-sys feature
-/// is added for it. Does nothing where the element is not found.
-pub(crate) fn scroll_to_id(id: String) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async move {
-        use wasm_bindgen::JsCast;
-        // After the state change that opens it has rendered.
-        gloo_timers::future::TimeoutFuture::new(50).await;
-        let Some(element) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id(&id))
-        else {
-            return;
-        };
-        if let Ok(f) = js_sys::Reflect::get(&element, &"scrollIntoView".into()) {
-            if let Some(f) = f.dyn_ref::<js_sys::Function>() {
-                let _ = f.call0(&element);
-            }
-        }
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = id;
-}
-
 /// Focus and select all of the field with this `id`, for a Copy button the
 /// clipboard refused.
 pub(crate) fn select_field_by_id(id: &str) {

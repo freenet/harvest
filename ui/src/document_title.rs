@@ -63,11 +63,6 @@ pub fn set_title(title: &str) {
     }
 }
 
-/// Set the title to just the app name.
-pub fn set_default_title() {
-    set_title(APP_NAME);
-}
-
 /// The title with what needs the person counted first, "(2) Harvest", as
 /// the header's pill counts it, and the store's name on a store's pages.
 pub fn set_counted_title(needs: usize, store_name: Option<&str>) {
@@ -80,9 +75,4 @@ pub fn set_counted_title(needs: usize, store_name: Option<&str>) {
     } else {
         set_title(&base);
     }
-}
-
-/// Set the title to include a store name.
-pub fn set_store_title(store_name: &str) {
-    set_title(&format!("{APP_NAME} - {store_name}"));
 }

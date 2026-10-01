@@ -2573,6 +2573,30 @@ pub(crate) fn requests_awaiting_invoice(
     )
 }
 
+/// [`requests_awaiting_invoice`] in the one conversation `tag`: what the
+/// Home page's "Answer ..." row and the Messages page's "Needs an invoice"
+/// say, so each row is one the header counted (review of #214).
+pub(crate) fn requests_awaiting_invoice_in(
+    state: &crate::state::AppState,
+    store_contract_id: &[u8],
+    tag: &[u8; 32],
+) -> usize {
+    let Some(store) = state.browsing_stores.get(store_contract_id) else {
+        return 0;
+    };
+    count_unanswered(
+        state
+            .mailbox_entries(store_contract_id)
+            .into_iter()
+            .filter(|entry| entry.conversation() == tag.as_slice())
+            .collect(),
+        &store.listings,
+        &store.orders,
+        |tag| state.conversation_keys.get(tag),
+        |listing| store.availability(listing).is_buyable(),
+    )
+}
+
 /// [`requests_awaiting_invoice`] over given entries, grouped by conversation,
 /// each group judged with its own conversation's keys.
 ///

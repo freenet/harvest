@@ -21,7 +21,7 @@ P1s were again in NEW mechanisms, so revision 3 removes one mechanism rather tha
 - **Auto-keep is gone.** A slot is taken only by a buyer's own press: *Pay this order*, or
   *File a complaint* about a paid copy the node has not kept. (Since the 2026-09-27 UI pass,
   also *Buy now*, for the one order that press created: see 3.1 and 5.1.)
-- **No screen shows a buyer a payment address except the purchase card**, once the copy is kept.
+- **No screen shows a buyer a payment address except the buyer's order page (P4)**, once the copy is kept. The address comes through `buy_view::PayPanel` and `bitcoin_view::OrderCard` only.
 - **A kept paid copy tracks the freshest evidence until a complaint is filed**, so a reorg
   before the complaint cannot strand it.
 - **The seller's power to reuse one address across many orders** is named in section 2.
@@ -126,7 +126,7 @@ The seller can do any of these, at any time, including after payment:
 | Pad the order's signed envelope, list one recognised bridge thousands of times, or submit non-minimal proofs | any size cap: the buyer's copy, the complaint, the record (R2-4, TM-E) |
 | Pay its own order address: early or late (to move the paid height), or repeatedly with large transactions (a flood that makes the address contract prune) | the window's start (TM-D); the buyer's claims (TM-B) |
 | Reuse one payment address across many orders, so one payment settles all of them (their windows overlap) | any rule that equates one paid order with one payment (R3: cap filling, record growth) |
-| Show the buyer a payment address anywhere else: the store's invoice list, a message (the footer's payment diagnostics list only the seller's own orders; My purchases lists the buyer's own kept purchases with no address, beside the same purchase cards the store page shows) | keep-then-reveal, if any screen but the purchase card shows an address (R3) |
+| Show the buyer a payment address anywhere else: the store's invoice list, a message (the footer's payment diagnostics list only the seller's own orders; My purchases lists the buyer's own orders with no address, and the store page shows no purchase card) | keep-then-reveal, if any screen but the order page shows an address (R3) |
 | Name its own bridge in a sockpuppet order, have it sign a padded tip, or have it retract its own confirmation | a byte bound derived rather than enforced (R6-1); a reversal rule that trusts any bridge the order names (R6-2) |
 | Publish a backdated despatch | the complaint window (P2-10) |
 | Publish `PaymentReversed` from genuine claims, withholding a later re-confirmation, after a real reorg of the buyer's payment | reader standing (section 6) |
@@ -213,7 +213,7 @@ review of harvest#187.
 
 For **every** kept order still `AwaitingPayment`, the UI watches, and periodically re-reads,
 the address contract under the order's code hash **and** under the current generation
-pointer's hash, and shows the purchase card. The pointer follows the bridges' redeploys; the
+pointer's hash, and shows the address on the order page. The pointer follows the bridges' redeploys; the
 order's hash is fixed at issue. It stops at the upgrade to `Paid`, or once the bridge-signed
 tip passes the last block any complaint about the order could count at
 (`last_settling_block + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS`), after which
@@ -318,20 +318,20 @@ reputation record whatever build of the store is current (`ReputationParameters 
 the receipt seed, and the kept paid copy. So a kept purchase is judged from the kept record
 alone (`kept_complaint_checks`), wherever the control is shown:
 
-- on the purchase card (the store page's, and the same card on My purchases), when the store is
-  loaded;
-- in My purchases' list of kept purchases (`KeptPurchases`; on the Payments tab until harvest#93
-  phase 2 moved it), which reads nothing but the kept list, so a store re-keyed while the
-  seller stays away, or one nobody hosts, leaves the control where it was. An order a loaded
-  store's card on the same page already shows is left out of this list
-  (`kept_purchases_to_list`), so no order carries two controls.
+- on the buyer's order page (P4, `buyer_order.rs`), whose "Report a problem" opens the report
+  step (P5, `buy_view::ReportForm`), when the store is loaded;
+- on the same order page for an order known only from the kept copy (`buyer_order.rs`
+  `KeptOrder`), which reads nothing but the kept list, so a store re-keyed while the
+  seller stays away, or one nobody hosts, leaves the control where it was. The flat list of
+  orders (`purchases_view::order_rows`) lists each order once and links to its order page
+  (`kept_purchases_to_list` feeds it), so no order carries two controls.
 
 Two things are read from any loaded store under the same owner key, and neither is required:
 the seller's despatch (without it, the despatch deadline decides when the complaint opens),
 and whether a loaded record already holds this buyer's complaint (without it, the kept
-complaint and the in-flight marker still refuse a second one). The list shows no payment
-address, ever; an unpaid kept order is listed as held and is paid from its purchase card once
-its store is loaded (3.1).
+complaint and the in-flight marker still refuse a second one). An order known only
+from the kept copy never shows an address; an unpaid one is listed as held and is paid from its
+order page once its store is loaded (3.1).
 
 ## 4. The complaint preconditions: one predicate, checked in three places
 
@@ -611,7 +611,7 @@ retractions), not with a Harvest-local copy of it.
   - the certificate's ground `verifying_key` (R2-8).
 - **A payment made outside the app's flow** (an address from a message) is never kept until
   the buyer files a complaint about it (3.3). Until then it lasts only as long as the store
-  keeps it. The app itself shows no address outside the purchase card.
+  keeps it. The app itself shows no address outside the order page.
 - **A stale record.** A reader served a stale copy by hosts the seller runs sees fewer
   complaints until its subscription catches up. The buyer's re-assert (3.4) pushes its
   complaint back into the network on every load.

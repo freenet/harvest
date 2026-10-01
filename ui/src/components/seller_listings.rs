@@ -264,10 +264,6 @@ pub(crate) fn ListingFormPage(
     }
 }
 
-/// What a seller is told about one of their listings with no sats price.
-pub(crate) const NEEDS_PRICE: &str =
-    "Buyers can\u{2019}t buy this until it has a price. Use Edit to give it one.";
-
 /// One listing: its picture when it has one, its title, price, delivery and
 /// stock, Edit, and the quick actions under "More".
 #[component]

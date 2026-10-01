@@ -578,11 +578,10 @@ fn SellerHome(store: SellerStore) -> Element {
                     page: seller_page(&id, SellerView::Conversation(thread.tag)),
                 });
             }
-            if thread.waiting > 0 {
+            if super::message_view::requests_awaiting_invoice_in(&state, &id, &thread.tag) > 0 {
                 rows.push(TodoRow {
                     title: format!("Answer {name}\u{2019}s order"),
-                    sub: "They pressed Buy now while your store couldn\u{2019}t answer."
-                        .to_string(),
+                    sub: "They asked to buy. Accept to send them an order to pay.".to_string(),
                     pill: Some("Needs an invoice".to_string()),
                     thumb: None,
                     page: seller_page(&id, SellerView::Conversation(thread.tag)),
@@ -1368,12 +1367,23 @@ fn SellerMessages(store: SellerStore) -> Element {
             .inbox
             .threads
             .iter()
+            // A conversation with an order of this store's and something
+            // said, or one waiting for an answer; one with no order only if
+            // it is a question (open, so never junk).
             .filter(|thread| {
-                thread.waiting > 0
-                    || thread
-                        .lines
-                        .iter()
-                        .any(|l| matches!(l.item, super::message_view::ChatItem::Said(_)))
+                let said = thread
+                    .lines
+                    .iter()
+                    .any(|l| matches!(l.item, super::message_view::ChatItem::Said(_)));
+                if thread
+                    .orders
+                    .iter()
+                    .any(|o| data.orders.iter().any(|x| x.order.id == *o))
+                {
+                    said || thread.waiting > 0
+                } else {
+                    super::message_view::is_question(thread)
+                }
             })
             .map(|thread| {
                 let name = data.names.get(&thread.tag).cloned().unwrap_or_default();
@@ -1414,7 +1424,11 @@ fn SellerMessages(store: SellerStore) -> Element {
                     when: at.map(order_status::short_date).unwrap_or_default(),
                     at,
                     waiting: thread.awaiting_reply,
-                    request: thread.waiting > 0,
+                    request: super::message_view::requests_awaiting_invoice_in(
+                        &state,
+                        &id,
+                        &thread.tag,
+                    ) > 0,
                     name,
                 }
             })

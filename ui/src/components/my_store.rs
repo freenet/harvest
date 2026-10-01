@@ -46,8 +46,8 @@ pub(crate) struct SellerStore {
     pub publish_in_flight: bool,
     /// Listings not taken down.
     pub listings: usize,
-    /// Conversations holding a buyer's request waiting for the seller's
-    /// hand answer (`message_view::SellerThread::waiting`).
+    /// Buyers' requests still waiting for an invoice
+    /// (`message_view::requests_awaiting_invoice`); never a Buy now.
     pub requests: usize,
     /// Buyer conversations waiting for the seller's reply
     /// (`message_view::awaiting_reply`, msg1 critique MSG-3).
@@ -213,9 +213,8 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                 })
                 .count();
             let to_send = sending.len();
-            // Read once: the replies waiting and the requests offered for a
-            // hand answer come from the same conversations the Home rows and
-            // the Messages page list, so every count agrees with its rows.
+            // Read once for the replies waiting, from the same conversations
+            // the Home rows and the Messages page list.
             let inbox = super::message_view::seller_inbox(state, id);
             Some(SellerStore {
                 contract_id: id.clone(),
@@ -257,7 +256,9 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                             .count()
                     })
                     .unwrap_or(0),
-                requests: inbox.threads.iter().filter(|t| t.waiting > 0).count(),
+                // Not a Buy now: the store answers those itself, and an
+                // unpaid one does not need the seller (Ian, 2026-09-26).
+                requests: super::message_view::requests_awaiting_invoice(state, id),
                 replies: inbox.threads.iter().filter(|t| t.awaiting_reply).count(),
                 record: browsing
                     .map(|b| b.record_badge().1)
@@ -287,64 +288,6 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
             .then_with(|| a.contract_id.cmp(&b.contract_id))
     });
     stores
-}
-
-/// "‹ Stores", above a page reached from the Stores page.
-#[component]
-pub(crate) fn BackToStores() -> Element {
-    rsx! {
-        button {
-            class: "crumb",
-            onclick: move |_| super::router::go(super::router::Page::Stores),
-            "\u{2039} Stores"
-        }
-    }
-}
-
-#[component]
-pub(crate) fn NoIdentity(in_flight: bool) -> Element {
-    rsx! {
-        div { class: "card",
-            h3 { "Sell on Harvest" }
-            p {
-                "A store on Harvest is backed by a Ghost Key: a Freenet identity you get by "
-                "donating. Buyers see the amount you donated as what you have at stake."
-            }
-            ol { class: "steps",
-                li {
-                    a {
-                        href: "{ghost_key_create_url()}",
-                        target: "_blank",
-                        rel: "noopener noreferrer",
-                        "Get a Ghost Key on freenet.org"
-                    }
-                    ", if you do not have one yet. It is a donation to Freenet, from $1. When it "
-                    "is done, press Import to Freenet on that page."
-                }
-                li {
-                    "Let Harvest use it. "
-                    button {
-                        class: "btn btn-sm btn-primary",
-                        disabled: in_flight,
-                        onclick: move |_| connect_ghostkey(),
-                        if in_flight { "Waiting for the vault\u{2026}" } else { "Choose a Ghost Key" }
-                    }
-                }
-            }
-            GhostKeyAccessNote {}
-            p { class: "text-muted small",
-                "Have a Ghost Key saved in a file? Import it in your "
-                a {
-                    href: "{GHOST_KEY_VAULT_PATH}",
-                    target: "_blank",
-                    rel: "noopener noreferrer",
-                    "Ghost Key vault"
-                }
-                " first."
-            }
-            p { class: "text-muted small", "Only buying? You do not need one. Go to Stores." }
-        }
-    }
 }
 
 /// Send a `RequestAnyAccess` request to the ghostkey delegate. The
