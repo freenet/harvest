@@ -1559,7 +1559,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-bitcoin-common",
  "freenet-migrate",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
 ]
 
 [[package]]
@@ -1573,7 +1573,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-bitcoin-common",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
  "getrandom 0.2.17",
  "ghostkey-common",
  "ghostkey_lib",
@@ -1595,6 +1595,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-macros"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "freenet-migrate"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,7 +1616,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
  "serde",
  "serde_with",
 ]
@@ -1655,7 +1666,31 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.2.0",
+ "futures",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
+dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.3.1",
  "futures",
  "js-sys",
  "semver",
@@ -1837,7 +1872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ea36af38ec33104315d5b6f8c8a2aa4ff7996b6c43136f8184989023e444f5"
 dependencies = [
  "ciborium",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
  "serde",
 ]
 
@@ -1942,7 +1977,7 @@ dependencies = [
  "freenet-bitcoin-inbox",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "ghostkey-common",
  "hex",
@@ -1969,7 +2004,7 @@ dependencies = [
  "freenet-bitcoin-common",
  "freenet-bitcoin-inbox",
  "freenet-migrate",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "ghostkey-common",
  "harvest-common",
@@ -2008,7 +2043,7 @@ dependencies = [
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "futures",
  "getrandom 0.2.17",
  "ghostkey-common",
@@ -2356,7 +2391,7 @@ dependencies = [
 name = "image-contract"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "harvest-image",
 ]
 
@@ -2367,7 +2402,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-bitcoin-common",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "harvest-common",
  "serde",
@@ -2677,7 +2712,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "harvest-common",
  "serde",
@@ -3134,7 +3169,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "harvest-common",
  "serde",
@@ -3425,7 +3460,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-bitcoin-common",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "ghostkey_lib",
  "harvest-common",
@@ -4001,7 +4036,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-bitcoin-common",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "harvest-common",
  "serde",
