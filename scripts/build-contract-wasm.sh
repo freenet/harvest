@@ -27,7 +27,10 @@
 #
 # This is the ONE build path for these artifacts. `cargo make sync-wasm` calls
 # it, and CI's drift guard calls it, so the hashes CI reports are the hashes a
-# publish would deploy. Do not add a second `cargo build` for these crates.
+# publish would deploy. Do not build these crates anywhere else. (Inside this
+# script there are deliberately two kinds of build: the shared artifacts in
+# one invocation, and each `isolated_*` artifact in one of its own. See the
+# build below for why each is the way it is.)
 #
 # Usage:
 #   scripts/build-contract-wasm.sh            # build + print code hashes
@@ -149,10 +152,11 @@ if [ "${HARVEST_ALLOW_MISSING_CRATES:-0}" = "1" ]; then
   isolated_crates=("${keep_crates[@]}"); isolated_artifacts=("${keep_artifacts[@]}")
 fi
 
-# One invocation for all of them. This is NOT cosmetic: cargo unifies features
-# across the packages it is asked to build in a single invocation, so building
-# a subset can resolve different features and produce different bytes than
-# building them together.
+# One invocation for all the shared artifacts. This is NOT cosmetic: cargo
+# unifies features across the packages it is asked to build in a single
+# invocation, so building a subset can resolve different features and produce
+# different bytes than building them together. (The isolated artifacts are the
+# opposite case, built alone below, and must not be added here.)
 cargo build "${locked[@]}" --release --target wasm32-unknown-unknown \
   $(printf -- '-p %s ' "${crates[@]}")
 

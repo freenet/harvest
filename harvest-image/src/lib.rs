@@ -313,11 +313,14 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, ImageError> {
 /// metadata, at accepted dimensions. See the module docs for what is allowed
 /// and why.
 ///
-/// Every allowed segment's body is checked against its fixed form too, not
-/// only its marker: the quantisation and Huffman tables parse as baseline
-/// tables and are consumed exactly, the ICC profile is one bounded chunk, the
-/// Adobe segment is its 12-byte form, and the frame and scan headers carry
-/// only baseline values. So no allowed segment is a free-form container.
+/// Every allowed segment's body is checked too, not only its marker: the
+/// quantisation and Huffman tables parse as baseline tables and are consumed
+/// exactly; the frame and scan headers carry only baseline values and use
+/// only table slots that were defined; the ICC profile is one chunk with a
+/// valid ICC header, at most [`MAX_ICC_PROFILE_BYTES`]; the Adobe segment is
+/// its 12-byte form. The ICC profile's contents and the Adobe flag bytes are
+/// bounded, not fixed: those are the containers a canvas fills with its own
+/// colour data, and nothing a camera writes reaches them.
 ///
 /// **What remains, stated plainly:** table VALUES and the entropy-coded data
 /// can still be chosen to carry bytes. That cannot be closed by any check
@@ -333,10 +336,11 @@ pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
     let mut frame: Option<Frame> = None;
     let (mut seen_jfif, mut seen_dri, mut seen_adobe, mut seen_icc) = (false, false, false, false);
     let (mut quant_tables, mut huffman_tables) = (0usize, 0usize);
+    let mut defined = Slots::default();
     for seg in &parsed.head {
         match seg.marker {
-            DQT => quant_tables += check_quant_tables(seg.body)?,
-            DHT => huffman_tables += check_huffman_tables(seg.body)?,
+            DQT => quant_tables += check_quant_tables(seg.body, &mut defined)?,
+            DHT => huffman_tables += check_huffman_tables(seg.body, &mut defined)?,
             DRI => {
                 if seg.body.len() != 2 {
                     return Err(ImageError::BadLength { marker: DRI });
@@ -353,7 +357,9 @@ pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
             }
             APP14 if seg.body.starts_with(ADOBE_TAG) => {
                 once(&mut seen_adobe, APP14)?;
-                if seg.body.len() != ADOBE_BODY_LEN {
+                // The last byte is the colour transform: 0 (none), 1
+                // (YCbCr) or 2 (YCCK).
+                if seg.body.len() != ADOBE_BODY_LEN || seg.body[ADOBE_BODY_LEN - 1] > 2 {
                     return Err(ImageError::BadAdobe);
                 }
             }
@@ -386,7 +392,16 @@ pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
     if quant_tables == 0 || huffman_tables == 0 {
         return Err(ImageError::NoTables);
     }
-    check_scan(parsed.scan_header, &frame.ids)?;
+    // Every table the frame and scan name must exist. A decoder refuses a
+    // file that names an undefined one.
+    if frame
+        .quant_slots
+        .iter()
+        .any(|&s| defined.quant & (1 << s) == 0)
+    {
+        return Err(ImageError::BadFrame);
+    }
+    check_scan(parsed.scan_header, &frame.ids, &defined)?;
     if parsed.entropy.is_empty() {
         return Err(ImageError::EmptyScan);
     }
@@ -416,23 +431,43 @@ fn check_jfif(body: &[u8]) -> Result<(), ImageError> {
     Ok(())
 }
 
-/// One ICC chunk, numbered 1 of 1, of at most [`MAX_ICC_PROFILE_BYTES`].
+/// The length of an ICC profile's own header (ICC.1, section 7.2).
+const ICC_PROFILE_HEADER_LEN: usize = 128;
+
+/// One ICC chunk, numbered 1 of 1, holding a whole profile of at most
+/// [`MAX_ICC_PROFILE_BYTES`]: its header's size field equals the bytes
+/// present, and it carries the `acsp` signature. So the segment is a profile,
+/// not an arbitrary blob with an ICC label on it.
 fn check_icc(body: &[u8]) -> Result<(), ImageError> {
     let header = ICC_TAG.len() + 2;
-    if body.len() <= header
+    if body.len() < header + ICC_PROFILE_HEADER_LEN
         || body.len() - header > MAX_ICC_PROFILE_BYTES
         || body[ICC_TAG.len()] != 1
         || body[ICC_TAG.len() + 1] != 1
     {
         return Err(ImageError::BadIcc);
     }
+    let profile = &body[header..];
+    let declared = u32::from_be_bytes([profile[0], profile[1], profile[2], profile[3]]);
+    if declared as usize != profile.len() || &profile[36..40] != b"acsp" {
+        return Err(ImageError::BadIcc);
+    }
     Ok(())
+}
+
+/// Which table slots the file defines, one bit per slot.
+#[derive(Default)]
+struct Slots {
+    quant: u8,
+    dc: u8,
+    ac: u8,
 }
 
 /// The quantisation tables in one DQT segment, each `Pq|Tq` then 64 bytes,
 /// with 8-bit precision (`Pq` = 0, as baseline requires) and a slot of 0-3,
-/// consuming the body exactly. Returns how many tables it held.
-fn check_quant_tables(body: &[u8]) -> Result<usize, ImageError> {
+/// consuming the body exactly. Records the slots it defines and returns how
+/// many tables it held.
+fn check_quant_tables(body: &[u8], defined: &mut Slots) -> Result<usize, ImageError> {
     let bad = ImageError::BadTable { marker: DQT };
     if body.is_empty() || !body.len().is_multiple_of(65) {
         return Err(bad);
@@ -441,14 +476,16 @@ fn check_quant_tables(body: &[u8]) -> Result<usize, ImageError> {
         if table[0] >> 4 != 0 || table[0] & 0x0F > 3 {
             return Err(bad);
         }
+        defined.quant |= 1 << (table[0] & 0x0F);
     }
     Ok(body.len() / 65)
 }
 
 /// The Huffman tables in one DHT segment, each `Tc|Th`, sixteen code counts
 /// and that many symbols, with class and slot each 0 or 1 (baseline),
-/// consuming the body exactly. Returns how many tables it held.
-fn check_huffman_tables(body: &[u8]) -> Result<usize, ImageError> {
+/// consuming the body exactly. Records the slots it defines and returns how
+/// many tables it held.
+fn check_huffman_tables(body: &[u8], defined: &mut Slots) -> Result<usize, ImageError> {
     let bad = ImageError::BadTable { marker: DHT };
     let mut rest = body;
     let mut tables = 0;
@@ -461,6 +498,20 @@ fn check_huffman_tables(body: &[u8]) -> Result<usize, ImageError> {
         if symbols == 0 || symbols > 256 || rest.len() < 17 + symbols {
             return Err(bad);
         }
+        if !is_prefix_code(&rest[1..17]) {
+            return Err(bad);
+        }
+        let slot = 1 << (rest[0] & 0x0F);
+        if rest[0] >> 4 == 0 {
+            // A DC symbol is a magnitude category, at most 11 for 8-bit
+            // samples; libjpeg refuses anything over 15, and so does this.
+            if rest[17..17 + symbols].iter().any(|&s| s > 15) {
+                return Err(bad);
+            }
+            defined.dc |= slot;
+        } else {
+            defined.ac |= slot;
+        }
         rest = &rest[17 + symbols..];
         tables += 1;
     }
@@ -470,16 +521,37 @@ fn check_huffman_tables(body: &[u8]) -> Result<usize, ImageError> {
     Ok(tables)
 }
 
+/// Whether sixteen code-length counts describe a Huffman code a decoder will
+/// build: at each length, the codes assigned so far must leave room, and the
+/// all-ones code is reserved. This is libjpeg's own check
+/// (`jpeg_make_d_derived_tbl`), so a table it would refuse is refused here,
+/// rather than published as an image no browser shows.
+fn is_prefix_code(counts: &[u8]) -> bool {
+    let mut code: u32 = 0;
+    for (length, &count) in counts.iter().enumerate() {
+        code += u32::from(count);
+        if code >= 1 << (length + 1) {
+            return false;
+        }
+        code <<= 1;
+    }
+    true
+}
+
 /// What a frame header says, for the scan to be checked against.
 struct Frame {
     info: ImageInfo,
     /// Component ids, in frame order.
     ids: Vec<u8>,
+    /// The quantisation slot each component uses.
+    quant_slots: Vec<u8>,
 }
 
 /// A baseline frame: 8-bit samples, one (grey) or three (colour) components
-/// with distinct ids, sampling factors of 1-4 and a quantisation slot of 0-3,
-/// a length that matches, and dimensions inside the cap.
+/// with distinct ids, sampling factors of 1 or 2 totalling at most 10 blocks
+/// per unit (libjpeg's limit; anything else no browser decodes), a
+/// quantisation slot of 0-3, a length that matches, and dimensions inside
+/// the cap.
 fn check_frame(body: &[u8]) -> Result<Frame, ImageError> {
     if body.len() < 6 {
         return Err(ImageError::BadFrame);
@@ -495,13 +567,20 @@ fn check_frame(body: &[u8]) -> Result<Frame, ImageError> {
         return Err(ImageError::BadFrame);
     }
     let mut ids = Vec::with_capacity(usize::from(components));
+    let mut quant_slots = Vec::with_capacity(usize::from(components));
+    let mut blocks = 0u8;
     for spec in body[6..].chunks_exact(3) {
         let (id, sampling, slot) = (spec[0], spec[1], spec[2]);
         let (h, v) = (sampling >> 4, sampling & 0x0F);
-        if ids.contains(&id) || !(1..=4).contains(&h) || !(1..=4).contains(&v) || slot > 3 {
+        if ids.contains(&id) || !(1..=2).contains(&h) || !(1..=2).contains(&v) || slot > 3 {
             return Err(ImageError::BadFrame);
         }
+        blocks += h * v;
         ids.push(id);
+        quant_slots.push(slot);
+    }
+    if blocks > 10 {
+        return Err(ImageError::BadFrame);
     }
     if width == 0 || height == 0 || width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE {
         return Err(ImageError::Dimensions { width, height });
@@ -509,13 +588,14 @@ fn check_frame(body: &[u8]) -> Result<Frame, ImageError> {
     Ok(Frame {
         info: ImageInfo { width, height },
         ids,
+        quant_slots,
     })
 }
 
 /// The one scan must cover every component, in frame order, since there is
-/// no other scan to carry the rest, with baseline Huffman slots (0 or 1) and
-/// the baseline spectral values (0, 63, 0, 0).
-fn check_scan(body: &[u8], ids: &[u8]) -> Result<(), ImageError> {
+/// no other scan to carry the rest, with baseline Huffman slots (0 or 1)
+/// that were defined, and the baseline spectral values (0, 63, 0, 0).
+fn check_scan(body: &[u8], ids: &[u8], defined: &Slots) -> Result<(), ImageError> {
     let Some(&count) = body.first() else {
         return Err(ImageError::BadScan);
     };
@@ -523,7 +603,11 @@ fn check_scan(body: &[u8], ids: &[u8]) -> Result<(), ImageError> {
         return Err(ImageError::BadScan);
     }
     for (spec, id) in body[1..1 + 2 * ids.len()].chunks_exact(2).zip(ids) {
-        if spec[0] != *id || spec[1] >> 4 > 1 || spec[1] & 0x0F > 1 {
+        let (dc, ac) = (spec[1] >> 4, spec[1] & 0x0F);
+        if spec[0] != *id || dc > 1 || ac > 1 {
+            return Err(ImageError::BadScan);
+        }
+        if defined.dc & (1 << dc) == 0 || defined.ac & (1 << ac) == 0 {
             return Err(ImageError::BadScan);
         }
     }

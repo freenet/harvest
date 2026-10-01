@@ -97,7 +97,12 @@ impl ContractInterface for Contract {
                 // An image depends on no other contract. A node passes along
                 // related states that arrive with an upsert; they say nothing
                 // about this one, so they change nothing.
-                _ => held,
+                UpdateData::RelatedState { .. }
+                | UpdateData::RelatedDelta { .. }
+                | UpdateData::RelatedStateAndDelta { .. } => held,
+                // A kind of update this build does not know. Refused, not
+                // ignored: it might carry this contract's own state.
+                _ => return Err(invalid("unknown kind of update".into())),
             };
         }
         // Never hand back a state `validate_state` would refuse, such as

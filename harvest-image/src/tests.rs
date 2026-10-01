@@ -835,6 +835,22 @@ fn huffman_tables_must_be_baseline_and_exact() {
     assert_eq!(sniff(&before_sos(FIREFOX, &segment(DHT, &good))), refused);
 }
 
+/// An ICC APP2 body holding `profile`, as chunk 1 of 1.
+fn icc_body(profile: &[u8]) -> Vec<u8> {
+    let mut body = b"ICC_PROFILE\0\x01\x01".to_vec();
+    body.extend_from_slice(profile);
+    body
+}
+
+/// Chromium's real profile, resized to `len` bytes with its size field
+/// updated to match.
+fn profile_of_len(len: usize) -> Vec<u8> {
+    let mut profile = body_of(CHROMIUM, APP2)[14..].to_vec();
+    profile.resize(len, 0);
+    profile[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    profile
+}
+
 #[test]
 fn the_icc_profile_is_one_bounded_chunk() {
     let icc = body_of(CHROMIUM, APP2);
@@ -855,21 +871,141 @@ fn the_icc_profile_is_one_bounded_chunk() {
         bad(replace_segment(CHROMIUM, APP2, &second)),
         Err(ImageError::BadIcc)
     );
-    let mut huge = icc[..14].to_vec();
-    huge.resize(14 + MAX_ICC_PROFILE_BYTES + 1, 0);
+    let over = icc_body(&profile_of_len(MAX_ICC_PROFILE_BYTES + 1));
     assert_eq!(
-        bad(replace_segment(CHROMIUM, APP2, &huge)),
+        bad(replace_segment(CHROMIUM, APP2, &over)),
         Err(ImageError::BadIcc)
     );
-    huge.pop();
+    let at_cap = icc_body(&profile_of_len(MAX_ICC_PROFILE_BYTES));
     assert!(
-        bad(replace_segment(CHROMIUM, APP2, &huge)).is_ok(),
+        bad(replace_segment(CHROMIUM, APP2, &at_cap)).is_ok(),
         "exactly at the cap"
     );
     assert_eq!(
         bad(replace_segment(CHROMIUM, APP2, &icc[..14])),
         Err(ImageError::BadIcc),
         "no profile"
+    );
+}
+
+#[test]
+fn the_icc_chunk_must_hold_a_whole_profile() {
+    let bad = |profile: &[u8]| sniff(&replace_segment(CHROMIUM, APP2, &icc_body(profile)));
+    // Shorter than an ICC header, even with a matching size field.
+    let short = profile_of_len(ICC_PROFILE_HEADER_LEN - 1);
+    assert_eq!(bad(&short), Err(ImageError::BadIcc));
+    // Exactly a header is a well-formed (if empty) profile.
+    assert!(bad(&profile_of_len(ICC_PROFILE_HEADER_LEN)).is_ok());
+    // A size field that does not match the bytes present.
+    let mut lying = profile_of_len(600);
+    lying[3] ^= 1;
+    assert_eq!(bad(&lying), Err(ImageError::BadIcc));
+    // No profile signature: an arbitrary blob with an ICC label on it.
+    let mut unsigned = profile_of_len(600);
+    unsigned[36..40].copy_from_slice(b"GPS ");
+    assert_eq!(bad(&unsigned), Err(ImageError::BadIcc));
+}
+
+#[test]
+fn an_adobe_transform_must_be_a_known_one() {
+    let mut adobe = b"Adobe\0\x64\0\0\0\0\x02".to_vec();
+    assert!(sniff(&after_soi(FIREFOX, &segment(APP14, &adobe))).is_ok());
+    adobe[11] = 3;
+    assert_eq!(
+        sniff(&after_soi(FIREFOX, &segment(APP14, &adobe))),
+        Err(ImageError::BadAdobe)
+    );
+}
+
+#[test]
+fn sampling_must_stay_within_what_a_decoder_takes() {
+    // Each factor 1 or 2: three components at 2x2 is 12 blocks, over 10.
+    let mut frame = frame_body(3);
+    for k in 0..3 {
+        frame[7 + 3 * k] = 0x22;
+    }
+    assert_eq!(
+        sniff(&replace_segment(FIREFOX, SOF0, &frame)),
+        Err(ImageError::BadFrame)
+    );
+    // 2x2 + 2x1 + 2x1 is 8 blocks: accepted.
+    let mut frame = frame_body(3);
+    frame[7] = 0x22;
+    frame[10] = 0x21;
+    frame[13] = 0x21;
+    assert!(sniff(&replace_segment(FIREFOX, SOF0, &frame)).is_ok());
+    // A factor of 3 or 4 is refused even within the block budget.
+    for sampling in [0x31, 0x13, 0x41] {
+        let mut frame = frame_body(1);
+        frame[7] = sampling;
+        assert_eq!(
+            sniff(&replace_segment(GREY, SOF0, &frame)),
+            Err(ImageError::BadFrame),
+            "{sampling:02X}"
+        );
+    }
+}
+
+#[test]
+fn every_table_named_must_be_defined() {
+    // Grey has one quantisation table (slot 0) and Huffman tables in DC
+    // slot 0 and AC slot 0 only.
+    let mut frame = frame_body(1);
+    frame[8] = 1;
+    assert_eq!(
+        sniff(&replace_segment(GREY, SOF0, &frame)),
+        Err(ImageError::BadFrame),
+        "quant slot 1"
+    );
+    let scan = body_of(GREY, SOS);
+    let mut dc_one = scan.clone();
+    dc_one[2] = 0x10;
+    assert_eq!(
+        sniff(&replace_segment(GREY, SOS, &dc_one)),
+        Err(ImageError::BadScan),
+        "DC slot 1"
+    );
+    let mut ac_one = scan.clone();
+    ac_one[2] = 0x01;
+    assert_eq!(
+        sniff(&replace_segment(GREY, SOS, &ac_one)),
+        Err(ImageError::BadScan),
+        "AC slot 1"
+    );
+    // Slots past any a baseline file can define: refused, and the slot
+    // number is never used as a shift count (it would overflow).
+    for spec in [0xF0, 0x0F, 0x90, 0x09] {
+        let mut wild = scan.clone();
+        wild[2] = spec;
+        assert_eq!(
+            sniff(&replace_segment(GREY, SOS, &wild)),
+            Err(ImageError::BadScan),
+            "{spec:02X}"
+        );
+    }
+}
+
+#[test]
+fn a_huffman_table_holds_at_most_256_symbols() {
+    // One AC table in slot 1: 16 code counts summing to `n`, then n symbols.
+    let table = |n: usize| {
+        let mut t = vec![0x11];
+        let mut counts = [0u8; 16];
+        let mut left = n;
+        for c in counts.iter_mut().rev() {
+            let take = left.min(255);
+            *c = take as u8;
+            left -= take;
+        }
+        t.extend_from_slice(&counts);
+        t.extend(std::iter::repeat_n(0u8, n));
+        t
+    };
+    // The grey file has two tables, so a third and fourth fit under the cap.
+    assert!(sniff(&before_sos(GREY, &segment(DHT, &table(256)))).is_ok());
+    assert_eq!(
+        sniff(&before_sos(GREY, &segment(DHT, &table(257)))),
+        Err(ImageError::BadTable { marker: DHT })
     );
 }
 
@@ -894,4 +1030,51 @@ fn strip_keeps_an_adobe_segment_and_drops_another_app14() {
     assert_eq!(strip(&with_adobe).as_deref(), Ok(&with_adobe[..]));
     let ducky = after_soi(FIREFOX, &segment(APP14, b"Ducky\0\x01"));
     assert_eq!(strip(&ducky).as_deref(), Ok(FIREFOX));
+}
+
+/// A Huffman table for `class_slot` with `counts` and the given symbols.
+fn huffman(class_slot: u8, counts: [u8; 16], symbols: &[u8]) -> Vec<u8> {
+    let mut t = vec![class_slot];
+    t.extend_from_slice(&counts);
+    t.extend_from_slice(symbols);
+    t
+}
+
+#[test]
+fn a_huffman_table_must_be_a_code_a_decoder_can_build() {
+    let extra = |table: Vec<u8>| sniff(&before_sos(GREY, &segment(DHT, &table)));
+    let refused = Err(ImageError::BadTable { marker: DHT });
+    // Three one-bit codes: there are only two.
+    let mut counts = [0; 16];
+    counts[0] = 3;
+    assert_eq!(extra(huffman(0x11, counts, &[1, 2, 3])), refused);
+    // Two one-bit codes: fits, but uses the all-ones code, which is reserved.
+    counts[0] = 2;
+    assert_eq!(extra(huffman(0x11, counts, &[1, 2])), refused);
+    // One one-bit code and two two-bit codes: the second two-bit code is
+    // all ones again.
+    counts[0] = 1;
+    counts[1] = 2;
+    assert_eq!(extra(huffman(0x11, counts, &[1, 2, 3])), refused);
+    // One of each: a proper code.
+    counts[1] = 1;
+    assert!(extra(huffman(0x11, counts, &[1, 2])).is_ok());
+    // Twelve one-bit codes, which codex found the earlier check accepted.
+    let mut counts = [0; 16];
+    counts[0] = 12;
+    assert_eq!(extra(huffman(0x11, counts, &[0; 12])), refused);
+}
+
+#[test]
+fn a_dc_symbol_is_a_magnitude_category_of_at_most_15() {
+    let extra = |table: Vec<u8>| sniff(&before_sos(GREY, &segment(DHT, &table)));
+    let mut counts = [0; 16];
+    counts[1] = 2;
+    assert!(extra(huffman(0x01, counts, &[0, 15])).is_ok());
+    assert_eq!(
+        extra(huffman(0x01, counts, &[0, 16])),
+        Err(ImageError::BadTable { marker: DHT })
+    );
+    // The same symbol is fine in an AC table, where it means something else.
+    assert!(extra(huffman(0x11, counts, &[0, 16])).is_ok());
 }
