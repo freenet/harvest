@@ -1,51 +1,4 @@
-//! The rules for a Harvest listing image, shared by the image contract, the
-//! seller's upload path and the buyer's display path.
-//!
-//! # The shape (Ian, 2026-10-01)
-//!
-//! An image is a contract whose parameters are the BLAKE3 hash of its state.
-//! The state is the image file itself, nothing else: no wrapper, no type
-//! field. A listing names an image by that hash, and anyone can derive the
-//! contract key from it.
-//!
-//! # One format, so no MIME type
-//!
-//! Every upload is re-encoded in the browser, so the stored format is ours to
-//! fix, and it is fixed at **baseline JPEG**. Nothing declares a type, so
-//! nothing can declare a wrong one; a reader always builds an `image/jpeg`
-//! blob. JPEG rather than WebP because every browser's canvas encodes JPEG,
-//! while Safari's canvas cannot encode WebP at all (it silently returns PNG).
-//!
-//! # Why an allowlist over the whole file
-//!
-//! A JPEG can carry a seller's location in places a header check never
-//! reaches: an APP1 Exif or XMP segment anywhere before the scan, a second
-//! picture with its own Exif after the first end-of-image marker (MPF, which
-//! phone cameras write), or a JFIF thumbnail. So [`sniff`] walks every
-//! segment to the end of the file, accepts only the segments a canvas
-//! encoder writes, checks each one's body against its fixed form, and
-//! refuses everything else, including any byte after the end-of-image
-//! marker. Real output from Chromium, Firefox and WebKit is in
-//! `tests/fixtures/` and must keep passing.
-//!
-//! The threat this answers is a seller's own browser leaking a photo's
-//! location by ACCIDENT, through the containers cameras fill in. A seller
-//! who means to hide bytes in their own photo can still do it in table
-//! values or the compressed data; no check short of re-encoding closes
-//! that, and nothing here claims to.
-//!
-//! **What this does not prove**: that the entropy-coded data decodes to a
-//! sensible picture. Only a full decode could, and the buyer's browser does
-//! that decode, in its sandbox, at dimensions this module has bounded.
-//!
-//! # One crate for all three checks
-//!
-//! The contract, the seller's pre-publish check and the buyer's pre-display
-//! check all call this crate at one commit, so they cannot disagree. It
-//! depends on `blake3` alone and nothing in `harvest-common`, so ordinary
-//! Harvest changes never move the image contract's code hash, and with it
-//! every image's address.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -549,9 +502,10 @@ struct Frame {
 
 /// A baseline frame: 8-bit samples, one (grey) or three (colour) components
 /// with distinct ids, sampling factors of 1 or 2 totalling at most 10 blocks
-/// per unit (libjpeg's limit; anything else no browser decodes), a
-/// quantisation slot of 0-3, a length that matches, and dimensions inside
-/// the cap.
+/// per unit (libjpeg's block limit), a quantisation slot of 0-3, a length
+/// that matches, and dimensions inside the cap. libjpeg itself allows
+/// factors up to 4, so this refuses some files a browser would show (4:1:1);
+/// every canvas writes 1 or 2, which is all an upload ever is.
 fn check_frame(body: &[u8]) -> Result<Frame, ImageError> {
     if body.len() < 6 {
         return Err(ImageError::BadFrame);
@@ -617,51 +571,8 @@ fn check_scan(body: &[u8], ids: &[u8], defined: &Slots) -> Result<(), ImageError
     Ok(())
 }
 
-/// The JPEG with every segment [`sniff`] would refuse as metadata removed,
-/// and anything after end-of-image dropped. For the seller's upload path: a
-/// browser that ever writes metadata into its canvas output (an engine not in
-/// `tests/fixtures/`) still produces a publishable image, and the result is
-/// then checked with [`sniff`] like any other.
-///
-/// It removes only what carries no picture: APPn segments other than a
-/// thumbnail-free JFIF header, an ICC profile and an Adobe colour marker;
-/// comments; and trailing data, which is where a second (MPF) picture sits.
-/// It does not convert progressive files, add or remove scans, or repair a
-/// truncated file; those are refused with the same errors as [`sniff`].
-pub fn strip(bytes: &[u8]) -> Result<Vec<u8>, ImageError> {
-    let parsed = parse(bytes)?;
-    let mut out = Vec::with_capacity(bytes.len());
-    out.extend_from_slice(&[0xFF, SOI]);
-    let mut kept_jfif = false;
-    for seg in &parsed.head {
-        let keep = match seg.marker {
-            APP0 => !kept_jfif && check_jfif(seg.body).is_ok(),
-            APP2 => seg.body.starts_with(ICC_TAG),
-            APP14 => seg.body.starts_with(ADOBE_TAG),
-            0xE0..=0xEF | COM => false,
-            _ => true,
-        };
-        if !keep {
-            continue;
-        }
-        if seg.marker == APP0 {
-            kept_jfif = true;
-        }
-        write_segment(&mut out, seg.marker, seg.body);
-    }
-    write_segment(&mut out, SOS, parsed.scan_header);
-    out.extend_from_slice(parsed.entropy);
-    out.extend_from_slice(&[0xFF, EOI]);
-    Ok(out)
-}
-
-fn write_segment(out: &mut Vec<u8>, marker: u8, body: &[u8]) {
-    // `parse` read this length from a u16 field, so it fits back into one.
-    let len = (body.len() + 2) as u16;
-    out.extend_from_slice(&[0xFF, marker]);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(body);
-}
+mod strip;
+pub use strip::strip;
 
 #[cfg(test)]
 mod tests;

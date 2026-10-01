@@ -24,4 +24,7 @@
 # `harvest-common`, and `scripts/build-contract-wasm.sh` builds it in a cargo
 # invocation of its own, so no other crate's features reach it. Both are so
 # that this file stays short: an ordinary Harvest change cannot move it. A
-# toolchain, stdlib or blake3 change can.
+# toolchain, stdlib or blake3 change can, and so can ANY edit to
+# `harvest-image/src/lib.rs` or `contracts/image-contract/src/lib.rs` that
+# moves a line, comments included: release WASM embeds panic locations. See
+# `harvest-image/README.md`.
