@@ -147,7 +147,9 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         return store.needs_you() > 0
             || store.expired_invoices > 0
             || state.wallet_gap_note_due(&store.contract_id).is_some()
-            || !state.instant_checkout_alerts(&store.contract_id).is_empty();
+            || !state
+                .instant_checkout_order_alerts(&store.contract_id)
+                .is_empty();
     }
     store.needs_you() > 0
         || store.unpriced > 0
@@ -288,13 +290,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                             .count()
                     })
                     .unwrap_or(0),
-                // A request on a store closed for good can never be
-                // invoiced, so it is nothing the seller can do.
-                requests: if browsing.is_some_and(|b| b.closed) {
-                    0
-                } else {
-                    super::message_view::requests_awaiting_invoice(state, id)
-                },
+                requests: super::message_view::requests_awaiting_invoice(state, id),
                 record: browsing
                     .map(|b| b.record_badge().1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
@@ -807,7 +803,7 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
             if let (None, Some(name)) = (conflict.closing.as_ref(), conflict.resend.as_ref()) {
                 p { class: "text-muted",
                     "Closing {name} was sent but hasn\u{2019}t shown up yet. You can send it \
-                     again; the other store can\u{2019}t be closed until it shows."
+                     again; until it shows, only {name} can be closed."
                 }
             }
             if let Some(name) = conflict.closing.clone() {
@@ -1100,7 +1096,13 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                 )
             })
     };
-    let alerts = APP_STATE.read().instant_checkout_alerts(&store.contract_id);
+    let alerts = if store.closed {
+        APP_STATE
+            .read()
+            .instant_checkout_order_alerts(&store.contract_id)
+    } else {
+        APP_STATE.read().instant_checkout_alerts(&store.contract_id)
+    };
     // The paid orders to send, each on its own card with Mark as sent: the
     // same list the count and the Orders tab use (`orders_to_send`).
     let to_send = APP_STATE
@@ -2543,6 +2545,43 @@ mod seller_stores_tests {
         assert!(!overview_needs(&closed, &state), "nothing about selling");
         closed.to_send = 1;
         assert!(overview_needs(&closed, &state), "its orders still count");
+        closed.to_send = 0;
+
+        // What the delegate reports about orders still counts on a closed
+        // store; what it reports about selling does not.
+        let status = |gap: Option<u64>, oversold: bool, capped: bool| {
+            harvest_common::delegate::AutoInvoiceStatus {
+                armed_at_ms: 0,
+                watched_remaining: 1,
+                invoicing_until_ms: 0,
+                last_background_run_ms: None,
+                issued_last_day: 0,
+                oversold: if oversold {
+                    vec![harvest_common::payment::OrderId([3; 32])]
+                } else {
+                    vec![]
+                },
+                paused: None,
+                wallet_gap_paid_at_ms: gap,
+                wallet_gap_limit: 100,
+                capped: capped.then(|| "too many unpaid orders".to_string()),
+                last_wakeup_ms: None,
+                watch_delegation: None,
+            }
+        };
+        let id = closed.contract_id.clone();
+        for (what, s, needs) in [
+            ("a selling cap", status(None, false, true), false),
+            ("an oversold order", status(None, true, false), true),
+            (
+                "a payment past the wallet gap",
+                status(Some(5), false, false),
+                true,
+            ),
+        ] {
+            state.auto_invoice.status.insert(id.clone(), Ok(s));
+            assert_eq!(overview_needs(&closed, &state), needs, "{what}");
+        }
     }
 
     /// The header's "needs you" pill goes to the first store something
