@@ -252,3 +252,10 @@ description = "Superseded by bounded per-call work (harvest#206): with every cap
 date = "2026-10-01"
 code_hash = "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03"
 delegate_key = "1c51568325a171b45ff957bceaf61bc05a686b8b2deab53deddb508e96925c6c"
+
+[[entry]]
+version = "V30"
+description = "Superseded by listing photos (harvest images PR 2), which changed `harvest-common`: `Listing` gained `images` (a list of `ListingImage` references, each naming an image contract by the BLAKE3 hash of its bytes, harvest#212), `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]` so every earlier listing encodes, and so is identified and signed, exactly as before; a new `listing_image` module holds the types and the store's bounds on them. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This delegate's behaviour did not change: it decodes the store state (`auto_invoice.rs`) and so carries the new field's decoder, and it never rewrites a listing, so it cannot drop photos. No secret family, request or import family changed. The parameters are unchanged (empty). The generation harvest#216 shipped (`d0fede7`)."
+date = "2026-10-02"
+code_hash = "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72"
+delegate_key = "b8ccb5678c1260d004b6cbac80aec3b6183c72edac836ec7fd4f22e67d8e67c1"

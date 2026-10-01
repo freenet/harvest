@@ -165,6 +165,13 @@ pub fn ListingForm(
                         let listing = Listing {
                             checkout,
                             choices,
+                            // This form does not edit photos yet, so an edit
+                            // keeps the ones the listing has; they are terms
+                            // like any other and go into the new id.
+                            images: editing
+                                .as_ref()
+                                .map(|l| l.images.clone())
+                                .unwrap_or_default(),
                             // Stamped by `with_derived_id` below, out of the
                             // finished terms: a listing whose id is not the
                             // one its terms give is refused by every peer
@@ -235,6 +242,10 @@ pub(crate) fn same_terms(
         created_at: _,
         checkout: original_checkout,
         choices: original_choices,
+        // Not compared: this form cannot change photos yet, so whatever the
+        // original has, the edit keeps (see the submit handler). The upload
+        // path adds them here when it lets the seller change them.
+        images: _,
     } = original;
     original_title.trim() == title.trim()
         && original_description.trim() == description.trim()
@@ -358,6 +369,7 @@ impl TermsForm {
             created_at: chrono::DateTime::UNIX_EPOCH,
             checkout,
             choices,
+            images: Vec::new(),
         };
         if let Some(problem) = probe.checkout_problem().or_else(|| probe.choices_problem()) {
             return Err(sentence(&problem));
@@ -519,6 +531,7 @@ mod tests {
 
     fn original() -> Listing {
         Listing {
+            images: Vec::new(),
             checkout: Some(FixedCheckout {
                 unit_sats: 10_000,
                 delivery: DeliveryPrice::Included,

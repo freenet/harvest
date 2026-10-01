@@ -239,3 +239,8 @@ mod tests {
         assert_eq!(original, decoded);
     }
 }
+
+// Declared here, after everything else, rather than in the list at the top:
+// a line inserted above `is_canonical_cbor` moves its panic locations, and
+// with them the code hash of every contract that links it.
+pub mod listing_image;
