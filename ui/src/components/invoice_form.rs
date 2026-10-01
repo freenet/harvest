@@ -117,8 +117,10 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
         let listed_ids: Vec<&harvest_common::payment::OrderId> =
             listed.iter().map(|order| &order.order.id).collect();
         let questions = super::message_view::seller_questions(&inbox, &listed_ids);
+        let sending: std::collections::HashSet<&harvest_common::payment::OrderId> =
+            to_send.iter().map(|order| &order.order.id).collect();
         let homes = super::message_view::thread_homes(&inbox, &listed, |order| {
-            to_send.iter().any(|t| t.order.id == order.order.id)
+            sending.contains(&order.order.id)
         });
         (
             to_send,
@@ -140,11 +142,13 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
     // This order's conversation, if it is shown under this card; else
     // whether it is shown under another of the buyer's orders
     // (`message_view::thread_homes`: one that needs the seller, then the
-    // newest).
+    // newest). Looked up in one map built per render, not by a scan of
+    // every conversation per card (review after 01f2bcf).
+    let by_order = inbox.by_order();
     let thread_for = |id: &harvest_common::payment::OrderId| {
-        inbox
-            .for_order(id)
-            .map(|thread| (thread.clone(), homes.get(&thread.tag) == Some(id)))
+        by_order
+            .get(id)
+            .map(|thread| ((*thread).clone(), homes.get(&thread.tag) == Some(id)))
     };
     // Where a card's conversation is shown under another order: that
     // conversation and the order it is under, for the pointer button.

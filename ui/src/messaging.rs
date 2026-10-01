@@ -384,6 +384,11 @@ impl BuyerConversation {
         self.keys.listing_tag(listing)
     }
 
+    /// [`ConversationKeys::listing_tagger`] for this conversation.
+    pub fn listing_tagger(&self) -> ListingTagger {
+        self.keys.listing_tagger()
+    }
+
     /// The ephemeral secret, for this crate's tests only.
     ///
     /// Exists so a test can check that the binding computed here is the
