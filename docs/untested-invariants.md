@@ -1462,6 +1462,15 @@ which is also when the store contract re-keys.
 | `harvest-image/src/lib.rs` line layout | Line numbers are part of every image's address: the release WASM embeds the `file:line:col` of each possible panic, so moving any line of `src/lib.rs`, a comment included, re-keys the image contract (measured on #212: four comment lines moved the hash). Prose lives in `harvest-image/README.md` and `strip` in `src/strip.rs` so that editing either moves nothing (measured: both edits left the hash unchanged). | **Yes, after the fact** -- the drift guard reports any move of `image_contract` on any PR. Nothing stops the edit itself. |
 | The compiled WASM | Behaves as the native tests say. | **By hand** -- `fdev verify-merge` against the built `image_contract.wasm`: a canvas fixture under its hash holds all five laws; a second image under the same key is refused with "image bytes do not hash to the contract parameters". Not run by `tests/merge-laws/run.sh`. |
 
+## Delegate work per call (added 2026-10-01, harvest#206)
+
+A node stops a delegate call after 5 s of wall clock, and the web app then gets an error it cannot attribute (#203, #204). `tests/delegate-budget` runs the COMMITTED delegate WASM under wasmtime with fuel metering and fails CI when one call is over budget. It is a separate cargo workspace, so `cargo test --workspace` does not run it; only the `delegate-budget` CI job does.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `tests/delegate-budget` | Every driven handler's single call stays under 4,000,000,000 fuel (about 1 s of copy-heavy work on nova) and 64 secret writes, with each collection it walks filled to its cap. | **Yes, for the driven handlers** -- red on the pre-#203 delegate (`GetStoreSubkeys` 2.5x-12.4x); caps are read from the delegate source, every step asserts its answer or the state it writes, and the memory cap is the node's (a smaller cap turns it red). **Red today** on the byte-cap mailbox scan (161%), a real finding whose fix is a delegate re-key. |
+| same | Handlers not driven, record sizes above the minimal fixture, secret READ time, slower-than-desktop hardware, and flows of many calls. | **No** -- listed in `tests/delegate-budget/README.md`, "What it does not cover". |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

@@ -39,12 +39,22 @@ use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Memory, Module,
 const ERR_SECRET_NOT_FOUND: i32 = -2;
 const ERR_INVALID_PARAM: i32 = -4;
 const ERR_BUFFER_TOO_SMALL: i32 = -6;
-const ERR_MEMORY_BOUNDS: i32 = -9;
+const ERR_MEMORY_BOUNDS: i32 = -7;
 
 /// Fuel handed to one `process` call. Far above any budget, so an
 /// over-budget handler is measured rather than cut off, but finite, so a
 /// runaway loop ends the run instead of hanging CI.
 pub const FUEL_CEILING: u64 = 1_000_000_000_000;
+
+/// The node's cap on a delegate's linear memory: `DEFAULT_MAX_MEMORY_PAGES`
+/// (4096 pages of 64 KiB) in freenet-core's `wasm_runtime/engine.rs`,
+/// enforced by its `ResourceLimiter`. A handler that needs more fails there,
+/// so it fails here too.
+pub const MAX_MEMORY_BYTES: usize = 4096 * 64 * 1024;
+
+/// The node keeps this secret namespace to itself: its `list_secrets` never
+/// shows a delegate a key under it (`secrets_store/store.rs`, #4117).
+const RESERVED_PREFIX: &[u8] = b"\0freenet-migrate/";
 
 /// The secret store and the other host state one delegate "lives" on.
 pub struct HostState {
@@ -57,6 +67,29 @@ pub struct HostState {
     /// guest time (what fuel measures) from host time (what it does not).
     host_calls: u64,
     host_time: Duration,
+    /// Secret writes and removals in the current call: on a node each is an
+    /// encrypted, fsync'd file write, which fuel does not see.
+    host_writes: u64,
+}
+
+impl wasmtime::ResourceLimiter for HostState {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= MAX_MEMORY_BYTES)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl HostState {
@@ -68,6 +101,7 @@ impl HostState {
             memory: None,
             host_calls: 0,
             host_time: Duration::ZERO,
+            host_writes: 0,
         }
     }
 }
@@ -82,6 +116,8 @@ pub struct CallOutcome {
     /// Host-function calls `process` made, and the wall time spent in them.
     pub host_calls: u64,
     pub host_time: Duration,
+    /// Secret writes and removals `process` made.
+    pub host_writes: u64,
 }
 
 pub struct Host {
@@ -185,6 +221,7 @@ impl Host {
             memory: None,
             host_calls: 0,
             host_time: Duration::ZERO,
+            host_writes: 0,
         };
         let (_, outcome) = run_once(&engine, &module, snapshot, 0, &origin, &msg, false)?;
         outcome
@@ -206,6 +243,7 @@ fn run_once(
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_imports(&mut linker)?;
     let mut store = Store::new(engine, state);
+    store.limiter(|state| state);
     if metered {
         // Instantiation and buffer setup are not what the node's limit is
         // applied to, and are not what this check judges.
@@ -235,6 +273,7 @@ fn run_once(
     }
     store.data_mut().host_calls = 0;
     store.data_mut().host_time = Duration::ZERO;
+    store.data_mut().host_writes = 0;
     let started = Instant::now();
     let ret = process.call(&mut store, (params, origin, inbound));
     let wall = started.elapsed();
@@ -263,7 +302,8 @@ fn run_once(
         }
     };
     let state = store.into_data();
-    let (host_calls, host_time) = (state.host_calls, state.host_time);
+    let (host_calls, host_time, host_writes) =
+        (state.host_calls, state.host_time, state.host_writes);
     Ok((
         HostState {
             memory: None,
@@ -275,6 +315,7 @@ fn run_once(
             metered_wall: wall,
             host_calls,
             host_time,
+            host_writes,
         },
     ))
 }
@@ -434,6 +475,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 ) else {
                     return ERR_MEMORY_BOUNDS;
                 };
+                caller.data_mut().host_writes += 1;
                 caller.data_mut().secrets.insert(key, value);
                 0
             })
@@ -461,6 +503,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let Some(key) = read_guest(caller, key_ptr, key_len) else {
                     return ERR_MEMORY_BOUNDS;
                 };
+                caller.data_mut().host_writes += 1;
                 match caller.data_mut().secrets.remove(&key) {
                     Some(_) => 0,
                     None => ERR_SECRET_NOT_FOUND,
@@ -474,7 +517,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     // guest).
     fn list(state: &HostState, prefix: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        for key in state.secrets.keys().filter(|k| k.starts_with(prefix)) {
+        for key in state
+            .secrets
+            .keys()
+            .filter(|k| k.starts_with(prefix) && !k.starts_with(RESERVED_PREFIX))
+        {
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
             out.extend_from_slice(key);
         }

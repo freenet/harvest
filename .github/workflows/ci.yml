@@ -281,5 +281,7 @@ jobs:
       # workspace. Formatting needs no build, so it costs nothing here.
       - name: rustfmt the harness
         run: cargo fmt --manifest-path tests/delegate-budget/Cargo.toml -- --check
+      - name: clippy the harness
+        run: cargo clippy --release --locked --manifest-path tests/delegate-budget/Cargo.toml -- -D warnings
       - name: bound each delegate call's work (fuel)
         run: cargo run --release --locked --manifest-path tests/delegate-budget/Cargo.toml

@@ -73,6 +73,11 @@ Each call works as on the node:
    version the delegate is built on.
 4. `process(params, origin, inbound)` runs. Only this call is metered.
 
+Also as on the node: linear memory is capped at 256 MiB (4096 pages, the
+node's `ResourceLimiter`), the error codes are the node's
+(`native_api::error_codes`), and `list_secrets` never shows a key in the
+node's reserved `\0freenet-migrate/` namespace.
+
 Application messages carry the Harvest web app's `MessageOrigin::WebApp`.
 Contract notifications and the background runs (lifecycle, wake-up) carry no
 origin, as the node sends them.
@@ -80,21 +85,26 @@ origin, as the node sends them.
 ## What it drives
 
 Crypto-heavy handlers first, then the handlers whose cost grows with stored
-state, filled to their caps:
+state, filled to their caps. The caps are read from the delegate's own source
+(`MAX_STORE_KEYS`, `MAX_ARMS`, `MAX_KNOWN_STORES`, `MAX_BUYER_CONVERSATIONS`,
+`SEEN_CAP`), so raising one there raises the fixture with it; a renamed
+constant fails the run.
 
 | step | why it is here |
 |---|---|
-| `CreateStoreKey` x8, `GetStoreSubkeys` x8 | the #203 call. Its old cost depended on the store key, so one key proves nothing |
+| `CreateStoreKey` to the 64-key cap, `GetStoreSubkeys` x8 | the #203 call. Its old cost depended on the store key, so one key proves nothing. Every key is created so the export below carries all of them |
 | `SignStoreUpdate`, `WrapStoreKeyFor`, `UnwrapStoreKey` | store-key custody. The vault signature is made as the Ghost Key vault makes it |
 | `InitEncryptionKey`, `DeriveConversationKeys` with 512 peers, store key and Ghost Key | 512 is the mailbox cap (`MAX_MESSAGES`), the most senders one request can name |
 | `RegisterStore`, `ListStores` | registry |
 | `SetPaymentXpub`, `DeriveOrderAddress`, `PeekOrderAddresses (10)`, `DeriveOrderAddress` with a foreign published script | BIP-32 derivation. The foreign script forces the full 100-index `PUBLISHED_INDEX_GAP` scan |
-| `ArmAutoInvoice`, forced `Heartbeat`, `GetWatchKey` | instant checkout |
-| tip notification, then a mailbox notification with 512 unread messages from 512 buyers | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and the 512 messages were recorded as read, so a refused scan cannot pass as a cheap one |
-| `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own |
-| `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap |
-| `KeepPurchase` (paid, genuine SPV proof), `ListKeptPurchases (1024)` | the kept-purchase cap. The other 1023 are seeded straight into the secret store in the delegate's own encoding. The harness checks all 1024 come back |
-| `ExportSecrets` | the migration export, run last because it disarms instant checkout |
+| `ArmAutoInvoice` to the 16-arm cap, forced `Heartbeat`, `GetWatchKey` | instant checkout. Every arm is taken so the wake-up, resubscribe and export walk all of them |
+| tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap) | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
+| a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (about 2.8 MiB, under `MAX_MAILBOX_BYTES`) | anyone can write to a store's mailbox, and decoding and decrypting grow with bytes. **Over budget today (161%)**: see below |
+| `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass |
+| `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap; the harness checks 256 come back |
+| `KeepPurchase` (paid, genuine SPV proof) into an empty store, then 1022 seeded straight into the secret store in the delegate's own encoding, then `KeepPurchase` of the 1024th at the last conversation, then `ListKeptPurchases (1024)` | the kept-purchase cap. A keep ends by listing everything kept, so a keep into a full store is its worst case. The harness checks all 1024 come back |
+| `RememberStore` to the 1024 cap, `ListRememberedStores (1024)` | the buyer's remembered stores; the harness checks 1024 come back |
+| `ExportSecrets` | the migration export with the state above, run last because it disarms instant checkout. The harness checks it carries at least as many entries as were seeded |
 
 ## Calibration
 
@@ -144,37 +154,73 @@ Same harness, same scenario, two builds of the delegate:
 
 | delegate | `GetStoreSubkeys`, 8 store keys | result |
 |---|---|---|
-| main before #203 (sha256 `d8088bf5…`, the build live when the bug was found) | 10,167,507,014 - 49,739,927,758 fuel (2.5x - 12.4x budget), 1.0 - 5.1 s unmetered | **exit 1**, all eight over |
-| #203 (sha256 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
+| main before #203 (blake3 `d8088bf5…`, the build live when the bug was found) | 10,167,507,014 - 49,739,927,758 fuel (2.5x - 12.4x budget), 1.0 - 5.1 s unmetered | **exit 1**, all eight over |
+| #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
-Largest other calls, identical on both builds:
+Largest other calls on the committed delegate (`cbe71dd9…`), with every cap
+above filled:
 
 | call | fuel | share of budget |
 |---|---:|---:|
-| `ListKeptPurchases (1024)` | 2,906,374,095 | 72.7% |
-| `ExportSecrets` with every cap full | 2,731,662,535 | 68.3% |
-| mailbox notification, 512 unread | 2,543,487,928 | 63.6% |
+| mailbox notification at the byte cap | 6,456,728,583 | **161.4%, over** |
+| `KeepPurchase`, the 1024th | 3,133,039,423 | 78.3% |
+| `ListKeptPurchases (1024)` | 2,906,368,755 | 72.7% |
+| `ExportSecrets` | 2,782,717,412 | 69.6% |
+| mailbox notification, 512 short messages | 2,546,058,099 | 63.7% |
 | `DeriveConversationKeys (512 peers)` | 1,524,552,047 | 38.1% |
+| heartbeat wake-up, 16 arms | 1,128,378,877 | 28.2% |
 | `ListBuyerConversations (256)` | 1,048,280,976 | 26.2% |
 
-These are within budget. They are also the handlers to watch: each grows with
-a collection, and at that collection's cap the top three already use 64-73% of
-the budget.
+**The byte-cap mailbox is a real finding, not a harness artefact.** Any buyer
+can fill a store's mailbox this way, and instant checkout's first scan of it
+does about 1.6x the budget: roughly 0.6-1.6 s on nova, more on a slower peer.
+Most of the cost is decoding the mailbox (ciphertexts are CBOR integer arrays,
+not byte strings) and decrypting every new message; computing each digest
+once instead of per sort comparison only brings it to 157%. The fix is in the
+delegate (bound the messages opened per notification, or change the mailbox
+encoding), so it is a re-key, and this check stays red until it lands.
+
+The others are within budget, and they are the handlers to watch: each grows
+with a collection, and at its cap the top four use 70-78% of the budget.
+
+Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
+is an encrypted, fsync'd file write that fuel does not see. The most any call
+makes today is 17 (the wake-up and the export, one per arm).
 
 ## What it does not cover
 
 * **Handlers not driven**:
   * `SetWatchDelegation` and `UpdateWatchDelegation` need a Ghost Key
-    certificate.
-  * The instant-checkout follow-ups: the store GET answer that decides a batch
-    of up to 16 instant orders, and the store UPDATE answer.
-  * Conversation export and import, migration markers and secret import.
+    certificate; so the delegated-watch part of the wake-up does no work here.
+  * The instant-checkout decide path: the store GET answer that decides a
+    batch of up to 16 instant orders (`auto_invoice::on_store_state`,
+    `decide`), and the store UPDATE answer. This is the largest unmeasured
+    piece of crypto.
+  * A mailbox full of instant `OrderRequest`s: unlike the texts above, these
+    are not marked read and are reopened on every notification.
+  * `ImportMigratedSecret` (parses an RSA key), `ExportBuyerConversation`
+    and `ImportBuyerConversation`, and the migration markers
+    (`GetMigrationMarker`, `SetMigrationMarker`, `GetPredecessorMarker`,
+    `RecordPredecessorMarker`).
+  * `GetRsaPublicKey`, `SetStoreArchived`, `ForgetBuyerConversation`,
+    `MarkConversationBackedUp`.
+  * The Bitcoin delegate's `Watch`, `Unwatch`, `ListWatched`,
+    `AssociateOrder`, `ConfigureBridge`, `GetBridge`, `GetPaymentXpub`.
   * `CreateListing`, which is a stub.
 
   To add one, add a step to `scenario()` in `src/main.rs` with real inputs,
-  and assert its answer.
-* **Host time.** Fuel bounds guest work only. A handler that makes thousands
-  of secret-store calls is reported with its host call count but judged only
-  on its fuel.
+  and assert its answer (or the state it writes).
+* **Record sizes.** Kept purchases are seeded at the size a minimal paid
+  order has. A record may be much larger (`MAX_KEPT_PURCHASE_BYTES`, with a
+  complaint and longer proofs); wasmtime charges a bulk copy one unit of fuel
+  whatever its size, so larger records cost more time than fuel shows.
+* **Host time beyond writes.** Fuel bounds guest work and `BUDGET_WRITES`
+  bounds writes; secret reads are reported (the "host calls" column, up to
+  about 4,600 for the export) but not judged. On a node each read is a file
+  read and a decrypt.
+* **Slow hardware.** The 5x margin is measured on a desktop-class CPU. A
+  Raspberry Pi-class peer can run unoptimised Cranelift code several times
+  slower, which uses most of that margin on its own; the calls at 70-78% are
+  then the ones at risk.
 * **Anything but one call.** The node's limit is per call. A flow that makes
   many calls is bounded per call, not in total.

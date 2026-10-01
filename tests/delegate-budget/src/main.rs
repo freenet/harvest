@@ -57,17 +57,62 @@ const BUDGET_FUEL: u64 = 4_000_000_000;
 /// The seconds of work [`BUDGET_FUEL`] stands for, for the report only.
 const BUDGET_SECONDS: f64 = 1.0;
 
+/// The most secret writes and removals one call may make. Fuel does not
+/// see them, and on a node each is an encrypted file write with an fsync
+/// (`secrets_store/store.rs`): 5-30 ms on slow storage, so 64 is up to about
+/// two seconds there. The most measured today is 17 (a wake-up or an export
+/// with every arm taken: one write per arm).
+const BUDGET_WRITES: u64 = 64;
+
 /// How many store keys to derive subkeys for. `GetStoreSubkeys` cost used to
 /// depend on the store key (a seeded RSA prime search), so one key proves
 /// nothing either way; the #203 probe saw 0.85-5 s across keys.
 const STORE_KEYS: usize = 8;
 
+/// The delegate's caps this scenario fills, read from its source so a raised
+/// cap raises the fixture with it ([`delegate_cap`]).
+fn caps() -> Result<Caps> {
+    Ok(Caps {
+        store_keys: delegate_cap("store_keys.rs", "MAX_STORE_KEYS")?,
+        arms: delegate_cap("auto_invoice.rs", "MAX_ARMS")?,
+        known_stores: delegate_cap("known_stores.rs", "MAX_KNOWN_STORES")?,
+        buyer_conversations: delegate_cap("messaging.rs", "MAX_BUYER_CONVERSATIONS")?,
+    })
+}
+
+struct Caps {
+    store_keys: usize,
+    arms: usize,
+    known_stores: usize,
+    buyer_conversations: usize,
+}
+
+/// `pub(crate) const {name}: usize = N;` in the delegate's `src/{file}`.
+/// The constants are crate-private, so they are read from the source; a
+/// renamed or reshaped constant fails the run rather than leaving a stale
+/// fixture size.
+fn delegate_cap(file: &str, name: &str) -> Result<usize> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../delegates/harvest-delegate/src")
+        .join(file);
+    let src = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let needle = format!("const {name}: usize = ");
+    let rest = src
+        .split(&needle)
+        .nth(1)
+        .ok_or_else(|| anyhow!("{name} not found in {file}: update the harness"))?;
+    rest.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .replace('_', "")
+        .parse()
+        .with_context(|| format!("{name} in {file} is not a plain number"))
+}
+
 /// The mailbox cap (`harvest_common::mailbox::MAX_MESSAGES`): the most
 /// distinct senders one `DeriveConversationKeys` can name.
 const MAILBOX_PEERS: usize = harvest_common::mailbox::MAX_MESSAGES;
-
-/// `messaging::MAX_BUYER_CONVERSATIONS`: conversations a buyer keeps.
-const BUYER_CONVERSATIONS: usize = 256;
 
 /// `harvest_common::delegate::MAX_KEPT_PURCHASES`: purchases a buyer keeps.
 const KEPT_PURCHASES: usize = harvest_common::delegate::MAX_KEPT_PURCHASES;
@@ -79,6 +124,9 @@ struct Measured {
     /// only: fuel does not count host time, so this shows how much of a call
     /// happens outside it).
     host_calls: u64,
+    /// Secret writes and removals the call made (each an fsync'd file write
+    /// on a node; see [`BUDGET_WRITES`]).
+    host_writes: u64,
     /// `--calibrate` only: the best unmetered, node-like wall time of
     /// `process`, and the part of it spent in host functions.
     timing: Option<(Duration, Duration)>,
@@ -110,7 +158,7 @@ impl Runner {
         let origin = self.origin.clone();
         let timing = self.time(Some(&origin), &msg)?;
         let outcome = self.host.call(Some(&origin), &msg)?;
-        self.record(name, outcome.fuel, outcome.host_calls, timing);
+        self.record(name, &outcome, timing);
         outcome
             .result
             .map_err(|e| anyhow!("{name}: the delegate returned an error: {e}"))
@@ -131,7 +179,7 @@ impl Runner {
         });
         let timing = self.time(None, &msg)?;
         let outcome = self.host.call(None, &msg)?;
-        self.record(name, outcome.fuel, outcome.host_calls, timing);
+        self.record(name, &outcome, timing);
         outcome
             .result
             .map_err(|e| anyhow!("{name}: the delegate returned an error: {e}"))
@@ -142,7 +190,7 @@ impl Runner {
     /// with no origin.
     fn background(&mut self, name: &str, raw: &[u8]) -> Result<Vec<OutboundDelegateMsg>> {
         let outcome = self.host.call_raw(None, raw)?;
-        self.record(name, outcome.fuel, outcome.host_calls, None);
+        self.record(name, &outcome, None);
         outcome
             .result
             .map_err(|e| anyhow!("{name}: the delegate returned an error: {e}"))
@@ -169,16 +217,16 @@ impl Runner {
     fn record(
         &mut self,
         name: &str,
-        fuel: Option<u64>,
-        host_calls: u64,
+        outcome: &host::CallOutcome,
         timing: Option<(Duration, Duration)>,
     ) {
-        let shown = fuel.map_or("past the ceiling".to_string(), group);
-        println!("  {name:<52} {shown:>18}");
+        let shown = outcome.fuel.map_or("past the ceiling".to_string(), group);
+        println!("  {name:<52} {shown:>18} {:>6} writes", outcome.host_writes);
         self.measured.push(Measured {
             name: name.to_string(),
-            fuel,
-            host_calls,
+            fuel: outcome.fuel,
+            host_calls: outcome.host_calls,
+            host_writes: outcome.host_writes,
             timing,
         });
     }
@@ -289,14 +337,23 @@ fn group(n: u64) -> String {
 /// What the Harvest web app and the node send the delegate, in the order a
 /// seller (and then a buyer) would. Crypto-heavy handlers first.
 fn scenario(r: &mut Runner) -> Result<()> {
+    let caps = caps()?;
+    let buyer_conversations = caps.buyer_conversations;
     let ghost = SigningKey::from_bytes(&[0x42; 32]);
     let fingerprint = "budget-seller-fp".to_string();
 
     // --- store keys (harvest#93 phase 1b) --------------------------------
+    // Every store key the delegate will hold: export and the per-key walks
+    // read them all.
     let mut stores = Vec::new();
-    for i in 0..STORE_KEYS {
+    for i in 0..caps.store_keys {
+        let name = if i < STORE_KEYS || i == caps.store_keys - 1 {
+            format!("CreateStoreKey #{i}")
+        } else {
+            "CreateStoreKey (filling to the cap)".to_string()
+        };
         let answer = r.app(
-            &format!("CreateStoreKey #{i}"),
+            &name,
             cbor(&HarvestDelegateRequest::CreateStoreKey {
                 request_id: i as u64,
                 ghostkey_fingerprint: None,
@@ -312,7 +369,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // The call that tripped the node's limit in #203: the UI sends it right
     // after a store key arrives, and it gates store creation.
     let mut inbox_keys = Vec::new();
-    for (i, store) in stores.iter().enumerate() {
+    for (i, store) in stores.iter().take(STORE_KEYS).enumerate() {
         let answer = r.app(
             &format!("GetStoreSubkeys #{i}"),
             cbor(&HarvestDelegateRequest::GetStoreSubkeys {
@@ -516,6 +573,34 @@ fn scenario(r: &mut Runner) -> Result<()> {
         }),
         "Heartbeat",
     )?;
+    // Every arm the delegate takes: the wake-up and resubscribe walk them all.
+    for (i, store_key) in stores.iter().enumerate().take(caps.arms).skip(1) {
+        let mut contract = [0x51u8; 32];
+        contract[1] = i as u8;
+        // Its own mailbox: the scan below is of the first store's.
+        let mut mailbox = [0x53u8; 32];
+        mailbox[1] = i as u8;
+        r.app(
+            "ArmAutoInvoice (filling to the cap)",
+            cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(AutoInvoiceArm {
+                    store_contract_id: contract.to_vec(),
+                    store_verifying_key: *store_key,
+                    mailbox_contract_id: mailbox,
+                    seller_fingerprint: fingerprint.clone(),
+                    network: BitcoinNetwork::Signet,
+                    tip_contract_id: tip_contract,
+                    trusted_bridges: vec![bridge_id],
+                    address_code_hash: [0x56; 32],
+                    watched_scripts: Vec::new(),
+                    watch_left_ms: 24 * 3600 * 1000,
+                    watched_until_height: None,
+                    presence_contract_id: Some([0x57; 32]),
+                }),
+            }),
+            "AutoInvoice",
+        )?;
+    }
     r.app(
         "GetWatchKey",
         cbor(&HarvestDelegateRequest::GetWatchKey),
@@ -601,24 +686,97 @@ fn scenario(r: &mut Runner) -> Result<()> {
         "harvest:auto:ledger:{}",
         bs58::encode(store_contract).into_string()
     );
-    match r.host.state.secrets.get(ledger.as_bytes()) {
-        Some(l) if l.len() >= MAILBOX_PEERS * 32 => {}
-        other => bail!(
-            "the mailbox notification did not record the {MAILBOX_PEERS} messages as read \
-             (ledger {} bytes): the scan was refused or skipped, so its cost was not measured",
-            other.map_or(0, Vec::len)
-        ),
+    let seen = ledger_seen(r, &ledger)?;
+    if seen < MAILBOX_PEERS {
+        bail!(
+            "the mailbox notification recorded {seen} of the {MAILBOX_PEERS} messages as read: \
+             the scan was refused or skipped, so its cost was not measured"
+        );
+    }
+
+    // The same mailbox at its BYTE cap rather than its count cap: every size
+    // class as full as `SIZE_CLASS_CAPS` lets it be, each message from a new
+    // buyer. Decrypting and hashing grow with bytes, not with count.
+    let class_caps = harvest_common::mailbox::SIZE_CLASS_CAPS;
+    let buckets = harvest_common::mailbox::SIZE_BUCKETS;
+    let mut sizes = Vec::new();
+    for class in (0..buckets.len()).rev() {
+        let room = class_caps[class] - sizes.len().min(class_caps[class]);
+        // A text that pads into this bucket and no further.
+        let len = buckets[class] - 200;
+        sizes.extend(std::iter::repeat_n(len, room));
+    }
+    let big: Vec<harvest_common::mailbox::EncryptedMessage> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let mut seed = [0x90u8; 32];
+            seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            let buyer = StaticSecret::from(seed);
+            let tag = *PublicKey::from(&buyer).as_bytes();
+            let shared = buyer.diffie_hellman(&PublicKey::from(inbox)).to_bytes();
+            let key = harvest_common::mailbox::conversation_key_from_dh(
+                &shared,
+                harvest_common::mailbox::MessageDirection::BuyerToSeller,
+            );
+            fixtures::encrypt_message_seeded(
+                &harvest_common::sealed::PlaintextMessage {
+                    conversation_id: harvest_common::mailbox::ConversationId([(i % 251) as u8; 32]),
+                    content: harvest_common::sealed::MessageContent::Text("x".repeat(len)),
+                },
+                &tag,
+                &key,
+                r.host.state.now - chrono::Duration::seconds(i as i64),
+                10_000 + i as u64,
+            )
+        })
+        .collect();
+    let big_state = harvest_common::mailbox::MailboxStateV1 { messages: big };
+    let big_bytes = cbor(&big_state);
+    println!(
+        "  (byte-cap mailbox: {} messages, {} KiB)",
+        big_state.messages.len(),
+        big_bytes.len() / 1024
+    );
+    r.notify(
+        "ContractNotification: mailbox (byte cap, unread)",
+        mailbox_contract,
+        big_bytes,
+    )?;
+    let seen_after = ledger_seen(r, &ledger)?;
+    let seen_cap = delegate_cap("auto_invoice.rs", "SEEN_CAP")?;
+    if seen_after < (seen + MAILBOX_PEERS).min(seen_cap) {
+        bail!(
+            "the byte-cap mailbox scan recorded {} new messages as read",
+            seen_after - seen
+        );
     }
 
     // --- runs the node starts on its own ------------------------------------
     // Byte layouts pinned in `node_glue`'s tests against stdlib 0.12.0.
-    r.background("Background: Installed", &[0x0a, 0, 0, 0, 0, 0, 0, 0])?;
-    r.background("Background: NodeStarted", &[0x0a, 0, 0, 0, 1, 0, 0, 0, 0])?;
+    // Both resubscribe every arm (`auto_invoice::resubscribe_all`): with
+    // arms taken, an empty answer means an early return.
+    for (name, raw) in [
+        ("Background: Installed", vec![0x0a, 0, 0, 0, 0, 0, 0, 0]),
+        (
+            "Background: NodeStarted",
+            vec![0x0a, 0, 0, 0, 1, 0, 0, 0, 0],
+        ),
+    ] {
+        if r.background(name, &raw)?.is_empty() {
+            bail!("{name} resubscribed nothing: it returned early, so its cost was not measured");
+        }
+    }
     let mut wakeup = vec![0x09, 0, 0, 0];
     wakeup.extend_from_slice(&9u64.to_le_bytes());
     wakeup.extend_from_slice(b"heartbeat");
     r.host.state.now += chrono::Duration::minutes(5);
-    r.background("Background: heartbeat wake-up", &wakeup)?;
+    let woke = r.background("Background: heartbeat wake-up", &wakeup)?;
+    if woke.is_empty() {
+        bail!(
+            "the heartbeat wake-up sent nothing: it returned early, so its cost was not measured"
+        );
+    }
 
     // --- the buyer's half ---------------------------------------------------
     let orders = fixtures::OrderFx {
@@ -627,12 +785,12 @@ fn scenario(r: &mut Runner) -> Result<()> {
     };
     let seller_store_key = orders.seller.verifying_key().to_bytes();
     let mut first_secret = None;
-    for i in 0..BUYER_CONVERSATIONS {
+    for i in 0..buyer_conversations {
         let mut secret = [0x60u8; 32];
         secret[1..9].copy_from_slice(&(i as u64).to_le_bytes());
         first_secret.get_or_insert(secret);
         let conversation = *PublicKey::from(&StaticSecret::from(secret)).as_bytes();
-        let name = if i == 0 || i == BUYER_CONVERSATIONS - 1 {
+        let name = if i == 0 || i == buyer_conversations - 1 {
             format!("StoreBuyerConversation #{i}")
         } else {
             // Measured like every other call; named alike so the report
@@ -652,14 +810,18 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "BuyerConversationStored",
         )?;
     }
-    r.app(
-        &format!("ListBuyerConversations ({BUYER_CONVERSATIONS})"),
+    let listed = r.app(
+        &format!("ListBuyerConversations ({buyer_conversations})"),
         cbor(&HarvestDelegateRequest::ListBuyerConversations {
             request_id: 900,
             store_contract_id: store_contract.to_vec(),
         }),
         "BuyerConversationList",
     )?;
+    let n = count_array_somewhere(&listed);
+    if n != buyer_conversations {
+        bail!("ListBuyerConversations answered {n} conversations, expected {buyer_conversations}");
+    }
 
     let secret = first_secret.expect("at least one conversation");
     let conversation = *PublicKey::from(&StaticSecret::from(secret)).as_bytes();
@@ -683,7 +845,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // Fill to the cap directly in the secret store, in the delegate's own
     // encoding and key scheme (`kept_purchases::kept_purchase_key`); keeping
     // 1024 through the handler would only measure the handler 1024 times.
-    for n in 1..KEPT_PURCHASES as u32 {
+    for n in 1..(KEPT_PURCHASES - 1) as u32 {
         let record = KeptPurchase {
             store_key: seller_store_key,
             conversation,
@@ -704,6 +866,32 @@ fn scenario(r: &mut Runner) -> Result<()> {
             cbor(&record),
         );
     }
+    // The last slot through the handler, at the conversation found last: a
+    // keep ends by listing every kept purchase and looks its conversation's
+    // seed up among all of them, so the full store is its worst case.
+    let last_secret = {
+        let mut secret = [0x60u8; 32];
+        secret[1..9].copy_from_slice(&((buyer_conversations - 1) as u64).to_le_bytes());
+        secret
+    };
+    let last_conversation = *PublicKey::from(&StaticSecret::from(last_secret)).as_bytes();
+    let last_receipt = SigningKey::from_bytes(
+        &harvest_common::mailbox::buyer_receipt_seed_from_secret(&last_secret),
+    )
+    .verifying_key()
+    .to_bytes();
+    r.app(
+        &format!("KeepPurchase (the {KEPT_PURCHASES}th, store full)"),
+        cbor(&HarvestDelegateRequest::KeepPurchase {
+            keep: Box::new(PurchaseToKeep {
+                store_key: seller_store_key,
+                conversation: last_conversation,
+                order: orders.paid(orders.order(KEPT_PURCHASES as u32, last_receipt)),
+                complaint: None,
+            }),
+        }),
+        "KeptPurchases",
+    )?;
     let kept = r.app(
         &format!("ListKeptPurchases ({KEPT_PURCHASES})"),
         cbor(&HarvestDelegateRequest::ListKeptPurchases),
@@ -721,6 +909,36 @@ fn scenario(r: &mut Runner) -> Result<()> {
         ),
     }
 
+    // --- the buyer's remembered stores, to the cap --------------------------
+    for i in 0..caps.known_stores {
+        let mut seed = [0x33u8; 32];
+        seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+        let code =
+            harvest_common::store::store_code(&SigningKey::from_bytes(&seed).verifying_key());
+        let name = if i + 1 == caps.known_stores {
+            format!("RememberStore (the {}th)", caps.known_stores)
+        } else {
+            "RememberStore (filling to the cap)".to_string()
+        };
+        r.app(
+            &name,
+            cbor(&HarvestDelegateRequest::RememberStore { store_code: code }),
+            "RememberedStores",
+        )?;
+    }
+    let remembered = r.app(
+        &format!("ListRememberedStores ({})", caps.known_stores),
+        cbor(&HarvestDelegateRequest::ListRememberedStores),
+        "RememberedStores",
+    )?;
+    let n = count_array_somewhere(&remembered);
+    if n != caps.known_stores {
+        bail!(
+            "ListRememberedStores answered {n} stores, expected {}",
+            caps.known_stores
+        );
+    }
+
     // --- the migration export, last: it disarms instant checkout -----------
     let out = r.send(
         "ExportSecrets (migration)",
@@ -729,7 +947,10 @@ fn scenario(r: &mut Runner) -> Result<()> {
         }),
     )?;
     let exported = first_app_payload(&out).ok_or_else(|| anyhow!("export answered nothing"))?;
-    freenet_migrate_check(&exported)?;
+    freenet_migrate_check(
+        &exported,
+        KEPT_PURCHASES + buyer_conversations + caps.known_stores,
+    )?;
 
     Ok(())
 }
@@ -737,12 +958,49 @@ fn scenario(r: &mut Runner) -> Result<()> {
 /// The export answers `freenet_migrate::ExportedSecrets`, not a Harvest
 /// response. Checked only for being a non-empty CBOR value: its contents are
 /// `freenet-migrate`'s business and tested there.
-fn freenet_migrate_check(bytes: &[u8]) -> Result<()> {
+fn freenet_migrate_check(bytes: &[u8], at_least: usize) -> Result<()> {
     let v: Value = ciborium::from_reader(bytes).context("export is not CBOR")?;
-    if matches!(v, Value::Null) {
-        bail!("export answered null");
+    let n = count_array_somewhere(&v);
+    if n < at_least {
+        bail!(
+            "the export carried {n} entries, fewer than the {at_least} secrets seeded: it was \
+             refused or cut short, so its cost was not measured ({})",
+            brief(&v)
+        );
     }
     Ok(())
+}
+
+/// The length of the longest array anywhere in `v`: the list an answer
+/// carries, whatever its envelope.
+fn count_array_somewhere(v: &Value) -> usize {
+    match v {
+        Value::Array(items) => items
+            .len()
+            .max(items.iter().map(count_array_somewhere).max().unwrap_or(0)),
+        Value::Map(entries) => entries
+            .iter()
+            .map(|(_, v)| count_array_somewhere(v))
+            .max()
+            .unwrap_or(0),
+        Value::Tag(_, inner) => count_array_somewhere(inner),
+        _ => 0,
+    }
+}
+
+/// How many message digests the instant-checkout ledger records as read.
+fn ledger_seen(r: &Runner, key: &str) -> Result<usize> {
+    let bytes = r
+        .host
+        .state
+        .secrets
+        .get(key.as_bytes())
+        .ok_or_else(|| anyhow!("no instant-checkout ledger was written"))?;
+    let v: Value = ciborium::from_reader(bytes.as_slice()).context("ledger is not CBOR")?;
+    match field(&v, &["seen"])? {
+        Value::Array(items) => Ok(items.len()),
+        other => bail!("ledger seen is not a list: {}", brief(other)),
+    }
 }
 
 /// `Vec<u8>` from either a CBOR byte string or an array of integers.
@@ -824,6 +1082,14 @@ fn run() -> Result<bool> {
     let scenario_result = scenario(&mut runner);
 
     let ok = report(&runner.measured, &hash, scenario_result.as_ref().err())?;
+    // A call past the fuel ceiling also stops the scenario; that is an
+    // over-budget result (exit 1), not a harness failure (exit 2).
+    if !ok {
+        if let Err(e) = &scenario_result {
+            eprintln!("(the scenario also stopped early: {e:#})");
+        }
+        return Ok(false);
+    }
     scenario_result.context("the scenario did not complete")?;
     Ok(ok)
 }
@@ -840,6 +1106,8 @@ struct Row {
     calls: usize,
     fuel: Option<u64>,
     host_calls: u64,
+    /// The most writes any call of this name made.
+    host_writes: u64,
     timing: Option<(Duration, Duration)>,
 }
 
@@ -855,6 +1123,7 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
         match rows.iter_mut().find(|r| r.name == m.name) {
             Some(row) => {
                 row.calls += 1;
+                row.host_writes = row.host_writes.max(m.host_writes);
                 if over_budget(m.fuel) || (!over_budget(row.fuel) && m.fuel > row.fuel) {
                     row.fuel = m.fuel;
                     row.host_calls = m.host_calls;
@@ -866,13 +1135,14 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
                 calls: 1,
                 fuel: m.fuel,
                 host_calls: m.host_calls,
+                host_writes: m.host_writes,
                 timing: m.timing,
             }),
         }
     }
     let over: Vec<&str> = rows
         .iter()
-        .filter(|r| over_budget(r.fuel))
+        .filter(|r| over_budget(r.fuel) || r.host_writes > BUDGET_WRITES)
         .map(|r| r.name.as_str())
         .collect();
 
@@ -891,31 +1161,36 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     writeln!(md).ok();
     writeln!(
         md,
-        "| call | calls | fuel (max) | of budget | host calls | |"
+        "| call | calls | fuel (max) | of budget | host calls | writes | |"
     )
     .ok();
-    writeln!(md, "|---|---:|---:|---:|---:|---|").ok();
+    writeln!(md, "|---|---:|---:|---:|---:|---:|---|").ok();
     println!();
     println!(
-        "{:<52} {:>5} {:>18} {:>9} {:>10}",
-        "call", "calls", "fuel (max)", "budget", "host calls"
+        "{:<52} {:>5} {:>18} {:>9} {:>10} {:>6}",
+        "call", "calls", "fuel (max)", "budget", "host calls", "writes"
     );
     for r in &rows {
         let pct = r.fuel.map_or("-".into(), |f| {
             format!("{:.1}%", f as f64 * 100.0 / BUDGET_FUEL as f64)
         });
         let fuel = r.fuel.map_or("past the ceiling".into(), group);
-        let flag = if over_budget(r.fuel) { "OVER" } else { "" };
+        let flag = if over_budget(r.fuel) || r.host_writes > BUDGET_WRITES {
+            "OVER"
+        } else {
+            ""
+        };
         println!(
-            "{:<52} {:>5} {fuel:>18} {pct:>9} {:>10} {flag}",
-            r.name, r.calls, r.host_calls
+            "{:<52} {:>5} {fuel:>18} {pct:>9} {:>10} {:>6} {flag}",
+            r.name, r.calls, r.host_calls, r.host_writes
         );
         writeln!(
             md,
-            "| {} | {} | {fuel} | {pct} | {} | {} |",
+            "| {} | {} | {fuel} | {pct} | {} | {} | {} |",
             r.name,
             r.calls,
             r.host_calls,
+            r.host_writes,
             if flag.is_empty() {
                 ""
             } else {
@@ -982,7 +1257,8 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     } else {
         for name in &over {
             eprintln!(
-                "::error::{name} exceeds the per-call budget of {} fuel",
+                "::error::{name} exceeds the per-call budget of {} fuel or {BUDGET_WRITES} \
+                 secret writes",
                 group(BUDGET_FUEL)
             );
         }
