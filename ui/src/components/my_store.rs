@@ -697,6 +697,10 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                     p { class: "text-muted text-italic",
                         "Checking whether this Ghost Key already has a store\u{2026}"
                     }
+                    p { class: "text-muted small",
+                        "Harvest looks for a store you made with it on another device. This can \
+                         take up to a minute."
+                    }
                 },
                 crate::index_flow::CreationGate::BacksStore(name) => rsx! {
                     p { class: "text-muted",
@@ -794,7 +798,7 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                                     let target = s.clone();
                                     move |_| confirming.set(Some(target.clone()))
                                 },
-                                "Close\u{2026}"
+                                "Close {s.name}\u{2026}"
                             }
                         }
                     }

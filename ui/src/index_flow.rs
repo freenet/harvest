@@ -1309,7 +1309,7 @@ mod tests {
         let closure = code(include_str!("closure_flow.rs"));
         assert!(closure.contains(".on_close_deadline(&id,attempt);"));
         assert!(
-            closure.contains("Err(e)=>{state.closes_sent.remove(&owner);"),
+            closure.contains("ifletErr(e)=result{letmutstate=crate::gateway::APP_STATE.write();state.closes_sent.remove(&owner);"),
             "a close that could not be sent must not hold back the next one"
         );
         let messages = code(include_str!("components/message_view.rs"));
