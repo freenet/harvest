@@ -72,7 +72,10 @@ pub fn ListingForm(
             .unwrap_or_default()
     });
     let built_terms = terms().build();
-    let terms_error = built_terms.as_ref().err().cloned();
+    // Said once the seller has pressed List it, not over an empty form
+    // (critique C15).
+    let mut tried = use_signal(|| false);
+    let terms_error = built_terms.as_ref().err().cloned().filter(|_| tried());
 
     rsx! {
         div { class: "listing-form",
@@ -82,9 +85,12 @@ pub fn ListingForm(
                     id: "listing-title",
                     class: "form-input field-title",
                     r#type: "text",
-                    placeholder: "Stoneware mug, 300 ml",
+                    placeholder: "e.g. Stoneware mug, 300 ml",
                     value: "{title}",
                     oninput: move |e| title.set(e.value()),
+                }
+                if tried() && title().trim().is_empty() {
+                    p { class: "text-warning", "Say what it is." }
                 }
             }
 
@@ -93,7 +99,7 @@ pub fn ListingForm(
                 textarea {
                     id: "listing-description",
                     class: "form-textarea",
-                    placeholder: "What it is made of, its size, how it is packed.",
+                    placeholder: "e.g. what it is made of, its size, how it is packed",
                     value: "{description}",
                     oninput: move |e| description.set(e.value()),
                 }
@@ -129,8 +135,11 @@ pub fn ListingForm(
             div { class: "form-actions",
             button {
                 class: "btn btn-primary",
-                disabled: title().trim().is_empty() || quantity_error || terms_error.is_some(),
                 onclick: move |_| {
+                        tried.set(true);
+                        if terms().build().is_err() || parse_quantity(&quantity()).is_err() {
+                            return;
+                        }
                         // Re-checked here, not only in `disabled`: two clicks
                         // can land before the button re-renders (#80), and the
                         // first clears the title.
@@ -403,7 +412,7 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                     class: "form-input field-num",
                     r#type: "text",
                     inputmode: "decimal",
-                    placeholder: "0.0001",
+                    placeholder: "e.g. 0.0001",
                     value: "{form.unit_price}",
                     oninput: move |e| terms.with_mut(|t| t.unit_price = e.value()),
                 }

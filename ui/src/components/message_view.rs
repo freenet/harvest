@@ -186,7 +186,7 @@ pub(crate) fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32
                     let store_contract_id = store_contract_id.clone();
                     move |_| APP_STATE.write().export_conversation(&store_contract_id, &tag)
                 },
-                "Show this backup"
+                "Save a backup"
             }
         }
     }
@@ -213,7 +213,7 @@ pub(crate) fn Restore() -> Element {
                 textarea {
                     class: "form-textarea",
                     rows: 3,
-                    placeholder: "Paste a Harvest conversation backup here.",
+                    placeholder: "Paste a Harvest backup here.",
                     value: "{paste}",
                     oninput: move |event| paste.set(event.value()),
                 }

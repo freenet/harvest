@@ -216,7 +216,7 @@ body::before {
        .store-head, .store-head-title, .store-head-acts, .chips, .two-col,
        .item-grid, .item-card, .item-page, .bill, .amount-field, .progress,
        .side-row, .switch-menu, .row-more-menu, .needs-menu, .modal-actions,
-       .open-steps > li, .todo-note) > * {
+       .open-steps > li, .todo-note, .row-more > summary.btn) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -2908,4 +2908,57 @@ section + .panel {
 /* An order's card on its own page: its words and controls, no second box. */
 .order-plain > * + * {
   margin-top: var(--space-sm);
+}
+
+/* Nothing to buy here: one line, no empty box. */
+.item-buy-none {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.item-buy-none .item-why-not {
+  border: 0;
+  padding: 0;
+}
+
+@media (max-width: 600px) {
+  /* A row's second line wraps on a phone rather than cut off an amount
+     (critique C10). */
+  .rc-sub {
+    white-space: normal;
+  }
+}
+
+/* A row's one quick action, drawn as a button inside the row button. */
+.row-action {
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* The listing's "More" sits on the same line as Edit. */
+.row-more > summary.btn {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Cards in one row of the grid are one height. */
+.item-grid {
+  align-items: stretch;
+}
+
+.open-steps a {
+  color: var(--accent);
+}
+
+/* An order's history: one line per step, a rule down the side. */
+.history {
+  list-style: none;
+  padding-left: var(--space-md);
+  border-left: 2px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.history li + li {
+  margin-top: var(--space-xs);
 }

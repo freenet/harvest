@@ -79,11 +79,6 @@ pub(crate) struct OrderRow {
     pub status: Status,
     /// The buyer can pay it now: the row's one quick action, and "needs you".
     pub to_pay: bool,
-    /// The store's reply in this order's conversation is new: said on the
-    /// conversation's newest order still standing, once.
-    pub new_reply: bool,
-    /// The conversation it was placed in, when it is a store's purchase.
-    pub conversation: Option<[u8; 32]>,
     pub picture: Option<String>,
 }
 
@@ -95,20 +90,6 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
     let stores = purchase_rows(state);
     for store in stores.iter() {
         let id = &store.store_contract_id;
-        let replied: Vec<[u8; 32]> = state
-            .browsing_stores
-            .get(id)
-            .map(|b| {
-                b.conversations
-                    .iter()
-                    .map(|c| c.buyer_public_key)
-                    .filter(|tag| {
-                        super::message_view::buyer_conversation_summary(state, id, *tag)
-                            .is_some_and(|s| super::message_view::is_new_reply(&s, tag))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         for purchase in state.buyer_purchases(id) {
             // Not this buyer's: never an order of theirs.
             if purchase
@@ -127,7 +108,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                     order: purchase.order_id.clone(),
                 },
                 item: match &listing {
-                    Some((_, Some(title), q)) => format!("{title} \u{00d7} {q}"),
+                    Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                     None => format!("Order {}", purchase.order_id.short()),
                 },
@@ -135,8 +116,6 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 date: order.map(|o| o.order.created_at),
                 amount: order.map(|o| super::pay_card::money(o.order.amount_sats, o.order.network)),
                 to_pay: super::order_status::buyer_can_pay(&purchase, status),
-                new_reply: replied.contains(&purchase.conversation),
-                conversation: Some(purchase.conversation),
                 picture: listing.as_ref().and_then(|(l, t, _)| {
                     super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
                 }),
@@ -171,24 +150,10 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 Status::WaitingForPayment
             },
             to_pay: false,
-            new_reply: false,
-            conversation: None,
             picture: None,
         });
     }
     rows.sort_by_key(|row| std::cmp::Reverse(row.date));
-    // A reply belongs to a conversation, not to each of its orders: marked
-    // on the newest order of it still standing, never on an ended one.
-    let mut marked: Vec<[u8; 32]> = Vec::new();
-    for row in rows.iter_mut() {
-        if !row.new_reply {
-            continue;
-        }
-        match row.conversation {
-            Some(tag) if !row.status.ended() && !marked.contains(&tag) => marked.push(tag),
-            _ => row.new_reply = false,
-        }
-    }
     rows
 }
 
@@ -266,7 +231,7 @@ fn use_purchases_loading() -> (bool, usize) {
 
 /// Whether any conversation this device keeps has no backup anywhere else:
 /// the banner that sends the buyer to Backup until there is one.
-fn backup_due(state: &AppState) -> bool {
+pub(crate) fn backup_due(state: &AppState) -> bool {
     state
         .browsing_stores
         .iter()
@@ -280,16 +245,22 @@ fn backup_due(state: &AppState) -> bool {
 pub fn PurchasesPage() -> Element {
     let (loading, failed) = use_purchases_loading();
     let mut show_ended = use_signal(|| false);
-    let (rows, new_replies, banner) = {
+    let (rows, replies, banner) = {
         let state = APP_STATE.read();
         (
             order_rows(&state),
-            super::needs::buyer_needs(&state).replied.len(),
+            // A reply belongs to a conversation, not to one of its orders:
+            // its own row under "Needs you", so the rows there add up to
+            // the header's count (critique C8).
+            conversation_rows(&state)
+                .into_iter()
+                .filter(|row| row.new_reply)
+                .collect::<Vec<_>>(),
             backup_due(&state),
         )
     };
-    let (needs, rest): (Vec<&OrderRow>, Vec<&OrderRow>) =
-        rows.iter().partition(|row| row.to_pay || row.new_reply);
+    let new_replies = replies.len();
+    let (needs, rest): (Vec<&OrderRow>, Vec<&OrderRow>) = rows.iter().partition(|row| row.to_pay);
     let (ended, earlier): (Vec<&OrderRow>, Vec<&OrderRow>) =
         rest.into_iter().partition(|row| row.status.ended());
     rsx! {
@@ -313,14 +284,32 @@ pub fn PurchasesPage() -> Element {
                 p { class: "text-muted small", "When you buy something it is listed here." }
             }
         }
-        if !needs.is_empty() {
+        if !needs.is_empty() || !replies.is_empty() {
             h3 { class: "sec-lbl sec-lbl-first", "Needs you" }
             for row in needs.iter() {
                 OrderRowView { key: "{row.page.fragment()}", row: (*row).clone() }
             }
+            for row in replies.iter() {
+                button {
+                    key: "{bs58::encode(row.tag).into_string()}",
+                    class: "rowcard",
+                    onclick: {
+                        let page = Page::Conversation { store: row.store.clone(), tag: Some(row.tag) };
+                        move |_| go(page.clone())
+                    },
+                    span { class: "rc-main",
+                        span { class: "rc-name", "{row.name} replied" }
+                        span { class: "rc-sub", "{row.latest}" }
+                    }
+                    span { class: "rc-status",
+                        span { class: "pill pill-needs", "New reply" }
+                    }
+                    span { class: "chev", aria_hidden: "true", "\u{203a}" }
+                }
+            }
         }
         if !earlier.is_empty() {
-            h3 { class: if needs.is_empty() { "sec-lbl sec-lbl-first" } else { "sec-lbl" }, "Earlier" }
+            h3 { class: if needs.is_empty() && replies.is_empty() { "sec-lbl sec-lbl-first" } else { "sec-lbl" }, "Earlier" }
             for row in earlier.iter() {
                 OrderRowView { key: "{row.page.fragment()}", row: (*row).clone() }
             }
@@ -369,17 +358,13 @@ fn OrderRowView(row: OrderRow) -> Element {
             super::item_image::RowThumb { src: row.picture.clone() }
             span { class: "rc-main",
                 span { class: "rc-name", "{row.item}" }
-                span { class: "rc-sub",
-                    "{sub}"
-                    if row.new_reply {
-                        " \u{00b7} "
-                        strong { class: "rc-flag", "new reply" }
-                    }
-                }
+                span { class: "rc-sub", "{sub}" }
             }
             span { class: "rc-status",
+                // The row's one quick action, drawn as the button it is
+                // (critique C9); the row itself is what is pressed.
                 if row.to_pay {
-                    span { class: "pill pill-needs", "Pay now" }
+                    span { class: "btn btn-sm btn-primary row-action", "Pay now" }
                 } else {
                     span { class: "{row.status.pill_class()}", "{row.status.label()}" }
                 }
@@ -433,7 +418,18 @@ pub(crate) fn conversation_rows(state: &AppState) -> Vec<ConversationRow> {
                 tag,
                 name: store.name.clone(),
                 latest,
-                orders: purchases.iter().filter(|p| p.conversation == tag).count(),
+                // Orders still standing, as the store's page counts them
+                // (round-6 R6-1): an expired or cancelled one is not.
+                orders: purchases
+                    .iter()
+                    .filter(|p| p.conversation == tag)
+                    .filter(|p| {
+                        !super::order_status::buyer_status(state, id, p).ended()
+                            && !p.blockers.iter().any(|b| {
+                                matches!(b, crate::state::PaymentBlocker::CommitmentNotForThisBuyer)
+                            })
+                    })
+                    .count(),
                 at: summary.latest_at,
                 new_reply: super::message_view::is_new_reply(&summary, &tag),
             });

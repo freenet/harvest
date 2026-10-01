@@ -619,6 +619,7 @@ fn LoadedStore(
         name => name.to_string(),
     };
     let tagline = crate::markdown::first_line(&info.description);
+    let about_more = tagline.as_deref().map(str::trim) != Some(info.description.trim());
     // This buyer's orders from this store are on Purchases, once: here only
     // a line that goes there (critique S2-10).
     let orders = if owned {
@@ -709,9 +710,9 @@ fn LoadedStore(
                 // A link, not a button: the items are the page's main thing,
                 // and before paying it leads to the Ghost Key step (IA
                 // first-timer check). Not on one's own store (R6-9).
-                if owned {
-                    span { class: "link-off", title: "This is your own store", "Message the seller" }
-                } else {
+                // Not on one's own store (R6-9): a seller doesn't message
+                // themselves, and the banner above says whose store it is.
+                if !owned {
                     button {
                         class: "link-btn",
                         onclick: move |_| go(message_to.clone()),
@@ -741,7 +742,12 @@ fn LoadedStore(
             }
         }
         div { class: "tabs", role: "tablist",
-            for (t , label) in [(StoreTab::Items, "Items"), (StoreTab::About, "About"), (StoreTab::Record, "Record")] {
+            // About only when the description says more than the line
+            // under the name (critique C17).
+            for (t , label) in [(StoreTab::Items, "Items"), (StoreTab::About, "About"), (StoreTab::Record, "Record")]
+                .into_iter()
+                .filter(|(t, _)| *t != StoreTab::About || about_more)
+            {
                 button {
                     class: if tab == t { "tab active" } else { "tab" },
                     role: "tab",
@@ -946,10 +952,12 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     let offer = offered_buy(&browsing, &store, owned, &l, &availability, open);
     let own_preview =
         owned && offered_buy(&browsing, &store, false, &l, &availability, open).is_some();
+    let has_form = offer.is_some() || own_preview;
     let picture = super::item_image::listing_image(&l.id, &l.title);
     let network = crate::gateway::bitcoin_config::default_network();
     let test = super::pay_card::is_test_network(network);
-    let stock = availability_words(&availability, false);
+    // "Sold out" is said once, where the form would be.
+    let stock = availability_words(&availability, false).filter(|w| w != "Sold out");
     let delivery = price_lines(&l).map(|(_, delivery)| delivery);
     // Why nothing can be bought here, in one line, in place of the form.
     let why_not = if offer.is_some() || own_preview {
@@ -957,7 +965,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     } else if browsing.closed || closed {
         Some("This store is closed right now, so this can\u{2019}t be bought.".to_string())
     } else if !availability.is_buyable() {
-        Some("Sold out.".to_string())
+        Some("This has sold out.".to_string())
     } else if !l.offers_instant_checkout() {
         Some(NOT_PRICED.to_string())
     } else if browsing.unverified_listings.contains(&l.id) {
@@ -990,7 +998,9 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
             if let Some(ref src) = picture {
                 img { class: "item-picture", src: "{src}", alt: "{l.title}" }
             }
-            div { class: "item-buy",
+            // No box when there is nothing to fill in: one line says why,
+            // with the way back to what can be bought (critique C7).
+            div { class: if has_form { "item-buy" } else { "item-buy item-buy-none" },
                 match (offer, why_not) {
                     (Some(buyable), _) => rsx! {
                         super::buy_view::BuyForm {
@@ -1006,6 +1016,14 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
                     },
                     (None, Some(why)) => rsx! {
                         p { class: "item-why-not", "{why}" }
+                        button {
+                            class: "link-btn",
+                            onclick: {
+                                let store = store.clone();
+                                move |_| super::router::go(Page::Store { store: store.clone(), tab: StoreTab::Items })
+                            },
+                            "See what else {store_name} sells \u{203a}"
+                        }
                     },
                     (None, None) => rsx! {},
                 }

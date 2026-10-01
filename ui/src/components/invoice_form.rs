@@ -349,19 +349,19 @@ fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded:
     rsx! {
         match xpub {
             Some(status) if !editing() => rsx! {
-                p { class: "text-muted",
+                p {
                     "Paying into your "
                     strong { "{status.network.as_str()}" }
-                    " wallet. "
-                    "{status.next_index} address(es) from this key are already taken, \
-                     counting the orders your stores have published, so the next invoice \
-                     gets a new one. "
-                    "This key is shared by every store and every Ghost Key in this app."
+                    " wallet. Each order gets a new address from it."
+                }
+                p { class: "text-muted small",
+                    "{super::needs::plural(status.next_index as usize, \"address\", \"addresses\")} used so far. \
+                     Every store on this device pays into this wallet."
                 }
                 button {
                     class: "btn btn-sm btn-outline",
                     onclick: move |_| editing.set(true),
-                    "Change payment key"
+                    "Change payout wallet"
                 }
             },
             _ => rsx! {

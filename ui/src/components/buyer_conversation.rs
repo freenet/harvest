@@ -12,6 +12,7 @@ use crate::gateway::APP_STATE;
 /// (a store with no conversation on this device yet).
 #[component]
 pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> Element {
+    let mut show_ended = use_signal(|| false);
     // A reload lands here before Purchases has asked for the stores.
     use_effect(|| crate::store_link::load_visited_stores(false, true));
     let (loaded, name, keys, owned, orders, said) = {
@@ -20,7 +21,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
         let info = browsing.and_then(|s| s.info.as_ref());
         let key = info.and_then(|i| i.encryption_public_key);
         let identity = browsing.and_then(|s| s.seller_verifying_key);
-        let orders: Vec<(Page, String, String, Option<String>)> = tag
+        let orders: Vec<(Page, String, String, Option<String>, bool)> = tag
             .map(|tag| {
                 let mut purchases: Vec<_> = state
                     .buyer_purchases(&store)
@@ -42,7 +43,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                         let status = super::order_status::buyer_status(&state, &store, &p);
                         let listing = state.purchase_listing(&store, &p);
                         let item = match &listing {
-                            Some((_, Some(title), q)) => format!("{title} \u{00d7} {q}"),
+                            Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                             Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                             None => format!("Order {}", p.order_id.short()),
                         };
@@ -62,12 +63,13 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                                 ),
                                 None => status.label().to_string(),
                             },
-                            listing.and_then(|(l, t, _)| {
+                            listing.as_ref().and_then(|(l, t, _)| {
                                 super::item_image::listing_image(
-                                    &l,
+                                    l,
                                     t.as_deref().unwrap_or_default(),
                                 )
                             }),
+                            status.ended(),
                         )
                     })
                     .collect()
@@ -169,7 +171,9 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                 if orders.is_empty() {
                     p { class: "text-muted small", "None in this conversation." }
                 }
-                for (page , item , status , picture) in orders.iter() {
+                // Ended ones folded, as on Purchases, so this counts what
+                // the store's page and the Messages list count (C2).
+                for (page , item , status , picture , _) in orders.iter().filter(|o| !o.4 || show_ended()) {
                     button {
                         key: "{page.fragment()}",
                         class: "side-row",
@@ -183,6 +187,17 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                             span { class: "rc-sub", "{status}" }
                         }
                         span { class: "chev", aria_hidden: "true", "\u{203a}" }
+                    }
+                }
+                if orders.iter().any(|o| o.4) {
+                    button {
+                        class: "link-btn side-link",
+                        onclick: move |_| show_ended.toggle(),
+                        if show_ended() {
+                            "Hide ended orders"
+                        } else {
+                            {format!("Show {}", super::needs::plural(orders.iter().filter(|o| o.4).count(), "ended order", "ended orders"))}
+                        }
                     }
                 }
                 button {

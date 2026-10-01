@@ -58,6 +58,8 @@ struct OrderFacts {
     complaint: ComplaintOffer,
     bitcoin: crate::state::BitcoinState,
     open_pill: &'static str,
+    /// A conversation this device keeps has no backup elsewhere.
+    backup_due: bool,
     open: bool,
     trust: Option<String>,
 }
@@ -92,10 +94,10 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
             .map(|purchase| {
                 let listing = state.purchase_listing(&store, &purchase);
                 let item = match &listing {
-                    Some((_, Some(title), q)) => format!("{title} \u{00d7} {q}"),
+                    Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                     None => match pending.as_ref() {
-                        Some(p) => format!("{} \u{00d7} {}", p.title, p.quantity),
+                        Some(p) => format!("{}\u{a0}\u{00d7}\u{a0}{}", p.title, p.quantity),
                         None => format!("Order {}", purchase.order_id.short()),
                     },
                 };
@@ -144,6 +146,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                     bitcoin: state.bitcoin.clone(),
                     open_pill: open.pill(),
+                    backup_due: super::purchases_view::backup_due(&state),
                     open: open == crate::state::BuyerOpen::Open,
                     trust,
                     purchase,
@@ -163,7 +166,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                 rsx! {
                     {back}
                     div { class: "page-title",
-                        h2 { "{pending.title} \u{00d7} {pending.quantity}" }
+                        h2 { "{pending.title}\u{a0}\u{00d7}\u{a0}{pending.quantity}" }
                         span { class: "pill", "Placed" }
                     }
                     p { class: "page-meta", "From {store_name} \u{00b7} just now" }
@@ -315,7 +318,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     _ => rsx! {
                         div { class: "panel",
                             if let Some(order) = settled.clone() {
-                                super::buy_view::SettledPurchase { order, bitcoin: facts.bitcoin.clone() }
+                                super::buy_view::SettledPurchase { order, bitcoin: facts.bitcoin.clone(), after_pill: true }
                             }
                             if let Some(line) = super::buy_view::complaint_line(&facts.complaint, &short) {
                                 p { class: "text-muted small", "{line}" }
@@ -363,7 +366,20 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                             }
                         }
                         strong { "Total" }
-                        strong { "{super::pay_card::money(sats, network)}" }
+                        strong {
+                            "{super::pay_card::money(sats, network)}"
+                            if super::pay_card::is_test_network(network) {
+                                span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
+                            }
+                        }
+                    }
+                    // The order lives on this device only: the backup is
+                    // offered once there is something worth keeping.
+                    if facts.backup_due && !matches!(facts.status, Status::Expired | Status::Cancelled) {
+                        p { class: "text-muted small",
+                            "This order is kept on this device only. "
+                            button { class: "link-btn", onclick: move |_| go(Page::Backup), "Save a backup" }
+                        }
                     }
                 }
                 if let Some(ref ship) = facts.ship_to {
@@ -516,7 +532,7 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
                     .and_then(|p| state.purchase_item(store, p))
                     .map(|(title, q)| {
                         format!(
-                            "{} \u{00d7} {q}",
+                            "{}\u{a0}\u{00d7}\u{a0}{q}",
                             title.unwrap_or_else(|| "An item no longer listed".to_string())
                         )
                     })

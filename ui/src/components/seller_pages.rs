@@ -234,11 +234,16 @@ fn StoreHeader(store: SellerStore, stores: Vec<(Vec<u8>, String)>, tab: SellerTa
                         }
                     }
                 }
-                if let Some(line) = line {
-                    p { class: "store-head-line", "{line}" }
-                }
-                if let Some(why) = why {
-                    p { class: if open { "text-muted small" } else { "text-warning" }, "{why}" }
+                // Why buyers can't buy, said on Home, where the seller works
+                // from; the pill alone on the other tabs, so a page's own
+                // task is not pushed down (critique C14).
+                if tab == SellerTab::Home {
+                    if let Some(line) = line {
+                        p { class: "store-head-line", "{line}" }
+                    }
+                    if let Some(why) = why {
+                        p { class: if open { "text-muted small" } else { "text-warning" }, "{why}" }
+                    }
                 }
             }
             div { class: "store-head-acts",
@@ -334,10 +339,20 @@ pub(crate) fn name_from_address(shipping: &str) -> Option<String> {
         return None;
     }
     let first = shipping.lines().find(|l| !l.trim().is_empty())?;
-    let head = first.split(',').next()?.trim();
+    // Up to the first comma or bracket, so a name is never cut inside one.
+    let head = first.split([',', '(', ';']).next()?.trim();
     let words: Vec<&str> = head.split_whitespace().take(3).collect();
-    let name = words.join(" ");
-    let name: String = name.chars().take(28).collect();
+    // Whole words only, within 28 characters.
+    let mut name = String::new();
+    for word in words {
+        if name.chars().count() + word.chars().count() + 1 > 28 && !name.is_empty() {
+            break;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
     (!name.is_empty() && name.chars().any(char::is_alphabetic)).then_some(name)
 }
 
@@ -422,18 +437,21 @@ impl SellerData {
         }
     }
 
-    /// The name of `order`'s buyer: their conversation's, else from the
-    /// order's own address, else "A buyer".
+    /// The name of `order`'s buyer: from the order's own address, else their
+    /// conversation's, else "A buyer".
     pub(crate) fn buyer_of(&self, order: &OrderId) -> String {
-        if let Some(name) = self.thread_of.get(order).and_then(|t| self.names.get(t)) {
-            return name.clone();
-        }
-        match self.requests.get(order) {
-            Some(SellerRequest::Found(r)) => {
-                name_from_address(&r.shipping).unwrap_or_else(|| "A buyer".to_string())
+        // The order's own address first: one buyer may send two orders to
+        // two people, and "Send it to" must name this one's.
+        if let Some(SellerRequest::Found(r)) = self.requests.get(order) {
+            if let Some(name) = name_from_address(&r.shipping) {
+                return name;
             }
-            _ => "A buyer".to_string(),
         }
+        self.thread_of
+            .get(order)
+            .and_then(|t| self.names.get(t))
+            .cloned()
+            .unwrap_or_else(|| "A buyer".to_string())
     }
 
     /// What `order` was for, "Stoneware mug \u{00d7} 1", or its reference
@@ -441,7 +459,7 @@ impl SellerData {
     pub(crate) fn item_of(&self, order: &AuthorizedOrder) -> String {
         match self.requests.get(&order.order.id) {
             Some(SellerRequest::Found(r)) => format!(
-                "{} \u{00d7} {}",
+                "{}\u{a0}\u{00d7}\u{a0}{}",
                 r.title.as_deref().unwrap_or("An item no longer listed"),
                 r.quantity
             ),
@@ -1036,12 +1054,7 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                         .cloned()
                         .unwrap_or(SellerRequest::NotFound),
                     to_send,
-                    stage_line: stage.describe(
-                        state.tip_height(o.order.network),
-                        o.status,
-                        crate::state::now_ms(),
-                        crate::fulfilment::Reader::Seller,
-                    ),
+                    history: history(&state, &o, stage),
                     needs_reissue: state.needs_reissue(&o),
                     withheld: state.withheld_settlements.contains_key(&o.order.id),
                     oversold: matches!(
@@ -1099,7 +1112,7 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
         p { class: "page-meta",
             "{meta} \u{00b7} {amount}"
             if test {
-                span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+                span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
             }
             " \u{00b7} order {o.order.id.short()}"
         }
@@ -1168,9 +1181,13 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                         }
                     }
                 }
-                if let Some(line) = view.stage_line.clone() {
-                    h3 { class: "sec-lbl", "Where it stands" }
-                    p { class: "stage-line", "{line}" }
+                if !view.history.is_empty() {
+                    h3 { class: "sec-lbl", "History" }
+                    ol { class: "history",
+                        for (i , line) in view.history.iter().enumerate() {
+                            li { key: "{i}", "{line}" }
+                        }
+                    }
                 }
             }
             aside { class: "col-side",
@@ -1230,7 +1247,8 @@ struct OrderView {
     paid: Option<String>,
     request: SellerRequest,
     to_send: bool,
-    stage_line: Option<String>,
+    /// The order's steps so far and the next deadline, one line each.
+    history: Vec<String>,
     needs_reissue: bool,
     withheld: bool,
     oversold: bool,
@@ -1241,6 +1259,71 @@ struct OrderView {
     name: String,
     others: usize,
     live: crate::state::BitcoinState,
+}
+
+/// An order's history on its page (S4): when it was ordered and paid, sent
+/// or to be sent by, and until when the buyer can report a problem. Days
+/// are worked out from blocks against this node's tip, as everywhere.
+fn history(
+    state: &AppState,
+    order: &AuthorizedOrder,
+    stage: crate::fulfilment::OrderStage,
+) -> Vec<String> {
+    use crate::fulfilment::{approx_date, OrderStage};
+    let now = crate::state::now_ms();
+    let mut lines = vec![format!(
+        "Ordered {}",
+        order_status::short_date(order.order.created_at)
+    )];
+    let Some(tip) = state.tip_height(order.order.network) else {
+        return lines;
+    };
+    let day = |height: u32| approx_date(height, tip, now);
+    if let Some(paid) = crate::fulfilment::paid_height(order) {
+        lines.push(format!("Paid about {}", day(paid)));
+    }
+    match stage {
+        OrderStage::AwaitingDespatch { despatch_by, .. } => {
+            lines.push(format!("Send it by about {}", day(despatch_by)));
+            lines.push("Once it is sent, the buyer has a set time to report a problem".to_string());
+        }
+        OrderStage::DespatchWindowClosed {
+            despatch_by,
+            complaint_until,
+        } => {
+            lines.push(format!(
+                "The send-by date, about {}, has passed",
+                day(despatch_by)
+            ));
+            lines.push(format!(
+                "The buyer can report a problem until about {}",
+                day(complaint_until)
+            ));
+        }
+        OrderStage::Despatched {
+            despatched_at,
+            complaint_until,
+        } => {
+            lines.push(format!("Marked as sent about {}", day(despatched_at)));
+            lines.push(format!(
+                "The buyer can report a problem until about {}",
+                day(complaint_until)
+            ));
+        }
+        OrderStage::Closed { closed_at } => {
+            lines.push(format!(
+                "Complete: the time to report a problem ended about {}",
+                day(closed_at)
+            ));
+        }
+        OrderStage::Reversed => lines.push("The payment was reversed on the chain".to_string()),
+        OrderStage::Cancelled { .. } => lines.push("Cancelled".to_string()),
+        OrderStage::Lapsed { closed_at } => {
+            lines.push(format!("Expired unpaid about {}", day(closed_at)))
+        }
+        OrderStage::AwaitingPayment { .. } | OrderStage::Unknown => {}
+    }
+    lines
 }
 
 // ---- S5: Messages ----
@@ -1523,10 +1606,7 @@ fn SellerSettings(store: SellerStore) -> Element {
         section { class: "settings-sec",
             h3 { "Payout wallet" }
             super::invoice_form::PayoutWallet {}
-            p { class: "text-muted small",
-                "Each order gets a new address from this wallet. Harvest can create addresses but can \
-                 never spend your coins."
-            }
+            p { class: "text-muted small", "Harvest can create addresses but can never spend your coins." }
             // Where a seller checks the Bitcoin side when payments seem slow
             // to show.
             button {
@@ -1551,18 +1631,41 @@ fn SellerSettings(store: SellerStore) -> Element {
         }
         section { class: "settings-sec",
             h3 { "Pause the store" }
-            p { class: "text-muted small",
-                "Pausing, so buyers see the store as closed while your orders and messages stay, \
-                 comes with the next update of Harvest. Until then your store is closed to buyers \
-                 whenever Freenet isn\u{2019}t running on this computer."
-            }
+            p { class: "text-muted small", "Coming in the next update of Harvest." }
         }
         section { class: "settings-sec",
-            h3 { "Move or close this store" }
-            p { class: "text-muted small",
-                "For when two stores share one Ghost Key, or the key may be in someone else\u{2019}s \
-                 hands. Closing a store for good comes with the next update of Harvest."
-            }
+            h3 { "Move or retire this store" }
+            p { class: "text-muted small", "Coming in the next update of Harvest." }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_from_address;
+
+    /// A buyer's name is the start of their address, cut at a comma or a
+    /// bracket and at a whole word, never inside one (critique C3: "E2E
+    /// TEST (release").
+    #[test]
+    fn a_name_is_the_start_of_the_address_in_whole_words() {
+        assert_eq!(
+            name_from_address("Jane Doe\n14 Orchard Lane").as_deref(),
+            Some("Jane Doe")
+        );
+        assert_eq!(
+            name_from_address("Jane Doe, 14 Orchard Lane").as_deref(),
+            Some("Jane Doe")
+        );
+        assert_eq!(
+            name_from_address("E2E TEST (release 0.2.139 candidate)").as_deref(),
+            Some("E2E TEST")
+        );
+        assert_eq!(
+            name_from_address("Maximiliana Wolfeschlegelsteinhausen Bergerdorff").as_deref(),
+            Some("Maximiliana")
+        );
+        assert_eq!(name_from_address("  \n 12 ").as_deref(), None);
+        assert_eq!(name_from_address(crate::fulfilment::ADDRESS_HIDDEN), None);
     }
 }

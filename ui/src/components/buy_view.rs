@@ -112,7 +112,6 @@ pub fn BuyForm(
         unpaid_in_conversation(&state.buyer_purchases(&store_contract_id), current)
             >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
     };
-    let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid && !closed;
 
     // Sent, with no order id to follow (never expected: every Buy now names
     // its order): the wait is said here.
@@ -242,12 +241,25 @@ pub fn BuyForm(
             }
             button {
                 class: "btn btn-primary btn-wide",
-                disabled: !ready,
+                // Pressable until something only the store can change stops
+                // it: a missing field is said under the form when pressed,
+                // rather than a grey button with no reason (critique C5).
+                disabled: too_many_unpaid || closed,
                 onclick: {
                     let listing = listing.clone();
                     let store_contract_id = store_contract_id.clone();
+                    let by_region = by_region.clone();
                     move |_| {
+                        if let Some(missing) = missing_choice(&listing, &picks(), !by_region.is_empty() && region().is_empty()) {
+                            problem.set(Some(missing));
+                            return;
+                        }
+                        if shipping().trim().is_empty() {
+                            problem.set(Some("Add where to send it.".to_string()));
+                            return;
+                        }
                         let (Some(quantity_wanted), Some(total)) = (parsed_quantity, total) else {
+                            problem.set(Some("This can\u{2019}t be bought with those choices.".to_string()));
                             return;
                         };
                         if too_many_unpaid {
@@ -325,6 +337,20 @@ pub fn BuyForm(
             }
         }
     }
+}
+
+/// What the buyer still has to choose before Buy now can go out, said in
+/// their words: a choice group left on "Choose one", or the delivery region.
+fn missing_choice(listing: &Listing, picks: &[String], region_missing: bool) -> Option<String> {
+    if let Some((group, _)) = listing
+        .choices
+        .iter()
+        .zip(picks)
+        .find(|(_, pick)| pick.is_empty())
+    {
+        return Some(format!("Choose a {}.", group.name.to_lowercase()));
+    }
+    region_missing.then(|| "Choose where to deliver it.".to_string())
 }
 
 /// A Buy now this tab sent, waiting for (or answered by) the seller's
@@ -1253,6 +1279,10 @@ pub(crate) fn kept_purchases_to_list(
 pub(crate) fn SettledPurchase(
     order: harvest_common::payment::AuthorizedOrder,
     bitcoin: crate::state::BitcoinState,
+    /// The page's pill already says "Paid": the sentence does not start by
+    /// saying it again (critique C11).
+    #[props(default)]
+    after_pill: bool,
 ) -> Element {
     let tip_height = bitcoin
         .tips
@@ -1273,6 +1303,10 @@ pub(crate) fn SettledPurchase(
             crate::fulfilment::Reader::Buyer,
         )
         .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
+    let note = match note.strip_prefix("Paid. ") {
+        Some(rest) if after_pill => rest.to_string(),
+        _ => note,
+    };
     // The amount is in the page's own title and bill.
     rsx! {
         p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
