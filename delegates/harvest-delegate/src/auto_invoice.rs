@@ -3184,9 +3184,9 @@ mod tests {
                     sales: (0..count(SALES_CAP))
                         .map(|_| {
                             let order = OrderId(id(space));
-                            let decremented = order.0[0]
-                                .is_multiple_of(3)
-                                .then_some(u64::from(order.0[1]));
+                            // Independent of the order, so two copies of one
+                            // order can differ in it.
+                            let decremented = (id(3)[0] == 0).then_some(u64::from(id(9)[0]));
                             Sale {
                                 listing: ListingId(id(8)),
                                 quantity: 1,
