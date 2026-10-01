@@ -485,7 +485,7 @@ impl AppState {
             owner,
             CloseSent {
                 backer,
-                name: name.clone(),
+                name,
                 sent_ms: crate::state::now_ms(),
             },
         );
@@ -497,16 +497,15 @@ impl AppState {
                 let result =
                     crate::gateway::store_ops::submit_close_by_id(&store_id, retirement, closure)
                         .await;
-                let mut state = crate::gateway::APP_STATE.write();
-                match result {
-                    Ok(()) => state.notifications.push(format!(
-                        "Closing {name} was sent. It shows as closed once the network has it."
-                    )),
-                    Err(e) => {
-                        state.closes_sent.remove(&owner);
-                        dioxus::logger::tracing::error!("Failed to close a store: {e}");
-                        state.notifications.push(format!("{CLOSE_NOT_SAVED} ({e})"));
-                    }
+                // No notice on success: the card's "Closing..." line says it
+                // while it travels, and the page says "closed for good" once
+                // it lands. A notice would outlive both and sit beside a
+                // store already shown closed.
+                if let Err(e) = result {
+                    let mut state = crate::gateway::APP_STATE.write();
+                    state.closes_sent.remove(&owner);
+                    dioxus::logger::tracing::error!("Failed to close a store: {e}");
+                    state.notifications.push(format!("{CLOSE_NOT_SAVED} ({e})"));
                 }
             });
         }
