@@ -198,48 +198,51 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                         if let Some(what) = titles.get(&order.order.id) {
                             h4 { class: "order-title", "{what}" }
                         }
+                        // The address and controls inside the order's own box.
                         super::bitcoin_view::OrderCard {
                             order: order.clone(),
                             live: super::bitcoin_view::live_address_for_order(&live, &order.order),
-                        }
-                        if matches!(
-                            order.status,
-                            harvest_common::payment::OrderStatus::Paid
-                                | harvest_common::payment::OrderStatus::PaymentReversed
-                        ) {
-                            if let Some(request) = requests.get(&order.order.id) {
-                                SellerRequestView { request: request.clone(), quiet_when_missing: true }
-                            }
-                        }
-                        if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
-                            CancelInvoice {
-                                store_contract_id: store_contract_id.clone(),
-                                order_id: order.order.id.clone(),
-                            }
-                        }
-                        // A paid order past every window can still be marked
-                        // as sent late, which extends the buyer's time to
-                        // report a problem (`despatch_preconditions`); the
-                        // control hides itself once a despatch is recorded.
-                        if order.status == harvest_common::payment::OrderStatus::Paid {
-                            MarkDespatched {
-                                store_contract_id: store_contract_id.clone(),
-                                order_id: order.order.id.clone(),
-                            }
-                        }
-                        match (thread_for(&order.order.id), elsewhere(&order.order.id)) {
-                            (Some((thread, true)), _) => rsx! {
-                                super::message_view::SellerThreadToggle {
-                                    store_contract_id: store_contract_id.clone(),
-                                    thread,
-                                    under: Some(order.order.id.clone()),
-                                    open_thread,
+                            footer: rsx! {
+                                if matches!(
+                                    order.status,
+                                    harvest_common::payment::OrderStatus::Paid
+                                        | harvest_common::payment::OrderStatus::PaymentReversed
+                                ) {
+                                    if let Some(request) = requests.get(&order.order.id) {
+                                        SellerRequestView { request: request.clone(), quiet_when_missing: true }
+                                    }
+                                }
+                                if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
+                                    CancelInvoice {
+                                        store_contract_id: store_contract_id.clone(),
+                                        order_id: order.order.id.clone(),
+                                    }
+                                }
+                                // A paid order past every window can still be marked
+                                // as sent late, which extends the buyer's time to
+                                // report a problem (`despatch_preconditions`); the
+                                // control hides itself once a despatch is recorded.
+                                if order.status == harvest_common::payment::OrderStatus::Paid {
+                                    MarkDespatched {
+                                        store_contract_id: store_contract_id.clone(),
+                                        order_id: order.order.id.clone(),
+                                    }
+                                }
+                                match (thread_for(&order.order.id), elsewhere(&order.order.id)) {
+                                    (Some((thread, true)), _) => rsx! {
+                                        super::message_view::SellerThreadToggle {
+                                            store_contract_id: store_contract_id.clone(),
+                                            thread,
+                                            under: Some(order.order.id.clone()),
+                                            open_thread,
+                                        }
+                                    },
+                                    (_, Some((thread, home))) => rsx! {
+                                        super::message_view::SellerThreadPointer { thread, home, open_thread }
+                                    },
+                                    _ => rsx! {},
                                 }
                             },
-                            (_, Some((thread, home))) => rsx! {
-                                super::message_view::SellerThreadPointer { thread, home, open_thread }
-                            },
-                            _ => rsx! {},
                         }
                     }
                 }
