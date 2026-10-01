@@ -526,8 +526,13 @@ impl AppState {
             }
             return CreationGate::Checking;
         }
-        let settled = view.is_some_and(|v| v.index.is_some())
-            || (walked && (recovered.is_some() || view.is_some_and(|v| v.absent)));
+        // The current index has answered (state or NotFound) AND the walk
+        // over earlier generations ended conclusively. Neither alone: a
+        // current index can be written by a new device before an older
+        // generation's stores are carried forward, and a recovered older
+        // index says nothing about the current one. A recovery only adds
+        // the stores it lists, above.
+        let settled = walked && view.is_some_and(|v| v.index.is_some() || v.absent);
         match (
             settled && self.store_lists_answered.contains(fingerprint),
             waited,
@@ -782,10 +787,13 @@ mod tests {
     }
 
     /// A recovery from a walk where another earlier generation never
-    /// answered follows its stores but does not settle the gate; and a
+    /// answered follows its stores but does not settle the gate; a
     /// recovery that arrives after the current index's view was dropped (a
-    /// failed GET) is kept all the same. Mutated red by settling on an
-    /// incomplete recovery, and by keeping the recovery on the view.
+    /// failed GET) is kept all the same, but settles nothing until the
+    /// CURRENT index answers: an older generation says nothing about it.
+    /// Mutated red by settling on an incomplete recovery, by settling on a
+    /// recovery without the current index, and by keeping the recovery on
+    /// the view.
     #[test]
     fn an_incomplete_or_viewless_recovery_is_kept_but_settles_nothing() {
         let mut state = AppState::default();
@@ -813,6 +821,37 @@ mod tests {
                 complete: true,
             },
         );
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking,
+            "the current index has not answered"
+        );
+        state.watch_ghostkey_index(backer_vk());
+        assert!(state.on_index_absent(&index_id(backer_vk())));
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Ready
+        );
+    }
+
+    /// A current index that has arrived does not settle the gate until the
+    /// walk over earlier generations ends: a new device can write the
+    /// current index before an older generation's stores are carried
+    /// forward (codex, round 3). Mutated red by settling on the current
+    /// index alone.
+    #[test]
+    fn a_current_index_waits_for_the_walk() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.store_lists_answered.insert("fp".into());
+        state.watch_ghostkey_index(backer_vk());
+        let bytes = harvest_common::to_cbor(&index_of(&[])).unwrap();
+        state.on_contract_state(index_id(backer_vk()), bytes);
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking
+        );
+        state.on_index_walk_end("fp", IndexWalkEnd::Empty);
         assert_eq!(
             state.store_creation_gate("fp", &backer_vk()),
             CreationGate::Ready
@@ -1242,7 +1281,7 @@ mod tests {
             // recovery incomplete.
             "_ifprobe.any_unknown=>(None,crate::index_flow::IndexWalkEnd::Unknown),",
             "freenet_migrate::Outcome::Indeterminate{..}=>{(None,crate::index_flow::IndexWalkEnd::Unknown)}",
-            "crate::index_flow::IndexWalkEnd::Recovered{index:merged,complete:!probe.any_unknown,},",
+            "crate::index_flow::IndexWalkEnd::Recovered{index:merged,complete:!probe.any_unknown&&!truncated_fold,},",
             "super::APP_STATE.write().on_index_walk_end(&fingerprint,end);",
             // The marker skip settles the walk too.
             ".on_index_walk_end(&fingerprint,crate::index_flow::IndexWalkEnd::Empty);",

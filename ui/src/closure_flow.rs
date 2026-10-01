@@ -241,6 +241,18 @@ impl AppState {
             })
     }
 
+    /// The store key of a close sent for one of `backer`'s stores whose
+    /// closed state has not shown, however long ago it was sent. Once a
+    /// close has been sent, only THAT store may be closed again (a resend):
+    /// the close may well have landed where this device cannot see it yet,
+    /// and offering the other store then would let the seller close both.
+    pub(crate) fn sent_close_owner(&self, backer: &[u8; 32]) -> Option<[u8; 32]> {
+        self.closes_sent
+            .iter()
+            .find(|(owner, sent)| sent.backer == *backer && !self.store_key_shows_closed(owner))
+            .map(|(owner, _)| *owner)
+    }
+
     /// Whether any loaded generation of the store owned by `owner` reads
     /// closed.
     fn store_key_shows_closed(&self, owner: &[u8; 32]) -> bool {
@@ -279,13 +291,16 @@ impl AppState {
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return false;
         };
+        let Some(backing) = store.backing.as_ref() else {
+            return false;
+        };
         self.work_store_key(store_contract_id)
             .is_some_and(|key| self.holds_store_key(&key.to_bytes()))
             && !store.closed
-            && store
-                .backing
-                .as_ref()
-                .is_some_and(|b| self.close_in_flight_for(&b.backer).is_none())
+            && self.close_in_flight_for(&backing.backer).is_none()
+            && self
+                .sent_close_owner(&backing.backer)
+                .is_none_or(|owner| owner == backing.store)
     }
 
     /// Close the store at `store_contract_id` for good: ask its store key to
@@ -310,6 +325,16 @@ impl AppState {
             return Err(format!(
                 "{name} is already being closed; wait for it to finish"
             ));
+        }
+        if self
+            .sent_close_owner(&backer)
+            .is_some_and(|owner| owner != store_key.to_bytes())
+        {
+            return Err(
+                "another of this Ghost Key's stores was already sent to close; \
+                        reload Harvest to see whether it has"
+                    .into(),
+            );
         }
         let backer_key = ed25519_dalek::VerifyingKey::from_bytes(&backer)
             .map_err(|_| "this store's backing names no valid key".to_string())?;
@@ -978,8 +1003,11 @@ mod tests {
     }
 
     /// A sent close whose closed state never arrives (the contract refused
-    /// it) stops holding back other closes after a while. Mutated red by
-    /// dropping the expiry.
+    /// it, or this device has not seen it) stops showing as under way after
+    /// a while, but only THAT store may then be closed again: the close may
+    /// have landed out of sight, and offering the other store would let the
+    /// seller close both. Mutated red by dropping the expiry, and by
+    /// offering the other store after it.
     #[test]
     fn a_sent_close_that_never_shows_stops_blocking() {
         let mut state = both_ours();
@@ -992,10 +1020,14 @@ mod tests {
             },
         );
         assert!(!state.can_close_store(&[1; 32]));
+        assert!(!state.can_close_store(&[2; 32]));
         state
             .closes_sent
             .values_mut()
             .for_each(|sent| sent.sent_ms = 0);
-        assert!(state.can_close_store(&[1; 32]));
+        assert!(state.close_in_flight_for(&BACKER_VK()).is_none());
+        assert!(state.can_close_store(&[2; 32]), "the same store, again");
+        assert!(!state.can_close_store(&[1; 32]), "never the other one");
+        assert!(state.close_store_for_good(&[1; 32]).is_err());
     }
 }
