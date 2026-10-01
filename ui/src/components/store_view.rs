@@ -970,23 +970,27 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
 
     rsx! {
         {back}
+        // The item's name and price head the page; the form is beside its
+        // description (and its picture, when it has one).
+        div { class: "item-head",
+            h2 { class: "item-title", "{l.title}" }
+            if let Some((price, _)) = price_lines(&l) {
+                p { class: "item-price",
+                    "{price}"
+                    if test {
+                        span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
+                    }
+                }
+            }
+            p { class: "text-muted small",
+                {[stock, delivery].into_iter().flatten().collect::<Vec<_>>().join(" \u{00b7} ")}
+            }
+        }
         div { class: if picture.is_some() { "item-page has-picture" } else { "item-page" },
             if let Some(ref src) = picture {
                 img { class: "item-picture", src: "{src}", alt: "{l.title}" }
             }
             div { class: "item-buy",
-                h2 { class: "item-title", "{l.title}" }
-                if let Some((price, _)) = price_lines(&l) {
-                    p { class: "item-price",
-                        "{price}"
-                        if test {
-                            span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
-                        }
-                    }
-                }
-                p { class: "text-muted small",
-                    {[stock, delivery].into_iter().flatten().collect::<Vec<_>>().join(" \u{00b7} ")}
-                }
                 match (offer, why_not) {
                     (Some(buyable), _) => rsx! {
                         super::buy_view::BuyForm {

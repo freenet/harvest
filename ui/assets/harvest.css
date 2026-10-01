@@ -2884,3 +2884,23 @@ button.harvest-title-group {
 .seller-listing-actions {
   align-items: center;
 }
+
+.item-head {
+  margin-bottom: var(--space-lg);
+}
+
+.item-head > * + * {
+  margin-top: var(--space-xs);
+}
+
+.item-buy > .buy-form:first-child {
+  margin-top: 0;
+}
+
+.lede + *,
+.page-meta + .panel,
+.panel + .panel,
+.panel + section,
+section + .panel {
+  margin-top: var(--space-lg);
+}

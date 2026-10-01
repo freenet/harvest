@@ -173,7 +173,7 @@ pub(crate) fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32
                 "I have saved this"
             }
             button {
-                class: "btn",
+                class: "btn btn-outline",
                 onclick: move |_| {
                     APP_STATE.write().conversation_backup_on_screen = None;
                 },
@@ -181,12 +181,12 @@ pub(crate) fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32
             }
         } else {
             button {
-                class: "btn",
+                class: "btn btn-sm btn-outline",
                 onclick: {
                     let store_contract_id = store_contract_id.clone();
                     move |_| APP_STATE.write().export_conversation(&store_contract_id, &tag)
                 },
-                "Back up this conversation"
+                "Show this backup"
             }
         }
     }
@@ -219,7 +219,7 @@ pub(crate) fn Restore() -> Element {
                 }
             }
             button {
-                class: "btn",
+                class: "btn btn-outline",
                 disabled: paste().trim().is_empty(),
                 onclick: move |_| {
                     let pasted = paste().trim().to_string();
