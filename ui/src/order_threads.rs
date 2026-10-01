@@ -249,17 +249,62 @@ impl crate::state::AppState {
     /// their own store state. What this guards is only that the buyer is not
     /// offered a box whose text the seller would hide.
     pub fn paid_conversation(&self, store_contract_id: &[u8], tag: &[u8; 32]) -> bool {
-        use crate::messaging::{Addressing, MessageContent};
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return false;
         };
-        let Some(conversation) = store
-            .conversations
-            .iter()
-            .find(|conversation| conversation.buyer_public_key == *tag)
-        else {
+        let Some(claims) = self.buyer_claims(store_contract_id, tag) else {
             return false;
         };
+        self.buyer_purchases(store_contract_id)
+            .iter()
+            .filter(|purchase| purchase.conversation == *tag && purchase.paid.is_some())
+            .any(|purchase| {
+                store.orders.iter().any(|order| {
+                    order.order.id == purchase.order_id
+                        && order.status == OrderStatus::Paid
+                        && order_in_conversation(order, &claims)
+                })
+            })
+    }
+
+    /// Whether paying an order in the buyer's conversation `tag` would let
+    /// them write there without a Ghost Key: what the gate's "Once this
+    /// order is paid, you can message the seller here" may promise (codex
+    /// on #205). An order of theirs filed there, unpaid and awaiting
+    /// payment, that can be paid now (nothing stands in the way, or only
+    /// this node keeping its copy, which the pay press does), and that
+    /// belongs to the conversation by the same check the paid gate makes
+    /// ([`order_in_conversation`] over [`Self::buyer_claims`]). Not an
+    /// expired or blocked invoice, nor one the gate could never tie to this
+    /// conversation.
+    pub fn payment_would_open(&self, store_contract_id: &[u8], tag: &[u8; 32]) -> bool {
+        let Some(claims) = self.buyer_claims(store_contract_id, tag) else {
+            return false;
+        };
+        self.buyer_purchases(store_contract_id)
+            .iter()
+            .any(|purchase| {
+                purchase.conversation == *tag
+                    && purchase.paid.is_none()
+                    && (purchase.blockers.is_empty() || purchase.ready_to_keep())
+                    && purchase.commitment.as_ref().is_some_and(|order| {
+                        order.status == OrderStatus::AwaitingPayment
+                            && order_in_conversation(order, &claims)
+                    })
+            })
+    }
+
+    /// What the buyer's conversation `tag` lets an order be matched against
+    /// ([`ConversationClaims`]): the requests the BUYER wrote in it and the
+    /// store's current listings, under its own keys. `None` when this node
+    /// no longer holds the conversation.
+    fn buyer_claims(&self, store_contract_id: &[u8], tag: &[u8; 32]) -> Option<ConversationClaims> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|conversation| conversation.buyer_public_key == *tag)?;
         let requests: Vec<(ListingId, Option<InstantSelection>)> = conversation
             .read(&store.mailbox_messages)
             .into_iter()
@@ -272,24 +317,15 @@ impl crate::state::AppState {
                 _ => None,
             })
             .collect();
-        let claims = ConversationClaims::of(
+        let tagger = conversation.listing_tagger();
+        Some(ConversationClaims::of(
             tag,
             requests
                 .iter()
                 .map(|(listing, selection)| (listing, selection.as_ref())),
             store.listings.iter().map(|listing| &listing.listing.id),
-            |listing| Some(conversation.listing_tag(listing)),
-        );
-        self.buyer_purchases(store_contract_id)
-            .iter()
-            .filter(|purchase| purchase.conversation == *tag && purchase.paid.is_some())
-            .any(|purchase| {
-                store.orders.iter().any(|order| {
-                    order.order.id == purchase.order_id
-                        && order.status == OrderStatus::Paid
-                        && order_in_conversation(order, &claims)
-                })
-            })
+            |listing| Some(tagger.tag(listing)),
+        ))
     }
 }
 

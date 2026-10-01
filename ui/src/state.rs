@@ -24275,8 +24275,11 @@ mod buy_flow_tests {
     /// matched one by one, and one order index serves every conversation's
     /// requests (review after 6c61839: a scan of every order per request was
     /// still conversations × orders). The junk carries quote requests and
-    /// Buy nows, which reach per-thread work even unopened. Red with the
-    /// order lookup replaced by a scan, and with an index built per thread.
+    /// Buy nows, which reach per-thread work even unopened; each request asks
+    /// the index a fixed number of times (review after 01f2bcf), and plain
+    /// text nothing vouches for makes no thread. Red with the order lookup
+    /// replaced by a scan, with an index built per thread, and with
+    /// `unanswered_requests_in` walking `by_id` instead of asking the index.
     #[test]
     fn the_sellers_inbox_does_not_scan_every_order_per_conversation() {
         use crate::components::message_view::seller_inbox;
@@ -24324,11 +24327,25 @@ mod buy_flow_tests {
                     .expect("sealed"),
             );
         }
+        // And conversations holding only plain text nothing vouches for:
+        // nothing in them is shown, so they make no thread at all.
+        let mut silent: Vec<[u8; 32]> = Vec::new();
+        for _ in 0..50 {
+            let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+            let tag = buyer.buyer_public_key;
+            state
+                .conversation_keys
+                .insert(tag.to_vec(), seller_keys_for(&tag));
+            junk.push(buyer.seal("junk".into()).expect("sealed"));
+            silent.push(tag);
+        }
         let store = state.browsing_stores.get_mut(STORE).unwrap();
         store.orders = orders;
         store.mailbox_messages.extend(junk);
         crate::order_threads::FULL_MATCHES.with(|n| n.set(0));
         crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.set(0));
+        crate::components::message_view::ORDER_LOOKUPS.with(|n| n.set(0));
+        crate::components::message_view::BINDING_TAG_LOOKUPS.with(|n| n.set(0));
         // No wall-clock bound: it would be flaky on a slow CI runner, and
         // the counts below pin the property deterministically.
         let inbox = seller_inbox(&state, STORE);
@@ -24341,6 +24358,27 @@ mod buy_flow_tests {
             crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.get()),
             1,
             "one order index for every conversation's requests"
+        );
+        // Each request asks the index once, never walks the orders: a Buy
+        // now (255 of them, odd i) by its request id, once for whether its
+        // address is hidden and once for whether it is answered; a quote
+        // request (256 here plus the fixture's one) once, by binding and tag.
+        assert_eq!(
+            crate::components::message_view::ORDER_LOOKUPS.with(|n| n.get()),
+            2 * 255,
+            "one id lookup per Buy now per question asked of it"
+        );
+        assert_eq!(
+            crate::components::message_view::BINDING_TAG_LOOKUPS.with(|n| n.get()),
+            257,
+            "one binding-and-tag lookup per quote request"
+        );
+        assert!(
+            !inbox
+                .threads
+                .iter()
+                .any(|thread| silent.contains(&thread.tag)),
+            "junk with nothing shown makes no thread"
         );
         assert!(
             inbox.threads.len() >= 511,
@@ -31232,17 +31270,58 @@ mod buy_flow_tests {
             label("I'll pay double"),
             Some((crate::components::message_view::UNCONFIRMED, false))
         );
-        // Counted: only the buyer's own confirmed line, not the forged one
-        // (review after 9417fbf); shown: yes.
-        assert_eq!(
-            crate::components::message_view::buyer_thread_count(&state, STORE, Some(tag)),
-            1
-        );
+        // The thread shows (its button carries no count since the msg4
+        // screenshots, so a forged line can't inflate one).
         assert!(crate::components::message_view::buyer_thread_has_messages(
             &state,
             STORE,
             Some(tag)
         ));
+    }
+
+    /// **"Once this order is paid, you can message the seller here" is
+    /// promised only where it is true** (codex on #205): an order in the
+    /// conversation that can be paid now and that the paid gate would tie
+    /// to it. Not with only the seller's acceptance (the gate can't tie
+    /// it), not on an invoice too old to pay, not once paid. Red with the
+    /// payability check or the membership check dropped.
+    #[test]
+    fn the_after_payment_promise_is_made_only_where_payment_would_open() {
+        let unpaid = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, tag) = buyer_after_acceptance(&unpaid);
+        assert!(
+            !state.payment_would_open(STORE, &tag),
+            "only an acceptance: the paid gate could never tie the order here"
+        );
+        buyer_asks_for_the_widget(&mut state);
+        assert!(
+            state.payment_would_open(STORE, &tag),
+            "payable now and tied here: {:?}",
+            purchases(&state)[0].blockers
+        );
+        // Too old to pay.
+        let stale = commitment(
+            &seller_signing_key(),
+            Some(anchor(
+                TIP_HEIGHT - harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS - 10,
+            )),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut old, old_tag) = buyer_after_acceptance(&stale);
+        buyer_asks_for_the_widget(&mut old);
+        assert!(
+            !purchases(&old)[0].blockers.is_empty(),
+            "precondition: blocked"
+        );
+        assert!(!old.payment_would_open(STORE, &old_tag));
+        // Already paid.
+        let (mut paid, _) = a_paid_purchase();
+        buyer_asks_for_the_widget(&mut paid);
+        assert!(!paid.payment_would_open(STORE, &the_buyers_conversation().buyer_public_key));
     }
 
     /// **The buyer's rule is a strict subset of the seller's.** Over the
