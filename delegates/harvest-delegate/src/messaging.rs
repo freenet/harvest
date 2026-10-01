@@ -394,6 +394,31 @@ fn held_conversations<S: SecretStore>(
         .collect()
 }
 
+/// The secret of the conversation whose routing tag is `tag`, found by its
+/// key (`buyer_conversation_key` ends in the tag) and checked against it, or
+/// `None`. One X25519, where a scan of every conversation was one each
+/// (#206: the scan was a fifth of a keep's budget at the cap).
+pub(crate) fn conversation_secret_for_tag<S: SecretStore>(
+    store: &S,
+    tag: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let suffix = format!(":{}", bs58::encode(tag).into_string());
+    store
+        .list_secrets(BUYER_CONVERSATION_PREFIX)
+        .into_iter()
+        .filter(|key| key.ends_with(suffix.as_bytes()))
+        .filter_map(|key| {
+            store
+                .get_secret(&key)
+                .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+        })
+        .map(|record| record.secret.0)
+        .find(|secret| {
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).as_bytes()
+                == tag
+        })
+}
+
 /// The secret of every buyer conversation this delegate holds, for the
 /// kept-purchase check that a copy names its conversation's receipt key
 /// (`kept_purchases::keep`).
@@ -2663,5 +2688,38 @@ mod buyer_conversation_backup_tests {
             }
             other => panic!("expected BuyerConversationStored, got {other:?}"),
         }
+    }
+
+    /// #206: a conversation is found by the routing tag its key ends in,
+    /// checked against its secret; a record filed under a tag its secret
+    /// does not match is not taken for it. Mutated red by skipping the check.
+    #[test]
+    fn a_conversation_is_found_by_its_tag() {
+        let mut store = MemSecrets::default();
+        let secret = [0x31u8; 32];
+        let tag =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).as_bytes();
+        let record = |secret: [u8; 32]| BuyerConversationRecord {
+            secret: harvest_common::delegate::ConversationSecret(secret),
+            seller_public_key: [2; 32],
+            conversation_id: tag,
+            created_at: 1,
+            backed_up: false,
+            imported: false,
+        };
+        store.set_secret(
+            &buyer_conversation_key(&[1; 32], &tag),
+            &harvest_common::to_cbor(&record([0x99; 32])).unwrap(),
+        );
+        assert_eq!(
+            conversation_secret_for_tag(&store, &tag),
+            None,
+            "a mismatched record"
+        );
+        store.set_secret(
+            &buyer_conversation_key(&[2; 32], &tag),
+            &harvest_common::to_cbor(&record(secret)).unwrap(),
+        );
+        assert_eq!(conversation_secret_for_tag(&store, &tag), Some(secret));
     }
 }

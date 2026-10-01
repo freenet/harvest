@@ -196,7 +196,70 @@ pub extern "C" fn process(parameters: i64, origin: i64, inbound: i64) -> i64 {
         ),
         Inbound::Background(run) => crate::background::run(&mut ctx, run, crate::now_ms()),
     };
-    DelegateInterfaceResult::from(result).into_raw()
+    let bytes = encode_result(&result);
+    let raw = RawResult {
+        ptr: bytes.as_ptr() as i64,
+        size: bytes.len() as u32,
+    };
+    std::mem::forget(bytes);
+    Box::into_raw(Box::new(raw)) as i64
+}
+
+/// `freenet_stdlib::prelude::DelegateInterfaceResult`'s layout (`#[repr(C)]`,
+/// fields private there): where the result's bytes start and how many.
+#[cfg(feature = "freenet-main-delegate")]
+#[repr(C)]
+struct RawResult {
+    ptr: i64,
+    size: u32,
+}
+
+/// `bincode::serialize(result)`, byte for byte, with every application
+/// message's payload copied in one piece (#206).
+///
+/// `ApplicationMessage::payload` is a plain `Vec<u8>`, so serde hands bincode
+/// one byte at a time; on a large answer (a full export runs to megabytes)
+/// that per-byte path cost a whole call's budget by itself. Bincode writes a
+/// `Vec<u8>` as its `u64` length and the raw bytes however it is reached, so
+/// writing them directly is the same encoding. Everything else goes through
+/// bincode as before. `the_result_encoding_is_bincodes` pins the equality.
+pub(crate) fn encode_result(
+    result: &Result<
+        Vec<freenet_stdlib::prelude::OutboundDelegateMsg>,
+        freenet_stdlib::prelude::DelegateError,
+    >,
+) -> Vec<u8> {
+    use freenet_stdlib::prelude::{bincode, OutboundDelegateMsg};
+    let Ok(messages) = result else {
+        return bincode::serialize(result).expect("a delegate error encodes");
+    };
+    let payloads: usize = messages
+        .iter()
+        .map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(a) => a.payload.len(),
+            _ => 0,
+        })
+        .sum();
+    let mut out = Vec::with_capacity(payloads + 64 * messages.len() + 12);
+    out.extend_from_slice(&0u32.to_le_bytes()); // Ok
+    out.extend_from_slice(&(messages.len() as u64).to_le_bytes());
+    for message in messages {
+        match message {
+            OutboundDelegateMsg::ApplicationMessage(a) => {
+                out.extend_from_slice(&0u32.to_le_bytes()); // ApplicationMessage
+                out.extend_from_slice(&(a.payload.len() as u64).to_le_bytes());
+                out.extend_from_slice(&a.payload);
+                out.extend_from_slice(
+                    &bincode::serialize(&a.context).expect("a delegate context encodes"),
+                );
+                out.push(u8::from(a.processed));
+            }
+            other => out.extend_from_slice(
+                &bincode::serialize(other).expect("an outbound message encodes"),
+            ),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -285,5 +348,38 @@ mod tests {
             json["wakeups"][0]["tag"].as_str().unwrap().as_bytes(),
             HEARTBEAT_TAG
         );
+    }
+
+    /// The answer bytes are bincode's, whatever mix of messages, and for an
+    /// error. Mutated red by writing the payload without its length, or
+    /// dropping `processed`.
+    #[test]
+    fn the_result_encoding_is_bincodes() {
+        use freenet_stdlib::prelude::{
+            ApplicationMessage, ContractInstanceId, DelegateContext, DelegateError,
+            GetContractRequest, OutboundDelegateMsg,
+        };
+        let mut get = GetContractRequest::new(ContractInstanceId::new([7; 32]));
+        get.context = DelegateContext::new(vec![1, 2, 3]);
+        let mut with_context = ApplicationMessage::new((0..70_000).map(|i| i as u8).collect());
+        with_context.context = DelegateContext::new(vec![9; 40]);
+        let cases: Vec<Result<Vec<OutboundDelegateMsg>, DelegateError>> = vec![
+            Ok(vec![]),
+            Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(vec![]).processed(true),
+            )]),
+            Ok(vec![
+                OutboundDelegateMsg::ApplicationMessage(with_context),
+                OutboundDelegateMsg::GetContractRequest(get),
+                OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(vec![24; 300])),
+            ]),
+            Err(DelegateError::Other("no".into())),
+        ];
+        for case in cases {
+            assert_eq!(
+                encode_result(&case),
+                freenet_stdlib::prelude::bincode::serialize(&case).unwrap()
+            );
+        }
     }
 }

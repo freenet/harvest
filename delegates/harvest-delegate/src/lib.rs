@@ -4,6 +4,7 @@ mod auto_invoice;
 mod background;
 mod bip32;
 mod bitcoin;
+mod fast_cbor;
 mod handlers;
 mod import;
 mod kept_purchases;

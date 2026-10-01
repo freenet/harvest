@@ -1822,6 +1822,72 @@ fn within_age(message: &EncryptedMessage, now_ms: u64) -> bool {
     at >= 0 && now_ms.abs_diff(at as u64) <= REQUEST_MAX_AGE_MS
 }
 
+/// How much opening one mailbox run may do, in bytes of ciphertext plus
+/// [`OPEN_FIXED_COST`] per message (#206). Opening a message is an X25519
+/// agreement and an AES-GCM pass over it; under the node's fuel metering that
+/// is about 3.1 million units each plus about 760 a byte, so this is about
+/// one billion units, a quarter of a call's budget. A full mailbox of short
+/// texts is about two runs; one filled to its byte cap is about five.
+pub(crate) const OPEN_BUDGET: usize = 1_310_720;
+
+/// The X25519 agreement in [`OPEN_BUDGET`]'s units: about 4 KiB of AES-GCM.
+pub(crate) const OPEN_FIXED_COST: usize = 4096;
+
+/// Fresh randomness from the node, for [`open_within_budget`]'s order.
+fn random_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    // Falling back to zeros only makes the order predictable, never wrong.
+    let _ = getrandom::getrandom(&mut seed);
+    seed
+}
+
+/// One message a run opened: its digest, the message, and whether it is an
+/// instant request this store can open.
+type Opened<'a> = ([u8; 32], &'a EncryptedMessage, bool);
+
+/// Open `candidates` in an order drawn from `seed` until [`OPEN_BUDGET`] is
+/// spent, skipping any message that would not fit (so smaller ones behind it
+/// still get their turn). Answers each opened message, with its digest and
+/// whether it is an instant request this store can open, and whether any
+/// candidate was left for the next run.
+///
+/// # Why a random order
+///
+/// Anyone can write to a store's mailbox, and opening is the expensive part,
+/// so a bound on it is a bound an attacker can try to fill with junk ahead of
+/// a real buyer's request. In any order the attacker can predict -- oldest
+/// first, newest first, by digest -- they can place junk ahead of it, and with
+/// a whole mailbox of junk per write a real request could wait as long as
+/// they keep writing. Drawn from the node's randomness the order is one they
+/// cannot see: each run opens every candidate with the same chance, about the
+/// budget's share of what is waiting (a third or more even at the byte cap,
+/// and nearly all of it for a buyer's short request, which also fits where a
+/// large message does not). Junk opened once is never opened again (it is
+/// recorded as seen), so the backlog only shrinks between the attacker's
+/// writes. A real request is therefore reached within a few runs whatever the
+/// attacker does, where before this every run opened everything and a full
+/// mailbox could put the run past the node's limit, which reached no one.
+fn open_within_budget<'a>(
+    store_sk: &SigningKey,
+    mut candidates: Vec<([u8; 32], &'a EncryptedMessage)>,
+    seed: [u8; 32],
+) -> (Vec<Opened<'a>>, bool) {
+    candidates.sort_by_cached_key(|(digest, _)| *blake3::keyed_hash(&seed, digest).as_bytes());
+    let mut left = OPEN_BUDGET;
+    let mut opened = Vec::new();
+    let mut backlog = false;
+    for (digest, message) in candidates {
+        let cost = OPEN_FIXED_COST + message.ciphertext.len();
+        if cost > left {
+            backlog = true;
+            continue;
+        }
+        left -= cost;
+        opened.push((digest, message, open_instant(store_sk, message).is_some()));
+    }
+    (opened, backlog)
+}
+
 fn on_mailbox<S: SecretStore>(
     secrets: &mut S,
     record: &ArmRecord,
@@ -1835,37 +1901,65 @@ fn on_mailbox<S: SecretStore>(
     let Some(store_sk) = store_key(secrets, &record.arm.store_verifying_key) else {
         return Vec::new();
     };
-    let Ok(mailbox) = from_cbor::<MailboxStateV1>(state) else {
+    // The hand-written decoder first: same bytes, a fraction of the work
+    // (`fast_cbor`); anything it does not recognise goes the generic way.
+    let Some(mailbox) =
+        crate::fast_cbor::decode_mailbox(state).or_else(|| from_cbor::<MailboxStateV1>(state).ok())
+    else {
         return Vec::new();
     };
     let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
-    let mut batch: Vec<EncryptedMessage> = Vec::new();
-    let mut entries: Vec<&EncryptedMessage> = mailbox.messages.iter().collect();
-    entries.sort_by_key(|m| (m.timestamp, entry_digest(m)));
     let mut ledger_changed = false;
+    // The messages not yet looked at, each digest computed once (a sort key
+    // recomputed per comparison hashed every ciphertext about log2(n) times
+    // over, #206).
+    let candidates: Vec<([u8; 32], &EncryptedMessage)> = mailbox
+        .messages
+        .iter()
+        .filter(|m| within_age(m, now_ms))
+        .map(|m| (entry_digest(m), m))
+        .filter(|(digest, _)| !ledger.seen.contains(digest))
+        .collect();
+    let (opened, backlog) = open_within_budget(&store_sk, candidates, random_seed());
+    for (digest, _, instant) in &opened {
+        if !instant {
+            // Not an instant request this store can open: a reply, a text, a
+            // quote request, or junk. Looked at once.
+            ledger.saw(*digest);
+            ledger_changed = true;
+        }
+    }
+    // What did not fit this run is looked at by the next one: the next
+    // mailbox change, or the wake-up, which re-reads a mailbox whose ledger
+    // says so (`mailbox_retries`).
+    // A run with nothing left over is what a retry asks for (a full read of
+    // what is waiting: `on_mailbox_retry` clears the flag and runs this), so
+    // it settles the flag either way.
+    if ledger.retry_pending != backlog {
+        ledger.retry_pending = backlog;
+        ledger_changed = true;
+    }
+    // The instant requests in the order they were made (oldest first, as
+    // before this module bounded its work), into one batch.
+    let mut instants: Vec<([u8; 32], &EncryptedMessage)> = opened
+        .iter()
+        .filter(|(_, _, instant)| *instant)
+        .map(|(digest, message, _)| (*digest, *message))
+        .collect();
+    instants.sort_by(|a, b| (a.1.timestamp, a.0).cmp(&(b.1.timestamp, b.0)));
+    let mut batch: Vec<EncryptedMessage> = Vec::new();
     // What the context can carry, less room for its own framing.
     let budget = DelegateContext::MAX_SIZE - 1024;
     let mut used = 0usize;
-    for message in entries {
-        let digest = entry_digest(message);
-        if ledger.seen.contains(&digest) || !within_age(message, now_ms) {
-            continue;
-        }
-        if open_instant(&store_sk, message).is_some() {
-            let size = to_cbor(message).map_or(usize::MAX, |b| b.len());
-            if size > budget {
-                // Can never be carried; the seller answers it.
-                ledger.saw(digest);
-                ledger_changed = true;
-            } else if batch.len() < MAX_BATCH && used + size <= budget {
-                used += size;
-                batch.push(message.clone());
-            }
-        } else {
-            // Not an instant request this store can open: a reply, a text, a
-            // quote request, or junk. Looked at once.
+    for (digest, message) in instants {
+        let size = to_cbor(message).map_or(usize::MAX, |b| b.len());
+        if size > budget {
+            // Can never be carried; the seller answers it.
             ledger.saw(digest);
             ledger_changed = true;
+        } else if batch.len() < MAX_BATCH && used + size <= budget {
+            used += size;
+            batch.push(message.clone());
         }
     }
     if ledger_changed {
@@ -2918,6 +3012,153 @@ mod tests {
             .listing_statuses
             .records
             .insert(harvest_common::store::Bytes32(f.listing.id.0), signed);
+    }
+
+    /// A text from the `i`th buyer, `len` characters long: what instant
+    /// checkout opens and then never again.
+    fn junk(i: usize, len: usize) -> EncryptedMessage {
+        let mut seed = [0x77u8; 32];
+        seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+        let secret = StaticSecret::from(seed);
+        let tag = *PublicKey::from(&secret).as_bytes();
+        let inbox = PublicKey::from(&harvest_common::custody::inbox_secret(&store_sk()));
+        let key = conversation_key_from_dh(
+            &secret.diffie_hellman(&inbox).to_bytes(),
+            MessageDirection::BuyerToSeller,
+        );
+        harvest_common::sealed::seal(
+            &key,
+            &tag,
+            &ConversationId([i as u8; 32]),
+            MessageContent::Text("x".repeat(len)),
+            chrono::DateTime::from_timestamp_millis((NOW - 60_000 - i as u64) as i64).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn seen(f: &Fixture) -> usize {
+        load_ledger(&f.secrets, &f.record.arm.store_contract_id)
+            .seen
+            .len()
+    }
+
+    /// #206: one run opens no more than [`OPEN_BUDGET`] allows; what is left
+    /// is flagged for the next run (the flag beside the ledger, which the
+    /// wake-up's `mailbox_retries` turns into a re-read), and the runs drain
+    /// it. The flag clears with the run that finishes. Mutated red by
+    /// dropping the budget, by not flagging the backlog, and by not clearing
+    /// the flag.
+    #[test]
+    fn opening_is_bounded_and_the_rest_waits_for_the_next_run() {
+        let mut f = fixture();
+        let messages: Vec<EncryptedMessage> = (0..400).map(|i| junk(i, 600)).collect();
+        let per_message = OPEN_FIXED_COST + messages[0].ciphertext.len();
+        let state = to_cbor(&MailboxStateV1 { messages }).unwrap();
+        let mut runs = 0;
+        let mut before = 0;
+        loop {
+            runs += 1;
+            on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+            let now_seen = seen(&f);
+            assert!(
+                now_seen - before <= OPEN_BUDGET / per_message,
+                "run {runs} over budget"
+            );
+            before = now_seen;
+            let pending = load_ledger(&f.secrets, &f.record.arm.store_contract_id).retry_pending;
+            assert_eq!(
+                f.secrets
+                    .get_secret(&retry_key(&f.record.arm.store_contract_id))
+                    .as_deref()
+                    == Some(b"1".as_slice()),
+                pending,
+                "the flag beside the ledger says what the ledger says"
+            );
+            assert_eq!(mailbox_retries(&f.secrets).len(), usize::from(pending));
+            if !pending {
+                break;
+            }
+            assert!(runs < 10, "no progress");
+        }
+        assert!(runs > 1, "400 messages did not fit one run's budget");
+        assert_eq!(seen(&f), 400);
+    }
+
+    /// #206: a buyer's request behind a mailbox of junk is reached within a
+    /// few runs, whichever order the junk is in, because the order of opening
+    /// comes from the node's randomness and never from anything the writer
+    /// chooses. Here the junk is all OLDER than the request (first in the old
+    /// oldest-first order) and big enough that each run opens about a third
+    /// of it. Across 64 seeds the request is opened in the first run most of
+    /// the time and always by the time the junk is drained. Mutated red by
+    /// opening oldest first.
+    #[test]
+    fn a_request_behind_junk_is_reached_whatever_the_junk_order() {
+        let buyer = Buyer::new(40);
+        let request = buyer.request(&jam(), 1, 1, 12_000);
+        let junk: Vec<EncryptedMessage> = (0..300).map(|i| junk(i, 3_000)).collect();
+        let total: usize = junk
+            .iter()
+            .map(|m| OPEN_FIXED_COST + m.ciphertext.len())
+            .sum();
+        let drained_by = total.div_ceil(OPEN_BUDGET - OPEN_FIXED_COST - 4_000) + 1;
+        let mut first_run = 0;
+        for seed in 0..64u8 {
+            let mut waiting: Vec<&EncryptedMessage> = junk.iter().collect();
+            waiting.push(&request);
+            let mut runs = 0;
+            loop {
+                runs += 1;
+                let candidates = waiting.iter().map(|m| (entry_digest(m), *m)).collect();
+                let (opened, _) =
+                    open_within_budget(&store_sk(), candidates, [seed.wrapping_add(runs); 32]);
+                if opened.iter().any(|(_, _, instant)| *instant) {
+                    break;
+                }
+                let done: Vec<[u8; 32]> = opened.iter().map(|(d, _, _)| *d).collect();
+                waiting.retain(|m| !done.contains(&entry_digest(m)));
+                assert!(
+                    runs <= drained_by as u8,
+                    "seed {seed}: not reached in {runs} runs"
+                );
+            }
+            if runs == 1 {
+                first_run += 1;
+            }
+        }
+        assert!(
+            first_run >= 16,
+            "reached in the first run for only {first_run} of 64 seeds"
+        );
+    }
+
+    /// #206: whether a store takes orders, as the wake-up's heartbeat asks
+    /// it, is what the full status says, without reading the ledger. Checked
+    /// taking, with the watch lapsed, with no payment key, and with no tip.
+    /// Mutated red by ignoring the refusal, or the remaining run.
+    #[test]
+    fn taking_orders_is_what_the_status_says() {
+        let agree = |f: &Fixture| {
+            let status = status_of(&f.secrets, &f.record, NOW);
+            assert_eq!(
+                taking_orders(&f.secrets, &f.record, NOW, &upcoming(&f.secrets)),
+                status.paused.is_none() && status.watched_remaining > 0,
+                "{status:?}"
+            );
+        };
+        let f = fixture();
+        agree(&f);
+        let mut lapsed = fixture();
+        lapsed.record.watched_until_ms = NOW;
+        agree(&lapsed);
+        // No payment key and no tip: only the store key is held.
+        let mut bare = fixture();
+        bare.secrets = MemSecrets::default();
+        crate::store_keys::keep(&mut bare.secrets, &store_sk());
+        agree(&bare);
+        let mut no_watch = fixture();
+        no_watch.record.arm.watched_scripts.clear();
+        agree(&no_watch);
     }
 
     #[test]

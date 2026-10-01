@@ -33,7 +33,7 @@
 //!   single-app acknowledgement for that reason. Harvest's delegate does serve
 //!   one app, but the prefix is free and stays correct if that changes.
 
-use freenet_migrate::{ExportRequest, ExportScope, OriginPolicy, SecretStore};
+use freenet_migrate::{ExportScope, OriginPolicy, SecretStore};
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError, MessageOrigin, OutboundDelegateMsg};
 use harvest_common::migration::{HarvestMigrationRequest, SECRET_KEY_PREFIX};
 
@@ -119,16 +119,56 @@ fn export<S: SecretStore + crate::secrets::RemovableSecrets>(
     source_generation: u32,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let policy = origin_policy()?;
-    let out = freenet_migrate::handle_export_request(
+    let payload = export_payload(
         &WithoutStoreKeys(&*store),
         origin,
         &policy,
-        &export_scope(),
-        &ExportRequest { source_generation },
+        source_generation,
     )
     .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))?;
     crate::auto_invoice::disarm_all(store);
-    Ok(out)
+    Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+        freenet_stdlib::prelude::ApplicationMessage::new(payload).processed(true),
+    )])
+}
+
+/// What `freenet_migrate::handle_export_request` answers for this
+/// delegate's scope, byte for byte, with the encoding done by
+/// [`crate::fast_cbor::encode_exported`] (#206: ciborium's encoding of a full
+/// export ran to twice a call's budget).
+///
+/// The crate's steps, in its order: authorize the origin (fail closed), refuse
+/// when the host's whole-scope enumeration is at its cap (a truncated listing
+/// may have dropped keys under the prefix), list the prefix, read each value.
+/// The crate also drops its reserved `\0freenet-migrate/` markers; none can
+/// match the `harvest:` prefix this export uses, so none appear here.
+/// `the_fast_export_is_the_crates_export` pins the equality.
+fn export_payload<S: SecretStore>(
+    store: &S,
+    origin: Option<&MessageOrigin>,
+    policy: &OriginPolicy,
+    source_generation: u32,
+) -> Result<Vec<u8>, freenet_migrate::MigrateError> {
+    policy.authorize(origin)?;
+    let all = store.list_secrets(b"");
+    if all.len() >= freenet_migrate::HOST_ENUMERATION_CAP {
+        return Err(freenet_migrate::MigrateError::TruncatedExport {
+            returned: all.len(),
+            cap: freenet_migrate::HOST_ENUMERATION_CAP,
+        });
+    }
+    let ExportScope::Prefix(prefix) = export_scope() else {
+        unreachable!("this delegate exports by prefix")
+    };
+    let secrets: Vec<(Vec<u8>, Vec<u8>)> = store
+        .list_secrets(&prefix)
+        .into_iter()
+        .filter_map(|key| store.get_secret(&key).map(|value| (key, value)))
+        .collect();
+    Ok(crate::fast_cbor::encode_exported(
+        source_generation,
+        &secrets,
+    ))
 }
 
 /// Handle a migration request from a successor generation.
@@ -156,7 +196,7 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_migrate::MigrateError;
+    use freenet_migrate::{ExportRequest, MigrateError};
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::collections::BTreeMap;
 
@@ -478,5 +518,38 @@ mod tests {
                 String::from_utf8_lossy(&key)
             );
         }
+    }
+
+    /// The export this delegate answers is the crate's, byte for byte, for
+    /// the same store, origin and scope, store keys hidden; and it refuses
+    /// what the crate refuses. Mutated red by changing the scope, or by
+    /// dropping the store-key filter.
+    #[test]
+    fn the_fast_export_is_the_crates_export() {
+        let mut s = store();
+        s.0.insert(
+            format!("{}abc", crate::store_keys::STORE_KEY_PREFIX).into_bytes(),
+            vec![1; 32],
+        );
+        let wrapped = WithoutStoreKeys(&s);
+        let policy = origin_policy().unwrap();
+        let crates = freenet_migrate::handle_export_request(
+            &wrapped,
+            Some(&harvest_origin()),
+            &policy,
+            &export_scope(),
+            &ExportRequest {
+                source_generation: 29,
+            },
+        )
+        .unwrap();
+        let OutboundDelegateMsg::ApplicationMessage(m) = &crates[0] else {
+            panic!("an application message");
+        };
+        assert_eq!(
+            export_payload(&wrapped, Some(&harvest_origin()), &policy, 29).unwrap(),
+            m.payload
+        );
+        assert!(export_payload(&wrapped, None, &policy, 29).is_err());
     }
 }

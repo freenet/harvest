@@ -1015,6 +1015,25 @@ mod tests {
         ));
     }
 
+    /// #206: an imported ledger that has requests to retry sets the flag the
+    /// wake-up reads instead of the ledger, so the retry is not lost across
+    /// the re-key. Mutated red by not writing the flag on import.
+    #[test]
+    fn an_imported_ledgers_retry_reaches_the_wakeup() {
+        let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
+        let flag = crate::auto_invoice::retry_key_for_ledger(&key).unwrap();
+        let mut store = MemSecrets::default();
+        let pending = crate::auto_invoice::Ledger {
+            retry_pending: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::Written
+        ));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+    }
+
     /// A predecessor list that does not decode is refused; this delegate's
     /// own list that does not decode is left alone and retried, never
     /// replaced.
