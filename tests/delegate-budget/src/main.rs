@@ -695,9 +695,11 @@ fn scenario(r: &mut Runner) -> Result<()> {
             ))
         })
         .collect::<Result<_>>()?;
-    r.notify(
+    drain_mailbox(
+        r,
         &format!("ContractNotification: mailbox ({MAILBOX_PEERS} unread)"),
         mailbox_contract,
+        store_contract,
         cbor(&mailbox_state(messages)?),
     )?;
     let ledger = format!(
@@ -756,9 +758,11 @@ fn scenario(r: &mut Runner) -> Result<()> {
         big_state.messages.len(),
         big_bytes.len() / 1024
     );
-    r.notify(
+    drain_mailbox(
+        r,
         "ContractNotification: mailbox (byte cap, unread)",
         mailbox_contract,
+        store_contract,
         big_bytes,
     )?;
     let seen_after = ledger_seen(r, &ledger)?;
@@ -1030,6 +1034,31 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
 
+    // --- a migration import of a full ledger into a full ledger --------------
+    // What a successor does with each ledger a predecessor exports: decode
+    // both, merge, encode. The largest secret this delegate imports.
+    if let (Some((a, _, _)), Some((b, _, _))) = (extra_arms.first(), extra_arms.get(1)) {
+        let key = |c: &[u8; 32]| {
+            format!("harvest:auto:ledger:{}", bs58::encode(c).into_string()).into_bytes()
+        };
+        let incoming = r
+            .host
+            .state
+            .secrets
+            .get(&key(b))
+            .cloned()
+            .ok_or_else(|| anyhow!("no seeded ledger to import"))?;
+        r.app(
+            "ImportMigratedSecret (full ledger into a full ledger)",
+            cbor(&HarvestDelegateRequest::ImportMigratedSecret {
+                predecessor: [0x29; 32],
+                key: key(a),
+                value: harvest_common::delegate::MigratedSecretValue(incoming),
+            }),
+            "MigratedSecretImported",
+        )?;
+    }
+
     // --- the migration export, last: it disarms instant checkout -----------
     let out = r.send(
         "ExportSecrets (migration)",
@@ -1064,6 +1093,29 @@ fn freenet_migrate_check(bytes: &[u8], at_least: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Deliver a mailbox state, and again for as long as the delegate says a run
+/// left messages for the next one (its retry flag,
+/// `harvest:auto:retry:{store}` = "1"): on a node the next mailbox change or
+/// the wake-up's re-read delivers it. Every run is measured under `name`. A
+/// delegate without the flag (one that opens everything in one run) gets one
+/// delivery.
+fn drain_mailbox(
+    r: &mut Runner,
+    name: &str,
+    mailbox: [u8; 32],
+    store: [u8; 32],
+    state: Vec<u8>,
+) -> Result<()> {
+    let flag = format!("harvest:auto:retry:{}", bs58::encode(store).into_string());
+    for _ in 0..32 {
+        r.notify(name, mailbox, state.clone())?;
+        if r.host.state.secrets.get(flag.as_bytes()).map(Vec::as_slice) != Some(b"1") {
+            return Ok(());
+        }
+    }
+    bail!("{name}: still not done after 32 runs; the delegate's per-run bound makes no progress")
 }
 
 /// A mailbox state as a node delivers it: in the contract's canonical order
