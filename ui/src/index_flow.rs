@@ -58,9 +58,26 @@ pub struct IndexView {
     /// (harvest#181): no store yet, unless the key's index migration walk
     /// finds an earlier generation's.
     pub absent: bool,
-    /// [`INDEX_SETTLE_WAIT_MS`] has passed since it was asked for with no
-    /// settled answer.
-    pub waited: bool,
+    /// An earlier generation's index, recovered by the key's index migration
+    /// walk (harvest#181). Its stores count as listed from the moment it is
+    /// recovered, not from when its forward PUT lands, which may be never.
+    pub recovered: Option<GhostKeyIndexV1>,
+}
+
+/// How a Ghost Key's index migration walk ended, as "Create a store" needs
+/// to know it (harvest#181).
+#[derive(Clone, Debug, PartialEq)]
+pub enum IndexWalkEnd {
+    /// Every earlier generation answered and none held an index, or the
+    /// delegate says the lineage was carried forward already, so the
+    /// current index is the whole answer.
+    Empty,
+    /// An earlier generation's index was recovered.
+    Recovered(GhostKeyIndexV1),
+    /// Some earlier generation never answered: nothing is known, and the
+    /// gate waits out [`INDEX_SETTLE_WAIT_MS`] rather than reading silence as
+    /// "no store".
+    Unknown,
 }
 
 /// How long My Store waits for a Ghost Key's index to settle before it
@@ -113,19 +130,26 @@ impl AppState {
                 ghost_key,
                 index: None,
                 absent: false,
-                waited: false,
+                recovered: None,
             },
         );
         // My Store waits for the index before offering "Create a store"
-        // (harvest#181), but not for ever.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let id = id.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                gloo_timers::future::TimeoutFuture::new(INDEX_SETTLE_WAIT_MS).await;
-                use dioxus::prelude::WritableExt;
-                crate::gateway::APP_STATE.write().on_index_wait_elapsed(&id);
-            });
+        // (harvest#181), but not for ever. Kept per Ghost Key, not per
+        // view: a failed GET drops the view, and a wait kept on it would be
+        // dropped too, leaving "Checking" up until the vault reconnects.
+        if let Some(fingerprint) = self.connected_ghost_key(&ghost_key) {
+            if self.index_waits_started.insert(fingerprint.clone()) {
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(INDEX_SETTLE_WAIT_MS).await;
+                    use dioxus::prelude::WritableExt;
+                    crate::gateway::APP_STATE
+                        .write()
+                        .on_index_wait_elapsed(&fingerprint);
+                });
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = fingerprint;
+            }
         }
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
@@ -408,18 +432,60 @@ impl AppState {
         }
     }
 
-    /// The Ghost Key `fingerprint`'s index migration walk has finished: an
-    /// earlier generation's index, if there was one, has been carried
-    /// forward (and arrives as the current index's state).
-    pub(crate) fn on_index_walk_done(&mut self, fingerprint: &str) {
-        self.index_walks_done.insert(fingerprint.to_string());
+    /// The Ghost Key `fingerprint`'s index migration walk has ended.
+    ///
+    /// Only an ending that settles the question counts (harvest#181 review):
+    /// a walk that met silence knows nothing, and one that recovered an
+    /// earlier index must make that index's stores known now, because the
+    /// forward PUT that would bring it to the current address may be slow,
+    /// or fail.
+    pub(crate) fn on_index_walk_end(&mut self, fingerprint: &str, end: IndexWalkEnd) {
+        match end {
+            IndexWalkEnd::Unknown => {}
+            IndexWalkEnd::Empty => {
+                self.index_walks_done.insert(fingerprint.to_string());
+            }
+            IndexWalkEnd::Recovered(index) => {
+                let Some(ghost_key) = self
+                    .ghostkeys
+                    .iter()
+                    .find(|k| k.fingerprint == fingerprint)
+                    .and_then(|k| k.verifying_key_bytes.as_deref())
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                else {
+                    return;
+                };
+                let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&ghost_key) else {
+                    return;
+                };
+                // The same rule as a served index: every entry the Ghost
+                // Key's own signed statement, or none of it used.
+                if let Err(e) = index.verify(&IndexParameters::new(vk)) {
+                    dioxus::logger::tracing::warn!(
+                        "a recovered Ghost Key index did not verify: {e}"
+                    );
+                    return;
+                }
+                let stores: Vec<[u8; 32]> = index.store_keys().map(|k| k.to_bytes()).collect();
+                let Some(view) = self
+                    .ghostkey_indexes
+                    .values_mut()
+                    .find(|v| v.ghost_key == ghost_key)
+                else {
+                    return;
+                };
+                view.recovered = Some(index);
+                self.index_walks_done.insert(fingerprint.to_string());
+                for store in stores {
+                    self.follow_indexed_store(&store);
+                }
+            }
+        }
     }
 
-    /// The wait for an index to settle is over.
-    pub(crate) fn on_index_wait_elapsed(&mut self, contract_id: &[u8]) {
-        if let Some(view) = self.ghostkey_indexes.get_mut(contract_id) {
-            view.waited = true;
-        }
+    /// The wait for the Ghost Key `fingerprint`'s index to settle is over.
+    pub(crate) fn on_index_wait_elapsed(&mut self, fingerprint: &str) {
+        self.index_waits_elapsed.insert(fingerprint.to_string());
     }
 
     /// Whether the Ghost Key `fingerprint` (verifying key `backer`) may
@@ -441,16 +507,19 @@ impl AppState {
             .ghostkey_indexes
             .values()
             .find(|v| v.ghost_key == *backer);
-        let waited = view.is_some_and(|v| v.waited);
-        let settled = match view {
-            None => false,
-            Some(view) => match &view.index {
-                Some(index) => index
-                    .store_keys()
-                    .all(|store| self.indexed_store_settled(&store)),
-                None => view.absent && self.index_walks_done.contains(fingerprint),
-            },
-        };
+        let waited = self.index_waits_elapsed.contains(fingerprint);
+        let settled = view.is_some_and(|view| {
+            let known = view.index.is_some()
+                || view.recovered.is_some()
+                || (view.absent && self.index_walks_done.contains(fingerprint));
+            known
+                && view
+                    .index
+                    .iter()
+                    .chain(view.recovered.iter())
+                    .flat_map(|index| index.store_keys())
+                    .all(|store| self.indexed_store_settled(&store))
+        });
         match (
             settled && self.store_lists_answered.contains(fingerprint),
             waited,
@@ -579,7 +648,10 @@ mod tests {
             checking(),
             "an earlier index generation may still hold its stores"
         );
-        state.on_index_walk_done("fp");
+        // A walk that met silence knows nothing (harvest#181 review).
+        state.on_index_walk_end("fp", IndexWalkEnd::Unknown);
+        assert_eq!(state.store_creation_gate("fp", &backer_vk()), checking());
+        state.on_index_walk_end("fp", IndexWalkEnd::Empty);
         assert_eq!(
             state.store_creation_gate("fp", &backer_vk()),
             CreationGate::Ready
@@ -607,11 +679,113 @@ mod tests {
         let mut state = AppState::default();
         connect(&mut state, backer_vk());
         state.watch_ghostkey_index(backer_vk());
-        state.on_index_wait_elapsed(&index_id(backer_vk()));
+        assert!(
+            state.index_waits_started.contains("fp"),
+            "the wait is started"
+        );
+        state.on_index_wait_elapsed("fp");
         assert_eq!(
             state.store_creation_gate("fp", &backer_vk()),
             CreationGate::Unconfirmed
         );
+    }
+
+    /// The wait belongs to the Ghost Key, not to the index view: a GET that
+    /// could not be sent drops the view, and the gate still ends its wait
+    /// instead of showing "Checking" until the vault reconnects. Mutated red
+    /// by keeping the wait on the view.
+    #[test]
+    fn a_failed_index_read_still_ends_the_wait() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.store_lists_answered.insert("fp".into());
+        state.watch_ghostkey_index(backer_vk());
+        state.on_index_watch_failed(&index_id(backer_vk()));
+        assert!(state.ghostkey_indexes.is_empty());
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking
+        );
+        state.on_index_wait_elapsed("fp");
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Unconfirmed
+        );
+    }
+
+    /// An earlier generation's index, recovered by the walk, counts at once:
+    /// the gate waits for the stores it lists and follows them, without
+    /// waiting on the forward PUT that may never land. One that does not
+    /// verify is ignored and settles nothing. Mutated red by marking the
+    /// walk done without the recovered stores, and by skipping the verify.
+    #[test]
+    fn a_recovered_index_holds_creation_back_for_its_stores() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.store_lists_answered.insert("fp".into());
+        state.watch_ghostkey_index(backer_vk());
+        let id = index_id(backer_vk());
+        assert!(state.on_index_absent(&id));
+
+        let mut forged = index_of(&[0x71]);
+        let foreign = IndexEntry::from_backing(&signed_backing(0x72, 0x42, 10));
+        forged.entries.insert(foreign.slot(), foreign);
+        state.on_index_walk_end("fp", IndexWalkEnd::Recovered(forged));
+        assert!(state.stores_from_my_indexes.is_empty());
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking,
+            "a recovery that does not verify settles nothing"
+        );
+
+        state.on_index_walk_end("fp", IndexWalkEnd::Recovered(index_of(&[0x71])));
+        assert!(state.stores_from_my_indexes.contains(&store_id(0x71)));
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking,
+            "its store has not loaded"
+        );
+        load_backed(&mut state, 9, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        state
+            .browsing_stores
+            .insert(store_id(0x71), state.browsing_stores[&vec![9; 32]].clone());
+        assert!(matches!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::BacksStore(_)
+        ));
+    }
+
+    /// "Create store" sent from a form opened under an earlier answer is
+    /// refused while the gate is checking or the key backs a store, and goes
+    /// on otherwise (here to the next refusal: no block loaded). Mutated red
+    /// by not checking the gate.
+    #[test]
+    fn creating_a_store_rechecks_the_gate() {
+        let details = || crate::state::StoreDetails {
+            store_name: "Bean Shop".into(),
+            description: String::new(),
+        };
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.watch_ghostkey_index(backer_vk());
+        assert_eq!(
+            state.begin_own_store_creation("fp".into(), backer_vk(), details()),
+            Err(crate::backing_flow::STILL_CHECKING_GHOST_KEY.to_string())
+        );
+        assert!(state.store_creation_in_flight.is_none());
+
+        state.on_index_wait_elapsed("fp");
+        assert_eq!(
+            state.begin_own_store_creation("fp".into(), backer_vk(), details()),
+            Err(crate::backing_flow::NO_BLOCK_FOR_BACKING.to_string()),
+            "past the gate"
+        );
+
+        load_backed(&mut state, 9, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
+        let refused = state
+            .begin_own_store_creation("fp".into(), backer_vk(), details())
+            .unwrap_err();
+        assert!(refused.contains("already has a store"), "{refused}");
     }
 
     /// A connected Ghost Key's index is read, and every store it lists is
@@ -979,5 +1153,47 @@ mod tests {
         connect(&mut state, backer_vk());
         state.ensure_indexed(&[1u8; 32]);
         assert!(state.index_entries_to_publish.is_empty());
+    }
+
+    /// The wasm-only wiring the gate and the close depend on, pinned by
+    /// source because no host test can run it (harvest#181 review). Red
+    /// if any of these calls is deleted or loosened.
+    #[test]
+    fn the_wasm_only_wiring_for_one_store_per_ghost_key_is_in_place() {
+        let squash = |src: &str| src.split_whitespace().collect::<String>();
+        let migrate = squash(include_str!("gateway/migrate_ops.rs"));
+        for needle in [
+            // A silent candidate marks the walk as knowing nothing...
+            "probe.any_unknown=true;",
+            // ...which ends it as Unknown, never Empty.
+            "_ifprobe.any_unknown=>(None,crate::index_flow::IndexWalkEnd::Unknown),",
+            "crate::index_flow::IndexWalkEnd::Recovered(merged),",
+            "super::APP_STATE.write().on_index_walk_end(&fingerprint,end);",
+            // The marker skip settles the walk too.
+            ".on_index_walk_end(&fingerprint,crate::index_flow::IndexWalkEnd::Empty);",
+        ] {
+            assert!(migrate.contains(needle), "migrate_ops lost: {needle}");
+        }
+        assert!(
+            !migrate.contains("on_index_walk_done"),
+            "the walk is never marked done regardless of how it ended"
+        );
+        let handler = squash(include_str!("gateway/response_handler.rs"));
+        assert!(handler.contains("APP_STATE.write().on_index_absent(instance_id.as_bytes());"));
+        let this = squash(include_str!("index_flow.rs"));
+        assert!(this.contains(".on_index_wait_elapsed(&fingerprint);"));
+        let closure = squash(include_str!("closure_flow.rs"));
+        assert!(closure.contains(".on_close_deadline(&id,attempt);"));
+        let my_store = include_str!("components/my_store.rs");
+        let my_store = squash(&my_store[..my_store.find("#[cfg(test)]").expect("tests")]);
+        assert!(
+            my_store.contains(".begin_own_store_creation(fingerprint.clone(),vk_bytes,details);")
+        );
+        assert_eq!(
+            my_store.matches("another_store").count(),
+            1,
+            "the UI never asks for a second store on purpose"
+        );
+        assert!(my_store.contains("another_store:false,"));
     }
 }

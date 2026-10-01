@@ -830,9 +830,8 @@ On a phone these are a segmented control under the store name.
 |                                                                   |
 |                                   [ Create store ]                |
 |                                                                   |
-|  You can move your store to a different Ghost Key later; it       |
-|  keeps its name, link and record.                                 |
-|  Next: add a payout wallet, add a listing, share your link.       |
+|  One Ghost Key backs one store. Next: add a payout wallet, add a  |
+|  listing, share your link.                                        |
 +-------------------------------------------------------------------+
 ```
 
@@ -1818,8 +1817,11 @@ left open, and what phase 1a deliberately does not do yet.
   good", confirmed with the words that it is permanent and cannot be reopened
   or moved to another Ghost Key. The store key signs the retirement of the
   store's backer and the closure, and both go in one update, so the other
-  store counts again and the closed one stops taking orders. This is not the
-  swap of harvest#104, and does not pretend to be.
+  store counts again and the closed one stops taking orders. The stores are
+  named with their codes, listings and orders, since the usual way here is
+  the same store made twice under one name, and only one close per Ghost Key
+  runs at a time, so a seller cannot close both. This is not the swap of
+  harvest#104, and does not pretend to be.
 - **No second store under one Ghost Key (harvest#181).** The "Open a second
   store under it anyway" escape was removed: it created exactly the state
   above on purpose. A creation refused because the Ghost Key already backs a

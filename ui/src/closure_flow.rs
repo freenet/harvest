@@ -26,6 +26,8 @@
 //! invoicing for it. Moving a store to another Ghost Key instead, which keeps
 //! it alive, is harvest#104 and is not built.
 
+use std::collections::BTreeMap;
+
 use harvest_common::backing::{AuthorizedClosure, AuthorizedRetirement, Retirement, StoreClosure};
 
 use crate::state::{AppState, PendingSignature};
@@ -44,60 +46,209 @@ pub struct PendingClosure {
     pub closure: StoreClosure,
 }
 
-/// A store being closed for good: the two signed halves as they come back.
-/// Published together, once both are here.
+/// A store being closed for good: whose key it is, which Ghost Key it frees,
+/// and the two signed halves as they come back. Published together, once
+/// both are here and both verify.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClosingStore {
+    /// The store's own key, which must have signed both halves.
+    pub owner: [u8; 32],
+    /// The Ghost Key whose backing is being retired.
+    pub backer: [u8; 32],
+    /// Tells this attempt's deadline from a later attempt's.
+    pub attempt: u64,
     pub retirement: Option<AuthorizedRetirement>,
     pub closure: Option<AuthorizedClosure>,
+}
+
+/// A close handed to the node, waiting for the store's state to show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloseSent {
+    pub backer: [u8; 32],
+    pub name: String,
+}
+
+/// Another store backed by the same Ghost Key, told apart the way a seller
+/// can tell it: two stores in this state often carry the same name (a store
+/// made again on a second device), so the code and what it holds are shown
+/// beside the name.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SharingStore {
+    /// The store's current generation where that is loaded, so a close
+    /// goes to the instance buyers read.
+    pub contract_id: Vec<u8>,
+    pub name: String,
+    pub code: String,
+    pub listings: usize,
+    pub orders: usize,
+    /// This device holds its key and nothing blocks a close.
+    pub can_close: bool,
+}
+
+/// One Ghost Key behind this store and others, as My Store shows it
+/// (harvest#181).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct KeyConflict {
+    /// This store, described the way the others are.
+    pub this: SharingStore,
+    /// The other stores the same Ghost Key backs.
+    pub others: Vec<SharingStore>,
+    /// A store of this Ghost Key whose close is under way or sent and not
+    /// yet seen, by name: while it travels, no close is offered anywhere.
+    pub closing: Option<String>,
+}
+
+impl KeyConflict {
+    /// The stores this device can close, this one first. Empty while a close
+    /// travels.
+    pub(crate) fn closable(&self) -> Vec<SharingStore> {
+        if self.closing.is_some() {
+            return Vec::new();
+        }
+        std::iter::once(&self.this)
+            .chain(&self.others)
+            .filter(|s| s.can_close)
+            .cloned()
+            .collect()
+    }
 }
 
 /// What the seller is told when a close cannot be published.
 pub(crate) const CLOSE_NOT_SAVED: &str =
     "The store could not be closed. Nothing changed; try again.";
 
+/// How long a close waits for its two signatures before giving up, so a
+/// delegate that never answers cannot leave "Closing..." on screen for the
+/// rest of the session.
+pub(crate) const CLOSE_SIGN_TIMEOUT_MS: u32 = 60_000;
+
 impl AppState {
-    /// The OTHER loaded stores whose current backing is the same Ghost Key as
-    /// the store at `store_contract_id`, by id and name: section 6.2's
-    /// conflict, as the seller needs it named. Empty when there is none.
-    pub(crate) fn stores_sharing_backer(&self, store_contract_id: &[u8]) -> Vec<(Vec<u8>, String)> {
-        let Some(backer) = self
+    /// The OTHER stores whose current backing is the same Ghost Key as the
+    /// store at `store_contract_id`: section 6.2's conflict, as the seller
+    /// needs it named. Empty when there is none.
+    ///
+    /// Decided exactly as `refresh_backing_verdicts` decides the conflict:
+    /// by store KEY, over verified backings only. `browsing_stores` can hold
+    /// one store under two generation ids (the id its registration names
+    /// and the current one), and comparing ids would report a store as
+    /// sharing a key with itself and offer to close the seller's only store.
+    pub(crate) fn stores_sharing_backer(&self, store_contract_id: &[u8]) -> Vec<SharingStore> {
+        let Some(view) = self
             .browsing_stores
             .get(store_contract_id)
             .and_then(|s| s.backing.as_ref())
-            .map(|b| b.backer)
+            .filter(|v| v.certificate_status.is_verified())
         else {
             return Vec::new();
         };
-        let mut others: Vec<(Vec<u8>, String)> = self
+        let (owner, backer) = (view.store, view.backer);
+        // One entry per other store key, preferring its current generation.
+        let mut by_owner: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
+        for (id, store) in &self.browsing_stores {
+            let Some(other) = store.backing.as_ref() else {
+                continue;
+            };
+            if other.backer != backer
+                || other.store == owner
+                || !other.certificate_status.is_verified()
+            {
+                continue;
+            }
+            let current = current_store_id(&other.store);
+            let keep = by_owner
+                .get(&other.store)
+                .is_none_or(|_| current.as_deref() == Some(id.as_slice()));
+            if keep {
+                by_owner.insert(other.store, id.clone());
+            }
+        }
+        by_owner
+            .into_iter()
+            .map(|(owner, id)| self.sharing_store(id, &owner))
+            .collect()
+    }
+
+    /// The conflict the store at `store_contract_id` is part of, if any.
+    pub(crate) fn key_conflict(&self, store_contract_id: &[u8]) -> Option<KeyConflict> {
+        let others = self.stores_sharing_backer(store_contract_id);
+        if others.is_empty() {
+            return None;
+        }
+        let view = self
             .browsing_stores
+            .get(store_contract_id)?
+            .backing
+            .as_ref()?;
+        Some(KeyConflict {
+            this: self.sharing_store(store_contract_id.to_vec(), &view.store),
+            closing: self.close_in_flight_for(&view.backer),
+            others,
+        })
+    }
+
+    fn sharing_store(&self, contract_id: Vec<u8>, owner: &[u8; 32]) -> SharingStore {
+        let browsing = self.browsing_stores.get(&contract_id);
+        SharingStore {
+            name: self.store_name_of(&contract_id).label(),
+            code: ed25519_dalek::VerifyingKey::from_bytes(owner)
+                .map(|key| harvest_common::store::store_code(&key))
+                .unwrap_or_default(),
+            listings: browsing.map(|b| b.listings.len()).unwrap_or(0),
+            orders: browsing
+                .map(|b| {
+                    b.orders
+                        .iter()
+                        .filter(|o| !crate::fulfilment::is_unpaid_buy_now(o))
+                        .count()
+                })
+                .unwrap_or(0),
+            can_close: self.can_close_store(&contract_id),
+            contract_id,
+        }
+    }
+
+    /// The name of a store whose close is under way, or sent and not yet
+    /// shown in its state, among the stores `backer` backs. One close at a
+    /// time per Ghost Key: the two stores' retirements are byte-identical,
+    /// so two closes in flight could be answered with each other's
+    /// signatures, and a seller who still saw "close the other" while the
+    /// first close travelled could close both.
+    pub(crate) fn close_in_flight_for(&self, backer: &[u8; 32]) -> Option<String> {
+        self.closing_stores
             .iter()
-            .filter(|(id, _)| id.as_slice() != store_contract_id)
-            .filter(|(_, store)| store.backing.as_ref().is_some_and(|b| b.backer == backer))
-            .map(|(id, _)| (id.clone(), self.store_name_of(id).label()))
-            .collect();
-        others.sort();
-        others
+            .find(|(_, closing)| closing.backer == *backer)
+            .map(|(id, _)| self.store_name_of(id).label())
+            .or_else(|| {
+                self.closes_sent
+                    .iter()
+                    .filter(|(id, sent)| {
+                        sent.backer == *backer
+                            && !self.browsing_stores.get(*id).is_some_and(|s| s.closed)
+                    })
+                    .map(|(_, sent)| sent.name.clone())
+                    .next()
+            })
     }
 
     /// Whether this device can close the store: it holds its store key, the
-    /// store is not closed already, and no close is under way.
+    /// store is not closed already, and no close is under way for any store
+    /// its Ghost Key backs.
     pub(crate) fn can_close_store(&self, store_contract_id: &[u8]) -> bool {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return false;
+        };
         self.work_store_key(store_contract_id)
             .is_some_and(|key| self.holds_store_key(&key.to_bytes()))
-            && !self
-                .browsing_stores
-                .get(store_contract_id)
-                .is_some_and(|s| s.closed)
-            && !self.closing_stores.contains_key(store_contract_id)
+            && !store.closed
+            && store
+                .backing
+                .as_ref()
+                .is_some_and(|b| self.close_in_flight_for(&b.backer).is_none())
     }
 
     /// Close the store at `store_contract_id` for good: ask its store key to
     /// sign the retirement of its current backer and the closure.
     pub(crate) fn close_store_for_good(&mut self, store_contract_id: &[u8]) -> Result<(), String> {
-        if self.closing_stores.contains_key(store_contract_id) {
-            return Err("this store is already being closed".into());
-        }
         let store_key = self
             .work_store_key(store_contract_id)
             .ok_or(crate::state::NO_STORE_KEY_MESSAGE)?;
@@ -113,16 +264,30 @@ impl AppState {
             .as_ref()
             .ok_or("this store has no current backing to take off")?
             .backer;
-        let backer = ed25519_dalek::VerifyingKey::from_bytes(&backer)
+        if let Some(name) = self.close_in_flight_for(&backer) {
+            return Err(format!(
+                "{name} is already being closed; wait for it to finish"
+            ));
+        }
+        let backer_key = ed25519_dalek::VerifyingKey::from_bytes(&backer)
             .map_err(|_| "this store's backing names no valid key".to_string())?;
         let owner = store_key;
-        self.closing_stores
-            .insert(store_contract_id.to_vec(), ClosingStore::default());
+        let attempt = self.next_messaging_request_id();
+        self.closing_stores.insert(
+            store_contract_id.to_vec(),
+            ClosingStore {
+                owner: owner.to_bytes(),
+                backer,
+                attempt,
+                retirement: None,
+                closure: None,
+            },
+        );
         let signed = self
             .request_store_key_signature(
                 PendingSignature::Retirement(Box::new(PendingRetirement {
                     store_contract_id: store_contract_id.to_vec(),
-                    retirement: Retirement { backer },
+                    retirement: Retirement { backer: backer_key },
                 })),
                 owner.to_bytes(),
             )
@@ -137,8 +302,36 @@ impl AppState {
             });
         if signed.is_err() {
             self.abandon_close(store_contract_id);
+            return signed;
         }
-        signed
+        #[cfg(target_arch = "wasm32")]
+        {
+            let id = store_contract_id.to_vec();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(CLOSE_SIGN_TIMEOUT_MS).await;
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_close_deadline(&id, attempt);
+            });
+        }
+        Ok(())
+    }
+
+    /// The close of `store_contract_id` started as `attempt` has had its
+    /// time: if its signatures are still not both back, stop it and say so.
+    pub(crate) fn on_close_deadline(&mut self, store_contract_id: &[u8], attempt: u64) {
+        if self
+            .closing_stores
+            .get(store_contract_id)
+            .is_some_and(|c| c.attempt == attempt)
+        {
+            self.abandon_close(store_contract_id);
+            self.notifications.push(format!(
+                "{} (the store key did not answer)",
+                CLOSE_NOT_SAVED
+            ));
+        }
     }
 
     /// The store key signed a store's retirement.
@@ -181,14 +374,45 @@ impl AppState {
     /// alone: a retirement without the closure leaves a dead store that its
     /// delegate may still invoice for, and a closure without the retirement
     /// leaves the Ghost Key counted at a closed store.
+    ///
+    /// Both are verified against the store's key first. The contract drops
+    /// a record that does not verify without an error, and the node answers
+    /// an update as soon as it is handed over, so a bad signature published
+    /// here would be told to the seller as a close that never happened.
     fn publish_close_if_ready(&mut self, store_contract_id: &[u8]) {
         let Some(ClosingStore {
+            owner,
+            backer,
             retirement: Some(retirement),
             closure: Some(closure),
+            ..
         }) = self.closing_stores.get(store_contract_id).cloned()
         else {
             return;
         };
+        let verified = ed25519_dalek::VerifyingKey::from_bytes(&owner)
+            .ok()
+            .is_some_and(|owner| {
+                retirement.verify(&owner).is_ok() && closure.verify(&owner).is_ok()
+            });
+        if !verified {
+            self.abandon_close(store_contract_id);
+            self.notifications.push(format!(
+                "{CLOSE_NOT_SAVED} (the store key's signature did not check out)"
+            ));
+            return;
+        }
+        let name = self.store_name_of(store_contract_id).label();
+        self.abandon_close(store_contract_id);
+        // Held until the store's state shows it closed: until then the
+        // conflict is still on screen, and a second close must not start.
+        self.closes_sent.insert(
+            store_contract_id.to_vec(),
+            CloseSent {
+                backer,
+                name: name.clone(),
+            },
+        );
         #[cfg(target_arch = "wasm32")]
         {
             let store_id = store_contract_id.to_vec();
@@ -198,14 +422,12 @@ impl AppState {
                     crate::gateway::store_ops::submit_close_by_id(&store_id, retirement, closure)
                         .await;
                 let mut state = crate::gateway::APP_STATE.write();
-                state.abandon_close(&store_id);
                 match result {
-                    Ok(()) => state.notifications.push(
-                        "The store is closed for good. Buyers can\u{2019}t buy from it any more, \
-                         and your Ghost Key now counts for your other store."
-                            .to_string(),
-                    ),
+                    Ok(()) => state.notifications.push(format!(
+                        "Closing {name} was sent. It shows as closed once the network has it."
+                    )),
                     Err(e) => {
+                        state.closes_sent.remove(&store_id);
                         dioxus::logger::tracing::error!("Failed to close a store: {e}");
                         state.notifications.push(format!("{CLOSE_NOT_SAVED} ({e})"));
                     }
@@ -217,16 +439,35 @@ impl AppState {
             .push((store_contract_id.to_vec(), retirement, closure));
     }
 
-    /// Forget a close: published, failed, or refused.
+    /// Forget a close in progress: published, failed, refused or timed out.
+    /// Withdraws both halves, and the requests they went out under, so a
+    /// late answer to either cannot be matched to a later attempt.
     pub(crate) fn abandon_close(&mut self, store_contract_id: &[u8]) {
         self.closing_stores.remove(store_contract_id);
-        self.pending_signatures.retain(|pending| {
-            !matches!(pending,
+        let ours = |pending: &PendingSignature| {
+            matches!(pending,
                 PendingSignature::Retirement(p) if p.store_contract_id == store_contract_id)
-                && !matches!(pending,
+                || matches!(pending,
                 PendingSignature::Closure(p) if p.store_contract_id == store_contract_id)
-        });
+        };
+        let withdrawn: Vec<Vec<u8>> = self
+            .pending_signatures
+            .iter()
+            .filter(|p| ours(p))
+            .filter_map(|p| p.signed_bytes().ok())
+            .collect();
+        self.pending_signatures.retain(|p| !ours(p));
+        self.pending_store_key_requests
+            .retain(|_, bytes| !withdrawn.contains(bytes));
     }
+}
+
+/// The id of the current generation of the store owned by `owner`.
+fn current_store_id(owner: &[u8; 32]) -> Option<Vec<u8>> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(owner).ok()?;
+    crate::gateway::store_ops::store_instance_id(&crate::migrate::store_params(&key))
+        .ok()
+        .map(|id| id.as_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -254,29 +495,52 @@ mod tests {
             CLOSED,
             vec![signed_backing(CLOSED, BACKER, 11)],
         );
-        state.my_stores.insert(
-            "fp".into(),
-            vec![harvest_common::StoreRegistration {
-                store_contract_id: vec![2; 32],
-                reputation_contract_id: Vec::new(),
-                mailbox_contract_id: Vec::new(),
-                store_contract_key: None,
-                store_verifying_key: Some(store_key(CLOSED).verifying_key().to_bytes()),
-            }],
-        );
+        state
+            .my_stores
+            .insert("fp".into(), vec![registration(2, CLOSED)]);
+        state
+    }
+
+    fn registration(id: u8, seed: u8) -> harvest_common::StoreRegistration {
+        harvest_common::StoreRegistration {
+            store_contract_id: vec![id; 32],
+            reputation_contract_id: Vec::new(),
+            mailbox_contract_id: Vec::new(),
+            store_contract_key: None,
+            store_verifying_key: Some(store_key(seed).verifying_key().to_bytes()),
+        }
+    }
+
+    /// The same, with both stores' keys on this device.
+    fn both_ours() -> AppState {
+        let mut state = two_stores_one_key();
+        state
+            .my_stores
+            .get_mut("fp")
+            .unwrap()
+            .push(registration(1, KEPT));
         state
     }
 
     fn answer<T: serde::Serialize>(state: &mut AppState, record: &T) {
-        let (scoped_payload, signature) = sign(&store_key(CLOSED), record);
+        answer_as(state, CLOSED, CLOSED, record);
+    }
+
+    /// An answer naming the store key `named`, signed by `signer`.
+    fn answer_as<T: serde::Serialize>(state: &mut AppState, named: u8, signer: u8, record: &T) {
+        let (scoped_payload, signature) = sign(&store_key(signer), record);
         state.on_delegate_response(HarvestDelegateResponse::StoreUpdateSigned {
             request_id: 0,
-            store_verifying_key: store_key(CLOSED).verifying_key().to_bytes(),
+            store_verifying_key: store_key(named).verifying_key().to_bytes(),
             result: Ok(StoreKeySignature {
                 scoped_payload,
                 signature,
             }),
         });
+    }
+
+    fn backer() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[BACKER; 32]).verifying_key()
     }
 
     /// harvest#181: the conflict is named, and closing the store signs the
@@ -336,6 +600,10 @@ mod tests {
             .expect("two requests");
         state.store_key_signature_failed(first, "the delegate said no");
         assert!(state.closing_stores.is_empty());
+        assert!(
+            state.pending_store_key_requests.is_empty(),
+            "the other half's request is withdrawn too"
+        );
         assert!(!state.pending_signatures.iter().any(|p| matches!(
             p,
             PendingSignature::Retirement(_) | PendingSignature::Closure(_)
@@ -352,5 +620,244 @@ mod tests {
             .iter()
             .any(|n| n.starts_with(CLOSE_NOT_SAVED)));
         assert!(state.can_close_store(&[2; 32]), "can be tried again");
+    }
+
+    /// Refusing the closure half (the second request) stops the close the
+    /// same way, including after the retirement half was already signed.
+    /// Mutated red by abandoning only on a refused retirement.
+    #[test]
+    fn a_refused_closure_stops_the_close_after_the_retirement_was_signed() {
+        let mut state = two_stores_one_key();
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        let (first, second) = {
+            let mut ids = state.pending_store_key_requests.keys().copied();
+            (ids.next().unwrap(), ids.next().unwrap())
+        };
+        // The retirement is answered by its own request.
+        state.pending_store_key_requests.remove(&first);
+        answer(&mut state, &Retirement { backer: backer() });
+        assert!(state.closing_stores[&vec![2; 32]].retirement.is_some());
+        state.store_key_signature_failed(second, "the delegate said no");
+        assert!(state.closing_stores.is_empty());
+        assert!(state.pending_store_key_requests.is_empty());
+        assert!(state.closes_ready.is_empty());
+        assert!(state.can_close_store(&[2; 32]));
+    }
+
+    /// harvest#181 review: one store can sit in `browsing_stores` under two
+    /// generation ids, the id its registration names and the current one.
+    /// That is one store, not two, and the seller must never be offered to
+    /// close it as "the other store". Mutated red by comparing ids instead
+    /// of store keys.
+    #[test]
+    fn one_store_under_two_generation_ids_is_not_two_stores() {
+        let mut state = AppState::default();
+        load_backed(&mut state, 1, KEPT, vec![signed_backing(KEPT, BACKER, 10)]);
+        let copy = state.browsing_stores[&vec![1; 32]].clone();
+        state.browsing_stores.insert(vec![3; 32], copy);
+        state.refresh_backing_verdicts();
+        assert!(state.browsing_stores[&vec![1; 32]]
+            .certificate_status
+            .is_verified());
+        assert!(state.stores_sharing_backer(&[1; 32]).is_empty());
+        assert!(state.key_conflict(&[3; 32]).is_none());
+    }
+
+    /// A real second store seen under two generation ids is named once,
+    /// by its CURRENT id, so a close goes where buyers read. Mutated red by
+    /// keeping whichever id came first.
+    #[test]
+    fn another_store_is_named_once_by_its_current_id() {
+        let current = current_store_id(&store_key(CLOSED).verifying_key().to_bytes()).unwrap();
+        // `browsing_stores` is a HashMap with a fresh order per instance, so
+        // both orders are met over these rounds.
+        for _ in 0..16 {
+            let mut state = two_stores_one_key();
+            let copy = state.browsing_stores[&vec![2; 32]].clone();
+            state.browsing_stores.insert(current.clone(), copy);
+            state.refresh_backing_verdicts();
+            let others = state.stores_sharing_backer(&[1; 32]);
+            assert_eq!(others.len(), 1, "{others:?}");
+            assert_eq!(others[0].contract_id, current);
+            assert_eq!(
+                others[0].code,
+                harvest_common::store::store_code(&store_key(CLOSED).verifying_key())
+            );
+        }
+    }
+
+    /// Backings whose certificate does not verify do not count, here as in
+    /// `refresh_backing_verdicts`: no conflict is claimed, and no permanent
+    /// close is invited, over backings buyers ignore anyway (the store page
+    /// says the store is unbacked instead). Mutated red by dropping the
+    /// verified filter.
+    #[test]
+    fn an_unverified_backing_is_no_conflict() {
+        let mut state = two_stores_one_key();
+        let other = signed_backing(CLOSED, BACKER, 11);
+        state.certificate_verdicts.borrow_mut().insert(
+            (other.statement.certificate_pem.clone(), BACKER_VK()),
+            crate::ghostkey_cert::CertificateStatus::Invalid("not this key".into()),
+        );
+        state.refresh_backing_verdicts();
+        assert!(state.stores_sharing_backer(&[1; 32]).is_empty());
+        assert!(state.key_conflict(&[1; 32]).is_none());
+        assert!(state.key_conflict(&[2; 32]).is_none());
+    }
+
+    #[allow(non_snake_case)]
+    fn BACKER_VK() -> [u8; 32] {
+        backer().to_bytes()
+    }
+
+    /// One close at a time per Ghost Key, from the first request until the
+    /// closed store's state shows it: no second close is offered or
+    /// accepted meanwhile, so the seller cannot close both stores, and two
+    /// byte-identical retirements are never in flight together. Mutated red
+    /// by dropping the in-flight check from `can_close_store`, from
+    /// `close_store_for_good`, and by forgetting a close once it is sent.
+    #[test]
+    fn one_close_at_a_time_per_ghost_key() {
+        let mut state = both_ours();
+        assert!(state.can_close_store(&[1; 32]) && state.can_close_store(&[2; 32]));
+        let conflict = state.key_conflict(&[2; 32]).expect("a conflict");
+        let order: Vec<Vec<u8>> = conflict
+            .closable()
+            .into_iter()
+            .map(|s| s.contract_id)
+            .collect();
+        assert_eq!(order, vec![vec![2; 32], vec![1; 32]], "this store first");
+
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        assert!(!state.can_close_store(&[1; 32]));
+        assert!(state.close_store_for_good(&[1; 32]).is_err());
+        let conflict = state.key_conflict(&[1; 32]).expect("still shown");
+        assert!(conflict.closing.is_some());
+        assert!(conflict.closable().is_empty());
+
+        answer(&mut state, &Retirement { backer: backer() });
+        answer(
+            &mut state,
+            &StoreClosure {
+                store: store_key(CLOSED).verifying_key(),
+            },
+        );
+        assert_eq!(state.closes_ready.len(), 1);
+        assert!(state.closing_stores.is_empty());
+        assert!(
+            !state.can_close_store(&[1; 32]),
+            "sent, not yet seen: still one at a time"
+        );
+        assert!(state.key_conflict(&[1; 32]).unwrap().closing.is_some());
+
+        state.browsing_stores.get_mut(&vec![2; 32]).unwrap().closed = true;
+        assert!(state.close_in_flight_for(&BACKER_VK()).is_none());
+        assert!(state.can_close_store(&[1; 32]));
+    }
+
+    /// A close whose signatures never both come back is given up at its
+    /// deadline, and only that attempt's deadline counts. Mutated red by a
+    /// no-op deadline and by ignoring the attempt.
+    #[test]
+    fn a_close_the_store_key_never_answers_is_given_up() {
+        let mut state = two_stores_one_key();
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        let attempt = state.closing_stores[&vec![2; 32]].attempt;
+        state.on_close_deadline(&[2; 32], attempt + 1);
+        assert!(
+            !state.closing_stores.is_empty(),
+            "another attempt's deadline"
+        );
+        state.on_close_deadline(&[2; 32], attempt);
+        assert!(state.closing_stores.is_empty());
+        assert!(state.pending_store_key_requests.is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.starts_with(CLOSE_NOT_SAVED)));
+        assert!(state.can_close_store(&[2; 32]));
+    }
+
+    /// Halves that do not verify under the store's key are not published:
+    /// the contract would drop them silently and the seller would be told
+    /// of a close that never happened. Mutated red by skipping the verify.
+    #[test]
+    fn a_close_signed_by_the_wrong_key_is_not_published() {
+        let mut state = two_stores_one_key();
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        answer_as(&mut state, CLOSED, KEPT, &Retirement { backer: backer() });
+        answer_as(
+            &mut state,
+            CLOSED,
+            KEPT,
+            &StoreClosure {
+                store: store_key(CLOSED).verifying_key(),
+            },
+        );
+        assert!(state.closes_ready.is_empty());
+        assert!(state.closes_sent.is_empty());
+        assert!(state.closing_stores.is_empty());
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.starts_with(CLOSE_NOT_SAVED)));
+    }
+
+    /// Every refusal before anything is signed leaves nothing behind.
+    #[test]
+    fn a_close_that_cannot_start_leaves_nothing_behind() {
+        let mut state = two_stores_one_key();
+        assert!(state.close_store_for_good(&[9; 32]).is_err(), "not loaded");
+        assert!(state.close_store_for_good(&[1; 32]).is_err(), "not ours");
+        state.browsing_stores.get_mut(&vec![2; 32]).unwrap().closed = true;
+        assert!(
+            state.close_store_for_good(&[2; 32]).is_err(),
+            "closed already"
+        );
+        assert!(state.closing_stores.is_empty());
+        assert!(state.pending_store_key_requests.is_empty());
+        assert!(state.pending_signatures.is_empty());
+    }
+
+    /// The update a close publishes, applied by the store contract's own
+    /// rules: both halves land together, the store reads closed and its
+    /// backer is retired. Mutated red by leaving either half out of
+    /// `close_delta`.
+    #[test]
+    fn the_close_update_applies_both_halves() {
+        use freenet_scaffold::ComposableState;
+        let state = two_stores_one_key();
+        let before = state.browsing_stores[&vec![2; 32]].backing_state.clone();
+        let owner = store_key(CLOSED).verifying_key();
+        let (scoped_payload, signature) =
+            sign(&store_key(CLOSED), &Retirement { backer: backer() });
+        let retirement = AuthorizedRetirement {
+            retirement: Retirement { backer: backer() },
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = sign(&store_key(CLOSED), &StoreClosure { store: owner });
+        let closure = AuthorizedClosure {
+            closure: StoreClosure { store: owner },
+            scoped_payload,
+            signature,
+        };
+        let params = crate::migrate::store_params(&owner);
+        let mut after = before.clone();
+        after
+            .apply_delta(
+                &before,
+                &params,
+                &Some(crate::gateway::store_ops::close_delta(
+                    owner, retirement, closure,
+                )),
+            )
+            .expect("applies");
+        after.verify(&after, &params).expect("verifies");
+        assert!(harvest_common::backing::is_closed(&after));
+        assert!(after
+            .retirements
+            .records
+            .contains_key(&harvest_common::store::Bytes32(backer().to_bytes())));
     }
 }
