@@ -1828,9 +1828,10 @@ left open, and what phase 1a deliberately does not do yet.
   above on purpose. A creation refused because the Ghost Key already backs a
   store is final, and says to use a different Ghost Key. "Create a store"
   also waits until this device knows what the key backs: the delegate's
-  store list, the key's index (answered, or absent or recovered after a
-  migration walk in which every earlier generation answered) and every store
-  it lists, with a warning after a minute if nothing is known by then. An
+  store list, the key's current index (its state or a NotFound) together
+  with a conclusive migration walk over its earlier generations, and every
+  store any of them lists, with a warning after a minute if nothing is known
+  by then. An
   index that lists a store which never loads still counts: the page names
   the store's code and offers no Create. The delegate's `another_store` field stays on the wire; the UI
   never sets it.

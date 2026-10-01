@@ -141,12 +141,17 @@ impl SellerStore {
 /// checkout alerts). The store's card on Stores reads the same, so it never
 /// says "up to date" over a card that lists something.
 pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
+    // A store closed for good is only read (harvest#181): what is left to do
+    // there is its orders, nothing about selling.
+    if store.closed {
+        return store.needs_you() > 0 || store.expired_invoices > 0;
+    }
     store.needs_you() > 0
         || store.unpriced > 0
         || state.wallet_gap_note_due(&store.contract_id).is_some()
         || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
-        || (store.details_resolved && !store.certificate.is_verified() && !store.closed)
+        || (store.details_resolved && !store.certificate.is_verified())
         || store.key_conflict.is_some()
         || store.expired_invoices > 0
         || !state.instant_checkout_alerts(&store.contract_id).is_empty()
@@ -754,9 +759,17 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
             p { class: "text-warning",
                 strong { "Buyers can\u{2019}t buy from this store right now." }
             }
-            p {
-                "Your Ghost Key backs two stores, and one Ghost Key can back only one, so \
-                 buyers treat both as unbacked. Keep one store and close the other for good."
+            if conflict.others.len() == 1 {
+                p {
+                    "Your Ghost Key backs two stores, and one Ghost Key can back only one, so \
+                     buyers treat both as unbacked. Keep one store and close the other for good."
+                }
+            } else {
+                p {
+                    "Your Ghost Key backs {conflict.others.len() + 1} stores, and one Ghost Key \
+                     can back only one, so buyers treat all of them as unbacked. Keep one store \
+                     and close the others for good, one at a time."
+                }
             }
             ul { class: "conflict-stores",
                 for (s , this) in stores {
@@ -791,7 +804,7 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                     strong { "Close {target.name} (code {target.code}) for good?" }
                     " This can\u{2019}t be undone. Buyers won\u{2019}t be able to buy from it \
                      again, and it can\u{2019}t be reopened or moved to another Ghost Key. Its \
-                     listings and orders stay readable."
+                     orders stay here for you to read."
                 }
                 div { class: "form-actions",
                     button {
@@ -819,8 +832,8 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                 }
             } else if none_closable {
                 p { class: "text-muted",
-                    "This device doesn\u{2019}t hold the key to either store. Open Harvest on the \
-                     device where you made one of them and close it there."
+                    "This device doesn\u{2019}t hold the key to any of these stores. Open Harvest \
+                     on the device where you made one of them and close it there."
                 }
             }
         }
@@ -895,7 +908,12 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
     // unpaid Buy now.
     let orders_needs = store.needs_you();
 
-    let current = tab();
+    // A store closed for good is only read (harvest#181): no Listings or
+    // Settings, whose controls would still sign changes to it.
+    let current = match tab() {
+        Tab::Listings | Tab::Settings if store.closed => Tab::Overview,
+        t => t,
+    };
 
     rsx! {
         div { class: "dashboard",
@@ -928,6 +946,8 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
                 (Tab::Orders, "Orders".to_string()),
                 (Tab::Settings, "Settings".to_string()),
             ]
+            .into_iter()
+            .filter(|(t, _)| !store.closed || matches!(t, Tab::Overview | Tab::Orders))
             {
                 button {
                     class: if current == t { "tab active" } else { "tab" },
@@ -974,6 +994,10 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
     rsx! {
         div { class: "tab-body",
             match tab() {
+                // Closed for good: only Overview and Orders (see the tabs).
+                Tab::Listings | Tab::Settings if store.closed => rsx! {
+                    Overview { store: store.clone(), tab, editing_details }
+                },
                 Tab::Overview => rsx! { Overview { store: store.clone(), tab, editing_details } },
                 Tab::Listings => rsx! {
                     super::seller_listings::SellerListings {
@@ -1079,7 +1103,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
             if !store.details_resolved {
                 p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
-            } else if let Some(gap) = store.gap {
+            } else if let Some(gap) = store.gap.filter(|_| !store.closed) {
                 // The repair prompt says what is wrong and what publishing
                 // fixes, as a one-click action where nothing needs typing.
                 div { class: "need",
@@ -1108,10 +1132,10 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     }
                 }
             }
-            if let Some(limit) = wallet_gap {
+            if let Some(limit) = wallet_gap.filter(|_| !store.closed) {
                 p { class: "text-warning", "{wallet_gap_note(limit)}" }
             }
-            if store.unpriced > 0 {
+            if store.unpriced > 0 && !store.closed {
                 div { class: "need row-between",
                     span {
                         if store.unpriced == 1 {
@@ -1178,7 +1202,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
         }
 
-        if let Some(status) = status {
+        if let Some(status) = status.filter(|_| !store.closed) {
             section { class: "card",
                 div { class: "row-between",
                     h3 { "Your store" }
@@ -1866,10 +1890,11 @@ fn move_legacy_store(_fingerprint: String) {
             gate,
             crate::index_flow::CreationGate::Ready | crate::index_flow::CreationGate::Unconfirmed
         ) {
-            APP_STATE.write().notifications.push(format!(
-                "Could not move the store: {}",
-                crate::backing_flow::STILL_CHECKING_GHOST_KEY
-            ));
+            let why = crate::backing_flow::creation_refusal(&gate).unwrap_or_default();
+            APP_STATE
+                .write()
+                .notifications
+                .push(format!("Could not move the store: {why}"));
             return;
         }
         let started = APP_STATE.write().move_legacy_store(&fingerprint, vk_bytes);
@@ -2497,7 +2522,11 @@ mod seller_stores_tests {
         let mut closed = base.clone();
         closed.closed = true;
         closed.certificate = crate::ghostkey_cert::CertificateStatus::Absent;
-        assert!(!overview_needs(&closed, &state));
+        closed.unpriced = 2;
+        closed.gap = Some(StoreDetailsGap::NoName);
+        assert!(!overview_needs(&closed, &state), "nothing about selling");
+        closed.to_send = 1;
+        assert!(overview_needs(&closed, &state), "its orders still count");
     }
 
     /// The header's "needs you" pill goes to the first store something

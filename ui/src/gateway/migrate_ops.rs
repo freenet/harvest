@@ -852,11 +852,15 @@ fn finish(mut probe: Probe) {
             Some((outcome, seal)) => {
                 let note = migrate::describe(&outcome);
                 let (forward, end) = match outcome {
-                    freenet_migrate::Outcome::Recovered { merged, .. } => (
+                    freenet_migrate::Outcome::Recovered {
+                        merged,
+                        truncated_fold,
+                        ..
+                    } => (
                         encode_forward(&merged, INDEX_CONTRACT_WASM),
                         crate::index_flow::IndexWalkEnd::Recovered {
                             index: merged,
-                            complete: !probe.any_unknown,
+                            complete: !probe.any_unknown && !truncated_fold,
                         },
                     ),
                     freenet_migrate::Outcome::Indeterminate { .. } => {

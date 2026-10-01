@@ -80,6 +80,24 @@ pub(crate) const STILL_CHECKING_GHOST_KEY: &str =
     "Harvest is still checking whether this Ghost Key already has a store. Wait a moment and \
      try again.";
 
+/// Why "Create store" (or "Move this store") is refused under `gate`, in
+/// the seller's terms; `None` when it may go on (harvest#181).
+pub(crate) fn creation_refusal(gate: &crate::index_flow::CreationGate) -> Option<String> {
+    use crate::index_flow::CreationGate;
+    match gate {
+        CreationGate::Ready | CreationGate::Unconfirmed => None,
+        CreationGate::Checking => Some(STILL_CHECKING_GHOST_KEY.into()),
+        CreationGate::BacksStore(name) => Some(format!(
+            "this Ghost Key already has a store, {name}. One Ghost Key can back only one store, \
+             so use a different Ghost Key for another"
+        )),
+        CreationGate::ListsUnloadedStore(code) => Some(format!(
+            "this Ghost Key already has a store (code {code}). One Ghost Key can back only one \
+             store, so use a different Ghost Key for another"
+        )),
+    }
+}
+
 /// How many blocks behind the newest known one a new backing is dated.
 ///
 /// A reader leaves out a backing dated above ITS tip
@@ -182,24 +200,9 @@ impl AppState {
         seller_verifying_key_bytes: [u8; 32],
         details: StoreDetails,
     ) -> Result<u64, String> {
-        match self.store_creation_gate(&fingerprint, &seller_verifying_key_bytes) {
-            crate::index_flow::CreationGate::Checking => {
-                return Err(STILL_CHECKING_GHOST_KEY.into());
-            }
-            crate::index_flow::CreationGate::ListsUnloadedStore(code) => {
-                return Err(format!(
-                    "this Ghost Key already has a store (code {code}). One Ghost Key can back \
-                     only one store, so use a different Ghost Key for another"
-                ));
-            }
-            crate::index_flow::CreationGate::BacksStore(name) => {
-                return Err(format!(
-                    "this Ghost Key already has a store, {name}. One Ghost Key can back only one \
-                     store, so use a different Ghost Key for another"
-                ));
-            }
-            crate::index_flow::CreationGate::Ready
-            | crate::index_flow::CreationGate::Unconfirmed => {}
+        let gate = self.store_creation_gate(&fingerprint, &seller_verifying_key_bytes);
+        if let Some(why) = creation_refusal(&gate) {
+            return Err(why);
         }
         self.begin_store_creation(fingerprint, seller_verifying_key_bytes, details, Vec::new())
     }
