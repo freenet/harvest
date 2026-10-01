@@ -1295,11 +1295,27 @@ mod tests {
         assert!(handler.contains("APP_STATE.write().on_index_absent(instance_id.as_bytes());"));
         let this = code(include_str!("index_flow.rs"));
         assert!(this.contains(".on_index_wait_elapsed(&fingerprint);"));
+        // The wait starts before anything in the watch can return early.
+        let watch = &this[this.find("fnwatch_ghostkey_index(").expect("the watch")..];
+        assert!(
+            watch
+                .find("self.index_waits_started.insert(")
+                .expect("the wait")
+                < watch
+                    .find("VerifyingKey::from_bytes(&ghost_key)")
+                    .expect("the key parse"),
+            "the index wait must start before the watch can return"
+        );
         let closure = code(include_str!("closure_flow.rs"));
         assert!(closure.contains(".on_close_deadline(&id,attempt);"));
         assert!(
             closure.contains("Err(e)=>{state.closes_sent.remove(&owner);"),
             "a close that could not be sent must not hold back the next one"
+        );
+        let messages = code(include_str!("components/message_view.rs"));
+        assert!(
+            messages.contains("ifstore.closed{return0;}count_unanswered("),
+            "a closed store's requests are not counted"
         );
         let my_store = code(include_str!("components/my_store.rs"));
         assert!(
