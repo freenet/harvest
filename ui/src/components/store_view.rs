@@ -845,8 +845,10 @@ fn item_summary(
     let buyable = offered_buy(store, contract_id, false, l, availability, open).is_some()
         || (owned && offered_buy(store, contract_id, false, l, availability, true).is_some());
     let price = price_lines(l).map(|(price, _)| price);
-    let off_why = availability_words(availability, closed)
-        .filter(|w| w == "Sold out" || w == "Closed")
+    // A closed store says so once, in its header; its cards are greyed
+    // with their prices, not each labelled "Closed".
+    let off_why = availability_words(availability, false)
+        .filter(|w| w == "Sold out")
         .or_else(|| (!l.offers_instant_checkout()).then(|| "Not for sale yet".to_string()));
     let note = match availability {
         ListingAvailability::Available { quantity: Some(n) } if *n > 0 => Some(format!("{n} left")),
@@ -859,7 +861,7 @@ fn item_summary(
         note,
         // Greyed only with a reason to show; a store still being checked
         // reads as it is.
-        off: !buyable && off_why.is_some(),
+        off: !buyable && (off_why.is_some() || closed),
         off_why,
         picture: super::item_image::listing_image(&l.id, &l.title),
     }

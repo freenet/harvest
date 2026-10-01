@@ -2942,10 +2942,9 @@ section + .panel {
   align-items: center;
 }
 
-/* Cards in one row of the grid are one height. */
-.item-grid {
-  align-items: stretch;
-}
+/* Cards keep their own height: in a grid where some items have pictures
+   and some don't, stretching left the picture-less ones with an empty
+   lower half. */
 
 .open-steps a {
   color: var(--accent);
@@ -2961,4 +2960,11 @@ section + .panel {
 
 .history li + li {
   margin-top: var(--space-xs);
+}
+
+@media (max-width: 600px), (pointer: coarse) {
+  /* The row is the tap target; its "Pay now" is a label on it. */
+  .row-action {
+    min-height: 0;
+  }
 }

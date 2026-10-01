@@ -962,7 +962,8 @@ pub(crate) fn complaint_offer(
 pub(crate) fn complaint_line(offer: &ComplaintOffer, short: &str) -> Option<String> {
     match offer {
         ComplaintOffer::OnRecord(category) => Some(format!(
-            "Your complaint about order {short} ({category}) is on the seller\u{2019}s public record."
+            "You reported a problem with order {short}: \u{201c}{category}\u{201d}. It is on the \
+             seller\u{2019}s public record."
         )),
         ComplaintOffer::Sent => Some(format!(
             "Your complaint about order {short} is being kept on your node. It goes to the \

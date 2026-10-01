@@ -317,7 +317,12 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                     _ => rsx! {
                         div { class: "panel",
-                            if let Some(order) = settled.clone() {
+                            // Once a report is on record, the window it was made
+                            // in says nothing more (the line under says what).
+                            if let (Some(order), false) = (
+                                settled.clone(),
+                                matches!(facts.complaint, ComplaintOffer::OnRecord(_)),
+                            ) {
                                 super::buy_view::SettledPurchase { order, bitcoin: facts.bitcoin.clone(), after_pill: true }
                             }
                             if let Some(line) = super::buy_view::complaint_line(&facts.complaint, &short) {
