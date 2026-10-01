@@ -1272,11 +1272,9 @@ pub(crate) fn SettledPurchase(
             crate::fulfilment::Reader::Buyer,
         )
         .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
-    let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
+    // The amount is in the page's own title and bill.
     rsx! {
-        p { class: if stage.needs_attention() { "text-warning" } else { "" },
-            "{amount} \u{00b7} {note}"
-        }
+        p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
     }
 }
 

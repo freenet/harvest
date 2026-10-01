@@ -474,7 +474,7 @@ impl SellerData {
 
 /// The amount, as every price reads (rule 7): "0.00010000 tBTC".
 pub(crate) fn order_amount(order: &AuthorizedOrder) -> String {
-    super::pay_card::amount_text(order.order.amount_sats, order.order.network)
+    super::pay_card::money(order.order.amount_sats, order.order.network)
 }
 
 /// When `order` was paid, roughly, as a day: from its stage, else its date.
@@ -1416,9 +1416,15 @@ fn SellerConversationPage(store: SellerStore, tag: [u8; 32]) -> Element {
                             stage,
                             state.despatch_recorded(&id, &o.order.id),
                         );
-                        let pill = order_status::send_by_pill(&state, o)
-                            .filter(|_| to_send)
-                            .unwrap_or_else(|| status.label().to_string());
+                        // The ref too: one buyer's orders of one item would
+                        // otherwise read alike.
+                        let pill = format!(
+                            "{} \u{00b7} order {}",
+                            order_status::send_by_pill(&state, o)
+                                .filter(|_| to_send)
+                                .unwrap_or_else(|| status.label().to_string()),
+                            o.order.id.short()
+                        );
                         (
                             o.order.id.clone(),
                             data.item_of(o),

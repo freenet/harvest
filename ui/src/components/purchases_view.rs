@@ -79,8 +79,11 @@ pub(crate) struct OrderRow {
     pub status: Status,
     /// The buyer can pay it now: the row's one quick action, and "needs you".
     pub to_pay: bool,
-    /// The store's reply in this order's conversation is new.
+    /// The store's reply in this order's conversation is new: said on the
+    /// conversation's newest order still standing, once.
     pub new_reply: bool,
+    /// The conversation it was placed in, when it is a store's purchase.
+    pub conversation: Option<[u8; 32]>,
     pub picture: Option<String>,
 }
 
@@ -133,6 +136,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 amount: order.map(|o| super::pay_card::money(o.order.amount_sats, o.order.network)),
                 to_pay: super::order_status::buyer_can_pay(&purchase, status),
                 new_reply: replied.contains(&purchase.conversation),
+                conversation: Some(purchase.conversation),
                 picture: listing.as_ref().and_then(|(l, t, _)| {
                     super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
                 }),
@@ -168,10 +172,23 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
             },
             to_pay: false,
             new_reply: false,
+            conversation: None,
             picture: None,
         });
     }
     rows.sort_by_key(|row| std::cmp::Reverse(row.date));
+    // A reply belongs to a conversation, not to each of its orders: marked
+    // on the newest order of it still standing, never on an ended one.
+    let mut marked: Vec<[u8; 32]> = Vec::new();
+    for row in rows.iter_mut() {
+        if !row.new_reply {
+            continue;
+        }
+        match row.conversation {
+            Some(tag) if !row.status.ended() && !marked.contains(&tag) => marked.push(tag),
+            _ => row.new_reply = false,
+        }
+    }
     rows
 }
 

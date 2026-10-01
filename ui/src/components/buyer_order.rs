@@ -48,6 +48,9 @@ struct OrderFacts {
     status: Status,
     item: String,
     listing: Option<harvest_common::listing::ListingId>,
+    /// What the items cost before delivery, when the listing's price is
+    /// still here to work it out.
+    items_sats: Option<u64>,
     picture: Option<String>,
     ship_to: Option<crate::state::SellerOrderRequest>,
     store_name: String,
@@ -106,6 +109,18 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     status: order_status::buyer_status(&state, &store, &purchase),
                     picture: listing.as_ref().and_then(|(l, t, _)| {
                         super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
+                    }),
+                    items_sats: listing.as_ref().and_then(|(l, _, q)| {
+                        state
+                            .browsing_stores
+                            .get(&store)?
+                            .listings
+                            .iter()
+                            .find(|x| x.listing.id == *l)?
+                            .listing
+                            .checkout
+                            .as_ref()
+                            .map(|c| c.unit_sats.saturating_mul(u64::from(*q)))
                     }),
                     listing: listing.map(|(l, _, _)| l),
                     item,
@@ -322,13 +337,26 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                 if let Some((sats, network)) = amount {
                     h3 { class: "sec-lbl", "Details" }
                     div { class: "bill",
-                        span { "{facts.item}" }
-                        span {}
+                        // The item and delivery lines only where they add up
+                        // to the order's amount: the listing may have changed
+                        // its price since.
+                        match facts.items_sats.filter(|items| *items <= sats) {
+                            Some(items) => rsx! {
+                                span { "{facts.item}" }
+                                span { "{super::pay_card::money(items, network)}" }
+                                if sats > items {
+                                    span {
+                                        match facts.ship_to.as_ref().and_then(|s| s.region.clone()) {
+                                            Some(region) => rsx! { "Delivery, {region}" },
+                                            None => rsx! { "Delivery" },
+                                        }
+                                    }
+                                    span { "{super::pay_card::money(sats - items, network)}" }
+                                }
+                            },
+                            None => rsx! {},
+                        }
                         if let Some(ref ship) = facts.ship_to {
-                            if let Some(ref region) = ship.region {
-                                span { class: "text-muted", "Delivery to {region}" }
-                                span {}
-                            }
                             for choice in ship.choices.iter() {
                                 span { class: "text-muted", "{choice}" }
                                 span {}
@@ -368,7 +396,9 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                     "Visit store"
                 }
-                if purchase.cancellable() {
+                // Not on an expired order: nothing is left to cancel
+                // (critique 06-4).
+                if purchase.cancellable() && facts.status != Status::Expired {
                     div { class: "side-cancel",
                         super::buy_view::CancelPurchase { store_contract_id: store.clone(), purchase: purchase.clone() }
                     }

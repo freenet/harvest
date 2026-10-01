@@ -1297,8 +1297,9 @@ h4 {
 
 .harvest-footer {
   display: flex;
-  justify-content: space-between;
-  gap: var(--space-md);
+  justify-content: flex-start;
+  align-items: baseline;
+  gap: var(--space-sm);
   flex-wrap: wrap;
 }
 
@@ -2867,4 +2868,19 @@ h4 {
     grid-area: thumb;
     align-self: start;
   }
+}
+
+/* The logo goes to Stores, the starting page. */
+button.harvest-title-group {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* A pill among buttons sits on their line. */
+.seller-listing-actions {
+  align-items: center;
 }

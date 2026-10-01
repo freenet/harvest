@@ -319,7 +319,10 @@ pub fn App() -> Element {
     rsx! {
         div { class: "harvest-app",
             header { class: "harvest-header",
-                div { class: "harvest-title-group",
+                button {
+                    class: "harvest-title-group",
+                    aria_label: "Harvest, to Stores",
+                    onclick: move |_| go(Page::Stores),
                     img {
                         class: "harvest-logo",
                         src: "harvest-logo.svg",

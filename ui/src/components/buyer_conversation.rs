@@ -40,7 +40,16 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                                 order: p.order_id.clone(),
                             },
                             item,
-                            status.label().to_string(),
+                            // With its date: two orders of one item would
+                            // otherwise read alike.
+                            match p.commitment.as_ref().or(p.paid.as_ref()) {
+                                Some(o) => format!(
+                                    "{} \u{00b7} {}",
+                                    status.label(),
+                                    super::order_status::short_date(o.order.created_at)
+                                ),
+                                None => status.label().to_string(),
+                            },
                             listing.and_then(|(l, t, _)| {
                                 super::item_image::listing_image(
                                     &l,

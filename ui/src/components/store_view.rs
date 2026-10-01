@@ -851,7 +851,9 @@ fn item_summary(
         title: l.title.clone(),
         price,
         note,
-        off: !buyable,
+        // Greyed only with a reason to show; a store still being checked
+        // reads as it is.
+        off: !buyable && off_why.is_some(),
         off_why,
         picture: super::item_image::listing_image(&l.id, &l.title),
     }
