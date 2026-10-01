@@ -553,6 +553,73 @@ mod tests {
         assert!(export_payload(&wrapped, None, &policy, 29).is_err());
     }
 
+    /// #206: a migration of an instant-checkout state at its caps -- sixteen
+    /// ledgers each full, one with a retry pending -- goes through this
+    /// delegate's export and its successor's import whole: every ledger
+    /// arrives equal, and the retry reaches the flag the wake-up reads. The
+    /// export's bytes are the crate's (`the_fast_export_is_the_crates_export`)
+    /// so an export from before this change imports the same way. Mutated
+    /// red by dropping a ledger from the export.
+    #[test]
+    fn full_ledgers_migrate_whole() {
+        use crate::auto_invoice::{ledger_key, Ledger, Sale};
+        use harvest_common::listing::ListingId;
+        use harvest_common::payment::OrderId;
+        let id = |tag: u8, i: usize| {
+            let mut b = [tag; 32];
+            b[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            b
+        };
+        let mut s = store();
+        let mut ledgers = Vec::new();
+        for arm in 0..16u8 {
+            let ledger = Ledger {
+                seen: (0..1024).map(|i| id(arm, i)).collect(),
+                answered: (0..1024).map(|i| id(arm ^ 0x40, i)).collect(),
+                issued_at_ms: (0..99).collect(),
+                sales: (0..2048)
+                    .map(|i| Sale {
+                        order: OrderId(id(arm ^ 0x80, i)),
+                        listing: ListingId(id(arm ^ 0xc0, i % 64)),
+                        quantity: 1,
+                        issued_at_ms: 1,
+                        anchor_height: 1,
+                        decremented: None,
+                    })
+                    .collect(),
+                settled: (0..1024).map(|i| OrderId(id(arm ^ 0x20, i))).collect(),
+                gap_orders: (0..1500)
+                    .map(|i| (OrderId(id(arm ^ 0x10, i)), i as u32))
+                    .collect(),
+                retry_pending: arm == 3,
+                ..Default::default()
+            };
+            let key = ledger_key(&[arm; 32]);
+            s.set_secret(&key, &harvest_common::to_cbor(&ledger).unwrap());
+            ledgers.push((key, ledger));
+        }
+        let payload = export_payload(
+            &WithoutStoreKeys(&s),
+            Some(&harvest_origin()),
+            &origin_policy().unwrap(),
+            29,
+        )
+        .unwrap();
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        let mut successor = crate::secrets::MemSecrets::default();
+        for (key, value) in &exported.secrets {
+            let _ = crate::import::import_secret(&mut successor, key, value);
+        }
+        for (key, ledger) in &ledgers {
+            let held: Ledger =
+                harvest_common::from_cbor(&successor.get_secret(key).expect("imported")).unwrap();
+            assert_eq!(&held, ledger);
+            let flag = crate::auto_invoice::retry_key_for_ledger(key).unwrap();
+            let want: &[u8] = if ledger.retry_pending { b"1" } else { b"0" };
+            assert_eq!(successor.get_secret(&flag).as_deref(), Some(want));
+        }
+    }
+
     /// At the host's enumeration cap the export is refused, as the crate
     /// refuses it, rather than shipping a list that may be missing keys.
     /// Mutated red by dropping the check.
