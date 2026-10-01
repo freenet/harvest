@@ -1173,7 +1173,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Orders), "Open orders" }
                 }
             }
-            if !needs && store.details_resolved {
+            if !needs && store.details_resolved && !store.closed {
                 p { class: "text-muted", "Nothing needs you right now." }
             }
         }
@@ -1191,7 +1191,9 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
         }
 
-        if !setup_done {
+        // A store closed for good is not set up or shared any more
+        // (harvest#181): its page is only for reading its orders.
+        if !setup_done && !store.closed {
             section { class: "card",
                 h3 { "Set up" }
                 ul { class: "checklist",
@@ -1218,6 +1220,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
             }
         }
 
+        if !store.closed {
         section { class: "card",
             h3 { "Share your store" }
             // Content-sized values with Copy, as on the pay card: the whole
@@ -1242,6 +1245,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                 "store in Freenet or straight in their browser. Buyers can also type the store "
                 "code into Stores."
             }
+        }
         }
 
         section { class: "card",
