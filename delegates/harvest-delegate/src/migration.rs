@@ -552,4 +552,20 @@ mod tests {
         );
         assert!(export_payload(&wrapped, None, &policy, 29).is_err());
     }
+
+    /// At the host's enumeration cap the export is refused, as the crate
+    /// refuses it, rather than shipping a list that may be missing keys.
+    /// Mutated red by dropping the check.
+    #[test]
+    fn a_full_scope_is_refused_not_truncated() {
+        let mut s = store();
+        for i in 0..freenet_migrate::HOST_ENUMERATION_CAP {
+            s.0.insert(format!("harvest:filler:{i}").into_bytes(), vec![1]);
+        }
+        let policy = origin_policy().unwrap();
+        assert!(matches!(
+            export_payload(&WithoutStoreKeys(&s), Some(&harvest_origin()), &policy, 29),
+            Err(freenet_migrate::MigrateError::TruncatedExport { .. })
+        ));
+    }
 }

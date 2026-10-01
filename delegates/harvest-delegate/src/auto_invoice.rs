@@ -3088,20 +3088,29 @@ mod tests {
     /// few runs, whichever order the junk is in, because the order of opening
     /// comes from the node's randomness and never from anything the writer
     /// chooses. Here the junk is all OLDER than the request (first in the old
-    /// oldest-first order) and big enough that each run opens about a third
-    /// of it. Across 64 seeds the request is opened in the first run most of
-    /// the time and always by the time the junk is drained. Mutated red by
-    /// opening oldest first.
+    /// oldest-first order), the same size as it (so no gap in the budget lets
+    /// it slip in), and a full mailbox of it, about twice what one run opens.
+    /// Across 64 seeds the request is opened in the first run about half the
+    /// time and always by the time the junk is drained; oldest first would
+    /// never open it in the first run. Mutated red by opening oldest first.
     #[test]
     fn a_request_behind_junk_is_reached_whatever_the_junk_order() {
         let buyer = Buyer::new(40);
         let request = buyer.request(&jam(), 1, 1, 12_000);
-        let junk: Vec<EncryptedMessage> = (0..300).map(|i| junk(i, 3_000)).collect();
+        let size = request.ciphertext.len();
+        let junk: Vec<EncryptedMessage> = (0..511)
+            .map(|i| junk(i, 1))
+            .map(|mut m| {
+                // The same cost as the request: only the order decides.
+                m.ciphertext.resize(size, 0);
+                m
+            })
+            .collect();
         let total: usize = junk
             .iter()
             .map(|m| OPEN_FIXED_COST + m.ciphertext.len())
             .sum();
-        let drained_by = total.div_ceil(OPEN_BUDGET - OPEN_FIXED_COST - 4_000) + 1;
+        let drained_by = total.div_ceil(OPEN_BUDGET - OPEN_FIXED_COST - size) + 1;
         let mut first_run = 0;
         for seed in 0..64u8 {
             let mut waiting: Vec<&EncryptedMessage> = junk.iter().collect();
@@ -3159,6 +3168,27 @@ mod tests {
         let mut no_watch = fixture();
         no_watch.record.arm.watched_scripts.clear();
         agree(&no_watch);
+        // Refused (a stale tip) while addresses are still watched: only the
+        // refusal says no.
+        let mut stale = fixture();
+        save(
+            &mut stale.secrets,
+            &tip_key(BitcoinNetwork::Signet),
+            &TipCache {
+                anchor: BlockAnchor {
+                    height: 1_000,
+                    hash: freenet_bitcoin_common::BlockHash([7; 32]),
+                },
+                block_time: ((NOW - TIP_MAX_AGE_MS) / 1000) as u32 - 600,
+            },
+        );
+        assert!(!taking_orders(
+            &stale.secrets,
+            &stale.record,
+            NOW,
+            &upcoming(&stale.secrets)
+        ));
+        agree(&stale);
     }
 
     #[test]
