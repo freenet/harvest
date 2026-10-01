@@ -77,15 +77,9 @@ pub(crate) struct SellerStore {
     pub unpriced: usize,
     /// The store has closed for good (its key signed the closed flag).
     pub closed: bool,
-    /// Other loaded stores the same Ghost Key currently backs, by id and
-    /// name, and whether this device can close each (harvest#181): a Ghost
-    /// Key backs one store at a time, so both count for nothing.
-    pub shares_key_with: Vec<(Vec<u8>, String, bool)>,
-    /// Whether this device can close THIS store (it holds its key and no
-    /// close is under way).
-    pub can_close: bool,
-    /// A close of this store is under way.
-    pub closing: bool,
+    /// The same Ghost Key backs this store and others (harvest#181): a Ghost
+    /// Key backs one store at a time, so all of them count for nothing.
+    pub key_conflict: Option<crate::closure_flow::KeyConflict>,
 }
 
 /// Whether an order at `stage` is paid and waiting to be sent: the one rule
@@ -153,7 +147,7 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         || store.foreign_owner.is_some()
         || (store.details_resolved && store.gap.is_some())
         || (store.details_resolved && !store.certificate.is_verified() && !store.closed)
-        || !store.shares_key_with.is_empty()
+        || store.key_conflict.is_some()
         || store.expired_invoices > 0
         || !state.instant_checkout_alerts(&store.contract_id).is_empty()
 }
@@ -294,16 +288,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                 to_send,
                 to_confirm,
                 closed: browsing.is_some_and(|b| b.closed),
-                shares_key_with: state
-                    .stores_sharing_backer(id)
-                    .into_iter()
-                    .map(|(other, name)| {
-                        let can = state.can_close_store(&other);
-                        (other, name, can)
-                    })
-                    .collect(),
-                can_close: state.can_close_store(id),
-                closing: state.closing_stores.contains_key(id),
+                key_conflict: state.key_conflict(id),
                 unpriced: browsing
                     .map(|b| {
                         b.listings
@@ -626,7 +611,15 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
         .as_deref()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .map(|backer| APP_STATE.read().store_creation_gate(&fp, &backer))
-        .unwrap_or(crate::index_flow::CreationGate::Checking);
+        // A vault too old to share the key's public key: there is no index
+        // to read, so it cannot be checked at all.
+        .unwrap_or(crate::index_flow::CreationGate::Unconfirmed);
+    // Moving a store made before revision 2 creates a store under this Ghost
+    // Key too, so it waits for the same answer.
+    let gate_open = matches!(
+        gate,
+        crate::index_flow::CreationGate::Ready | crate::index_flow::CreationGate::Unconfirmed
+    );
     // A store made before revision 2 that has not loaded yet: offering
     // "Create store" now would make a second store instead of moving this
     // one (#98 review, L3).
@@ -652,7 +645,7 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                     }
                 }
             }
-        } else if legacy_movable {
+        } else if legacy_movable && gate_open {
             p { class: "text-warning",
                 "This Ghost Key has a store made before stores had keys of their own, so this \
                  version of Harvest cannot publish to it and buyers cannot pay it. Moving it gives \
@@ -669,9 +662,9 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                 },
                 "Move this store"
             }
-        } else if legacy_loading {
+        } else if legacy_loading && gate_open {
             p { class: "text-muted text-italic", "Loading your existing store\u{2026}" }
-        } else if show_store_form() {
+        } else if show_store_form() && gate_open {
             StoreDetailsForm {
                 heading: "",
                 submit_label: "Create store",
@@ -681,7 +674,7 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                     let fp = fp.clone();
                     move |details: StoreDetails| {
                         show_store_form.set(false);
-                        initiate_store_creation(fp.clone(), details, Vec::new());
+                        initiate_store_creation(fp.clone(), details);
                     }
                 },
             }
@@ -694,8 +687,8 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                 },
                 crate::index_flow::CreationGate::BacksStore(name) => rsx! {
                     p { class: "text-muted",
-                        "This Ghost Key already has a store, {name}. Harvest is opening it on this \
-                         device. To open another store, use a different Ghost Key."
+                        "This Ghost Key already has a store, {name}. One Ghost Key can back only \
+                         one store, so to open another store, use a different Ghost Key."
                     }
                 },
                 crate::index_flow::CreationGate::Ready => rsx! {
@@ -725,59 +718,66 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
     }
 }
 
-/// One Ghost Key backs this store and another (harvest#181): name both, say
-/// what it costs, and offer to close one for good, with a confirmation that
-/// says it is permanent. See `crate::closure_flow` for why closing, not
-/// retiring alone, is the way out.
+/// One Ghost Key backs this store and another (harvest#181): name the stores
+/// so they can be told apart (they often share a name), say what it costs,
+/// and offer to close one for good, with a confirmation that says it is
+/// permanent. See `crate::closure_flow` for why closing, not retiring alone,
+/// is the way out.
 #[component]
-fn KeyBacksTwoStores(store: SellerStore) -> Element {
+fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
     // The store the seller has asked to close, waiting on their confirmation.
-    let mut confirming = use_signal(|| Option::<(Vec<u8>, String)>::None);
-    let others: Vec<String> = store
-        .shares_key_with
-        .iter()
-        .map(|(_, name, _)| name.clone())
-        .collect();
-    let others = others.join(", ");
-    // Every store this device could close: this one, then the others.
-    let mut closable: Vec<(Vec<u8>, String)> = Vec::new();
-    if store.can_close {
-        closable.push((store.contract_id.clone(), store.label.clone()));
-    }
-    for (id, name, can) in &store.shares_key_with {
-        if *can {
-            closable.push((id.clone(), name.clone()));
-        }
-    }
+    let mut confirming = use_signal(|| Option::<crate::closure_flow::SharingStore>::None);
+    let closable = conflict.closable();
+    let stores: Vec<(crate::closure_flow::SharingStore, bool)> =
+        std::iter::once((conflict.this.clone(), true))
+            .chain(conflict.others.iter().cloned().map(|s| (s, false)))
+            .collect();
     rsx! {
         div { class: "need",
             p { class: "text-warning",
-                "The Ghost Key behind {store.label} also backs {others}. One Ghost Key can back \
-                 only one store, so buyers treat both as unbacked and can\u{2019}t buy from \
-                 either. Keep one and close the other for good."
+                strong { "Buyers can\u{2019}t buy from this store right now. " }
+                "Its Ghost Key also backs another store, and one Ghost Key can back only one \
+                 store, so buyers\u{2019} apps treat both as unbacked. Keep one and close the \
+                 other for good."
             }
-            if store.closing {
-                p { class: "text-muted text-italic", "Closing {store.label}\u{2026}" }
-            } else if let Some((id, name)) = confirming() {
+            ul { class: "conflict-stores",
+                for (s , this) in stores {
+                    li { key: "{s.code}",
+                        strong { "{s.name}" }
+                        span { class: "text-muted",
+                            " \u{00b7} code {s.code} \u{00b7} {count(s.listings, \"listing\")} \u{00b7} {count(s.orders, \"order\")}"
+                            if this { " \u{00b7} this store" }
+                        }
+                    }
+                }
+            }
+            if let Some(name) = conflict.closing.clone() {
+                p { class: "text-muted text-italic",
+                    "Closing {name}\u{2026} The store you kept takes orders again once the network has the close."
+                }
+            } else if let Some(target) = confirming() {
                 p {
-                    "Closing {name} is permanent. Buyers won\u{2019}t be able to buy from it again, \
-                     and it can\u{2019}t be reopened or moved to another Ghost Key. Its listings \
-                     and orders stay readable."
+                    "Close {target.name} (code {target.code}) for good? This can\u{2019}t be undone. \
+                     Buyers won\u{2019}t be able to buy from it again, and it can\u{2019}t be \
+                     reopened or moved to another Ghost Key. Its listings and orders stay readable."
                 }
                 div { class: "form-actions",
                     button {
                         class: "btn btn-sm btn-primary",
-                        onclick: move |_| {
-                            let result = APP_STATE.write().close_store_for_good(&id);
-                            if let Err(e) = result {
-                                APP_STATE
-                                    .write()
-                                    .notifications
-                                    .push(format!("Could not close the store: {e}"));
+                        onclick: {
+                            let id = target.contract_id.clone();
+                            move |_| {
+                                let result = APP_STATE.write().close_store_for_good(&id);
+                                if let Err(e) = result {
+                                    APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!("Could not close the store: {e}"));
+                                }
+                                confirming.set(None);
                             }
-                            confirming.set(None);
                         },
-                        "Close {name} for good"
+                        "Close {target.name} for good"
                     }
                     button {
                         class: "btn btn-sm btn-outline",
@@ -792,21 +792,29 @@ fn KeyBacksTwoStores(store: SellerStore) -> Element {
                 }
             } else {
                 div { class: "form-actions",
-                    for (id , name) in closable {
+                    for target in closable {
                         button {
                             class: "btn btn-sm btn-outline",
-                            key: "{name}",
+                            key: "{target.code}",
                             onclick: {
-                                let id = id.clone();
-                                let name = name.clone();
-                                move |_| confirming.set(Some((id.clone(), name.clone())))
+                                let target = target.clone();
+                                move |_| confirming.set(Some(target.clone()))
                             },
-                            "Close {name}\u{2026}"
+                            "Close {target.name} ({target.code})\u{2026}"
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// "1 listing", "3 orders".
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 
@@ -1066,10 +1074,10 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     "This store is closed for good. Buyers can\u{2019}t buy from it, and its orders \
                      stay here for you to read."
                 }
-            } else if !store.shares_key_with.is_empty() {
+            } else if let Some(conflict) = store.key_conflict.clone() {
                 // One Ghost Key behind two stores (harvest#181): said to the
                 // seller in their terms, with the way out.
-                KeyBacksTwoStores { store: store.clone() }
+                KeyBacksTwoStores { conflict }
             } else if store.details_resolved && !store.certificate.is_verified() {
                 // Editing the details will not fix this, so it is not phrased
                 // as a repair prompt: a certificate that does not verify is
@@ -1766,16 +1774,11 @@ fn publish_store_details(store_contract_id: Vec<u8>, details: StoreDetails) {
 ///    for the reputation key, the messaging key and a new store key.
 /// 3. When all but the messaging key have arrived, the Ghost Key backs the
 ///    new store key, the store key accepts it, and the contracts publish.
-fn initiate_store_creation(
-    _fingerprint: String,
-    _details: StoreDetails,
-    _carried_listings: Vec<Listing>,
-) {
+fn initiate_store_creation(_fingerprint: String, _details: StoreDetails) {
     #[cfg(target_arch = "wasm32")]
     {
         let fingerprint = _fingerprint;
         let details = _details;
-        let carried_listings = _carried_listings;
 
         // The Ghost Key's verifying key, from the vault's own answer: the
         // backing names it.
@@ -1795,12 +1798,12 @@ fn initiate_store_creation(
             );
             return;
         };
-        let started = APP_STATE.write().begin_store_creation(
-            fingerprint.clone(),
-            vk_bytes,
-            details,
-            carried_listings,
-        );
+        // Gated again here: the form may have been opened under an earlier
+        // answer (harvest#181).
+        let started =
+            APP_STATE
+                .write()
+                .begin_own_store_creation(fingerprint.clone(), vk_bytes, details);
         match started {
             Ok(store_key_request) => send_store_creation_requests(fingerprint, store_key_request),
             Err(e) => APP_STATE
@@ -2403,7 +2406,7 @@ mod seller_stores_tests {
         assert!(!overview_needs(&base, &state), "nothing to do");
 
         type Change = fn(&mut SellerStore);
-        let cases: [(&str, Change); 9] = [
+        let cases: [(&str, Change); 10] = [
             ("a request", |s| s.requests = 1),
             ("an order to send", |s| s.to_send = 1),
             ("a payment to confirm", |s| s.to_confirm = 1),
@@ -2421,6 +2424,21 @@ mod seller_stores_tests {
             ("a backing that does not check out", |s| {
                 s.certificate = crate::ghostkey_cert::CertificateStatus::Invalid("x".into())
             }),
+            ("one Ghost Key behind two stores", |s| {
+                let store = crate::closure_flow::SharingStore {
+                    contract_id: vec![9; 32],
+                    name: "Bean Shop".into(),
+                    code: "abc".into(),
+                    listings: 0,
+                    orders: 0,
+                    can_close: true,
+                };
+                s.key_conflict = Some(crate::closure_flow::KeyConflict {
+                    this: store.clone(),
+                    others: vec![store],
+                    closing: None,
+                })
+            }),
         ];
         for (what, change) in cases {
             let mut store = base.clone();
@@ -2437,6 +2455,13 @@ mod seller_stores_tests {
         loading.certificate = crate::ghostkey_cert::CertificateStatus::Absent;
         loading.gap = Some(StoreDetailsGap::NeverPublished);
         assert!(!overview_needs(&loading, &state));
+
+        // A store closed for good has given up its backing, so "unbacked"
+        // is how it should read, not something to do (harvest#181).
+        let mut closed = base.clone();
+        closed.closed = true;
+        closed.certificate = crate::ghostkey_cert::CertificateStatus::Absent;
+        assert!(!overview_needs(&closed, &state));
     }
 
     /// The header's "needs you" pill goes to the first store something

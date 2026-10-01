@@ -461,12 +461,20 @@ pub struct AppState {
     /// The Ghost Key indexes this tab follows, by index contract id
     /// (harvest#93 phase 1c). See `index_flow`.
     pub ghostkey_indexes: HashMap<Vec<u8>, crate::index_flow::IndexView>,
-    /// Ghost Keys (by fingerprint) whose index migration walk has finished
-    /// this session (harvest#181). See `AppState::store_creation_gate`.
+    /// Ghost Keys (by fingerprint) whose index migration walk has ended in a
+    /// way that settles what the key backs this session (harvest#181). See
+    /// `index_flow::IndexWalkEnd` and `AppState::store_creation_gate`.
     pub index_walks_done: HashSet<String>,
+    /// Ghost Keys (by fingerprint) whose index wait has been started, and
+    /// those whose wait has run out (`index_flow::INDEX_SETTLE_WAIT_MS`).
+    pub index_waits_started: HashSet<String>,
+    pub index_waits_elapsed: HashSet<String>,
     /// Stores being closed for good, by id, with the signed halves so far
     /// (`crate::closure_flow`, harvest#181).
     pub closing_stores: HashMap<Vec<u8>, crate::closure_flow::ClosingStore>,
+    /// Closes handed to the node, by store id, until the store's state
+    /// shows it closed (`crate::closure_flow`, harvest#181).
+    pub closes_sent: HashMap<Vec<u8>, crate::closure_flow::CloseSent>,
     /// Off-target only: closes ready to publish, recorded instead of sent.
     #[cfg(not(target_arch = "wasm32"))]
     pub closes_ready: Vec<(

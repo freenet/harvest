@@ -912,9 +912,24 @@ pub async fn submit_listing_status_by_id(
     .await
 }
 
-/// Close one of our stores for good (harvest#181): its backer's retirement
-/// and the closure, both signed by the store key, in one update, so neither
-/// can land without the other.
+/// The update that closes a store for good (harvest#181): its backer's
+/// retirement and the closure, both signed by the store key, in ONE delta,
+/// which the contract applies all or nothing, so neither can land without
+/// the other.
+pub(crate) fn close_delta(
+    owner: ed25519_dalek::VerifyingKey,
+    retirement: harvest_common::backing::AuthorizedRetirement,
+    closure: harvest_common::backing::AuthorizedClosure,
+) -> harvest_common::store::StoreStateV1Delta {
+    harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
+        retirements: Some(vec![retirement]),
+        closed: Some(vec![closure]),
+        ..Default::default()
+    }
+}
+
+/// Close one of our stores for good (harvest#181), with [`close_delta`].
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_close_by_id(
     store_contract_id: &[u8],
@@ -925,13 +940,8 @@ pub async fn submit_close_by_id(
 
     let (contract_key, _origin, owner) =
         owned_store_key(store_contract_id, "no store to close").await?;
-    let delta_bytes = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
-        owner: Some(owner),
-        retirements: Some(vec![retirement]),
-        closed: Some(vec![closure]),
-        ..Default::default()
-    })
-    .map_err(|e| format!("serialize store close delta: {e}"))?;
+    let delta_bytes = harvest_common::to_cbor(&close_delta(owner, retirement, closure))
+        .map_err(|e| format!("serialize store close delta: {e}"))?;
     super::update_contract(
         &contract_key,
         UpdateData::Delta(StateDelta::from(delta_bytes)),
