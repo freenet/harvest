@@ -11,9 +11,28 @@ use super::my_store::{
 use super::router::{go, Page, SellerView};
 use crate::gateway::APP_STATE;
 
-/// S1. `another`: a seller with a store opening one more.
+/// S1. `another`: a seller with a store opening one more. Until this node
+/// knows which stores are its own (after a reload, the store lists arrive
+/// late) it says it is checking: a store of the seller's arriving then must
+/// not be taken for one just opened here (review of #214).
 #[component]
 pub(crate) fn OpenStore(another: bool) -> Element {
+    let known = APP_STATE
+        .read()
+        .seller_known_or_waited(crate::state::now_ms());
+    if !known {
+        return rsx! {
+            super::seller_pages::BackTo { label: "Stores".to_string(), page: Page::Stores }
+            p { class: "text-muted text-italic", "Checking your stores\u{2026}" }
+        };
+    }
+    rsx! {
+        OpenStoreSteps { another }
+    }
+}
+
+#[component]
+fn OpenStoreSteps(another: bool) -> Element {
     let (ghostkeys, in_flight, has_harvest_delegate, stores) = {
         let state = APP_STATE.read();
         (

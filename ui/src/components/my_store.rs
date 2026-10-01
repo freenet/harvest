@@ -46,7 +46,8 @@ pub(crate) struct SellerStore {
     pub publish_in_flight: bool,
     /// Listings not taken down.
     pub listings: usize,
-    /// Buyers' requests still waiting for an invoice.
+    /// Conversations holding a buyer's request waiting for the seller's
+    /// hand answer (`message_view::SellerThread::waiting`).
     pub requests: usize,
     /// Buyer conversations waiting for the seller's reply
     /// (`message_view::awaiting_reply`, msg1 critique MSG-3).
@@ -139,25 +140,6 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         || !state.instant_checkout_alerts(&store.contract_id).is_empty()
 }
 
-/// The first store this device manages that something needs the seller at
-/// (`SellerStore::needs_you`): where the header's "needs you" pill goes.
-pub(crate) fn first_store_needing_seller(state: &AppState) -> Option<Vec<u8>> {
-    seller_stores(state)
-        .into_iter()
-        .find(|s| s.needs_you() > 0)
-        .map(|s| s.contract_id)
-}
-
-/// What needs the seller across every store this device manages
-/// ([`SellerStore::needs_you`]): the number beside "Stores" in the
-/// navigation, visible from every page.
-pub(crate) fn requests_needing_seller(state: &AppState) -> usize {
-    seller_stores(state)
-        .iter()
-        .map(SellerStore::needs_you)
-        .sum()
-}
-
 /// Every store this device can manage, by name.
 pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
     let mut stores: Vec<SellerStore> = state
@@ -216,17 +198,25 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                 .unwrap_or(0);
             // A payment withheld for the seller to confirm needs them too:
             // its card is on their list (`invoice_form::invoices_issued_by`).
+            let sending = browsing
+                .map(|_| state.seller_orders_to_send(id, fingerprint))
+                .unwrap_or_default();
+            // Not one already counted to send: one order is one thing to do
+            // (review of #214).
             let to_confirm = state
                 .withheld_settlements
                 .iter()
-                .filter(|(_, (store, order))| {
+                .filter(|(order_id, (store, order))| {
                     store.as_slice() == id.as_slice()
                         && order.order.seller_fingerprint == *fingerprint
+                        && !sending.iter().any(|s| s.order.id == **order_id)
                 })
                 .count();
-            let to_send = browsing
-                .map(|_| state.seller_orders_to_send(id, fingerprint).len())
-                .unwrap_or(0);
+            let to_send = sending.len();
+            // Read once: the replies waiting and the requests offered for a
+            // hand answer come from the same conversations the Home rows and
+            // the Messages page list, so every count agrees with its rows.
+            let inbox = super::message_view::seller_inbox(state, id);
             Some(SellerStore {
                 contract_id: id.clone(),
                 fingerprint: fingerprint.clone(),
@@ -267,8 +257,8 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                             .count()
                     })
                     .unwrap_or(0),
-                requests: super::message_view::requests_awaiting_invoice(state, id),
-                replies: super::message_view::replies_awaited(state, id),
+                requests: inbox.threads.iter().filter(|t| t.waiting > 0).count(),
+                replies: inbox.threads.iter().filter(|t| t.awaiting_reply).count(),
                 record: browsing
                     .map(|b| b.record_badge().1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
@@ -1788,7 +1778,7 @@ mod seller_stores_tests {
         assert_eq!(stores[0].unpriced, 1);
         assert_eq!(stores[0].requests, 0);
         assert!(stores[0].code.is_some() && stores[0].link.is_some());
-        assert_eq!(requests_needing_seller(&state), 0);
+        assert!(super::super::needs::places(&state).is_empty());
     }
 
     /// Every item the Overview's "Needs you" card can list makes a store's
@@ -1848,12 +1838,16 @@ mod seller_stores_tests {
         assert!(!overview_needs(&loading, &state));
     }
 
-    /// The header's "needs you" pill goes to the first store something
-    /// needs the seller at, and the seller pages move to it even when they
-    /// are already open on another store (`seller_page_target`, read by
-    /// `StoreDashboard`'s effect). Red with a store needing nothing chosen.
+    /// **The header's pill lists each place something needs the person**
+    /// (`needs::places`): nothing when nothing waits; one store's Home, with
+    /// what waits there, when one store needs the seller; one place per
+    /// store when two do (the pill then opens its menu), and the count is
+    /// their sum. Red with a store needing nothing listed, or one counted
+    /// twice.
     #[test]
-    fn the_needs_you_pill_goes_to_the_store_that_needs_the_seller() {
+    fn the_needs_you_pill_lists_each_place_that_needs_the_seller() {
+        use super::super::needs::places;
+        use super::super::router::{Page, SellerView};
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
         let mut state = AppState::default();
         state.my_stores.insert(
@@ -1863,11 +1857,11 @@ mod seller_stores_tests {
                 registration(2, Some(crate::state::test_store_key())),
             ],
         );
-        assert_eq!(first_store_needing_seller(&state), None, "nothing waits");
-        let order = AuthorizedOrder {
+        assert!(places(&state).is_empty(), "nothing waits");
+        let order = |n: u8| AuthorizedOrder {
             order: Order {
-                request_id: Some([7; 32]),
-                id: OrderId([7; 32]),
+                request_id: Some([n; 32]),
+                id: OrderId([n; 32]),
                 buyer_fingerprint: String::new(),
                 seller_fingerprint: "fp".into(),
                 amount_sats: 1,
@@ -1894,9 +1888,25 @@ mod seller_stores_tests {
         // A payment for the seller to confirm, at the second store.
         state
             .withheld_settlements
-            .insert(OrderId([7; 32]), (vec![2u8; 32], order));
-        assert_eq!(first_store_needing_seller(&state), Some(vec![2u8; 32]));
-        assert_eq!(requests_needing_seller(&state), 1);
+            .insert(OrderId([7; 32]), (vec![2u8; 32], order(7)));
+        let found = places(&state);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].page,
+            Page::Seller {
+                store: Some(vec![2u8; 32]),
+                view: SellerView::Home
+            }
+        );
+        assert_eq!(found[0].count, 1);
+        assert_eq!(found[0].detail, "1 payment to match");
+        // And one at the first: two places, so the pill opens its menu.
+        state
+            .withheld_settlements
+            .insert(OrderId([8; 32]), (vec![1u8; 32], order(8)));
+        let found = places(&state);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found.iter().map(|p| p.count).sum::<usize>(), 2);
     }
 
     /// "Open another store" says which Ghost Key backs which store, in one

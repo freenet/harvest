@@ -932,9 +932,15 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
         }
     };
     let Some((browsing, found)) = found else {
+        // Said once the wait is over, never "Loading" for good.
+        let unreachable = APP_STATE.read().store_name_of(&store) == StoreName::Unreachable;
         return rsx! {
             {back}
-            p { class: "text-muted text-italic", "Loading this store\u{2026}" }
+            if unreachable {
+                p { class: "text-warning", "That store didn\u{2019}t load. It may not be reachable right now." }
+            } else {
+                p { class: "text-muted text-italic", "Loading this store\u{2026}" }
+            }
         };
     };
     let Some((authorized, availability)) =

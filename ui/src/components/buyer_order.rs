@@ -48,9 +48,9 @@ struct OrderFacts {
     status: Status,
     item: String,
     listing: Option<harvest_common::listing::ListingId>,
-    /// What the items cost before delivery, when the listing's price is
-    /// still here to work it out.
-    items_sats: Option<u64>,
+    /// What the items and their delivery cost, from the listing as it is
+    /// now: shown only where they add up to the order's amount.
+    breakdown: Option<(u64, u64)>,
     picture: Option<String>,
     ship_to: Option<crate::state::SellerOrderRequest>,
     store_name: String,
@@ -112,8 +112,8 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     picture: listing.as_ref().and_then(|(l, t, _)| {
                         super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
                     }),
-                    items_sats: listing.as_ref().and_then(|(l, _, q)| {
-                        state
+                    breakdown: listing.as_ref().and_then(|(l, _, q)| {
+                        let checkout = state
                             .browsing_stores
                             .get(&store)?
                             .listings
@@ -121,8 +121,16 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                             .find(|x| x.listing.id == *l)?
                             .listing
                             .checkout
-                            .as_ref()
-                            .map(|c| c.unit_sats.saturating_mul(u64::from(*q)))
+                            .clone()?;
+                        let items = checkout.unit_sats.saturating_mul(u64::from(*q));
+                        let delivery = match &checkout.delivery {
+                            harvest_common::listing::DeliveryPrice::Included => 0,
+                            harvest_common::listing::DeliveryPrice::ByRegion(rows) => {
+                                let region = state.purchase_ship_to(&store, &purchase)?.region?;
+                                rows.iter().find(|r| r.region == region)?.sats
+                            }
+                        };
+                        Some((items, delivery))
                     }),
                     listing: listing.map(|(l, _, _)| l),
                     item,
@@ -234,10 +242,21 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
         .as_ref()
         .or(purchase.paid.as_ref())
         .map(|o| order_status::short_date(o.order.created_at));
-    let can_pay = order_status::buyer_can_pay(&purchase, facts.status);
     let just_bought = pending.is_some();
     let asked = pending.as_ref().map(|p| p.sent.asked_sats);
-    let holds = pending.as_ref().is_some_and(|p| p.holds_stock);
+    // The order asks what this tab's Buy now showed, or nothing here says
+    // to pay it (PayPanel says why).
+    let asked_matches = match (asked, purchase.commitment.as_ref()) {
+        (Some(asked), Some(order)) => order.order.amount_sats == asked,
+        _ => true,
+    };
+    let can_pay = order_status::buyer_can_pay(&purchase, facts.status) && asked_matches;
+    // Only a counted listing holds stock, and only for the hour after Buy
+    // now.
+    let holds = can_pay
+        && pending.as_ref().is_some_and(|p| {
+            p.holds_stock && crate::state::now_ms().saturating_sub(p.sent.at_ms) < 60 * 60 * 1000
+        });
     let pill_class = if can_pay {
         "pill pill-needs"
     } else {
@@ -276,7 +295,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
         div { class: "two-col",
             div { class: "col-main",
                 match facts.status {
-                    Status::WaitingForPayment | Status::CantBePaid | Status::Placed => rsx! {
+                    Status::WaitingForPayment | Status::CantBePaid | Status::Placed | Status::PaymentSeen => rsx! {
                         div { class: if can_pay { "panel panel-strong" } else { "panel" },
                             if can_pay {
                                 if let Some((sats, network)) = amount {
@@ -302,7 +321,11 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                     Status::Expired => rsx! {
                         div { class: "panel",
-                            p { "This order expired before it was paid. Nothing was charged." }
+                            p { "This order can no longer be paid: its time to pay has passed." }
+                            p { class: "text-muted small",
+                                "If you sent a payment and it is still confirming, message the seller: \
+                                 they can see it in their wallet."
+                            }
                             if let Some(listing) = facts.listing.clone() {
                                 button {
                                     class: "btn btn-primary",
@@ -328,6 +351,12 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                             if let Some(line) = super::buy_view::complaint_line(&facts.complaint, &short) {
                                 p { class: "text-muted small", "{line}" }
                             }
+                            // Why not yet, when a report can't be made now.
+                            if let ComplaintOffer::Refused(ref why) = facts.complaint {
+                                if !why.is_empty() {
+                                    p { class: "text-muted small", "A problem can\u{2019}t be reported yet: {why}." }
+                                }
+                            }
                             if facts.complaint == ComplaintOffer::Open {
                                 button {
                                     class: "btn btn-outline",
@@ -346,20 +375,21 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     h3 { class: "sec-lbl", "Details" }
                     div { class: "bill",
                         // The item and delivery lines only where they add up
-                        // to the order's amount: the listing may have changed
-                        // its price since.
-                        match facts.items_sats.filter(|items| *items <= sats) {
-                            Some(items) => rsx! {
+                        // to the order's amount exactly: a listing changed
+                        // since, or an order asking something else, shows the
+                        // total alone, never a made-up "delivery" line.
+                        match facts.breakdown.filter(|(items, delivery)| items + delivery == sats) {
+                            Some((items, delivery)) => rsx! {
                                 span { "{facts.item}" }
                                 span { "{super::pay_card::money(items, network)}" }
-                                if sats > items {
+                                if delivery > 0 {
                                     span {
                                         match facts.ship_to.as_ref().and_then(|s| s.region.clone()) {
                                             Some(region) => rsx! { "Delivery, {region}" },
                                             None => rsx! { "Delivery" },
                                         }
                                     }
-                                    span { "{super::pay_card::money(sats - items, network)}" }
+                                    span { "{super::pay_card::money(delivery, network)}" }
                                 }
                             },
                             None => rsx! {},
@@ -478,11 +508,7 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
     let paid = kept.order.status == OrderStatus::Paid;
     let short = order.short();
     let amount = super::pay_card::money(kept.order.order.amount_sats, kept.order.order.network);
-    let status = if paid {
-        Status::Paid
-    } else {
-        Status::WaitingForPayment
-    };
+    let status = order_status::kept_status(&APP_STATE.read(), &kept);
     rsx! {
         {back}
         div { class: "page-title",
@@ -510,8 +536,13 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
                 }
             } else if seen_paid {
                 p { "Payment seen. Your node is keeping its proof of payment, and a problem can be reported once it has." }
+            } else if status == Status::Expired {
+                p { "This order can no longer be paid: its time to pay has passed." }
             } else {
-                p { "No payment seen yet. Your node keeps this order and follows what the bridge reports for its address. If you haven\u{2019}t paid, the store\u{2019}s page is where to." }
+                // No payment address here, ever (review round 6): a buyer
+                // who paid while it went unseen would read one as a prompt
+                // to pay again.
+                p { "No payment seen yet. The payment steps show here once its store can be reached again." }
             }
             p { class: "text-muted small",
                 "Its store isn\u{2019}t loaded, so this is your node\u{2019}s own copy of the order."

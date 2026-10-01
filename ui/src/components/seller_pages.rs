@@ -547,11 +547,14 @@ fn SellerHome(store: SellerStore) -> Element {
             });
         }
         // Payments held for the seller to say which order they are for.
-        for order in data
-            .orders
-            .iter()
-            .filter(|o| state.withheld_settlements.contains_key(&o.order.id))
-        {
+        let sending: Vec<OrderId> = state
+            .seller_orders_to_send(&id, &store.fingerprint)
+            .into_iter()
+            .map(|o| o.order.id)
+            .collect();
+        for order in data.orders.iter().filter(|o| {
+            state.withheld_settlements.contains_key(&o.order.id) && !sending.contains(&o.order.id)
+        }) {
             rows.push(TodoRow {
                 title: format!("Say which order a payment is for: {}", data.item_of(order)),
                 sub: format!("Order {}", order.order.id.short()),
@@ -593,7 +596,7 @@ fn SellerHome(store: SellerStore) -> Element {
                 && order_status::seller_status(&state, &id, o) == Status::WaitingForPayment
         }) {
             rows.push(TodoRow {
-                title: format!("Cancel expired invoice {}", order.order.id.short()),
+                title: format!("Cancel expired order {}", order.order.id.short()),
                 sub: "Too old for a buyer to pay. The buyer can order again.".to_string(),
                 pill: None,
                 thumb: None,
@@ -1046,7 +1049,11 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                 OrderView {
                     item: data.item_of(&o),
                     status: order_status::seller_status(&state, &id, &o),
-                    pill: order_status::send_by_pill(&state, &o).filter(|_| to_send),
+                    pill: if state.withheld_settlements.contains_key(&o.order.id) {
+                        Some("Payment to match".to_string())
+                    } else {
+                        order_status::send_by_pill(&state, &o).filter(|_| to_send)
+                    },
                     paid: paid_date(&state, &o),
                     request: data
                         .requests
@@ -1144,6 +1151,14 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                     }
                 } else if matches!(view.status, Status::Sent | Status::Complete | Status::Reported | Status::Paid) && !view.withheld {
                     section { class: "panel",
+                        if !view.twins.is_empty() {
+                            p { class: "text-warning",
+                                "Your order {view.twins.join(\", \")} uses this same payment address, and \
+                                 the payment that settled this one also falls inside its window. One \
+                                 payment can\u{2019}t pay for both: check your wallet for a separate \
+                                 payment per order."
+                            }
+                        }
                         super::invoice_form::SellerRequestView { request: view.request.clone(), quiet_when_missing: true }
                         // A paid order past every window can still be marked
                         // as sent late; the control hides itself once a

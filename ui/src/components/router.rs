@@ -265,7 +265,15 @@ impl Page {
         let path = fragment.strip_prefix('#').unwrap_or(fragment);
         let path = path.strip_prefix('/')?;
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let bytes = |s: &str| bs58::decode(s).into_vec().ok().filter(|v| v.len() == 32);
+        // A 32-byte id is at most 44 base58 characters: anything longer is
+        // refused before decoding, which is quadratic in its length (a link
+        // someone sends could otherwise hang the tab before it paints).
+        let bytes = |s: &str| {
+            (s.len() <= 44)
+                .then(|| bs58::decode(s).into_vec().ok())
+                .flatten()
+                .filter(|v| v.len() == 32)
+        };
         let arr = |s: &str| bytes(s).and_then(|v| <[u8; 32]>::try_from(v).ok());
         let order = |s: &str| arr(s).map(OrderId);
         let at = |kind: &str, s: &str| match kind {
@@ -368,6 +376,7 @@ pub(crate) fn go(page: Page) {
     }
     let fragment = page.fragment();
     show(page);
+    scroll_to_top();
     set_fragment(&fragment);
 }
 
@@ -380,6 +389,7 @@ pub(crate) fn replace(page: Page) {
     }
     let fragment = page.fragment();
     show(page);
+    scroll_to_top();
     replace_fragment(&fragment);
 }
 
@@ -401,20 +411,35 @@ fn show(page: Page) {
         super::app::load_store_for_page(&store);
     }
     *PAGE.write() = page;
-    scroll_to_top();
 }
 
 /// Follow the iframe's fragment as it now reads (a Back, a Forward, or the
 /// page's first load): show the page it names, if it names one and it is not
 /// already on screen. Returns whether it named a page.
 pub(crate) fn follow_fragment() -> bool {
-    let Some(page) = Page::from_fragment(&current_fragment()) else {
-        return false;
+    let fragment = current_fragment();
+    let followed = follow(&fragment);
+    if followed {
+        tell_shell(&fragment);
+    }
+    followed
+}
+
+/// [`follow_fragment`] for a given fragment. An empty one is the app's first
+/// page, Stores, which has none of its own until the first change of page:
+/// Back to it lands there (review of #214). Anything else that names no page
+/// (a store link) is left alone.
+fn follow(fragment: &str) -> bool {
+    let page = match fragment {
+        "" | "#" => Page::Stores,
+        other => match Page::from_fragment(other) {
+            Some(page) => page,
+            None => return false,
+        },
     };
     if *PAGE.peek() != page {
         show(page);
     }
-    tell_shell(&current_fragment());
     true
 }
 
@@ -617,6 +642,38 @@ mod tests {
         let fragments: std::collections::HashSet<String> =
             pages.iter().map(Page::fragment).collect();
         assert_eq!(fragments.len(), pages.len());
+    }
+
+    /// **Back to the app's first page lands on Stores**: that page has no
+    /// fragment until the first change of page, so an empty one is Stores.
+    /// A store link is still left alone. Red with `follow` refusing "".
+    #[test]
+    fn back_to_the_first_page_lands_on_stores() {
+        use dioxus::prelude::{ScopeId, VirtualDom};
+        fn empty() -> Element {
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(empty);
+        dom.rebuild_in_place();
+        dom.in_scope(ScopeId::ROOT, || {
+            go(Page::Purchases);
+            assert_eq!(*PAGE.peek(), Page::Purchases);
+            assert!(follow(""));
+            assert_eq!(*PAGE.peek(), Page::Stores);
+            go(Page::Purchases);
+            assert!(
+                !follow("#store=Hyqno9kqmxYLezD1"),
+                "a store link is not followed"
+            );
+            assert_eq!(*PAGE.peek(), Page::Purchases);
+        });
+    }
+
+    /// An id longer than a 32-byte id can be is refused unread.
+    #[test]
+    fn an_overlong_id_is_refused() {
+        let long = "1".repeat(10_000);
+        assert_eq!(Page::from_fragment(&format!("#/store/{long}")), None);
     }
 
     /// **A shared store link is not a page's fragment**: it is left to

@@ -439,13 +439,15 @@ pub(crate) fn buyer_conversation_summary(
     })
 }
 
-/// The buyer's conversations this session has shown, each with how many
-/// messages it held then: a store's reply is "New reply" until its
-/// conversation is opened. Kept for the session only: nothing in the browser
+/// The buyer's conversations this session has shown, each with when its
+/// newest message was written: a store's reply is "New reply" until its
+/// conversation is opened. By time, not by count, so a mailbox that loses
+/// old entries cannot hide a new reply (review of #214). Kept for the session only: nothing in the browser
 /// lasts across a reload here (`docs/buyer-conversation-persistence.md`),
 /// and the delegate has no field for it yet.
-pub(crate) static SEEN_CONVERSATIONS: GlobalSignal<std::collections::HashMap<[u8; 32], usize>> =
-    GlobalSignal::new(std::collections::HashMap::new);
+pub(crate) static SEEN_CONVERSATIONS: GlobalSignal<
+    std::collections::HashMap<[u8; 32], chrono::DateTime<chrono::Utc>>,
+> = GlobalSignal::new(std::collections::HashMap::new);
 
 /// Whether the store's reply in this conversation is new to the buyer: the
 /// store wrote last, and the conversation has not been opened in this
@@ -455,7 +457,7 @@ pub(crate) fn is_new_reply(summary: &ConversationSummary, tag: &[u8; 32]) -> boo
         && SEEN_CONVERSATIONS
             .read()
             .get(tag)
-            .is_none_or(|seen| *seen < summary.said)
+            .is_none_or(|seen| summary.latest_at.is_some_and(|at| at > *seen))
 }
 
 /// Messages this tab sent to a store (or to its conversation `tag`) not yet

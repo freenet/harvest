@@ -228,7 +228,8 @@ pub(crate) fn ListingFormPage(
                                 state.notifications.push(format!("Could not save the listing: {e}"));
                             }
                         }
-                        super::router::go(page.clone());
+                        // In place of the form, so Back does not reopen it.
+                        super::router::replace(page.clone());
                     }
                 },
             }
@@ -254,7 +255,8 @@ pub(crate) fn ListingFormPage(
                                 state.notifications.push(format!("Cannot add the listing: {e}"));
                             }
                         }
-                        super::router::go(page.clone());
+                        // In place of the form, so Back does not reopen it.
+                        super::router::replace(page.clone());
                     }
                 },
             }

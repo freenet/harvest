@@ -342,11 +342,14 @@ pub fn BuyForm(
 /// What the buyer still has to choose before Buy now can go out, said in
 /// their words: a choice group left on "Choose one", or the delivery region.
 fn missing_choice(listing: &Listing, picks: &[String], region_missing: bool) -> Option<String> {
-    if let Some((group, _)) = listing
+    // By position, with a pick missing altogether counted as not chosen: a
+    // listing edited after the form opened may have more groups than picks.
+    if let Some(group) = listing
         .choices
         .iter()
-        .zip(picks)
-        .find(|(_, pick)| pick.is_empty())
+        .enumerate()
+        .find(|(i, _)| picks.get(*i).is_none_or(|pick| pick.is_empty()))
+        .map(|(_, group)| group)
     {
         return Some(format!("Choose a {}.", group.name.to_lowercase()));
     }
@@ -2043,5 +2046,50 @@ mod tests {
         );
         let at_send = seller_answers(std::slice::from_ref(&old_decline));
         assert_eq!(latest_answer(&[old_decline], &at_send, Some(&ours)), None);
+    }
+
+    /// What Buy now says is missing: the first group left on "Choose one"
+    /// (or with no pick at all, after the listing gained a group), then the
+    /// region. Red with `zip`, which stops at the shorter list.
+    #[test]
+    fn buy_now_says_which_choice_is_missing() {
+        let mut listing = Listing {
+            checkout: None,
+            choices: vec![
+                harvest_common::listing::ChoiceGroup {
+                    name: "Size".into(),
+                    options: vec!["S".into(), "M".into()],
+                },
+                harvest_common::listing::ChoiceGroup {
+                    name: "Colour".into(),
+                    options: vec!["Blue".into()],
+                },
+            ],
+            id: ListingId([1; 32]),
+            title: "Mug".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            missing_choice(&listing, &["".into(), "Blue".into()], false).as_deref(),
+            Some("Choose a size.")
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into()], false).as_deref(),
+            Some("Choose a colour."),
+            "a group with no pick at all"
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into(), "Blue".into()], true).as_deref(),
+            Some("Choose where to deliver it.")
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into(), "Blue".into()], false),
+            None
+        );
+        listing.choices.clear();
+        assert_eq!(missing_choice(&listing, &[], false), None);
     }
 }

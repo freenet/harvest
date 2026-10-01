@@ -27,6 +27,13 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                     .buyer_purchases(&store)
                     .into_iter()
                     .filter(|p| p.conversation == tag)
+                    // Not one issued to someone else: never this buyer's
+                    // order, as Purchases leaves it out too.
+                    .filter(|p| {
+                        !p.blockers.iter().any(|b| {
+                            matches!(b, crate::state::PaymentBlocker::CommitmentNotForThisBuyer)
+                        })
+                    })
                     .collect();
                 // Newest first, as Purchases lists them.
                 purchases.sort_by_key(|p| {
@@ -77,7 +84,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
             .unwrap_or_default();
         let said = tag
             .and_then(|tag| super::message_view::buyer_conversation_summary(&state, &store, tag))
-            .map(|s| s.said);
+            .and_then(|s| s.latest_at);
         (
             info.is_some(),
             state.store_name_of(&store).label(),
@@ -101,16 +108,39 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
             }
         }
     }));
-    let has_messages = tag.is_some_and(|tag| {
-        super::message_view::buyer_thread_has_messages(&APP_STATE.read(), &store, Some(tag))
+    // A first message starts a conversation: this page then follows it,
+    // so what was just sent shows here and Back is not left on an empty
+    // page (review of #214).
+    let started = tag.is_none().then(|| {
+        APP_STATE
+            .read()
+            .browsing_stores
+            .get(&store)
+            .and_then(|s| s.conversations.last())
+            .map(|c| c.buyer_public_key)
     });
+    let here = store.clone();
+    use_effect(use_reactive!(|(started, here)| {
+        if let Some(Some(tag)) = started {
+            super::router::replace(Page::Conversation {
+                store: here.clone(),
+                tag: Some(tag),
+            });
+        }
+    }));
+    let has_messages =
+        super::message_view::buyer_thread_has_messages(&APP_STATE.read(), &store, tag);
+    let unreachable =
+        !loaded && APP_STATE.read().store_name_of(&store) == crate::state::StoreName::Unreachable;
 
     rsx! {
         super::seller_pages::BackTo { label: "Messages".to_string(), page: Page::PurchaseMessages }
         h2 { class: "page-h", "Messages with {name}" }
         div { class: "two-col",
             div { class: "col-main",
-                if !loaded {
+                if unreachable {
+                    p { class: "text-warning", "That store didn\u{2019}t load. It may not be reachable right now." }
+                } else if !loaded {
                     p { class: "text-muted text-italic", "Loading this store\u{2026}" }
                 } else {
                     if has_messages {
@@ -128,11 +158,11 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                                     seller_encryption_key: key,
                                     seller_verifying_key: identity,
                                     target: tag,
-                                    label: "Message the seller".to_string(),
-                                    placeholder: "Message the seller".to_string(),
+                                    label: "Your message".to_string(),
+                                    placeholder: format!("Write to {name}"),
                                     hint: format!(
                                         "Only {name} can read this. They see it the next time they \
-                                         open Harvest."
+                                         open Harvest, and their reply appears here, on this device."
                                     ),
                                 }
                             },

@@ -26,6 +26,9 @@ pub(crate) enum Status {
     CantBePaid,
     /// Placed, and the store has not answered with payment details yet.
     Placed,
+    /// Unpaid on record, but a payment that would settle it (or may) is
+    /// already at its address: nothing to pay, nothing to prompt.
+    PaymentSeen,
 }
 
 impl Status {
@@ -41,6 +44,7 @@ impl Status {
             Status::Reversed => "Payment reversed",
             Status::CantBePaid => "Can\u{2019}t be paid",
             Status::Placed => "Placed",
+            Status::PaymentSeen => "Payment seen",
         }
     }
 
@@ -66,7 +70,7 @@ impl Status {
     /// Complete) this status has reached, or `None` for one off the line.
     pub(crate) fn step(self) -> Option<usize> {
         match self {
-            Status::Placed | Status::WaitingForPayment => Some(0),
+            Status::Placed | Status::WaitingForPayment | Status::PaymentSeen => Some(0),
             Status::Paid => Some(1),
             Status::Sent | Status::Reported => Some(2),
             Status::Complete => Some(3),
@@ -154,6 +158,14 @@ pub(crate) fn buyer_status(
     let Some(order) = purchase.commitment.as_ref() else {
         return Status::Placed;
     };
+    // A payment in sight comes before anything said about paying it: an
+    // order whose window closed while its payment was still confirming is
+    // not "Expired", and one with a payment on its way is not "Waiting for
+    // payment" (review of #214: that prompt is what leads to paying twice).
+    let sight = state.payment_sight(order);
+    if order.status == OrderStatus::AwaitingPayment && (sight.settles() || sight.ambiguous) {
+        return Status::PaymentSeen;
+    }
     if purchase
         .blockers
         .iter()
@@ -189,20 +201,63 @@ pub(crate) fn buyer_can_pay(purchase: &BuyerPurchase, status: Status) -> bool {
         && (purchase.blockers.is_empty() || purchase.ready_to_keep())
 }
 
+/// Where an order known only from this node's kept copy stands: from the
+/// copy itself, the complaint on record, and what this node has seen paid.
+pub(crate) fn kept_status(
+    state: &AppState,
+    kept: &harvest_common::delegate::KeptPurchase,
+) -> Status {
+    if state
+        .complaint_on_record_by_key(&kept.store_key, &kept.order.order.id)
+        .is_some()
+    {
+        return Status::Reported;
+    }
+    if kept.order.status == OrderStatus::AwaitingPayment && state.kept_seen_paid(kept) {
+        return Status::PaymentSeen;
+    }
+    let status = from_stage(stage_of(state, &kept.order), kept.order.status);
+    if status == Status::WaitingForPayment {
+        let sight = state.payment_sight(&kept.order);
+        if sight.settles() || sight.ambiguous {
+            return Status::PaymentSeen;
+        }
+    }
+    status
+}
+
 /// The seller's pill for a paid order still to send: "Send by 4 Oct", or
-/// "Send now" once that date has passed. `None` for any other order.
+/// "Send now" once that date has passed; "Sold out" for one paid after its
+/// listing sold out, whose page says to refund or make one. `None` for any
+/// other order.
 pub(crate) fn send_by_pill(state: &AppState, order: &AuthorizedOrder) -> Option<String> {
     let tip = state.tip_height(order.order.network);
-    match (stage_of(state, order), tip) {
+    let oversold =
+        state.auto_invoice.status.values().any(
+            |status| matches!(status, Ok(status) if status.oversold.contains(&order.order.id)),
+        );
+    let pill = send_by_stage(stage_of(state, order), tip, order.status)?;
+    Some(if oversold {
+        "Sold out".to_string()
+    } else {
+        pill
+    })
+}
+
+/// [`send_by_pill`] from the stage alone.
+pub(crate) fn send_by_stage(
+    stage: OrderStage,
+    tip: Option<u32>,
+    status: OrderStatus,
+) -> Option<String> {
+    match (stage, tip) {
         (OrderStage::AwaitingDespatch { despatch_by, .. }, Some(tip)) => Some(format!(
             "Send by {}",
             crate::fulfilment::approx_date(despatch_by, tip, crate::state::now_ms())
         )),
         (OrderStage::DespatchWindowClosed { .. }, _) => Some("Send now".to_string()),
         (OrderStage::AwaitingDespatch { .. }, None) => Some("To send".to_string()),
-        (OrderStage::Unknown, _) if order.status == OrderStatus::Paid => {
-            Some("To send".to_string())
-        }
+        (OrderStage::Unknown, _) if status == OrderStatus::Paid => Some("To send".to_string()),
         _ => None,
     }
 }
@@ -396,6 +451,54 @@ mod tests {
                 &purchase(None, vec![PaymentBlocker::CommitmentNotPublished])
             ),
             Status::Placed
+        );
+    }
+
+    /// The seller's send-by pill: a date while the window runs, "Send now"
+    /// once it has passed, "To send" when no date can be placed, and none
+    /// for an order not waiting to be sent.
+    #[test]
+    fn the_send_by_pill_names_what_to_do() {
+        let paid = OrderStatus::Paid;
+        let waiting = OrderStage::AwaitingDespatch {
+            paid_at: 1,
+            despatch_by: 9,
+        };
+        assert!(send_by_stage(waiting, Some(5), paid).is_some_and(|p| p.starts_with("Send by ")));
+        assert_eq!(
+            send_by_stage(waiting, None, paid).as_deref(),
+            Some("To send")
+        );
+        assert_eq!(
+            send_by_stage(
+                OrderStage::DespatchWindowClosed {
+                    despatch_by: 1,
+                    complaint_until: 9
+                },
+                Some(5),
+                paid
+            )
+            .as_deref(),
+            Some("Send now")
+        );
+        assert_eq!(
+            send_by_stage(OrderStage::Unknown, None, paid).as_deref(),
+            Some("To send")
+        );
+        assert_eq!(
+            send_by_stage(OrderStage::Unknown, None, OrderStatus::AwaitingPayment),
+            None
+        );
+        assert_eq!(
+            send_by_stage(
+                OrderStage::Despatched {
+                    despatched_at: 1,
+                    complaint_until: 9
+                },
+                Some(5),
+                paid
+            ),
+            None
         );
     }
 }

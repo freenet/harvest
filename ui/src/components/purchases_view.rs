@@ -125,7 +125,6 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
     }
     let shown = shown_order_ids(state, &stores);
     for kept in super::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown) {
-        let paid = kept.order.status == harvest_common::payment::OrderStatus::Paid;
         let store = state
             .browsing_stores
             .iter()
@@ -144,11 +143,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 kept.order.order.amount_sats,
                 kept.order.order.network,
             )),
-            status: if paid {
-                Status::Paid
-            } else {
-                Status::WaitingForPayment
-            },
+            status: super::order_status::kept_status(state, &kept),
             to_pay: false,
             picture: None,
         });

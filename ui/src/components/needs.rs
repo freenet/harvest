@@ -46,7 +46,11 @@ pub(crate) fn places(state: &AppState) -> Vec<Place> {
                 parts.push(format!("{} waiting for your reply", store.replies));
             }
             if store.requests > 0 {
-                parts.push(format!("{} waiting for an invoice", store.requests));
+                parts.push(plural(
+                    store.requests,
+                    "needs an invoice",
+                    "need an invoice",
+                ));
             }
             if store.to_confirm > 0 {
                 parts.push(plural(
@@ -72,7 +76,10 @@ pub(crate) fn places(state: &AppState) -> Vec<Place> {
         if buyer.to_pay > 0 {
             parts.push(format!("{} to pay", buyer.to_pay));
         }
-        match buyer.replied.as_slice() {
+        // One line per store, however many conversations it replied in.
+        let mut stores = buyer.replied.clone();
+        stores.dedup();
+        match stores.as_slice() {
             [] => {}
             [one] => parts.push(format!("{one} replied")),
             many => parts.push(format!("{} stores replied", many.len())),
