@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
         assert!(
             creation_refusal(&CreationGate::ListsUnloadedStore("abc".into()))
                 .unwrap()
-                .contains("(code abc)")
+                .contains("(code abc) that Harvest can\u{2019}t reach right now. Try again later")
         );
     }
 

@@ -543,6 +543,10 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
                 }
             }
         } else if legacy_movable && gate_open {
+            // A move creates a store under this Ghost Key too.
+            if gate == crate::index_flow::CreationGate::Unconfirmed {
+                p { class: "text-warning", "{UNCONFIRMED_WARNING}" }
+            }
             p { class: "text-warning",
                 "This Ghost Key has a store made before stores had keys of their own, so this \
                  version of Harvest cannot publish to it and buyers cannot pay it. Moving it gives \
@@ -619,35 +623,20 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
     }
 }
 
-/// How long `CheckingForStore`'s bar takes to fill: the time after which
-/// the gate gives up and says it could not check (`CreationGate::Unconfirmed`).
-const CHECK_BAR_SECONDS: u32 = 60;
-
 /// "Checking whether this Ghost Key already has a store", with a bar that
-/// fills over the minute the check can take, so the wait (35 to 50 s on the
-/// rig) visibly moves.
+/// keeps moving, so the wait (35 to 50 s on the rig, up to a minute) reads
+/// as work going on. It does not claim how far along the check is: the
+/// wait starts when the Ghost Key's index is first watched, not when this
+/// page opens.
 #[component]
 fn CheckingForStore() -> Element {
-    #[allow(unused_mut)]
-    let mut seconds = use_signal(|| 0u32);
-    #[cfg(target_arch = "wasm32")]
-    use_future(move || async move {
-        while seconds() < CHECK_BAR_SECONDS {
-            gloo_timers::future::TimeoutFuture::new(1_000).await;
-            seconds += 1;
-        }
-    });
-    let filled = seconds().min(CHECK_BAR_SECONDS) * 100 / CHECK_BAR_SECONDS;
     rsx! {
         p { "Checking whether this Ghost Key already has a store\u{2026}" }
         div {
             class: "check-bar",
             role: "progressbar",
-            aria_label: "Checking",
-            aria_valuemin: "0",
-            aria_valuemax: "{CHECK_BAR_SECONDS}",
-            aria_valuenow: "{seconds()}",
-            div { class: "check-bar-fill", style: "width: {filled}%" }
+            aria_label: "Checking whether this Ghost Key already has a store",
+            div { class: "check-bar-run" }
         }
         p { class: "text-muted small",
             "Harvest looks for a store you made with it on another device. This can take up to a \

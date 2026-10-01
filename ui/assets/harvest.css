@@ -2275,21 +2275,37 @@ h4 {
   margin: 0;
 }
 
-/* "Checking whether this Ghost Key already has a store": fills over the
-   minute the check can take. */
+/* "Checking whether this Ghost Key already has a store": a short block
+   that keeps crossing the track while the check runs. */
 .check-bar {
+  position: relative;
   height: 6px;
   max-width: 24rem;
-  background: var(--color-parchment);
+  background: var(--border);
   border-radius: 3px;
   overflow: hidden;
   margin: var(--space-xs) 0;
 }
 
-.check-bar-fill {
-  height: 100%;
+.check-bar-run {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30%;
   background: var(--accent);
-  transition: width 1s linear;
+  border-radius: 3px;
+  animation: check-bar-run 1.6s ease-in-out infinite;
+}
+
+@keyframes check-bar-run {
+  from { left: -30%; }
+  to { left: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .check-bar-run {
+    animation-duration: 6s;
+  }
 }
 
 /* The four steps an order goes through. */

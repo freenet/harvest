@@ -1381,6 +1381,10 @@ pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
 // node), short enough that "Checking" does not look like a hang.
 const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
 
+/// Why nothing is invoiced at a store closed for good (harvest#181).
+pub(crate) const STORE_CLOSED_INVOICE: &str =
+    "this store is closed for good, so it can't take orders any more";
+
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
     of Harvest, and an invoice issued now could reuse a payment address. Harvest moves it once \
@@ -11666,6 +11670,16 @@ impl AppState {
                  on it"
             ));
         }
+        // Closing for good is permanent and buyers refuse to pay a closed
+        // store (`PaymentBlocker::StoreClosed`), so nothing is issued there
+        // (harvest#181).
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_some_and(|store| store.closed)
+        {
+            return Err(STORE_CLOSED_INVOICE.to_string());
+        }
         // A listing its seller took down is not one to start a fresh sale of
         // (harvest#70). An invoice answering a buyer's request is allowed
         // whatever the listing's state now: the buyer asked while it was on
@@ -19892,6 +19906,24 @@ mod invoice_tests {
                 .store_contract_id,
             current
         );
+    }
+
+    /// A store closed for good issues nothing (harvest#181): buyers refuse
+    /// to pay it, and closing is permanent. Mutated red by dropping the
+    /// closed check in `issue_invoice`.
+    #[test]
+    fn a_store_closed_for_good_cannot_issue_an_invoice() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .entry(STORE_ID.to_vec())
+            .or_default()
+            .closed = true;
+        assert_eq!(
+            state.issue_invoice(invoice()),
+            Err(STORE_CLOSED_INVOICE.to_string())
+        );
+        assert!(state.pending_invoices.is_empty());
     }
 
     /// **A seller who cannot see the chain issues nothing at all.**

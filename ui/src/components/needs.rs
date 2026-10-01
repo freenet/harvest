@@ -35,17 +35,26 @@ pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
 /// their order (`my_store::seller_stores`), then Purchases.
 pub(crate) fn places(state: &AppState) -> Vec<Place> {
     // One Ghost Key behind two stores (harvest#181) is one thing to do,
-    // said at the first of them only: closing either one fixes both.
-    let mut conflict_said: Vec<Vec<u8>> = Vec::new();
+    // said at the first of them only: closing either one fixes both. Told
+    // apart by store code, which a re-key does not change, as well as by id
+    // (`closure_flow::SharingStore` names a store by its current id).
+    let mut conflict_said: Vec<(Vec<u8>, String)> = Vec::new();
     let mut places: Vec<Place> = super::my_store::seller_stores(state)
         .into_iter()
         .filter_map(|store| {
+            let said = conflict_said
+                .iter()
+                .any(|(id, code)| *id == store.contract_id || store.code.as_ref() == Some(code));
             let conflict = store
                 .key_conflict
                 .as_ref()
-                .filter(|c| c.closing.is_none() && !conflict_said.contains(&store.contract_id))
+                .filter(|c| c.closing.is_none() && !said)
                 .map(|c| {
-                    conflict_said.extend(c.others.iter().map(|o| o.contract_id.clone()));
+                    conflict_said.extend(
+                        c.others
+                            .iter()
+                            .map(|o| (o.contract_id.clone(), o.code.clone())),
+                    );
                     c.others.len() + 1
                 });
             let count = store.needs_you() + usize::from(conflict.is_some());

@@ -1316,8 +1316,11 @@ mod tests {
             "a close that could not be sent must not hold back the next one"
         );
         let messages = code(include_str!("components/message_view.rs"));
+        let counted = &messages[messages
+            .find("fnrequests_awaiting_invoice_by_tag(")
+            .expect("the count")..];
         assert!(
-            messages.contains("ifstore.closed{returnDefault::default();}unanswered_by_tag("),
+            counted.contains("ifstore.closed{returnDefault::default();}unanswered_by_tag("),
             "a closed store's requests are not counted"
         );
         let my_store = code(include_str!("components/my_store.rs"));

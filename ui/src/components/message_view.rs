@@ -1357,7 +1357,12 @@ pub(crate) fn seller_inbox(
             })
         })
         .map(|mut thread| {
-            thread.waiting = offered_requests(state, &thread, &store.listings, &index).len();
+            // A store closed for good can never invoice again (harvest#181).
+            thread.waiting = if store.closed {
+                0
+            } else {
+                offered_requests(state, &thread, &store.listings, &index).len()
+            };
             thread
         })
         .collect();
@@ -1528,7 +1533,11 @@ pub(crate) fn SellerConversation(
     let mut problem = use_signal(|| Option::<String>::None);
     let (offered, availability) = {
         let state = APP_STATE.read();
-        let store = state.browsing_stores.get(&store_contract_id);
+        // Nothing to accept at a store closed for good (harvest#181).
+        let store = state
+            .browsing_stores
+            .get(&store_contract_id)
+            .filter(|store| !store.closed);
         let offered = store
             .map(|store| {
                 offered_requests(

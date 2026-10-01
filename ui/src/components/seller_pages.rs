@@ -82,20 +82,14 @@ pub(crate) fn SellerPages(store: Option<Vec<u8>>, view: SellerView) -> Element {
         .map(|s| (s.contract_id.clone(), s.label.clone()))
         .collect();
     let id = current.contract_id.clone();
-    // A store closed for good is only read (harvest#181): no Listings or
-    // Settings, whose controls would still sign changes to it. A link or a
-    // reload to one of them opens Home.
-    let view = match view {
-        SellerView::Listings
-        | SellerView::AddListing
-        | SellerView::EditListing(_)
-        | SellerView::Settings
-            if current.closed =>
-        {
-            SellerView::Home
-        }
-        view => view,
-    };
+    // A link or a reload to a page a closed store no longer has opens Home,
+    // and the address says so, so Back does not return to it.
+    let shown = shown_view(view.clone(), current.closed);
+    if shown != view {
+        let home = seller_page(&id, shown.clone());
+        spawn(async move { super::router::replace(home) });
+    }
+    let view = shown;
     rsx! {
         div { class: "seller-pages",
             StoreHeader { store: current.clone(), stores: others, tab: view.tab() }
@@ -131,6 +125,32 @@ pub(crate) fn SellerPages(store: Option<Vec<u8>>, view: SellerView) -> Element {
     }
 }
 
+/// The page shown for `view`: a store closed for good is only read
+/// (harvest#181), so its Listings and Settings, whose controls would still
+/// sign changes to it, open Home instead.
+pub(crate) fn shown_view(view: SellerView, closed: bool) -> SellerView {
+    match view {
+        SellerView::Listings
+        | SellerView::AddListing
+        | SellerView::EditListing(_)
+        | SellerView::Settings
+            if closed =>
+        {
+            SellerView::Home
+        }
+        view => view,
+    }
+}
+
+/// The tabs a store's pages offer: all of them, or for a store closed for
+/// good only those [`shown_view`] still shows.
+pub(crate) fn seller_tabs(closed: bool) -> Vec<SellerTab> {
+    SellerTab::ALL
+        .into_iter()
+        .filter(|t| shown_view(t.view(), closed) == t.view())
+        .collect()
+}
+
 /// "‹ Orders": the way back to the page a detail page was opened from. The
 /// browser's Back works too; this is the one on the page.
 #[component]
@@ -159,13 +179,24 @@ pub(crate) fn seller_page(store: &[u8], view: SellerView) -> Page {
 /// it tells buyers it is open (`instant_checkout_stores` arms a store, and
 /// so starts its presence, only with a buyable instant-checkout listing, and
 /// it answers orders only with a payout wallet). `None` while the store is
-/// still loading, or when nothing here is missing.
+/// still loading, when nothing here is missing, or while buyers see it open
+/// all the same (another of the seller's devices may hold the wallet and
+/// keep it open; `seller_status` says what this device lacks then).
 pub(crate) fn closed_reason(state: &AppState, store: &SellerStore) -> Option<&'static str> {
     if store.closed {
         return Some("Closed for good");
     }
-    if store.key_conflict.is_some() {
-        return Some("Closed: one Ghost Key, two stores");
+    if let Some(ref conflict) = store.key_conflict {
+        return Some(if conflict.others.len() == 1 {
+            "Closed: one Ghost Key, two stores"
+        } else {
+            "Closed: one Ghost Key, several stores"
+        });
+    }
+    if state.store_presence(&store.contract_id, crate::state::now_ms())
+        == crate::presence_flow::StorePresence::Open
+    {
+        return None;
     }
     let browsing = state
         .browsing_stores
@@ -351,10 +382,7 @@ fn StoreHeader(store: SellerStore, stores: Vec<(Vec<u8>, String)>, tab: SellerTa
             }
         }
         div { class: "tabs", role: "tablist",
-            for t in SellerTab::ALL
-                .into_iter()
-                .filter(|t| !store.closed || !matches!(t, SellerTab::Listings | SellerTab::Settings))
-            {
+            for t in seller_tabs(store.closed) {
                 button {
                     class: if tab == t { "tab active" } else { "tab" },
                     role: "tab",
@@ -617,199 +645,212 @@ struct TodoRow {
     page: Page,
 }
 
+/// What one store's Home lists: its To do rows, the notes under them, what
+/// is left to set up, and this week's numbers.
+type HomeContent = (
+    Vec<TodoRow>,
+    Vec<(String, Option<(&'static str, Page)>)>,
+    Option<Setup>,
+    Option<String>,
+);
+
+/// See [`HomeContent`].
+fn home_content(state: &AppState, store: &SellerStore) -> HomeContent {
+    let id = store.contract_id.clone();
+    let data = SellerData::of(state, store);
+    let mut rows: Vec<TodoRow> = Vec::new();
+    // One Ghost Key behind two stores (harvest#181): nobody can buy from
+    // either until one is closed for good, which is done in Settings.
+    if let Some(ref conflict) = store.key_conflict {
+        let n = conflict.others.len() + 1;
+        rows.push(TodoRow {
+            title: match conflict.closing {
+                Some(ref name) => format!("Closing {name}\u{2026}"),
+                None if n == 2 => "Close one of your two stores".to_string(),
+                None => format!("Close all but one of your {n} stores"),
+            },
+            sub: format!(
+                "Your Ghost Key backs {n} stores, and it can back only one, so buyers \
+                 can\u{2019}t buy from any of them."
+            ),
+            pill: Some("Buyers can\u{2019}t buy".to_string()),
+            thumb: None,
+            page: seller_page(&id, SellerView::Settings),
+        });
+    }
+    // Orders to send, the one thing a seller must not miss, soonest
+    // first.
+    let mut sending = state.seller_orders_to_send(&id, &store.fingerprint);
+    sending.sort_by_key(|o| match order_status::stage_of(state, o) {
+        crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }
+        | crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. } => despatch_by,
+        _ => u32::MAX,
+    });
+    for order in sending {
+        let paid = paid_date(state, &order)
+            .map(|d| format!("Paid {d}"))
+            .unwrap_or_else(|| "Paid".to_string());
+        rows.push(TodoRow {
+            title: format!(
+                "Send {} to {}",
+                data.item_of(&order),
+                data.ship_name_of(&order.order.id)
+                    .unwrap_or_else(|| data.buyer_of(&order.order.id))
+            ),
+            sub: paid,
+            pill: order_status::send_by_pill(state, &order),
+            thumb: data
+                .listing_of(&order.order.id)
+                .and_then(|(l, t)| super::item_image::listing_image(&l, &t)),
+            page: seller_page(&id, SellerView::Order(order.order.id.clone())),
+        });
+    }
+    // Payments held for the seller to say which order they are for.
+    let sending: Vec<OrderId> = state
+        .seller_orders_to_send(&id, &store.fingerprint)
+        .into_iter()
+        .map(|o| o.order.id)
+        .collect();
+    for order in data.orders.iter().filter(|o| {
+        state.withheld_settlements.contains_key(&o.order.id) && !sending.contains(&o.order.id)
+    }) {
+        rows.push(TodoRow {
+            title: format!("Say which order a payment is for: {}", data.item_of(order)),
+            sub: format!("Order {}", order.order.id.short()),
+            pill: Some("Payment to match".to_string()),
+            thumb: None,
+            page: seller_page(&id, SellerView::Order(order.order.id.clone())),
+        });
+    }
+    // Buyers waiting for a reply, and requests waiting for an answer.
+    for thread in data.inbox.threads.iter() {
+        let name = data.names.get(&thread.tag).cloned().unwrap_or_default();
+        if thread.awaiting_reply {
+            rows.push(TodoRow {
+                title: format!("Reply to {name}"),
+                sub: thread
+                    .latest_from_buyer()
+                    .map(|(text, _)| format!("\u{201c}{}\u{201d}", one_line(&text)))
+                    .unwrap_or_default(),
+                pill: Some("Waiting for your reply".to_string()),
+                thumb: None,
+                page: seller_page(&id, SellerView::Conversation(thread.tag)),
+            });
+        }
+        if data
+            .invoice_requests
+            .get(thread.tag.as_slice())
+            .is_some_and(|n| *n > 0)
+        {
+            rows.push(TodoRow {
+                title: format!("Answer {name}\u{2019}s order"),
+                sub: "They asked to buy. Accept to send them an order to pay.".to_string(),
+                pill: Some("Needs an invoice".to_string()),
+                thumb: None,
+                page: seller_page(&id, SellerView::Conversation(thread.tag)),
+            });
+        }
+    }
+    // Invoices nobody can pay any more, still open.
+    for order in data.orders.iter().filter(|o| {
+        !crate::fulfilment::is_unpaid_buy_now(o)
+            && state.needs_reissue(o)
+            && order_status::seller_status(state, &id, o) == Status::WaitingForPayment
+    }) {
+        rows.push(TodoRow {
+            title: format!("Cancel expired order {}", order.order.id.short()),
+            sub: "Too old for a buyer to pay. The buyer can order again.".to_string(),
+            pill: None,
+            thumb: None,
+            page: seller_page(&id, SellerView::Order(order.order.id.clone())),
+        });
+    }
+    // Listings nobody can buy until they have a price. Not for a store
+    // closed for good: nothing about selling is left to do there.
+    if let Some(browsing) = state.browsing_stores.get(&id).filter(|_| !store.closed) {
+        for listing in browsing.listings.iter().filter(|l| {
+            browsing.availability(&l.listing.id)
+                != harvest_common::listing::ListingAvailability::Withdrawn
+                && !l.listing.offers_instant_checkout()
+        }) {
+            rows.push(TodoRow {
+                title: format!("Give {} a price", listing.listing.title),
+                sub: "Buyers can\u{2019}t buy it until it has one.".to_string(),
+                pill: None,
+                thumb: super::item_image::listing_image(
+                    &listing.listing.id,
+                    &listing.listing.title,
+                ),
+                page: seller_page(&id, SellerView::EditListing(listing.listing.id.clone())),
+            });
+        }
+    }
+    // Things to fix that are not a row's job: said as lines.
+    let mut notes: Vec<(String, Option<(&'static str, Page)>)> = Vec::new();
+    if let Some(ref refusal) = store.foreign_owner {
+        notes.push((refusal.clone(), None));
+    }
+    if store.details_resolved && !store.closed {
+        if let Some(gap) = store.gap {
+            notes.push((
+                gap.message().to_string(),
+                Some(("Open Settings", seller_page(&id, SellerView::Settings))),
+            ));
+        }
+        // Under a conflict the backing reads as not verifying because
+        // the key backs another store: the To do row says that, so the
+        // certificate is not blamed as well.
+        if !store.certificate.is_verified() && store.key_conflict.is_none() {
+            notes.push((
+                match store.certificate.detail() {
+                    Some(why) => format!(
+                        "Buyers see this store as unbacked: {} ({why}).",
+                        store.certificate.label()
+                    ),
+                    None => format!(
+                        "Buyers see this store as unbacked: {}.",
+                        store.certificate.label()
+                    ),
+                },
+                None,
+            ));
+        }
+    }
+    if let Some(limit) = state.wallet_gap_note_due(&id) {
+        notes.push((super::my_store::wallet_gap_note(limit), None));
+    }
+    // A closed store's alerts are about its orders only (an oversold
+    // order still needs sending), not its selling cap.
+    let alerts = if store.closed {
+        state.instant_checkout_order_alerts(&id)
+    } else {
+        state.instant_checkout_alerts(&id)
+    };
+    for alert in alerts {
+        notes.push((alert, None));
+    }
+    let has_wallet = state.bitcoin.payment_xpub.is_some();
+    let wallet_known = state.bitcoin.payment_xpub_loaded;
+    let details_done = store.details_resolved && store.gap.is_none();
+    // Nothing to set up on a store closed for good.
+    let set_up = store.closed || (details_done && has_wallet && store.listings > 0);
+    let setup = (!set_up).then_some(Setup {
+        details: details_done,
+        wallet: has_wallet,
+        wallet_known,
+        listing: store.listings > 0,
+        resolved: store.details_resolved,
+    });
+    let numbers = week_numbers(state, store, &data);
+    (rows, notes, setup, numbers)
+}
+
 /// What needs the seller in this store, as a list to work through; what is
 /// left to set up; and one line of this week's numbers.
 #[component]
 fn SellerHome(store: SellerStore) -> Element {
     let id = store.contract_id.clone();
-    let (rows, notes, setup, numbers) = {
-        let state = APP_STATE.read();
-        let data = SellerData::of(&state, &store);
-        let mut rows: Vec<TodoRow> = Vec::new();
-        // One Ghost Key behind two stores (harvest#181): nobody can buy from
-        // either until one is closed for good, which is done in Settings.
-        if let Some(ref conflict) = store.key_conflict {
-            let n = conflict.others.len() + 1;
-            rows.push(TodoRow {
-                title: match conflict.closing {
-                    Some(ref name) => format!("Closing {name}\u{2026}"),
-                    None if n == 2 => "Close one of your two stores".to_string(),
-                    None => format!("Close all but one of your {n} stores"),
-                },
-                sub: format!(
-                    "Your Ghost Key backs {n} stores, and it can back only one, so buyers \
-                     can\u{2019}t buy from any of them."
-                ),
-                pill: Some("Buyers can\u{2019}t buy".to_string()),
-                thumb: None,
-                page: seller_page(&id, SellerView::Settings),
-            });
-        }
-        // Orders to send, the one thing a seller must not miss, soonest
-        // first.
-        let mut sending = state.seller_orders_to_send(&id, &store.fingerprint);
-        sending.sort_by_key(|o| match order_status::stage_of(&state, o) {
-            crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }
-            | crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. } => {
-                despatch_by
-            }
-            _ => u32::MAX,
-        });
-        for order in sending {
-            let paid = paid_date(&state, &order)
-                .map(|d| format!("Paid {d}"))
-                .unwrap_or_else(|| "Paid".to_string());
-            rows.push(TodoRow {
-                title: format!(
-                    "Send {} to {}",
-                    data.item_of(&order),
-                    data.ship_name_of(&order.order.id)
-                        .unwrap_or_else(|| data.buyer_of(&order.order.id))
-                ),
-                sub: paid,
-                pill: order_status::send_by_pill(&state, &order),
-                thumb: data
-                    .listing_of(&order.order.id)
-                    .and_then(|(l, t)| super::item_image::listing_image(&l, &t)),
-                page: seller_page(&id, SellerView::Order(order.order.id.clone())),
-            });
-        }
-        // Payments held for the seller to say which order they are for.
-        let sending: Vec<OrderId> = state
-            .seller_orders_to_send(&id, &store.fingerprint)
-            .into_iter()
-            .map(|o| o.order.id)
-            .collect();
-        for order in data.orders.iter().filter(|o| {
-            state.withheld_settlements.contains_key(&o.order.id) && !sending.contains(&o.order.id)
-        }) {
-            rows.push(TodoRow {
-                title: format!("Say which order a payment is for: {}", data.item_of(order)),
-                sub: format!("Order {}", order.order.id.short()),
-                pill: Some("Payment to match".to_string()),
-                thumb: None,
-                page: seller_page(&id, SellerView::Order(order.order.id.clone())),
-            });
-        }
-        // Buyers waiting for a reply, and requests waiting for an answer.
-        for thread in data.inbox.threads.iter() {
-            let name = data.names.get(&thread.tag).cloned().unwrap_or_default();
-            if thread.awaiting_reply {
-                rows.push(TodoRow {
-                    title: format!("Reply to {name}"),
-                    sub: thread
-                        .latest_from_buyer()
-                        .map(|(text, _)| format!("\u{201c}{}\u{201d}", one_line(&text)))
-                        .unwrap_or_default(),
-                    pill: Some("Waiting for your reply".to_string()),
-                    thumb: None,
-                    page: seller_page(&id, SellerView::Conversation(thread.tag)),
-                });
-            }
-            if data
-                .invoice_requests
-                .get(thread.tag.as_slice())
-                .is_some_and(|n| *n > 0)
-            {
-                rows.push(TodoRow {
-                    title: format!("Answer {name}\u{2019}s order"),
-                    sub: "They asked to buy. Accept to send them an order to pay.".to_string(),
-                    pill: Some("Needs an invoice".to_string()),
-                    thumb: None,
-                    page: seller_page(&id, SellerView::Conversation(thread.tag)),
-                });
-            }
-        }
-        // Invoices nobody can pay any more, still open.
-        for order in data.orders.iter().filter(|o| {
-            !crate::fulfilment::is_unpaid_buy_now(o)
-                && state.needs_reissue(o)
-                && order_status::seller_status(&state, &id, o) == Status::WaitingForPayment
-        }) {
-            rows.push(TodoRow {
-                title: format!("Cancel expired order {}", order.order.id.short()),
-                sub: "Too old for a buyer to pay. The buyer can order again.".to_string(),
-                pill: None,
-                thumb: None,
-                page: seller_page(&id, SellerView::Order(order.order.id.clone())),
-            });
-        }
-        // Listings nobody can buy until they have a price. Not for a store
-        // closed for good: nothing about selling is left to do there.
-        if let Some(browsing) = state.browsing_stores.get(&id).filter(|_| !store.closed) {
-            for listing in browsing.listings.iter().filter(|l| {
-                browsing.availability(&l.listing.id)
-                    != harvest_common::listing::ListingAvailability::Withdrawn
-                    && !l.listing.offers_instant_checkout()
-            }) {
-                rows.push(TodoRow {
-                    title: format!("Give {} a price", listing.listing.title),
-                    sub: "Buyers can\u{2019}t buy it until it has one.".to_string(),
-                    pill: None,
-                    thumb: super::item_image::listing_image(
-                        &listing.listing.id,
-                        &listing.listing.title,
-                    ),
-                    page: seller_page(&id, SellerView::EditListing(listing.listing.id.clone())),
-                });
-            }
-        }
-        // Things to fix that are not a row's job: said as lines.
-        let mut notes: Vec<(String, Option<(&'static str, Page)>)> = Vec::new();
-        if let Some(ref refusal) = store.foreign_owner {
-            notes.push((refusal.clone(), None));
-        }
-        if store.details_resolved && !store.closed {
-            if let Some(gap) = store.gap {
-                notes.push((
-                    gap.message().to_string(),
-                    Some(("Open Settings", seller_page(&id, SellerView::Settings))),
-                ));
-            }
-            if !store.certificate.is_verified() {
-                notes.push((
-                    match store.certificate.detail() {
-                        Some(why) => format!(
-                            "Buyers see this store as unbacked: {} ({why}).",
-                            store.certificate.label()
-                        ),
-                        None => format!(
-                            "Buyers see this store as unbacked: {}.",
-                            store.certificate.label()
-                        ),
-                    },
-                    None,
-                ));
-            }
-        }
-        if let Some(limit) = state.wallet_gap_note_due(&id) {
-            notes.push((super::my_store::wallet_gap_note(limit), None));
-        }
-        // A closed store's alerts are about its orders only (an oversold
-        // order still needs sending), not its selling cap.
-        let alerts = if store.closed {
-            state.instant_checkout_order_alerts(&id)
-        } else {
-            state.instant_checkout_alerts(&id)
-        };
-        for alert in alerts {
-            notes.push((alert, None));
-        }
-        let has_wallet = state.bitcoin.payment_xpub.is_some();
-        let wallet_known = state.bitcoin.payment_xpub_loaded;
-        let details_done = store.details_resolved && store.gap.is_none();
-        // Nothing to set up on a store closed for good.
-        let set_up = store.closed || (details_done && has_wallet && store.listings > 0);
-        let setup = (!set_up).then_some(Setup {
-            details: details_done,
-            wallet: has_wallet,
-            wallet_known,
-            listing: store.listings > 0,
-            resolved: store.details_resolved,
-        });
-        let numbers = week_numbers(&state, &store, &data);
-        (rows, notes, setup, numbers)
-    };
+    let (rows, notes, setup, numbers) = home_content(&APP_STATE.read(), &store);
 
     rsx! {
         section { class: "page-sec",
@@ -1827,19 +1868,14 @@ fn SellerSettings(store: SellerStore) -> Element {
 mod tests {
     use super::name_from_address;
 
-    /// "Closed" on one of the seller's own stores always says what to fix
-    /// (#181 handoff, section D): the store sends no presence until it has
-    /// a buyable listing and a payout wallet, so without a reason it read
-    /// "Checking…" and then a bare "Closed". Red if any reason is dropped
-    /// or a selling store is called closed.
-    #[test]
-    fn a_closed_own_store_says_why() {
-        use super::closed_reason;
-        use crate::state::{test_store_key, AppState, BrowsingStore};
-        use harvest_common::listing::{
-            AuthorizedListing, FixedCheckout, Listing, ListingId, ListingKind,
-        };
-        let listing = |n: u8, priced: bool| AuthorizedListing {
+    use crate::state::{test_store_key, AppState, BrowsingStore};
+    use harvest_common::listing::{
+        AuthorizedListing, FixedCheckout, Listing, ListingAvailability, ListingId, ListingKind,
+        ListingStatus,
+    };
+
+    fn listing(n: u8, priced: bool) -> AuthorizedListing {
+        AuthorizedListing {
             listing: Listing {
                 checkout: priced.then_some(FixedCheckout {
                     unit_sats: 10_000,
@@ -1856,7 +1892,11 @@ mod tests {
             scoped_payload: Vec::new(),
             signature: Vec::new(),
             certificate_pem: String::new(),
-        };
+        }
+    }
+
+    /// A state with one store of ours, id `[1; 32]`, not loaded yet.
+    fn one_store() -> AppState {
         let mut state = AppState::default();
         state.my_stores.insert(
             "fp".into(),
@@ -1868,56 +1908,128 @@ mod tests {
                 store_verifying_key: Some(test_store_key()),
             }],
         );
-        let with = |state: &mut AppState, listings: Vec<AuthorizedListing>| {
-            state.browsing_stores.insert(
-                vec![1; 32],
-                BrowsingStore {
-                    info: Some(harvest_common::store::StoreInfoV1 {
-                        version: 1,
-                        certificate_pem: String::new(),
-                        seller_fingerprint: "fp".into(),
-                        reputation_contract_id: [0; 32],
-                        store_name: "Bean Shop".into(),
-                        description: String::new(),
-                        encryption_public_key: None,
-                        record_public_key: None,
-                    }),
-                    listings,
-                    ..Default::default()
-                },
-            );
-        };
-        let reason = |state: &AppState| {
-            let store = super::super::my_store::seller_stores(state).remove(0);
-            closed_reason(state, &store)
-        };
+        state
+    }
 
-        // Still loading: nothing said against it yet.
-        assert_eq!(reason(&state), None);
-
-        state.bitcoin.payment_xpub_loaded = true;
-        with(&mut state, vec![]);
-        assert_eq!(
-            reason(&state),
-            Some("Closed: add a listing and a payout wallet")
+    /// The store loaded, holding `listings`.
+    fn loaded(state: &mut AppState, listings: Vec<AuthorizedListing>) {
+        state.browsing_stores.insert(
+            vec![1; 32],
+            BrowsingStore {
+                info: Some(harvest_common::store::StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: "fp".into(),
+                    reputation_contract_id: [0; 32],
+                    store_name: "Bean Shop".into(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    record_public_key: None,
+                }),
+                listings,
+                ..Default::default()
+            },
         );
-        with(&mut state, vec![listing(1, true)]);
-        assert_eq!(reason(&state), Some("Closed: add a payout wallet"));
+    }
 
+    fn with_wallet(state: &mut AppState) {
+        state.bitcoin.payment_xpub_loaded = true;
         state.bitcoin.payment_xpub = Some(harvest_common::PaymentXpubStatus {
             xpub: "vpub-placeholder".into(),
             network: freenet_bitcoin_common::BitcoinNetwork::Signet,
             next_index: 0,
         });
-        with(&mut state, vec![]);
+    }
+
+    fn store_of(state: &AppState) -> super::SellerStore {
+        super::super::my_store::seller_stores(state).remove(0)
+    }
+
+    /// A Ghost Key backing this store and `others` more.
+    fn conflict(others: usize) -> crate::closure_flow::KeyConflict {
+        let sharing = |n: u8| crate::closure_flow::SharingStore {
+            contract_id: vec![n; 32],
+            name: format!("Store {n}"),
+            code: format!("code{n}"),
+            listings: 0,
+            orders: 0,
+            can_close: true,
+        };
+        crate::closure_flow::KeyConflict {
+            this: sharing(1),
+            others: (0..others).map(|i| sharing(10 + i as u8)).collect(),
+            closing: None,
+            resend: None,
+        }
+    }
+
+    /// "Closed" on one of the seller's own stores always says what to fix
+    /// (#181 handoff, section D): the store sends no presence until it has
+    /// a buyable listing and a payout wallet, so without a reason it read
+    /// "Checking…" and then a bare "Closed". Red if any reason is dropped,
+    /// if a store still loading or a store buyers see open is called
+    /// closed, or if a selling store is.
+    #[test]
+    fn a_closed_own_store_says_why() {
+        use super::closed_reason;
+        let reason = |state: &AppState| closed_reason(state, &store_of(state));
+        let mut state = one_store();
+
+        // Still loading, the store or the wallet: nothing said against it.
+        assert_eq!(reason(&state), None);
+        state
+            .browsing_stores
+            .insert(vec![1; 32], BrowsingStore::default());
+        assert_eq!(reason(&state), None, "details not read yet");
+        loaded(&mut state, vec![listing(1, true)]);
+        assert_eq!(reason(&state), None, "the wallet not answered yet");
+
+        state.bitcoin.payment_xpub_loaded = true;
+        loaded(&mut state, vec![]);
+        assert_eq!(
+            reason(&state),
+            Some("Closed: add a listing and a payout wallet")
+        );
+        loaded(&mut state, vec![listing(1, true)]);
+        assert_eq!(reason(&state), Some("Closed: add a payout wallet"));
+
+        with_wallet(&mut state);
+        loaded(&mut state, vec![]);
         assert_eq!(reason(&state), Some("Closed: add a listing"));
-        with(&mut state, vec![listing(1, false)]);
+        loaded(&mut state, vec![listing(1, false)]);
         assert_eq!(reason(&state), Some("Closed: give a listing a price"));
-        with(&mut state, vec![listing(1, true)]);
+        loaded(&mut state, vec![listing(1, true)]);
+        state
+            .browsing_stores
+            .get_mut(&vec![1u8; 32])
+            .unwrap()
+            .listing_statuses
+            .insert(
+                ListingId([1; 32]),
+                ListingStatus {
+                    listing: ListingId([1; 32]),
+                    revision: 1,
+                    availability: ListingAvailability::SoldOut,
+                },
+            );
+        assert_eq!(reason(&state), Some("Closed: nothing left on sale"));
+        loaded(&mut state, vec![listing(1, true)]);
         assert_eq!(
             reason(&state),
             None,
             "a store that can sell is not called closed"
+        );
+
+        let mut store = store_of(&state);
+        store.key_conflict = Some(conflict(1));
+        assert_eq!(
+            closed_reason(&state, &store),
+            Some("Closed: one Ghost Key, two stores")
+        );
+        store.key_conflict = Some(conflict(2));
+        assert_eq!(
+            closed_reason(&state, &store),
+            Some("Closed: one Ghost Key, several stores")
         );
 
         state
@@ -1926,6 +2038,118 @@ mod tests {
             .unwrap()
             .closed = true;
         assert_eq!(reason(&state), Some("Closed for good"));
+    }
+
+    /// Buyers who see the store open can buy, whatever this device lacks:
+    /// another of the seller's devices may hold the wallet. Then the
+    /// seller's own status speaks ("Not taking orders"), not "Closed: add a
+    /// payout wallet" (review of the #211 merge). Mutated red by dropping
+    /// the presence check from `closed_reason`.
+    #[test]
+    fn a_store_buyers_see_open_is_not_called_closed() {
+        use harvest_common::presence::{Heartbeat, PresenceStateV1, SignedHeartbeat};
+        let mut state = one_store();
+        state.bitcoin.payment_xpub_loaded = true;
+        loaded(&mut state, vec![listing(1, true)]);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        state.browsing_stores.get_mut(&vec![1u8; 32]).unwrap().owner =
+            Some(sk.verifying_key().to_bytes());
+        assert_eq!(
+            super::closed_reason(&state, &store_of(&state)),
+            Some("Closed: add a payout wallet")
+        );
+        let now = crate::state::now_ms();
+        let follow = state.follow_due_presence(now);
+        let open = harvest_common::to_cbor(&PresenceStateV1 {
+            heartbeat: Some(SignedHeartbeat::sign(&sk, Heartbeat::new(now, now, true)).unwrap()),
+        })
+        .unwrap();
+        assert!(state.on_presence_state(&follow[0], &open));
+        assert_eq!(super::closed_reason(&state, &store_of(&state)), None);
+    }
+
+    /// The header gives the reason as its pill, never "Open", and a store
+    /// closed for good says its orders stay. Mutated red by dropping the
+    /// `closed_reason` early return or its line.
+    #[test]
+    fn the_header_pill_gives_the_reason() {
+        let mut state = one_store();
+        with_wallet(&mut state);
+        loaded(&mut state, vec![]);
+        let (pill, open, line, _) = super::header_status(&state, &store_of(&state));
+        assert_eq!((pill, open, line), ("Closed: add a listing", false, None));
+        state
+            .browsing_stores
+            .get_mut(&vec![1u8; 32])
+            .unwrap()
+            .closed = true;
+        let (pill, open, line, _) = super::header_status(&state, &store_of(&state));
+        assert_eq!((pill, open), ("Closed for good", false));
+        assert!(line.unwrap().contains("orders stay here"));
+    }
+
+    /// A store closed for good is only read (harvest#181): its Listings and
+    /// Settings, whose controls would sign changes to it, are neither
+    /// offered as tabs nor shown from a link. Mutated red by dropping the
+    /// fallback or the tab filter.
+    #[test]
+    fn a_closed_store_offers_nothing_that_signs() {
+        use super::super::router::{SellerTab, SellerView};
+        use super::{seller_tabs, shown_view};
+        for view in [
+            SellerView::Listings,
+            SellerView::AddListing,
+            SellerView::EditListing(ListingId([1; 32])),
+            SellerView::Settings,
+        ] {
+            assert_eq!(shown_view(view.clone(), true), SellerView::Home);
+            assert_eq!(shown_view(view.clone(), false), view);
+        }
+        assert_eq!(shown_view(SellerView::Messages, true), SellerView::Messages);
+        assert_eq!(
+            seller_tabs(true),
+            vec![SellerTab::Home, SellerTab::Orders, SellerTab::Messages]
+        );
+        assert_eq!(seller_tabs(false), SellerTab::ALL.to_vec());
+    }
+
+    /// Home's To do list: a Ghost Key behind two stores comes first and
+    /// opens Settings, where the close is; a store closed for good lists
+    /// nothing about selling and nothing to set up. Mutated red by dropping
+    /// the conflict row or any closed-store filter.
+    #[test]
+    fn home_lists_the_conflict_first_and_nothing_to_sell_once_closed() {
+        use super::super::router::SellerView;
+        let mut state = one_store();
+        loaded(&mut state, vec![listing(1, false)]);
+        let mut store = store_of(&state);
+        store.details_resolved = true;
+        store.key_conflict = Some(conflict(1));
+        let (rows, _, setup, _) = super::home_content(&state, &store);
+        assert_eq!(rows[0].title, "Close one of your two stores");
+        assert_eq!(
+            rows[0].page,
+            super::seller_page(&[1; 32], SellerView::Settings)
+        );
+        assert!(rows.iter().any(|r| r.title == "Give Item 1 a price"));
+        assert!(setup.is_some());
+
+        store.key_conflict = None;
+        store.closed = true;
+        store.gap = Some(crate::state::StoreDetailsGap::NoName);
+        state
+            .browsing_stores
+            .get_mut(&vec![1u8; 32])
+            .unwrap()
+            .closed = true;
+        let (rows, notes, setup, _) = super::home_content(&state, &store);
+        assert!(
+            rows.is_empty(),
+            "{:?}",
+            rows.iter().map(|r| &r.title).collect::<Vec<_>>()
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(setup.is_none());
     }
 
     /// A buyer's name is the start of their address, cut at a comma or a

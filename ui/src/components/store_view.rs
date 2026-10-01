@@ -271,8 +271,14 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
             } else {
                 tagline
             };
+            // A Ghost Key behind two stores is one more thing to do here, as
+            // the Home To do list shows it (harvest#181).
+            let conflict = store
+                .key_conflict
+                .as_ref()
+                .is_some_and(|c| c.closing.is_none());
             let mut status = own_store_status(
-                store.needs_you(),
+                store.needs_you() + usize::from(conflict),
                 super::my_store::overview_needs(&store, state),
                 seller.as_ref(),
                 state.buyer_open(&id, now_ms),
@@ -1909,6 +1915,32 @@ mod stores_page_tests {
         );
         let rows = own_store_rows(&state, crate::state::now_ms());
         assert_eq!(rows[0].status.not_open_pill(), Some("Closed for good"));
+
+        // And a store closed for want of a listing says what to add, as
+        // its header does, not "Checking…" and then a bare "Closed".
+        // Mutated red by narrowing the override to closed for good.
+        state.bitcoin.payment_xpub_loaded = true;
+        state.browsing_stores.insert(
+            vec![1u8; 32],
+            crate::state::BrowsingStore {
+                info: Some(harvest_common::store::StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: "fp".into(),
+                    reputation_contract_id: [0u8; 32],
+                    store_name: "Bean Shop".into(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    record_public_key: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let rows = own_store_rows(&state, crate::state::now_ms());
+        assert_eq!(
+            rows[0].status.not_open_pill(),
+            Some("Closed: add a listing and a payout wallet")
+        );
     }
 
     /// An own store's full row: its name, and as the second line its
