@@ -8,7 +8,7 @@ mod item_image;
 mod listing_form;
 pub(crate) mod message_view;
 pub(crate) mod my_store;
-mod needs;
+pub(crate) mod needs;
 mod open_store;
 pub(crate) mod order_status;
 mod pages;

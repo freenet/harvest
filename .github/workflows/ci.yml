@@ -180,7 +180,7 @@ jobs:
   # the committed file, not whatever the source would compile to. A stale
   # artifact means the code under review is not the code deployed.
   #
-  # HOW TO FIX A RED CHECK HERE: `cargo make sync-wasm`, then commit the four
+  # HOW TO FIX A RED CHECK HERE: `cargo make sync-wasm`, then commit the
   # files. If that moves an address, the drift guard will say so and the
   # re-key has to be decided (label `contract-rekey-acknowledged`), which is
   # exactly the intended order.
@@ -212,7 +212,7 @@ jobs:
             echo "| artifact | committed | rebuilt | |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for a in reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate; do
+          for a in reputation_contract store_contract mailbox_contract index_contract presence_contract image_contract harvest_delegate; do
             committed="ui/public/contracts/$a.wasm"
             built="target/wasm32-unknown-unknown/release/$a.wasm"
             # A missing file is a failure, never a silent skip -- an artifact
@@ -239,7 +239,7 @@ jobs:
             echo "Every committed artifact matches a fresh build." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "::error::The committed WASM under ui/public/contracts/ does not match this source. Those bytes are what 'include_bytes!' ships, so the deployed contract is not the reviewed one. Run 'cargo make sync-wasm' and commit the four files."
+          echo "::error::The committed WASM under ui/public/contracts/ does not match this source. Those bytes are what 'include_bytes!' ships, so the deployed contract is not the reviewed one. Run 'cargo make sync-wasm' and commit the changed files."
           {
             echo "The UI embeds these files with \`include_bytes!\`, so they are what a"
             echo "store is actually created under -- not whatever the source would compile to."

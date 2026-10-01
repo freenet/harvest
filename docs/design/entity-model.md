@@ -89,11 +89,12 @@ other way round, and so should the data model:
   the store's page for both seller and buyer: "Backed by a $100 Ghost Key since
   September; previously a $20 Ghost Key." A seller can change the Ghost Key
   behind a store (a bigger donation, or a key that leaked) without losing the
-  store's name, link, listings or history.
+  store's name, link, listings or history. (Not built yet: harvest#104.)
 - **The record belongs to the store, for good.** Every complaint ever filed
   against a store stays on its record, whichever Ghost Key was backing it at
   the time. A clean slate means a new store *and* a new Ghost Key.
-- A second store is a rare, deliberate act ("open another store").
+- A second store is a rare, deliberate act ("open another store"), with a
+  different Ghost Key: one Ghost Key backs one store (section 6.2).
 
 Model decisions (agreed with Ian, 2026-09-18):
 
@@ -832,9 +833,8 @@ On a phone these are a segmented control under the store name.
 |                                                                   |
 |                                   [ Create store ]                |
 |                                                                   |
-|  You can move your store to a different Ghost Key later; it       |
-|  keeps its name, link and record.                                 |
-|  Next: add a payout wallet, add a listing, share your link.       |
+|  One Ghost Key backs one store. Next: add a payout wallet, add a  |
+|  listing, share your link.                                        |
 +-------------------------------------------------------------------+
 ```
 
@@ -1222,10 +1222,11 @@ carries A's complaints to B.
   would invite a seller to back many stores and let readers divide.
 - *Merge laws.* Nothing to add. The Ghost Key record (section 3) already holds
   the key's backings and retirements as grow-only sets.
-- *Cost.* One reader rule and one Settings message. (The wording first
-  sketched here named retiring the other backing; there is no retire control,
-  so the message offers a different Ghost Key or a deliberate second store.
-  See "No retire control" under phase 1a.)
+- *Cost.* One reader rule and one seller message. (The wording first
+  sketched here named retiring the other backing. Since harvest#181 the
+  message names both stores and offers to close one for good, which signs
+  the retirement and the closure together; see "Closing a store for good"
+  under phase 1a.)
 - *UX.* Matches what section 2 already tells a seller: "Use a different Ghost
   Key if you want the two kept apart." No privacy is lost, since both stores
   would have shown the same key anyway.
@@ -1813,20 +1814,33 @@ left open, and what phase 1a deliberately does not do yet.
   an existing store", which is what makes either story work. The contract
   keeps `Retirement` and its tombstone semantics; only the client control and
   the `RetireStore` delegate request are gone.
-- **The refusal is escapable.** When a creation is refused because the
-  Ghost Key already backs a store, My Store says which store and offers
-  "Open a second store under it anyway". Confirming re-runs the creation
-  with `another_store`, which turns off this tab's check and the delegate's
-  one. With no retire control, this and using a different Ghost Key are the
-  only ways forward from the refusal.
+- **Closing a store for good, decided 2026-09-30 (harvest#181, Ian's option
+  a).** The one place a retirement IS signed: a Ghost Key found backing two of
+  the seller's stores. My Store names both and offers "Close <store> for
+  good", confirmed with the words that it is permanent and cannot be reopened
+  or moved to another Ghost Key. The store key signs the retirement of the
+  store's backer and the closure, and both go in one update, so the other
+  store counts again and the closed one stops taking orders. The stores are
+  named with their codes, listings and orders, since the usual way here is
+  the same store made twice under one name, and only one close per Ghost Key
+  runs at a time, so a seller cannot close both. This is not the swap of
+  harvest#104, and does not pretend to be.
+- **No second store under one Ghost Key (harvest#181).** The "Open a second
+  store under it anyway" escape was removed: it created exactly the state
+  above on purpose. A creation refused because the Ghost Key already backs a
+  store is final, and says to use a different Ghost Key. "Create a store"
+  also waits until this device knows what the key backs: the delegate's
+  store list, the key's current index (its state or a NotFound) together
+  with a conclusive migration walk over its earlier generations, and every
+  store any of them lists, with a warning after a minute if nothing is known
+  by then. An
+  index that lists a store which never loads still counts: the page names
+  the store's code and offers no Create. The delegate's `another_store` field stays on the wire; the UI
+  never sets it.
 - **Deferred to phase 2 (the seller UI):** a control for the seller to
-  close their store (the contract, the reader rules and every buyer-facing
-  surface honour the closed flag, but nothing in the UI signs one yet), and
-  a Settings message for a Ghost Key that already backs another store. The
-  wording this section used to give for that message told the seller to
-  retire the other backing; with no retire control (above) it must not, and
-  phase 1a's own refusals no longer do. It should offer a different Ghost
-  Key, or a second store under this one on purpose.
+  close a store in general (outside the two-stores case above), and the
+  Settings message for a Ghost Key that already backs another store, which
+  harvest#181 now covers on the store's own page.
 - **Creation is single-flight, and a retry resumes it (#98 review, M1).**
   Within a tab, a creation or move holds `store_creation_in_flight` from the
   moment it starts until the store is published, it fails, or the seller

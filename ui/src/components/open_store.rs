@@ -129,7 +129,8 @@ fn OpenStoreSteps(another: bool) -> Element {
             }
         }
         p { class: "text-muted small",
-            "Next, from your store\u{2019}s Home: add a payout wallet, add a listing, share your link."
+            "One Ghost Key backs one store. Next, from your store\u{2019}s Home: add a payout wallet, \
+             add a listing, share your link."
         }
         p { class: "text-muted small",
             "Only buying? You don\u{2019}t need any of this. "

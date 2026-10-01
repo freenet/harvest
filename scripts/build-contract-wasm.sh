@@ -27,7 +27,10 @@
 #
 # This is the ONE build path for these artifacts. `cargo make sync-wasm` calls
 # it, and CI's drift guard calls it, so the hashes CI reports are the hashes a
-# publish would deploy. Do not add a second `cargo build` for these crates.
+# publish would deploy. Do not build these crates anywhere else. (Inside this
+# script there are deliberately two kinds of build: the shared artifacts in
+# one invocation, and each `isolated_*` artifact in one of its own. See the
+# build below for why each is the way it is.)
 #
 # Usage:
 #   scripts/build-contract-wasm.sh            # build + print code hashes
@@ -59,6 +62,16 @@ done
 crates=(reputation-contract store-contract mailbox-contract index-contract presence-contract harvest-delegate)
 artifacts=(reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate)
 crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract contracts/presence-contract delegates/harvest-delegate)
+
+# Artifacts built ALONE, each in its own cargo invocation, so that no other
+# crate's features reach them through cargo's feature unification (see the
+# build below). The image contract is here because its code hash is part of
+# every listing image's address: built with the others, a feature switched
+# on for a shared dependency by harvest-common or the delegate (bs58/check
+# through freenet-stdlib, say) would compile into it and re-key every image.
+isolated_crates=(image-contract)
+isolated_artifacts=(image_contract)
+isolated_dirs=(contracts/image-contract)
 
 # `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
 # freenet/ghostkeys, not built here, so nothing in this workspace can move it.
@@ -128,14 +141,31 @@ if [ "${HARVEST_ALLOW_MISSING_CRATES:-0}" = "1" ]; then
     fi
   done
   crates=("${keep_crates[@]}"); artifacts=("${keep_artifacts[@]}")
+  keep_crates=(); keep_artifacts=()
+  for i in "${!isolated_crates[@]}"; do
+    if [ -d "$workspace/${isolated_dirs[$i]}" ]; then
+      keep_crates+=("${isolated_crates[$i]}"); keep_artifacts+=("${isolated_artifacts[$i]}")
+    else
+      echo "warning: ${isolated_dirs[$i]} is absent here; not building ${isolated_artifacts[$i]}" >&2
+    fi
+  done
+  isolated_crates=("${keep_crates[@]}"); isolated_artifacts=("${keep_artifacts[@]}")
 fi
 
-# One invocation for all of them. This is NOT cosmetic: cargo unifies features
-# across the packages it is asked to build in a single invocation, so building
-# a subset can resolve different features and produce different bytes than
-# building them together.
+# One invocation for all the shared artifacts. This is NOT cosmetic: cargo
+# unifies features across the packages it is asked to build in a single
+# invocation, so building a subset can resolve different features and produce
+# different bytes than building them together. (The isolated artifacts are the
+# opposite case, built alone below, and must not be added here.)
 cargo build "${locked[@]}" --release --target wasm32-unknown-unknown \
   $(printf -- '-p %s ' "${crates[@]}")
+
+# Then each isolated artifact by itself, for the opposite reason: its bytes
+# must depend on its own dependency tree and nothing else in the workspace.
+for c in "${isolated_crates[@]}"; do
+  cargo build "${locked[@]}" --release --target wasm32-unknown-unknown -p "$c"
+done
+artifacts+=("${isolated_artifacts[@]}")
 
 out="$workspace/target/wasm32-unknown-unknown/release"
 

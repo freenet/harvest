@@ -67,6 +67,7 @@ pairs=(
   "mailbox_contract:legacy/mailbox_contract.toml"
   "index_contract:legacy/index_contract.toml"
   "presence_contract:legacy/presence_contract.toml"
+  "image_contract:legacy/image_contract.toml"
   "harvest_delegate:legacy/harvest_delegate.toml"
 )
 

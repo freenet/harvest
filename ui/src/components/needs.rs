@@ -34,11 +34,32 @@ pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
 /// Every place something needs the person, the seller's stores first in
 /// their order (`my_store::seller_stores`), then Purchases.
 pub(crate) fn places(state: &AppState) -> Vec<Place> {
+    // One Ghost Key behind two stores (harvest#181) is one thing to do,
+    // said at the first of them only: closing either one fixes both.
+    let mut conflict_said: Vec<Vec<u8>> = Vec::new();
     let mut places: Vec<Place> = super::my_store::seller_stores(state)
         .into_iter()
-        .filter(|store| store.needs_you() > 0)
-        .map(|store| {
+        .filter_map(|store| {
+            let conflict = store
+                .key_conflict
+                .as_ref()
+                .filter(|c| c.closing.is_none() && !conflict_said.contains(&store.contract_id))
+                .map(|c| {
+                    conflict_said.extend(c.others.iter().map(|o| o.contract_id.clone()));
+                    c.others.len() + 1
+                });
+            let count = store.needs_you() + usize::from(conflict.is_some());
+            (count > 0).then_some((store, conflict, count))
+        })
+        .map(|(store, conflict, count)| {
             let mut parts = Vec::new();
+            if let Some(n) = conflict {
+                parts.push(if n == 2 {
+                    "close one of two stores".to_string()
+                } else {
+                    format!("close all but one of {n} stores")
+                });
+            }
             if store.to_send > 0 {
                 parts.push(format!("{} to send", store.to_send));
             }
@@ -60,7 +81,7 @@ pub(crate) fn places(state: &AppState) -> Vec<Place> {
                 ));
             }
             Place {
-                count: store.needs_you(),
+                count,
                 detail: parts.join(" \u{00b7} "),
                 page: Page::Seller {
                     store: Some(store.contract_id.clone()),

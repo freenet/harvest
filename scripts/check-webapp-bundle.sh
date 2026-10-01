@@ -91,6 +91,7 @@ REQUIRED=(
     contracts/mailbox_contract.wasm
     contracts/index_contract.wasm
     contracts/presence_contract.wasm
+    contracts/image_contract.wasm
     contracts/harvest_delegate.wasm
     contracts/ghostkey_delegate.wasm
 )

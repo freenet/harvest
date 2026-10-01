@@ -1,0 +1,13 @@
+[package]
+name = "harvest-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Harvest listing image rules: the BLAKE3-addressed baseline JPEG the image contract accepts"
+
+# blake3 and nothing else. In particular NOT harvest-common: the image
+# contract's code hash is every image's address, and this crate is compiled
+# into it, so anything it depends on can move every image.
+[dependencies]
+blake3 = { workspace = true }
