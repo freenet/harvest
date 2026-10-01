@@ -1470,10 +1470,24 @@ pub(crate) fn seller_inbox(
     let claims = seller_claims(&all, &store.listings, |tag| {
         state.conversation_keys.get(tag)
     });
-    let paid: std::collections::HashSet<[u8; 32]> = claims
+    // Each conversation's orders through one lookup, so each costs what its
+    // own claims hold, never claims × orders (review after 1bd9bcd: with
+    // free junk conversations that froze the Orders tab and the header).
+    let lookup = crate::order_threads::OrderLookup::new(&store.orders);
+    type Members<'o> = Vec<(
+        [u8; 32],
+        Vec<(&'o harvest_common::payment::AuthorizedOrder, bool)>,
+    )>;
+    let members: Members<'_> = claims
         .iter()
-        .filter(|(_, claims)| {
-            crate::order_threads::conversation_has_paid_order(&store.orders, claims)
+        .map(|(tag, claims)| (*tag, lookup.in_conversation(claims)))
+        .collect();
+    let paid: std::collections::HashSet<[u8; 32]> = members
+        .iter()
+        .filter(|(_, orders)| {
+            orders
+                .iter()
+                .any(|(order, _)| crate::order_threads::status_opens(order.status))
         })
         .map(|(tag, _)| *tag)
         .collect();
@@ -1500,17 +1514,21 @@ pub(crate) fn seller_inbox(
         },
         |digest| state.authored_here(store_contract_id, digest),
     );
-    let threads = claims
-        .iter()
-        .map(|(tag, claims)| {
-            let entries: Vec<MailboxEntry> = shown
-                .iter()
-                .filter(|entry| {
-                    entry.conversation() == tag.as_slice()
-                        && matches!(entry, MailboxEntry::Readable { .. })
-                })
-                .cloned()
-                .collect();
+    // What is shown, by conversation, once: a conversation with nothing
+    // shown is dropped before any per-thread work.
+    let mut shown_by_tag: std::collections::HashMap<[u8; 32], Vec<MailboxEntry>> =
+        std::collections::HashMap::new();
+    for entry in shown {
+        if let (MailboxEntry::Readable { .. }, Ok(tag)) =
+            (&entry, <[u8; 32]>::try_from(entry.conversation()))
+        {
+            shown_by_tag.entry(tag).or_default().push(entry);
+        }
+    }
+    let threads = members
+        .into_iter()
+        .filter_map(|(tag, orders)| {
+            let entries = shown_by_tag.remove(&tag)?;
             let mut timed: Vec<(chrono::DateTime<chrono::Utc>, ChatLine)> = entries
                 .iter()
                 .filter_map(|entry| match entry {
@@ -1535,40 +1553,35 @@ pub(crate) fn seller_inbox(
             let awaiting = awaiting_reply(open.contains(tag.as_slice()), &entries, |digest| {
                 state.first_seen(digest, now)
             });
-            SellerThread {
-                tag: *tag,
+            let mut seen_orders: Vec<&harvest_common::payment::AuthorizedOrder> = orders
+                .iter()
+                .map(|(order, _)| *order)
+                .filter(|order| !crate::fulfilment::is_unpaid_buy_now(order))
+                .collect();
+            seen_orders
+                .sort_by_key(|order| std::cmp::Reverse((order.order.created_at, order.order.id.0)));
+            Some(SellerThread {
+                tag,
                 open: open.contains(tag.as_slice()),
                 entries,
                 lines: timed.into_iter().map(|(_, line)| line).collect(),
                 waiting: 0,
-                orders: store
-                    .orders
+                orders: orders
                     .iter()
-                    .filter(|order| crate::order_threads::order_in_conversation(order, claims))
-                    .map(|order| order.order.id.clone())
+                    .map(|(order, _)| order.order.id.clone())
                     .collect(),
-                by_request: store
-                    .orders
+                by_request: orders
                     .iter()
-                    .filter(|order| crate::order_threads::order_by_request(order, claims))
-                    .map(|order| order.order.id.clone())
+                    .filter(|(_, by_request)| *by_request)
+                    .map(|(order, _)| order.order.id.clone())
                     .collect(),
                 awaiting_reply: awaiting,
-                order_refs: {
-                    let mut shown: Vec<&harvest_common::payment::AuthorizedOrder> = store
-                        .orders
-                        .iter()
-                        .filter(|order| crate::order_threads::order_in_conversation(order, claims))
-                        .filter(|order| !crate::fulfilment::is_unpaid_buy_now(order))
-                        .collect();
-                    shown.sort_by_key(|order| {
-                        std::cmp::Reverse((order.order.created_at, order.order.id.0))
-                    });
-                    shown.iter().map(|order| order.order.id.short()).collect()
-                },
-            }
+                order_refs: seen_orders
+                    .iter()
+                    .map(|order| order.order.id.short())
+                    .collect(),
+            })
         })
-        .filter(|thread| !thread.entries.is_empty())
         .map(|mut thread| {
             thread.waiting = offered_requests(state, &thread, &store.listings, &store.orders).len();
             thread
@@ -1583,19 +1596,29 @@ pub(crate) fn seller_inbox(
 
 /// Whether a seller conversation waits for the seller's reply (msg1 critique
 /// MSG-3): it is open (a Ghost Key's voucher or a paid order, so junk and
-/// unopened conversations never count), the buyer has written in it, and
-/// the buyer's newest line is later than the seller's newest reply.
+/// unopened conversations never count), the buyer has written in it, and a
+/// buyer line comes after every reply of the seller's.
 ///
-/// Writer timestamps alone cannot tell a buyer whose clock runs fast from a
-/// quick follow-up, so a buyer line's time is the EARLIER of its own
-/// timestamp and when this device first saw it (`first_seen`, kept per
-/// session by `AppState::first_seen`; review after 9417fbf). That clears a
-/// fast-clock buyer the seller has since answered (first seen before the
-/// reply), keeps a quick follow-up after a reply waiting, and caps a
-/// far-future date at when it arrived, so a later reply answers it. After a
-/// reload first-seen starts again at the reload, which can make an answered
-/// conversation read as waiting until the seller replies again: the safe
-/// side for a "need you" count.
+/// Every timestamp is its writer's claim and either clock can be off, fast
+/// or slow, so "after" is decided by what this device saw where it can be
+/// (`first_seen`, kept per session by `AppState::first_seen`; reviews after
+/// 9417fbf and 1bd9bcd):
+///
+/// * a buyer line and a reply first seen at different moments of this
+///   session (one arrived while the page was open) are ordered by when they
+///   were seen. That keeps a quick follow-up waiting whatever its writer's
+///   clock says, fast or slow, and a reply dated in the future answers only
+///   what was seen before it;
+/// * two first seen together (the mailbox as it stood when the page opened,
+///   or arriving in one update) are ordered by their own timestamps, each
+///   capped at when it was seen, so no date in the future wins.
+///
+/// What is left when the page opens: the timestamps decide, as written. A
+/// conversation answered by a reply dated before a buyer line with a
+/// fast clock reads as waiting again, and a buyer line dated in the future
+/// is capped only at the page's opening, so it re-raises "waiting" on every
+/// reload until the seller replies again: both err toward "need you". A
+/// buyer line dated before a reply by a slow clock reads as answered.
 ///
 /// A reply is text in the seller's direction (confirmed as the seller's or
 /// not: text the buyer sealed there clears only their own waiting), or a
@@ -1607,49 +1630,50 @@ pub(crate) fn awaiting_reply(
     first_seen: impl Fn(&[u8; 32]) -> chrono::DateTime<chrono::Utc>,
 ) -> bool {
     use crate::messaging::Addressing;
+    type Seen = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
     if !open {
         return false;
     }
-    let newest_buyer = entries
-        .iter()
-        .filter_map(|entry| match entry {
-            MailboxEntry::Readable {
-                content: MessageContent::Text(_) | MessageContent::VouchedText { .. },
-                addressing: Addressing::ToSeller,
-                timestamp,
-                digest,
-                ..
-            } => Some((*timestamp).min(first_seen(digest))),
-            _ => None,
-        })
-        .max();
-    let Some(newest_buyer) = newest_buyer else {
-        return false;
-    };
-    let newest_reply = entries
-        .iter()
-        .filter_map(|entry| match entry {
-            MailboxEntry::Readable {
-                content,
-                addressing: Addressing::ToBuyer,
-                timestamp,
-                ..
-            } => {
-                let replies = match content {
-                    MessageContent::Text(_) | MessageContent::VouchedText { .. } => true,
-                    MessageContent::Decline { reason } => {
-                        !reason.trim().is_empty() && !is_store_decline_reason(reason)
-                    }
-                    MessageContent::OrderRequest { .. } | MessageContent::OrderAccepted { .. } => {
-                        false
-                    }
-                };
-                replies.then_some(*timestamp)
+    let mut buyer: Vec<Seen> = Vec::new();
+    let mut replies: Vec<Seen> = Vec::new();
+    for entry in entries {
+        let MailboxEntry::Readable {
+            content,
+            addressing,
+            timestamp,
+            digest,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let text = matches!(
+            content,
+            MessageContent::Text(_) | MessageContent::VouchedText { .. }
+        );
+        match addressing {
+            Addressing::ToSeller if text => buyer.push((*timestamp, first_seen(digest))),
+            Addressing::ToBuyer => {
+                let reply = text
+                    || matches!(content, MessageContent::Decline { reason }
+                        if !reason.trim().is_empty() && !is_store_decline_reason(reason));
+                if reply {
+                    replies.push((*timestamp, first_seen(digest)));
+                }
             }
-            _ => None,
-        })
-        .max();
-    newest_reply.is_none_or(|reply| newest_buyer > reply)
+            Addressing::ToSeller => {}
+        }
+    }
+    // Whether buyer line `b` comes after reply `r`, by first sight when they
+    // were seen at different moments, else by their capped timestamps.
+    let after = |(b_stamp, b_seen): &Seen, (r_stamp, r_seen): &Seen| {
+        if b_seen != r_seen {
+            b_seen > r_seen
+        } else {
+            (*b_stamp).min(*b_seen) > (*r_stamp).min(*r_seen)
+        }
+    };
+    buyer.iter().any(|b| replies.iter().all(|r| after(b, r)))
 }
 
 /// How many of one of our stores' buyer conversations wait for the seller's
@@ -2503,38 +2527,43 @@ pub(crate) fn seller_claims<'a>(
     // anyone can fill it with unreadable entries under fresh tags, which
     // must not each cost a scan of every order (review round 4 of #205).
     // Unreadable entries are counted on their own.
-    let mut tags: Vec<[u8; 32]> = Vec::new();
+    // One pass: each readable canonical tag, with the requests read under it
+    // (review after 1bd9bcd: a scan of every entry per tag was tags ×
+    // entries).
+    type Requests<'e> = Vec<(
+        &'e harvest_common::listing::ListingId,
+        Option<&'e crate::messaging::InstantSelection>,
+    )>;
+    let mut by_tag: std::collections::BTreeMap<[u8; 32], Requests<'_>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
-        if !matches!(entry, MailboxEntry::Readable { .. }) {
+        let MailboxEntry::Readable {
+            conversation,
+            content,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        if !crate::messaging::is_canonical_tag(conversation) {
             continue;
         }
-        if !crate::messaging::is_canonical_tag(entry.conversation()) {
+        let Ok(tag) = <[u8; 32]>::try_from(conversation.as_slice()) else {
             continue;
-        }
-        if let Ok(tag) = <[u8; 32]>::try_from(entry.conversation()) {
-            if !tags.contains(&tag) {
-                tags.push(tag);
-            }
+        };
+        let requests = by_tag.entry(tag).or_default();
+        if let MessageContent::OrderRequest {
+            listing_id,
+            instant,
+            ..
+        } = content
+        {
+            requests.push((listing_id, instant.as_ref()));
         }
     }
-    tags.sort();
-    tags.into_iter()
-        .map(|tag| {
-            let requests = entries.iter().filter_map(|entry| match entry {
-                MailboxEntry::Readable {
-                    conversation,
-                    content:
-                        MessageContent::OrderRequest {
-                            listing_id,
-                            instant,
-                            ..
-                        },
-                    ..
-                } if conversation.as_slice() == tag.as_slice() => {
-                    Some((listing_id, instant.as_ref()))
-                }
-                _ => None,
-            });
+    by_tag
+        .into_iter()
+        .map(|(tag, requests)| {
             let keys = keys_for(&tag);
             let claims = crate::order_threads::ConversationClaims::of(
                 &tag,
@@ -3359,19 +3388,19 @@ mod inbox_tests {
 
     /// **A conversation waits for the seller's reply when the buyer wrote
     /// last** (msg1 critique MSG-3), and only an open one with readable buyer
-    /// text: an unopened conversation, junk and a request never count. A
-    /// buyer line's time is the earlier of its own and when this device first
-    /// saw it (review after 9417fbf), so: a quick follow-up after a reply
-    /// waits; a fast-clock buyer the seller answered is answered; a far-future
-    /// message is answered by a later reply; after a reload (first-seen
-    /// starting again) an answered fast-clock message errs to waiting. The
-    /// store's automatic declines are not a reply; the seller's own decline
-    /// is. Red with the open check dropped, with first-seen ignored, and with
-    /// store declines counted as replies.
+    /// text: an unopened conversation, junk and a request never count. Seen
+    /// live at different moments, a buyer line and a reply are ordered by
+    /// first sight, whatever either clock says; seen together (when the page
+    /// opened), by their timestamps capped at first sight (reviews after
+    /// 9417fbf and 1bd9bcd). Red with the open check dropped, with first
+    /// sight ignored, with the cap on a reply's timestamp dropped, and with
+    /// the store's automatic declines counted as replies.
     #[test]
     fn a_conversation_waits_for_a_reply_only_when_the_buyer_wrote_last() {
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
         let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        // When the page opened: everything not listed was first seen then.
+        const OPENED: i64 = 50_000;
         let mut next = 0u8;
         let mut said = |addressing, secs: i64, content: MessageContent| {
             next += 1;
@@ -3389,18 +3418,18 @@ mod inbox_tests {
         };
         let text = |t: &str| MessageContent::Text(t.into());
         let decline = |r: &str| MessageContent::Decline { reason: r.into() };
-        // First seen when its own timestamp says, unless listed here.
-        let seen = |overrides: Vec<([u8; 32], i64)>| {
+        let seen = |live: Vec<(&MailboxEntry, i64)>| {
+            let live: Vec<([u8; 32], i64)> = live.iter().map(|(e, s)| (e.digest(), *s)).collect();
             move |digest: &[u8; 32]| {
-                overrides
+                at(live
                     .iter()
                     .find(|(d, _)| d == digest)
-                    .map(|(_, secs)| at(*secs))
-                    .unwrap_or(at(i64::MAX / 4_000_000))
+                    .map(|(_, s)| *s)
+                    .unwrap_or(OPENED))
             }
         };
-        let digest = |entry: &MailboxEntry| entry.digest();
 
+        // On the page when it opened: the timestamps decide.
         let buyer = said(ToSeller, 5_000, text("is it on its way?"));
         assert!(awaiting_reply(
             true,
@@ -3418,37 +3447,52 @@ mod inbox_tests {
             seen(vec![])
         ));
 
-        // A quick follow-up, 200 seconds after the reply: waits.
+        // A quick follow-up seen live after a reply seen live: waits.
         let follow_up = said(ToSeller, 6_200, text("thanks, which carrier?"));
         assert!(awaiting_reply(
             true,
-            &[buyer.clone(), reply.clone(), follow_up.clone()],
-            seen(vec![(digest(&follow_up), 6_200)])
+            &[reply.clone(), follow_up.clone()],
+            seen(vec![(&reply, 6_000), (&follow_up, 6_200)])
+        ));
+        // ... even from a buyer whose clock runs 5 minutes slow: replied at
+        // 9_900, follow-up stamped 9_700, seen at 10_000.
+        let late_reply = said(ToBuyer, 9_900, text("posted"));
+        let slow = said(ToSeller, 9_700, text("thanks!"));
+        assert!(awaiting_reply(
+            true,
+            &[late_reply.clone(), slow.clone()],
+            seen(vec![(&late_reply, 9_900), (&slow, 10_000)])
         ));
 
-        // A buyer 5 minutes fast: stamped 10_300, arrived (first seen)
-        // 10_000, answered at 10_100.
+        // A buyer 5 minutes fast, seen at 10_000, answered at 10_100.
         let fast = said(ToSeller, 10_300, text("sent just now"));
         let answer = said(ToBuyer, 10_100, text("on it"));
         assert!(!awaiting_reply(
             true,
             &[fast.clone(), answer.clone()],
-            seen(vec![(digest(&fast), 10_000)])
+            seen(vec![(&fast, 10_000), (&answer, 10_100)])
         ));
-        // After a reload first-seen starts again later: errs to waiting.
-        assert!(awaiting_reply(
-            true,
-            &[fast.clone(), answer],
-            seen(vec![(digest(&fast), 20_000)])
-        ));
+        // After a reload both were first seen when the page opened, and the
+        // timestamps decide: errs to waiting.
+        assert!(awaiting_reply(true, &[fast, answer], seen(vec![])));
 
-        // Dated far in the future but seen at 5_000: a reply at 6_000
-        // answers it.
+        // A buyer line dated in the future, seen at 5_000, answered by a
+        // reply seen at 6_000; after a reload it waits again.
         let future = said(ToSeller, 99_999, text("reply to me forever"));
         assert!(!awaiting_reply(
             true,
             &[future.clone(), reply.clone()],
-            seen(vec![(digest(&future), 5_000)])
+            seen(vec![(&future, 5_000), (&reply, 6_000)])
+        ));
+        assert!(awaiting_reply(true, &[future, reply.clone()], seen(vec![])));
+
+        // A reply dated in the future answers only what was seen before it.
+        let future_reply = said(ToBuyer, 99_999, text("done"));
+        let after_it = said(ToSeller, 7_000, text("not received"));
+        assert!(awaiting_reply(
+            true,
+            &[future_reply.clone(), after_it.clone()],
+            seen(vec![(&future_reply, 6_000), (&after_it, 7_000)])
         ));
 
         // The store's own automatic decline is not a reply; the seller's is.
