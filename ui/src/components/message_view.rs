@@ -1665,7 +1665,10 @@ pub(crate) fn awaiting_reply(
         }
     }
     // Whether buyer line `b` comes after reply `r`, by first sight when they
-    // were seen at different moments, else by their capped timestamps.
+    // were seen at different moments, else by their capped timestamps. (The
+    // reply's cap cannot change an outcome: seen together, both share one
+    // first-seen moment, which the buyer's capped time never exceeds. It is
+    // kept for symmetry, and its mutation survives for that reason.)
     let after = |(b_stamp, b_seen): &Seen, (r_stamp, r_seen): &Seen| {
         if b_seen != r_seen {
             b_seen > r_seen
@@ -3393,8 +3396,9 @@ mod inbox_tests {
     /// first sight, whatever either clock says; seen together (when the page
     /// opened), by their timestamps capped at first sight (reviews after
     /// 9417fbf and 1bd9bcd). Red with the open check dropped, with first
-    /// sight ignored, with the cap on a reply's timestamp dropped, and with
-    /// the store's automatic declines counted as replies.
+    /// sight ignored, with the cap on a buyer line's timestamp dropped, and
+    /// with the store's automatic declines counted as replies. (The cap on a
+    /// reply's timestamp cannot change an outcome; see `awaiting_reply`.)
     #[test]
     fn a_conversation_waits_for_a_reply_only_when_the_buyer_wrote_last() {
         use crate::messaging::Addressing::{ToBuyer, ToSeller};
@@ -3485,6 +3489,12 @@ mod inbox_tests {
             seen(vec![(&future, 5_000), (&reply, 6_000)])
         ));
         assert!(awaiting_reply(true, &[future, reply.clone()], seen(vec![])));
+
+        // Both dated in the future and on the page when it opened: each is
+        // capped at the opening, so the buyer's later date does not win.
+        let far = said(ToSeller, 99_999, text("far"));
+        let far_reply = said(ToBuyer, 80_000, text("far reply"));
+        assert!(!awaiting_reply(true, &[far, far_reply], seen(vec![])));
 
         // A reply dated in the future answers only what was seen before it.
         let future_reply = said(ToBuyer, 99_999, text("done"));
