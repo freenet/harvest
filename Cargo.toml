@@ -72,7 +72,7 @@ aes-gcm = "0.10"
 # encoding for wrapped copies in store state. `hkdf` is the only crate new to
 # the tree; it rides on the `hmac`/`sha2` already here. `rand_chacha` 0.3 is
 # the one on `rand_core` 0.6, which is what `rsa` 0.9 takes.
-hkdf = "0.12"
+hkdf = "0.13"
 zeroize = "1"
 rand_chacha = "0.3"
 serde_bytes = "0.11"
