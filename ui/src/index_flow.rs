@@ -115,8 +115,25 @@ impl AppState {
     /// Refused for a Ghost Key the user does not hold (#101 review): see
     /// the module docs.
     pub(crate) fn watch_ghostkey_index(&mut self, ghost_key: [u8; 32]) {
-        if self.connected_ghost_key(&ghost_key).is_none() {
+        let Some(fingerprint) = self.connected_ghost_key(&ghost_key) else {
             return;
+        };
+        // My Store waits for the index before offering "Create a store"
+        // (harvest#181), but not for ever. Started before anything below
+        // can return, and kept per Ghost Key, not per view: a failed GET
+        // drops the view, and a wait kept on it would be dropped too,
+        // leaving "Checking" up until the vault reconnects.
+        if self.index_waits_started.insert(fingerprint.clone()) {
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(INDEX_SETTLE_WAIT_MS).await;
+                use dioxus::prelude::WritableExt;
+                crate::gateway::APP_STATE
+                    .write()
+                    .on_index_wait_elapsed(&fingerprint);
+            });
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = fingerprint;
         }
         let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&ghost_key) else {
             return;
@@ -136,24 +153,6 @@ impl AppState {
                 absent: false,
             },
         );
-        // My Store waits for the index before offering "Create a store"
-        // (harvest#181), but not for ever. Kept per Ghost Key, not per
-        // view: a failed GET drops the view, and a wait kept on it would be
-        // dropped too, leaving "Checking" up until the vault reconnects.
-        if let Some(fingerprint) = self.connected_ghost_key(&ghost_key) {
-            if self.index_waits_started.insert(fingerprint.clone()) {
-                #[cfg(target_arch = "wasm32")]
-                wasm_bindgen_futures::spawn_local(async move {
-                    gloo_timers::future::TimeoutFuture::new(INDEX_SETTLE_WAIT_MS).await;
-                    use dioxus::prelude::WritableExt;
-                    crate::gateway::APP_STATE
-                        .write()
-                        .on_index_wait_elapsed(&fingerprint);
-                });
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = fingerprint;
-            }
-        }
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = crate::gateway::get_contract_by_id(&id).await {

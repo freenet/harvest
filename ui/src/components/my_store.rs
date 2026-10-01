@@ -144,7 +144,10 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
     // A store closed for good is only read (harvest#181): what is left to do
     // there is its orders, nothing about selling.
     if store.closed {
-        return store.needs_you() > 0 || store.expired_invoices > 0;
+        return store.needs_you() > 0
+            || store.expired_invoices > 0
+            || state.wallet_gap_note_due(&store.contract_id).is_some()
+            || !state.instant_checkout_alerts(&store.contract_id).is_empty();
     }
     store.needs_you() > 0
         || store.unpriced > 0
@@ -285,7 +288,13 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                             .count()
                     })
                     .unwrap_or(0),
-                requests: super::message_view::requests_awaiting_invoice(state, id),
+                // A request on a store closed for good can never be
+                // invoiced, so it is nothing the seller can do.
+                requests: if browsing.is_some_and(|b| b.closed) {
+                    0
+                } else {
+                    super::message_view::requests_awaiting_invoice(state, id)
+                },
                 record: browsing
                     .map(|b| b.record_badge().1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
@@ -795,6 +804,12 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                     }
                 }
             }
+            if let (None, Some(name)) = (conflict.closing.as_ref(), conflict.resend.as_ref()) {
+                p { class: "text-muted",
+                    "Closing {name} was sent but hasn\u{2019}t shown up yet. You can send it \
+                     again; the other store can\u{2019}t be closed until it shows."
+                }
+            }
             if let Some(name) = conflict.closing.clone() {
                 p { class: "text-muted text-italic",
                     "Closing {name}\u{2026} The store you kept takes orders again once the network has the close."
@@ -1132,7 +1147,7 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                     }
                 }
             }
-            if let Some(limit) = wallet_gap.filter(|_| !store.closed) {
+            if let Some(limit) = wallet_gap {
                 p { class: "text-warning", "{wallet_gap_note(limit)}" }
             }
             if store.unpriced > 0 && !store.closed {
@@ -2497,6 +2512,7 @@ mod seller_stores_tests {
                     this: store.clone(),
                     others: vec![store],
                     closing: None,
+                    resend: None,
                 })
             }),
         ];

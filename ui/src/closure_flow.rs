@@ -107,6 +107,10 @@ pub(crate) struct KeyConflict {
     /// A store of this Ghost Key whose close is under way or sent and not
     /// yet seen, by name: while it travels, no close is offered anywhere.
     pub closing: Option<String>,
+    /// A store of this Ghost Key sent to close long enough ago that it is no
+    /// longer shown as under way, but whose closed state has not shown: only
+    /// it may be closed (again) until it does.
+    pub resend: Option<String>,
 }
 
 impl KeyConflict {
@@ -191,6 +195,10 @@ impl AppState {
         Some(KeyConflict {
             this: self.sharing_store(store_contract_id.to_vec(), &view.store),
             closing: self.close_in_flight_for(&view.backer),
+            resend: self
+                .sent_close_owner(&view.backer)
+                .and_then(|owner| self.closes_sent.get(&owner))
+                .map(|sent| sent.name.clone()),
             others,
         })
     }
@@ -331,8 +339,8 @@ impl AppState {
             .is_some_and(|owner| owner != store_key.to_bytes())
         {
             return Err(
-                "another of this Ghost Key's stores was already sent to close; \
-                        reload Harvest to see whether it has"
+                "another of this Ghost Key's stores was already sent to close; send that \
+                        one again, or wait for it to show as closed"
                     .into(),
             );
         }
@@ -1026,6 +1034,11 @@ mod tests {
             .values_mut()
             .for_each(|sent| sent.sent_ms = 0);
         assert!(state.close_in_flight_for(&BACKER_VK()).is_none());
+        assert_eq!(
+            state.key_conflict(&[1; 32]).unwrap().resend.as_deref(),
+            Some("Bean Shop"),
+            "the page says why only that store is offered"
+        );
         assert!(state.can_close_store(&[2; 32]), "the same store, again");
         assert!(!state.can_close_store(&[1; 32]), "never the other one");
         assert!(state.close_store_for_good(&[1; 32]).is_err());

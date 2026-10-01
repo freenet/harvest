@@ -1791,10 +1791,6 @@ mod stores_page_tests {
         assert_eq!(colliding(&labels), vec![true, true, false, false]);
     }
 
-    /// An own store's full row: its name, and as the second line its
-    /// tagline, or its code while it has no name and no tagline, or when
-    /// another card reads the same. Asserted as whole rows, so the tagline
-    /// and the code cannot trade places unnoticed.
     /// A store closed for good says so on its row, not the "Closed" of a
     /// seller who is offline (harvest#181). Mutated red by dropping the
     /// override.
@@ -1822,6 +1818,10 @@ mod stores_page_tests {
         assert_eq!(rows[0].status.not_open_pill(), Some("Closed for good"));
     }
 
+    /// An own store's full row: its name, and as the second line its
+    /// tagline, or its code while it has no name and no tagline, or when
+    /// another card reads the same. Asserted as whole rows, so the tagline
+    /// and the code cannot trade places unnoticed.
     #[test]
     fn own_store_rows_are_named_with_a_tagline_or_their_code() {
         use crate::state::test_store_key;
