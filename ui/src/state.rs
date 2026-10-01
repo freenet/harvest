@@ -26583,9 +26583,9 @@ mod buy_flow_tests {
         store.orders = orders;
         store.mailbox_messages.extend(junk);
         crate::order_threads::FULL_MATCHES.with(|n| n.set(0));
-        let started = std::time::Instant::now();
+        // No wall-clock bound: it would be flaky on a slow CI runner, and
+        // the count below pins the property deterministically.
         let inbox = seller_inbox(&state, STORE);
-        let took = started.elapsed();
         assert_eq!(
             crate::order_threads::FULL_MATCHES.with(|n| n.get()),
             0,
@@ -26595,10 +26595,6 @@ mod buy_flow_tests {
             inbox.threads.len() <= 1,
             "junk conversations show nothing: {}",
             inbox.threads.len()
-        );
-        assert!(
-            took < std::time::Duration::from_millis(1500),
-            "the seller's inbox took {took:?} over 512 conversations and 4096 orders"
         );
     }
 
