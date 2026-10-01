@@ -282,7 +282,11 @@ jobs:
             locked=()
             echo "::warning::merge base has no Cargo.lock; its address derivation resolves dependencies fresh"
           fi
-          if ! ( cd "$base_dir" && cargo run "${locked[@]}" --quiet \
+          # An artifact this PR introduces has no WASM at the base. Skip its row
+          # there (the comparison then reports it NEW and fails until
+          # acknowledged) rather than failing the whole derivation, which
+          # would leave every other artifact's address unchecked.
+          if ! ( cd "$base_dir" && HARVEST_ALLOW_MISSING_CRATES=1 cargo run "${locked[@]}" --quiet \
                    -p harvest-common --features harvest-common/address-guard \
                    --bin harvest-addresses -- /tmp/base ) > /tmp/base-addr.tsv
           then
@@ -318,7 +322,7 @@ jobs:
             echo "|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          for a in reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate; do
+          for a in reputation_contract store_contract mailbox_contract index_contract presence_contract image_contract harvest_delegate; do
             # Missing on either side is a failure, never a silent skip: a
             # renamed or dropped artifact would otherwise pass this job by
             # having nothing to compare.

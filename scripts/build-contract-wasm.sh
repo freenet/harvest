@@ -56,9 +56,9 @@ done
 # The artifacts whose compiled bytes are network addresses. Keep in step
 # with the workspace members under contracts/ and delegates/; a crate missing
 # from this list is a crate the drift guard does not watch.
-crates=(reputation-contract store-contract mailbox-contract index-contract presence-contract harvest-delegate)
-artifacts=(reputation_contract store_contract mailbox_contract index_contract presence_contract harvest_delegate)
-crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract contracts/presence-contract delegates/harvest-delegate)
+crates=(reputation-contract store-contract mailbox-contract index-contract presence-contract image-contract harvest-delegate)
+artifacts=(reputation_contract store_contract mailbox_contract index_contract presence_contract image_contract harvest_delegate)
+crate_dirs=(contracts/reputation-contract contracts/store-contract contracts/mailbox-contract contracts/index-contract contracts/presence-contract contracts/image-contract delegates/harvest-delegate)
 
 # `ghostkey_delegate.wasm` is deliberately absent: it is vendored from
 # freenet/ghostkeys, not built here, so nothing in this workspace can move it.

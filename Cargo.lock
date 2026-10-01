@@ -1983,6 +1983,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harvest-image"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "harvest-ui"
 version = "0.1.0"
 dependencies = [
@@ -2343,6 +2350,14 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "image-contract"
+version = "0.1.0"
+dependencies = [
+ "freenet-stdlib",
+ "harvest-image",
 ]
 
 [[package]]

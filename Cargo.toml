@@ -6,6 +6,8 @@ members = [
     "contracts/mailbox-contract",
     "contracts/index-contract",
     "contracts/presence-contract",
+    "contracts/image-contract",
+    "harvest-image",
     "delegates/harvest-delegate",
     "ui",
 ]
@@ -20,6 +22,7 @@ repository = "https://github.com/freenet/harvest"
 [workspace.dependencies]
 # Internal
 harvest-common = { path = "common" }
+harvest-image = { path = "harvest-image" }
 # Local path dependency for the prototype. Switch to a git or crates.io
 # dependency before this leaves one machine -- a path dep does not survive a
 # clone, and CI would fail on it.

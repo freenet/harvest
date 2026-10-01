@@ -1,0 +1,23 @@
+# Superseded generations of the Harvest listing image contract.
+#
+# See README.md in this directory for the rules. Oldest first; the CURRENT
+# generation is derived from the WASM this build ships and is never listed
+# here.
+#
+# No rows yet: the contract is new (harvest images, PR 1). Its first
+# superseded generation must be recorded here, and the file taken out of
+# `MAY_BE_EMPTY` in `ui/build.rs`, in the change that supersedes it.
+#
+# Instance ids are derived per image: `BLAKE3(code_hash || image_hash)`,
+# where the parameters are the image's own 32-byte BLAKE3 hash, raw, with no
+# CBOR (`harvest_image`). A listing names an image by that hash, not by its
+# contract id, so a new generation re-keys every image's ADDRESS while
+# leaving every listing that names it valid. Readers therefore look an image
+# up under the current code hash first and then under each hash recorded
+# here, and the seller's app copies its images forward. That keeps this
+# registry load-bearing in a way the presence contract's is not: an image is
+# never worthless the way an old heartbeat is.
+#
+# The crate depends on `harvest-image` and `freenet-stdlib` only, never on
+# `harvest-common`, precisely so that this file stays short: an ordinary
+# Harvest change cannot move it. A toolchain, stdlib or blake3 change can.

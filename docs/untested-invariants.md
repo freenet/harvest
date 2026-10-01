@@ -1441,6 +1441,25 @@ Friction fixes from the 2026-09-27 friction report, UI-only.
 | `store_view::LoadedStore` | The store's record opens under its own heading with Hide; a buyer's orders from the store are one line linking to Purchases, not the cards; no invoice list. | **No.** Markup. |
 | `store_view::StoresPage` (the `load_visited_stores` effect), `StoreDashboard` (its store read from `SELLER_PAGE` at mount), `harvest.css` `.rowcard`, `.vrow`, `.find-store`, `.crumb` | The visited stores are asked for when the Stores page opens, so their names arrive; the dashboard opens on the store whose card was pressed (`dashboard_store` is tested, the mount is not); the page has no horizontal scroll at 390 px and its buttons and links are 44 px tall on a phone. | **No.** wasm-only effect and component wiring; the CSS is checked by screenshots at 1280 and 390, not by a test. |
 
+## Listing images: the image contract (added 2026-10-01)
+
+An image is a contract whose parameters are the BLAKE3 hash of its state, and
+whose state is one baseline JPEG (`harvest-image`, `contracts/image-contract`).
+Nothing references it yet: listings gain image references in a later change,
+which is also when the store contract re-keys.
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `harvest_image::validate` | Parameters are one 32-byte hash; an empty state is never valid; over 256 KiB is refused before hashing; the bytes hash to the parameters; then the format check runs. | **Yes** -- one test per check, each red with its check removed (mutation-checked 2026-10-01). |
+| `harvest_image::sniff` | Only a baseline JPEG in the layout a canvas writes: JFIF without a thumbnail, ICC, Adobe, tables, one SOF0 (8-bit, 1 or 3 components, edges 1 to 2048), one scan covering every component, end-of-image, nothing after. Every other APPn, COM, frame type, marker, fill byte, second scan or trailing byte is refused. | **Yes** -- every allowlist arm and every refusal has a test that goes red with it removed or loosened, plus real canvas output from Chromium, Firefox and WebKit that must keep passing. |
+| `harvest_image::sniff` | Accepts what every browser's canvas writes. | **Partly** -- the three engines' output is in `harvest-image/tests/fixtures/`, but that is Playwright's Chromium, Firefox and WebKitGTK on Linux. Real Safari encodes through ImageIO and was not captured; if it writes anything else, the seller's upload path (`strip`) has to remove it, and a progressive JPEG would be refused outright. |
+| `harvest_image::sniff`, `strip` | Never panic on any input. | **Partly** -- every truncation of the fixtures and 12,000 deterministic corruptions run on every `cargo test`. Not a coverage-guided fuzzer. |
+| `harvest_image::strip` | Leaves canvas output byte-identical, removes every metadata segment and trailing data, and repairs nothing structural. | **Yes** -- `strip_leaves_canvas_output_byte_identical`, `strip_removes_every_kind_of_metadata_and_the_result_passes`, `strip_does_not_repair_structure`; red with the metadata, ICC and trailing rules each loosened. |
+| `image-contract` `update_state` | A held image is never replaced, by an empty state, other bytes, or a delta; an empty delta changes nothing; a delta is checked as a whole image; related-contract updates are refused. | **Yes** -- one test each. The extra `held != incoming` refusal in `merge` is unreachable while validation binds both to one hash, so no test can tell it from its removal; that mutant survives by design. |
+| `image-contract` `summarize_state`, `get_state_delta` | The summary is the hash of the state HELD (not the parameters), so a wrong copy never looks in sync; a peer out of sync is sent the whole image. | **Yes** -- `the_summary_is_the_hash_of_what_is_held`, `a_peer_in_sync_is_sent_nothing_and_any_other_is_sent_the_image`. |
+| `contracts/image-contract/Cargo.toml` | The crate depends on `harvest-image` and `freenet-stdlib` only, so no ordinary Harvest change moves every image's address. | **Partly** -- the drift guard reports any move of `image_contract` on any PR, but nothing stops a dependency on `harvest-common` being added. |
+| The compiled WASM | Behaves as the native tests say. | **By hand once** -- `fdev verify-merge` against the built `image_contract.wasm` (6fe02a37) on 2026-10-01: a canvas fixture under its hash holds all five laws; a second image under the same key is refused with "image bytes do not hash to the contract parameters". |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the
