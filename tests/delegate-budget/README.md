@@ -97,9 +97,9 @@ constant fails the run.
 | `InitEncryptionKey`, `DeriveConversationKeys` with 512 peers, store key and Ghost Key | 512 is the mailbox cap (`MAX_MESSAGES`), the most senders one request can name |
 | `RegisterStore`, `ListStores` | registry |
 | `SetPaymentXpub`, `DeriveOrderAddress`, `PeekOrderAddresses (10)`, `DeriveOrderAddress` with a foreign published script | BIP-32 derivation. The foreign script forces the full 100-index `PUBLISHED_INDEX_GAP` scan |
-| `ArmAutoInvoice` to the 16-arm cap, forced `Heartbeat`, `GetWatchKey` | instant checkout. Every arm is taken so the wake-up, resubscribe and export walk all of them |
-| tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap) | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
-| a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (about 2.8 MiB, under `MAX_MAILBOX_BYTES`) | anyone can write to a store's mailbox, and decoding and decrypting grow with bytes. **Over budget today (161%)**: see below |
+| `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
+| tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
+| a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. **Over budget today**: see below |
 | `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass |
 | `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap; the harness checks 256 come back |
 | `KeepPurchase` (paid, genuine SPV proof) into an empty store, then 1022 seeded straight into the secret store in the delegate's own encoding, then `KeepPurchase` of the 1024th at the last conversation, then `ListKeptPurchases (1024)` | the kept-purchase cap. A keep ends by listing everything kept, so a keep into a full store is its worst case. The harness checks all 1024 come back |
@@ -157,31 +157,37 @@ Same harness, same scenario, two builds of the delegate:
 | main before #203 (blake3 `d8088bf5…`, the build live when the bug was found) | 10,167,507,014 - 49,739,927,758 fuel (2.5x - 12.4x budget), 1.0 - 5.1 s unmetered | **exit 1**, all eight over |
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
-Largest other calls on the committed delegate (`cbe71dd9…`), with every cap
-above filled:
+Largest calls on the committed delegate (`cbe71dd9…`), with every cap above
+filled:
 
 | call | fuel | share of budget |
 |---|---:|---:|
-| mailbox notification at the byte cap | 6,456,728,583 | **161.4%, over** |
-| `KeepPurchase`, the 1024th | 3,133,039,423 | 78.3% |
+| mailbox notification at the byte cap | 10,389,656,844 | **259.7%, over** |
+| `ExportSecrets`, 16 full ledgers | 7,973,492,968 | **199.3%, over** |
+| heartbeat wake-up, 16 full ledgers | 7,549,169,942 | **188.7%, over** |
+| `KeepPurchase`, the 1024th | 3,192,943,691 | 79.8% |
+| mailbox notification, 512 short messages | 3,189,562,696 | 79.7% |
 | `ListKeptPurchases (1024)` | 2,906,368,755 | 72.7% |
-| `ExportSecrets` | 2,782,717,412 | 69.6% |
-| mailbox notification, 512 short messages | 2,546,058,099 | 63.7% |
-| `DeriveConversationKeys (512 peers)` | 1,524,552,047 | 38.1% |
-| heartbeat wake-up, 16 arms | 1,128,378,877 | 28.2% |
-| `ListBuyerConversations (256)` | 1,048,280,976 | 26.2% |
 
-**The byte-cap mailbox is a real finding, not a harness artefact.** Any buyer
-can fill a store's mailbox this way, and instant checkout's first scan of it
-does about 1.6x the budget: roughly 0.6-1.6 s on nova, more on a slower peer.
-Most of the cost is decoding the mailbox (ciphertexts are CBOR integer arrays,
-not byte strings) and decrypting every new message; computing each digest
-once instead of per sort comparison only brings it to 157%. The fix is in the
-delegate (bound the messages opened per notification, or change the mailbox
-encoding), so it is a re-key, and this check stays red until it lands.
+**The three over-budget rows are real findings, not harness artefacts.**
+
+* The byte-cap mailbox: any buyer can fill a store's mailbox this way, and
+  instant checkout's first scan of it does 2.6x the budget. Part of the cost
+  is the sort hashing every ciphertext on every comparison: computing each
+  digest once brings it to 179.9% (and the 512-message scan from 79.7% to
+  62.8%). The rest is decoding the mailbox (ciphertexts are CBOR integer
+  arrays, not byte strings) and decrypting every new message.
+* The wake-up and the export decode every arm's whole ledger (the wake-up
+  twice). A busy seller's ledgers reach these caps over weeks of instant
+  orders, and the wake-up runs every few minutes: if it runs past the node's
+  limit, heartbeats stop and the store reads as closed.
+
+The fixes are in the delegate (digest once; bound the messages opened per
+notification; keep less per arm, or read only what a run needs), so they are
+a re-key, and this check stays red until they land.
 
 The others are within budget, and they are the handlers to watch: each grows
-with a collection, and at its cap the top four use 70-78% of the budget.
+with a collection, and at its cap the top three use 73-80% of the budget.
 
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call

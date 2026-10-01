@@ -85,10 +85,11 @@ impl wasmtime::ResourceLimiter for HostState {
     fn table_growing(
         &mut self,
         _current: usize,
-        _desired: usize,
+        desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(true)
+        // The node's `MAX_TABLE_ELEMENTS`.
+        Ok(desired <= 10_000)
     }
 }
 

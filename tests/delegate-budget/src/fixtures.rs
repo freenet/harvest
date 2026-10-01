@@ -189,3 +189,83 @@ pub fn encrypt_message_seeded(
         nonce,
     }
 }
+
+/// The instant-checkout ledger as the delegate stores it
+/// (`delegates/harvest-delegate/src/auto_invoice.rs`, `Ledger`, `Sale`): a
+/// crate-private type, mirrored field for field. A drift is caught where it is
+/// used (a re-arm must read the seeded issued count back), not silently.
+#[derive(serde::Serialize)]
+struct Ledger {
+    seen: Vec<[u8; 32]>,
+    answered: Vec<[u8; 32]>,
+    issued_at_ms: Vec<u64>,
+    statuses: Vec<harvest_common::listing::ListingStatus>,
+    sales: Vec<Sale>,
+    settled: Vec<harvest_common::payment::OrderId>,
+    oversold: Vec<Oversold>,
+    gap_orders: Vec<(harvest_common::payment::OrderId, u32)>,
+    gap_paid: Option<(u64, u32)>,
+    capped: Option<(u64, String)>,
+    retry_pending: bool,
+}
+
+#[derive(serde::Serialize)]
+struct Sale {
+    order: harvest_common::payment::OrderId,
+    listing: harvest_common::listing::ListingId,
+    quantity: u32,
+    issued_at_ms: u64,
+    anchor_height: u32,
+    decremented: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct Oversold {
+    order: harvest_common::payment::OrderId,
+    found_at_ms: u64,
+}
+
+fn id32(tag: u8, n: u32, i: usize) -> [u8; 32] {
+    let mut b = [tag; 32];
+    b[1..5].copy_from_slice(&n.to_le_bytes());
+    b[5..13].copy_from_slice(&(i as u64).to_le_bytes());
+    b
+}
+
+/// One arm's ledger with every list at its cap, `issued` invoices in the last
+/// hour, and recent entries, so nothing is aged out on load.
+pub fn full_ledger(
+    arm: u32,
+    now_ms: u64,
+    issued: usize,
+    caps: &crate::LedgerCaps,
+) -> impl serde::Serialize {
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::OrderId;
+    Ledger {
+        seen: (0..caps.seen).map(|i| id32(0xA1, arm, i)).collect(),
+        answered: (0..caps.answered).map(|i| id32(0xA2, arm, i)).collect(),
+        issued_at_ms: (0..issued).map(|i| now_ms - 60_000 - i as u64).collect(),
+        statuses: Vec::new(),
+        sales: (0..caps.sales)
+            .map(|i| Sale {
+                order: OrderId(id32(0xA3, arm, i)),
+                listing: ListingId(id32(0xA4, arm, i % 64)),
+                quantity: 1,
+                issued_at_ms: now_ms - 120_000,
+                anchor_height: 250_000,
+                decremented: None,
+            })
+            .collect(),
+        settled: (0..caps.answered)
+            .map(|i| OrderId(id32(0xA5, arm, i)))
+            .collect(),
+        oversold: Vec::new(),
+        gap_orders: (0..caps.gap_orders)
+            .map(|i| (OrderId(id32(0xA6, arm, i)), i as u32))
+            .collect(),
+        gap_paid: None,
+        capped: None,
+        retry_pending: false,
+    }
+}

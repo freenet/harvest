@@ -80,6 +80,14 @@ fn caps() -> Result<Caps> {
     })
 }
 
+/// The ledger caps a seeded ledger is filled to.
+pub struct LedgerCaps {
+    pub seen: usize,
+    pub answered: usize,
+    pub sales: usize,
+    pub gap_orders: usize,
+}
+
 struct Caps {
     store_keys: usize,
     arms: usize,
@@ -97,10 +105,11 @@ fn delegate_cap(file: &str, name: &str) -> Result<usize> {
         .join(file);
     let src = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let needle = format!("const {name}: usize = ");
-    let rest = src
-        .split(&needle)
-        .nth(1)
-        .ok_or_else(|| anyhow!("{name} not found in {file}: update the harness"))?;
+    let found = src.matches(&needle).count();
+    if found != 1 {
+        bail!("{name} occurs {found} times in {file}, expected once: update the harness");
+    }
+    let rest = src.split(&needle).nth(1).unwrap_or_default();
     rest.split(';')
         .next()
         .unwrap_or_default()
@@ -557,7 +566,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 tip_contract_id: tip_contract,
                 trusted_bridges: vec![bridge_id],
                 address_code_hash: [0x56; 32],
-                watched_scripts: watched,
+                watched_scripts: watched.clone(),
                 watch_left_ms: 24 * 3600 * 1000,
                 watched_until_height: None,
                 presence_contract_id: Some([0x57; 32]),
@@ -574,12 +583,21 @@ fn scenario(r: &mut Runner) -> Result<()> {
         "Heartbeat",
     )?;
     // Every arm the delegate takes: the wake-up and resubscribe walk them all.
+    if caps.arms > stores.len() {
+        bail!(
+            "MAX_ARMS ({}) is above the store keys created ({})",
+            caps.arms,
+            stores.len()
+        );
+    }
+    let mut extra_arms = Vec::new();
     for (i, store_key) in stores.iter().enumerate().take(caps.arms).skip(1) {
         let mut contract = [0x51u8; 32];
         contract[1] = i as u8;
         // Its own mailbox: the scan below is of the first store's.
         let mut mailbox = [0x53u8; 32];
         mailbox[1] = i as u8;
+        extra_arms.push((contract, *store_key, mailbox));
         r.app(
             "ArmAutoInvoice (filling to the cap)",
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
@@ -592,7 +610,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                     tip_contract_id: tip_contract,
                     trusted_bridges: vec![bridge_id],
                     address_code_hash: [0x56; 32],
-                    watched_scripts: Vec::new(),
+                    watched_scripts: watched.clone(),
                     watch_left_ms: 24 * 3600 * 1000,
                     watched_until_height: None,
                     presence_contract_id: Some([0x57; 32]),
@@ -680,7 +698,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     r.notify(
         &format!("ContractNotification: mailbox ({MAILBOX_PEERS} unread)"),
         mailbox_contract,
-        cbor(&harvest_common::mailbox::MailboxStateV1 { messages }),
+        cbor(&mailbox_state(messages)?),
     )?;
     let ledger = format!(
         "harvest:auto:ledger:{}",
@@ -701,7 +719,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     let buckets = harvest_common::mailbox::SIZE_BUCKETS;
     let mut sizes = Vec::new();
     for class in (0..buckets.len()).rev() {
-        let room = class_caps[class] - sizes.len().min(class_caps[class]);
+        let room = class_caps[class].min(MAILBOX_PEERS - sizes.len());
         // A text that pads into this bucket and no further.
         let len = buckets[class] - 200;
         sizes.extend(std::iter::repeat_n(len, room));
@@ -731,7 +749,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             )
         })
         .collect();
-    let big_state = harvest_common::mailbox::MailboxStateV1 { messages: big };
+    let big_state = mailbox_state(big)?;
     let big_bytes = cbor(&big_state);
     println!(
         "  (byte-cap mailbox: {} messages, {} KiB)",
@@ -745,11 +763,76 @@ fn scenario(r: &mut Runner) -> Result<()> {
     )?;
     let seen_after = ledger_seen(r, &ledger)?;
     let seen_cap = delegate_cap("auto_invoice.rs", "SEEN_CAP")?;
-    if seen_after < (seen + MAILBOX_PEERS).min(seen_cap) {
+    let new = big_state.messages.len();
+    if seen_cap < seen + new {
         bail!(
-            "the byte-cap mailbox scan recorded {} new messages as read",
-            seen_after - seen
+            "SEEN_CAP ({seen_cap}) is below the {} messages this scenario records",
+            seen + new
         );
+    }
+    if seen_after != seen + new {
+        bail!(
+            "the byte-cap mailbox scan recorded {} of its {new} messages as read",
+            seen_after.saturating_sub(seen)
+        );
+    }
+
+    // Every other arm's ledger at its caps, in the delegate's own encoding
+    // (`auto_invoice::Ledger`, mirrored in `fixtures::ledger`): the wake-up
+    // and the export decode each arm's ledger.
+    let now_ms = r.host.state.now.timestamp_millis() as u64;
+    let issued = delegate_cap("auto_invoice.rs", "MAX_PER_DAY")? - 1;
+    for (n, (contract, _, _)) in extra_arms.iter().enumerate() {
+        r.host.state.secrets.insert(
+            format!(
+                "harvest:auto:ledger:{}",
+                bs58::encode(contract).into_string()
+            )
+            .into_bytes(),
+            cbor(&fixtures::full_ledger(
+                n as u32,
+                now_ms,
+                issued,
+                &LedgerCaps {
+                    seen: delegate_cap("auto_invoice.rs", "SEEN_CAP")?,
+                    answered: delegate_cap("auto_invoice.rs", "ANSWERED_CAP")?,
+                    sales: delegate_cap("auto_invoice.rs", "SALES_CAP")?,
+                    gap_orders: delegate_cap("auto_invoice.rs", "GAP_ORDERS_CAP")?,
+                },
+            )),
+        );
+    }
+    // A re-arm answers the status read from that ledger: the issued count
+    // proves the seeded ledger decodes, rather than being read as empty.
+    if let Some((contract, store_key, mailbox)) = extra_arms.first() {
+        let status = r.app(
+            "ArmAutoInvoice (re-arm, full ledger)",
+            cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(AutoInvoiceArm {
+                    store_contract_id: contract.to_vec(),
+                    store_verifying_key: *store_key,
+                    mailbox_contract_id: *mailbox,
+                    seller_fingerprint: fingerprint.clone(),
+                    network: BitcoinNetwork::Signet,
+                    tip_contract_id: tip_contract,
+                    trusted_bridges: vec![bridge_id],
+                    address_code_hash: [0x56; 32],
+                    watched_scripts: watched.clone(),
+                    watch_left_ms: 24 * 3600 * 1000,
+                    watched_until_height: None,
+                    presence_contract_id: Some([0x57; 32]),
+                }),
+            }),
+            "AutoInvoice",
+        )?;
+        let got = field(&status, &["AutoInvoice", "result", "Ok", "issued_last_day"])?;
+        if !matches!(got, Value::Integer(i) if i128::from(*i) == issued as i128) {
+            bail!(
+                "a seeded ledger read back {} issued invoices, expected {issued}: the delegate did \
+                 not decode it, so the full-ledger walks below would measure empty ledgers",
+                brief(got)
+            );
+        }
     }
 
     // --- runs the node starts on its own ------------------------------------
@@ -869,11 +952,19 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // The last slot through the handler, at the conversation found last: a
     // keep ends by listing every kept purchase and looks its conversation's
     // seed up among all of them, so the full store is its worst case.
-    let last_secret = {
-        let mut secret = [0x60u8; 32];
-        secret[1..9].copy_from_slice(&((buyer_conversations - 1) as u64).to_le_bytes());
-        secret
-    };
+    // `conversation_seed` walks the conversations in secret-key order,
+    // `harvest:buyer_conv:{store}:{bs58(public key)}`, with an X25519 per
+    // step: the worst case is the conversation whose bs58 sorts last.
+    let last_secret = (0..buyer_conversations)
+        .map(|i| {
+            let mut secret = [0x60u8; 32];
+            secret[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            secret
+        })
+        .max_by_key(|secret| {
+            bs58::encode(PublicKey::from(&StaticSecret::from(*secret)).as_bytes()).into_string()
+        })
+        .expect("at least one conversation");
     let last_conversation = *PublicKey::from(&StaticSecret::from(last_secret)).as_bytes();
     let last_receipt = SigningKey::from_bytes(
         &harvest_common::mailbox::buyer_receipt_seed_from_secret(&last_secret),
@@ -960,7 +1051,11 @@ fn scenario(r: &mut Runner) -> Result<()> {
 /// `freenet-migrate`'s business and tested there.
 fn freenet_migrate_check(bytes: &[u8], at_least: usize) -> Result<()> {
     let v: Value = ciborium::from_reader(bytes).context("export is not CBOR")?;
-    let n = count_array_somewhere(&v);
+    // `freenet_migrate::ExportedSecrets { secrets: Vec<(key, value)>, .. }`.
+    let n = match field(&v, &["secrets"])? {
+        Value::Array(items) => items.len(),
+        other => bail!("the export's secrets are not a list: {}", brief(other)),
+    };
     if n < at_least {
         bail!(
             "the export carried {n} entries, fewer than the {at_least} secrets seeded: it was \
@@ -969,6 +1064,21 @@ fn freenet_migrate_check(bytes: &[u8], at_least: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A mailbox state as a node delivers it: in the contract's canonical order
+/// (by nonce, so effectively random in time) and passing its own `verify`.
+/// The delegate sorts what it is given, and a fixture already in time order
+/// would be its cheapest input, not a real one.
+fn mailbox_state(
+    mut messages: Vec<harvest_common::mailbox::EncryptedMessage>,
+) -> Result<harvest_common::mailbox::MailboxStateV1> {
+    messages.sort_by(harvest_common::mailbox::canonical_order);
+    let state = harvest_common::mailbox::MailboxStateV1 { messages };
+    state
+        .verify()
+        .map_err(|e| anyhow!("the mailbox fixture is not a state the contract accepts: {e}"))?;
+    Ok(state)
 }
 
 /// The length of the longest array anywhere in `v`: the list an answer

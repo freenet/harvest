@@ -1468,7 +1468,7 @@ A node stops a delegate call after 5 s of wall clock, and the web app then gets 
 
 | Where | Claim | Caught? |
 |---|---|---|
-| `tests/delegate-budget` | Every driven handler's single call stays under 4,000,000,000 fuel (about 1 s of copy-heavy work on nova) and 64 secret writes, with each collection it walks filled to its cap. | **Yes, for the driven handlers** -- red on the pre-#203 delegate (`GetStoreSubkeys` 2.5x-12.4x); caps are read from the delegate source, every step asserts its answer or the state it writes, and the memory cap is the node's (a smaller cap turns it red). **Red today** on the byte-cap mailbox scan (161%), a real finding whose fix is a delegate re-key. |
+| `tests/delegate-budget` | Every driven handler's single call stays under 4,000,000,000 fuel (about 1 s of copy-heavy work on nova) and 64 secret writes, with each collection it walks filled to its cap. | **Yes, for the driven handlers** -- red on the pre-#203 delegate (`GetStoreSubkeys` 2.5x-12.4x); caps are read from the delegate source, every step asserts its answer or the state it writes, and the memory cap is the node's (a smaller cap turns it red). **Red today** on three real findings whose fixes are a delegate re-key: the byte-cap mailbox scan (260%), and the heartbeat wake-up (189%) and export (199%) with every arm's ledger full. |
 | same | Handlers not driven, record sizes above the minimal fixture, secret READ time, slower-than-desktop hardware, and flows of many calls. | **No** -- listed in `tests/delegate-budget/README.md`, "What it does not cover". |
 
 ## The four that matter
