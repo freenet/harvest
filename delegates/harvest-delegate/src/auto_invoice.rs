@@ -102,6 +102,46 @@ pub(crate) fn ledger_key(store_contract_id: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Whether a store's ledger has requests a refused update left undecided
+/// (`Ledger::retry_pending`), kept beside the ledger as `b"1"` or `b"0"` so
+/// the wake-up can find out without decoding every ledger (#206: decoding
+/// sixteen full ledgers twice put the wake-up at 189% of a call's budget).
+/// Node-local, like the arm: not exported.
+fn retry_key(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{AUTO_PREFIX}retry:{}",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+/// [`retry_key`] for the store a [`ledger_key`] names.
+pub(crate) fn retry_key_for_ledger(ledger_key: &[u8]) -> Option<Vec<u8>> {
+    let suffix = ledger_key.strip_prefix(format!("{AUTO_PREFIX}ledger:").as_bytes())?;
+    let mut key = format!("{AUTO_PREFIX}retry:").into_bytes();
+    key.extend_from_slice(suffix);
+    Some(key)
+}
+
+/// Bring a [`retry_key`] in line with a ledger's flag, writing only when it
+/// differs (each write is an fsync on a node).
+pub(crate) fn sync_retry_flag<S: SecretStore>(secrets: &mut S, key: &[u8], pending: bool) {
+    let want: &[u8] = if pending { b"1" } else { b"0" };
+    if secrets.get_secret(key).as_deref() != Some(want) {
+        secrets.set_secret(key, want);
+    }
+}
+
+/// Save a store's ledger, and its [`retry_key`] beside it. Every ledger
+/// write goes through here.
+fn save_ledger<S: SecretStore>(secrets: &mut S, store_contract_id: &[u8], ledger: &Ledger) -> bool {
+    if !save(secrets, &ledger_key(store_contract_id), ledger) {
+        return false;
+    }
+    sync_retry_flag(secrets, &retry_key(store_contract_id), ledger.retry_pending);
+    true
+}
+
 /// Whether `key` is one of the ledgers ([`ledger_key`]): the one part of
 /// instant checkout's state that moves to a successor generation.
 pub(crate) fn is_ledger_key(key: &[u8]) -> bool {
@@ -113,7 +153,7 @@ pub(crate) fn is_ledger_key(key: &[u8]) -> bool {
 pub(crate) fn merge_ledger_bytes(
     held: Option<&[u8]>,
     incoming: &[u8],
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<(Vec<u8>, bool)>, String> {
     let incoming: Ledger =
         from_cbor(incoming).map_err(|_| "the ledger did not decode".to_string())?;
     let mut ledger: Ledger = match held {
@@ -125,7 +165,9 @@ pub(crate) fn merge_ledger_bytes(
     if !merge_ledgers(&mut ledger, incoming) {
         return Ok(None);
     }
-    to_cbor(&ledger).map(Some).map_err(|e| e.to_string())
+    to_cbor(&ledger)
+        .map(|bytes| Some((bytes, ledger.retry_pending)))
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn tip_key(network: BitcoinNetwork) -> Vec<u8> {
@@ -482,7 +524,14 @@ pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelega
     }
     arms(secrets)
         .iter()
-        .filter(|record| load_ledger(secrets, &record.arm.store_contract_id).retry_pending)
+        // Every ledger write writes the flag (`save_ledger`, and the import
+        // of a predecessor's ledger), so no flag means nothing pending.
+        .filter(|record| {
+            secrets
+                .get_secret(&retry_key(&record.arm.store_contract_id))
+                .as_deref()
+                == Some(b"1")
+        })
         .filter_map(|record| {
             let context = to_cbor(&MailboxRetry {
                 magic: RETRY_MAGIC,
@@ -514,7 +563,7 @@ fn on_mailbox_retry<S: SecretStore>(
     let mut ledger = load_ledger(secrets, store_contract_id);
     if ledger.retry_pending {
         ledger.retry_pending = false;
-        save(secrets, &ledger_key(store_contract_id), &ledger);
+        save_ledger(secrets, store_contract_id, &ledger);
     }
     on_mailbox(secrets, &record, state, now_ms)
 }
@@ -708,9 +757,22 @@ pub(crate) fn note_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) {
 ///
 /// It does not see the per-request caps, which need the store's state: a
 /// store at its open-order or daily cap still reads as taking orders.
-fn taking_orders<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> bool {
-    let status = status_of(secrets, record, now_ms);
-    status.paused.is_none() && status.watched_remaining > 0
+///
+/// The same answer as [`status_of`]'s `paused` and `watched_remaining`,
+/// without reading the ledger, which neither needs: the wake-up asks this for
+/// every arm, and a full ledger is the costliest secret a store has (#206).
+fn taking_orders<S: SecretStore>(
+    secrets: &S,
+    record: &ArmRecord,
+    now_ms: u64,
+    upcoming: &[harvest_common::DerivedAddress],
+) -> bool {
+    let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
+    if global_refusal(secrets, record, tip.as_ref(), now_ms).is_err() {
+        return false;
+    }
+    let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
+    accepted_run_of(upcoming, record, &watched, now_ms).0 > 0
 }
 
 /// Sign a heartbeat for `record`'s store and send it to its presence
@@ -727,12 +789,27 @@ pub(crate) fn heartbeat<S: SecretStore>(
     harvest_common::presence::SignedHeartbeat,
     OutboundDelegateMsg,
 )> {
+    let upcoming = upcoming(secrets);
+    heartbeat_with(secrets, record, now_ms, force, &upcoming)
+}
+
+/// [`heartbeat`] with the upcoming addresses already derived.
+fn heartbeat_with<S: SecretStore>(
+    secrets: &mut S,
+    record: &ArmRecord,
+    now_ms: u64,
+    force: bool,
+    upcoming: &[harvest_common::DerivedAddress],
+) -> Option<(
+    harvest_common::presence::SignedHeartbeat,
+    OutboundDelegateMsg,
+)> {
     use harvest_common::presence::{Heartbeat, SignedHeartbeat};
     let presence = record.arm.presence_contract_id?;
     if secrets.has_secret(EXPORTED_KEY) {
         return None;
     }
-    let taking = taking_orders(secrets, record, now_ms);
+    let taking = taking_orders(secrets, record, now_ms, upcoming);
     let key = beat_key(&record.arm.store_contract_id);
     if !force {
         if let Some(last) = load::<_, BeatRecord>(secrets, &key) {
@@ -804,9 +881,10 @@ fn note_presence_seen<S: SecretStore>(secrets: &mut S, record: &ArmRecord, state
 
 /// A heartbeat for every armed store that is due one: the wake-up's work.
 pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<OutboundDelegateMsg> {
+    let upcoming = upcoming(secrets);
     arms(secrets)
         .iter()
-        .filter_map(|record| heartbeat(secrets, record, now_ms, false))
+        .filter_map(|record| heartbeat_with(secrets, record, now_ms, false, &upcoming))
         .map(|(_, message)| message)
         .collect()
 }
@@ -1041,14 +1119,31 @@ fn accepted_run<S: SecretStore>(
     watched: &WatchSet,
     now_ms: u64,
 ) -> (u32, u64) {
-    let Some(status) = crate::bitcoin::load_payment_xpub(secrets) else {
-        return (0, 0);
-    };
-    let upcoming = crate::bitcoin::upcoming_addresses(
-        &status,
-        harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
-    )
-    .unwrap_or_default();
+    accepted_run_of(&upcoming(secrets), record, watched, now_ms)
+}
+
+/// The addresses instant checkout would issue next, from the seller's
+/// payment key: derived once per run, not once per store (all stores share
+/// the key).
+pub(crate) fn upcoming<S: SecretStore>(secrets: &S) -> Vec<harvest_common::DerivedAddress> {
+    crate::bitcoin::load_payment_xpub(secrets)
+        .and_then(|status| {
+            crate::bitcoin::upcoming_addresses(
+                &status,
+                harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
+            )
+            .ok()
+        })
+        .unwrap_or_default()
+}
+
+/// [`accepted_run`] over addresses already derived.
+fn accepted_run_of(
+    upcoming: &[harvest_common::DerivedAddress],
+    record: &ArmRecord,
+    watched: &WatchSet,
+    now_ms: u64,
+) -> (u32, u64) {
     let mut count = 0u32;
     let mut until = u64::MAX;
     for address in upcoming {
@@ -1381,7 +1476,7 @@ fn on_store_change<S: SecretStore>(
     );
     // Recorded before anything is published: a decrement sent but not
     // recorded would be sent again on the next change, twice off the stock.
-    if !save(secrets, &ledger_key(&record.arm.store_contract_id), &ledger) {
+    if !save_ledger(secrets, &record.arm.store_contract_id, &ledger) {
         return Vec::new();
     }
     Decided {
@@ -1774,7 +1869,7 @@ fn on_mailbox<S: SecretStore>(
         }
     }
     if ledger_changed {
-        save(secrets, &ledger_key(&record.arm.store_contract_id), &ledger);
+        save_ledger(secrets, &record.arm.store_contract_id, &ledger);
     }
     if batch.is_empty() {
         return Vec::new();
@@ -1848,7 +1943,7 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
                 // `retry_pending` is what a run started some other way (a
                 // wake-up, next PR) looks at.
                 ledger.retry_pending = true;
-                save(secrets, &ledger_key(&pending.store_contract_id), &ledger);
+                save_ledger(secrets, &pending.store_contract_id, &ledger);
             }
         }
     }
@@ -2150,7 +2245,7 @@ pub(crate) fn decide<S: SecretStore>(
     // Recorded before anything is published, as in `on_store_change`: an
     // order or decrement sent but not recorded would lose its hold, or be
     // decremented again.
-    if !save(secrets, &ledger_key(&arm.store_contract_id), &ledger) {
+    if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
         return Decided::default();
     }
     decided
@@ -3756,7 +3851,7 @@ mod tests {
         let mut new = fixture();
         counted(&mut new, 3);
         let key = ledger_key(&new.record.arm.store_contract_id);
-        let merged = merge_ledger_bytes(None, &exported).unwrap().unwrap();
+        let (merged, _) = merge_ledger_bytes(None, &exported).unwrap().unwrap();
         new.secrets.set_secret(&key, &merged);
         publish(&mut new, &first);
         with_status(&mut new, &first.orders[0].order.id, OrderStatus::Paid);
@@ -4441,9 +4536,19 @@ mod tests {
         assert!(wd::wake_and_read(&mut f.secrets, &inbox, NOW + 300_000).is_empty());
         let read = run(&mut f, &[buyer.request(&jam(), 1, 4, 12_000)]);
         assert_eq!(read.refused[0].1, Refusal::WatchLapsed);
-        assert!(!taking_orders(&f.secrets, &f.record, NOW));
+        assert!(!taking_orders(
+            &f.secrets,
+            &f.record,
+            NOW,
+            &upcoming(&f.secrets)
+        ));
         wd::wake_and_scan(&mut f.secrets, &script_at(20), Some(wd::TIP), NOW + 600_000);
-        assert!(taking_orders(&f.secrets, &f.record, NOW));
+        assert!(taking_orders(
+            &f.secrets,
+            &f.record,
+            NOW,
+            &upcoming(&f.secrets)
+        ));
         let status = status_of(&f.secrets, &f.record, NOW);
         assert_eq!(status.paused, None);
         assert_eq!(status.watched_remaining, 10);
@@ -4521,12 +4626,12 @@ mod tests {
         let record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
         let status = status_of(&secrets, &record, NOW);
         assert_eq!(status.watched_remaining, 10);
-        assert!(taking_orders(&secrets, &record, NOW));
+        assert!(taking_orders(&secrets, &record, NOW, &upcoming(&secrets)));
         // Too near U1: 6-9 no longer count, and nothing past them does.
         wd::set_tip(&mut secrets, u1 - WATCH_NEEDED_BLOCKS + 1);
         let status = status_of(&secrets, &record, NOW);
         assert_eq!(status.watched_remaining, 0);
-        assert!(!taking_orders(&secrets, &record, NOW));
+        assert!(!taking_orders(&secrets, &record, NOW, &upcoming(&secrets)));
 
         // The handoff: the tab watched 6-9 and has lapsed; the delegate 10-15.
         let mut secrets = wd::delegated();
@@ -4542,7 +4647,7 @@ mod tests {
         assert_eq!(status_of(&secrets, &record, NOW).watched_remaining, 10);
         record.watched_until_ms = NOW + WATCH_NEEDED_MS;
         assert_eq!(status_of(&secrets, &record, NOW).watched_remaining, 0);
-        assert!(!taking_orders(&secrets, &record, NOW));
+        assert!(!taking_orders(&secrets, &record, NOW, &upcoming(&secrets)));
     }
 
     /// A watch that ends at a height must outlast an invoice's window in

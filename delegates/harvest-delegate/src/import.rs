@@ -328,7 +328,16 @@ pub(crate) fn import_secret<S: SecretStore>(
             let held = store.get_secret(key);
             match crate::auto_invoice::merge_ledger_bytes(held.as_deref(), value) {
                 Ok(None) => SecretImport::AlreadyAuthoritative,
-                Ok(Some(bytes)) => written(store.set_secret(key, &bytes)),
+                Ok(Some((bytes, retry_pending))) => {
+                    let ok = store.set_secret(key, &bytes);
+                    // The wake-up reads this flag rather than the ledger.
+                    if ok {
+                        if let Some(flag) = crate::auto_invoice::retry_key_for_ledger(key) {
+                            crate::auto_invoice::sync_retry_flag(store, &flag, retry_pending);
+                        }
+                    }
+                    written(ok)
+                }
                 Err(why) if held.is_some() && why.contains("own") => SecretImport::Retryable(why),
                 Err(why) => SecretImport::Permanent(why),
             }
