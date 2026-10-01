@@ -661,6 +661,7 @@ pub(crate) fn PayPanel(
                 order: commitment.clone(),
                 live: super::bitcoin_view::live_address_for_order(&bitcoin, &commitment.order),
                 buyer: true,
+                plain: true,
             }
         },
         // Deliberately no payment address while anything is outstanding. A
@@ -1358,41 +1359,46 @@ pub fn AcceptRequest(
                     "for you: if you count this listing, lower the count yourself once it is paid."
                 }
             }
-            div { class: "form-group",
-                label { class: "form-label",
-                    "Amount for {quantity} x {listing_title} (satoshis)"
-                }
-                // Fixed for a Buy now answer: the buyer's app pays only the
-                // total they agreed to (`PaymentBlocker::AmountNotAsked`), so
-                // any other amount would publish an order nobody can pay.
-                input {
-                    class: "form-input field-num",
-                    // Text with a numeric keyboard, as every other number
-                    // field: a number input's spinner eats the width.
-                    r#type: "text",
-                    inputmode: "numeric",
-                    readonly: instant.is_some(),
-                    value: "{amount}",
-                    oninput: move |event| amount.set(event.value()),
-                }
-                if instant.is_some() {
-                    p { class: "text-muted small",
-                        "The total the buyer agreed to when they pressed Buy now. Their app pays no "
-                        "other amount."
+            // A Buy now answer's amount is the total the buyer agreed to, and
+            // one confirmation is what every Buy now order asks: nothing to
+            // type (critique C-2). An older request is priced by hand.
+            if let Some(answer) = instant {
+                p {
+                    "Total: "
+                    strong {
+                        "{super::pay_card::money(answer.total_sats, crate::gateway::bitcoin_config::default_network())}"
                     }
                 }
-            }
-            div { class: "form-group",
-                label { class: "form-label", "Confirmations required" }
-                input {
-                    class: "form-input field-count",
-                    r#type: "text",
-                    inputmode: "numeric",
-                    value: "{confirmations}",
-                    oninput: move |event| confirmations.set(event.value()),
+                p { class: "text-muted small",
+                    "The total the buyer agreed to when they pressed Buy now. Their app pays no other amount."
                 }
-                if let Err(why) = confirmations_read {
-                    p { class: "text-warning", "{why}" }
+            } else {
+                div { class: "form-group",
+                    label { class: "form-label",
+                        "Amount for {quantity} x {listing_title} (satoshis)"
+                    }
+                    input {
+                        class: "form-input field-num",
+                        // Text with a numeric keyboard, as every other number
+                        // field: a number input's spinner eats the width.
+                        r#type: "text",
+                        inputmode: "numeric",
+                        value: "{amount}",
+                        oninput: move |event| amount.set(event.value()),
+                    }
+                }
+                div { class: "form-group",
+                    label { class: "form-label", "Confirmations required" }
+                    input {
+                        class: "form-input field-count",
+                        r#type: "text",
+                        inputmode: "numeric",
+                        value: "{confirmations}",
+                        oninput: move |event| confirmations.set(event.value()),
+                    }
+                    if let Err(why) = confirmations_read {
+                        p { class: "text-warning", "{why}" }
+                    }
                 }
             }
             if let Some(message) = problem() {

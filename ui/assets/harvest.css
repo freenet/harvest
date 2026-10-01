@@ -2904,3 +2904,8 @@ button.harvest-title-group {
 section + .panel {
   margin-top: var(--space-lg);
 }
+
+/* An order's card on its own page: its words and controls, no second box. */
+.order-plain > * + * {
+  margin-top: var(--space-sm);
+}

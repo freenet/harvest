@@ -1152,17 +1152,20 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                              accept, so nobody can pay it now. Cancel it; the buyer can order again."
                         }
                     }
-                    super::bitcoin_view::OrderCard {
-                        order: o.clone(),
-                        live: super::bitcoin_view::live_address_for_order(&view.live, &o.order),
-                        footer: rsx! {
-                            if o.status == harvest_common::payment::OrderStatus::AwaitingPayment {
-                                super::invoice_form::CancelInvoice {
-                                    store_contract_id: id.clone(),
-                                    order_id: o.order.id.clone(),
+                    section { class: "panel",
+                        super::bitcoin_view::OrderCard {
+                            order: o.clone(),
+                            live: super::bitcoin_view::live_address_for_order(&view.live, &o.order),
+                            plain: true,
+                            footer: rsx! {
+                                if o.status == harvest_common::payment::OrderStatus::AwaitingPayment {
+                                    super::invoice_form::CancelInvoice {
+                                        store_contract_id: id.clone(),
+                                        order_id: o.order.id.clone(),
+                                    }
                                 }
-                            }
-                        },
+                            },
+                        }
                     }
                 }
                 if let Some(line) = view.stage_line.clone() {

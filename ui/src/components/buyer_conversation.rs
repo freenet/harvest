@@ -22,10 +22,22 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
         let identity = browsing.and_then(|s| s.seller_verifying_key);
         let orders: Vec<(Page, String, String, Option<String>)> = tag
             .map(|tag| {
-                state
+                let mut purchases: Vec<_> = state
                     .buyer_purchases(&store)
                     .into_iter()
                     .filter(|p| p.conversation == tag)
+                    .collect();
+                // Newest first, as Purchases lists them.
+                purchases.sort_by_key(|p| {
+                    std::cmp::Reverse(
+                        p.commitment
+                            .as_ref()
+                            .or(p.paid.as_ref())
+                            .map(|o| o.order.created_at),
+                    )
+                });
+                purchases
+                    .into_iter()
                     .map(|p| {
                         let status = super::order_status::buyer_status(&state, &store, &p);
                         let listing = state.purchase_listing(&store, &p);
