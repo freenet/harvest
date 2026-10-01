@@ -2801,3 +2801,22 @@ a.btn {
 .order-cancel {
   margin-top: var(--space-sm);
 }
+
+/* Mixed pictures: wider cards, so a square beside the words leaves the
+   words their room. */
+.item-grid:not(.gallery):has(.item-card-img) {
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+}
+
+.item-grid:not(.gallery) .item-card:has(.item-card-img) {
+  grid-template-columns: 3.75rem minmax(0, 1fr);
+}
+
+.item-grid:not(.gallery) .item-card-img {
+  width: 3.75rem;
+  height: 3.75rem;
+}
+
+.item-card-price .test-coins {
+  white-space: nowrap;
+}
