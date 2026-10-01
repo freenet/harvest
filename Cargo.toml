@@ -74,7 +74,7 @@ aes-gcm = "0.10"
 # the one on `rand_core` 0.6, which is what `rsa` 0.9 takes.
 hkdf = "0.12"
 zeroize = "1"
-rand_chacha = "0.3"
+rand_chacha = "0.9"
 serde_bytes = "0.11"
 
 # Utilities
