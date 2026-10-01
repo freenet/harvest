@@ -23,9 +23,16 @@
 //! picture with its own Exif after the first end-of-image marker (MPF, which
 //! phone cameras write), or a JFIF thumbnail. So [`sniff`] walks every
 //! segment to the end of the file, accepts only the segments a canvas
-//! encoder writes, and refuses everything else, including any byte after the
-//! end-of-image marker. Real output from Chromium, Firefox and WebKit is in
+//! encoder writes, checks each one's body against its fixed form, and
+//! refuses everything else, including any byte after the end-of-image
+//! marker. Real output from Chromium, Firefox and WebKit is in
 //! `tests/fixtures/` and must keep passing.
+//!
+//! The threat this answers is a seller's own browser leaking a photo's
+//! location by ACCIDENT, through the containers cameras fill in. A seller
+//! who means to hide bytes in their own photo can still do it in table
+//! values or the compressed data; no check short of re-encoding closes
+//! that, and nothing here claims to.
 //!
 //! **What this does not prove**: that the entropy-coded data decodes to a
 //! sensible picture. Only a full decode could, and the buyer's browser does
@@ -54,6 +61,11 @@ pub const MAX_IMAGE_BYTES: usize = 256 * 1024;
 /// browser is asked to decode: a 200 KB file may otherwise declare
 /// 65535 x 65535 and exhaust the tab's memory.
 pub const MAX_IMAGE_EDGE: u16 = 2048;
+
+/// The largest ICC profile accepted, in one segment. Canvas encoders write a
+/// fixed profile for their colour space (Chromium's and WebKit's are 456
+/// bytes); the cap bounds what a buyer's browser is asked to parse.
+pub const MAX_ICC_PROFILE_BYTES: usize = 8 * 1024;
 
 /// What a valid image is, as far as its header says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +111,18 @@ pub enum ImageError {
     MultipleScans,
     /// No frame header, so no dimensions.
     NoFrame,
+    /// A quantisation or Huffman table segment that does not parse as
+    /// baseline tables, or more tables than a baseline file can use.
+    BadTable { marker: u8 },
+    /// No quantisation table, or no Huffman table.
+    NoTables,
+    /// An ICC profile that is not exactly one chunk, or over
+    /// [`MAX_ICC_PROFILE_BYTES`].
+    BadIcc,
+    /// An Adobe APP14 segment that is not the fixed 12-byte form.
+    BadAdobe,
+    /// A scan with no entropy-coded data.
+    EmptyScan,
     /// Bytes after the end-of-image marker.
     TrailingBytes,
     /// A dimension of zero or over [`MAX_IMAGE_EDGE`].
@@ -129,6 +153,14 @@ impl fmt::Display for ImageError {
             Self::BadScan => write!(f, "JPEG scan header is not accepted"),
             Self::MultipleScans => write!(f, "JPEG has more than one scan"),
             Self::NoFrame => write!(f, "JPEG has no frame header"),
+            Self::BadTable { marker } => write!(f, "JPEG table segment FF{marker:02X} is not baseline"),
+            Self::NoTables => write!(f, "JPEG lacks a quantisation or Huffman table"),
+            Self::BadIcc => write!(
+                f,
+                "JPEG ICC profile must be one chunk of at most {MAX_ICC_PROFILE_BYTES} bytes"
+            ),
+            Self::BadAdobe => write!(f, "JPEG Adobe segment is not the fixed 12-byte form"),
+            Self::EmptyScan => write!(f, "JPEG scan has no image data"),
             Self::TrailingBytes => write!(f, "bytes after the end of the JPEG"),
             Self::Dimensions { width, height } => write!(
                 f,
@@ -176,8 +208,9 @@ const APP2: u8 = 0xE2;
 const APP14: u8 = 0xEE;
 const COM: u8 = 0xFE;
 
-/// The exact APP0 body a canvas writes, minus the density fields: `JFIF\0`,
-/// a version, a unit, two densities, and a 0 x 0 thumbnail.
+/// The length field of a plain JFIF APP0 segment (which counts itself):
+/// `JFIF\0`, a version, a unit, two densities and a 0 x 0 thumbnail, so a
+/// 14-byte body.
 const JFIF_LEN: usize = 16;
 
 /// One marker segment: its marker and the body after the two length bytes.
@@ -263,9 +296,14 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, ImageError> {
                         trailing: &bytes[i + 2..],
                     });
                 }
-                // Anything else after a scan is a second scan, or tables
-                // for one. A canvas writes a single interleaved scan.
-                Some(_) => return Err(ImageError::MultipleScans),
+                // A second scan, or tables for one. A canvas writes a single
+                // interleaved scan.
+                Some(&SOS) | Some(&DHT) | Some(&DQT) | Some(&DRI) => {
+                    return Err(ImageError::MultipleScans)
+                }
+                // Anything else after the scan: a fill byte, DNL, or a
+                // segment (an APPn would be metadata after the picture).
+                Some(&marker) => return Err(ImageError::UnexpectedMarker { marker }),
             }
         }
     }
@@ -274,16 +312,31 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, ImageError> {
 /// Whether `bytes` is a baseline JPEG in the layout a canvas writes, with no
 /// metadata, at accepted dimensions. See the module docs for what is allowed
 /// and why.
+///
+/// Every allowed segment's body is checked against its fixed form too, not
+/// only its marker: the quantisation and Huffman tables parse as baseline
+/// tables and are consumed exactly, the ICC profile is one bounded chunk, the
+/// Adobe segment is its 12-byte form, and the frame and scan headers carry
+/// only baseline values. So no allowed segment is a free-form container.
+///
+/// **What remains, stated plainly:** table VALUES and the entropy-coded data
+/// can still be chosen to carry bytes. That cannot be closed by any check
+/// short of re-encoding, and it does not need to be: the threat here is a
+/// seller's own browser leaking a photo's location by accident, through the
+/// metadata containers a camera fills in. A seller who sets out to hide data
+/// in their own photo can always do so.
 pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
     let parsed = parse(bytes)?;
     if !parsed.trailing.is_empty() {
         return Err(ImageError::TrailingBytes);
     }
-    let mut frame: Option<(ImageInfo, u8)> = None;
-    let (mut seen_jfif, mut seen_dri, mut seen_adobe) = (false, false, false);
+    let mut frame: Option<Frame> = None;
+    let (mut seen_jfif, mut seen_dri, mut seen_adobe, mut seen_icc) = (false, false, false, false);
+    let (mut quant_tables, mut huffman_tables) = (0usize, 0usize);
     for seg in &parsed.head {
         match seg.marker {
-            DQT | DHT => {}
+            DQT => quant_tables += check_quant_tables(seg.body)?,
+            DHT => huffman_tables += check_huffman_tables(seg.body)?,
             DRI => {
                 if seg.body.len() != 2 {
                     return Err(ImageError::BadLength { marker: DRI });
@@ -294,8 +347,16 @@ pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
                 once(&mut seen_jfif, APP0)?;
                 check_jfif(seg.body)?;
             }
-            APP2 if seg.body.starts_with(b"ICC_PROFILE\0") => {}
-            APP14 if seg.body.starts_with(b"Adobe") => once(&mut seen_adobe, APP14)?,
+            APP2 if seg.body.starts_with(ICC_TAG) => {
+                once(&mut seen_icc, APP2)?;
+                check_icc(seg.body)?;
+            }
+            APP14 if seg.body.starts_with(ADOBE_TAG) => {
+                once(&mut seen_adobe, APP14)?;
+                if seg.body.len() != ADOBE_BODY_LEN {
+                    return Err(ImageError::BadAdobe);
+                }
+            }
             SOF0 => {
                 if frame.is_some() {
                     return Err(ImageError::Duplicate { marker: SOF0 });
@@ -311,10 +372,25 @@ pub fn sniff(bytes: &[u8]) -> Result<ImageInfo, ImageError> {
             0xC1..=0xCF => return Err(ImageError::UnsupportedCoding { marker: seg.marker }),
             marker => return Err(ImageError::UnexpectedMarker { marker }),
         }
+        // A baseline decoder has four quantisation slots and four Huffman
+        // slots (two classes of two). Redefining them is legal JPEG, and
+        // also unbounded room; no canvas does it.
+        if quant_tables > 4 {
+            return Err(ImageError::BadTable { marker: DQT });
+        }
+        if huffman_tables > 4 {
+            return Err(ImageError::BadTable { marker: DHT });
+        }
     }
-    let (info, components) = frame.ok_or(ImageError::NoFrame)?;
-    check_scan(parsed.scan_header, components)?;
-    Ok(info)
+    let frame = frame.ok_or(ImageError::NoFrame)?;
+    if quant_tables == 0 || huffman_tables == 0 {
+        return Err(ImageError::NoTables);
+    }
+    check_scan(parsed.scan_header, &frame.ids)?;
+    if parsed.entropy.is_empty() {
+        return Err(ImageError::EmptyScan);
+    }
+    Ok(frame.info)
 }
 
 fn once(seen: &mut bool, marker: u8) -> Result<(), ImageError> {
@@ -323,6 +399,11 @@ fn once(seen: &mut bool, marker: u8) -> Result<(), ImageError> {
     }
     Ok(())
 }
+
+const ICC_TAG: &[u8] = b"ICC_PROFILE\0";
+const ADOBE_TAG: &[u8] = b"Adobe";
+/// `Adobe`, a version, two flag words and a colour transform byte.
+const ADOBE_BODY_LEN: usize = 12;
 
 /// `JFIF\0`, version, units, X and Y density, and a 0 x 0 thumbnail: the
 /// header and nothing else. A JFIF thumbnail is a second picture, and may be
@@ -335,9 +416,71 @@ fn check_jfif(body: &[u8]) -> Result<(), ImageError> {
     Ok(())
 }
 
-/// A baseline frame: 8-bit samples, one (grey) or three (colour) components,
+/// One ICC chunk, numbered 1 of 1, of at most [`MAX_ICC_PROFILE_BYTES`].
+fn check_icc(body: &[u8]) -> Result<(), ImageError> {
+    let header = ICC_TAG.len() + 2;
+    if body.len() <= header
+        || body.len() - header > MAX_ICC_PROFILE_BYTES
+        || body[ICC_TAG.len()] != 1
+        || body[ICC_TAG.len() + 1] != 1
+    {
+        return Err(ImageError::BadIcc);
+    }
+    Ok(())
+}
+
+/// The quantisation tables in one DQT segment, each `Pq|Tq` then 64 bytes,
+/// with 8-bit precision (`Pq` = 0, as baseline requires) and a slot of 0-3,
+/// consuming the body exactly. Returns how many tables it held.
+fn check_quant_tables(body: &[u8]) -> Result<usize, ImageError> {
+    let bad = ImageError::BadTable { marker: DQT };
+    if body.is_empty() || !body.len().is_multiple_of(65) {
+        return Err(bad);
+    }
+    for table in body.chunks_exact(65) {
+        if table[0] >> 4 != 0 || table[0] & 0x0F > 3 {
+            return Err(bad);
+        }
+    }
+    Ok(body.len() / 65)
+}
+
+/// The Huffman tables in one DHT segment, each `Tc|Th`, sixteen code counts
+/// and that many symbols, with class and slot each 0 or 1 (baseline),
+/// consuming the body exactly. Returns how many tables it held.
+fn check_huffman_tables(body: &[u8]) -> Result<usize, ImageError> {
+    let bad = ImageError::BadTable { marker: DHT };
+    let mut rest = body;
+    let mut tables = 0;
+    while !rest.is_empty() {
+        if rest.len() < 17 || rest[0] >> 4 > 1 || rest[0] & 0x0F > 1 {
+            return Err(bad);
+        }
+        let symbols: usize = rest[1..17].iter().map(|&n| usize::from(n)).sum();
+        // 162 symbols cover every 8-bit AC code; 256 is the hard ceiling.
+        if symbols == 0 || symbols > 256 || rest.len() < 17 + symbols {
+            return Err(bad);
+        }
+        rest = &rest[17 + symbols..];
+        tables += 1;
+    }
+    if tables == 0 {
+        return Err(bad);
+    }
+    Ok(tables)
+}
+
+/// What a frame header says, for the scan to be checked against.
+struct Frame {
+    info: ImageInfo,
+    /// Component ids, in frame order.
+    ids: Vec<u8>,
+}
+
+/// A baseline frame: 8-bit samples, one (grey) or three (colour) components
+/// with distinct ids, sampling factors of 1-4 and a quantisation slot of 0-3,
 /// a length that matches, and dimensions inside the cap.
-fn check_frame(body: &[u8]) -> Result<(ImageInfo, u8), ImageError> {
+fn check_frame(body: &[u8]) -> Result<Frame, ImageError> {
     if body.len() < 6 {
         return Err(ImageError::BadFrame);
     }
@@ -351,19 +494,40 @@ fn check_frame(body: &[u8]) -> Result<(ImageInfo, u8), ImageError> {
     if body.len() != 6 + 3 * usize::from(components) {
         return Err(ImageError::BadFrame);
     }
+    let mut ids = Vec::with_capacity(usize::from(components));
+    for spec in body[6..].chunks_exact(3) {
+        let (id, sampling, slot) = (spec[0], spec[1], spec[2]);
+        let (h, v) = (sampling >> 4, sampling & 0x0F);
+        if ids.contains(&id) || !(1..=4).contains(&h) || !(1..=4).contains(&v) || slot > 3 {
+            return Err(ImageError::BadFrame);
+        }
+        ids.push(id);
+    }
     if width == 0 || height == 0 || width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE {
         return Err(ImageError::Dimensions { width, height });
     }
-    Ok((ImageInfo { width, height }, components))
+    Ok(Frame {
+        info: ImageInfo { width, height },
+        ids,
+    })
 }
 
-/// The one scan must cover every component, since there is no other scan to
-/// carry the rest.
-fn check_scan(body: &[u8], components: u8) -> Result<(), ImageError> {
+/// The one scan must cover every component, in frame order, since there is
+/// no other scan to carry the rest, with baseline Huffman slots (0 or 1) and
+/// the baseline spectral values (0, 63, 0, 0).
+fn check_scan(body: &[u8], ids: &[u8]) -> Result<(), ImageError> {
     let Some(&count) = body.first() else {
         return Err(ImageError::BadScan);
     };
-    if count != components || body.len() != 4 + 2 * usize::from(count) {
+    if usize::from(count) != ids.len() || body.len() != 4 + 2 * usize::from(count) {
+        return Err(ImageError::BadScan);
+    }
+    for (spec, id) in body[1..1 + 2 * ids.len()].chunks_exact(2).zip(ids) {
+        if spec[0] != *id || spec[1] >> 4 > 1 || spec[1] & 0x0F > 1 {
+            return Err(ImageError::BadScan);
+        }
+    }
+    if body[body.len() - 3..] != [0, 63, 0] {
         return Err(ImageError::BadScan);
     }
     Ok(())
@@ -388,8 +552,8 @@ pub fn strip(bytes: &[u8]) -> Result<Vec<u8>, ImageError> {
     for seg in &parsed.head {
         let keep = match seg.marker {
             APP0 => !kept_jfif && check_jfif(seg.body).is_ok(),
-            APP2 => seg.body.starts_with(b"ICC_PROFILE\0"),
-            APP14 => seg.body.starts_with(b"Adobe"),
+            APP2 => seg.body.starts_with(ICC_TAG),
+            APP14 => seg.body.starts_with(ADOBE_TAG),
             0xE0..=0xEF | COM => false,
             _ => true,
         };

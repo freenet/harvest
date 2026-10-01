@@ -57,6 +57,10 @@ OUT="${OUT:-$W/results}"; mkdir -p "$OUT"
 # runs. The hashes go in the results, so a reported number always names the
 # bytes it describes.
 SNAP="$OUT/wasm"; mkdir -p "$SNAP"
+# Not image_contract: under one key it has exactly one valid state (the
+# bytes that hash to the key), so the merge laws are about that state alone.
+# They were checked against the built WASM by hand (see the image contract's
+# section in docs/untested-invariants.md); no corpus here exercises it.
 for a in store_contract reputation_contract mailbox_contract index_contract presence_contract; do
   src="$REPO/target/wasm32-unknown-unknown/release/$a.wasm"
   [ -f "$src" ] && cp "$src" "$SNAP/$a.wasm"

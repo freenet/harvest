@@ -20,7 +20,8 @@ Harvest is built on two layers:
 ```
 harvest/
 ├── common/          # harvest-common: wire types shared across contracts, delegate, UI
-├── contracts/       # Freenet contracts: store, mailbox, reputation
+├── harvest-image/   # listing image rules (baseline JPEG allowlist); deliberately NOT harvest-common
+├── contracts/       # Freenet contracts: store, mailbox, reputation, index, presence, image
 ├── delegates/       # Freenet delegates: harvest delegate (store keys, conversation keys, payment keys, registries)
 ├── ui/              # Dioxus web UI
 └── docs/

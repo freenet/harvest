@@ -104,12 +104,31 @@ fn state_and_delta_is_checked_on_its_state() {
 }
 
 #[test]
-fn related_contract_updates_are_refused() {
-    let related = UpdateData::RelatedState {
+fn related_contract_updates_change_nothing() {
+    let related = || UpdateData::RelatedState {
         related_to: ContractInstanceId::new([7; 32]),
-        state: State::from(IMAGE.to_vec()),
+        state: State::from(OTHER.to_vec()),
     };
-    assert!(update(&[], vec![related]).is_err());
+    assert_eq!(update(IMAGE, vec![related()]).unwrap(), IMAGE);
+    // And cannot stand in for an image either.
+    assert!(update(&[], vec![related()]).is_err());
+}
+
+#[test]
+fn a_wrong_held_copy_is_repaired_by_the_image() {
+    // Validation should make a wrong copy impossible to hold. If one is held
+    // anyway, its summary differs, the peer is sent the image, and the image
+    // must win, or the copy stays wrong for good.
+    assert_eq!(update(OTHER, vec![state(IMAGE)]).unwrap(), IMAGE);
+    assert_eq!(update(OTHER, vec![delta(IMAGE)]).unwrap(), IMAGE);
+    assert_eq!(update(b"junk", vec![delta(IMAGE)]).unwrap(), IMAGE);
+}
+
+#[test]
+fn an_update_never_returns_an_invalid_state() {
+    // Nothing held and nothing new: no valid image to hand back.
+    assert!(update(&[], vec![delta(&[])]).is_err());
+    assert!(update(&[], vec![]).is_err());
 }
 
 #[test]

@@ -75,7 +75,8 @@ The probe runs client-side in the UI, so `harvest-ui` is the crate that needs
 the generated consts and the crate whose `build.rs` emits them.
 
 The TOML itself sits at the repo root rather than under `ui/` for one reason
-that matters: `harvest-common` is compiled *into* all three contracts, so
+that matters: `harvest-common` is compiled *into* every contract but the
+image contract (which depends on `harvest-image` alone, on purpose), so
 anything codegen'd there would make **editing a registry re-key every contract
 it describes** -- a migration registry that causes the migration it records.
 The root keeps the registries visibly outside the contract build graph, and

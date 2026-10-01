@@ -17,13 +17,15 @@
 //!
 //! - **The empty state is invalid** (`harvest_image::validate`). Otherwise
 //!   anyone could publish nothing under any image's key.
-//! - **`update_state` never replaces a non-empty state.** It keeps what it
-//!   holds and refuses anything that is not that state. Taking the incoming
-//!   state, as the pack contract does, is safe there only because its
-//!   validation already refuses empty bytes.
+//! - **`update_state` never replaces a valid held state**, and every
+//!   incoming copy must itself be valid, so an update can only ever leave
+//!   the one valid image in place, or put it there over nothing (or over a
+//!   wrong copy, which validation should make impossible). Its result is
+//!   checked once more before it is returned.
 //! - **The summary is the hash of the state actually held**, not the
 //!   parameters. A wrong copy (which validation should make impossible) can
-//!   then never claim to be in sync with a right one.
+//!   then never claim to be in sync with a right one, and is sent the image,
+//!   which `update_state` takes over it.
 //!
 //! A peer whose summary differs is sent the whole image as its "delta": a
 //! fixed state has no smaller difference to send, and `update_state` checks
@@ -46,24 +48,21 @@ fn check(parameters: &Parameters<'_>, state: &[u8]) -> Result<(), ContractError>
         .map_err(|e| invalid(e.to_string()))
 }
 
-/// Fold one incoming copy into the held state: take it if nothing is held,
-/// accept it if it is what is held, refuse it otherwise.
+/// Fold one incoming copy into the held state. The incoming copy must be
+/// valid. If what is held is not (nothing, or bytes that are not this
+/// image), the valid copy replaces it: that is the repair the hash summary
+/// exists to trigger. A valid held copy is kept.
 fn merge(
     parameters: &Parameters<'_>,
     held: Vec<u8>,
     incoming: &[u8],
 ) -> Result<Vec<u8>, ContractError> {
     check(parameters, incoming)?;
-    if held.is_empty() {
+    if check(parameters, &held).is_err() {
         return Ok(incoming.to_vec());
     }
-    if held != incoming {
-        // Unreachable while `check` holds both to one hash; refused rather
-        // than taken, so a defect there cannot become a replaced image.
-        // (So no test can tell this line from its removal: a mutation
-        // check of it survives, by design.)
-        return Err(invalid("an image's state can never change".into()));
-    }
+    // Both are valid, so both hash to the parameters and are the same bytes:
+    // keeping `held` and taking `incoming` are one outcome.
     Ok(held)
 }
 
@@ -95,9 +94,15 @@ impl ContractInterface for Contract {
                 UpdateData::StateAndDelta { state, .. } => {
                     merge(&parameters, held, state.as_ref())?
                 }
-                _ => return Err(invalid("an image contract reads no other contract".into())),
+                // An image depends on no other contract. A node passes along
+                // related states that arrive with an upsert; they say nothing
+                // about this one, so they change nothing.
+                _ => held,
             };
         }
+        // Never hand back a state `validate_state` would refuse, such as
+        // nothing at all after an update of only empty deltas.
+        check(&parameters, &held)?;
         Ok(UpdateModification::valid(State::from(held)))
     }
 

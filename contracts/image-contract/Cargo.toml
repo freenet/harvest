@@ -7,8 +7,10 @@ repository.workspace = true
 description = "Harvest listing image contract: an immutable baseline JPEG addressed by its BLAKE3 hash"
 
 # No harvest-common. This WASM's code hash is part of every image's address,
-# so it depends only on the image rules and the contract interface. A change
-# anywhere else in Harvest must not move it.
+# so it depends only on the image rules and the contract interface, and
+# scripts/build-contract-wasm.sh builds it alone so that no other crate's
+# features are unified into it. A change anywhere else in Harvest must not
+# move it.
 [dependencies]
 harvest-image = { workspace = true }
 freenet-stdlib = { workspace = true }

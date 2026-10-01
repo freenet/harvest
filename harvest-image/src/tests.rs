@@ -6,6 +6,9 @@ use super::*;
 const CHROMIUM: &[u8] = include_bytes!("../tests/fixtures/chromium-canvas.jpg");
 const FIREFOX: &[u8] = include_bytes!("../tests/fixtures/firefox-canvas.jpg");
 const WEBKIT: &[u8] = include_bytes!("../tests/fixtures/webkit-canvas.jpg");
+/// A one-component (grey) baseline JPEG from Pillow (libjpeg): no canvas
+/// writes one, but a grey frame is legal baseline and must stay accepted.
+const GREY: &[u8] = include_bytes!("../tests/fixtures/pillow-gray.jpg");
 /// Chromium's `toBlob("image/webp")`: the format this crate refuses.
 const WEBP: &[u8] = include_bytes!("../tests/fixtures/chromium-canvas.webp");
 
@@ -590,4 +593,305 @@ fn a_well_formed_scan_of_fewer_components_than_the_frame_is_refused() {
         sniff(&replace_segment(FIREFOX, SOS, &scan)),
         Err(ImageError::BadScan)
     );
+}
+
+/// `jpeg` with every segment of `marker` before the scan removed.
+fn without(jpeg: &[u8], marker: u8) -> Vec<u8> {
+    let mut v = jpeg.to_vec();
+    loop {
+        let mut i = 2;
+        let mut found = None;
+        while v[i + 1] != SOS {
+            let len = usize::from(u16::from_be_bytes([v[i + 2], v[i + 3]]));
+            if v[i + 1] == marker {
+                found = Some((i, 2 + len));
+                break;
+            }
+            i += 2 + len;
+        }
+        match found {
+            Some((at, n)) => {
+                v.drain(at..at + n);
+            }
+            None => return v,
+        }
+    }
+}
+
+fn body_of(jpeg: &[u8], marker: u8) -> Vec<u8> {
+    let at = find(jpeg, marker);
+    let len = usize::from(u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]));
+    jpeg[at + 4..at + 2 + len].to_vec()
+}
+
+#[test]
+fn a_grey_baseline_jpeg_is_accepted() {
+    assert_eq!(
+        sniff(GREY),
+        Ok(ImageInfo {
+            width: 160,
+            height: 120
+        })
+    );
+    assert_eq!(strip(GREY).as_deref(), Ok(GREY));
+}
+
+#[test]
+fn an_app0_of_the_plain_length_that_is_not_jfif_is_refused() {
+    let mut body = jfif_body();
+    body[..5].copy_from_slice(b"JFXX\0");
+    assert_eq!(
+        sniff(&replace_segment(FIREFOX, APP0, &body)),
+        Err(ImageError::BadJfif)
+    );
+}
+
+#[test]
+fn a_second_byte_that_is_not_start_of_image_is_refused() {
+    let mut v = FIREFOX.to_vec();
+    v[1] = 0xD9;
+    assert_eq!(sniff(&v), Err(ImageError::NotJpeg));
+}
+
+#[test]
+fn the_size_cap_runs_before_the_hash() {
+    // Wrong hash AND oversized: the size is what is reported, so the
+    // oversized bytes were never hashed.
+    let big = vec![0u8; MAX_IMAGE_BYTES + 1];
+    assert_eq!(
+        validate(&[0; 32], &big),
+        Err(ImageError::TooLarge(MAX_IMAGE_BYTES + 1))
+    );
+    // Exactly at the cap is not "too large" (it fails later, as a non-JPEG).
+    let at_cap = vec![0u8; MAX_IMAGE_BYTES];
+    assert_eq!(
+        validate(&image_hash(&at_cap), &at_cap),
+        Err(ImageError::NotJpeg)
+    );
+}
+
+#[test]
+fn short_frame_and_scan_headers_are_refused_without_panicking() {
+    for len in 0..6 {
+        let body = &frame_body(3)[..len];
+        assert_eq!(
+            sniff(&replace_segment(FIREFOX, SOF0, body)),
+            Err(ImageError::BadFrame)
+        );
+    }
+    assert_eq!(
+        sniff(&replace_segment(FIREFOX, SOS, &[])),
+        Err(ImageError::BadScan)
+    );
+}
+
+#[test]
+fn a_scan_header_with_extra_bytes_is_refused() {
+    // Extra bytes that still END in the baseline spectral values, so only
+    // the length rule can see them.
+    let mut scan = body_of(FIREFOX, SOS);
+    scan.extend_from_slice(&[0, 63, 0]);
+    assert_eq!(
+        sniff(&replace_segment(FIREFOX, SOS, &scan)),
+        Err(ImageError::BadScan)
+    );
+}
+
+/// One way to spoil a header, for a table of cases.
+type Change = fn(&mut Vec<u8>);
+
+#[test]
+fn a_scan_must_name_the_frame_components_in_order_with_baseline_values() {
+    let good = body_of(FIREFOX, SOS);
+    assert!(sniff(&replace_segment(FIREFOX, SOS, &good)).is_ok());
+    let cases: [(&str, Change); 7] = [
+        ("unknown id", |s| s[1] = 0x99),
+        ("ids out of order", |s| s.swap(1, 3)),
+        ("DC table slot 2", |s| s[2] = 0x20 | (s[2] & 0x0F)),
+        ("AC table slot 2", |s| s[2] = (s[2] & 0xF0) | 2),
+        ("spectral start", |s| {
+            *s.iter_mut().rev().nth(2).unwrap() = 1
+        }),
+        ("spectral end", |s| *s.iter_mut().rev().nth(1).unwrap() = 5),
+        ("approximation", |s| *s.last_mut().unwrap() = 0x10),
+    ];
+    for (what, change) in cases {
+        let mut scan = good.clone();
+        change(&mut scan);
+        assert_eq!(
+            sniff(&replace_segment(FIREFOX, SOS, &scan)),
+            Err(ImageError::BadScan),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn frame_components_must_be_distinct_with_baseline_sampling_and_slots() {
+    let cases: [(&str, Change); 5] = [
+        ("repeated id", |f| f[9] = f[6]),
+        ("zero horizontal sampling", |f| f[7] = 0x01),
+        ("zero vertical sampling", |f| f[7] = 0x10),
+        ("sampling of five", |f| f[7] = 0x51),
+        ("quantisation slot 4", |f| f[8] = 4),
+    ];
+    for (what, change) in cases {
+        let mut frame = frame_body(3);
+        change(&mut frame);
+        assert_eq!(
+            sniff(&replace_segment(FIREFOX, SOF0, &frame)),
+            Err(ImageError::BadFrame),
+            "{what}"
+        );
+    }
+    // The unchanged form is accepted, so each case above is refused for its
+    // own reason. (Firefox's scan names ids 1, 2, 3, as `frame_body` does.)
+    assert!(sniff(&replace_segment(FIREFOX, SOF0, &frame_body(3))).is_ok());
+}
+
+#[test]
+fn restart_markers_inside_the_scan_are_accepted() {
+    let mut v = before_sos(FIREFOX, &segment(DRI, &[0, 4]));
+    let scan_data = find(&v, SOS) + 2 + body_of(&v, SOS).len() + 2;
+    for (k, rst) in (0xD0..=0xD7).enumerate() {
+        let at = scan_data + 20 + 10 * k;
+        v.splice(at..at, [0xFF, rst]);
+    }
+    assert!(sniff(&v).is_ok());
+}
+
+#[test]
+fn a_segment_between_the_scan_and_the_end_is_refused() {
+    let mut v = FIREFOX[..FIREFOX.len() - 2].to_vec();
+    v.extend_from_slice(&segment(0xE1, &exif_with_gps()));
+    v.extend_from_slice(&[0xFF, EOI]);
+    assert_eq!(
+        sniff(&v),
+        Err(ImageError::UnexpectedMarker { marker: 0xE1 })
+    );
+}
+
+#[test]
+fn an_empty_scan_is_refused() {
+    let sos = find(FIREFOX, SOS);
+    let mut v = FIREFOX[..sos + 2 + 2 + body_of(FIREFOX, SOS).len()].to_vec();
+    v.extend_from_slice(&[0xFF, EOI]);
+    assert_eq!(sniff(&v), Err(ImageError::EmptyScan));
+}
+
+#[test]
+fn both_kinds_of_table_are_required() {
+    assert_eq!(sniff(&without(FIREFOX, DQT)), Err(ImageError::NoTables));
+    assert_eq!(sniff(&without(FIREFOX, DHT)), Err(ImageError::NoTables));
+}
+
+#[test]
+fn quantisation_tables_must_be_baseline_and_exact() {
+    let good = body_of(FIREFOX, DQT);
+    assert_eq!(good.len(), 65);
+    let bad = |body: &[u8]| sniff(&replace_segment(FIREFOX, DQT, body));
+    let mut sixteen_bit = good.clone();
+    sixteen_bit[0] |= 0x10;
+    assert_eq!(bad(&sixteen_bit), Err(ImageError::BadTable { marker: DQT }));
+    let mut slot_four = good.clone();
+    slot_four[0] = 4;
+    assert_eq!(bad(&slot_four), Err(ImageError::BadTable { marker: DQT }));
+    let mut long = good.clone();
+    long.push(0);
+    assert_eq!(bad(&long), Err(ImageError::BadTable { marker: DQT }));
+    assert_eq!(bad(&[]), Err(ImageError::BadTable { marker: DQT }));
+    // Five tables: one more than a baseline decoder has slots for.
+    let mut five = Vec::new();
+    for _ in 0..4 {
+        five.extend_from_slice(&good);
+    }
+    assert_eq!(
+        bad(&five),
+        Err(ImageError::BadTable { marker: DQT }),
+        "4 here + 1 more = 5"
+    );
+}
+
+#[test]
+fn huffman_tables_must_be_baseline_and_exact() {
+    let good = body_of(FIREFOX, DHT);
+    let bad = |body: &[u8]| sniff(&replace_segment(FIREFOX, DHT, body));
+    let refused = Err(ImageError::BadTable { marker: DHT });
+    let mut class_two = good.clone();
+    class_two[0] = 0x20;
+    assert_eq!(bad(&class_two), refused);
+    let mut slot_two = good.clone();
+    slot_two[0] = 0x02;
+    assert_eq!(bad(&slot_two), refused);
+    let mut extra = good.clone();
+    extra.push(0);
+    assert_eq!(bad(&extra), refused, "a byte after the last table");
+    assert_eq!(bad(&good[..good.len() - 1]), refused, "one symbol short");
+    let mut no_codes = good[..17].to_vec();
+    no_codes[1..17].fill(0);
+    assert_eq!(bad(&no_codes), refused);
+    assert_eq!(bad(&[]), refused);
+    // A fifth table, beyond the four baseline slots.
+    assert_eq!(sniff(&before_sos(FIREFOX, &segment(DHT, &good))), refused);
+}
+
+#[test]
+fn the_icc_profile_is_one_bounded_chunk() {
+    let icc = body_of(CHROMIUM, APP2);
+    let bad = |v: Vec<u8>| sniff(&v);
+    assert_eq!(
+        bad(after_soi(CHROMIUM, &segment(APP2, &icc))),
+        Err(ImageError::Duplicate { marker: APP2 })
+    );
+    let mut one_of_two = icc.clone();
+    one_of_two[13] = 2;
+    assert_eq!(
+        bad(replace_segment(CHROMIUM, APP2, &one_of_two)),
+        Err(ImageError::BadIcc)
+    );
+    let mut second = icc.clone();
+    second[12] = 2;
+    assert_eq!(
+        bad(replace_segment(CHROMIUM, APP2, &second)),
+        Err(ImageError::BadIcc)
+    );
+    let mut huge = icc[..14].to_vec();
+    huge.resize(14 + MAX_ICC_PROFILE_BYTES + 1, 0);
+    assert_eq!(
+        bad(replace_segment(CHROMIUM, APP2, &huge)),
+        Err(ImageError::BadIcc)
+    );
+    huge.pop();
+    assert!(
+        bad(replace_segment(CHROMIUM, APP2, &huge)).is_ok(),
+        "exactly at the cap"
+    );
+    assert_eq!(
+        bad(replace_segment(CHROMIUM, APP2, &icc[..14])),
+        Err(ImageError::BadIcc),
+        "no profile"
+    );
+}
+
+#[test]
+fn an_adobe_segment_must_be_its_fixed_form() {
+    let mut long = b"Adobe\0\x64\0\0\0\0\x01".to_vec();
+    long.push(0);
+    assert_eq!(
+        sniff(&after_soi(FIREFOX, &segment(APP14, &long))),
+        Err(ImageError::BadAdobe)
+    );
+    assert_eq!(
+        sniff(&after_soi(FIREFOX, &segment(APP14, b"Adobe"))),
+        Err(ImageError::BadAdobe)
+    );
+}
+
+#[test]
+fn strip_keeps_an_adobe_segment_and_drops_another_app14() {
+    let adobe = segment(APP14, b"Adobe\0\x64\0\0\0\0\x01");
+    let with_adobe = after_soi(FIREFOX, &adobe);
+    assert_eq!(strip(&with_adobe).as_deref(), Ok(&with_adobe[..]));
+    let ducky = after_soi(FIREFOX, &segment(APP14, b"Ducky\0\x01"));
+    assert_eq!(strip(&ducky).as_deref(), Ok(FIREFOX));
 }
