@@ -1213,6 +1213,28 @@ pub(crate) mod tests {
             .any(|n| n.contains("use a different Ghost Key")));
     }
 
+    /// Each gate answer maps to going on or to a refusal that says why.
+    #[test]
+    fn creation_refusal_says_why_for_each_gate() {
+        use crate::index_flow::CreationGate;
+        assert_eq!(creation_refusal(&CreationGate::Ready), None);
+        assert_eq!(creation_refusal(&CreationGate::Unconfirmed), None);
+        assert_eq!(
+            creation_refusal(&CreationGate::Checking).as_deref(),
+            Some(STILL_CHECKING_GHOST_KEY)
+        );
+        assert!(
+            creation_refusal(&CreationGate::BacksStore("Bean Shop".into()))
+                .unwrap()
+                .contains("already has a store, Bean Shop")
+        );
+        assert!(
+            creation_refusal(&CreationGate::ListsUnloadedStore("abc".into()))
+                .unwrap()
+                .contains("(code abc)")
+        );
+    }
+
     /// The delegate's own refusal of a second store still offers one "on
     /// purpose", which this build no longer has (harvest#181): the seller is
     /// told what they can do instead. Mutated red by passing the delegate's
