@@ -47,6 +47,61 @@ pub(crate) fn amount_text(sats: u64, network: BitcoinNetwork) -> String {
     format!("{} {}", btc_amount(sats), coin_unit(network))
 }
 
+/// `sats` in bitcoin with no trailing zeros, as a price reads: 10000 is
+/// "0.0001", 100000000 is "1". Integer arithmetic, so nothing is rounded.
+pub(crate) fn coins(sats: u64) -> String {
+    let whole = sats / 100_000_000;
+    let fraction = sats % 100_000_000;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let digits = format!("{fraction:08}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
+/// A price or an order's amount, the one way every page writes money (page
+/// structure, rule 7): "0.0001 tBTC". Where it is a price on its own, the
+/// page puts the "test coins" tag beside it ([`TEST_COIN_TAG`]).
+pub(crate) fn money(sats: u64, network: BitcoinNetwork) -> String {
+    format!("{} {}", coins(sats), coin_unit(network))
+}
+
+/// The tag beside a test-network price.
+pub(crate) const TEST_COIN_TAG: &str = "test coins";
+
+/// A price typed in bitcoin ("0.0001", "1", ".5"), in sats: at most eight
+/// decimals, no sign, and no more than there will ever be. `None` for
+/// anything else.
+pub(crate) fn parse_coins(typed: &str) -> Option<u64> {
+    let typed = typed.trim();
+    let (whole, fraction) = match typed.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (typed, ""),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty())
+        || !digits(whole)
+        || !digits(fraction)
+        || fraction.len() > 8
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    if whole > 21_000_000 {
+        return None;
+    }
+    let fraction: u64 = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<8}").parse().ok()?
+    };
+    whole.checked_mul(100_000_000)?.checked_add(fraction)
+}
+
 /// The BIP21 link that opens a wallet with this payment filled in. The
 /// amount is in bitcoin, as BIP21 requires.
 pub(crate) fn payment_uri(address: &str, sats: u64) -> String {
@@ -311,6 +366,46 @@ async fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 async fn copy_to_clipboard(_text: &str) -> bool {
     false
+}
+
+#[cfg(test)]
+mod money_tests {
+    use super::*;
+
+    /// One money format: bitcoin with no trailing zeros, and the unit.
+    #[test]
+    fn money_reads_as_bitcoin_with_no_trailing_zeros() {
+        assert_eq!(coins(10_000), "0.0001");
+        assert_eq!(coins(12_000), "0.00012");
+        assert_eq!(coins(100_000_000), "1");
+        assert_eq!(coins(150_000_000), "1.5");
+        assert_eq!(coins(1), "0.00000001");
+        assert_eq!(coins(0), "0");
+        assert_eq!(money(10_000, BitcoinNetwork::Signet), "0.0001 tBTC");
+        assert_eq!(money(10_000, BitcoinNetwork::Bitcoin), "0.0001 BTC");
+    }
+
+    /// A typed price reads back as the sats it names, and what is not a
+    /// price is refused. Red with the eight-decimal limit dropped.
+    #[test]
+    fn a_typed_price_is_read_in_bitcoin() {
+        assert_eq!(parse_coins("0.0001"), Some(10_000));
+        assert_eq!(parse_coins(" 0.00012 "), Some(12_000));
+        assert_eq!(parse_coins("1"), Some(100_000_000));
+        assert_eq!(parse_coins(".5"), Some(50_000_000));
+        assert_eq!(parse_coins("2."), Some(200_000_000));
+        assert_eq!(parse_coins("0"), Some(0));
+        assert_eq!(parse_coins("0.000000001"), None, "nine decimals");
+        assert_eq!(parse_coins(""), None);
+        assert_eq!(parse_coins("."), None);
+        assert_eq!(parse_coins("-1"), None);
+        assert_eq!(parse_coins("1,5"), None);
+        assert_eq!(parse_coins("1.2.3"), None);
+        assert_eq!(parse_coins("21000001"), None);
+        for sats in [1u64, 10_000, 12_345, 100_000_000, 2_100_000_000_000_000] {
+            assert_eq!(parse_coins(&coins(sats)), Some(sats));
+        }
+    }
 }
 
 #[cfg(test)]

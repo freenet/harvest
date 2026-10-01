@@ -35,6 +35,8 @@ pub enum SellerRequest {
 /// ([`AppState::seller_order_request`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SellerOrderRequest {
+    /// The listing the buyer asked for.
+    pub listing_id: Option<harvest_common::listing::ListingId>,
     /// The listing's title, while the store still lists it.
     pub title: Option<String>,
     pub quantity: u32,
@@ -7365,6 +7367,7 @@ impl AppState {
                     Some((
                         answering.order.id.clone(),
                         SellerOrderRequest {
+                            listing_id: Some(listing_id.clone()),
                             title: listing.map(|l| l.title.clone()),
                             quantity: *quantity,
                             shipping: shipping.clone(),
@@ -7432,6 +7435,17 @@ impl AppState {
         store_contract_id: &[u8],
         purchase: &BuyerPurchase,
     ) -> Option<(Option<String>, u32)> {
+        self.purchase_listing(store_contract_id, purchase)
+            .map(|(_, title, quantity)| (title, quantity))
+    }
+
+    /// [`Self::purchase_item`] with the listing the buyer asked for, which a
+    /// purchase's row and page show the item's picture by, when it has one.
+    pub fn purchase_listing(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<(harvest_common::listing::ListingId, Option<String>, u32)> {
         use crate::messaging::{Addressing, MessageContent};
         let store = self.browsing_stores.get(store_contract_id)?;
         let conversation = store
@@ -7472,7 +7486,64 @@ impl AppState {
             .iter()
             .find(|l| l.listing.id == listing_id)
             .map(|l| l.listing.title.clone());
-        Some((title, quantity))
+        Some((listing_id, title, quantity))
+    }
+
+    /// Where the buyer asked for `purchase` to be sent, as they typed it in
+    /// their own request: the address, the note, and the region and picks
+    /// (named by their group). The order page shows it under "Sending to".
+    /// `None` when the request is not in this device's thread, or two
+    /// requests under the order's id disagree.
+    pub fn purchase_ship_to(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<SellerOrderRequest> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)?;
+        let asked: Vec<SellerOrderRequest> = conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    shipping,
+                    note,
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&purchase.conversation)
+                        .is_some_and(|request| request.order_id() == purchase.order_id) =>
+                {
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == listing_id)
+                        .map(|l| &l.listing);
+                    Some(SellerOrderRequest {
+                        title: listing.map(|l| l.title.clone()),
+                        listing_id: Some(listing_id),
+                        quantity,
+                        shipping,
+                        note,
+                        region: selection.region.clone(),
+                        choices: labelled_choices(
+                            listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                            &selection.choices,
+                        ),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let first = asked.first()?.clone();
+        asked.iter().all(|other| *other == first).then_some(first)
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for

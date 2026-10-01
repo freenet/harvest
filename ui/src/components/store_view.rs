@@ -1,7 +1,6 @@
 use dioxus::prelude::*;
 use harvest_common::listing::{AuthorizedListing, ListingAvailability};
 
-use super::app::{open_seller_page, Route, SellerPage, ROUTE};
 use crate::gateway::APP_STATE;
 use crate::presence_flow::SellerStatus;
 use crate::state::{AppState, BuyerOpen, StoreListRow, StoreName};
@@ -75,7 +74,7 @@ pub fn StoresPage() -> Element {
                 }
                 button {
                     class: "link-btn",
-                    onclick: move |_| open_seller_page(SellerPage::AnotherStore),
+                    onclick: move |_| super::router::go(super::router::Page::OpenStore { another: true }),
                     "Open another store"
                 }
             }
@@ -95,7 +94,7 @@ pub fn StoresPage() -> Element {
                     }
                     button {
                         class: "link-btn",
-                        onclick: move |_| open_seller_page(SellerPage::First),
+                        onclick: move |_| super::router::go(super::router::Page::OpenStore { another: false }),
                         "Open a store \u{203a}"
                     }
                 }
@@ -300,7 +299,7 @@ fn OwnStoreCard(row: OwnStoreRow) -> Element {
             class: "rowcard",
             onclick: {
                 let id = row.contract_id.clone();
-                move |_| open_seller_page(SellerPage::Store(id.clone()))
+                move |_| super::router::go(super::seller_pages::seller_page(&id, super::router::SellerView::Home))
             },
             span { class: "rc-main",
                 span { class: if row.named { "rc-name" } else { "rc-name rc-pending" }, "{row.label}" }
@@ -511,100 +510,83 @@ fn VisitedRow(row: StoreListRow, collides: bool) -> Element {
     }
 }
 
-/// A store's own page (the 2026-09-30 redesign, after the mockup's
-/// `scrStore()`): only that store, with a way back to Stores. Loading and a
-/// link that opened nothing are said here, where the store would be.
+/// P2, a store as buyers see it: its header (name, Open or Closed, the
+/// trust line, one line about it, "Message the seller"), the test-coin note
+/// once, a line to this buyer's orders from it, and three tabs: Items,
+/// About, Record. Loading and a link that opened nothing are said here,
+/// where the store would be.
 #[component]
-pub fn StorePage() -> Element {
+pub fn StorePage(store: Vec<u8>, tab: super::router::StoreTab) -> Element {
     let app_state = APP_STATE.read();
-
-    // `AppState::displayed_store` owns this choice, so the document title
-    // (see `components::App`) cannot answer it differently.
-    let store_entry = app_state
-        .displayed_store()
-        .map(|(id, store)| (id.clone(), store.clone()));
-
+    let entry = app_state
+        .browsing_stores
+        .get(&store)
+        .filter(|s| s.info.is_some())
+        .cloned();
     // A store was opened but its state hasn't come back yet. Once
     // `store_link_error` is set, or the store is otherwise known not to have
     // arrived (`AppState::store_name_of`), the wait is over and the message
     // changes -- otherwise this reads "Loading store…" for the rest of the
     // session.
     let link_error = app_state.store_link_error.clone();
-    let unreachable = store_entry.is_none()
-        && app_state
-            .active_store_id
-            .as_ref()
-            .is_some_and(|id| app_state.store_name_of(id) == StoreName::Unreachable);
-    let awaiting = store_entry.is_none()
-        && app_state.active_store_id.is_some()
-        && link_error.is_none()
-        && !unreachable;
-    // On one of our own stores the banner's "Back to managing it" is the way
-    // back; a crumb to Stores above it would be a second one going somewhere
-    // else (critique 02s-1). Until the store has loaded there is no banner,
-    // so the crumb stays until then.
-    let owned = store_entry.is_some()
-        && app_state
-            .active_store_id
-            .as_ref()
-            .is_some_and(|id| app_state.store_owner_fingerprint(id).is_some());
+    let unreachable = entry.is_none()
+        && !store.is_empty()
+        && app_state.store_name_of(&store) == StoreName::Unreachable;
+    let awaiting = entry.is_none() && !store.is_empty() && link_error.is_none() && !unreachable;
     drop(app_state);
 
-    rsx! {
-        div { class: "store-page",
-            if !owned {
-                button {
-                    class: "crumb",
-                    onclick: move |_| *ROUTE.write() = Route::Stores,
-                    "\u{2039} Stores"
+    match entry {
+        Some(loaded) => rsx! {
+            LoadedStore { store: loaded, contract_id: store.clone(), tab }
+        },
+        None => rsx! {
+            super::seller_pages::BackTo { label: "Stores".to_string(), page: super::router::Page::Stores }
+            if awaiting {
+                p { class: "text-muted text-italic", "Loading store\u{2026}" }
+            } else if let Some(message) = link_error {
+                p { class: "text-warning", "{message}" }
+            } else if unreachable {
+                p { class: "text-warning",
+                    "That store didn\u{2019}t load. It may not be reachable right now."
                 }
+            } else {
+                p { class: "text-muted text-italic", "No store is open." }
             }
-            match store_entry {
-                Some((contract_id, store)) => {
-                    rsx! { LoadedStore { store: store, contract_id: contract_id } }
-                }
-                None if awaiting => {
-                    rsx! {
-                        p { class: "text-muted text-italic", "Loading store\u{2026}" }
-                    }
-                }
-                None => {
-                    match link_error {
-                        Some(message) => rsx! {
-                            p { class: "text-warning", "{message}" }
-                        },
-                        None if unreachable => rsx! {
-                            p { class: "text-warning",
-                                "That store didn\u{2019}t load. It may not be reachable right now."
-                            }
-                        },
-                        None => rsx! {
-                            p { class: "text-muted text-italic", "No store is open." }
-                        },
-                    }
-                }
-            }
-        }
+        },
     }
 }
 
+/// The conversation "Message the seller" opens on a store's page: the one a
+/// new message would continue (the store's last), or a new one.
+pub(crate) fn conversation_page(state: &AppState, store_contract_id: &[u8]) -> super::router::Page {
+    super::router::Page::Conversation {
+        store: store_contract_id.to_vec(),
+        tag: state
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.conversations.last())
+            .map(|c| c.buyer_public_key),
+    }
+}
+
+/// The store's header on its page, shared by the item page's way back.
 #[component]
-fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Element {
+fn LoadedStore(
+    store: crate::state::BrowsingStore,
+    contract_id: Vec<u8>,
+    tab: super::router::StoreTab,
+) -> Element {
+    use super::router::{go, Page, StoreTab};
     let info = store.info.as_ref().unwrap();
     // Counted the way the store's record (`StoreRecord`) counts them
     // (`BrowsingStore::complaint_standings`), so the trust line and the
     // record agree, and neither reads the store's status.
     let (backing_text, record_text) = trust_parts(&store);
     let unrecognised_complaints = store.complaints_under_unrecognised_bridges();
-    let mut show_messages = use_signal(|| false);
-    let mut show_record = use_signal(|| false);
     // A listing its seller took down is not shown to buyers at all
-    // (harvest#70); one that sold out is, marked, so an old link does not
+    // (harvest#70); one that sold out is, last, so an old link does not
     // land on a gap.
     let listings = visible_listings(&store);
-    // Read once, here, rather than inside the per-listing helper: this
-    // component re-renders on every keystroke in the boxes below it, and the
-    // answer cannot change between two listings of the same store.
     let owned = APP_STATE
         .read()
         .store_owner_fingerprint(&contract_id)
@@ -626,233 +608,410 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     let now = crate::state::now_ms();
     let presence = APP_STATE.read().store_presence(&contract_id, now);
     // Open only where a buyer can buy: the one answer the visited rows and
-    // the seller's own cards give too (`AppState::buyer_open`; codex on
-    // #197: presence alone called a store Open whose Buy controls were all
-    // hidden).
+    // the seller's own cards give too (`AppState::buyer_open`).
     let buyer_open = APP_STATE.read().buyer_open(&contract_id, now);
     let pill = buyer_open.pill();
     let pill_open = buyer_open == BuyerOpen::Open;
     let is_closed = buyer_open == BuyerOpen::Closed;
-    // Presence says open, and yet no order can be taken: why, beside the
-    // Closed pill (round 2 of #197: an unbacked store read Closed with no
-    // reason given).
     let cannot_take = !store.closed && presence.is_open() && !store.takes_orders();
     let name = match info.store_name.trim() {
         "" => StoreName::Unnamed.label(),
         name => name.to_string(),
     };
+    let tagline = crate::markdown::first_line(&info.description);
     // This buyer's orders from this store are on Purchases, once: here only
     // a line that goes there (critique S2-10).
-    let orders_here = if owned {
+    let orders = if owned {
         OrdersHere::default()
     } else {
         orders_here(&APP_STATE.read().buyer_purchases(&contract_id))
     };
+    let network = crate::gateway::bitcoin_config::default_network();
+    let test = super::pay_card::is_test_network(network);
+    let message_to = conversation_page(&APP_STATE.read(), &contract_id);
+    let items: Vec<ItemSummary> = listings
+        .iter()
+        .map(|(listing, availability)| {
+            item_summary(
+                &store,
+                &contract_id,
+                owned,
+                listing,
+                availability,
+                pill_open,
+                is_closed,
+            )
+        })
+        .collect();
 
     rsx! {
-        div {
-            // A seller looking at their own store sees it as a buyer would,
-            // and is sent back to its seller pages to manage it rather than
-            // offered a way to message themselves (entity model, wireframe F).
-            if owned {
-                div { class: "own-store-banner",
-                    span { "This is your store, as buyers see it." }
-                    button {
-                        class: "btn btn-sm btn-outline",
-                        onclick: {
-                            let id = contract_id.clone();
-                            move |_| open_seller_page(SellerPage::Store(id.clone()))
-                        },
-                        "Back to managing it"
-                    }
+        if owned {
+            div { class: "own-store-banner",
+                span { "This is your store, as buyers see it." }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: {
+                        let id = contract_id.clone();
+                        move |_| go(super::seller_pages::seller_page(&id, super::router::SellerView::Home))
+                    },
+                    "Back to managing it"
                 }
             }
-
-            div { class: if is_closed { "store-header store-header-closed" } else { "store-header" },
-                // Open or Closed beside the name, as buyers see it
-                // (`presence_flow`; the 2026-09-26 decision, critique S2-3).
-                div { class: "store-status",
-                    h2 { class: "store-name", "{name}" }
+        } else {
+            super::seller_pages::BackTo { label: "Stores".to_string(), page: Page::Stores }
+        }
+        div { class: if is_closed { "store-head store-head-closed" } else { "store-head" },
+            div { class: "store-head-main",
+                div { class: "store-head-title",
+                    h2 { class: "store-title", "{name}" }
                     span { class: if pill_open { "pill pill-open" } else { "pill" }, "{pill}" }
                 }
                 // What the seller has at stake, in a buyer's words: never a
                 // key id or "Ghost Key" (mockup decision 3, critique S2-2).
-                // No "Open since" and no amount: see `backing_words`.
                 p { class: "trust",
                     "{backing_text} \u{00b7} "
-                    // "No complaints" only once the record has been read
-                    // (review round 1 of #143, P1-5). Opens the store's
-                    // record, under its own heading (critique S2-4).
                     button {
-                        // One neutral colour whatever the count: an alarm
-                        // colour before the buyer knows what the record says
-                        // told them nothing (critique 02-4).
                         class: "link-btn trust-record",
-                        aria_expanded: if show_record() { "true" } else { "false" },
-                        aria_controls: "store-record",
-                        onclick: move |_| show_record.toggle(),
+                        onclick: {
+                            let id = contract_id.clone();
+                            move |_| go(Page::Store { store: id.clone(), tab: StoreTab::Record })
+                        },
                         "{record_text}"
                     }
                 }
-                if store.certificate_status.is_verified() {
-                    p { class: "trust-why", "{TRUST_WHY}" }
+                if let Some(ref tagline) = tagline {
+                    p { class: "store-tagline", "{tagline}" }
                 }
-                crate::markdown::Markdown {
-                    source: info.description.clone(),
-                    class: "store-desc",
-                }
-
-                // The verdict, spelled out. The trust line alone tells a
-                // buyer that something is wrong without telling them what it
-                // costs them, and this is the one line on the page that
-                // decides whether the seller has anything at stake.
                 if !store.certificate_status.is_verified() {
-                    p { class: "text-warning",
-                        "{certificate_warning(&store.certificate_status)}"
-                    }
+                    p { class: "text-warning", "{certificate_warning(&store.certificate_status)}" }
                 }
-
-                // Round 6 of #143: past the cap the count is a floor.
-                if store.record_full() {
-                    p { class: "text-warning",
-                        "This seller's record is full: it holds {harvest_common::reputation::MAX_COMPLAINTS} \
-                         complaints, the most a record can. A new complaint is kept only in place of \
-                         one dated farther from its payment, so the count here may be less than \
-                         every complaint ever made."
-                    }
-                    // harvest#144: uncounted complaints can still take a
-                    // full record's places, so say how many do.
-                    if unrecognised_complaints > 0 {
-                        p { class: "text-warning",
-                            "{unrecognised_complaints} of them are about orders paid through a Bitcoin \
-                             bridge this app does not recognise, so they are not counted. Anyone can \
-                             run a bridge, the seller included, so those complaints may have pushed \
-                             genuine ones off the record."
-                        }
-                    }
-                }
-
                 // Said plainly: a closed store's key may be in someone
                 // else's hands, so nothing on this page can be bought, and
                 // the record stays visible (harvest#93, 6.4). Otherwise why
-                // it is not open, for which Buy now is withheld below.
+                // it is not open, for which Buy now is withheld.
                 if store.closed {
                     p { class: "text-warning",
-                        "This store has closed. Its seller closed it because its key may be \
-                         in someone else's hands, so nothing here can be bought. Its record \
+                        "This store has closed. Its seller closed it because its key may be in \
+                         someone else\u{2019}s hands, so nothing here can be bought. Its record \
                          stays visible."
                     }
                 } else if cannot_take {
                     p { class: "text-warning", "{cannot_take_orders_line(&store.certificate_status)}" }
                 } else if !owned {
                     if let Some(line) = presence.buyer_line() {
-                        p { class: if presence.is_closed() { "text-warning" } else { "text-muted" },
+                        p { class: if presence.is_closed() { "text-warning" } else { "text-muted small" },
                             "{line}"
                         }
                     }
                 }
             }
-
-            if show_record() {
-                section {
-                    class: "card store-record-card",
-                    id: "store-record",
-                    aria_label: "{name}\u{2019}s record",
-                    div { class: "record-head",
-                        h3 { "Record" }
-                        button {
-                            class: "link-btn",
-                            onclick: move |_| show_record.set(false),
-                            "Hide"
+            div { class: "store-head-acts",
+                // A link, not a button: the items are the page's main thing,
+                // and before paying it leads to the Ghost Key step (IA
+                // first-timer check). Not on one's own store (R6-9).
+                if owned {
+                    span { class: "link-off", title: "This is your own store", "Message the seller" }
+                } else {
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| go(message_to.clone()),
+                        "Message the seller"
+                    }
+                }
+            }
+        }
+        if test {
+            p { class: "coin-note",
+                "Prices are in test coins ({super::pay_card::coin_unit(network)}), which have no value. "
+                a {
+                    href: "https://signetfaucet.com/",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "Get free test coins"
+                }
+            }
+        }
+        if orders.live > 0 {
+            p { class: "store-orders-line",
+                button {
+                    class: "link-btn",
+                    onclick: move |_| go(Page::Purchases),
+                    "{orders_line(orders)}"
+                }
+            }
+        }
+        div { class: "tabs", role: "tablist",
+            for (t , label) in [(StoreTab::Items, "Items"), (StoreTab::About, "About"), (StoreTab::Record, "Record")] {
+                button {
+                    class: if tab == t { "tab active" } else { "tab" },
+                    role: "tab",
+                    aria_selected: if tab == t { "true" } else { "false" },
+                    onclick: {
+                        let id = contract_id.clone();
+                        move |_| super::router::replace(Page::Store { store: id.clone(), tab: t })
+                    },
+                    "{label}"
+                    if t == StoreTab::Items && !listings.is_empty() {
+                        " "
+                        span { class: "tab-count", "{listings.len()}" }
+                    }
+                }
+            }
+        }
+        match tab {
+            StoreTab::Items => rsx! {
+                if items.is_empty() {
+                    p { class: "text-muted empty-line", "No listings yet." }
+                } else {
+                    div { class: "item-grid",
+                        for item in items.iter() {
+                            ItemCard { key: "{item.listing}", item: item.clone(), store: contract_id.clone() }
+                        }
+                    }
+                }
+            },
+            StoreTab::About => rsx! {
+                section { class: "about",
+                    if info.description.trim().is_empty() {
+                        p { class: "text-muted", "This store hasn\u{2019}t written anything about itself yet." }
+                    } else {
+                        crate::markdown::Markdown { source: info.description.clone(), class: "store-desc" }
+                    }
+                }
+            },
+            StoreTab::Record => rsx! {
+                section { class: "record",
+                    if store.certificate_status.is_verified() {
+                        p { class: "text-muted small", "{TRUST_WHY}" }
+                    }
+                    // Round 6 of #143: past the cap the count is a floor.
+                    if store.record_full() {
+                        p { class: "text-warning",
+                            "This seller\u{2019}s record is full: it holds {harvest_common::reputation::MAX_COMPLAINTS} \
+                             complaints, the most a record can. A new complaint is kept only in place of \
+                             one dated farther from its payment, so the count here may be less than \
+                             every complaint ever made."
+                        }
+                        // harvest#144: uncounted complaints can still take a
+                        // full record's places, so say how many do.
+                        if unrecognised_complaints > 0 {
+                            p { class: "text-warning",
+                                "{unrecognised_complaints} of them are about orders paid through a Bitcoin \
+                                 bridge this app does not recognise, so they are not counted. Anyone can \
+                                 run a bridge, the seller included, so those complaints may have pushed \
+                                 genuine ones off the record."
+                            }
                         }
                     }
                     super::reputation_view::StoreRecord { store_contract_id: contract_id.clone() }
                 }
-            }
+            },
+        }
+    }
+}
 
-            if orders_here.live > 0 {
-                p { class: "store-orders-line",
-                    button {
-                        class: "link-btn",
-                        onclick: move |_| *ROUTE.write() = Route::Purchases,
-                        "{orders_line(orders_here)}"
+/// One item on a store's page, as its card shows it.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct ItemSummary {
+    pub listing: harvest_common::listing::ListingId,
+    pub title: String,
+    /// "0.0001 tBTC", or `None` with no price to buy it at.
+    pub price: Option<String>,
+    /// One quiet line: "3 left", "Delivery included".
+    pub note: Option<String>,
+    /// Sold out, closed, or not for sale: greyed, last.
+    pub off: bool,
+    /// Why it is off, in a word or two ("Sold out", "Closed").
+    pub off_why: Option<String>,
+    pub picture: Option<String>,
+}
+
+fn item_summary(
+    store: &crate::state::BrowsingStore,
+    contract_id: &[u8],
+    owned: bool,
+    listing: &AuthorizedListing,
+    availability: &ListingAvailability,
+    open: bool,
+    closed: bool,
+) -> ItemSummary {
+    let l = &listing.listing;
+    let buyable = offered_buy(store, contract_id, false, l, availability, open).is_some()
+        || (owned && offered_buy(store, contract_id, false, l, availability, true).is_some());
+    let price = price_lines(l).map(|(price, _)| price);
+    let off_why = availability_words(availability, closed)
+        .filter(|w| w == "Sold out" || w == "Closed")
+        .or_else(|| (!l.offers_instant_checkout()).then(|| "Not for sale yet".to_string()));
+    let note = match availability {
+        ListingAvailability::Available { quantity: Some(n) } if *n > 0 => Some(format!("{n} left")),
+        _ => price_lines(l).map(|(_, delivery)| delivery),
+    };
+    ItemSummary {
+        listing: l.id.clone(),
+        title: l.title.clone(),
+        price,
+        note,
+        off: !buyable,
+        off_why,
+        picture: super::item_image::listing_image(&l.id, &l.title),
+    }
+}
+
+/// One item on a store's page: the whole card opens the item's page.
+#[component]
+fn ItemCard(item: ItemSummary, store: Vec<u8>) -> Element {
+    let test = super::pay_card::is_test_network(crate::gateway::bitcoin_config::default_network());
+    rsx! {
+        button {
+            class: if item.off { "item-card item-off" } else { "item-card" },
+            onclick: {
+                let store = store.clone();
+                let listing = item.listing.clone();
+                move |_| super::router::go(super::router::Page::Item { store: store.clone(), listing: listing.clone() })
+            },
+            if let Some(ref src) = item.picture {
+                img { class: "item-card-img", src: "{src}", alt: "" }
+            }
+            span { class: "item-card-title", "{item.title}" }
+            if let Some(ref why) = item.off_why {
+                span { class: "item-card-off", "{why}" }
+            } else if let Some(ref price) = item.price {
+                span { class: "item-card-price",
+                    "{price}"
+                    if test {
+                        span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
                     }
                 }
             }
+            if let Some(ref note) = item.note.as_ref().filter(|_| item.off_why.is_none()) {
+                span { class: "item-card-note", "{note}" }
+            }
+        }
+    }
+}
 
-            if listings.is_empty() {
-                p { class: "text-muted text-italic", "No listings yet." }
-            } else {
-                p { class: "section-count",
-                    if listings.len() == 1 { "1 listing" } else { "{listings.len()} listings" }
-                }
-                for (listing , availability) in listings.iter() {
-                    ListingCard {
-                        key: "{listing.listing.id}",
-                        listing: listing.clone(),
-                        availability: availability.clone(),
-                        // Only when it adds something. If the store's own
-                        // certificate failed, the warning above already
-                        // covers everything under it, and repeating it on
-                        // every card is the kind of noise that teaches a
-                        // reader to skip warnings.
-                        certificate_mismatch: store.certificate_status.is_verified()
-                            && store.unverified_listings.contains(&listing.listing.id),
-                        // `None` disables the Buy control rather than hiding
-                        // the listing. A store whose certificate does not
-                        // verify, or which publishes no encryption key, can
-                        // still be READ -- what it cannot be is bought from,
-                        // because there is no key to encrypt an address to
-                        // and no identity to hold to the order. See
-                        // `BuyControl`.
-                        // `None` for a listing whose OWN certificate did
-                        // not verify, as well as for a store that cannot be
-                        // bought from at all. The store-level check cannot
-                        // see this: `buyable` is computed once per store,
-                        // and a mismatched listing is a per-listing fact.
-                        // And for a listing its seller has marked sold out
-                        // (harvest#70): shown, never offered.
-                        buyable: offered_buy(&store, &contract_id, owned, &listing.listing, availability, pill_open),
-                        // A Buy now form already open stays when the store
-                        // closes under it, so the pay card of an order it
-                        // made does not vanish (review of #197); it just
-                        // cannot send another.
-                        keep_form: offered_buy(&store, &contract_id, owned, &listing.listing, availability, true),
-                        // On our own store, a Buy now shown where a buyer
-                        // would get one, disabled (critique 02s-2).
-                        own_preview: owned
-                            && offered_buy(&store, &contract_id, false, &listing.listing, availability, pill_open)
-                                .is_some(),
-                        closed: is_closed,
+/// P3: everything about one item, and the one form to buy it.
+#[component]
+pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> Element {
+    use super::router::{Page, StoreTab};
+    let found = {
+        let state = APP_STATE.read();
+        state
+            .browsing_stores
+            .get(&store)
+            .filter(|s| s.info.is_some())
+            .cloned()
+            .map(|b| {
+                let found = b
+                    .listings
+                    .iter()
+                    .find(|l| l.listing.id == listing)
+                    .cloned()
+                    .map(|l| {
+                        let availability = b.availability(&l.listing.id);
+                        (l, availability)
+                    });
+                (b, found)
+            })
+    };
+    let store_name = APP_STATE.read().store_name_of(&store).label();
+    let back = rsx! {
+        super::seller_pages::BackTo {
+            label: store_name.clone(),
+            page: Page::Store { store: store.clone(), tab: StoreTab::Items },
+        }
+    };
+    let Some((browsing, found)) = found else {
+        return rsx! {
+            {back}
+            p { class: "text-muted text-italic", "Loading this store\u{2026}" }
+        };
+    };
+    let Some((authorized, availability)) =
+        found.filter(|(_, a)| *a != ListingAvailability::Withdrawn)
+    else {
+        return rsx! {
+            {back}
+            p { class: "text-muted", "This item isn\u{2019}t listed any more." }
+        };
+    };
+    let l = authorized.listing.clone();
+    let owned = APP_STATE.read().store_owner_fingerprint(&store).is_some();
+    let now = crate::state::now_ms();
+    let buyer_open = APP_STATE.read().buyer_open(&store, now);
+    let open = buyer_open == BuyerOpen::Open;
+    let closed = buyer_open == BuyerOpen::Closed;
+    let offer = offered_buy(&browsing, &store, owned, &l, &availability, open);
+    let own_preview =
+        owned && offered_buy(&browsing, &store, false, &l, &availability, open).is_some();
+    let picture = super::item_image::listing_image(&l.id, &l.title);
+    let network = crate::gateway::bitcoin_config::default_network();
+    let test = super::pay_card::is_test_network(network);
+    let stock = availability_words(&availability, false);
+    let delivery = price_lines(&l).map(|(_, delivery)| delivery);
+    // Why nothing can be bought here, in one line, in place of the form.
+    let why_not = if offer.is_some() || own_preview {
+        None
+    } else if browsing.closed || closed {
+        Some("This store is closed right now, so this can\u{2019}t be bought.".to_string())
+    } else if !availability.is_buyable() {
+        Some("Sold out.".to_string())
+    } else if !l.offers_instant_checkout() {
+        Some(NOT_PRICED.to_string())
+    } else if browsing.unverified_listings.contains(&l.id) {
+        Some("This listing can\u{2019}t be verified as this seller\u{2019}s, so it can\u{2019}t be bought.".to_string())
+    } else if buyer_open == BuyerOpen::Checking {
+        Some("Checking whether this store is open\u{2026}".to_string())
+    } else {
+        Some("This store can\u{2019}t take orders right now.".to_string())
+    };
+
+    rsx! {
+        {back}
+        div { class: if picture.is_some() { "item-page has-picture" } else { "item-page" },
+            if let Some(ref src) = picture {
+                img { class: "item-picture", src: "{src}", alt: "{l.title}" }
+            }
+            div { class: "item-buy",
+                h2 { class: "item-title", "{l.title}" }
+                if let Some((price, _)) = price_lines(&l) {
+                    p { class: "item-price",
+                        "{price}"
+                        if test {
+                            span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
+                        }
                     }
                 }
-            }
-
-            // Under the listings, and quieter than any Buy now (mockup
-            // `scrStore`, critique 02-1). Disabled on our own store: a seller
-            // does not message themselves.
-            div { class: "store-ask",
-                button {
-                    class: "btn btn-outline",
-                    disabled: owned,
-                    title: owned.then_some("This is your own store"),
-                    aria_expanded: if show_messages() { "true" } else { "false" },
-                    onclick: move |_| show_messages.toggle(),
-                    // The same label open or closed: it names the card it
-                    // opens, which is headed "Ask ... a question" (msg1
-                    // critique MSG-8).
-                    "Ask the seller a question"
+                p { class: "text-muted small",
+                    {[stock, delivery].into_iter().flatten().collect::<Vec<_>>().join(" \u{00b7} ")}
+                }
+                match (offer, why_not) {
+                    (Some(buyable), _) => rsx! {
+                        super::buy_view::BuyForm {
+                            store_contract_id: buyable.store_contract_id.clone(),
+                            listing: l.clone(),
+                            seller_encryption_key: buyable.seller_encryption_key,
+                            seller_verifying_key: buyable.seller_verifying_key,
+                        }
+                    },
+                    (None, _) if own_preview => rsx! {
+                        button { class: "btn btn-primary btn-wide", disabled: true, title: "This is your own store", "Buy now" }
+                        p { class: "text-muted small", "This is your own store." }
+                    },
+                    (None, Some(why)) => rsx! {
+                        p { class: "item-why-not", "{why}" }
+                    },
+                    (None, None) => rsx! {},
                 }
             }
-            if show_messages() && !owned {
-                super::message_view::MessageView { store_contract_id: contract_id.clone() }
+            div { class: "item-about",
+                h3 { class: "sec-lbl", "About this item" }
+                if l.description.trim().is_empty() {
+                    p { class: "text-muted", "The seller hasn\u{2019}t described it." }
+                } else {
+                    crate::markdown::Markdown { source: l.description.clone(), class: "listing-desc" }
+                }
             }
-
-            // No list of the store's invoices here any more (critique S2-8,
-            // S2-9): it showed a buyer other people's orders, and cancelled
-            // ones under "Settled". The record is the public evidence; the
-            // seller's own orders are on their Orders tab; a buyer's are on
-            // Purchases, and the one a Buy now form just made stays under it.
         }
     }
 }
@@ -1104,99 +1263,6 @@ fn buyable(
     })
 }
 
-#[component]
-fn ListingCard(
-    listing: AuthorizedListing,
-    availability: ListingAvailability,
-    certificate_mismatch: bool,
-    /// What a new Buy now needs, or `None` when none may start
-    /// (`offered_buy`).
-    buyable: Option<Buyable>,
-    /// The same, whatever the store's presence: a form already open stays
-    /// open on it when the store closes, so its pay card stays.
-    #[props(default)]
-    keep_form: Option<Buyable>,
-    /// Our own store, where a buyer would be offered Buy now: shown
-    /// disabled, so the seller sees what buyers see.
-    #[props(default)]
-    own_preview: bool,
-    /// The store is closed: greyed, as a sold-out listing is.
-    #[props(default)]
-    closed: bool,
-) -> Element {
-    let l = &listing.listing;
-    let corner = availability_words(&availability, closed);
-    let sold_out = !availability.is_buyable();
-
-    rsx! {
-        div { class: if sold_out || closed { "listing-card listing-sold-out" } else { "listing-card" },
-            // No kind badge: every listing is a sale now, and "SALE" read as
-            // "discounted" (critique S2-5). Availability in its place.
-            div { class: "listing-header",
-                h4 { "{l.title}" }
-                if let Some(corner) = corner {
-                    span { class: "listing-stock", "{corner}" }
-                }
-            }
-            // The store verified, and this listing did not: it carries a
-            // certificate that is not the seller's. Worth saying loudly,
-            // precisely because everything around it checks out.
-            if certificate_mismatch {
-                // Neutral on purpose: the usual cause is a listing published
-                // before its certificate travelled with it, not a forgery,
-                // and "not this seller's" read as an accusation.
-                p { class: "text-muted",
-                    "This listing can\u{2019}t be verified as this seller\u{2019}s, so it can\u{2019}t be bought."
-                }
-            }
-            crate::markdown::Markdown {
-                source: l.description.clone(),
-                class: "listing-desc",
-            }
-            // The price, then the delivery under it; no listed date, which a
-            // buyer does not need (critique S2-7).
-            if let Some((price, delivery)) = price_lines(l) {
-                div { class: "listing-terms",
-                    span { class: "listing-price", "{price}" }
-                    span { class: "listing-delivery", "{delivery}" }
-                }
-            }
-            // A listing from before every listing had a sats price (a
-            // quote-only one, a gift or a request) cannot be bought: there is
-            // no longer a way to ask the seller for a total. Said, so a buyer
-            // is not left looking for a button.
-            if !l.offers_instant_checkout() {
-                p { class: "text-muted small", "{NOT_PRICED}" }
-            }
-            match buyable.clone().or(keep_form) {
-                Some(form) => rsx! {
-                    BuyControl {
-                        listing: l.clone(),
-                        buyable: form,
-                        can_start: buyable.is_some(),
-                    }
-                },
-                None if own_preview => rsx! {
-                    div { class: "buy-control",
-                        button {
-                            class: "btn btn-primary btn-sm",
-                            disabled: true,
-                            title: "This is your own store",
-                            "Buy now"
-                        }
-                    }
-                },
-                // Silence rather than a disabled button: a control that can
-                // never work is worse than none, and the reason is already on
-                // the page above -- the certificate warning, the store's
-                // Closed pill and why, or the notice that this store
-                // publishes no key to write to.
-                None => rsx! {},
-            }
-        }
-    }
-}
-
 /// What a listing's top corner says (after the mockup): "Closed" while the
 /// store is, "Sold out", "<n> left" when the seller counts its stock, and
 /// nothing for one on sale with no count.
@@ -1228,7 +1294,9 @@ pub(crate) fn price_lines(listing: &harvest_common::listing::Listing) -> Option<
         .checkout
         .as_ref()
         .filter(|_| listing.offers_instant_checkout())?;
-    let price = sats_text(checkout.unit_sats);
+    // In the network sellers here are paid on, the one money format (rule 7).
+    let network = crate::gateway::bitcoin_config::default_network();
+    let price = super::pay_card::money(checkout.unit_sats, network);
     let delivery = match &checkout.delivery {
         DeliveryPrice::Included => "Delivery included".to_string(),
         DeliveryPrice::ByRegion(rows) => {
@@ -1238,7 +1306,11 @@ pub(crate) fn price_lines(listing: &harvest_common::listing::Listing) -> Option<
                     if row.sats == 0 {
                         format!("{} free", row.region)
                     } else {
-                        format!("{} {}", row.region, sats_text(row.sats))
+                        format!(
+                            "{} {}",
+                            row.region,
+                            super::pay_card::money(row.sats, network)
+                        )
                     }
                 })
                 .collect();
@@ -1259,47 +1331,6 @@ pub(crate) fn sats_text(sats: u64) -> String {
         out.push(c);
     }
     format!("{out} sats")
-}
-
-/// The Buy button, and the form it opens.
-///
-/// Collapsed by default. A storefront is something people read, and a form
-/// under every listing would turn a page of things to look at into a page of
-/// things to fill in.
-#[component]
-fn BuyControl(
-    listing: harvest_common::listing::Listing,
-    buyable: Buyable,
-    /// A new Buy now may start. False while the store is not open: no
-    /// button, and a form already open stays but cannot send.
-    can_start: bool,
-) -> Element {
-    let mut open = use_signal(|| false);
-    if !can_start && !open() {
-        return rsx! {};
-    }
-
-    rsx! {
-        div { class: "buy-control",
-            button {
-                class: if open() { "btn btn-sm btn-outline" } else { "btn btn-primary btn-sm" },
-                onclick: move |_| open.toggle(),
-                // "Close", not "Cancel": once an order is placed the form
-                // shows its pay card, and "Cancel" there read as cancelling
-                // the order.
-                if open() { "Close" } else { "Buy now" }
-            }
-            if open() {
-                super::buy_view::BuyForm {
-                    store_contract_id: buyable.store_contract_id.clone(),
-                    listing: listing.clone(),
-                    seller_encryption_key: buyable.seller_encryption_key,
-                    seller_verifying_key: buyable.seller_verifying_key,
-                    closed: !can_start,
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

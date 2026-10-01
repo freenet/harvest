@@ -4,16 +4,6 @@ use harvest_common::listing::Listing;
 use crate::gateway::APP_STATE;
 use crate::state::{AppState, StoreDetails, StoreDetailsGap};
 
-/// The seller's pages for one store (harvest#93 phase 2, entity model
-/// section 4), reached from the Stores page's "Your store" cards.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Tab {
-    Overview,
-    Listings,
-    Orders,
-    Settings,
-}
-
 /// One store the seller can manage from this device: one with a store key
 /// (harvest#93). A store made before revision 2 is not one of these; its
 /// Ghost Key is offered a move instead (see [`StoreSetup`]).
@@ -309,57 +299,20 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
     stores
 }
 
-/// The seller's pages, reached from the Stores page: a store's dashboard,
-/// or opening a first or another store (`app::SellerPage`). The pages that
-/// open a store have a way back to Stores; the dashboard is under the Stores
-/// tab, which stays lit.
-#[component]
-pub fn MyStore() -> Element {
-    let app_state = APP_STATE.read();
-    let in_flight = app_state.request_any_access_in_flight;
-    let ghostkeys = app_state.ghostkeys.clone();
-    let has_harvest_delegate = app_state.harvest_delegate_key.is_some();
-    let stores = seller_stores(&app_state);
-    drop(app_state);
-    let another = super::app::SELLER_PAGE() == super::app::SellerPage::AnotherStore;
-
-    rsx! {
-        div { class: "my-store",
-            if ghostkeys.is_empty() {
-                BackToStores {}
-                h2 { "Open a store" }
-                NoIdentity { in_flight }
-            } else if stores.is_empty() {
-                BackToStores {}
-                h2 { "Open a store" }
-                FirstStore { ghostkeys, has_harvest_delegate }
-            } else if another {
-                BackToStores {}
-                h2 { "Open another store" }
-                section { class: "card",
-                    AnotherStore { has_harvest_delegate }
-                }
-            } else {
-                StoreDashboard { stores }
-            }
-        }
-    }
-}
-
 /// "‹ Stores", above a page reached from the Stores page.
 #[component]
 pub(crate) fn BackToStores() -> Element {
     rsx! {
         button {
             class: "crumb",
-            onclick: move |_| *super::app::ROUTE.write() = super::app::Route::Stores,
+            onclick: move |_| super::router::go(super::router::Page::Stores),
             "\u{2039} Stores"
         }
     }
 }
 
 #[component]
-fn NoIdentity(in_flight: bool) -> Element {
+pub(crate) fn NoIdentity(in_flight: bool) -> Element {
     rsx! {
         div { class: "card",
             h3 { "Sell on Harvest" }
@@ -519,17 +472,18 @@ pub(crate) fn GhostKeyAccessNote(
     }
 }
 
-fn ghost_key_name(identity: &ghostkey_common::GhostKeyInfo) -> String {
+pub(crate) fn ghost_key_name(identity: &ghostkey_common::GhostKeyInfo) -> String {
     match identity.label.as_deref().map(str::trim) {
         Some(label) if !label.is_empty() => format!("Ghost Key \u{201c}{label}\u{201d}"),
         _ => format!("Ghost Key {}", short_fingerprint(&identity.fingerprint)),
     }
 }
 
-/// A Ghost Key is connected and no store exists yet (wireframe B). With more
-/// than one Ghost Key, one line picks which backs the store.
+/// A Ghost Key is connected and no store exists yet: the last step of
+/// opening a store (S1, "Name your store"). With more than one Ghost Key,
+/// one line picks which backs the store.
 #[component]
-fn FirstStore(
+pub(crate) fn FirstStore(
     ghostkeys: Vec<ghostkey_common::GhostKeyInfo>,
     has_harvest_delegate: bool,
 ) -> Element {
@@ -538,38 +492,31 @@ fn FirstStore(
     let identity = ghostkeys[index].clone();
 
     rsx! {
-        div { class: "card",
-            h3 { "Set up your store" }
-            if ghostkeys.len() > 1 {
-                div { class: "form-group",
-                    label { class: "form-label", r#for: "backing-key", "Backed by" }
-                    select {
-                        id: "backing-key",
-                        class: "form-select field-fit",
-                        onchange: move |e| chosen.set(e.value().parse().unwrap_or(0)),
-                        for (i , key) in ghostkeys.iter().enumerate() {
-                            option { value: "{i}", selected: i == index,
-                                "{ghost_key_name(key)} \u{00b7} {describe_notary_info(&key.notary_info)}"
-                            }
+        if ghostkeys.len() > 1 {
+            div { class: "form-group",
+                label { class: "form-label", r#for: "backing-key", "Backed by" }
+                select {
+                    id: "backing-key",
+                    class: "form-select field-fit",
+                    onchange: move |e| chosen.set(e.value().parse().unwrap_or(0)),
+                    for (i , key) in ghostkeys.iter().enumerate() {
+                        option { value: "{i}", selected: i == index,
+                            "{ghost_key_name(key)} \u{00b7} {describe_notary_info(&key.notary_info)}"
                         }
                     }
                 }
-            } else {
-                p { class: "text-muted",
-                    "Backed by {ghost_key_name(&identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
-                }
             }
-            StoreSetup {
-                key: "{identity.fingerprint}",
-                identity: identity.clone(),
-                has_harvest_delegate,
-            }
-            UseAnotherKey {}
+        } else {
             p { class: "text-muted small",
-                "You can move your store to a different Ghost Key later; it keeps its name, link "
-                "and record. Next: add a payout wallet, add a listing, share your link."
+                "Backed by {ghost_key_name(&identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
             }
         }
+        StoreSetup {
+            key: "{identity.fingerprint}",
+            identity: identity.clone(),
+            has_harvest_delegate,
+        }
+        UseAnotherKey {}
     }
 }
 
@@ -721,168 +668,6 @@ fn StoreSetup(identity: ghostkey_common::GhostKeyInfo, has_harvest_delegate: boo
     }
 }
 
-/// The store the dashboard opens on: the one the seller opened from Stores
-/// (`SellerPage::Store`), or the first. `stores` is never empty here.
-pub(crate) fn dashboard_store<'a>(
-    stores: &'a [SellerStore],
-    page: &super::app::SellerPage,
-) -> &'a SellerStore {
-    match page {
-        super::app::SellerPage::Store(id) => stores.iter().find(|s| &s.contract_id == id),
-        _ => None,
-    }
-    .unwrap_or(&stores[0])
-}
-
-/// The store a send to the seller pages names, if it names one
-/// (`SellerPage::Store`): the dashboard moves to it, on its Overview.
-pub(crate) fn seller_page_target(page: &super::app::SellerPage) -> Option<Vec<u8>> {
-    match page {
-        super::app::SellerPage::Store(id) => Some(id.clone()),
-        _ => None,
-    }
-}
-
-/// The seller's dashboard: one store at a time, titled by its name, with a
-/// switcher when there is more than one (entity model, wireframe C).
-#[component]
-fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
-    // Pinned to the store first shown, so a store arriving later, or a name
-    // arriving that reorders the list, does not switch the page under the
-    // seller (and remount it, losing an open form). The store first shown is
-    // the one the seller opened from Stores, if they opened one.
-    let mut selected = use_signal(|| {
-        Some(
-            dashboard_store(&stores, &super::app::SELLER_PAGE.peek())
-                .contract_id
-                .clone(),
-        )
-    });
-    #[allow(unused_mut)]
-    let mut tab = use_signal(|| Tab::Overview);
-    // And moved to a store sent here while the pages are already open (the
-    // header's "needs you" pill, "Back to managing it"): each such send
-    // writes `SELLER_PAGE`, which re-runs this, and lands on that store's
-    // Overview, whose first card is "Needs you" (codex and skeptical on
-    // #197 round 4: the pill did nothing on a seller page).
-    use_effect(move || {
-        if let Some(id) = seller_page_target(&super::app::SELLER_PAGE()) {
-            selected.set(Some(id));
-            tab.set(Tab::Overview);
-        }
-    });
-    let store = selected()
-        .and_then(|id| stores.iter().find(|s| s.contract_id == id).cloned())
-        .unwrap_or_else(|| stores[0].clone());
-
-    // Counts what needs the seller, not everything there is: a request
-    // waiting for an invoice, or a paid order waiting to be sent. Never an
-    // unpaid Buy now.
-    let orders_needs = store.needs_you();
-
-    let current = tab();
-
-    rsx! {
-        div { class: "dashboard",
-        div { class: "dashboard-head",
-            h2 { class: "dashboard-title", "{store.label}" }
-            if stores.len() > 1 {
-                select {
-                    class: "form-select store-switcher",
-                    aria_label: "Switch store",
-                    onchange: {
-                        let ids: Vec<Vec<u8>> = stores.iter().map(|s| s.contract_id.clone()).collect();
-                        move |e: Event<FormData>| {
-                            if let Some(id) = e.value().parse::<usize>().ok().and_then(|i| ids.get(i)) {
-                                selected.set(Some(id.clone()));
-                            }
-                        }
-                    },
-                    for (i , s) in stores.iter().enumerate() {
-                        option { value: "{i}", selected: s.contract_id == store.contract_id, "{s.label}" }
-                    }
-                }
-            }
-        }
-        div { class: "tabs", role: "tablist",
-            for (t , label) in [
-                (Tab::Overview, "Overview".to_string()),
-                // No count: beside the Orders tab's, which is what needs the
-                // seller, a total read as one too (critique C-1).
-                (Tab::Listings, "Listings".to_string()),
-                (Tab::Orders, "Orders".to_string()),
-                (Tab::Settings, "Settings".to_string()),
-            ]
-            {
-                button {
-                    class: if current == t { "tab active" } else { "tab" },
-                    role: "tab",
-                    aria_selected: if current == t { "true" } else { "false" },
-                    onclick: {
-                        let mut tab = tab;
-                        move |_| tab.set(t)
-                    },
-                    "{label}"
-                    // What needs the seller, in the one colour that means
-                    // it, so it does not read as a count of orders beside
-                    // "Listings (n)" (critique S9-10).
-                    if t == Tab::Orders && orders_needs > 0 {
-                        " "
-                        span { class: "tab-needs", "({orders_needs})" }
-                    }
-                }
-            }
-        }
-        // One keyed item in a list, so switching stores REMOUNTS the body and
-        // nothing per-store (an open form, its typed values, an edit in
-        // progress) carries over to the other store. A key on a lone node is
-        // not compared (dioxus diffs keys only in lists), which is why this
-        // is a loop of one.
-        for body in std::iter::once(store.clone()) {
-            StoreBody {
-                key: "{bs58::encode(&body.contract_id).into_string()}",
-                store: body.clone(),
-                tab,
-            }
-        }
-        }
-    }
-}
-
-/// The page of My store that is showing, for one store.
-#[component]
-fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
-    // Whether the details form is open, shared by Overview (whose repair
-    // prompt opens it) and Settings (where it lives). Per store, because this
-    // component is remounted when the store changes.
-    let editing_details = use_signal(|| false);
-    rsx! {
-        div { class: "tab-body",
-            match tab() {
-                Tab::Overview => rsx! { Overview { store: store.clone(), tab, editing_details } },
-                Tab::Listings => rsx! {
-                    super::seller_listings::SellerListings {
-                        store_contract_id: store.contract_id.clone(),
-                        fingerprint: store.fingerprint.clone(),
-                    }
-                },
-                // Each order carries its own conversation, and questions
-                // follow the orders: no mailbox dump under them (the
-                // 2026-09-30 critique found the orders ~9,700px down).
-                Tab::Orders => rsx! {
-                    super::invoice_form::StorePayments {
-                        store_contract_id: store.contract_id.clone(),
-                        seller_fingerprint: store.fingerprint.clone(),
-                    }
-                },
-                Tab::Settings => rsx! {
-                    Settings { store: store.clone(), editing_details }
-                },
-            }
-        }
-    }
-}
-
 /// Said when a buyer paid an address past a run of 20 unused ones, which a
 /// wallet with the usual gap limit does not look at (Ian's wording,
 /// 2026-09-26).
@@ -900,275 +685,11 @@ pub(crate) fn wallet_gap_note(limit: u32) -> String {
     )
 }
 
-/// What needs the seller, what is left to set up, the link to share, and the
-/// store's record (wireframe C).
-#[component]
-fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>) -> Element {
-    let has_wallet = APP_STATE.read().bitcoin.payment_xpub.is_some();
-    let (buyers_see, complaint_lines) = {
-        let state = APP_STATE.read();
-        let loaded = state
-            .browsing_stores
-            .get(&store.contract_id)
-            .filter(|b| b.info.is_some());
-        let tip_of = |network| state.tip_height(network);
-        (
-            loaded.map(super::store_view::trust_line),
-            loaded
-                .map(|b| {
-                    super::reputation_view::counted_complaint_lines(
-                        b,
-                        tip_of,
-                        crate::state::now_ms(),
-                    )
-                })
-                .unwrap_or_default(),
-        )
-    };
-    let wallet_known = APP_STATE.read().bitcoin.payment_xpub_loaded;
-    let details_done = store.details_resolved && store.gap.is_none();
-    let setup_done = details_done && has_wallet && store.listings > 0;
-    let mut go = move |t: Tab| tab.set(t);
-
-    // ONE status, saying what happens to a buyer (`presence_flow::
-    // seller_status`). Only for a store that sells here.
-    let status = {
-        let state = APP_STATE.read();
-        let now = crate::state::now_ms();
-        state
-            .instant_checkout_local(&store.contract_id, now)
-            .map(|local| {
-                crate::presence_flow::seller_status(
-                    state.store_presence(&store.contract_id, now),
-                    state.wakeups_seen_recently(now),
-                    &local,
-                )
-            })
-    };
-    let alerts = APP_STATE.read().instant_checkout_alerts(&store.contract_id);
-    // The paid orders to send, each on its own card with Mark as sent: the
-    // same list the count and the Orders tab use (`orders_to_send`).
-    let to_send = APP_STATE
-        .read()
-        .seller_orders_to_send(&store.contract_id, &store.fingerprint);
-
-    let wallet_gap = APP_STATE.read().wallet_gap_note_due(&store.contract_id);
-    let needs = overview_needs(&store, &APP_STATE.read());
-
-    rsx! {
-        section { class: "card",
-            h3 { "Needs you" }
-            if let Some(ref refusal) = store.foreign_owner {
-                p { class: "text-warning", "{refusal}" }
-            }
-            if !store.details_resolved {
-                p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
-            } else if let Some(gap) = store.gap {
-                // The repair prompt says what is wrong and what publishing
-                // fixes, as a one-click action where nothing needs typing.
-                div { class: "need",
-                    p { class: "text-warning", "{gap.message()}" }
-                    StoreDetailsButton { store: store.clone(), editing_details, on_open_form: move |_| go(Tab::Settings) }
-                }
-            }
-            if store.details_resolved && !store.certificate.is_verified() {
-                // Editing the details will not fix this, so it is not phrased
-                // as a repair prompt: a certificate that does not verify is
-                // either an identity this build cannot read or one that is
-                // not the seller's, and both need looking at.
-                p { class: "text-warning",
-                    "Buyers see this store as unbacked: {store.certificate.label()}."
-                    if let Some(why) = store.certificate.detail() {
-                        " ({why})"
-                    }
-                }
-            }
-            if let Some(limit) = wallet_gap {
-                p { class: "text-warning", "{wallet_gap_note(limit)}" }
-            }
-            if store.unpriced > 0 {
-                div { class: "need row-between",
-                    span {
-                        if store.unpriced == 1 {
-                            "1 listing can\u{2019}t be bought until you give it a price. Use Edit to give it one."
-                        } else {
-                            "{store.unpriced} listings can\u{2019}t be bought until you give them a price. Use Edit to give each one a price."
-                        }
-                    }
-                    button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Listings), "Open listings" }
-                }
-            }
-            if store.to_confirm > 0 {
-                div { class: "need row-between",
-                    strong {
-                        if store.to_confirm == 1 {
-                            "1 payment needs you to confirm which order it is for."
-                        } else {
-                            "{store.to_confirm} payments need you to confirm which order each is for."
-                        }
-                    }
-                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
-                }
-            }
-            // Each paid order to send is its own card here, with what to
-            // pack, where, by when, and Mark as sent: no trip to Orders and
-            // no hunt through messages for the address (the 2026-09-27
-            // friction report).
-            for order in to_send.iter() {
-                super::invoice_form::SellerOrderCard {
-                    key: "{order.order.id}",
-                    store_contract_id: store.contract_id.clone(),
-                    order: order.clone(),
-                }
-            }
-            for alert in alerts.iter() {
-                p { class: "text-warning", "{alert}" }
-            }
-            if store.requests > 0 {
-                div { class: "need row-between",
-                    strong {
-                        if store.requests == 1 {
-                            "1 buyer is waiting for an invoice."
-                        } else {
-                            "{store.requests} buyers are waiting for an invoice."
-                        }
-                    }
-                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
-                }
-            }
-            if store.replies > 0 {
-                div { class: "need row-between",
-                    strong {
-                        if store.replies == 1 {
-                            "1 buyer is waiting for your reply."
-                        } else {
-                            "{store.replies} buyers are waiting for your reply."
-                        }
-                    }
-                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
-                }
-            }
-            if store.expired_invoices > 0 {
-                div { class: "need row-between",
-                    span {
-                        if store.expired_invoices == 1 {
-                            "1 unpaid invoice is too old for a buyer to start paying. Cancel it under Orders; the buyer can order again."
-                        } else {
-                            "{store.expired_invoices} unpaid invoices are too old for a buyer to start paying. Cancel them under Orders; the buyers can order again."
-                        }
-                    }
-                    button { class: "btn btn-sm btn-outline", onclick: move |_| go(Tab::Orders), "Open orders" }
-                }
-            }
-            if !needs && store.details_resolved {
-                p { class: "text-muted", "Nothing needs you right now." }
-            }
-        }
-
-        if let Some(status) = status {
-            section { class: "card",
-                div { class: "row-between",
-                    h3 { "Your store" }
-                    span { class: if status.open { "pill pill-open" } else { "pill" }, "{status.pill}" }
-                }
-                p { "{status.line}" }
-                if let Some(why) = status.why_not {
-                    p { class: "text-muted", "{why}" }
-                }
-            }
-        }
-
-        if !setup_done {
-            section { class: "card",
-                h3 { "Set up" }
-                ul { class: "checklist",
-                    li { class: "done", "Store created" }
-                    li { class: if details_done { "done" } else { "" },
-                        "Name and description published"
-                        if !details_done && store.details_resolved {
-                            button { class: "link-btn", onclick: move |_| go(Tab::Settings), "Settings" }
-                        }
-                    }
-                    li { class: if has_wallet { "done" } else { "" },
-                        "Payout wallet"
-                        if !has_wallet && wallet_known {
-                            button { class: "link-btn", onclick: move |_| go(Tab::Settings), "Add one" }
-                        }
-                    }
-                    li { class: if store.listings > 0 { "done" } else { "" },
-                        "A listing"
-                        if store.listings == 0 {
-                            button { class: "link-btn", onclick: move |_| go(Tab::Listings), "Add one" }
-                        }
-                    }
-                }
-            }
-        }
-
-        section { class: "card",
-            h3 { "Share your store" }
-            // Content-sized values with Copy, as on the pay card: the whole
-            // link is visible (it wraps), where the old one-line field showed
-            // only its first 80 or so characters and scrolled.
-            if let Some(ref code) = store.code {
-                super::pay_card::CopyField {
-                    label: "Store code",
-                    value: code.clone(),
-                    salt: "share".to_string(),
-                }
-            }
-            if let Some(ref link) = store.link {
-                super::pay_card::CopyField {
-                    label: "Link",
-                    value: link.clone(),
-                    salt: "share".to_string(),
-                }
-            }
-            p { class: "text-muted small",
-                "Anyone can open this link, with or without Freenet: it offers to open your "
-                "store in Freenet or straight in their browser. Buyers can also type the store "
-                "code into Stores."
-            }
-        }
-
-        section { class: "card",
-            h3 { "Your record" }
-            // What buyers read, from the same function the store page says it
-            // with, and each complaint that counts (critique 09-8).
-            if let Some(ref buyers_see) = buyers_see {
-                p { class: "text-muted small", "Buyers see: {buyers_see}" }
-            } else {
-                p { "{store.record}" }
-            }
-            // The latest few, and how many more (round 4 of #197).
-            for line in complaint_lines.iter().rev().take(COMPLAINTS_SHOWN) {
-                p { "Complaint: {line}" }
-            }
-            if complaint_lines.len() > COMPLAINTS_SHOWN {
-                p { class: "text-muted small",
-                    "and {complaint_lines.len() - COMPLAINTS_SHOWN} more, on your store\u{2019}s record"
-                }
-            }
-            button {
-                class: "btn btn-sm btn-outline",
-                onclick: {
-                    let id = store.contract_id.clone();
-                    move |_| super::app::open_store_page(id.clone())
-                },
-                "See your store as buyers do"
-            }
-        }
-    }
-}
-
-/// How many complaints the seller's record card lists before "and n more".
-const COMPLAINTS_SHOWN: usize = 3;
-
 /// The store-details button, with the repair logic `store_details_button_action`
 /// decides: publish straight away when nothing needs typing, otherwise open the
 /// form.
 #[component]
-fn StoreDetailsButton(
+pub(crate) fn StoreDetailsButton(
     store: SellerStore,
     editing_details: Signal<bool>,
     on_open_form: EventHandler<()>,
@@ -1229,99 +750,49 @@ fn StoreDetailsButton(
     }
 }
 
-/// Store details, payout wallet and the Ghost Key behind the store
-/// (wireframe E). Opening another store is its own page (`AnotherStore`).
+/// Whether the store's details need the form to fix (something to type),
+/// rather than a publish with nothing typed (`store_details_button_action`).
+pub(crate) fn store_details_need_form(gap: Option<StoreDetailsGap>) -> bool {
+    store_details_button_action(gap, false) == StoreDetailsAction::ToggleForm
+}
+
+/// The store's details on Settings: the form while editing, else its name
+/// and description, and what needs repairing.
 #[component]
-fn Settings(store: SellerStore, editing_details: Signal<bool>) -> Element {
-    let buyers_see = APP_STATE
-        .read()
-        .browsing_stores
-        .get(&store.contract_id)
-        .filter(|b| b.info.is_some())
-        .map(super::store_view::trust_line);
-    let identity = APP_STATE
-        .read()
-        .ghostkeys
-        .iter()
-        .find(|k| k.fingerprint == store.fingerprint)
-        .cloned();
+pub(crate) fn StoreDetailsBody(store: SellerStore, editing_details: Signal<bool>) -> Element {
     rsx! {
-        section { class: "card",
-            div { class: "row-between",
-                h3 { "Store details" }
-                if store.details_resolved {
-                    StoreDetailsButton { store: store.clone(), editing_details, on_open_form: move |_| {} }
-                }
-            }
-            if !store.details_resolved {
-                // Nothing is offered until we know what the store has
-                // published: a form filled with empty strings reads as lost
-                // details, and an edit from it would be published at a
-                // version the contract discards as stale.
-                p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
-            } else if editing_details() {
-                StoreDetailsForm {
-                    heading: "",
-                    submit_label: "Publish",
-                    initial: store.details.clone(),
-                    on_cancel: move |_| editing_details.set(false),
-                    on_submit: {
-                        let id = store.contract_id.clone();
-                        move |details: StoreDetails| {
-                            editing_details.set(false);
-                            publish_store_details(id.clone(), details);
-                        }
-                    },
-                }
-            } else {
-                if let Some(gap) = store.gap {
-                    p { class: "text-warning", "{gap.message()}" }
-                }
-                p { strong { "{store.details.store_name}" } }
-                if !store.details.description.is_empty() {
-                    crate::markdown::Markdown {
-                        source: store.details.description.clone(),
-                        class: "store-desc",
+        if !store.details_resolved {
+            // Nothing is offered until we know what the store has
+            // published: a form filled with empty strings reads as lost
+            // details, and an edit from it would be published at a
+            // version the contract discards as stale.
+            p { class: "text-muted text-italic", "Loading this store\u{2019}s published details\u{2026}" }
+        } else if editing_details() {
+            StoreDetailsForm {
+                heading: "",
+                submit_label: "Publish",
+                initial: store.details.clone(),
+                on_cancel: move |_| editing_details.set(false),
+                on_submit: {
+                    let id = store.contract_id.clone();
+                    move |details: StoreDetails| {
+                        editing_details.set(false);
+                        publish_store_details(id.clone(), details);
                     }
+                },
+            }
+        } else {
+            if let Some(gap) = store.gap {
+                p { class: "text-warning", "{gap.message()}" }
+            }
+            p { strong { "{store.details.store_name}" } }
+            if !store.details.description.is_empty() {
+                crate::markdown::Markdown {
+                    source: store.details.description.clone(),
+                    class: "store-desc",
                 }
             }
         }
-
-        section { class: "card",
-            h3 { "Payout wallet" }
-            super::invoice_form::PayoutWallet {}
-            p { class: "text-muted small",
-                "Each invoice gets a new address from this wallet. Harvest can create addresses but "
-                "can never spend your coins."
-            }
-            // Where a seller checks the Bitcoin side when payments seem slow
-            // to show; it used to sit in every visitor's footer.
-            button {
-                class: "link-btn",
-                onclick: move |_| *super::app::ROUTE.write() = super::app::Route::Diagnostics,
-                "Check Harvest\u{2019}s connection to Bitcoin"
-            }
-        }
-
-        section { class: "card",
-            h3 { "Backed by" }
-            if let Some(ref identity) = identity {
-                p {
-                    "{ghost_key_name(identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
-                }
-            }
-            // What buyers read on the store page, from the same function, so
-            // this cannot say something else again (critique 12-2).
-            // Said once the store's state is here, and only then with why it
-            // matters (round 4 of #197: the second line sat alone while it
-            // loaded, its "this" pointing at nothing).
-            if let Some(ref buyers_see) = buyers_see {
-                p { class: if store.certificate.is_verified() { "text-muted small" } else { "text-warning" },
-                    "Buyers see: {buyers_see}. It is how they judge what you have at stake."
-                }
-            }
-        }
-
     }
 }
 
@@ -1349,7 +820,7 @@ pub(crate) fn new_store(before: &[String], now: &[(String, Vec<u8>)]) -> Option<
 /// be connected. Its own page, reached from "Open another store" on Stores
 /// (critique S12-10: it used to sit at the bottom of one store's Settings).
 #[component]
-fn AnotherStore(has_harvest_delegate: bool) -> Element {
+pub(crate) fn AnotherStore(has_harvest_delegate: bool) -> Element {
     let (others, in_flight, busy) = {
         let state = APP_STATE.read();
         // Connected Ghost Keys with no store this device can manage: each can
@@ -1392,7 +863,10 @@ fn AnotherStore(has_harvest_delegate: bool) -> Element {
             .map(|s| (store_identity(&s), s.contract_id))
             .collect();
         if let Some(new) = new_store(&before.peek(), &now) {
-            super::app::open_seller_page(super::app::SellerPage::Store(new));
+            super::router::go(super::router::Page::Seller {
+                store: Some(new),
+                view: super::router::SellerView::Home,
+            });
         }
     });
 
@@ -1938,7 +1412,7 @@ pub(crate) fn mint_encryption_key(_fingerprint: String) {}
 /// Anything unrecognised is passed through unchanged rather than replaced with
 /// a guess: showing the raw field is ugly, but inventing a tier for a
 /// certificate this build cannot read would misrepresent a seller's standing.
-fn describe_notary_info(info: &str) -> String {
+pub(crate) fn describe_notary_info(info: &str) -> String {
     let amount = extract_amount(info);
     let date = extract_created_date(info);
     match (amount, date) {
@@ -2420,14 +1894,6 @@ mod seller_stores_tests {
             .insert(OrderId([7; 32]), (vec![2u8; 32], order));
         assert_eq!(first_store_needing_seller(&state), Some(vec![2u8; 32]));
         assert_eq!(requests_needing_seller(&state), 1);
-
-        use super::super::app::SellerPage;
-        assert_eq!(
-            seller_page_target(&SellerPage::Store(vec![2u8; 32])),
-            Some(vec![2u8; 32])
-        );
-        assert_eq!(seller_page_target(&SellerPage::First), None);
-        assert_eq!(seller_page_target(&SellerPage::AnotherStore), None);
     }
 
     /// "Open another store" says which Ghost Key backs which store, in one
@@ -2524,22 +1990,6 @@ mod seller_stores_tests {
             .find(|s| s.contract_id == vec![2u8; 32])
             .unwrap();
         assert_eq!(given_up.label, "Your store");
-
-        use super::super::app::SellerPage;
-        assert_eq!(
-            dashboard_store(&stores, &SellerPage::Store(vec![2u8; 32])).contract_id,
-            vec![2u8; 32],
-            "the store whose card was pressed"
-        );
-        assert_eq!(
-            dashboard_store(&stores, &SellerPage::First).contract_id,
-            stores[0].contract_id
-        );
-        assert_eq!(
-            dashboard_store(&stores, &SellerPage::Store(vec![9u8; 32])).contract_id,
-            stores[0].contract_id,
-            "a store no longer here falls back to the first"
-        );
     }
 
     /// Paid orders waiting to be sent are what a Buy now first needs the
