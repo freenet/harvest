@@ -76,12 +76,14 @@ pub(crate) fn places(state: &AppState) -> Vec<Place> {
         if buyer.to_pay > 0 {
             parts.push(format!("{} to pay", buyer.to_pay));
         }
-        // One line per store, however many conversations it replied in.
+        // One line per store, however many conversations it replied in;
+        // two stores with one name are still two.
         let mut stores = buyer.replied.clone();
-        stores.dedup();
+        stores.sort();
+        stores.dedup_by(|a, b| a.0 == b.0);
         match stores.as_slice() {
             [] => {}
-            [one] => parts.push(format!("{one} replied")),
+            [(_, one)] => parts.push(format!("{one} replied")),
             many => parts.push(format!("{} stores replied", many.len())),
         }
         places.push(Place {
@@ -104,9 +106,9 @@ pub(crate) fn places(state: &AppState) -> Vec<Place> {
 pub(crate) struct BuyerNeeds {
     /// Orders they can pay now (`order_status::buyer_can_pay`).
     pub to_pay: usize,
-    /// The stores whose reply is new to them, by name, one per conversation
-    /// (`message_view::is_new_reply`).
-    pub replied: Vec<String>,
+    /// The stores whose reply is new to them (id, name), one per
+    /// conversation (`message_view::is_new_reply`).
+    pub replied: Vec<(Vec<u8>, String)>,
 }
 
 /// [`BuyerNeeds`], across every store this device has bought from or
@@ -118,8 +120,7 @@ pub(crate) fn buyer_needs(state: &AppState) -> BuyerNeeds {
             continue;
         }
         for purchase in state.buyer_purchases(id) {
-            let status = super::order_status::buyer_status(state, id, &purchase);
-            if super::order_status::buyer_can_pay(&purchase, status) {
+            if super::order_status::can_pay_now(state, id, &purchase) {
                 needs.to_pay += 1;
             }
         }
@@ -127,7 +128,9 @@ pub(crate) fn buyer_needs(state: &AppState) -> BuyerNeeds {
             let tag = conversation.buyer_public_key;
             if let Some(summary) = super::message_view::buyer_conversation_summary(state, id, tag) {
                 if super::message_view::is_new_reply(&summary, &tag) {
-                    needs.replied.push(state.store_name_of(id).label());
+                    needs
+                        .replied
+                        .push((id.clone(), state.store_name_of(id).label()));
                 }
             }
         }

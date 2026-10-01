@@ -22,8 +22,32 @@ use crate::state::{AppState, SellerRequest};
 
 /// The seller's pages: one of their stores (`store`, or the first when
 /// `None`) on `view`, or opening a first store when they have none.
+/// Re-render once the wait for this node's store lists runs out (counted
+/// from the app's start), so a page waiting on them never says "Checking"
+/// for good, as the Stores page does.
+pub(crate) fn use_known_clock() {
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        let deadline = APP_STATE
+            .peek()
+            .session_started
+            .0
+            .saturating_add(crate::state::SELLER_ANSWER_WAIT_MS);
+        let left = deadline.saturating_sub(crate::state::now_ms());
+        if left > 0 {
+            gloo_timers::future::TimeoutFuture::new(left.saturating_add(50).min(60_000) as u32)
+                .await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
+}
+
 #[component]
 pub(crate) fn SellerPages(store: Option<Vec<u8>>, view: SellerView) -> Element {
+    use_known_clock();
     let (stores, known) = {
         let state = APP_STATE.read();
         (
@@ -372,6 +396,9 @@ pub(crate) struct SellerData {
     /// Whether the store's state has arrived: "no orders" and "not loaded
     /// yet" look alike through an empty list.
     pub loaded: bool,
+    /// Requests waiting for an invoice, by conversation tag
+    /// (`message_view::requests_awaiting_invoice_by_tag`): never a Buy now.
+    pub invoice_requests: std::collections::BTreeMap<Vec<u8>, usize>,
 }
 
 impl SellerData {
@@ -402,10 +429,12 @@ impl SellerData {
         let mut names: HashMap<[u8; 32], String> = HashMap::new();
         let mut unnamed: Vec<(Option<chrono::DateTime<chrono::Utc>>, [u8; 32])> = Vec::new();
         for thread in inbox.threads.iter() {
-            let named = thread
-                .orders
+            // From the newest of its orders with a readable address (the
+            // orders are newest first): one name for one buyer on every page.
+            let named = orders
                 .iter()
-                .find_map(|order| match requests.get(order) {
+                .filter(|o| thread.orders.contains(&o.order.id))
+                .find_map(|order| match requests.get(&order.order.id) {
                     Some(SellerRequest::Found(r)) => name_from_address(&r.shipping),
                     _ => None,
                 });
@@ -434,24 +463,29 @@ impl SellerData {
             names,
             thread_of,
             loaded: state.store_details_are_resolved(id),
+            invoice_requests: super::message_view::requests_awaiting_invoice_by_tag(state, id),
         }
     }
 
-    /// The name of `order`'s buyer: from the order's own address, else their
-    /// conversation's, else "A buyer".
+    /// The name of `order`'s buyer: their conversation's, so one buyer has
+    /// one name on every page; else from the order's own address; else "A
+    /// buyer".
     pub(crate) fn buyer_of(&self, order: &OrderId) -> String {
-        // The order's own address first: one buyer may send two orders to
-        // two people, and "Send it to" must name this one's.
-        if let Some(SellerRequest::Found(r)) = self.requests.get(order) {
-            if let Some(name) = name_from_address(&r.shipping) {
-                return name;
-            }
-        }
         self.thread_of
             .get(order)
             .and_then(|t| self.names.get(t))
             .cloned()
+            .or_else(|| self.ship_name_of(order))
             .unwrap_or_else(|| "A buyer".to_string())
+    }
+
+    /// Who `order` goes to, from its own address: "Send it to" names this
+    /// order's recipient, who may not be the buyer (a gift).
+    pub(crate) fn ship_name_of(&self, order: &OrderId) -> Option<String> {
+        match self.requests.get(order) {
+            Some(SellerRequest::Found(r)) => name_from_address(&r.shipping),
+            _ => None,
+        }
     }
 
     /// What `order` was for, "Stoneware mug \u{00d7} 1", or its reference
@@ -527,8 +561,17 @@ fn SellerHome(store: SellerStore) -> Element {
         let state = APP_STATE.read();
         let data = SellerData::of(&state, &store);
         let mut rows: Vec<TodoRow> = Vec::new();
-        // Orders to send, the one thing a seller must not miss.
-        for order in state.seller_orders_to_send(&id, &store.fingerprint) {
+        // Orders to send, the one thing a seller must not miss, soonest
+        // first.
+        let mut sending = state.seller_orders_to_send(&id, &store.fingerprint);
+        sending.sort_by_key(|o| match order_status::stage_of(&state, o) {
+            crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }
+            | crate::fulfilment::OrderStage::DespatchWindowClosed { despatch_by, .. } => {
+                despatch_by
+            }
+            _ => u32::MAX,
+        });
+        for order in sending {
             let paid = paid_date(&state, &order)
                 .map(|d| format!("Paid {d}"))
                 .unwrap_or_else(|| "Paid".to_string());
@@ -536,7 +579,8 @@ fn SellerHome(store: SellerStore) -> Element {
                 title: format!(
                     "Send {} to {}",
                     data.item_of(&order),
-                    data.buyer_of(&order.order.id)
+                    data.ship_name_of(&order.order.id)
+                        .unwrap_or_else(|| data.buyer_of(&order.order.id))
                 ),
                 sub: paid,
                 pill: order_status::send_by_pill(&state, &order),
@@ -578,7 +622,11 @@ fn SellerHome(store: SellerStore) -> Element {
                     page: seller_page(&id, SellerView::Conversation(thread.tag)),
                 });
             }
-            if super::message_view::requests_awaiting_invoice_in(&state, &id, &thread.tag) > 0 {
+            if data
+                .invoice_requests
+                .get(thread.tag.as_slice())
+                .is_some_and(|n| *n > 0)
+            {
                 rows.push(TodoRow {
                     title: format!("Answer {name}\u{2019}s order"),
                     sub: "They asked to buy. Accept to send them an order to pay.".to_string(),
@@ -868,6 +916,9 @@ struct OrderRow {
     pill_class: &'static str,
     filter: OrderFilter,
     thumb: Option<String>,
+    /// The block it is to be sent by, for sorting what to send soonest
+    /// first.
+    due: Option<u32>,
 }
 
 /// Every order in this store, filtered by what has to happen next.
@@ -920,6 +971,13 @@ fn SellerOrders(store: SellerStore, filter: OrderFilter) -> Element {
                     pill,
                     pill_class,
                     filter: filter_of(base, to_send),
+                    due: match stage {
+                        crate::fulfilment::OrderStage::AwaitingDespatch { despatch_by, .. }
+                        | crate::fulfilment::OrderStage::DespatchWindowClosed {
+                            despatch_by, ..
+                        } => Some(despatch_by),
+                        _ => None,
+                    },
                     thumb: data
                         .listing_of(&order.order.id)
                         .and_then(|(l, t)| super::item_image::listing_image(&l, &t)),
@@ -933,10 +991,14 @@ fn SellerOrders(store: SellerStore, filter: OrderFilter) -> Element {
             .filter(|r| f == OrderFilter::All || r.filter == f)
             .count()
     };
-    let shown: Vec<&OrderRow> = rows
+    let mut shown: Vec<&OrderRow> = rows
         .iter()
         .filter(|r| filter == OrderFilter::All || r.filter == filter)
         .collect();
+    // What to send soonest first, as Home lists it; the rest newest first.
+    if filter == OrderFilter::ToSend {
+        shown.sort_by_key(|r| r.due.unwrap_or(u32::MAX));
+    }
     let to_send = count(OrderFilter::ToSend);
     rsx! {
         div { class: "chips", role: "tablist",
@@ -1299,7 +1361,11 @@ fn history(
     match stage {
         OrderStage::AwaitingDespatch { despatch_by, .. } => {
             lines.push(format!("Send it by about {}", day(despatch_by)));
-            lines.push("Once it is sent, the buyer has a set time to report a problem".to_string());
+            lines.push(format!(
+                "Once it is sent, the buyer has {} to report a problem",
+                crate::fulfilment::approx_duration(crate::fulfilment::COMPLAINT_WINDOW_BLOCKS)
+                    .trim_start_matches("about ")
+            ));
         }
         OrderStage::DespatchWindowClosed {
             despatch_by,
@@ -1424,11 +1490,10 @@ fn SellerMessages(store: SellerStore) -> Element {
                     when: at.map(order_status::short_date).unwrap_or_default(),
                     at,
                     waiting: thread.awaiting_reply,
-                    request: super::message_view::requests_awaiting_invoice_in(
-                        &state,
-                        &id,
-                        &thread.tag,
-                    ) > 0,
+                    request: data
+                        .invoice_requests
+                        .get(thread.tag.as_slice())
+                        .is_some_and(|n| *n > 0),
                     name,
                 }
             })
@@ -1519,7 +1584,7 @@ fn SellerConversationPage(store: SellerStore, tag: [u8; 32]) -> Element {
                     .get(&tag)
                     .cloned()
                     .unwrap_or_else(|| "this buyer".to_string());
-                let orders: Vec<(OrderId, String, String, Option<String>)> = data
+                let orders: Vec<(OrderId, String, String)> = data
                     .orders
                     .iter()
                     .filter(|o| thread.orders.contains(&o.order.id))
@@ -1540,13 +1605,7 @@ fn SellerConversationPage(store: SellerStore, tag: [u8; 32]) -> Element {
                                 .unwrap_or_else(|| status.label().to_string()),
                             o.order.id.short()
                         );
-                        (
-                            o.order.id.clone(),
-                            data.item_of(o),
-                            pill,
-                            data.listing_of(&o.order.id)
-                                .and_then(|(l, t)| super::item_image::listing_image(&l, &t)),
-                        )
+                        (o.order.id.clone(), data.item_of(o), pill)
                     })
                     .collect();
                 (thread, name, orders)
@@ -1577,7 +1636,7 @@ fn SellerConversationPage(store: SellerStore, tag: [u8; 32]) -> Element {
                 if orders.is_empty() {
                     p { class: "text-muted small", "A question, with no order." }
                 }
-                for (order , item , pill , thumb) in orders.iter() {
+                for (order , item , pill) in orders.iter() {
                     button {
                         key: "{order}",
                         class: "side-row",
@@ -1586,7 +1645,6 @@ fn SellerConversationPage(store: SellerStore, tag: [u8; 32]) -> Element {
                             let order = order.clone();
                             move |_| go(seller_page(&id, SellerView::Order(order.clone())))
                         },
-                        super::item_image::RowThumb { src: thumb.clone() }
                         span { class: "rc-main",
                             span { class: "side-row-name", "{item}" }
                             span { class: "rc-sub", "{pill}" }

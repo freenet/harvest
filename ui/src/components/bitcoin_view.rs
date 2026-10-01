@@ -764,6 +764,7 @@ pub(crate) fn OrderCard(
                         network: o.network,
                         confirmations: o.required_confirmations,
                         order_ref: o.id.short(),
+                        titled: !plain,
                     }
                 }
             } else if destination.payable() && buyer {
@@ -792,6 +793,7 @@ pub(crate) fn OrderCard(
                     network: o.network,
                     confirmations: o.required_confirmations,
                     order_ref: o.id.short(),
+                    titled: !plain,
                 }
             } else if destination.payable() {
                 // The seller's own view of an unpaid invoice: the same

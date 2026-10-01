@@ -98,7 +98,9 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
             .unwrap_or_default();
         (state.store_details_are_resolved(&store_contract_id), rows)
     };
+    // Newest first, sold out last, as the store page lists them.
     rows.sort_by(|a, b| b.0.listing.created_at.cmp(&a.0.listing.created_at));
+    rows.sort_by_key(|(_, availability, _)| !availability.is_buyable());
     let (taken_down, shown): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|(_, availability, _)| *availability == ListingAvailability::Withdrawn);

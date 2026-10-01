@@ -21,7 +21,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
         let info = browsing.and_then(|s| s.info.as_ref());
         let key = info.and_then(|i| i.encryption_public_key);
         let identity = browsing.and_then(|s| s.seller_verifying_key);
-        let orders: Vec<(Page, String, String, Option<String>, bool)> = tag
+        let orders: Vec<(Page, String, String, bool)> = tag
             .map(|tag| {
                 let mut purchases: Vec<_> = state
                     .buyer_purchases(&store)
@@ -70,12 +70,6 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                                 ),
                                 None => status.label().to_string(),
                             },
-                            listing.as_ref().and_then(|(l, t, _)| {
-                                super::item_image::listing_image(
-                                    l,
-                                    t.as_deref().unwrap_or_default(),
-                                )
-                            }),
                             status.ended(),
                         )
                     })
@@ -203,7 +197,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                 }
                 // Ended ones folded, as on Purchases, so this counts what
                 // the store's page and the Messages list count (C2).
-                for (page , item , status , picture , _) in orders.iter().filter(|o| !o.4 || show_ended()) {
+                for (page , item , status , _) in orders.iter().filter(|o| !o.3 || show_ended()) {
                     button {
                         key: "{page.fragment()}",
                         class: "side-row",
@@ -211,7 +205,6 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                             let page = page.clone();
                             move |_| go(page.clone())
                         },
-                        super::item_image::RowThumb { src: picture.clone() }
                         span { class: "rc-main",
                             span { class: "side-row-name", "{item}" }
                             span { class: "rc-sub", "{status}" }
@@ -219,14 +212,14 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                         span { class: "chev", aria_hidden: "true", "\u{203a}" }
                     }
                 }
-                if orders.iter().any(|o| o.4) {
+                if orders.iter().any(|o| o.3) {
                     button {
                         class: "link-btn side-link",
                         onclick: move |_| show_ended.toggle(),
                         if show_ended() {
                             "Hide ended orders"
                         } else {
-                            {format!("Show {}", super::needs::plural(orders.iter().filter(|o| o.4).count(), "ended order", "ended orders"))}
+                            {format!("Show {}", super::needs::plural(orders.iter().filter(|o| o.3).count(), "ended order", "ended orders"))}
                         }
                     }
                 }
@@ -236,7 +229,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                         let store = store.clone();
                         move |_| super::app::show_store(store.clone())
                     },
-                    "Visit store"
+                    "View store"
                 }
                 if let Some(tag) = tag {
                     div { class: "side-cancel",

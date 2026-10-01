@@ -162,8 +162,10 @@ pub(crate) fn buyer_status(
     // order whose window closed while its payment was still confirming is
     // not "Expired", and one with a payment on its way is not "Waiting for
     // payment" (review of #214: that prompt is what leads to paying twice).
-    let sight = state.payment_sight(order);
-    if order.status == OrderStatus::AwaitingPayment && (sight.settles() || sight.ambiguous) {
+    // Only a payment that would settle it: one that may be another order's,
+    // on an address the seller reused, still shows the pay steps with the
+    // card's warning not to pay twice (as the purchase card always did).
+    if order.status == OrderStatus::AwaitingPayment && state.payment_sight(order).settles() {
         return Status::PaymentSeen;
     }
     if purchase
@@ -194,11 +196,35 @@ pub(crate) fn buyer_status(
     }
 }
 
-/// Whether the buyer can pay this purchase now: what its row's "Pay now"
-/// and the header's count say (`store_view::orders_here`'s "to pay").
+/// Whether the buyer can pay this purchase now, from its status and
+/// blockers alone. Every prompt to pay goes through [`can_pay_now`], which
+/// also checks the amount against what this tab's Buy now showed.
 pub(crate) fn buyer_can_pay(purchase: &BuyerPurchase, status: Status) -> bool {
     status == Status::WaitingForPayment
         && (purchase.blockers.is_empty() || purchase.ready_to_keep())
+}
+
+/// Whether to prompt the buyer to pay this purchase now: the one rule for
+/// the order page's "Pay ..." heading, the Purchases row's "Pay now", the
+/// store page's "to pay" and the header's count (review of #214). Never
+/// with a payment in sight ([`Status::PaymentSeen`]), and never when the
+/// order asks other than the total this tab's Buy now showed
+/// (`buy_view::PENDING_BUYS`), which the order page then explains.
+pub(crate) fn can_pay_now(
+    state: &AppState,
+    store_contract_id: &[u8],
+    purchase: &BuyerPurchase,
+) -> bool {
+    use dioxus::prelude::ReadableExt;
+    let status = buyer_status(state, store_contract_id, purchase);
+    let asked_matches = match (
+        super::buy_view::PENDING_BUYS.peek().get(&purchase.order_id),
+        purchase.commitment.as_ref(),
+    ) {
+        (Some(pending), Some(order)) => order.order.amount_sats == pending.sent.asked_sats,
+        _ => true,
+    };
+    buyer_can_pay(purchase, status) && asked_matches
 }
 
 /// Where an order known only from this node's kept copy stands: from the
@@ -217,11 +243,8 @@ pub(crate) fn kept_status(
         return Status::PaymentSeen;
     }
     let status = from_stage(stage_of(state, &kept.order), kept.order.status);
-    if status == Status::WaitingForPayment {
-        let sight = state.payment_sight(&kept.order);
-        if sight.settles() || sight.ambiguous {
-            return Status::PaymentSeen;
-        }
+    if status == Status::WaitingForPayment && state.payment_sight(&kept.order).settles() {
+        return Status::PaymentSeen;
     }
     status
 }

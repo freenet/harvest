@@ -63,7 +63,8 @@ pub(crate) fn coins(sats: u64) -> String {
 /// structure, rule 7): "0.0001 tBTC". Where it is a price on its own, the
 /// page puts the "test coins" tag beside it ([`TEST_COIN_TAG`]).
 pub(crate) fn money(sats: u64, network: BitcoinNetwork) -> String {
-    format!("{} {}", coins(sats), coin_unit(network))
+    // A no-break space: an amount never splits from its unit on a phone.
+    format!("{}\u{a0}{}", coins(sats), coin_unit(network))
 }
 
 /// The tag beside a test-network price.
@@ -145,8 +146,13 @@ pub(crate) fn PaySteps(
     /// The order's short reference: keeps the copy fields' element ids apart
     /// when two orders on one page share an amount.
     order_ref: String,
+    /// Headed "How to pay": not on the order page, whose "Pay ..." heads it.
+    #[props(default = true)]
+    titled: bool,
 ) -> Element {
-    let amount = amount_text(amount_sats, network);
+    // In a sentence the one money format; the box to copy keeps every digit
+    // a wallet takes.
+    let amount = money(amount_sats, network);
     let wait = confirmation_wait(confirmations);
     let uri = payment_uri(&address, amount_sats);
     let qr = qr_path(&uri);
@@ -154,7 +160,9 @@ pub(crate) fn PaySteps(
 
     rsx! {
         div { class: "pay-steps-wrap",
-            h4 { "How to pay" }
+            if titled {
+                h4 { "How to pay" }
+            }
             ol { class: "pay-steps",
                 li {
                     strong { "Open your bitcoin wallet." }
@@ -381,8 +389,8 @@ mod money_tests {
         assert_eq!(coins(150_000_000), "1.5");
         assert_eq!(coins(1), "0.00000001");
         assert_eq!(coins(0), "0");
-        assert_eq!(money(10_000, BitcoinNetwork::Signet), "0.0001 tBTC");
-        assert_eq!(money(10_000, BitcoinNetwork::Bitcoin), "0.0001 BTC");
+        assert_eq!(money(10_000, BitcoinNetwork::Signet), "0.0001\u{a0}tBTC");
+        assert_eq!(money(10_000, BitcoinNetwork::Bitcoin), "0.0001\u{a0}BTC");
     }
 
     /// A typed price reads back as the sats it names, and what is not a

@@ -216,7 +216,8 @@ body::before {
        .store-head-acts, .chips, .two-col, .item-grid, .item-card,
        .item-page, .bill, .amount-field, .progress, .side-row, .switch-menu,
        .row-more-menu, .needs-menu, .open-steps > li, .todo-note,
-       .row-more > summary.btn) > * {
+       .row-more > summary.btn,
+       .item-grid:not(.gallery) .item-card:has(.item-card-img)) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -2751,4 +2752,52 @@ section + .panel {
   .row-action {
     min-height: 0;
   }
+}
+
+/* A link drawn as a button is a button: no underline. */
+a.btn {
+  display: inline-block;
+  text-decoration: none;
+}
+
+.pay-steps a:not(.btn) {
+  color: var(--accent);
+}
+
+/* An item card's picture: a small square beside its words, unless every
+   item on the page has one (".gallery"), when it fills the card's top. */
+.item-grid:not(.gallery) .item-card:has(.item-card-img) {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+  grid-auto-rows: min-content;
+  column-gap: var(--space-sm);
+  align-content: start;
+}
+
+.item-grid:not(.gallery) .item-card-img {
+  grid-row: 1 / span 4;
+  width: 4.5rem;
+  height: 4.5rem;
+  margin: 0;
+  aspect-ratio: auto;
+  border-radius: var(--radius);
+}
+
+.item-grid:not(.gallery) .item-card > :not(.item-card-img) {
+  grid-column: 2;
+}
+
+/* An order's picture stays on the title's line, on a phone too. */
+.page-title h2 {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.page-title > .pill,
+.page-title > .row-thumb {
+  flex: none;
+}
+
+.order-cancel {
+  margin-top: var(--space-sm);
 }

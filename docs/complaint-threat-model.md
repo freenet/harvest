@@ -330,8 +330,8 @@ Two things are read from any loaded store under the same owner key, and neither 
 the seller's despatch (without it, the despatch deadline decides when the complaint opens),
 and whether a loaded record already holds this buyer's complaint (without it, the kept
 complaint and the in-flight marker still refuse a second one). An order known only
-from the kept copy never shows an address; an unpaid one is listed as held and is paid from its
-order page once its store is loaded (3.1).
+from the kept copy never shows an address; an unpaid one is listed with its status and is paid
+from its order page once its store is loaded (3.1).
 
 ## 4. The complaint preconditions: one predicate, checked in three places
 

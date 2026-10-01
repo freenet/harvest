@@ -255,11 +255,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
     let asked = pending.as_ref().map(|p| p.sent.asked_sats);
     // The order asks what this tab's Buy now showed, or nothing here says
     // to pay it (PayPanel says why).
-    let asked_matches = match (asked, purchase.commitment.as_ref()) {
-        (Some(asked), Some(order)) => order.order.amount_sats == asked,
-        _ => true,
-    };
-    let can_pay = order_status::buyer_can_pay(&purchase, facts.status) && asked_matches;
+    let can_pay = order_status::can_pay_now(&APP_STATE.read(), &store, &purchase);
     // Only a counted listing holds stock, and only for the hour after Buy
     // now.
     let holds = can_pay
@@ -363,7 +359,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                             // Why not yet, when a report can't be made now.
                             if let ComplaintOffer::Refused(ref why) = facts.complaint {
                                 if !why.is_empty() {
-                                    p { class: "text-muted small", "A problem can\u{2019}t be reported yet: {why}." }
+                                    p { class: "text-muted small", "A problem can\u{2019}t be reported: {why}." }
                                 }
                             }
                             if facts.complaint == ComplaintOffer::Open {
@@ -381,13 +377,20 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                 }
                 if let Some((sats, network)) = amount {
+                    // An action on the order, under its state: not on an
+                    // expired one, where nothing is left to cancel (06-4).
+                    if purchase.cancellable() && facts.status != Status::Expired {
+                        div { class: "order-cancel",
+                            super::buy_view::CancelPurchase { store_contract_id: store.clone(), purchase: purchase.clone() }
+                        }
+                    }
                     h3 { class: "sec-lbl", "Details" }
                     div { class: "bill",
                         // The item and delivery lines only where they add up
                         // to the order's amount exactly: a listing changed
                         // since, or an order asking something else, shows the
                         // total alone, never a made-up "delivery" line.
-                        match facts.breakdown.filter(|(items, delivery)| items + delivery == sats) {
+                        match facts.breakdown.filter(|(items, delivery)| items.checked_add(*delivery) == Some(sats)) {
                             Some((items, delivery)) => rsx! {
                                 span { "{facts.item}" }
                                 span { "{super::pay_card::money(items, network)}" }
@@ -454,14 +457,7 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                         let store = store.clone();
                         move |_| super::app::show_store(store.clone())
                     },
-                    "Visit store"
-                }
-                // Not on an expired order: nothing is left to cancel
-                // (critique 06-4).
-                if purchase.cancellable() && facts.status != Status::Expired {
-                    div { class: "side-cancel",
-                        super::buy_view::CancelPurchase { store_contract_id: store.clone(), purchase: purchase.clone() }
-                    }
+                    "View store"
                 }
             }
         }
@@ -543,7 +539,7 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
                         "Report a problem"
                     }
                 }
-            } else if seen_paid {
+            } else if seen_paid || status == Status::PaymentSeen {
                 p { "Payment seen. Your node is keeping its proof of payment, and a problem can be reported once it has." }
             } else if status == Status::Expired {
                 p { "This order can no longer be paid: its time to pay has passed." }

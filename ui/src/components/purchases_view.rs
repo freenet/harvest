@@ -115,7 +115,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 store: store.name.clone(),
                 date: order.map(|o| o.order.created_at),
                 amount: order.map(|o| super::pay_card::money(o.order.amount_sats, o.order.network)),
-                to_pay: super::order_status::buyer_can_pay(&purchase, status),
+                to_pay: super::order_status::can_pay_now(state, id, &purchase),
                 picture: listing.as_ref().and_then(|(l, t, _)| {
                     super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
                 }),
@@ -532,7 +532,7 @@ pub fn BackupPage() -> Element {
              and report a problem, on another device."
         }
         section { class: "panel",
-            h3 { class: "panel-h", "Save a backup" }
+            h3 { class: "panel-h", "Your backups" }
             p { class: "text-muted small",
                 "Each store you have bought from or written to has its own backup, which holds your \
                  orders and messages with it. Keep it private, like a password: anyone who has it \
@@ -562,7 +562,11 @@ pub fn BackupPage() -> Element {
                             span { class: "pill", "Not saved" }
                         }
                     }
-                    super::message_view::ConversationBackupControl { store_contract_id: store.clone(), tag: *tag }
+                    super::message_view::ConversationBackupControl {
+                        store_contract_id: store.clone(),
+                        tag: *tag,
+                        primary: !*backed_up,
+                    }
                 }
             }
         }

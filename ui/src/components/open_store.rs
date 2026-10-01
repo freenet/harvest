@@ -17,6 +17,7 @@ use crate::gateway::APP_STATE;
 /// not be taken for one just opened here (review of #214).
 #[component]
 pub(crate) fn OpenStore(another: bool) -> Element {
+    super::seller_pages::use_known_clock();
     let known = APP_STATE
         .read()
         .seller_known_or_waited(crate::state::now_ms());

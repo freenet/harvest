@@ -130,7 +130,13 @@ pub(crate) fn ForgetConversation(store_contract_id: Vec<u8>, tag: [u8; 32]) -> E
 /// gates that marker for the same reason: the party that benefits from the
 /// warning stopping is not the party that loses the conversation.
 #[component]
-pub(crate) fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element {
+pub(crate) fn ConversationBackupControl(
+    store_contract_id: Vec<u8>,
+    tag: [u8; 32],
+    /// The page's main action: no backup of this one exists elsewhere yet.
+    #[props(default)]
+    primary: bool,
+) -> Element {
     // The string, once the delegate has answered, and only for THIS
     // conversation -- one is on screen at a time and it must never appear
     // under another conversation's heading.
@@ -181,7 +187,7 @@ pub(crate) fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32
             }
         } else {
             button {
-                class: "btn btn-sm btn-outline",
+                class: if primary { "btn btn-sm btn-primary" } else { "btn btn-sm btn-outline" },
                 onclick: {
                     let store_contract_id = store_contract_id.clone();
                     move |_| APP_STATE.write().export_conversation(&store_contract_id, &tag)
@@ -2561,35 +2567,26 @@ pub(crate) fn requests_awaiting_invoice(
     state: &crate::state::AppState,
     store_contract_id: &[u8],
 ) -> usize {
-    let Some(store) = state.browsing_stores.get(store_contract_id) else {
-        return 0;
-    };
-    count_unanswered(
-        state.mailbox_entries(store_contract_id),
-        &store.listings,
-        &store.orders,
-        |tag| state.conversation_keys.get(tag),
-        |listing| store.availability(listing).is_buyable(),
-    )
+    // Conversations, not requests: one buyer with two requests is one row
+    // to answer, and the count agrees with the rows (review of #214).
+    requests_awaiting_invoice_by_tag(state, store_contract_id)
+        .values()
+        .filter(|n| **n > 0)
+        .count()
 }
 
-/// [`requests_awaiting_invoice`] in the one conversation `tag`: what the
-/// Home page's "Answer ..." row and the Messages page's "Needs an invoice"
-/// say, so each row is one the header counted (review of #214).
-pub(crate) fn requests_awaiting_invoice_in(
+/// The requests waiting for an invoice in each of one of our stores'
+/// conversations, by tag, read from the mailbox once: what the Home rows and
+/// the Messages page look each conversation up in.
+pub(crate) fn requests_awaiting_invoice_by_tag(
     state: &crate::state::AppState,
     store_contract_id: &[u8],
-    tag: &[u8; 32],
-) -> usize {
+) -> std::collections::BTreeMap<Vec<u8>, usize> {
     let Some(store) = state.browsing_stores.get(store_contract_id) else {
-        return 0;
+        return Default::default();
     };
-    count_unanswered(
-        state
-            .mailbox_entries(store_contract_id)
-            .into_iter()
-            .filter(|entry| entry.conversation() == tag.as_slice())
-            .collect(),
+    unanswered_by_tag(
+        state.mailbox_entries(store_contract_id),
         &store.listings,
         &store.orders,
         |tag| state.conversation_keys.get(tag),
@@ -2612,6 +2609,19 @@ fn count_unanswered<'a>(
     keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
     on_sale: impl Fn(&harvest_common::listing::ListingId) -> bool,
 ) -> usize {
+    unanswered_by_tag(entries, listings, published, keys_for, on_sale)
+        .values()
+        .sum()
+}
+
+/// [`count_unanswered`] per conversation, by tag.
+fn unanswered_by_tag<'a>(
+    entries: Vec<MailboxEntry>,
+    listings: &[harvest_common::listing::AuthorizedListing],
+    published: &[harvest_common::payment::AuthorizedOrder],
+    keys_for: impl Fn(&[u8]) -> Option<&'a crate::messaging::ConversationKeys>,
+    on_sale: impl Fn(&harvest_common::listing::ListingId) -> bool,
+) -> std::collections::BTreeMap<Vec<u8>, usize> {
     // Grouped in one pass, and matched through one index (review after
     // 6c61839): the header asks for this on every state change.
     let index = OrderIndex::new(published);
@@ -2626,7 +2636,7 @@ fn count_unanswered<'a>(
     conversations
         .iter()
         .map(|(tag, group)| {
-            unanswered_requests_in(group, listings, &index, keys_for(tag))
+            let n = unanswered_requests_in(group, listings, &index, keys_for(tag))
                 .iter()
                 // Not a Buy now: an unpaid one is not an order and does not
                 // need the seller (Ian, 2026-09-26). The seller's store
@@ -2643,9 +2653,10 @@ fn count_unanswered<'a>(
                     listings.iter().any(|l| l.listing.id == request.listing_id)
                         && on_sale(&request.listing_id)
                 })
-                .count()
+                .count();
+            (tag.clone(), n)
         })
-        .sum()
+        .collect()
 }
 
 #[cfg(test)]

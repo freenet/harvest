@@ -619,13 +619,31 @@ fn LoadedStore(
         name => name.to_string(),
     };
     let tagline = crate::markdown::first_line(&info.description);
-    let about_more = tagline.as_deref().map(str::trim) != Some(info.description.trim());
+    let about_more = tagline.as_deref()
+        != Some(
+            info.description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .as_str(),
+        )
+        && !info.description.trim().is_empty();
     // This buyer's orders from this store are on Purchases, once: here only
     // a line that goes there (critique S2-10).
     let orders = if owned {
         OrdersHere::default()
     } else {
-        orders_here(&APP_STATE.read().buyer_purchases(&contract_id))
+        let state = APP_STATE.read();
+        let purchases = state.buyer_purchases(&contract_id);
+        // "to pay" by the one rule every prompt to pay uses: never with a
+        // payment in sight (review of #214).
+        OrdersHere {
+            to_pay: purchases
+                .iter()
+                .filter(|p| super::order_status::can_pay_now(&state, &contract_id, p))
+                .count(),
+            ..orders_here(&purchases)
+        }
     };
     let network = crate::gateway::bitcoin_config::default_network();
     let test = super::pay_card::is_test_network(network);
@@ -645,6 +663,7 @@ fn LoadedStore(
         })
         .collect();
 
+    let all_pictures = !items.is_empty() && items.iter().all(|i| i.picture.is_some());
     rsx! {
         if owned {
             div { class: "own-store-banner",
@@ -769,7 +788,10 @@ fn LoadedStore(
                 if items.is_empty() {
                     p { class: "text-muted empty-line", "No listings yet." }
                 } else {
-                    div { class: "item-grid",
+                    // Pictures above the words when every item has one; a
+                    // small square beside them when only some do, so cards
+                    // with and without one are alike in shape (critique D1).
+                    div { class: if all_pictures { "item-grid gallery" } else { "item-grid" },
                         for item in items.iter() {
                             ItemCard { key: "{item.listing}", item: item.clone(), store: contract_id.clone() }
                         }
@@ -1659,7 +1681,10 @@ mod availability_tests {
         });
         assert_eq!(
             price_lines(&l),
-            Some(("0.00025 tBTC".to_string(), "Delivery included".to_string()))
+            Some((
+                "0.00025\u{a0}tBTC".to_string(),
+                "Delivery included".to_string()
+            ))
         );
         l.checkout = Some(FixedCheckout {
             unit_sats: 1_000_000,
@@ -1677,8 +1702,8 @@ mod availability_tests {
         assert_eq!(
             price_lines(&l),
             Some((
-                "0.01 tBTC".to_string(),
-                "Delivery: US free, EU 0.00005 tBTC".to_string()
+                "0.01\u{a0}tBTC".to_string(),
+                "Delivery: US free, EU 0.00005\u{a0}tBTC".to_string()
             ))
         );
         l.checkout = None;
