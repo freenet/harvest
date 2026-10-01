@@ -1867,7 +1867,14 @@ pub(crate) fn SellerThreadToggle(
     // No number (msg4 screenshots: each side counted only what it could
     // confirm, so the two sides saw different numbers); "New message from
     // the buyer" says when one waits.
-    let label = match (shown, thread.lines.is_empty()) {
+    // "Messages" only when someone wrote something (a decline is a step,
+    // not a message), confirmed or not, as on the buyer's side
+    // (`buyer_thread_has_messages`).
+    let has_messages = thread
+        .lines
+        .iter()
+        .any(|line| matches!(line.item, ChatItem::Said(_)));
+    let label = match (shown, !has_messages) {
         (true, _) => "Hide messages",
         (false, true) => "Message the buyer",
         (false, false) => "Messages",
