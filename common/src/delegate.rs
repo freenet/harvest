@@ -2109,6 +2109,7 @@ mod tests {
                 request_id: 42,
                 ghostkey_fingerprint: fp(),
                 listing: Listing {
+                    images: Vec::new(),
                     checkout: None,
                     choices: Vec::new(),
                     id: crate::listing::ListingId([17u8; 32]),

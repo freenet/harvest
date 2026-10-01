@@ -3293,6 +3293,7 @@ mod tests {
 
     fn listing(quantity_terms: Option<FixedCheckout>) -> Listing {
         Listing {
+            images: Vec::new(),
             id: ListingId([0; 32]),
             title: "Jam".into(),
             description: String::new(),

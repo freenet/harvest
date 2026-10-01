@@ -35,6 +35,8 @@ zeroize = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Only to check `listing_image`'s copies of its limits; see that module.
+harvest-image = { workspace = true }
 # Enables `freenet_bitcoin_common::spv::testing`, so `store` module tests
 # build genuine SPV proofs rather than stubbing out payment verification.
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }

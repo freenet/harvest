@@ -16649,6 +16649,7 @@ mod tests {
         PendingSignature::Listing(PendingListing {
             fingerprint: FINGERPRINT.to_string(),
             listing: harvest_common::listing::Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: harvest_common::listing::ListingId([1u8; 32]),
@@ -16847,6 +16848,7 @@ mod tests {
 
     fn new_listing(title: &str) -> harvest_common::listing::Listing {
         harvest_common::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: harvest_common::listing::ListingId([0u8; 32]),
@@ -18155,6 +18157,7 @@ mod tests {
     fn listing_with(id: u8, certificate_pem: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: harvest_common::listing::Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: harvest_common::listing::ListingId([id; 32]),
@@ -21528,6 +21531,7 @@ mod invoice_tests {
             .push_back(PendingSignature::Listing(PendingListing {
                 fingerprint: SELLER.to_string(),
                 listing: harvest_common::listing::Listing {
+                    images: Vec::new(),
                     checkout: None,
                     choices: Vec::new(),
                     id: listing_id(),
@@ -29693,6 +29697,7 @@ mod buy_flow_tests {
                 pending: PendingListing {
                     fingerprint: "seller-fp".into(),
                     listing: harvest_common::listing::Listing {
+                        images: Vec::new(),
                         checkout: None,
                         choices: Vec::new(),
                         id: harvest_common::listing::ListingId([0u8; 32]),
@@ -33926,6 +33931,7 @@ mod buy_flow_tests {
         // the quantity, and the listing's title while the store lists it.
         assert_eq!(state.purchase_item(STORE, &found[0]), Some((None, 1)));
         let listing = harvest_common::listing::Listing {
+            images: Vec::new(),
             id: widget(),
             title: "Widget".into(),
             description: String::new(),
@@ -34088,6 +34094,7 @@ mod buy_flow_tests {
             inbox::inbox_key(),
         ));
         let listing = harvest_common::listing::Listing {
+            images: Vec::new(),
             id: harvest_common::listing::ListingId([0; 32]),
             title: "Jam".into(),
             description: String::new(),

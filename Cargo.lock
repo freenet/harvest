@@ -1945,6 +1945,7 @@ dependencies = [
  "freenet-stdlib",
  "getrandom 0.2.17",
  "ghostkey-common",
+ "harvest-image",
  "hex",
  "hkdf",
  "rand_chacha 0.3.1",
