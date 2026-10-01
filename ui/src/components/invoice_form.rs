@@ -318,7 +318,7 @@ pub(crate) fn invoices_issued_by(
     mine
 }
 
-/// The payout wallet, as My store > Settings shows it.
+/// The payout wallet, as the seller's Settings shows it.
 #[component]
 pub fn PayoutWallet() -> Element {
     let (xpub, xpub_loaded) = {

@@ -72,7 +72,7 @@ pub(crate) struct SellerStore {
 }
 
 /// Whether an order at `stage` is paid and waiting to be sent: the one rule
-/// the "Needs you" count, the Overview's order cards and the Orders tab all
+/// the "Needs you" count, the Home tab's order cards and the Orders tab all
 /// use. Past its send-by date and still unsent it needs the seller all the
 /// more (`OrderStage::needs_attention`, codex on harvest#177), and so does a
 /// Paid order this node cannot yet place against the chain (`Unknown`):
@@ -123,7 +123,7 @@ impl SellerStore {
     }
 }
 
-/// Whether this store's "Needs you" card (`Overview`) holds anything: what
+/// Whether this store's "Needs you" card (the Home tab) holds anything: what
 /// [`SellerStore::needs_you`] counts, and the rest it lists (a listing with
 /// no price, a wallet gap, another key on the store's address, details to
 /// repair, a backing buyers do not believe, expired invoices, instant
@@ -1679,7 +1679,7 @@ mod seller_stores_tests {
         }
     }
 
-    /// My store manages only stores this device holds a store key for, and
+    /// The seller's pages manage only stores this device holds a store key for, and
     /// counts listings a buyer can see, not ones taken down. Mutated red by
     /// dropping the key filter and the `Withdrawn` filter.
     #[test]
@@ -1724,7 +1724,7 @@ mod seller_stores_tests {
         assert!(super::super::needs::places(&state).is_empty());
     }
 
-    /// Every item the Overview's "Needs you" card can list makes a store's
+    /// Every item the Home tab's "Needs you" card can list makes a store's
     /// card on Stores say so (`overview_needs`, shared by both), and a store
     /// still loading is not flagged for what it has not read yet. Red if
     /// any branch is dropped. (The wallet-gap and instant-checkout alerts
@@ -1772,7 +1772,7 @@ mod seller_stores_tests {
 
         // Until the store's details have been read, its certificate reads
         // Absent by default and its gap is unknown: neither is something
-        // to do yet, as the Overview itself does not list them (so a card
+        // to do yet, as the Home tab itself does not list them (so a card
         // does not say "Needs you" for every store still loading).
         let mut loading = base.clone();
         loading.details_resolved = false;

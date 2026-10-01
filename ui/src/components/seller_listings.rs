@@ -1,4 +1,4 @@
-//! My store > Listings: what the seller has listed, and the controls to change
+//! The seller's Listings: what the seller has listed, and the controls to change
 //! it (harvest#69, #70).
 //!
 //! Every change is a store-key-signed status or a new listing; see

@@ -25157,7 +25157,7 @@ mod buy_flow_tests {
         );
     }
 
-    /// **My store's overview counts the orders a seller must reissue, and
+    /// **The seller's Home tab counts the orders a seller must reissue, and
     /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
     /// fresh one and a cancelled one do not. Pins the composition in
     /// `my_store::seller_stores` (seller filter, `needs_reissue`, and

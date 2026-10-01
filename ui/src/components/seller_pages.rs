@@ -1636,13 +1636,7 @@ fn SellerSettings(store: SellerStore) -> Element {
             h3 { "Payout wallet" }
             super::invoice_form::PayoutWallet {}
             p { class: "text-muted small", "Harvest can create addresses but can never spend your coins." }
-            // Where a seller checks the Bitcoin side when payments seem slow
-            // to show.
-            button {
-                class: "link-btn",
-                onclick: move |_| go(Page::Diagnostics),
-                "Check Harvest\u{2019}s connection to Bitcoin"
-            }
+
         }
         section { class: "settings-sec",
             h3 { "Backed by" }
@@ -1660,11 +1654,11 @@ fn SellerSettings(store: SellerStore) -> Element {
         }
         section { class: "settings-sec",
             h3 { "Pause the store" }
-            p { class: "text-muted small", "Coming in the next update of Harvest." }
+            p { class: "text-muted small", "Not available yet." }
         }
         section { class: "settings-sec",
             h3 { "Move or retire this store" }
-            p { class: "text-muted small", "Coming in the next update of Harvest." }
+            p { class: "text-muted small", "Not available yet." }
         }
     }
 }

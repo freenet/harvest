@@ -146,7 +146,7 @@ pub(crate) enum Needs {
     /// Counted (`my_store::SellerStore::needs_you`, the header's count):
     /// "<n> need(s) you".
     Count(usize),
-    /// Nothing counted, but the Overview's "Needs you" card lists something
+    /// Nothing counted, but the Home tab's "Needs you" card lists something
     /// all the same (`my_store::overview_needs`): "Needs you".
     Look,
 }
@@ -154,7 +154,7 @@ pub(crate) enum Needs {
 /// Whether buyers can buy from one of the seller's stores.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Buyers {
-    /// Open, and the Overview says so: "up to date" when nothing needs the
+    /// Open, and the Home tab says so: "up to date" when nothing needs the
     /// seller, and nothing said otherwise.
     Open,
     /// "Closed", or the seller's own status pill ("Not taking orders" when
@@ -206,12 +206,12 @@ impl OwnStoreStatus {
 }
 
 /// The status on an own store's row card, from what needs the seller
-/// (`needs_you` counted, `needs_a_look` anything else the Overview's "Needs
+/// (`needs_you` counted, `needs_a_look` anything else the Home tab's "Needs
 /// you" card lists), whether buyers can buy (`AppState::buyer_open`, the
 /// same answer the store page's pill and the visited rows give) and the ONE
-/// status the seller's Overview reads (`presence_flow::seller_status`,
+/// status the seller's Home tab reads (`presence_flow::seller_status`,
 /// `None` for a store that sells nothing here). Nothing new is judged here:
-/// a store is "up to date" only where buyers can buy, the Overview would say
+/// a store is "up to date" only where buyers can buy, the Home tab would say
 /// Open, and it would say "Nothing needs you right now".
 pub(crate) fn own_store_status(
     needs_you: usize,
@@ -288,7 +288,7 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
 }
 
 /// A row card for one of the seller's own stores: the whole card opens its
-/// seller pages, on the Overview, whose first card is "Needs you".
+/// seller pages, on the Home tab, whose first card is "Needs you".
 #[component]
 fn OwnStoreCard(row: OwnStoreRow) -> Element {
     let needs = row.status.needs_pill();
@@ -1050,7 +1050,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
 
 /// A store's trust line, as buyers read it on its page: what its backing
 /// shows, then its record ("Backed by a donation to Freenet · 1
-/// complaint"). The one function the store page, the seller's Overview and
+/// complaint"). The one function the store page, the seller's Home tab and
 /// their Settings all say it with, so what the seller is told buyers see
 /// cannot drift from what buyers do see (critique 12-2: Settings still said
 /// "Ghostkey verified" after the store page stopped).
@@ -1695,11 +1695,11 @@ mod stores_page_tests {
     use crate::presence_flow::LocalSelling;
     use harvest_common::presence::ClosedWhy;
 
-    /// An own store's card says what the seller's Overview would: what
+    /// An own store's card says what the seller's Home tab would: what
     /// needs the seller ("<n> need you", or "Needs you" for anything else
-    /// the Overview lists), whether buyers can buy (the Overview's own pill,
+    /// the Home tab lists), whether buyers can buy (the Home tab's own pill,
     /// or "Closed"), and both when both hold (critique 01s-2); "up to date"
-    /// only where nothing needs the seller, buyers can buy and the Overview
+    /// only where nothing needs the seller, buyers can buy and the Home tab
     /// reads Open; "Checking…" while it is too soon to say. Red if a store
     /// whose device cannot answer orders reads "up to date", red if one
     /// closed for good does, and red hiding "Not taking orders" behind
@@ -2056,7 +2056,7 @@ mod store_page_tests {
     }
 
     /// The trust line the store page shows in two parts is the one line
-    /// the seller's Overview and Settings say buyers see: one function, so
+    /// the seller's Home tab and Settings say buyers see: one function, so
     /// they cannot disagree again (critique 12-2).
     #[test]
     fn the_trust_line_is_one_for_the_page_and_the_seller() {

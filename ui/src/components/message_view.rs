@@ -2550,7 +2550,7 @@ fn dispatch_reply(_mailbox: Vec<u8>, _sealed: harvest_common::mailbox::Encrypted
 }
 
 /// How many buyers' requests in one of our stores' inboxes are still waiting
-/// for an invoice: the count My store shows beside Orders and in the top
+/// for an invoice: the count the seller's pages show beside Messages and in the top
 /// navigation, so a seller sees that a request arrived without opening the
 /// inbox (harvest#93 phase 2).
 ///

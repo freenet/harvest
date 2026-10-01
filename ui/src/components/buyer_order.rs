@@ -212,9 +212,18 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                 }
             }
             None => {
-                let loading = APP_STATE.read().store_name_of(&store)
-                    == crate::state::StoreName::Loading
-                    || !APP_STATE.read().background_loads.is_empty();
+                // Also while this device's conversations with the store are
+                // being recalled: until then its orders can't be told apart
+                // (review of #214).
+                let loading = {
+                    let state = APP_STATE.read();
+                    state.store_name_of(&store) == crate::state::StoreName::Loading
+                        || !state.background_loads.is_empty()
+                        || state
+                            .pending_conversation_recalls
+                            .values()
+                            .any(|id| *id == store)
+                };
                 rsx! {
                     {back}
                     if loading {
