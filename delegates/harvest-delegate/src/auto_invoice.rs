@@ -1015,12 +1015,46 @@ pub(crate) fn disarm_all<S: SecretStore + crate::secrets::RemovableSecrets>(secr
 /// already decremented. Both are lists this delegate only ever grows or
 /// settles, so a union loses nothing either side knew.
 pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
-    let before = held.clone();
-    for digest in incoming.seen {
-        held.saw(digest);
+    // The same decisions as before #206, with every membership test against
+    // a set instead of a scan: two full ledgers took about a hundred million
+    // comparisons, most of a call's budget on the migration import. Each
+    // set mirrors its list exactly, counting copies so a damaged ledger that
+    // holds one twice still answers as the scan did.
+    // `merge_ledgers_is_the_scanning_merge` pins the equality.
+    use std::collections::{HashMap, HashSet};
+    fn counts<T: std::hash::Hash + Eq + Clone>(
+        items: impl Iterator<Item = T>,
+    ) -> HashMap<T, usize> {
+        let mut map = HashMap::new();
+        for item in items {
+            *map.entry(item).or_insert(0) += 1;
+        }
+        map
     }
+    fn forget<T: std::hash::Hash + Eq>(map: &mut HashMap<T, usize>, item: &T) {
+        if let Some(n) = map.get_mut(item) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(item);
+            }
+        }
+    }
+    let before = held.clone();
+    let mut seen = counts(held.seen.iter().copied());
+    for digest in incoming.seen {
+        if !seen.contains_key(&digest) {
+            held.seen.push_back(digest);
+            *seen.entry(digest).or_insert(0) += 1;
+            while held.seen.len() > SEEN_CAP {
+                if let Some(gone) = held.seen.pop_front() {
+                    forget(&mut seen, &gone);
+                }
+            }
+        }
+    }
+    let mut answered: HashSet<[u8; 32]> = held.answered.iter().copied().collect();
     for request in incoming.answered {
-        if !held.answered.contains(&request) {
+        if answered.insert(request) {
             held.answered.push_back(request);
         }
     }
@@ -1036,8 +1070,9 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     held.issued_at_ms.sort_unstable();
     let excess = held.issued_at_ms.len().saturating_sub(2 * MAX_PER_DAY);
     held.issued_at_ms.drain(..excess);
+    let mut gaps: HashSet<OrderId> = held.gap_orders.iter().map(|(id, _)| id.clone()).collect();
     for gap in incoming.gap_orders {
-        if !held.gap_orders.iter().any(|(id, _)| *id == gap.0) {
+        if gaps.insert(gap.0.clone()) {
             held.gap_orders.push_back(gap);
         }
     }
@@ -1071,23 +1106,36 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
     // Sales first, skipping any either side has settled, and only then the
     // tombstones: merged first, the incoming ones could push this
     // delegate's own out of the capped list and let a settled sale back in.
+    let held_settled: HashSet<OrderId> = held.settled.iter().cloned().collect();
+    let incoming_settled: HashSet<OrderId> = incoming.settled.iter().cloned().collect();
+    // The FIRST sale held under each order, as `find` returned it.
+    let mut sale_at: HashMap<OrderId, usize> = HashMap::new();
+    for (i, s) in held.sales.iter().enumerate() {
+        sale_at.entry(s.order.clone()).or_insert(i);
+    }
     for sale in incoming.sales {
-        if held.settled.contains(&sale.order) || incoming.settled.contains(&sale.order) {
+        if held_settled.contains(&sale.order) || incoming_settled.contains(&sale.order) {
             continue;
         }
-        match held.sales.iter_mut().find(|s| s.order == sale.order) {
-            Some(own) => {
+        match sale_at.get(&sale.order) {
+            Some(&i) => {
+                let own = &mut held.sales[i];
                 if own.decremented.is_none() {
                     own.decremented = sale.decremented;
                 }
             }
-            None => held.sales.push(sale),
+            None => {
+                sale_at.insert(sale.order.clone(), held.sales.len());
+                held.sales.push(sale);
+            }
         }
     }
     held.sales
-        .retain(|s| !held.settled.contains(&s.order) && !incoming.settled.contains(&s.order));
+        .retain(|s| !held_settled.contains(&s.order) && !incoming_settled.contains(&s.order));
+    let mut settled = held_settled;
     for order in incoming.settled {
-        if !held.settled.contains(&order) && held.settled.len() < ANSWERED_CAP {
+        if !settled.contains(&order) && held.settled.len() < ANSWERED_CAP {
+            settled.insert(order.clone());
             held.settled.push_back(order);
         }
     }
@@ -3012,6 +3060,164 @@ mod tests {
             .listing_statuses
             .records
             .insert(harvest_common::store::Bytes32(f.listing.id.0), signed);
+    }
+
+    /// `merge_ledgers` before #206, kept verbatim as the reference the set
+    /// version must agree with.
+    fn merge_ledgers_scanning(held: &mut Ledger, incoming: Ledger) -> bool {
+        let before = held.clone();
+        for digest in incoming.seen {
+            held.saw(digest);
+        }
+        for request in incoming.answered {
+            if !held.answered.contains(&request) {
+                held.answered.push_back(request);
+            }
+        }
+        while held.answered.len() > ANSWERED_CAP {
+            held.answered.pop_front();
+        }
+        // A set: the same ledger merged twice adds nothing.
+        for at in incoming.issued_at_ms {
+            if !held.issued_at_ms.contains(&at) {
+                held.issued_at_ms.push(at);
+            }
+        }
+        held.issued_at_ms.sort_unstable();
+        let excess = held.issued_at_ms.len().saturating_sub(2 * MAX_PER_DAY);
+        held.issued_at_ms.drain(..excess);
+        for gap in incoming.gap_orders {
+            if !held.gap_orders.iter().any(|(id, _)| *id == gap.0) {
+                held.gap_orders.push_back(gap);
+            }
+        }
+        while held.gap_orders.len() > GAP_ORDERS_CAP {
+            held.gap_orders.pop_front();
+        }
+        held.gap_paid = match (held.gap_paid, incoming.gap_paid) {
+            (Some((at, run)), Some((other_at, other_run))) => {
+                Some((at.max(other_at), run.max(other_run)))
+            }
+            (held, incoming) => held.or(incoming),
+        };
+        if incoming.capped.as_ref().map(|(at, _)| *at) > held.capped.as_ref().map(|(at, _)| *at) {
+            held.capped = incoming.capped;
+        }
+        held.retry_pending |= incoming.retry_pending;
+        for oversold in incoming.oversold {
+            if !held.oversold.iter().any(|o| o.order == oversold.order) {
+                held.oversold.push(oversold);
+            }
+        }
+        while held.oversold.len() > STATUSES_CAP {
+            held.oversold.remove(0);
+        }
+        for status in incoming.statuses {
+            match held.statuses.iter().find(|s| s.listing == status.listing) {
+                Some(own) if own.revision >= status.revision => {}
+                _ => held.signed(status),
+            }
+        }
+        // Sales first, skipping any either side has settled, and only then the
+        // tombstones: merged first, the incoming ones could push this
+        // delegate's own out of the capped list and let a settled sale back in.
+        for sale in incoming.sales {
+            if held.settled.contains(&sale.order) || incoming.settled.contains(&sale.order) {
+                continue;
+            }
+            match held.sales.iter_mut().find(|s| s.order == sale.order) {
+                Some(own) => {
+                    if own.decremented.is_none() {
+                        own.decremented = sale.decremented;
+                    }
+                }
+                None => held.sales.push(sale),
+            }
+        }
+        held.sales
+            .retain(|s| !held.settled.contains(&s.order) && !incoming.settled.contains(&s.order));
+        for order in incoming.settled {
+            if !held.settled.contains(&order) && held.settled.len() < ANSWERED_CAP {
+                held.settled.push_back(order);
+            }
+        }
+        if held.sales.len() > SALES_CAP {
+            // Keep the undecremented and the newest: a dropped sale is one whose
+            // payment would never come off the stock. Dropped first: the
+            // decremented, then the oldest.
+            held.sales
+                .sort_by_key(|s| (s.decremented.is_none(), s.issued_at_ms));
+            let excess = held.sales.len() - SALES_CAP;
+            held.sales.drain(..excess);
+        }
+        *held != before
+    }
+
+    /// #206: the set-based merge decides exactly what the scanning merge did,
+    /// over ledgers that overlap, hold duplicates (a damaged ledger), sit at
+    /// and past their caps, and settle each other's sales. Mutated red by
+    /// dropping a settled check, by keeping the LAST held sale per order, and
+    /// by forgetting a popped digest.
+    #[test]
+    fn merge_ledgers_is_the_scanning_merge() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let mut id = |n: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&next(n).to_le_bytes());
+            b
+        };
+        for round in 0..40 {
+            let big = round % 4 == 0;
+            let ledger = |id: &mut dyn FnMut(u64) -> [u8; 32]| {
+                let space = if big { 3_000 } else { 40 };
+                let count = |cap: usize| if big { cap + 20 } else { 30 };
+                Ledger {
+                    seen: (0..count(SEEN_CAP)).map(|_| id(space)).collect(),
+                    answered: (0..count(ANSWERED_CAP)).map(|_| id(space)).collect(),
+                    issued_at_ms: (0..30).map(|_| u64::from(id(500)[0])).collect(),
+                    sales: (0..count(SALES_CAP))
+                        .map(|_| {
+                            let order = OrderId(id(space));
+                            let decremented = order.0[0]
+                                .is_multiple_of(3)
+                                .then_some(u64::from(order.0[1]));
+                            Sale {
+                                listing: ListingId(id(8)),
+                                quantity: 1,
+                                issued_at_ms: u64::from(id(1_000)[0]),
+                                anchor_height: 1,
+                                decremented,
+                                order,
+                            }
+                        })
+                        .collect(),
+                    settled: (0..count(ANSWERED_CAP) / 3)
+                        .map(|_| OrderId(id(space)))
+                        .collect(),
+                    gap_orders: (0..count(GAP_ORDERS_CAP))
+                        .map(|_| (OrderId(id(space)), u32::from(id(50)[0])))
+                        .collect(),
+                    retry_pending: id(2)[0] == 1,
+                    ..Default::default()
+                }
+            };
+            let held = ledger(&mut id);
+            let incoming = ledger(&mut id);
+            let (mut fast, mut slow) = (held.clone(), held);
+            let changed = merge_ledgers(&mut fast, incoming.clone());
+            assert_eq!(
+                changed,
+                merge_ledgers_scanning(&mut slow, incoming),
+                "round {round}"
+            );
+            assert_eq!(fast, slow, "round {round}");
+        }
     }
 
     /// A text from the `i`th buyer, `len` characters long: what instant
