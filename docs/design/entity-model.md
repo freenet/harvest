@@ -89,11 +89,12 @@ other way round, and so should the data model:
   the store's page for both seller and buyer: "Backed by a $100 Ghost Key since
   September; previously a $20 Ghost Key." A seller can change the Ghost Key
   behind a store (a bigger donation, or a key that leaked) without losing the
-  store's name, link, listings or history.
+  store's name, link, listings or history. (Not built yet: harvest#104.)
 - **The record belongs to the store, for good.** Every complaint ever filed
   against a store stays on its record, whichever Ghost Key was backing it at
   the time. A clean slate means a new store *and* a new Ghost Key.
-- A second store is a rare, deliberate act ("open another store").
+- A second store is a rare, deliberate act ("open another store"), with a
+  different Ghost Key: one Ghost Key backs one store (section 6.2).
 
 Model decisions (agreed with Ian, 2026-09-18):
 
@@ -1827,9 +1828,11 @@ left open, and what phase 1a deliberately does not do yet.
   above on purpose. A creation refused because the Ghost Key already backs a
   store is final, and says to use a different Ghost Key. "Create a store"
   also waits until this device knows what the key backs: the delegate's
-  store list, the key's index (answered, or absent after its migration walk)
-  and every store it lists, with a warning after a minute if that never
-  settles. The delegate's `another_store` field stays on the wire; the UI
+  store list, the key's index (answered, or absent or recovered after a
+  migration walk in which every earlier generation answered) and every store
+  it lists, with a warning after a minute if nothing is known by then. An
+  index that lists a store which never loads still counts: the page names
+  the store's code and offers no Create. The delegate's `another_store` field stays on the wire; the UI
   never sets it.
 - **Deferred to phase 2 (the seller UI):** a control for the seller to
   close a store in general (outside the two-stores case above), and the

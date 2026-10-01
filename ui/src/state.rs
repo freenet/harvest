@@ -469,12 +469,15 @@ pub struct AppState {
     /// those whose wait has run out (`index_flow::INDEX_SETTLE_WAIT_MS`).
     pub index_waits_started: HashSet<String>,
     pub index_waits_elapsed: HashSet<String>,
+    /// Earlier-generation Ghost Key indexes recovered by the index migration
+    /// walk, by Ghost Key (harvest#181). See `index_flow::IndexWalkEnd`.
+    pub recovered_indexes: HashMap<[u8; 32], harvest_common::ghostkey_index::GhostKeyIndexV1>,
     /// Stores being closed for good, by id, with the signed halves so far
     /// (`crate::closure_flow`, harvest#181).
     pub closing_stores: HashMap<Vec<u8>, crate::closure_flow::ClosingStore>,
-    /// Closes handed to the node, by store id, until the store's state
+    /// Closes handed to the node, by store key, until the store's state
     /// shows it closed (`crate::closure_flow`, harvest#181).
-    pub closes_sent: HashMap<Vec<u8>, crate::closure_flow::CloseSent>,
+    pub closes_sent: HashMap<[u8; 32], crate::closure_flow::CloseSent>,
     /// Off-target only: closes ready to publish, recorded instead of sent.
     #[cfg(not(target_arch = "wasm32"))]
     pub closes_ready: Vec<(
@@ -4413,7 +4416,14 @@ impl AppState {
                 store.backing = view;
             }
         }
-        let currents = self.browsing_stores.values().filter_map(|store| {
+        // An earlier generation of a store whose current one is loaded is
+        // left out: it never receives the store's later records, so a
+        // retirement there (closing one of two stores, harvest#181) would
+        // never take effect on this device.
+        let currents = self.browsing_stores.iter().filter_map(|(id, store)| {
+            if self.superseded_generation(id) {
+                return None;
+            }
             let view = store.backing.as_ref()?;
             if !view.certificate_status.is_verified() {
                 return None;
