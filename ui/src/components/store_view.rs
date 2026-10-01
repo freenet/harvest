@@ -272,13 +272,19 @@ pub(crate) fn own_store_rows(state: &AppState, now_ms: u64) -> Vec<OwnStoreRow> 
             } else {
                 tagline
             };
+            let mut status = own_store_status(
+                store.needs_you(),
+                super::my_store::overview_needs(&store, state),
+                seller.as_ref(),
+                state.buyer_open(&id, now_ms),
+            );
+            // Not the "Closed" of a seller who is offline: this one never
+            // reopens (harvest#181).
+            if store.closed {
+                status.buyers = Buyers::NotOpen("Closed for good");
+            }
             OwnStoreRow {
-                status: own_store_status(
-                    store.needs_you(),
-                    super::my_store::overview_needs(&store, state),
-                    seller.as_ref(),
-                    state.buyer_open(&id, now_ms),
-                ),
+                status,
                 named,
                 sub,
                 label: store.label,
@@ -1789,6 +1795,33 @@ mod stores_page_tests {
     /// tagline, or its code while it has no name and no tagline, or when
     /// another card reads the same. Asserted as whole rows, so the tagline
     /// and the code cannot trade places unnoticed.
+    /// A store closed for good says so on its row, not the "Closed" of a
+    /// seller who is offline (harvest#181). Mutated red by dropping the
+    /// override.
+    #[test]
+    fn a_store_closed_for_good_says_so_on_its_row() {
+        let mut state = AppState::default();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::StoreRegistration {
+                store_contract_id: vec![1u8; 32],
+                reputation_contract_id: vec![0u8; 32],
+                mailbox_contract_id: vec![0u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        state.browsing_stores.insert(
+            vec![1u8; 32],
+            crate::state::BrowsingStore {
+                closed: true,
+                ..Default::default()
+            },
+        );
+        let rows = own_store_rows(&state, crate::state::now_ms());
+        assert_eq!(rows[0].status.not_open_pill(), Some("Closed for good"));
+    }
+
     #[test]
     fn own_store_rows_are_named_with_a_tagline_or_their_code() {
         use crate::state::test_store_key;
