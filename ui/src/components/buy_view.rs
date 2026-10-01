@@ -1129,6 +1129,7 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
     // P2-D), which a card with nothing to offer does not need.
     let (on_record, sent, refusal, message_to, store_page, paid_there) = {
         let state = APP_STATE.read();
+        let store_page = target.store_page(&state);
         let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
         let refusal = (on_record.is_none() && !sent)
@@ -1139,13 +1140,13 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
             sent,
             refusal,
             target.conversation(&state),
-            target.store_page(&state),
+            store_page.clone(),
             // Whether a message from the store page would go into a paid
             // conversation, needing no Ghost Key (`compose_tag` continues
             // the last conversation).
-            target.store_page(&state).is_some_and(|id| {
+            store_page.as_ref().is_some_and(|id| {
                 matches!(
-                    state.compose_gate_in(&id, None),
+                    state.compose_gate_in(id, None),
                     crate::voucher_flow::ComposeGate::PaidOrder { .. }
                 )
             }),

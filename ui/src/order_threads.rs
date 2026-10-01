@@ -119,6 +119,8 @@ impl ConversationClaims {
 /// request (rule 1 of the module docs) or its listing tag (rule 2). Nothing
 /// else is read: not its binding, not any message naming it.
 pub(crate) fn order_in_conversation(order: &AuthorizedOrder, claims: &ConversationClaims) -> bool {
+    #[cfg(test)]
+    FULL_MATCHES.with(|n| n.set(n.get() + 1));
     let by_listing_tag = order
         .order
         .listing_tag
@@ -138,6 +140,73 @@ pub(crate) fn order_by_request(order: &AuthorizedOrder, claims: &ConversationCla
             .iter()
             .any(|(asked, id)| *asked == request_id && *id == order.order.id)
     })
+}
+
+// How many times `order_in_conversation` has run on this thread: lets a
+// test prove the seller's inbox matches orders through `OrderLookup` and
+// never order by order (review after 1bd9bcd).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FULL_MATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A store's orders indexed by what a conversation's claims match on
+/// (review after 1bd9bcd): by listing tag and by request id. Matching every
+/// conversation against every order was claims × orders on each read of the
+/// seller's inbox, and anyone can make conversations; with this, matching
+/// one conversation costs what its own claims hold.
+pub(crate) struct OrderLookup<'a> {
+    by_listing_tag: std::collections::HashMap<[u8; 32], Vec<&'a AuthorizedOrder>>,
+    by_request_id: std::collections::HashMap<[u8; 32], Vec<&'a AuthorizedOrder>>,
+}
+
+impl<'a> OrderLookup<'a> {
+    pub(crate) fn new(orders: &'a [AuthorizedOrder]) -> Self {
+        let mut by_listing_tag: std::collections::HashMap<[u8; 32], Vec<&'a AuthorizedOrder>> =
+            std::collections::HashMap::new();
+        let mut by_request_id: std::collections::HashMap<[u8; 32], Vec<&'a AuthorizedOrder>> =
+            std::collections::HashMap::new();
+        for order in orders {
+            if let Some(tag) = order.order.listing_tag {
+                by_listing_tag.entry(tag).or_default().push(order);
+            }
+            if let Some(request_id) = order.order.request_id {
+                by_request_id.entry(request_id).or_default().push(order);
+            }
+        }
+        OrderLookup {
+            by_listing_tag,
+            by_request_id,
+        }
+    }
+
+    /// The orders belonging to the conversation `claims` describes, each
+    /// once, with whether by its request (rule 1, [`order_by_request`]):
+    /// exactly what [`order_in_conversation`] over every order gives, in no
+    /// particular order.
+    pub(crate) fn in_conversation(
+        &self,
+        claims: &ConversationClaims,
+    ) -> Vec<(&'a AuthorizedOrder, bool)> {
+        let mut found: Vec<(&'a AuthorizedOrder, bool)> = Vec::new();
+        for (request_id, order_id) in &claims.answered {
+            for order in self.by_request_id.get(request_id).into_iter().flatten() {
+                if order.order.id == *order_id
+                    && !found.iter().any(|(o, _)| o.order.id == order.order.id)
+                {
+                    found.push((order, true));
+                }
+            }
+        }
+        for tag in &claims.listing_tags {
+            for order in self.by_listing_tag.get(tag).into_iter().flatten() {
+                if !found.iter().any(|(o, _)| o.order.id == order.order.id) {
+                    found.push((order, false));
+                }
+            }
+        }
+        found
+    }
 }
 
 /// The seller's half of the rule: whether one of `orders` is paid (or was,
@@ -314,6 +383,58 @@ pub(crate) mod tests {
     }
 
     const L: ListingId = ListingId([9; 32]);
+
+    /// **The order lookup gives exactly what scanning every order does**
+    /// (review after 1bd9bcd): for each set of claims below, the orders it
+    /// finds, and which by request, equal `order_in_conversation` and
+    /// `order_by_request` over all orders. Red with either index dropped.
+    #[test]
+    fn the_order_lookup_matches_the_full_scan() {
+        let orders = vec![
+            quote_order(&TAG, &L, OrderStatus::Paid),
+            {
+                let mut o = buy_now_order(&TAG, &selection(4), OrderStatus::Paid);
+                o.order.listing_tag = Some(keys(&TAG).listing_tag(&L));
+                o
+            },
+            buy_now_order(&TAG, &selection(5), OrderStatus::AwaitingPayment),
+            quote_order(&OTHER, &L, OrderStatus::Paid),
+            quote_order(&TAG, &ListingId([8; 32]), OrderStatus::Cancelled),
+        ];
+        // Distinct ids, as a store's are (the quote fixture reuses one).
+        let orders: Vec<AuthorizedOrder> = orders
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut o)| {
+                if o.order.request_id.is_none() {
+                    o.order.id = OrderId([0x40 + i as u8; 32]);
+                }
+                o
+            })
+            .collect();
+        let lookup = OrderLookup::new(&orders);
+        for c in [
+            claims(&TAG, &[(L, Some(selection(4)))], &[], true),
+            claims(&TAG, &[(L, None)], &[ListingId([8; 32])], true),
+            claims(&TAG, &[(L, Some(selection(5)))], &[], false),
+            claims(&OTHER, &[(L, None)], &[], true),
+            claims(&TAG, &[], &[], false),
+        ] {
+            let mut found: Vec<([u8; 32], bool)> = lookup
+                .in_conversation(&c)
+                .iter()
+                .map(|(o, by_request)| (o.order.id.0, *by_request))
+                .collect();
+            found.sort();
+            let mut scanned: Vec<([u8; 32], bool)> = orders
+                .iter()
+                .filter(|o| order_in_conversation(o, &c))
+                .map(|o| (o.order.id.0, order_by_request(o, &c)))
+                .collect();
+            scanned.sort();
+            assert_eq!(found, scanned);
+        }
+    }
 
     /// **A paid invoice answering a QUOTE request opens its conversation.**
     /// Only a paid Buy now did before (extortion second opinion, section 4).

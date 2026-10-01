@@ -9463,8 +9463,10 @@ impl AppState {
 
     /// When this session first saw the mailbox entry with `digest`: `now`,
     /// the first time it is asked, and the same answer after
-    /// ([`Self::mailbox_first_seen`]). Bounded; a clear starts every entry
-    /// again at the time of the next ask, which errs toward "waiting".
+    /// ([`Self::mailbox_first_seen`]). Bounded: past 16,384 distinct entries
+    /// in one session (a mailbox holds 512 at a time) the record is cleared
+    /// whole, and every entry is first seen again at the next ask, as after
+    /// a reload: the timestamps decide, which errs toward "waiting".
     pub fn first_seen(
         &self,
         digest: &[u8; 32],
@@ -24235,6 +24237,70 @@ mod buy_flow_tests {
             inbox.unreadable,
             2 * twins.len(),
             "the twins' entries are only counted"
+        );
+    }
+
+    /// **The seller's inbox does not scale with conversations × orders**
+    /// (review after 1bd9bcd). Anyone can open conversations with a store,
+    /// and get keys for them, at no cost; with 512 of them (the mailbox's
+    /// cap) and 4096 orders (the store's), matching each conversation against
+    /// every order took tenths of a second natively and more in wasm, on
+    /// every state change, from the header. Bounded generously here; red
+    /// with the order lookup replaced by a scan of every order.
+    #[test]
+    fn the_sellers_inbox_does_not_scan_every_order_per_conversation() {
+        use crate::components::message_view::seller_inbox;
+        use crate::messaging::BuyerConversation;
+        let (mut state, _, _) = seller_holding_a_request();
+        let template = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        let orders: Vec<AuthorizedOrder> = (0..harvest_common::store::MAX_ORDERS)
+            .map(|i| {
+                let mut o = template.clone();
+                let n = (i as u32).to_le_bytes();
+                o.order.id = harvest_common::payment::OrderId([
+                    n[0], n[1], n[2], n[3], 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]);
+                o.order.listing_tag = Some([
+                    n[0], n[1], n[2], n[3], 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]);
+                o
+            })
+            .collect();
+        let mut junk = Vec::new();
+        for _ in 0..511 {
+            let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+            let tag = buyer.buyer_public_key;
+            state
+                .conversation_keys
+                .insert(tag.to_vec(), seller_keys_for(&tag));
+            junk.push(buyer.seal("junk".into()).expect("sealed"));
+        }
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = orders;
+        store.mailbox_messages.extend(junk);
+        crate::order_threads::FULL_MATCHES.with(|n| n.set(0));
+        let started = std::time::Instant::now();
+        let inbox = seller_inbox(&state, STORE);
+        let took = started.elapsed();
+        assert_eq!(
+            crate::order_threads::FULL_MATCHES.with(|n| n.get()),
+            0,
+            "orders are matched through the lookup, never one by one"
+        );
+        assert!(
+            inbox.threads.len() <= 1,
+            "junk conversations show nothing: {}",
+            inbox.threads.len()
+        );
+        assert!(
+            took < std::time::Duration::from_millis(1500),
+            "the seller's inbox took {took:?} over 512 conversations and 4096 orders"
         );
     }
 
