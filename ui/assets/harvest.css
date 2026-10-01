@@ -114,7 +114,7 @@
   --space-2xl: 4rem;
 
   /* Layout */
-  --max-width: 820px;
+  --max-width: 920px;
   --radius: 6px;
   --radius-lg: 12px;
 }
@@ -212,7 +212,11 @@ body::before {
        .seller-listing, .seller-listing-actions, .own-store-banner,
        .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
        .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
-       .needs-hit, .bubbles) > * {
+       .needs-hit, .bubbles, .harvest-status, .page-head, .page-title,
+       .store-head, .store-head-title, .store-head-acts, .chips, .two-col,
+       .item-grid, .item-card, .item-page, .bill, .amount-field, .progress,
+       .side-row, .switch-menu, .row-more-menu, .needs-menu, .modal-actions,
+       .open-steps > li, .todo-note) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -2008,5 +2012,859 @@ h4 {
 @media (max-width: 480px) {
   .store-header {
     padding: var(--space-md);
+  }
+}
+
+
+/* ---- Page structure (2026-10-01, "Harvest, page by page") ----
+   Every page has a title, at most one primary button, and its status in its
+   header. Lists are rows; a row opens a page. Pictures are optional
+   everywhere: a card puts one above its words, a row a small square before
+   its text, and with none the layout is whole as it is (no grey box). */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The connection: a dot while all is well, words only when it is not. */
+.harvest-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: none;
+}
+
+.harvest-status.connected .status-dot { background: var(--accent); }
+.harvest-status.connecting .status-dot { background: var(--accent-warm); }
+.harvest-status.error .status-dot { background: #b44; }
+
+/* The needs-you pill's menu, when work is in more than one place. */
+.needs-wrap,
+.switch-wrap {
+  position: relative;
+}
+
+.needs-backdrop,
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+}
+
+.modal-backdrop {
+  background: rgba(44, 36, 22, 0.35);
+}
+
+.needs-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.4rem);
+  z-index: 21;
+  width: min(22rem, calc(100vw - 2rem));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding: var(--space-sm);
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 24px rgba(44, 36, 22, 0.14);
+}
+
+.needs-menu-head {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: var(--space-xs) var(--space-sm) 0;
+}
+
+.needs-menu .rowcard {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+}
+
+/* A store's own store switcher (the "▾" beside its name). */
+.switch-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0.3rem 0.45rem;
+  cursor: pointer;
+}
+
+.switch-menu {
+  left: 0;
+  right: auto;
+}
+
+.switch-row {
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 0.5rem var(--space-sm);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.switch-row:hover {
+  background: var(--bg-card);
+}
+
+.switch-row.current {
+  font-weight: 600;
+}
+
+/* A page's heading row: the title, and a button on the right. */
+.page-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+
+.page-head h2,
+.page-h {
+  margin-bottom: var(--space-sm);
+}
+
+.crumb + .page-h,
+.crumb + .page-title {
+  margin-top: var(--space-xs);
+}
+
+/* An order's title: its picture when it has one, the item, the status. */
+.page-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-xs);
+}
+
+.page-title h2 {
+  margin: 0;
+}
+
+.page-meta {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: var(--space-lg);
+}
+
+.lede {
+  color: var(--text-secondary);
+  max-width: 40rem;
+}
+
+/* A store's header, on its own page and on every seller page: name and
+   status, the trust line, one line about it; actions on the right. Plain
+   text on the page, not a boxed panel (rule 2). */
+.store-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-lg);
+  margin-bottom: var(--space-md);
+}
+
+.store-head-main {
+  min-width: 0;
+  flex: 1 1 22rem;
+}
+
+.store-head-main > * + * {
+  margin-top: var(--space-xs);
+}
+
+.store-head-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.store-title {
+  font-family: var(--font-display);
+  font-size: 1.55rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.store-head-acts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+.store-head-line,
+.store-tagline {
+  color: var(--text-secondary);
+}
+
+.store-head-closed .store-title {
+  color: var(--text-secondary);
+}
+
+/* Words standing where a control would be, for one's own store. */
+.link-off {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* The test-coin note, once per store page; the backup banner. */
+.coin-note {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  margin-bottom: var(--space-md);
+}
+
+.coin-note a {
+  color: var(--accent);
+}
+
+.tab-count {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+/* Filters over a list: "To send", "Sent", ... */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.chip {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.chip.active {
+  background: var(--color-parchment);
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* A row's picture, when the item has one: a small square before its text. */
+.row-thumb {
+  flex: none;
+  width: 3rem;
+  height: 3rem;
+  object-fit: cover;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.rc-flag {
+  color: var(--amber);
+  font-weight: 600;
+}
+
+.rc-when {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.row-off {
+  opacity: 0.7;
+}
+
+.todo-note {
+  padding: var(--space-xs) 0;
+}
+
+.week-line,
+.foot-note {
+  margin-top: var(--space-lg);
+}
+
+.empty-line {
+  padding: var(--space-md) 0;
+}
+
+.empty-block {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  text-align: center;
+}
+
+.empty-block p {
+  margin: 0 auto;
+}
+
+.page-sec + .page-sec {
+  margin-top: var(--space-xl);
+}
+
+/* A detail page: the main column, and a side box (the other party, the
+   orders beside a conversation). One column on a phone. */
+.two-col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-lg);
+  align-items: start;
+}
+
+@media (min-width: 720px) {
+  .two-col {
+    grid-template-columns: minmax(0, 1fr) 15.5rem;
+  }
+}
+
+.col-main > * + * {
+  margin-top: var(--space-md);
+}
+
+.col-side {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  background: var(--bg-card);
+}
+
+.col-side > * + * {
+  margin-top: var(--space-sm);
+}
+
+.side-lbl {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.col-side > .side-lbl:not(:first-child) {
+  margin-top: var(--space-md);
+}
+
+.side-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.side-bubble {
+  max-width: none;
+  font-size: 0.9rem;
+}
+
+.side-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  text-align: left;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.side-row:hover {
+  border-color: var(--accent);
+}
+
+.side-row .row-thumb {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.side-row-name {
+  display: block;
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.side-link {
+  display: block;
+}
+
+.side-cancel {
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-sm);
+}
+
+.quiet-link {
+  color: var(--text-muted);
+}
+
+/* The state of an order, or a step to take: one box, strong when it holds
+   the page's main action. */
+.panel {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+}
+
+.panel-strong {
+  border: 1.5px solid var(--text-secondary);
+}
+
+.panel > * + * {
+  margin-top: var(--space-sm);
+}
+
+.panel-h {
+  font-size: 1.15rem;
+  margin: 0;
+}
+
+.stage-line {
+  color: var(--text-secondary);
+}
+
+/* The four steps an order goes through. */
+.progress {
+  display: flex;
+  list-style: none;
+  gap: var(--space-xs);
+  margin: 0 0 var(--space-lg);
+  padding: 0;
+}
+
+.progress li {
+  flex: 1;
+  border-top: 4px solid var(--color-parchment);
+  padding-top: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.progress li.on {
+  border-top-color: var(--accent);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* A bill: item and amount in two columns, the total last. */
+.bill {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.2rem var(--space-md);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-sm) 0;
+  font-size: 0.92rem;
+}
+
+.bill > :nth-child(even) {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Share, and other dialogs. */
+.modal {
+  position: fixed;
+  z-index: 21;
+  left: 50%;
+  top: 12vh;
+  transform: translateX(-50%);
+  width: min(34rem, calc(100vw - 2rem));
+  max-height: 76vh;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: 0 16px 40px rgba(44, 36, 22, 0.25);
+}
+
+.modal > * + * {
+  margin-top: var(--space-sm);
+}
+
+/* Settings: one section per thing set once. */
+.settings-sec {
+  padding: var(--space-lg) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-sec:first-child {
+  padding-top: 0;
+}
+
+.settings-sec h3 {
+  margin-bottom: var(--space-sm);
+}
+
+/* Opening a store: three numbered steps, done ones ticked. */
+.open-steps {
+  list-style: none;
+  counter-reset: step;
+  padding: 0;
+  margin: var(--space-lg) 0;
+}
+
+.open-steps > li {
+  counter-increment: step;
+  position: relative;
+  padding: var(--space-sm) 0 var(--space-md) 2.5rem;
+}
+
+.open-steps > li > * + * {
+  margin-top: var(--space-sm);
+}
+
+.open-steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: var(--space-sm);
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  text-align: center;
+  line-height: 1.6rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.open-steps > li.current::before {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.open-steps > li.done::before {
+  content: "\2713";
+  background: var(--color-parchment);
+  color: var(--text-secondary);
+}
+
+.open-steps > li.done .step-head {
+  color: var(--text-muted);
+}
+
+.step-head {
+  font-weight: 600;
+  font-size: 1.02rem;
+}
+
+/* A store's items: a grid of cards, each opening the item's page. A
+   picture, when there is one, fills the top of its card; without one the
+   card is its words, sized to them. */
+.item-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12.5rem, 1fr));
+  gap: var(--space-md);
+  align-items: start;
+}
+
+.item-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  text-align: left;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+
+.item-card:hover {
+  border-color: var(--accent);
+}
+
+.item-card-img {
+  display: block;
+  width: calc(100% + 2 * var(--space-md));
+  margin: calc(-1 * var(--space-md)) calc(-1 * var(--space-md)) var(--space-sm);
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+}
+
+.item-card-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.item-card-price {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.item-card-note,
+.item-card-off {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.item-off {
+  background: transparent;
+}
+
+.item-off .item-card-title,
+.item-off .item-card-img {
+  opacity: 0.6;
+}
+
+/* An item's page: the buy column on the right; the picture (when there is
+   one) and the description on the left. One column on a phone, the
+   picture first. */
+.item-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "buy" "about";
+  gap: var(--space-lg);
+  align-items: start;
+}
+
+.item-page.has-picture {
+  grid-template-areas: "pic" "buy" "about";
+}
+
+@media (min-width: 720px) {
+  .item-page {
+    grid-template-columns: minmax(0, 1fr) 21rem;
+    grid-template-areas: "about buy";
+  }
+
+  .item-page.has-picture {
+    grid-template-areas: "pic buy" "about buy";
+  }
+}
+
+.item-picture {
+  grid-area: pic;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+}
+
+.item-buy {
+  grid-area: buy;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+}
+
+.item-buy > * + * {
+  margin-top: var(--space-sm);
+}
+
+.item-about {
+  grid-area: about;
+}
+
+.item-about .sec-lbl {
+  margin-top: 0;
+}
+
+.item-title {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.item-price {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--accent);
+}
+
+.item-why-not {
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.btn-wide {
+  display: block;
+  width: 100%;
+  padding-top: 0.7rem;
+  padding-bottom: 0.7rem;
+  font-size: 0.95rem;
+}
+
+.buy-form {
+  margin-top: var(--space-md);
+}
+
+.buy-form .form-group {
+  margin-bottom: var(--space-sm);
+}
+
+/* A price typed in tBTC, with its unit beside the box. */
+.amount-field {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.amount-unit {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.amount-field .test-coins {
+  margin-left: 0;
+}
+
+/* A listing's quick actions, under "More". */
+.row-more {
+  position: relative;
+}
+
+.row-more > summary {
+  list-style: none;
+}
+
+.row-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.row-more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.3rem);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 10rem;
+  padding: var(--space-xs);
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(44, 36, 22, 0.12);
+}
+
+.row-more-item {
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 0.45rem var(--space-sm);
+  font: inherit;
+  font-size: 0.88rem;
+  color: inherit;
+  cursor: pointer;
+}
+
+.row-more-item:hover {
+  background: var(--bg-card);
+}
+
+.seller-listing .row-thumb {
+  width: 3.25rem;
+  height: 3.25rem;
+}
+
+.seller-listing-main {
+  flex: 1;
+}
+
+.list-head {
+  margin-bottom: var(--space-md);
+}
+
+.list-head .section-count {
+  margin: 0;
+}
+
+.backup-row {
+  padding: var(--space-md) 0;
+  border-top: 1px solid var(--border);
+}
+
+.backup-row > * + * {
+  margin-top: var(--space-sm);
+}
+
+/* An amber pill for what the reader must act on; a warm one for a record
+   or a reversal. */
+.pill-warn {
+  background: #f6dcd8;
+  color: #9b2c22;
+}
+
+@media (max-width: 600px) {
+  .store-title {
+    font-size: 1.3rem;
+  }
+
+  .panel {
+    padding: var(--space-md);
+  }
+
+  .item-buy {
+    padding: var(--space-md);
+  }
+
+  .modal {
+    top: 6vh;
+  }
+
+  .row-thumb {
+    width: 2.6rem;
+    height: 2.6rem;
+  }
+
+  /* A row's picture stays on its line, beside the name, on a phone. */
+  .rowcard:has(.row-thumb) {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "thumb main chev" "thumb status chev";
+  }
+
+  .rowcard > .row-thumb {
+    grid-area: thumb;
+    align-self: start;
   }
 }

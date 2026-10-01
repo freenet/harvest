@@ -140,10 +140,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
             });
         }
     }
-    let shown: Vec<([u8; 32], harvest_common::payment::OrderId)> = stores
-        .iter()
-        .flat_map(|row| state.kept_purchases_shown_at(&row.store_contract_id))
-        .collect();
+    let shown = shown_order_ids(state, &stores);
     for kept in super::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown) {
         let paid = kept.order.status == harvest_common::payment::OrderStatus::Paid;
         let store = state
@@ -481,6 +478,10 @@ pub fn PurchaseMessagesPage() -> Element {
     }
 }
 
+/// One conversation this device keeps, as Backup lists it: its store, the
+/// store's name, its tag, when it started and whether it is backed up.
+type KeptConversation = (Vec<u8>, String, [u8; 32], i64, bool);
+
 /// P9: keep a copy of the purchases and messages this device holds, and
 /// bring one back on another device.
 ///
@@ -490,7 +491,7 @@ pub fn PurchaseMessagesPage() -> Element {
 /// them.
 #[component]
 pub fn BackupPage() -> Element {
-    let kept: Vec<(Vec<u8>, String, [u8; 32], i64, bool)> = {
+    let kept: Vec<KeptConversation> = {
         let state = APP_STATE.read();
         let mut kept = Vec::new();
         for (id, store) in state.browsing_stores.iter() {
@@ -569,6 +570,18 @@ fn started_on(created_at: i64) -> String {
     chrono::DateTime::from_timestamp(created_at, 0)
         .map(super::order_status::short_date)
         .unwrap_or_else(|| "at an unknown time".to_string())
+}
+
+/// The kept purchases the loaded stores' purchases already show, judged
+/// from the same kept copy (`AppState::kept_purchases_shown_at` of each
+/// store), so a paid order is not listed twice.
+pub(crate) fn shown_order_ids(
+    state: &AppState,
+    rows: &[PurchaseRow],
+) -> Vec<([u8; 32], harvest_common::payment::OrderId)> {
+    rows.iter()
+        .flat_map(|row| state.kept_purchases_shown_at(&row.store_contract_id))
+        .collect()
 }
 
 /// What Purchases says when some of the stores this device has used could

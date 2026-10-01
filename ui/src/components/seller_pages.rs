@@ -171,8 +171,7 @@ fn StoreHeader(store: SellerStore, stores: Vec<(Vec<u8>, String)>, tab: SellerTa
             .browsing_stores
             .get(&store.contract_id)
             .filter(|b| b.info.is_some())
-            .map(super::store_view::trust_parts)
-            .map(|(backing, record)| (backing, record));
+            .map(super::store_view::trust_parts);
         (pill, open, line, why, trust)
     };
     let id = store.contract_id.clone();

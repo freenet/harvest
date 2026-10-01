@@ -621,10 +621,10 @@ mod route_tests {
     #[test]
     fn every_way_of_opening_a_store_lands_on_its_own_page() {
         in_app(|| {
-            assert_eq!(*ROUTE.peek(), Route::Stores, "the app opens on Stores");
+            assert_eq!(*PAGE.peek(), Page::Stores, "the app opens on Stores");
             let linked = params(7);
             crate::store_link::open_store(linked.clone());
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id_of(&linked)));
             {
                 let state = crate::gateway::APP_STATE.peek();
                 assert_eq!(state.active_store_id, Some(id_of(&linked)));
@@ -637,9 +637,9 @@ mod route_tests {
 
             // Back to Stores, then a store opened from Purchases or from
             // the seller's own pages, by its id.
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             open_store_page(vec![9u8; 32]);
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(vec![9u8; 32]));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().active_store_id,
                 Some(vec![9u8; 32])
@@ -651,18 +651,18 @@ mod route_tests {
             crate::gateway::APP_STATE
                 .write()
                 .note_store_code(id_of(&known), known.code().to_string());
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             open_store_page(id_of(&known));
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id_of(&known)));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().active_store_id,
                 Some(id_of(&known))
             );
 
             // A link from before store codes: the store page says why.
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             show_old_format_link();
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert!(matches!(*PAGE.peek(), Page::Store { .. }));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().store_link_error.as_deref(),
                 Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE)
@@ -673,29 +673,44 @@ mod route_tests {
         });
     }
 
-    /// The seller's pages open on the store whose card was pressed, or on
-    /// opening another store, and keep the Stores tab lit.
-    #[test]
-    fn a_store_card_opens_that_stores_seller_pages() {
-        in_app(|| {
-            open_seller_page(SellerPage::Store(vec![3u8; 32]));
-            assert_eq!(*ROUTE.peek(), Route::MyStore);
-            assert_eq!(*SELLER_PAGE.peek(), SellerPage::Store(vec![3u8; 32]));
-            open_seller_page(SellerPage::AnotherStore);
-            assert_eq!(*SELLER_PAGE.peek(), SellerPage::AnotherStore);
-            assert_eq!(nav_tab(*ROUTE.peek()), Some(Route::Stores));
-        });
+    /// The page for a store's own items.
+    fn store_page(id: Vec<u8>) -> Page {
+        Page::Store {
+            store: id,
+            tab: StoreTab::Items,
+        }
     }
 
-    /// Two tabs. A store's page and the seller's pages light Stores; the
-    /// footer's diagnostics light neither.
+    /// The seller's pages and opening a store are reached from Stores, and
+    /// keep its tab lit; an order, a conversation and the backup light
+    /// Purchases; the footer's diagnostics light neither.
     #[test]
-    fn stores_stays_lit_on_the_pages_reached_from_it() {
-        assert_eq!(nav_tab(Route::Stores), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::Store), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::MyStore), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::Purchases), Some(Route::Purchases));
-        assert_eq!(nav_tab(Route::Diagnostics), None);
+    fn each_page_lights_the_tab_it_is_reached_from() {
+        use super::super::router::{OrderAt, SellerView};
+        in_app(|| {
+            go(Page::Seller {
+                store: Some(vec![3u8; 32]),
+                view: SellerView::Home,
+            });
+            assert_eq!(PAGE.peek().nav_tab(), Some(NavTab::Stores));
+        });
+        assert_eq!(Page::Stores.nav_tab(), Some(NavTab::Stores));
+        assert_eq!(store_page(vec![1u8; 32]).nav_tab(), Some(NavTab::Stores));
+        assert_eq!(
+            Page::OpenStore { another: true }.nav_tab(),
+            Some(NavTab::Stores)
+        );
+        assert_eq!(Page::Purchases.nav_tab(), Some(NavTab::Purchases));
+        assert_eq!(Page::Backup.nav_tab(), Some(NavTab::Purchases));
+        assert_eq!(
+            Page::Order {
+                at: OrderAt::Kept([1u8; 32]),
+                order: harvest_common::payment::OrderId([2u8; 32]),
+            }
+            .nav_tab(),
+            Some(NavTab::Purchases)
+        );
+        assert_eq!(Page::Diagnostics.nav_tab(), None);
     }
 
     /// What needs the seller rides on the Stores tab, from every page, and
@@ -788,7 +803,7 @@ mod route_tests {
         in_app(|| {
             let id = vec![12u8; 32];
             open_store_page(id.clone());
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id.clone()));
             assert!(crate::gateway::APP_STATE
                 .peek()
                 .foreground_loads

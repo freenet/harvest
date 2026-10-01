@@ -287,4 +287,115 @@ mod tests {
         assert!(Status::Expired.ended() && Status::Cancelled.ended());
         assert!(!Status::Paid.ended());
     }
+
+    fn order(status: OrderStatus) -> AuthorizedOrder {
+        AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: Some([4; 32]),
+                id: harvest_common::payment::OrderId([1; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 2,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
+    /// **A purchase reads "Waiting for payment" only when the buyer can
+    /// wait it out**: an order a blocker makes unpayable reads "Can't be
+    /// paid", never waiting above a line saying not to pay it (round 3 of
+    /// harvest#187); a stale one reads expired, a cancelled one cancelled,
+    /// and a paid copy paid. Red with the remedy check dropped.
+    #[test]
+    fn a_purchase_waits_only_when_waiting_can_clear_it() {
+        use crate::state::PaymentBlocker;
+        let state = AppState::default();
+        let purchase =
+            |commitment: Option<AuthorizedOrder>, blockers: Vec<PaymentBlocker>| BuyerPurchase {
+                order_id: harvest_common::payment::OrderId([1; 32]),
+                conversation: [2; 32],
+                commitment,
+                blockers,
+                paid: None,
+            };
+        let store = [3u8; 32];
+        let waiting = purchase(Some(order(OrderStatus::AwaitingPayment)), vec![]);
+        assert_eq!(
+            buyer_status(&state, &store, &waiting),
+            Status::WaitingForPayment
+        );
+        assert!(buyer_can_pay(&waiting, Status::WaitingForPayment));
+        let wrong_amount = purchase(
+            Some(order(OrderStatus::AwaitingPayment)),
+            vec![PaymentBlocker::AmountNotAsked {
+                asked_sats: 1,
+                order_sats: 2,
+            }],
+        );
+        assert_eq!(
+            buyer_status(&state, &store, &wrong_amount),
+            Status::CantBePaid
+        );
+        let not_yet = purchase(
+            Some(order(OrderStatus::AwaitingPayment)),
+            vec![PaymentBlocker::ChainUnknown],
+        );
+        assert_eq!(
+            buyer_status(&state, &store, &not_yet),
+            Status::WaitingForPayment
+        );
+        assert!(
+            !buyer_can_pay(&not_yet, Status::WaitingForPayment),
+            "not yet"
+        );
+        let stale = purchase(
+            Some(order(OrderStatus::AwaitingPayment)),
+            vec![PaymentBlocker::AnchorStale {
+                anchor_height: 1,
+                tip_height: 100,
+            }],
+        );
+        assert_eq!(buyer_status(&state, &store, &stale), Status::Expired);
+        let cancelled = purchase(
+            Some(order(OrderStatus::Cancelled)),
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled)],
+        );
+        assert_eq!(buyer_status(&state, &store, &cancelled), Status::Cancelled);
+        let mut paid = purchase(
+            Some(order(OrderStatus::Paid)),
+            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)],
+        );
+        assert_eq!(
+            buyer_status(&state, &store, &paid),
+            Status::CantBePaid,
+            "a Paid record this app can't confirm as the buyer's"
+        );
+        paid.paid = Some(order(OrderStatus::Paid));
+        assert_eq!(buyer_status(&state, &store, &paid), Status::Paid);
+        assert_eq!(
+            buyer_status(
+                &state,
+                &store,
+                &purchase(None, vec![PaymentBlocker::CommitmentNotPublished])
+            ),
+            Status::Placed
+        );
+    }
 }

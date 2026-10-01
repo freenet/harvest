@@ -18,7 +18,7 @@ pub(crate) fn listing_image(listing: &ListingId, title: &str) -> Option<String> 
     #[cfg(feature = "image-preview")]
     {
         // About half the listings, so a page shows both cases side by side.
-        if listing.0[0] % 2 == 0 {
+        if listing.0[0].is_multiple_of(2) {
             return Some(preview_picture(listing, title));
         }
         None

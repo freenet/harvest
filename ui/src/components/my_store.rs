@@ -511,10 +511,13 @@ pub(crate) fn FirstStore(
                 "Backed by {ghost_key_name(&identity)} \u{00b7} {describe_notary_info(&identity.notary_info)}"
             }
         }
-        StoreSetup {
-            key: "{identity.fingerprint}",
-            identity: identity.clone(),
-            has_harvest_delegate,
+        // Keyed, so choosing another Ghost Key starts its form afresh.
+        for identity in std::iter::once(identity.clone()) {
+            StoreSetup {
+                key: "{identity.fingerprint}",
+                identity: identity.clone(),
+                has_harvest_delegate,
+            }
         }
         UseAnotherKey {}
     }

@@ -421,16 +421,16 @@ fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
 /// thread held at that moment.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Sent {
-    at_ms: u64,
+    pub(crate) at_ms: u64,
     /// The total the form showed when Buy now was pressed: what the order
     /// must ask, checked on its card even if the request itself is not in
     /// this device's thread (round 2 of harvest#187).
-    asked_sats: u64,
-    answers_before: Vec<[u8; 32]>,
+    pub(crate) asked_sats: u64,
+    pub(crate) answers_before: Vec<[u8; 32]>,
     /// The order the store would issue for this request
     /// (`OrderId::for_request`), so an acceptance of another request is
     /// never read as this one's.
-    expected: Option<harvest_common::payment::OrderId>,
+    pub(crate) expected: Option<harvest_common::payment::OrderId>,
 }
 
 /// How long a buyer waits for the seller's store before being told it is

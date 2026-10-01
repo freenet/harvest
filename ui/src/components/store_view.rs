@@ -1614,11 +1614,11 @@ mod availability_tests {
         l
     }
 
-    /// What a buyer reads under a listing: the sats price and the delivery,
-    /// never the old free-text price, and nothing for a listing with no
-    /// sats price.
+    /// What a buyer reads under a listing: its price and delivery in the
+    /// one money format (rule 7), never the old free-text price, and nothing
+    /// for a listing with no sats price.
     #[test]
-    fn a_listing_shows_its_sats_price_and_delivery() {
+    fn a_listing_shows_its_price_and_delivery() {
         use harvest_common::listing::{DeliveryPrice, FixedCheckout, PriceInfo, RegionPrice};
         let mut l = priced_listing(1).listing;
         l.price = Some(PriceInfo {
@@ -1627,7 +1627,7 @@ mod availability_tests {
         });
         assert_eq!(
             price_lines(&l),
-            Some(("25,000 sats".to_string(), "Delivery included".to_string()))
+            Some(("0.00025 tBTC".to_string(), "Delivery included".to_string()))
         );
         l.checkout = Some(FixedCheckout {
             unit_sats: 1_000_000,
@@ -1645,8 +1645,8 @@ mod availability_tests {
         assert_eq!(
             price_lines(&l),
             Some((
-                "1,000,000 sats".to_string(),
-                "Delivery: US free, EU 5,000 sats".to_string()
+                "0.01 tBTC".to_string(),
+                "Delivery: US free, EU 0.00005 tBTC".to_string()
             ))
         );
         l.checkout = None;
