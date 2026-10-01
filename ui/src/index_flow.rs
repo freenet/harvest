@@ -58,10 +58,6 @@ pub struct IndexView {
     /// (harvest#181): no store yet, unless the key's index migration walk
     /// finds an earlier generation's.
     pub absent: bool,
-    /// An earlier generation's index, recovered by the key's index migration
-    /// walk (harvest#181). Its stores count as listed from the moment it is
-    /// recovered, not from when its forward PUT lands, which may be never.
-    pub recovered: Option<GhostKeyIndexV1>,
 }
 
 /// How a Ghost Key's index migration walk ended, as "Create a store" needs
@@ -72,8 +68,13 @@ pub enum IndexWalkEnd {
     /// delegate says the lineage was carried forward already, so the
     /// current index is the whole answer.
     Empty,
-    /// An earlier generation's index was recovered.
-    Recovered(GhostKeyIndexV1),
+    /// An earlier generation's index was recovered. `complete` is false
+    /// when some other earlier generation never answered: its stores are
+    /// followed and counted, but they may not be all of them.
+    Recovered {
+        index: GhostKeyIndexV1,
+        complete: bool,
+    },
     /// Some earlier generation never answered: nothing is known, and the
     /// gate waits out [`INDEX_SETTLE_WAIT_MS`] rather than reading silence as
     /// "no store".
@@ -98,6 +99,9 @@ pub enum CreationGate {
     BacksStore(String),
     /// The check did not finish in time: offer it, and say so.
     Unconfirmed,
+    /// The key's index lists a store (by its code) that has not loaded in
+    /// the wait: the key has a store, so creation is not offered.
+    ListsUnloadedStore(String),
 }
 
 /// How many times a store's index entry publish may fail before this
@@ -130,7 +134,6 @@ impl AppState {
                 ghost_key,
                 index: None,
                 absent: false,
-                recovered: None,
             },
         );
         // My Store waits for the index before offering "Create a store"
@@ -445,7 +448,7 @@ impl AppState {
             IndexWalkEnd::Empty => {
                 self.index_walks_done.insert(fingerprint.to_string());
             }
-            IndexWalkEnd::Recovered(index) => {
+            IndexWalkEnd::Recovered { index, complete } => {
                 let Some(ghost_key) = self
                     .ghostkeys
                     .iter()
@@ -467,15 +470,13 @@ impl AppState {
                     return;
                 }
                 let stores: Vec<[u8; 32]> = index.store_keys().map(|k| k.to_bytes()).collect();
-                let Some(view) = self
-                    .ghostkey_indexes
-                    .values_mut()
-                    .find(|v| v.ghost_key == ghost_key)
-                else {
-                    return;
-                };
-                view.recovered = Some(index);
-                self.index_walks_done.insert(fingerprint.to_string());
+                // Kept by Ghost Key, not on the index view: a failed GET of
+                // the current index drops the view, and the recovery must
+                // not go with it.
+                self.recovered_indexes.insert(ghost_key, index);
+                if complete {
+                    self.index_walks_done.insert(fingerprint.to_string());
+                }
                 for store in stores {
                     self.follow_indexed_store(&store);
                 }
@@ -508,18 +509,25 @@ impl AppState {
             .values()
             .find(|v| v.ghost_key == *backer);
         let waited = self.index_waits_elapsed.contains(fingerprint);
-        let settled = view.is_some_and(|view| {
-            let known = view.index.is_some()
-                || view.recovered.is_some()
-                || (view.absent && self.index_walks_done.contains(fingerprint));
-            known
-                && view
-                    .index
-                    .iter()
-                    .chain(view.recovered.iter())
-                    .flat_map(|index| index.store_keys())
-                    .all(|store| self.indexed_store_settled(&store))
-        });
+        let recovered = self.recovered_indexes.get(backer);
+        let walked = self.index_walks_done.contains(fingerprint);
+        let listed: Vec<ed25519_dalek::VerifyingKey> = view
+            .and_then(|v| v.index.as_ref())
+            .into_iter()
+            .chain(recovered)
+            .flat_map(|index| index.store_keys())
+            .collect();
+        // An index that lists a store this device has not loaded is a
+        // positive answer: the key has a store. It is never read as silence,
+        // however long the store takes (harvest#181 review).
+        if let Some(store) = listed.iter().find(|s| !self.indexed_store_settled(s)) {
+            if waited {
+                return CreationGate::ListsUnloadedStore(harvest_common::store::store_code(store));
+            }
+            return CreationGate::Checking;
+        }
+        let settled = view.is_some_and(|v| v.index.is_some())
+            || (walked && (recovered.is_some() || view.is_some_and(|v| v.absent)));
         match (
             settled && self.store_lists_answered.contains(fingerprint),
             waited,
@@ -730,7 +738,13 @@ mod tests {
         let mut forged = index_of(&[0x71]);
         let foreign = IndexEntry::from_backing(&signed_backing(0x72, 0x42, 10));
         forged.entries.insert(foreign.slot(), foreign);
-        state.on_index_walk_end("fp", IndexWalkEnd::Recovered(forged));
+        state.on_index_walk_end(
+            "fp",
+            IndexWalkEnd::Recovered {
+                index: forged,
+                complete: true,
+            },
+        );
         assert!(state.stores_from_my_indexes.is_empty());
         assert_eq!(
             state.store_creation_gate("fp", &backer_vk()),
@@ -738,13 +752,25 @@ mod tests {
             "a recovery that does not verify settles nothing"
         );
 
-        state.on_index_walk_end("fp", IndexWalkEnd::Recovered(index_of(&[0x71])));
+        state.on_index_walk_end(
+            "fp",
+            IndexWalkEnd::Recovered {
+                index: index_of(&[0x71]),
+                complete: true,
+            },
+        );
         assert!(state.stores_from_my_indexes.contains(&store_id(0x71)));
         assert_eq!(
             state.store_creation_gate("fp", &backer_vk()),
             CreationGate::Checking,
             "its store has not loaded"
         );
+        // However long it takes: the key has a store, so no Create.
+        state.on_index_wait_elapsed("fp");
+        assert!(matches!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::ListsUnloadedStore(_)
+        ));
         load_backed(&mut state, 9, 0x71, vec![signed_backing(0x71, BACKER, 10)]);
         state
             .browsing_stores
@@ -753,6 +779,44 @@ mod tests {
             state.store_creation_gate("fp", &backer_vk()),
             CreationGate::BacksStore(_)
         ));
+    }
+
+    /// A recovery from a walk where another earlier generation never
+    /// answered follows its stores but does not settle the gate; and a
+    /// recovery that arrives after the current index's view was dropped (a
+    /// failed GET) is kept all the same. Mutated red by settling on an
+    /// incomplete recovery, and by keeping the recovery on the view.
+    #[test]
+    fn an_incomplete_or_viewless_recovery_is_kept_but_settles_nothing() {
+        let mut state = AppState::default();
+        connect(&mut state, backer_vk());
+        state.store_lists_answered.insert("fp".into());
+        state.watch_ghostkey_index(backer_vk());
+        state.on_index_watch_failed(&index_id(backer_vk()));
+        state.on_index_walk_end(
+            "fp",
+            IndexWalkEnd::Recovered {
+                index: index_of(&[]),
+                complete: false,
+            },
+        );
+        assert!(state.recovered_indexes.contains_key(&backer_vk()));
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Checking,
+            "another generation never answered"
+        );
+        state.on_index_walk_end(
+            "fp",
+            IndexWalkEnd::Recovered {
+                index: index_of(&[]),
+                complete: true,
+            },
+        );
+        assert_eq!(
+            state.store_creation_gate("fp", &backer_vk()),
+            CreationGate::Ready
+        );
     }
 
     /// "Create store" sent from a form opened under an earlier answer is
@@ -1160,14 +1224,25 @@ mod tests {
     /// if any of these calls is deleted or loosened.
     #[test]
     fn the_wasm_only_wiring_for_one_store_per_ghost_key_is_in_place() {
-        let squash = |src: &str| src.split_whitespace().collect::<String>();
-        let migrate = squash(include_str!("gateway/migrate_ops.rs"));
+        // The non-test source, with comment lines dropped (so a call that is
+        // commented out does not count), and whitespace squashed.
+        let code = |src: &str| -> String {
+            let src = src.find("#[cfg(test)]").map_or(src, |at| &src[..at]);
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let migrate = code(include_str!("gateway/migrate_ops.rs"));
         for needle in [
             // A silent candidate marks the walk as knowing nothing...
             "probe.any_unknown=true;",
-            // ...which ends it as Unknown, never Empty.
+            // ...which ends it as Unknown, never Empty, and leaves a
+            // recovery incomplete.
             "_ifprobe.any_unknown=>(None,crate::index_flow::IndexWalkEnd::Unknown),",
-            "crate::index_flow::IndexWalkEnd::Recovered(merged),",
+            "freenet_migrate::Outcome::Indeterminate{..}=>{(None,crate::index_flow::IndexWalkEnd::Unknown)}",
+            "crate::index_flow::IndexWalkEnd::Recovered{index:merged,complete:!probe.any_unknown,},",
             "super::APP_STATE.write().on_index_walk_end(&fingerprint,end);",
             // The marker skip settles the walk too.
             ".on_index_walk_end(&fingerprint,crate::index_flow::IndexWalkEnd::Empty);",
@@ -1178,22 +1253,33 @@ mod tests {
             !migrate.contains("on_index_walk_done"),
             "the walk is never marked done regardless of how it ended"
         );
-        let handler = squash(include_str!("gateway/response_handler.rs"));
+        let handler = code(include_str!("gateway/response_handler.rs"));
         assert!(handler.contains("APP_STATE.write().on_index_absent(instance_id.as_bytes());"));
-        let this = squash(include_str!("index_flow.rs"));
+        let this = code(include_str!("index_flow.rs"));
         assert!(this.contains(".on_index_wait_elapsed(&fingerprint);"));
-        let closure = squash(include_str!("closure_flow.rs"));
+        let closure = code(include_str!("closure_flow.rs"));
         assert!(closure.contains(".on_close_deadline(&id,attempt);"));
-        let my_store = include_str!("components/my_store.rs");
-        let my_store = squash(&my_store[..my_store.find("#[cfg(test)]").expect("tests")]);
+        assert!(
+            closure.contains("Err(e)=>{state.closes_sent.remove(&owner);"),
+            "a close that could not be sent must not hold back the next one"
+        );
+        let my_store = code(include_str!("components/my_store.rs"));
         assert!(
             my_store.contains(".begin_own_store_creation(fingerprint.clone(),vk_bytes,details);")
         );
+        assert!(my_store.contains("}elseiflegacy_movable&&gate_open{"));
+        assert!(my_store
+            .contains("letgate=APP_STATE.read().store_creation_gate(&fingerprint,&vk_bytes);"));
         assert_eq!(
             my_store.matches("another_store").count(),
             1,
             "the UI never asks for a second store on purpose"
         );
         assert!(my_store.contains("another_store:false,"));
+        // The UI rewords the delegate's refusal by matching its text.
+        assert!(
+            include_str!("../../delegates/harvest-delegate/src/handlers.rs")
+                .contains("open a second store under this one on")
+        );
     }
 }

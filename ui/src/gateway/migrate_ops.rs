@@ -854,8 +854,14 @@ fn finish(mut probe: Probe) {
                 let (forward, end) = match outcome {
                     freenet_migrate::Outcome::Recovered { merged, .. } => (
                         encode_forward(&merged, INDEX_CONTRACT_WASM),
-                        crate::index_flow::IndexWalkEnd::Recovered(merged),
+                        crate::index_flow::IndexWalkEnd::Recovered {
+                            index: merged,
+                            complete: !probe.any_unknown,
+                        },
                     ),
+                    freenet_migrate::Outcome::Indeterminate { .. } => {
+                        (None, crate::index_flow::IndexWalkEnd::Unknown)
+                    }
                     _ if probe.any_unknown => (None, crate::index_flow::IndexWalkEnd::Unknown),
                     _ => (None, crate::index_flow::IndexWalkEnd::Empty),
                 };

@@ -186,6 +186,12 @@ impl AppState {
             crate::index_flow::CreationGate::Checking => {
                 return Err(STILL_CHECKING_GHOST_KEY.into());
             }
+            crate::index_flow::CreationGate::ListsUnloadedStore(code) => {
+                return Err(format!(
+                    "this Ghost Key already has a store (code {code}). One Ghost Key can back \
+                     only one store, so use a different Ghost Key for another"
+                ));
+            }
             crate::index_flow::CreationGate::BacksStore(name) => {
                 return Err(format!(
                     "this Ghost Key already has a store, {name}. One Ghost Key can back only one \
@@ -1466,12 +1472,22 @@ pub(crate) mod tests {
     /// A signed backing of the store keyed by `store` seed by the Ghost Key
     /// `backer` seed, dated `height`.
     pub(crate) fn signed_backing(store: u8, backer: u8, height: u32) -> AuthorizedBacking {
+        signed_backing_with_cert(store, backer, height, format!("CERT-{backer}"))
+    }
+
+    /// [`signed_backing`] naming its own certificate.
+    pub(crate) fn signed_backing_with_cert(
+        store: u8,
+        backer: u8,
+        height: u32,
+        certificate_pem: String,
+    ) -> AuthorizedBacking {
         let store_key = SigningKey::from_bytes(&[store; 32]);
         let ghost = SigningKey::from_bytes(&[backer; 32]);
         let statement = BackingStatement {
             store: store_key.verifying_key(),
             backer: ghost.verifying_key(),
-            certificate_pem: format!("CERT-{backer}"),
+            certificate_pem,
             network: BitcoinNetwork::Signet,
             block: BlockAnchor {
                 height,
