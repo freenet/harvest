@@ -763,6 +763,10 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
             .chain(conflict.others.iter().cloned().map(|s| (s, false)))
             .collect();
     let none_closable = closable.is_empty() && conflict.closing.is_none();
+    let labels: Vec<String> = stores
+        .iter()
+        .map(|(s, _)| close_button_label(s, &stores))
+        .collect();
     rsx! {
         div { class: "need",
             p { class: "text-warning",
@@ -781,7 +785,7 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                 }
             }
             ul { class: "conflict-stores",
-                for (s , this) in stores {
+                for ((s , this) , label) in stores.iter().cloned().zip(labels) {
                     li { key: "{s.code}", class: "row-between",
                         span {
                             strong { "{s.name}" }
@@ -798,7 +802,7 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                                     let target = s.clone();
                                     move |_| confirming.set(Some(target.clone()))
                                 },
-                                "Close {s.name}\u{2026}"
+                                "{label}"
                             }
                         }
                     }
@@ -852,6 +856,21 @@ fn KeyBacksTwoStores(conflict: crate::closure_flow::KeyConflict) -> Element {
                 }
             }
         }
+    }
+}
+
+/// A Close button's words: the store's name, and its code too when another
+/// store on the card has the same name (the usual way two stores share a
+/// Ghost Key is the same store made twice).
+fn close_button_label(
+    store: &crate::closure_flow::SharingStore,
+    all: &[(crate::closure_flow::SharingStore, bool)],
+) -> String {
+    let twins = all.iter().filter(|(s, _)| s.name == store.name).count() > 1;
+    if twins {
+        format!("Close {} ({})\u{2026}", store.name, store.code)
+    } else {
+        format!("Close {}\u{2026}", store.name)
     }
 }
 
@@ -2471,6 +2490,36 @@ mod seller_stores_tests {
     /// still loading is not flagged for what it has not read yet. Red if
     /// any branch is dropped. (The wallet-gap and instant-checkout alerts
     /// come from the delegate's status and are read, not set up here.)
+    /// Two stores with one name are told apart on their Close buttons by
+    /// code; distinct names need none. Mutated red by never adding it.
+    #[test]
+    fn close_buttons_carry_the_code_only_for_same_named_stores() {
+        let store = |name: &str, code: &str| crate::closure_flow::SharingStore {
+            contract_id: vec![],
+            name: name.into(),
+            code: code.into(),
+            listings: 0,
+            orders: 0,
+            can_close: true,
+        };
+        let twins = [
+            (store("Bean Shop", "AAA"), true),
+            (store("Bean Shop", "BBB"), false),
+        ];
+        assert_eq!(
+            close_button_label(&twins[1].0, &twins),
+            "Close Bean Shop (BBB)\u{2026}"
+        );
+        let apart = [
+            (store("Bean Shop", "AAA"), true),
+            (store("Tea Shop", "BBB"), false),
+        ];
+        assert_eq!(
+            close_button_label(&apart[1].0, &apart),
+            "Close Tea Shop\u{2026}"
+        );
+    }
+
     #[test]
     fn overview_needs_covers_every_item_the_needs_you_card_lists() {
         let mut state = AppState::default();
