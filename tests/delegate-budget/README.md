@@ -180,36 +180,42 @@ Same harness, same scenario, two builds of the delegate:
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
 Largest calls with every cap above filled, on the delegate main shipped
-before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…` before the scan
-bound, `69a6d296…` with it), committed since. Both columns are one run each
-of the harness at commit `c4e9a29`, so every row is the same scenario. A run
-of several calls is shown as its most expensive call:
+before #216 (`cbe71dd9…`, V29) and on #216's final build (`ed88aa21…`).
+Both columns are one run each of the harness at commit `8aaa906` (the
+harness as of `2bd3b11`), so every row is the same scenario. A row of
+several calls shows its most expensive call. V29 is sent the published
+scripts with each request, as its web app did; it has no
+`AddPublishedScripts`, pending slot or wake-up catch-up:
 
 | call | V29 | #216 |
 |---|---:|---:|
-| `SetPaymentXpub`, 64 full stores' published scripts (262,144), one call | 834,583,191,788 (**20864.6%, over**) | 7,849,863,318 (**196.2%, over**), still catching up |
-| `DeriveOrderAddress`, same | 834,576,950,789 (**20864.4%, over**) | 7,842,882,740 (**196.1%, over**), still catching up |
-| `SetPaymentXpub`, one full store's published scripts (4,096) | 13,050,325,660 (**326.3%, over**), 1 call | 1,322,330,495 (33.1%), 11 calls |
-| `DeriveOrderAddress`, same | 13,049,967,370 (**326.2%, over**), 1 call | 1,315,349,403 (32.9%), 11 calls |
-| `SetPaymentXpub`, one full store's scripts 100 apart | past the 1,000-billion ceiling (stops the scenario) | 1,322,007,531 (33.1%), 32 calls, not finished |
-| `DeriveOrderAddress`, same | (not reached) | 1,315,026,815 (32.9%), 32 calls, not finished |
-| instant decide against a store of 4,096 paid orders | 26,110,253,849 (**652.8%, over**), 1 run | 8,722,602,646 (**218.1%, over**), 11 runs (10 at about 7.65 billion) |
-| heartbeat wake-up, 8 full watch delegations | 105,767,562,302 (**2644.2%, over**) | 1,844,244,959 (46.1%) |
-| same, every store's mailbox waiting to be re-read | 105,758,544,149 (**2644.0%, over**) | 1,933,038,739 (48.3%) |
-| tip read answered, 8 full watch delegations | 101,067,360,752 (**2526.7%, over**) | 1,207,268,765 (30.2%) |
-| `ArmAutoInvoice`, 8 full watch delegations | 6,330,624,918 (**158.3%, over**) | 232,229,633 (5.8%) |
-| forced `Heartbeat`, 8 full watch delegations | 6,132,743,453 (**153.3%, over**) | 170,641,580 (4.3%) |
-| mailbox notification at the byte cap, plaintexts built to be slow to decode | 13,710,079,810 (**342.8%, over**) | 1,963,465,605 (49.1%) a run, 7 runs |
-| the wake-up's mailbox read answered, same mailbox | 13,640,295,281 (**341.0%, over**) | 1,866,648,169 (46.7%) a run |
-| mailbox notification at the byte cap | 10,389,383,503 (**259.7%, over**) | 1,359,137,965 (34.0%) a run, 7 runs |
-| `ExportSecrets`, 16 full ledgers | 8,074,625,933 (**201.9%, over**) | 1,083,357,132 (27.1%) |
-| heartbeat wake-up, 16 full ledgers | 7,659,484,431 (**191.5%, over**) | 1,044,678,002 (26.1%), with 15 of the 16 retry flags missing (the seeded ledgers'; a missing flag means reading the ledger, the worst case) |
-| same, every store's mailbox waiting to be re-read | 7,660,135,838 (**191.5%, over**) | 168,491,440 (4.2%) |
-| `KeepPurchase`, the 1024th | 3,192,943,691 (79.8%) | 2,216,880,431 (55.4%) |
-| mailbox notification, 512 short messages | 3,189,665,483 (79.7%) | 794,658,923 (19.9%) a run, 4 runs |
-| `ImportMigratedSecret`, full ledger into a full ledger | 3,079,750,200 (77.0%) | 1,254,631,664 (31.4%) |
-| mailbox notification, one instant request | 2,940,227,930 (73.5%) | 134,960,678 (3.4%) |
-| `ListKeptPurchases (1024)` | 2,906,374,863 (72.7%) | 2,201,595,405 (55.0%) |
+| instant decide against a store of 4,096 paid orders (ceiling 70%) | 26,110,253,849 (**652.8%, over**) | 2,551,629,593 (63.8%), 11 runs |
+| heartbeat wake-up, 8 full watch delegations | 105,767,562,302 (**2644.2%, over**) | 1,845,602,573 (46.1%) |
+| same, every store's mailbox waiting to be re-read | 105,758,544,149 (**2644.0%, over**) | 1,934,399,600 (48.4%) |
+| tip read answered, 8 full watch delegations | 101,067,360,752 (**2526.7%, over**) | 607,539,117 (15.2%) |
+| `ArmAutoInvoice`, 8 full watch delegations | 6,330,624,918 (**158.3%, over**) | 192,676,953 (4.8%) |
+| forced `Heartbeat`, 8 full watch delegations | 6,132,743,453 (**153.3%, over**) | 170,783,473 (4.3%) |
+| heartbeat wake-up moving one store's catch-up on, to the end | (not on V29: no `AddPublishedScripts`) | 2,229,458,742 (55.7%), 33 wake-ups |
+| heartbeat wake-up once that catch-up is complete | (not on V29: no `AddPublishedScripts`) | 551,384,208 (13.8%) |
+| `SetPaymentXpub`, one full store's published scripts (4,096) | 13,050,327,747 (**326.3%, over**) | 1,221,560,677 (30.5%), 11 calls |
+| `DeriveOrderAddress`, same | 13,049,967,370 (**326.2%, over**) | 1,213,923,367 (30.3%), 11 calls |
+| `SetPaymentXpub`, a new key, its store's 4,096 scripts (pending, then made active) | (not on V29: no `AddPublishedScripts`) | 1,222,212,045 (30.6%), 11 calls |
+| `AddPublishedScripts`, 4,096 scripts, the 64th chunk of 64 full stores | (not on V29: no `AddPublishedScripts`) | 445,154,360 (11.1%), 64 chunks |
+| `SetPaymentXpub`, 64 full stores' scripts held (262,144), one call | 834,583,189,262 (**20864.6%, over**) | 1,228,125,142 (30.7%) |
+| `DeriveOrderAddress`, same | 834,576,950,789 (**20864.4%, over**) | 1,220,487,832 (30.5%) |
+| `SetPaymentXpub`, one full store's scripts 100 apart (32 calls, not finished) | past the 1,000-billion ceiling (stops the scenario) | 1,221,493,862 (30.5%), 32 calls |
+| `DeriveOrderAddress`, same | (not reached) | 1,213,856,649 (30.3%), 32 calls |
+| mailbox notification at the byte cap, plaintexts built to be slow to decode | 13,710,079,810 (**342.8%, over**) | 1,963,482,942 (49.1%), 7 runs |
+| the wake-up's mailbox read answered, same mailbox | 13,640,295,281 (**341.0%, over**) | 1,866,657,821 (46.7%) |
+| mailbox notification at the byte cap | 10,389,383,503 (**259.7%, over**) | 1,359,155,301 (34.0%), 7 runs |
+| `ExportSecrets`, 16 full ledgers | 8,074,583,065 (**201.9%, over**) | 1,083,991,246 (27.1%) |
+| heartbeat wake-up, 16 full ledgers | 7,659,484,431 (**191.5%, over**) | 456,289,297 (11.4%) |
+| same, every store's mailbox waiting to be re-read | 7,660,135,838 (**191.5%, over**) | 169,034,647 (4.2%) |
+| `KeepPurchase`, the 1024th | 3,192,943,691 (79.8%) | 2,217,682,277 (55.4%) |
+| mailbox notification, 512 short messages | 3,189,665,483 (79.7%) | 794,676,259 (19.9%), 4 runs |
+| `ImportMigratedSecret`, full ledger into a full ledger | 3,079,750,200 (77.0%) | 1,255,545,434 (31.4%) |
+| mailbox notification, one instant request | 2,940,227,930 (73.5%) | 135,079,615 (3.4%) |
+| `ListKeptPurchases (1024)` | 2,906,374,863 (72.7%) | 2,202,396,247 (55.1%) |
 
 **Every call on #216 is within its ceiling.** The published-script scan is
 cut into budgets (`FLOOR_SCAN_BUDGET`, 384 derivations, and 128 a wake-up)
