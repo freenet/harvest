@@ -2597,8 +2597,12 @@ pub(crate) fn decide<S: SecretStore>(
         // be past every paid one. The counter it reached is kept, so the next
         // run (the wake-up re-reads while requests wait) goes on from it.
         Ok(scan) if !scan.complete => {
-            crate::bitcoin::save_payment_xpub(secrets, &xpub).ok();
-            refuse_all(&mut decided, Refusal::CatchingUp);
+            let why = if crate::bitcoin::save_payment_xpub(secrets, &xpub).is_ok() {
+                Refusal::CatchingUp
+            } else {
+                Refusal::CounterNotSaved
+            };
+            refuse_all(&mut decided, why);
             return decided;
         }
         Ok(_) => {}

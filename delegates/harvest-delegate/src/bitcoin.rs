@@ -609,16 +609,25 @@ pub fn handle<S: SecretStore>(
         } => {
             let existing = load_payment_xpub(store);
             let mut matched_scripts = Vec::new();
-            // A scan left short (`FloorScan::complete`) still answers Ok with
-            // the counter it reached: the key is set, and every address is
-            // handed out by `DeriveOrderAddress` or instant checkout, which
-            // carry the scripts again and finish the scan before handing one
-            // out.
+            // A scan left short (`FloorScan::complete`) keeps the count it
+            // reached and answers Err, so the seller enters the key again and
+            // the scan goes on. Never Ok: the UI would record the scripts not
+            // yet reached as offered and unmatched, leave them out of its next
+            // address request, and that request's scan would then hand out an
+            // address of a published order (harvest#77). On Err the UI records
+            // nothing, so its next request carries every script again.
             let result =
                 apply_set_payment_xpub(&xpub, network, existing.as_ref()).and_then(|mut status| {
-                    matched_scripts =
-                        published_floor_scan(&mut status, &published_scripts)?.matched;
+                    let scan = published_floor_scan(&mut status, &published_scripts)?;
                     save_payment_xpub(store, &status)?;
+                    if !scan.complete {
+                        return Err(format!(
+                            "this key has more published orders than one request can catch \
+                             up with; the count is now at {}. Enter the key again to continue.",
+                            status.next_index
+                        ));
+                    }
+                    matched_scripts = scan.matched;
                     Ok(status)
                 });
             if result.is_err() {
@@ -1489,6 +1498,58 @@ mod origin_gating_tests {
             }
             other => panic!("expected OrderAddress, got {other:?}"),
         }
+    }
+
+    /// #206: setting a key whose published orders are past one call's scan
+    /// keeps the count reached and answers Err, never Ok (on Ok the UI would
+    /// leave the scripts not yet reached out of its next address request);
+    /// entered again, it goes on, and answers Ok once caught up. Mutated red
+    /// by answering Ok from a scan left short.
+    #[test]
+    fn a_key_set_past_one_scan_is_entered_again_until_caught_up() {
+        let chain = crate::bip32::AccountXpub::parse(SELLERS_KEY)
+            .expect("parse")
+            .external_chain()
+            .expect("chain");
+        let last = super::FLOOR_SCAN_BUDGET + 50;
+        let sent: Vec<Vec<u8>> = (0..=last)
+            .map(|i| chain.script_at(i).expect("derive"))
+            .collect();
+        let mut store = MemSecrets::default();
+        let set = |store: &mut MemSecrets, id: u64| match handle(
+            store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: id,
+                xpub: SELLERS_KEY.into(),
+                network: BitcoinNetwork::Bitcoin,
+                published_scripts: sent.clone(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::PaymentXpubSet {
+                result,
+                matched_scripts,
+                ..
+            } => (result, matched_scripts),
+            other => panic!("{other:?}"),
+        };
+        let (first, matched) = set(&mut store, 1);
+        let e = first.unwrap_err();
+        assert!(e.contains("Enter the key again"), "{e}");
+        assert!(matched.is_empty(), "nothing reported on Err");
+        assert_eq!(
+            load_payment_xpub(&store).unwrap().next_index,
+            super::FLOOR_SCAN_BUDGET,
+            "the count reached is kept"
+        );
+        let (second, matched) = set(&mut store, 2);
+        assert_eq!(second.expect("caught up").next_index, last + 1);
+        assert_eq!(
+            matched.len(),
+            (last + 1 - super::FLOOR_SCAN_BUDGET) as usize
+        );
     }
 
     /// #206: a counter far behind its published orders catches up over
