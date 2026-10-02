@@ -18,19 +18,37 @@
 //! # What is held
 //!
 //! - [`PUBLISHED_KEY`]: every published script sent, as 16-byte digests,
-//!   sorted, each with the order it arrived in. A script a scan has matched
-//!   stays: below that key's counter it never matches again, but a key
-//!   entered afresh starts at 0 and needs it, and removing it on a match
-//!   would leave that key relying on whatever the tab entering it happens
-//!   to know (found in review: a pending key replaced by a newer one, then
-//!   entered again, was handed its own published index 0). Past [`MAX_HELD`]
-//!   the oldest go: the one residual, documented with the scan.
-//! - [`ISSUED_KEY`]: the digests of the addresses the active key has handed
-//!   out. An addition naming one of these is dropped: it is below the
-//!   counter by construction. That keeps this device's own orders, which
-//!   every tab sends once they are published, out of the set above.
+//!   sorted, each with a sequence number for when it was last sent. A
+//!   script a scan has matched stays: below that key's counter it never
+//!   matches again, but a key entered afresh starts at 0 and needs it, and
+//!   removing it on a match would leave that key relying on whatever the tab
+//!   entering it happens to know (found in review: a pending key replaced by
+//!   a newer one, then entered again, was handed its own published index
+//!   0). This device's own orders are held too, like any other: an earlier
+//!   filter that dropped them as "issued by the active key" dropped them for
+//!   good when that key came back later (review of 36bb41b), and the cap
+//!   below is the most distinct scripts a seller can have published at
+//!   once, so they matter only over churn, which eviction handles.
 //! - [`CURSOR_ACTIVE_KEY`], [`CURSOR_PENDING_KEY`]: how far each key's scan
 //!   has got (`bitcoin::advance_scan`).
+//!
+//! # Eviction, the one residual
+//!
+//! Past [`MAX_HELD`] held scripts, those sent longest ago go first: a script
+//! sent again (every tab sends every script it knows on load) is fresh
+//! again. What can go is therefore a script no tab has sent for longer than
+//! [`MAX_HELD`] others have been sent since: in practice an order pruned
+//! from its store (a store keeps [`harvest_common::store::MAX_ORDERS`]),
+//! which no tab can send any more either. A migration's imported scripts
+//! count as older than every script this delegate holds, so they go before
+//! any of its own.
+//!
+//! # A list that does not read
+//!
+//! A held list that is there but does not decode is never taken for an
+//! empty one ([`DigestList::load`] answers [`Unreadable`]): empty would make
+//! every scan complete at once and hand out addresses, and an addition
+//! would write over what it could not read. Every caller refuses instead.
 //!
 //! # Raw bytes, not CBOR
 //!
@@ -50,46 +68,47 @@
 
 use freenet_migrate::SecretStore;
 
-/// The published scripts held ([`DigestList`], untagged).
+/// The published scripts held ([`DigestList`]).
 pub(crate) const PUBLISHED_KEY: &[u8] = b"harvest:bitcoin:published:v1";
-
-/// The digests the active key has handed out ([`DigestList`], tagged with
-/// that key). Node-local and never exported: losing it only lets this
-/// device's own orders into [`PUBLISHED_KEY`], where they never match.
-pub(crate) const ISSUED_KEY: &[u8] = b"harvest:bitcoin:issued:v1";
 
 /// `[generation u32][count u32]` of [`PUBLISHED_KEY`], written with it, so
 /// a store's status can tell whether a scan is complete without reading the
 /// list itself. Advisory: every scan reads the list.
 pub(crate) const PUBLISHED_META_KEY: &[u8] = b"harvest:bitcoin:published-meta:v1";
 
-/// Save the published list and its [`PUBLISHED_META_KEY`]. Whether the list
-/// was kept.
+/// The held list is there and does not decode: see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// Save the published list and its [`PUBLISHED_META_KEY`]. Whether both
+/// were kept.
 ///
-/// The count goes first: if the list is then refused, the count names a
-/// generation the list does not have, which only ever reads as "changed
-/// since" (a scan not known complete, `decide` feeding its store again),
-/// never as "unchanged" over a list that did change.
+/// The count goes first, and a refused count stops the list being written:
+/// a count left naming an older generation over a newer list could tell the
+/// status a scan is complete when it is not. A count written over a list
+/// that is then refused names a generation the list does not have, which
+/// only ever reads as "changed since" (a scan not known complete, `decide`
+/// feeding its store again).
 pub(crate) fn save_published<S: SecretStore>(store: &mut S, list: &DigestList) -> bool {
     let mut meta = list.generation().to_le_bytes().to_vec();
     meta.extend_from_slice(&(list.len() as u32).to_le_bytes());
-    store.set_secret(PUBLISHED_META_KEY, &meta);
-    list.save(store, PUBLISHED_KEY)
+    store.set_secret(PUBLISHED_META_KEY, &meta) && list.save(store, PUBLISHED_KEY)
 }
 
 /// The published list's generation and length, from its
-/// [`PUBLISHED_META_KEY`] when that is there, else from the list.
-pub(crate) fn published_meta<S: SecretStore>(store: &S) -> (u32, usize) {
+/// [`PUBLISHED_META_KEY`] when that is there, else from the list. `None`
+/// when neither reads: treat it as changed.
+pub(crate) fn published_meta<S: SecretStore>(store: &S) -> Option<(u32, usize)> {
     if let Some(meta) = store
         .get_secret(PUBLISHED_META_KEY)
         .filter(|m| m.len() == 8)
     {
         let generation = u32::from_le_bytes(meta[..4].try_into().expect("4 bytes"));
         let count = u32::from_le_bytes(meta[4..].try_into().expect("4 bytes"));
-        return (generation, count as usize);
+        return Some((generation, count as usize));
     }
-    let list = DigestList::load(store, PUBLISHED_KEY, b"");
-    (list.generation(), list.len())
+    let list = DigestList::load(store, PUBLISHED_KEY).ok()?;
+    Some((list.generation(), list.len()))
 }
 
 /// How far the active key's scan has got ([`Cursor`]). Never exported:
@@ -99,7 +118,7 @@ pub(crate) const CURSOR_ACTIVE_KEY: &[u8] = b"harvest:bitcoin:cursor-active:v1";
 /// How far the pending key's scan has got ([`Cursor`]). As above.
 pub(crate) const CURSOR_PENDING_KEY: &[u8] = b"harvest:bitcoin:cursor-pending:v1";
 
-/// The most entries either list holds: what one seller can have published
+/// The most entries the list holds: what one seller can have published
 /// at once, [`crate::store_keys::MAX_STORE_KEYS`] stores of
 /// [`harvest_common::store::MAX_ORDERS`] orders.
 pub(crate) const MAX_HELD: usize =
@@ -120,32 +139,30 @@ pub(crate) fn digest(script: &[u8]) -> Digest {
     out
 }
 
-/// A sorted list of digests, each with the sequence number it arrived
+/// A sorted list of digests, each with the sequence number it was last sent
 /// under, as it is stored:
 ///
 /// `[version u8][generation u32][next_seq u32][tag_len u16][tag][records]`,
 /// each record `[digest 16][seq u32]`, sorted by digest. Integers are little
-/// endian. The generation rises whenever an entry is added, which is what
-/// sends every scan back to its counter ([`Cursor`]).
+/// endian; the tag is empty. The generation rises whenever an entry is
+/// added, which is what sends every scan back to its counter ([`Cursor`]).
 pub(crate) struct DigestList {
     bytes: Vec<u8>,
     records_at: usize,
 }
 
 impl DigestList {
-    /// An empty list under `tag`, at generation 0.
-    pub(crate) fn empty(tag: &[u8]) -> Self {
+    /// An empty list, at generation 0.
+    pub(crate) fn empty() -> Self {
         let mut bytes = vec![VERSION];
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&(tag.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(tag);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
         let records_at = bytes.len();
         Self { bytes, records_at }
     }
 
-    /// Read a stored list. `None` when it is not one (a cleared slot is
-    /// empty bytes).
+    /// Read a stored list. `None` when it is not one.
     pub(crate) fn decode(bytes: Vec<u8>) -> Option<Self> {
         if bytes.first() != Some(&VERSION) || bytes.len() < 11 {
             return None;
@@ -158,22 +175,17 @@ impl DigestList {
         Some(Self { bytes, records_at })
     }
 
-    /// Load the list under `key`, or an empty one under `tag` when there is
-    /// none, it does not decode, or it was kept under another tag.
-    pub(crate) fn load<S: SecretStore>(store: &S, key: &[u8], tag: &[u8]) -> Self {
-        store
-            .get_secret(key)
-            .and_then(Self::decode)
-            .filter(|list| list.tag() == tag)
-            .unwrap_or_else(|| Self::empty(tag))
+    /// Load the list under `key`: an empty one when none is held, and
+    /// [`Unreadable`] when one is held that does not decode (never empty).
+    pub(crate) fn load<S: SecretStore>(store: &S, key: &[u8]) -> Result<Self, Unreadable> {
+        match store.get_secret(key) {
+            None => Ok(Self::empty()),
+            Some(bytes) => Self::decode(bytes).ok_or(Unreadable),
+        }
     }
 
     pub(crate) fn save<S: SecretStore>(&self, store: &mut S, key: &[u8]) -> bool {
         store.set_secret(key, &self.bytes)
-    }
-
-    pub(crate) fn tag(&self) -> &[u8] {
-        &self.bytes[11..self.records_at]
     }
 
     pub(crate) fn generation(&self) -> u32 {
@@ -214,73 +226,141 @@ impl DigestList {
             .collect()
     }
 
-    /// Whether `d` is held: a binary search over the records in place.
-    pub(crate) fn contains(&self, d: &Digest) -> bool {
+    /// Where `d` is held: a binary search over the records in place.
+    fn position(&self, d: &[u8]) -> Option<usize> {
         let (mut lo, mut hi) = (0, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.digest_at(mid).cmp(d.as_slice()) {
+            match self.digest_at(mid).cmp(d) {
                 core::cmp::Ordering::Less => lo = mid + 1,
                 core::cmp::Ordering::Greater => hi = mid,
-                core::cmp::Ordering::Equal => return true,
+                core::cmp::Ordering::Equal => return Some(mid),
             }
         }
-        false
+        None
     }
 
-    /// Add every digest of `new` not already held, under fresh sequence
-    /// numbers in the order given, and raise the generation if any was.
-    /// Past [`MAX_HELD`], the entries that arrived first go. Returns how many
-    /// were added. One merge pass, however many arrive.
+    /// Every digest held, the one sent longest ago first: the order
+    /// eviction takes them in.
+    #[cfg(test)]
+    pub(crate) fn by_age(&self) -> Vec<Digest> {
+        let base = self.next_seq();
+        let mut held: Vec<(u32, Digest)> = (0..self.len())
+            .map(|i| {
+                (
+                    base.wrapping_sub(self.seq_at(i)),
+                    self.digest_at(i).try_into().expect("16 bytes"),
+                )
+            })
+            .collect();
+        held.sort_by(|a, b| b.0.cmp(&a.0));
+        held.into_iter().map(|(_, d)| d).collect()
+    }
+
+    /// Whether `d` is held.
+    pub(crate) fn contains(&self, d: &Digest) -> bool {
+        self.position(d).is_some()
+    }
+
+    /// Hold every digest of `new`, as sent now: one not held is added, one
+    /// held already is marked sent now (so eviction, which takes the scripts
+    /// sent longest ago, does not take a script tabs keep sending). The
+    /// generation rises if any was added. Past [`MAX_HELD`], those sent
+    /// longest ago go. Returns how many were added. One merge pass, however
+    /// many arrive.
     pub(crate) fn insert(&mut self, new: &[Digest]) -> usize {
         self.insert_capped(new, MAX_HELD)
     }
 
     pub(crate) fn insert_capped(&mut self, new: &[Digest], cap: usize) -> usize {
-        let mut fresh: Vec<(Digest, u32)> = Vec::new();
         let mut seq = self.next_seq();
+        let mut stamped: Vec<(Digest, u32)> = Vec::with_capacity(new.len());
         let mut seen = std::collections::BTreeSet::new();
         for d in new {
-            if !self.contains(d) && seen.insert(*d) {
-                fresh.push((*d, seq));
+            if seen.insert(*d) {
+                stamped.push((*d, seq));
                 seq = seq.wrapping_add(1);
             }
         }
-        if fresh.is_empty() {
+        if stamped.is_empty() {
             return 0;
         }
-        fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let added = stamped.iter().filter(|(d, _)| !self.contains(d)).count();
+        self.merge(stamped, added, cap, seq);
+        added
+    }
+
+    /// Hold every digest of `new` not held already, as sent before anything
+    /// held here (a migration's import): eviction takes them before any of
+    /// this delegate's own. Returns how many were added.
+    pub(crate) fn insert_as_oldest(&mut self, new: &[Digest]) -> usize {
+        let base = self.next_seq();
+        let oldest = (0..self.len())
+            .map(|i| base.wrapping_sub(self.seq_at(i)))
+            .max()
+            .unwrap_or(0);
+        let mut fresh: Vec<Digest> = new.iter().filter(|d| !self.contains(d)).copied().collect();
+        fresh.sort_unstable();
+        fresh.dedup();
         let added = fresh.len();
+        if added == 0 {
+            return 0;
+        }
+        let stamped: Vec<(Digest, u32)> = fresh
+            .into_iter()
+            .enumerate()
+            .map(|(k, d)| (d, base.wrapping_sub(oldest).wrapping_sub(1 + k as u32)))
+            .collect();
+        self.merge(stamped, added, MAX_HELD, base);
+        added
+    }
+
+    /// Merge `stamped` in (a digest held already takes the new sequence
+    /// number), raise the generation if `added`, set the next sequence
+    /// number, and evict past `cap`.
+    fn merge(&mut self, mut stamped: Vec<(Digest, u32)>, added: usize, cap: usize, next: u32) {
+        stamped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut out = Vec::with_capacity(self.bytes.len() + added * RECORD);
         out.extend_from_slice(&self.bytes[..self.records_at]);
-        let mut fresh = fresh.into_iter().peekable();
+        let mut incoming = stamped.into_iter().peekable();
         for i in 0..self.len() {
             let held = self.digest_at(i);
-            while let Some((d, s)) = fresh.next_if(|(d, _)| d.as_slice() < held) {
+            while let Some((d, s)) = incoming.next_if(|(d, _)| d.as_slice() < held) {
                 out.extend_from_slice(&d);
                 out.extend_from_slice(&s.to_le_bytes());
             }
-            let at = self.records_at + i * RECORD;
-            out.extend_from_slice(&self.bytes[at..at + RECORD]);
+            match incoming.next_if(|(d, _)| d.as_slice() == held) {
+                Some((d, s)) => {
+                    out.extend_from_slice(&d);
+                    out.extend_from_slice(&s.to_le_bytes());
+                }
+                None => {
+                    let at = self.records_at + i * RECORD;
+                    out.extend_from_slice(&self.bytes[at..at + RECORD]);
+                }
+            }
         }
-        for (d, s) in fresh {
+        for (d, s) in incoming {
             out.extend_from_slice(&d);
             out.extend_from_slice(&s.to_le_bytes());
         }
-        let generation = self.generation().wrapping_add(1);
+        let generation = if added > 0 {
+            self.generation().wrapping_add(1)
+        } else {
+            self.generation()
+        };
         self.bytes = out;
-        self.set_header(generation, seq);
+        self.set_header(generation, next);
         let over = self.len().saturating_sub(cap);
         if over > 0 {
             self.evict_oldest(over);
         }
-        added
     }
 
-    /// Drop the `count` entries that arrived first: the largest ages,
-    /// counted back from the next sequence number so a wrapped counter still
-    /// orders them. Sequence numbers are unique (one per entry ever added),
-    /// so exactly `count` go.
+    /// Drop the `count` entries sent longest ago: the largest ages, counted
+    /// back from the next sequence number so a wrapped counter still orders
+    /// them. Sequence numbers are unique among those held, so exactly
+    /// `count` go.
     fn evict_oldest(&mut self, count: usize) {
         let base = self.next_seq();
         let age = |list: &Self, i: usize| base.wrapping_sub(list.seq_at(i));
@@ -360,7 +440,7 @@ mod tests {
     /// generation and a repeat does not.
     #[test]
     fn the_list_holds_finds_and_round_trips() {
-        let mut list = DigestList::empty(b"tag");
+        let mut list = DigestList::empty();
         assert_eq!(list.insert(&[d(3), d(1), d(2), d(1)]), 3);
         assert_eq!(list.generation(), 1);
         assert_eq!(list.insert(&[d(2)]), 0);
@@ -370,7 +450,6 @@ mod tests {
         }
         assert!(!list.contains(&d(4)));
         let back = DigestList::decode(list.bytes.clone()).expect("decodes");
-        assert_eq!(back.tag(), b"tag");
         assert_eq!(back.len(), 3);
         assert!(back.contains(&d(2)));
         // Sorted after every operation.
@@ -385,7 +464,7 @@ mod tests {
     /// newest, and by evicting below the cap.
     #[test]
     fn eviction_is_oldest_first_and_only_past_the_cap() {
-        let mut list = DigestList::empty(b"");
+        let mut list = DigestList::empty();
         list.insert_capped(&(0..10).map(d).collect::<Vec<_>>(), 10);
         assert_eq!(list.len(), 10, "at the cap, nothing goes");
         list.insert_capped(&(10..13).map(d).collect::<Vec<_>>(), 10);
@@ -397,11 +476,51 @@ mod tests {
             assert!(list.contains(&d(n)), "kept: {n}");
         }
         // In two batches arriving in one order, the earlier batch goes first.
-        let mut list = DigestList::empty(b"");
+        let mut list = DigestList::empty();
         list.insert_capped(&[d(100), d(101)], 3);
         list.insert_capped(&[d(1), d(2)], 3);
         assert!(!list.contains(&d(100)));
         assert!(list.contains(&d(101)) && list.contains(&d(1)) && list.contains(&d(2)));
+    }
+
+    /// #206 review: a script sent again is fresh again, so eviction takes
+    /// the scripts sent longest ago, not those that arrived first; and a
+    /// migration's imports go before any of this delegate's own. A re-send
+    /// adds nothing, so the generation stays. Mutated red by not refreshing
+    /// a re-sent script, and by importing as the newest.
+    #[test]
+    fn eviction_takes_what_was_sent_longest_ago() {
+        let mut list = DigestList::empty();
+        list.insert_capped(&[d(1), d(2), d(3)], 3);
+        let generation = list.generation();
+        assert_eq!(list.insert_capped(&[d(1)], 3), 0, "re-sent");
+        assert_eq!(list.generation(), generation);
+        list.insert_capped(&[d(4)], 3);
+        assert!(list.contains(&d(1)), "sent again, so not the oldest");
+        assert!(!list.contains(&d(2)));
+
+        let mut list = DigestList::empty();
+        list.insert_capped(&[d(10), d(11)], MAX_HELD);
+        assert_eq!(list.insert_as_oldest(&[d(20), d(10)]), 1);
+        list.insert_capped(&[d(12)], 3);
+        assert!(!list.contains(&d(20)), "the import went first");
+        assert!(list.contains(&d(10)) && list.contains(&d(11)) && list.contains(&d(12)));
+    }
+
+    /// #206 review: a held list that does not decode is unreadable, never
+    /// empty. Mutated red by loading it as empty.
+    #[test]
+    fn a_list_that_does_not_read_is_not_empty() {
+        let mut store = crate::secrets::MemSecrets::default();
+        assert_eq!(
+            DigestList::load(&store, PUBLISHED_KEY).map(|l| l.len()),
+            Ok(0)
+        );
+        store.set_secret(PUBLISHED_KEY, b"\x07garbage");
+        assert_eq!(
+            DigestList::load(&store, PUBLISHED_KEY).err(),
+            Some(Unreadable)
+        );
     }
 
     #[test]

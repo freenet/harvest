@@ -294,7 +294,10 @@ pub(crate) fn family(key: &[u8]) -> Family {
     } else if key == crate::published_set::PUBLISHED_KEY {
         Family::PublishedScripts
     } else if key == crate::published_set::PUBLISHED_META_KEY
-        || key == crate::published_set::ISSUED_KEY
+        // Retired before release (review of 36bb41b): the addresses the
+        // active key had handed out, once dropped from the held scripts. A
+        // predecessor of this branch that wrote it is refused, not held.
+        || key == RETIRED_ISSUED_KEY
         || key == crate::published_set::CURSOR_ACTIVE_KEY
         || key == crate::published_set::CURSOR_PENDING_KEY
     {
@@ -543,9 +546,15 @@ fn import_payment_xpub<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) 
     }
 }
 
+/// The retired key of the issued-address list (`published_set` module
+/// docs): refused on import.
+const RETIRED_ISSUED_KEY: &[u8] = b"harvest:bitcoin:issued:v1";
+
 /// A predecessor's published scripts, merged into this delegate's: every
-/// digest it held that this one does not is added (in its order, as the
-/// newest), which also starts every scan again over them.
+/// digest it held that this one does not is added, as sent before any of
+/// this delegate's own (so eviction takes them first), which also starts
+/// every scan again over them. A held list that does not read is never
+/// written over.
 fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport {
     use crate::published_set::{DigestList, PUBLISHED_KEY};
     let Some(incoming) = DigestList::decode(value.to_vec()) else {
@@ -553,8 +562,12 @@ fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport
             "the predecessor's published scripts did not decode".into(),
         );
     };
-    let mut held = DigestList::load(store, PUBLISHED_KEY, b"");
-    if held.insert(&incoming.digests()) == 0 {
+    let Ok(mut held) = DigestList::load(store, PUBLISHED_KEY) else {
+        return SecretImport::Retryable(
+            "this delegate's own published scripts did not decode".into(),
+        );
+    };
+    if held.insert_as_oldest(&incoming.digests()) == 0 {
         return SecretImport::AlreadyAuthoritative;
     }
     written(crate::published_set::save_published(store, &held))
@@ -1030,19 +1043,21 @@ mod tests {
     }
 
     /// #206: a predecessor's published scripts are merged into this
-    /// delegate's, neither side's lost, and a scan over them starts again.
-    /// Mutated red by importing them as a standalone secret.
+    /// delegate's, neither side's lost, and a scan over them starts again;
+    /// they count as sent before this delegate's own, so eviction takes them
+    /// first. Mutated red by importing them as a standalone secret, and as
+    /// the newest.
     #[test]
     fn published_scripts_are_merged() {
         use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
-        let mut theirs = DigestList::empty(b"");
+        let mut theirs = DigestList::empty();
         theirs.insert(&[digest(b"a"), digest(b"b")]);
         let mut theirs_store = MemSecrets::default();
         theirs.save(&mut theirs_store, PUBLISHED_KEY);
         let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
 
         let mut store = MemSecrets::default();
-        let mut ours = DigestList::empty(b"");
+        let mut ours = DigestList::empty();
         ours.insert(&[digest(b"b"), digest(b"c")]);
         crate::published_set::save_published(&mut store, &ours);
         let before = ours.generation();
@@ -1050,7 +1065,7 @@ mod tests {
             import_secret(&mut store, PUBLISHED_KEY, &value),
             SecretImport::Written
         );
-        let merged = DigestList::load(&store, PUBLISHED_KEY, b"");
+        let merged = DigestList::load(&store, PUBLISHED_KEY).unwrap();
         assert_eq!(merged.len(), 3);
         for s in [b"a", b"b", b"c"] {
             assert!(merged.contains(&digest(s)));
@@ -1058,12 +1073,15 @@ mod tests {
         assert!(merged.generation() > before, "scans start again");
         assert_eq!(
             crate::published_set::published_meta(&store),
-            (merged.generation(), 3)
+            Some((merged.generation(), 3))
         );
         assert_eq!(
             import_secret(&mut store, PUBLISHED_KEY, &value),
             SecretImport::AlreadyAuthoritative
         );
+        // The import counts as sent before this delegate's own, so eviction
+        // takes it first. (Mutated red by importing as the newest.)
+        assert_eq!(merged.by_age()[0], digest(b"a"));
     }
 
     /// Every key shape this delegate writes has a family decided on purpose.
@@ -1097,7 +1115,6 @@ mod tests {
             Family::Refused,    // instant-checkout fed scripts
             Family::PublishedScripts,
             Family::Refused, // published scripts' count
-            Family::Refused, // addresses this key handed out
             Family::Refused, // the active key's scan cursor
             Family::Refused, // the pending key's scan cursor
         ];

@@ -515,7 +515,9 @@ pub(crate) fn active_scan_known_complete<S: SecretStore>(store: &S) -> bool {
     let Some(status) = load_payment_xpub(store) else {
         return false;
     };
-    let (generation, held) = crate::published_set::published_meta(store);
+    let Some((generation, held)) = crate::published_set::published_meta(store) else {
+        return false;
+    };
     let cursor = cursor_for(store, Slot::Active, &status, generation);
     is_complete(status.next_index, cursor, held == 0)
 }
@@ -552,7 +554,8 @@ pub(crate) fn advance_scan<S: SecretStore>(
     budget: u32,
 ) -> Result<Progress, ScanError> {
     use crate::published_set::{digest, Cursor, DigestList, PUBLISHED_KEY};
-    let published = DigestList::load(store, PUBLISHED_KEY, b"");
+    let published = DigestList::load(store, PUBLISHED_KEY)
+        .map_err(|_| ScanError::NotSaved(UNREADABLE_PUBLISHED.to_string()))?;
     let generation = published.generation();
     let start = status.next_index;
     let mut cursor = cursor_for(store, slot, status, generation);
@@ -568,7 +571,9 @@ pub(crate) fn advance_scan<S: SecretStore>(
             let d = digest(&chain.script_at(cursor).map_err(ScanError::Key)?);
             derived += 1;
             if published.contains(&d) {
-                counter = cursor + 1;
+                // Never lower: the cursor is at or above the counter
+                // (`cursor_for`), and this holds whatever changes there.
+                counter = counter.max(cursor + 1);
             }
             cursor += 1;
         }
@@ -601,32 +606,36 @@ pub(crate) fn advance_scan<S: SecretStore>(
     })
 }
 
-/// Add published scripts to those held ([`crate::published_set`]): every
-/// one not already held and not an address the active key handed out
-/// itself. Any added sends every key's scan back to its counter. `Err` when
-/// the host refused the write: the scripts are not held, and the caller must
-/// not go on as though they were.
+/// What a refusal says when the held published scripts do not read
+/// (`published_set::Unreadable`): nothing is handed out, and nothing is
+/// written over them.
+pub(crate) const UNREADABLE_PUBLISHED: &str =
+    "the published orders' addresses this delegate holds could not be read, so no address \
+     can be checked against them; nothing was handed out";
+
+/// Add published scripts to those held ([`crate::published_set`]), every
+/// one, this device's own orders included, and mark each as sent now. Any
+/// added sends every key's scan back to its counter. `Err` when the held
+/// list does not read (it is never written over) or the host refused the
+/// write: the scripts are not held, and the caller must not go on as though
+/// they were.
 pub(crate) fn add_published<S: SecretStore>(
     store: &mut S,
     scripts: &[Vec<u8>],
 ) -> Result<usize, String> {
-    use crate::published_set::{digest, DigestList, ISSUED_KEY, PUBLISHED_KEY};
-    if scripts.is_empty() {
-        return Ok(0);
-    }
-    let active_tag = load_payment_xpub(store).map(|s| s.xpub.into_bytes());
-    let issued = active_tag
-        .as_deref()
-        .map(|tag| DigestList::load(store, ISSUED_KEY, tag));
+    use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
     let fresh: Vec<_> = scripts
         .iter()
         .filter(|s| !s.is_empty())
         .map(|s| digest(s))
-        .filter(|d| !issued.as_ref().is_some_and(|issued| issued.contains(d)))
         .collect();
-    let mut published = DigestList::load(store, PUBLISHED_KEY, b"");
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+    let mut published =
+        DigestList::load(store, PUBLISHED_KEY).map_err(|_| UNREADABLE_PUBLISHED.to_string())?;
     let added = published.insert(&fresh);
-    if added > 0 && !crate::published_set::save_published(store, &published) {
+    if !crate::published_set::save_published(store, &published) {
         return Err(
             "the node refused to store the published orders' addresses, so none can be \
              checked against them yet"
@@ -634,20 +643,6 @@ pub(crate) fn add_published<S: SecretStore>(
         );
     }
     Ok(added)
-}
-
-/// Record that the active key handed out `script` ([`ISSUED_KEY`]), so the
-/// order it ends up on is not held as a published script when a tab sends
-/// it back. Best effort: a write refused only lets that script into the held
-/// set, where it never matches.
-///
-/// [`ISSUED_KEY`]: crate::published_set::ISSUED_KEY
-fn note_issued<S: SecretStore>(store: &mut S, xpub: &str, script: &[u8]) {
-    use crate::published_set::{digest, DigestList, ISSUED_KEY};
-    let mut issued = DigestList::load(store, ISSUED_KEY, xpub.as_bytes());
-    if issued.insert(&[digest(script)]) > 0 {
-        issued.save(store, ISSUED_KEY);
-    }
 }
 
 /// Why [`issue_next_address`] handed nothing out.
@@ -691,8 +686,7 @@ impl NotIssued {
 /// the scan is complete: until every script the delegate holds has been
 /// looked for up to [`PUBLISHED_INDEX_GAP`] past the counter. Then it
 /// derives the address at the counter, lets `accept` turn it down (nothing
-/// spent), saves the counter past it BEFORE returning it, and records it as
-/// issued.
+/// spent), and saves the counter past it BEFORE returning it.
 pub(crate) fn issue_next_address<S: SecretStore>(
     store: &mut S,
     budget: u32,
@@ -716,7 +710,6 @@ pub(crate) fn issue_next_address<S: SecretStore>(
     // may show it to a buyer while the delegate still believes the index is
     // unused.
     save_payment_xpub(store, &next).map_err(NotIssued::NotSaved)?;
-    note_issued(store, &next.xpub, &derived.script_pubkey);
     Ok(derived)
 }
 
@@ -1410,21 +1403,37 @@ mod tests {
         matched
     }
 
-    /// #206, #183: the delegate-owned catch-up, run to completion, reaches
-    /// exactly the counter the unbounded reference scan reaches over the same
-    /// scripts, over random published sets: contiguous runs, gaps up to and
-    /// past `PUBLISHED_INDEX_GAP`, scripts below the counter, foreign
-    /// scripts, and runs longer than one call; the scripts arriving in random
-    /// chunks in random order, with scans of random budgets between them (so
-    /// additions arrive after part of the scan is done). And the first
-    /// address it hands out is that counter. So no arrival order or budget
-    /// lets an address below the true floor out. Mutated red by not sending a
-    /// scan back to its counter when a script is added, and by resuming past
-    /// the cursor.
+    /// `key` with its chain code replaced: another valid key of the same
+    /// network, deriving entirely different addresses.
+    fn variant_of(key: &str, byte: u8) -> String {
+        let mut bytes = bs58::decode(key).with_check(None).into_vec().unwrap();
+        bytes[13..45].copy_from_slice(&[byte; 32]);
+        bs58::encode(bytes).with_check().into_string()
+    }
+
+    /// #206, #183: the delegate-owned catch-up, run to completion, hands out
+    /// as its first address exactly the counter the unbounded reference scan
+    /// reaches over the same scripts from the last point the counter was set
+    /// other than by the scan. Over random published sets (contiguous runs,
+    /// gaps up to and past `PUBLISHED_INDEX_GAP`, scripts below the counter,
+    /// foreign scripts, a second key's real scripts, runs longer than one
+    /// call), arriving in random chunks in random order, with scans of
+    /// random budgets between them, addresses handed out between chunks
+    /// (each never one already held, and published afterwards), the counter
+    /// now and then set lower, and the key switched to another and back.
+    /// So no arrival order, budget or switch lets an address below the true
+    /// floor out. Mutated red by not sending a scan back to its counter when
+    /// a script is added, by resuming past the cursor, and by reading a
+    /// cursor saved for a higher counter.
     #[test]
     fn the_catch_up_reaches_the_unbounded_floor_whatever_the_arrival() {
         let key = signet_vpub();
+        let other = variant_of(&key, 0x5a);
         let chain = AccountXpub::parse(&key).unwrap().external_chain().unwrap();
+        let other_chain = AccountXpub::parse(&other)
+            .unwrap()
+            .external_chain()
+            .unwrap();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move |n: u64| {
             state ^= state << 13;
@@ -1432,14 +1441,15 @@ mod tests {
             state ^= state << 17;
             state % n.max(1)
         };
-        for round in 0..24 {
+        for round in 0..32 {
             let start = next(50) as u32;
             let mut indices = Vec::new();
             let mut at = start;
             let count = 1 + next(if round % 3 == 0 { 900 } else { 60 });
             for _ in 0..count {
-                // Mostly close, sometimes a gap of up to the limit, now and
-                // then past it (which ends the scan there).
+                // Mostly close; sometimes a gap of up to the limit; now and
+                // then one of the limit or more (exactly the limit is still
+                // reached, more is past it and ends the scan there).
                 at += match next(40) {
                     0 => PUBLISHED_INDEX_GAP + next(20) as u32,
                     1..=3 => next(u64::from(PUBLISHED_INDEX_GAP)) as u32,
@@ -1455,46 +1465,90 @@ mod tests {
                 .map(|&i| chain.script_at(i).unwrap())
                 .collect();
             published.push(vec![0x00, 0x14, round as u8]);
-            let mut reference = PaymentXpubStatus {
-                xpub: key.clone(),
-                network: BitcoinNetwork::Signet,
-                next_index: start,
-            };
-            floor_unbounded(&mut reference, &published);
-
-            // Shuffled, then cut into chunks.
+            for i in 0..next(30) as u32 {
+                published.push(other_chain.script_at(i * 3).unwrap());
+            }
             for i in (1..published.len()).rev() {
                 let j = next(i as u64 + 1) as usize;
                 published.swap(i, j);
             }
+
             let mut store = crate::secrets::MemSecrets::default();
             let mut status = PaymentXpubStatus {
+                xpub: key.clone(),
+                network: BitcoinNetwork::Signet,
                 next_index: start,
-                ..reference.clone()
             };
             save_payment_xpub(&mut store, &status).unwrap();
+            // Where the counter was last set other than by the scan.
+            let mut set_at = start;
+            let mut held: Vec<Vec<u8>> = Vec::new();
+            let mut handed_out: Vec<Vec<u8>> = Vec::new();
             let mut rest = published.as_slice();
             while !rest.is_empty() {
                 let take = (1 + next(rest.len() as u64 / 2 + 1) as usize).min(rest.len());
                 add_published(&mut store, &rest[..take]).unwrap();
+                held.extend_from_slice(&rest[..take]);
                 rest = &rest[take..];
-                if next(2) == 0 {
-                    advance_scan(&mut store, Slot::Active, &mut status, 1 + next(400) as u32)
-                        .unwrap();
+                match next(4) {
+                    0 => {
+                        advance_scan(&mut store, Slot::Active, &mut status, 1 + next(400) as u32)
+                            .unwrap();
+                    }
+                    1 => {
+                        if let Ok(d) =
+                            issue_next_address(&mut store, 1 + next(400) as u32, |_| true)
+                        {
+                            assert!(!held.contains(&d.script_pubkey), "round {round}");
+                            handed_out.push(d.script_pubkey);
+                            set_at = d.index + 1;
+                        }
+                    }
+                    2 if round % 4 == 1 => {
+                        // Set lower, as a counter restored from elsewhere.
+                        let mut lowered = load_payment_xpub(&store).unwrap();
+                        lowered.next_index = lowered.next_index.saturating_sub(1 + next(40) as u32);
+                        save_payment_xpub(&mut store, &lowered).unwrap();
+                        set_at = lowered.next_index;
+                    }
+                    _ => {}
                 }
             }
+            // What was handed out is published too, by now.
+            add_published(&mut store, &handed_out).unwrap();
+            if round % 5 == 2 {
+                // Switched to another key and back: the key starts again at 0.
+                for xpub in [&other, &key] {
+                    let mut tries = 0;
+                    while set_payment_key(&mut store, xpub, BitcoinNetwork::Signet, &[], tries > 0)
+                        .is_err()
+                    {
+                        tries += 1;
+                        assert!(tries < 200, "round {round}: no end");
+                    }
+                }
+                set_at = 0;
+            }
+            let mut all = published.clone();
+            all.extend(handed_out.iter().cloned());
+            let mut reference = PaymentXpubStatus {
+                xpub: key.clone(),
+                network: BitcoinNetwork::Signet,
+                next_index: set_at,
+            };
+            floor_unbounded(&mut reference, &all);
             let mut calls = 0;
-            while !advance_scan(&mut store, Slot::Active, &mut status, FLOOR_SCAN_BUDGET)
-                .unwrap()
-                .complete
-            {
+            let first = loop {
+                match issue_next_address(&mut store, FLOOR_SCAN_BUDGET, |_| true) {
+                    Ok(d) => break d,
+                    Err(NotIssued::CatchingUp(_)) => {}
+                    Err(e) => panic!("round {round}: {e:?}"),
+                }
                 calls += 1;
                 assert!(calls < 100, "round {round}: no end");
-            }
-            assert_eq!(status.next_index, reference.next_index, "round {round}");
-            let first =
-                issue_next_address(&mut store, FLOOR_SCAN_BUDGET, |_| true).expect("caught up");
+            };
             assert_eq!(first.index, reference.next_index, "round {round}");
+            assert!(!all.contains(&first.script_pubkey), "round {round}");
         }
     }
 
@@ -2355,26 +2409,123 @@ mod origin_gating_tests {
         ));
     }
 
-    /// #206: an address the active key handed out, sent back by a tab once
-    /// its order is published, is not held (it is below the counter by
-    /// construction); a script from elsewhere is. Mutated red by not
-    /// recording what was handed out.
+    /// #206 review: K2's orders are held; K3, with none, completes and is
+    /// made active; K2 entered again at the same generation must not read
+    /// K3's cursor (which says "nothing held from 0 to 100") and hand out
+    /// K2's index 0. Mutated red by not checking the cursor's key.
     #[test]
-    fn the_keys_own_addresses_are_not_held_when_sent_back() {
-        use crate::published_set::{DigestList, PUBLISHED_KEY};
+    fn a_cursor_is_never_read_for_another_key() {
+        let k2 = attackers_key();
+        let k3 = another_key(0xcd);
         let mut store = MemSecrets::default();
         seller_sets(&mut store, SELLERS_KEY);
-        let own = derive_with(&mut store, 1, &[]).expect("an address");
-        let elsewhere = scripts_of(SELLERS_KEY, 50..51);
-        add_with(
-            &mut store,
-            2,
-            &[own.script_pubkey.clone(), elsewhere[0].clone()],
-        )
-        .unwrap();
-        let held = DigestList::load(&store, PUBLISHED_KEY, b"");
-        assert_eq!(held.len(), 1);
-        assert!(held.contains(&crate::published_set::digest(&elsewhere[0])));
+        add_with(&mut store, 1, &scripts_of(&k2, 0..5)).unwrap();
+        assert!(
+            set_with(&mut store, &k3, 2, &[]).0.is_ok(),
+            "K3 has no orders"
+        );
+        let (k2_set, _) = set_with(&mut store, &k2, 3, &[]);
+        assert_eq!(k2_set.expect("set").next_index, 5);
+    }
+
+    /// #206 review: this device's own orders are held like any other, so
+    /// a key switched away from and back to resumes past them, whichever
+    /// tab sends them and when. (A filter that dropped them as "issued by
+    /// the active key" lost them for good: retired.)
+    #[test]
+    fn the_keys_own_orders_are_held_after_a_switch_back() {
+        let k2 = attackers_key();
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        let own: Vec<Vec<u8>> = (0..3)
+            .map(|i| derive_with(&mut store, i, &[]).unwrap().script_pubkey)
+            .collect();
+        add_with(&mut store, 10, &own).unwrap();
+        assert!(set_with(&mut store, &k2, 11, &[]).0.is_ok());
+        let (back, _) = set_with(&mut store, SELLERS_KEY, 13, &[]);
+        assert_eq!(back.expect("set").next_index, 3);
+    }
+
+    /// #206 review: after a complete scan, addresses handed out walk the
+    /// counter past the cursor; a held script below the counter there (this
+    /// device's own, published later) never lowers it, and the next address
+    /// is the next index. Mutated red by letting a match set the counter
+    /// below where it was.
+    #[test]
+    fn handing_out_past_the_cursor_never_lowers_the_counter() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        add_with(&mut store, 1, &scripts_of(SELLERS_KEY, 0..1)).unwrap();
+        let first = derive_with(&mut store, 2, &[]).unwrap();
+        assert_eq!(first.index, 1);
+        let mut last = first.index;
+        for id in 0..PUBLISHED_INDEX_GAP + 5 {
+            last = derive_with(&mut store, 10 + u64::from(id), &[])
+                .unwrap()
+                .index;
+        }
+        // Published now: an index between the old cursor and the counter.
+        add_with(&mut store, 3, &scripts_of(SELLERS_KEY, 103..104)).unwrap();
+        let next = derive_with(&mut store, 4, &[]).unwrap();
+        assert_eq!(next.index, last + 1);
+    }
+
+    /// #206 review: a held list that does not read is never taken for an
+    /// empty one: no address goes out, nothing is written over it, and the
+    /// key is not made active over it. Mutated red by loading it as empty.
+    #[test]
+    fn an_unreadable_held_list_hands_nothing_out() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        store.set_secret(crate::published_set::PUBLISHED_KEY, b"\x07garbage");
+        let e = derive_with(&mut store, 1, &[]).unwrap_err();
+        assert!(e.contains("could not be read"), "{e}");
+        assert!(add_with(&mut store, 2, &scripts_of(SELLERS_KEY, 0..2)).is_err());
+        assert_eq!(
+            store
+                .get_secret(crate::published_set::PUBLISHED_KEY)
+                .as_deref(),
+            Some(&b"\x07garbage"[..]),
+            "not written over"
+        );
+        assert!(set_with(&mut store, &attackers_key(), 3, &[]).0.is_err());
+        assert!(same_account(
+            &load_payment_xpub(&store).unwrap().xpub,
+            SELLERS_KEY
+        ));
+        assert_eq!(load_payment_xpub(&store).unwrap().next_index, 0);
+    }
+
+    /// #206 review: the held list's count is written, checked, before the
+    /// list: refused, the list is not written either and the addition fails,
+    /// so a count can never name an older generation than the list (which
+    /// would let the store's status call a scan complete that is not).
+    /// Mutated red by not checking the count's write.
+    #[test]
+    fn a_refused_count_write_adds_nothing() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        add_with(&mut store, 1, &scripts_of(SELLERS_KEY, 0..2)).unwrap();
+        let before = store.get_secret(crate::published_set::PUBLISHED_KEY);
+        store.refused_prefix = Some(crate::published_set::PUBLISHED_META_KEY.to_vec());
+        assert!(add_with(&mut store, 2, &scripts_of(SELLERS_KEY, 5..7)).is_err());
+        assert_eq!(
+            store.get_secret(crate::published_set::PUBLISHED_KEY),
+            before
+        );
+    }
+
+    /// #206 review: a held-list write the node refuses: an address request
+    /// carrying scripts hands nothing out.
+    #[test]
+    fn a_refused_held_list_write_hands_nothing_out() {
+        let mut store = MemSecrets::refusing_writes_under(b"harvest:bitcoin:published".to_vec());
+        store.refused_prefix = None;
+        seller_sets(&mut store, SELLERS_KEY);
+        store.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
+        let e = derive_with(&mut store, 1, &scripts_of(SELLERS_KEY, 0..3)).unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        assert_eq!(load_payment_xpub(&store).unwrap().next_index, 0);
     }
 
     /// #206: a scheduled wake-up moves the active key's scan on by its
@@ -2398,84 +2549,212 @@ mod origin_gating_tests {
         );
     }
 
-    /// #206: only the choke point hands out an index. In the delegate's
-    /// non-test code, `apply_derive_order_address` is called only from
-    /// `issue_next_address`, and the counter is moved only by the scan
-    /// (`advance_scan`), the derivation itself, a migration's merge, and
-    /// `decide` mirroring the index the choke point just handed out. Fails
-    /// for any new call site. Mutated red by adding one.
-    #[test]
-    fn only_the_choke_point_hands_out_an_index() {
-        fn non_test(source: &str) -> String {
-            let mut out = String::new();
-            let mut lines = source.lines();
-            while let Some(line) = lines.next() {
-                if line.trim_start() == "#[cfg(test)]" {
-                    let mut depth = 0i32;
-                    let mut opened = false;
-                    for item in lines.by_ref() {
-                        depth += item.matches('{').count() as i32;
-                        depth -= item.matches('}').count() as i32;
-                        opened |= item.contains('{');
-                        if (opened && depth <= 0) || (!opened && item.trim_end().ends_with(';')) {
-                            break;
+    /// The delegate's source with every `#[cfg(test)]` item removed. Braces
+    /// inside string and character literals and comments are not counted.
+    fn non_test(source: &str) -> String {
+        /// The change in brace depth over `line`, ignoring literals and
+        /// comments.
+        fn depth_change(line: &str) -> i32 {
+            let mut depth = 0;
+            let mut chars = line.chars().peekable();
+            let mut in_string = false;
+            while let Some(c) = chars.next() {
+                if in_string {
+                    match c {
+                        '\\' => {
+                            chars.next();
                         }
+                        '"' => in_string = false,
+                        _ => {}
                     }
                     continue;
                 }
-                out.push_str(line);
-                out.push('\n');
+                match c {
+                    '"' => in_string = true,
+                    '/' if chars.peek() == Some(&'/') => break,
+                    '\'' => {
+                        // A character literal ('{', '\''), or a lifetime.
+                        let rest: String = chars.clone().take(3).collect();
+                        if rest.starts_with('\\') {
+                            chars.nth(2);
+                        } else if rest.chars().nth(1) == Some('\'') {
+                            chars.nth(1);
+                        }
+                    }
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
             }
-            out
+            depth
         }
-        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
-            let at = source
-                .find(signature)
-                .unwrap_or_else(|| panic!("{signature}"));
-            let end = source[at..].find("\n}\n").expect("end");
-            &source[at..at + end]
-        }
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut derive_calls = Vec::new();
-        let mut counter_writes = Vec::new();
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|e| e != "rs") {
+        let mut out = String::new();
+        let mut lines = source.lines();
+        while let Some(line) = lines.next() {
+            if line.trim_start() == "#[cfg(test)]" {
+                let mut depth = 0;
+                let mut opened = false;
+                for item in lines.by_ref() {
+                    let change = depth_change(item);
+                    opened |= change != 0 || item.contains('{');
+                    depth += change;
+                    if (opened && depth <= 0) || (!opened && item.trim_end().ends_with(';')) {
+                        break;
+                    }
+                }
+                out.push('\n');
                 continue;
             }
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Every use of `pattern` in `code`, as the item it is in: the nearest
+    /// `fn` or `struct` above it.
+    fn uses(code: &str, pattern: &str) -> Vec<String> {
+        let lines: Vec<&str> = code.lines().collect();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            for _ in line.matches(pattern) {
+                let item = lines[..=i]
+                    .iter()
+                    .rev()
+                    .find_map(|l| {
+                        let t = l.trim_start();
+                        let t = t
+                            .strip_prefix("pub(crate) ")
+                            .or_else(|| t.strip_prefix("pub "))
+                            .unwrap_or(t);
+                        let t = t
+                            .strip_prefix("fn ")
+                            .or_else(|| t.strip_prefix("struct "))?;
+                        Some(
+                            t.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .next()
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .unwrap_or_default();
+                found.push(item);
+            }
+        }
+        found
+    }
+
+    /// Every use of `pattern` in the delegate's non-test source, walked
+    /// recursively, as `file::item`, sorted.
+    fn uses_in_delegate(pattern: &str) -> Vec<String> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        let mut found = Vec::new();
+        for path in files {
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             let code = non_test(&std::fs::read_to_string(&path).unwrap());
-            derive_calls.extend(
-                code.matches("apply_derive_order_address(")
-                    .map(|_| name.clone()),
-            );
-            counter_writes.extend(
-                code.matches(".next_index = ")
-                    .chain(code.matches("next_index += "))
-                    .map(|_| name.clone()),
+            found.extend(
+                uses(&code, pattern)
+                    .into_iter()
+                    .map(|item| format!("{name}::{item}")),
             );
         }
-        derive_calls.sort();
-        counter_writes.sort();
-        // The definition and the one call.
-        assert_eq!(
-            derive_calls,
-            ["bitcoin.rs", "bitcoin.rs"],
-            "{derive_calls:?}"
-        );
-        let bitcoin = non_test(include_str!("bitcoin.rs"));
-        assert!(body(&bitcoin, "pub(crate) fn issue_next_address")
-            .contains("apply_derive_order_address(&mut next)"));
-        assert_eq!(
-            counter_writes,
-            ["auto_invoice.rs", "bitcoin.rs", "bitcoin.rs", "import.rs"],
-            "{counter_writes:?}"
-        );
-        assert!(
-            body(&bitcoin, "pub(crate) fn advance_scan").contains("raised.next_index = counter")
-        );
-        assert!(body(&bitcoin, "fn apply_derive_order_address")
-            .contains("status.next_index = index + 1"));
+        found.sort();
+        found
+    }
+
+    /// #206: only the choke point hands out an index. In the delegate's
+    /// non-test source (every file, walked recursively, `#[cfg(test)]`
+    /// items removed), each way of deriving an address, writing the
+    /// counter, or building a counter is used only where it is allowed:
+    /// `apply_derive_order_address` only in `issue_next_address`; an
+    /// address derived (`.order_address(`) only there and where nothing is
+    /// handed out (validating a key, listing the next addresses); the
+    /// counter saved only by the choke point, the scan and a key's set; the
+    /// counter's secret written only by its saver; a counter built or moved
+    /// only by those, a migration's merge, and `decide`'s mirror of what the
+    /// choke point just handed out. Fails for any new use. Mutated red by
+    /// the review's bypass (an `order_address` call, a counter built by
+    /// literal, and `save_payment_xpub` in a new function).
+    #[test]
+    fn only_the_choke_point_hands_out_an_index() {
+        let pinned: &[(&str, &[&str])] = &[
+            (
+                "apply_derive_order_address(",
+                &[
+                    "bitcoin.rs::apply_derive_order_address",
+                    "bitcoin.rs::issue_next_address",
+                ],
+            ),
+            (
+                ".order_address(",
+                &[
+                    "bitcoin.rs::apply_derive_order_address",
+                    "bitcoin.rs::apply_set_payment_xpub",
+                    "bitcoin.rs::upcoming_addresses",
+                ],
+            ),
+            (
+                "save_payment_xpub(",
+                &[
+                    "bitcoin.rs::issue_next_address",
+                    "bitcoin.rs::save_status",
+                    "bitcoin.rs::set_payment_key",
+                ],
+            ),
+            (
+                ".save_status(",
+                &["bitcoin.rs::advance_scan", "bitcoin.rs::set_payment_key"],
+            ),
+            (
+                "set_secret(BITCOIN_PAYMENT_XPUB_KEY",
+                &["bitcoin.rs::save_payment_xpub"],
+            ),
+            (
+                ".next_index = ",
+                &[
+                    "auto_invoice.rs::decide_one",
+                    "bitcoin.rs::advance_scan",
+                    "bitcoin.rs::apply_derive_order_address",
+                    "import.rs::import_payment_xpub",
+                ],
+            ),
+            ("next_index += ", &[]),
+            (
+                "next_index:",
+                &[
+                    "watch_delegation.rs::Vouching",
+                    "watch_delegation.rs::canary_floor",
+                    "watch_delegation.rs::of",
+                ],
+            ),
+            (
+                "PaymentXpubStatus {",
+                &["bitcoin.rs::apply_set_payment_xpub"],
+            ),
+        ];
+        for (pattern, allowed) in pinned {
+            assert_eq!(
+                uses_in_delegate(pattern),
+                allowed.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "{pattern}"
+            );
+        }
         let auto = non_test(include_str!("auto_invoice.rs"));
         let mirror = auto
             .find("xpub.next_index = derived.index + 1")
@@ -2487,6 +2766,16 @@ mod origin_gating_tests {
             issue < mirror,
             "the mirror follows the choke point's answer"
         );
+    }
+
+    /// The scraper ignores braces in literals and comments: a test item
+    /// holding a `"{"` does not hide the code after it.
+    #[test]
+    fn the_scraper_skips_test_items_whole() {
+        let source = "fn a() {}\n#[cfg(test)]\nfn t() {\n    let s = \"{\"; // }\n    let c = '{';\n}\nfn b() { order_address(1) }\n";
+        let code = non_test(source);
+        assert!(!code.contains("fn t"));
+        assert_eq!(uses(&code, "order_address("), ["b"]);
     }
 
     /// #206: a pending slot that a migration does not carry only restarts

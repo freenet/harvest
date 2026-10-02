@@ -1793,17 +1793,20 @@ fn feed_published<S: SecretStore>(
     }
     let digest = *hasher.finalize().as_bytes();
     let key = fed_key(store_contract_id);
-    let (generation, _) = crate::published_set::published_meta(secrets);
-    let mut fed = digest.to_vec();
-    fed.extend_from_slice(&generation.to_le_bytes());
-    if secrets.get_secret(&key).as_deref() == Some(fed.as_slice()) {
+    let marker = |secrets: &S| {
+        crate::published_set::published_meta(secrets).map(|(generation, _)| {
+            let mut fed = digest.to_vec();
+            fed.extend_from_slice(&generation.to_le_bytes());
+            fed
+        })
+    };
+    if marker(secrets).is_some_and(|fed| secrets.get_secret(&key).as_deref() == Some(&fed[..])) {
         return Ok(());
     }
     crate::bitcoin::add_published(secrets, published)?;
-    let (generation, _) = crate::published_set::published_meta(secrets);
-    let mut fed = digest.to_vec();
-    fed.extend_from_slice(&generation.to_le_bytes());
-    secrets.set_secret(&key, &fed);
+    if let Some(fed) = marker(secrets) {
+        secrets.set_secret(&key, &fed);
+    }
     Ok(())
 }
 
@@ -6612,6 +6615,40 @@ mod tests {
         );
     }
 
+    /// #206 review: a held published list the node will not write, or one
+    /// that does not read, refuses the batch `CounterNotSaved` and invoices
+    /// nothing; the status says so. Mutated red by going on when the
+    /// scripts are not held.
+    #[test]
+    fn scripts_that_cannot_be_held_refuse_the_batch() {
+        for unreadable in [false, true] {
+            let mut f = fixture();
+            unpaid_orders_on(&mut f, 0..3, NOW - 1_000);
+            if unreadable {
+                f.secrets
+                    .set_secret(crate::published_set::PUBLISHED_KEY, b"\x07garbage");
+            } else {
+                f.secrets.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
+            }
+            let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+            let decided = run(&mut f, std::slice::from_ref(&entry));
+            assert!(decided.orders.is_empty(), "unreadable: {unreadable}");
+            assert!(
+                decided
+                    .refused
+                    .iter()
+                    .all(|(_, why)| *why == Refusal::CounterNotSaved),
+                "{:?}",
+                decided.refused
+            );
+            assert_eq!(counter(&f), 0);
+            assert_eq!(
+                open_now(&f, NOW).0,
+                Some(Refusal::CounterNotSaved.explain())
+            );
+        }
+    }
+
     /// #206 (D3): a mark `decide` left is ignored once the catch-up it was
     /// about is over by another path: the active key's scan completed by a
     /// tab's request (or another store's `decide`, or a wake-up), or the
@@ -6832,10 +6869,10 @@ mod tests {
         unpaid_orders_on(&mut f, 0..3, NOW - 1_000);
         let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
         run(&mut f, std::slice::from_ref(&entry));
-        let held = |f: &Fixture| DigestList::load(&f.secrets, PUBLISHED_KEY, b"");
+        let held = |f: &Fixture| DigestList::load(&f.secrets, PUBLISHED_KEY).unwrap();
         assert!(held(&f).contains(&digest(&script_at(0))));
         let writes = f.secrets.write_log.len();
-        let looked_up = f.secrets.reads_under(crate::published_set::ISSUED_KEY);
+        let looked_up = f.secrets.reads_under(PUBLISHED_KEY);
         run(&mut f, std::slice::from_ref(&entry));
         assert!(
             !f.secrets.write_log[writes..]
@@ -6844,13 +6881,13 @@ mod tests {
             "nothing new, nothing written"
         );
         assert_eq!(
-            f.secrets.reads_under(crate::published_set::ISSUED_KEY),
-            looked_up,
-            "the same scripts are not looked up again"
+            f.secrets.reads_under(PUBLISHED_KEY),
+            looked_up + 1,
+            "read once, by the scan: the same scripts are not added again"
         );
         // The held list lost them (as an eviction would), at a later
         // generation.
-        let mut emptied = DigestList::empty(b"");
+        let mut emptied = DigestList::empty();
         emptied.insert(&[digest(b"elsewhere")]);
         emptied.insert(&[digest(b"elsewhere too")]);
         crate::published_set::save_published(&mut f.secrets, &emptied);
