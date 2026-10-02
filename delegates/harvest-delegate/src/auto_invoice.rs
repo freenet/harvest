@@ -713,6 +713,19 @@ fn ledger_retry_pending<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -
     }
 }
 
+/// The ledger, for a run that will write it back: `None` when one is held
+/// that does not decode, so the run stops rather than saving an empty ledger
+/// over it, which would forget what was answered (a second invoice for a
+/// request already invoiced), the stock its sales hold, and what is settled.
+/// A store with no ledger yet starts from an empty one.
+fn load_ledger_kept<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Option<Ledger> {
+    match secrets.get_secret(&ledger_key(store_contract_id)) {
+        None => Some(Ledger::default()),
+        Some(bytes) => from_cbor(&bytes).ok(),
+    }
+}
+
+#[cfg(test)]
 fn load_ledger<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Ledger {
     load(secrets, &ledger_key(store_contract_id)).unwrap_or_default()
 }
@@ -1452,6 +1465,9 @@ pub(crate) enum Refusal {
     NoFreshTip,
     NoWatchedAddress,
     CounterNotSaved,
+    /// The store's ledger is held but does not decode: nothing is invoiced
+    /// rather than invoicing again what it records as answered.
+    LedgerUnreadable,
     // Per request: the request is marked seen, and declined where
     // `buyer_reason` has words for it; the rest stay in the seller's inbox.
     NotInstant,
@@ -1521,6 +1537,7 @@ impl Refusal {
                 | Refusal::NoFreshTip
                 | Refusal::NoWatchedAddress
                 | Refusal::CounterNotSaved
+                | Refusal::LedgerUnreadable
         )
     }
 
@@ -1541,6 +1558,9 @@ impl Refusal {
                 "every watched payment address is used; open Harvest to watch more".into()
             }
             Refusal::CounterNotSaved => "the address counter could not be saved".into(),
+            Refusal::LedgerUnreadable => {
+                "this store's instant-checkout record could not be read".into()
+            }
             Refusal::StoreCap => {
                 format!("{MAX_OPEN_PER_STORE} instant invoices are waiting for payment")
             }
@@ -1667,7 +1687,9 @@ fn on_store_change<S: SecretStore>(
     }
     note_paid_scripts(secrets, &store);
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
-    let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
+    let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
+        return Vec::new();
+    };
     if ledger.sales.is_empty() && ledger.statuses.is_empty() && ledger.gap_orders.is_empty() {
         return Vec::new();
     }
@@ -2144,7 +2166,9 @@ fn on_mailbox_ordered<S: SecretStore>(
     else {
         return Vec::new();
     };
-    let mut ledger = load_ledger(secrets, &record.arm.store_contract_id);
+    let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
+        return Vec::new();
+    };
     let mut ledger_changed = false;
     // The messages not yet looked at, each digest computed once (a sort key
     // recomputed per comparison hashed every ciphertext about log2(n) times
@@ -2284,7 +2308,9 @@ fn settle_batch_retry<S: SecretStore>(secrets: &mut S, batch: &PendingBatch, dec
         .iter()
         .any(|(_, why)| matches!(why, Refusal::NotOurStore | Refusal::StoreClosed));
     if for_good {
-        let mut ledger = load_ledger(secrets, id);
+        let Some(mut ledger) = load_ledger_kept(secrets, id) else {
+            return;
+        };
         if ledger.retry_pending {
             ledger.retry_pending = false;
             save_ledger(secrets, id, &ledger);
@@ -2310,22 +2336,23 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
             if pending.magic == REPLIES_MAGIC
                 && (!pending.retry.is_empty() || !pending.orders.is_empty())
             {
-                let mut ledger = load_ledger(secrets, &pending.store_contract_id);
-                ledger
-                    .seen
-                    .retain(|digest| !pending.retry.iter().any(|(d, _)| d == digest));
-                ledger
-                    .answered
-                    .retain(|request| !pending.retry.iter().any(|(_, r)| r == request));
-                // The sales stay: a refusal reported for an update that did
-                // land would otherwise lose the stock its order holds, and
-                // one that did not land is released after `NOT_LANDED_MS`
-                // anyway. A request made undecided here is answered at the
-                // store's next run, which the next mailbox change starts;
-                // `retry_pending` is what a run started some other way (the
-                // wake-up's `mailbox_retries`) looks at.
-                ledger.retry_pending = true;
-                save_ledger(secrets, &pending.store_contract_id, &ledger);
+                if let Some(mut ledger) = load_ledger_kept(secrets, &pending.store_contract_id) {
+                    ledger
+                        .seen
+                        .retain(|digest| !pending.retry.iter().any(|(d, _)| d == digest));
+                    ledger
+                        .answered
+                        .retain(|request| !pending.retry.iter().any(|(_, r)| r == request));
+                    // The sales stay: a refusal reported for an update that did
+                    // land would otherwise lose the stock its order holds, and
+                    // one that did not land is released after `NOT_LANDED_MS`
+                    // anyway. A request made undecided here is answered at the
+                    // store's next run, which the next mailbox change starts;
+                    // `retry_pending` is what a run started some other way (the
+                    // wake-up's `mailbox_retries`) looks at.
+                    ledger.retry_pending = true;
+                    save_ledger(secrets, &pending.store_contract_id, &ledger);
+                }
             }
         }
     }
@@ -2549,7 +2576,10 @@ pub(crate) fn decide<S: SecretStore>(
         return decided;
     }
 
-    let mut ledger = load_ledger(secrets, &arm.store_contract_id);
+    let Some(mut ledger) = load_ledger_kept(secrets, &arm.store_contract_id) else {
+        refuse_all(&mut decided, Refusal::LedgerUnreadable);
+        return decided;
+    };
     decided.statuses = settle(&mut ledger, store, Some(anchor.height), &store_sk, now_ms);
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
     // Counted once a run, not per request: up to MAX_ADDRESS_RUN
@@ -6174,6 +6204,34 @@ mod tests {
         assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1);
     }
 
+    /// A ledger held that does not decode is never written over with an
+    /// empty one: a mailbox run, a store change and a batch all stop, and
+    /// the batch is refused rather than invoiced again. Mutated red by
+    /// reading it as empty.
+    #[test]
+    fn an_unreadable_ledger_is_never_written_over() {
+        let mut f = fixture();
+        let id = f.record.arm.store_contract_id.clone();
+        f.secrets.set_secret(&ledger_key(&id), b"not a ledger");
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let state = to_cbor(&MailboxStateV1 {
+            messages: vec![entry.clone()],
+        })
+        .unwrap();
+        assert!(on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW).is_empty());
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        assert!(decided.orders.is_empty());
+        assert!(decided
+            .refused
+            .iter()
+            .all(|(_, why)| *why == Refusal::LedgerUnreadable));
+        assert!(decided.undecided);
+        assert_eq!(
+            f.secrets.get_secret(&ledger_key(&id)).as_deref(),
+            Some(b"not a ledger".as_slice())
+        );
+    }
+
     /// Each whole-store refusal, as `global_refusal` gives it: the exact
     /// reason, in the order checked. Mutated red by dropping or reordering a
     /// check.
@@ -6290,6 +6348,7 @@ mod tests {
             .replace(body("fn load_ledger<"), "")
             .replace(body("fn load_ledger_shown<"), "")
             .replace(body("fn ledger_retry_pending<"), "")
+            .replace(body("fn load_ledger_kept<"), "")
             .lines()
             // Doc comments name the key without forming one.
             .filter(|l| !l.trim_start().starts_with("//"))
