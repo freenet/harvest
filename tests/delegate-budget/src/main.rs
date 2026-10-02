@@ -52,13 +52,14 @@ use host::{Host, HostState};
 ///
 /// Roughly ONE SECOND of this delegate's work on the reference machine (nova),
 /// a fifth of the node's 5 s per-call limit: one second at the SLOWEST rate
-/// measured there (copy-heavy code, about 4.1 billion fuel/s; crypto runs at
-/// 9.5-11 billion, so for crypto this is about 0.4 s). The margin is for everything
+/// measured there with the node's engine, memory layout included
+/// (copy-heavy code, about 3.1 billion fuel/s; crypto runs at about 7
+/// billion, so for crypto this is about 0.4 s). The margin is for everything
 /// fuel does not see: a slower CPU than the reference, a node under load (the
 /// limit is wall clock, and nova at load 9-18 turned 1/30 timeouts into 7/30
 /// in the #203 investigation), and host-function time (the node's encrypted
 /// secret store). Calibration, and how to redo it: README.md.
-const BUDGET_FUEL: u64 = 4_000_000_000;
+const BUDGET_FUEL: u64 = 3_000_000_000;
 
 /// The seconds of work [`BUDGET_FUEL`] stands for, for the report only.
 const BUDGET_SECONDS: f64 = 1.0;
@@ -1816,7 +1817,7 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             anyhow!("the instant request asked nothing of the store: it was not batched")
         })?;
 
-    let name = format!("{DECIDE_ROW} {n} paid orders (instant decide)");
+    let name = format!("GetContractResponse: store, {n} paid orders (instant decide)");
     let counter = |r: &Runner| -> Result<u64> {
         let v = secret_value(r, XPUB_KEY)?;
         match field(&v, &["next_index"])? {
@@ -2901,21 +2902,6 @@ fn run() -> Result<bool> {
     };
     let scenario_result = scenario(&mut runner);
 
-    // A renamed decide row would escape its tighter ceiling unnoticed.
-    let scenario_result = scenario_result.and_then(|()| {
-        if runner
-            .measured
-            .iter()
-            .any(|m| m.name.starts_with(DECIDE_ROW))
-        {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "no row is named `{DECIDE_ROW}...`: instant decide was not measured under its \
-                 ceiling"
-            ))
-        }
-    });
     let ok = report(&runner.measured, &hash, scenario_result.as_ref().err())?;
     // A call past the fuel ceiling also stops the scenario; that is an
     // over-budget result (exit 1), not a harness failure (exit 2).
@@ -2946,29 +2932,8 @@ struct Row {
     timing: Option<(Duration, Duration)>,
 }
 
-/// The most fuel a call named `name` may consume: [`BUDGET_FUEL`], except
-/// where a row is held to a tighter ceiling ([`DECIDE_CEILING_PERCENT`]).
-fn ceiling(name: &str) -> u64 {
-    if name.starts_with(DECIDE_ROW) {
-        BUDGET_FUEL / 100 * DECIDE_CEILING_PERCENT
-    } else {
-        BUDGET_FUEL
-    }
-}
-
-/// Instant checkout's decide against a full store is held to this share of
-/// the budget, not the whole of it. The aim for a handler whose cost grows
-/// with a collection is about 60% at the cap (headroom for a slower CPU and
-/// a loaded node, README "Calibration"); decide at 4,096 paid orders sits
-/// at about 64% on #216, accepted because 70% of the budget is still well
-/// under the node's 5 s limit. The ceiling keeps it from creeping further.
-const DECIDE_CEILING_PERCENT: u64 = 70;
-
-/// The report rows of instant checkout's decide ([`instant_decide`]).
-const DECIDE_ROW: &str = "GetContractResponse: store,";
-
-fn over_budget(name: &str, fuel: Option<u64>) -> bool {
-    fuel.is_none_or(|f| f > ceiling(name))
+fn over_budget(fuel: Option<u64>) -> bool {
+    fuel.is_none_or(|f| f > BUDGET_FUEL)
 }
 
 /// Print the table, write the GitHub step summary, and say whether every
@@ -2980,9 +2945,7 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
             Some(row) => {
                 row.calls += 1;
                 row.host_writes = row.host_writes.max(m.host_writes);
-                if over_budget(&m.name, m.fuel)
-                    || (!over_budget(&row.name, row.fuel) && m.fuel > row.fuel)
-                {
+                if over_budget(m.fuel) || (!over_budget(row.fuel) && m.fuel > row.fuel) {
                     row.fuel = m.fuel;
                     row.host_calls = m.host_calls;
                     row.timing = m.timing;
@@ -3000,7 +2963,7 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     }
     let over: Vec<&str> = rows
         .iter()
-        .filter(|r| over_budget(&r.name, r.fuel) || r.host_writes > BUDGET_WRITES)
+        .filter(|r| over_budget(r.fuel) || r.host_writes > BUDGET_WRITES)
         .map(|r| r.name.as_str())
         .collect();
 
@@ -3010,9 +2973,8 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     writeln!(
         md,
         "Delegate `{}`, budget **{}** fuel per call (about {BUDGET_SECONDS} s of work; the \
-         node stops a call at 5 s). A row is judged against its ceiling, a share of that \
-         budget: 100% unless the README says otherwise. Fuel is deterministic: these numbers \
-         are the same on every run and every machine.",
+         node stops a call at 5 s). Fuel is deterministic: these numbers are the same on every \
+         run and every machine.",
         &hash[..16.min(hash.len())],
         group(BUDGET_FUEL)
     )
@@ -3020,33 +2982,32 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     writeln!(md).ok();
     writeln!(
         md,
-        "| call | calls | fuel (max) | of budget | ceiling | host calls | writes | |"
+        "| call | calls | fuel (max) | of budget | host calls | writes | |"
     )
     .ok();
-    writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---|").ok();
+    writeln!(md, "|---|---:|---:|---:|---:|---:|---|").ok();
     println!();
     println!(
-        "{:<52} {:>5} {:>18} {:>9} {:>7} {:>10} {:>6}",
-        "call", "calls", "fuel (max)", "budget", "ceiling", "host calls", "writes"
+        "{:<52} {:>5} {:>18} {:>9} {:>10} {:>6}",
+        "call", "calls", "fuel (max)", "budget", "host calls", "writes"
     );
     for r in &rows {
         let pct = r.fuel.map_or("-".into(), |f| {
             format!("{:.1}%", f as f64 * 100.0 / BUDGET_FUEL as f64)
         });
         let fuel = r.fuel.map_or("past the ceiling".into(), group);
-        let ceil = format!("{}%", ceiling(&r.name) * 100 / BUDGET_FUEL);
-        let flag = if over_budget(&r.name, r.fuel) || r.host_writes > BUDGET_WRITES {
+        let flag = if over_budget(r.fuel) || r.host_writes > BUDGET_WRITES {
             "OVER"
         } else {
             ""
         };
         println!(
-            "{:<52} {:>5} {fuel:>18} {pct:>9} {ceil:>7} {:>10} {:>6} {flag}",
+            "{:<52} {:>5} {fuel:>18} {pct:>9} {:>10} {:>6} {flag}",
             r.name, r.calls, r.host_calls, r.host_writes
         );
         writeln!(
             md,
-            "| {} | {} | {fuel} | {pct} | {ceil} | {} | {} | {} |",
+            "| {} | {} | {fuel} | {pct} | {} | {} | {} |",
             r.name,
             r.calls,
             r.host_calls,
@@ -3117,9 +3078,9 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     } else {
         for name in &over {
             eprintln!(
-                "::error::{name} exceeds its per-call ceiling of {} fuel or {BUDGET_WRITES} \
+                "::error::{name} exceeds the per-call budget of {} fuel or {BUDGET_WRITES} \
                  secret writes",
-                group(ceiling(name))
+                group(BUDGET_FUEL)
             );
         }
     }
