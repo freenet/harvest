@@ -6257,6 +6257,10 @@ mod tests {
         // The wake-up does not come back for it, and the seller is told.
         f.secrets.set_secret(&retry_key(&id), b"1");
         on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+        assert_eq!(
+            f.secrets.get_secret(&retry_key(&id)).as_deref(),
+            Some(b"0".as_slice())
+        );
         assert!(mailbox_retries(&f.secrets, NOW).is_empty());
         assert_eq!(
             status_of(&f.secrets, &f.record, NOW).paused,
