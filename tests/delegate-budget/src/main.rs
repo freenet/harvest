@@ -1375,6 +1375,119 @@ fn scenario(r: &mut Runner) -> Result<()> {
         bail!("ListBuyerConversations answered {n} conversations, expected {buyer_conversations}");
     }
 
+    // Every kept conversation's sent digests at their cap, and a seen time,
+    // seeded in the delegate's own encoding (`messaging::BuyerConversationRecord`:
+    // `sent` one CBOR byte string of 32-byte digests, `seen_ms`); then a note
+    // past the cap, a seen mark, and the recall that hands them all back.
+    let sent_cap = harvest_common::delegate::MAX_SENT_DIGESTS;
+    let conv_prefix = format!(
+        "harvest:buyer_conv:{}:",
+        bs58::encode(store_contract).into_string()
+    );
+    let conv_keys: Vec<Vec<u8>> = r
+        .host
+        .state
+        .secrets
+        .keys()
+        .filter(|k| k.starts_with(conv_prefix.as_bytes()))
+        .cloned()
+        .collect();
+    if conv_keys.len() != buyer_conversations {
+        bail!(
+            "{} conversations held, expected {buyer_conversations}",
+            conv_keys.len()
+        );
+    }
+    for key in &conv_keys {
+        let Value::Map(mut fields) =
+            ciborium::from_reader::<Value, _>(r.host.state.secrets[key].as_slice())?
+        else {
+            bail!("a kept conversation is not a CBOR map");
+        };
+        fields.retain(|(k, _)| !matches!(k, Value::Text(t) if t == "sent" || t == "seen_ms"));
+        fields.push((
+            Value::Text("sent".into()),
+            Value::Bytes((0..sent_cap * 32).map(|i| (i % 251) as u8).collect()),
+        ));
+        fields.push((
+            Value::Text("seen_ms".into()),
+            Value::Integer(1_700_000_000_000u64.into()),
+        ));
+        r.host
+            .state
+            .secrets
+            .insert(key.clone(), cbor(&Value::Map(fields)));
+    }
+    let first_conversation =
+        *PublicKey::from(&StaticSecret::from(first_secret.expect("one conversation"))).as_bytes();
+    r.app(
+        "NoteBuyerSent (a conversation at its digest cap)",
+        cbor(&HarvestDelegateRequest::NoteBuyerSent {
+            request_id: 901,
+            store_contract_id: store_contract.to_vec(),
+            buyer_public_key: first_conversation,
+            digest: [0xfe; 32],
+        }),
+        "BuyerConversationUpdated",
+    )?;
+    r.app(
+        "MarkConversationSeen",
+        cbor(&HarvestDelegateRequest::MarkConversationSeen {
+            request_id: 902,
+            store_contract_id: store_contract.to_vec(),
+            buyer_public_key: first_conversation,
+            seen_ms: 1_800_000_000_000,
+        }),
+        "BuyerConversationUpdated",
+    )?;
+    let listed = r.app(
+        &format!("ListBuyerConversations ({buyer_conversations}, every digest cap full)"),
+        cbor(&HarvestDelegateRequest::ListBuyerConversations {
+            request_id: 903,
+            store_contract_id: store_contract.to_vec(),
+        }),
+        "BuyerConversationList",
+    )?;
+    if count_array_somewhere(&listed) != buyer_conversations {
+        bail!("the recall after seeding digests lost conversations");
+    }
+
+    // The seller's half: every store it keeps digests for at the per-store
+    // cap (`messaging::seller_sent_key`, format byte then 64-byte entries),
+    // then a note past the cap and the list of one full store.
+    let seller_cap = harvest_common::delegate::MAX_SELLER_SENT_PER_STORE;
+    for s in 0..harvest_common::delegate::MAX_SELLER_SENT_STORES {
+        let mut id = [0x90u8; 32];
+        id[0] = s as u8;
+        if s == 0 {
+            id = store_contract;
+        }
+        let mut value = vec![1u8];
+        value.extend((0..seller_cap * 64).map(|i| (i % 253) as u8));
+        r.host.state.secrets.insert(
+            format!("harvest:seller_sent:{}", bs58::encode(id).into_string()).into_bytes(),
+            value,
+        );
+    }
+    r.app(
+        "NoteSellerSent (a store at its cap)",
+        cbor(&HarvestDelegateRequest::NoteSellerSent {
+            request_id: 904,
+            store_contract_id: store_contract.to_vec(),
+            conversation: first_conversation,
+            digest: [0xfd; 32],
+        }),
+        "SellerSentNoted",
+    )?;
+    r.app(
+        &format!("ListSellerSent ({seller_cap})"),
+        cbor(&HarvestDelegateRequest::ListSellerSent {
+            request_id: 905,
+            store_contract_id: store_contract.to_vec(),
+        }),
+        "SellerSent",
+    )?;
+
     let secret = first_secret.expect("at least one conversation");
     let conversation = *PublicKey::from(&StaticSecret::from(secret)).as_bytes();
     let receipt_seed = harvest_common::mailbox::buyer_receipt_seed_from_secret(&secret);

@@ -351,6 +351,8 @@ pub(crate) mod fixtures {
             created_at: 1_700_000_000,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         assert!(store.set_secret(
             &crate::messaging::buyer_conversation_key(&[3u8; 32], &conversation(c)),
@@ -594,6 +596,8 @@ mod tests {
             created_at: 1_700_000_000,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         assert!(secrets.set_secret(
             &crate::messaging::buyer_conversation_key(&[3u8; 32], &conversation(2)),

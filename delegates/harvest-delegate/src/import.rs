@@ -244,8 +244,14 @@ pub(crate) enum Family {
     /// The payment key and its derivation counter: the counter is raised to
     /// the higher of the two when both sides hold the same key.
     PaymentXpub,
-    /// A buyer's kept conversation: capped.
+    /// A buyer's kept conversation: capped; where this delegate holds the
+    /// same conversation, the two records' sent digests are merged and the
+    /// later seen time kept.
     BuyerConversation,
+    /// A seller's sent digests for one store
+    /// (`messaging::seller_sent_key`): merged, the predecessor's entries
+    /// taken as older, capped, and refused past the store cap.
+    SellerSent,
     /// A remembered store: capped.
     KnownStore,
     /// A buyer's kept purchase (harvest#53 Phase C): capped, and re-checked
@@ -309,6 +315,8 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::RsaHalf
     } else if key.starts_with(crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes()) {
         Family::BuyerConversation
+    } else if key.starts_with(crate::messaging::SELLER_SENT_PREFIX_STR.as_bytes()) {
+        Family::SellerSent
     } else if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
         Family::KnownStore
     } else if key.starts_with(crate::kept_purchases::KEPT_PURCHASE_PREFIX.as_bytes()) {
@@ -430,13 +438,19 @@ pub(crate) fn import_secret<S: SecretStore>(
             }
         }
         Family::PublishedScripts => import_published(store, value),
-        Family::BuyerConversation => copy_within_cap(
-            store,
-            key,
-            value,
-            crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
-            crate::messaging::MAX_BUYER_CONVERSATIONS,
-        ),
+        Family::BuyerConversation => {
+            match crate::messaging::merge_held_conversation(store, key, value) {
+                Some(outcome) => outcome,
+                None => copy_within_cap(
+                    store,
+                    key,
+                    value,
+                    crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
+                    crate::messaging::MAX_BUYER_CONVERSATIONS,
+                ),
+            }
+        }
+        Family::SellerSent => import_seller_sent(store, key, value),
         Family::KnownStore => crate::known_stores::import(store, key, value),
         Family::KeptPurchase => crate::kept_purchases::import(store, key, value),
         // Only reached if a caller bypasses `import`; staging needs the
@@ -544,6 +558,43 @@ fn import_payment_xpub<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) 
         Ok(bytes) => written(store.set_secret(key, &bytes)),
         Err(_) => SecretImport::Retryable("could not encode the payment key".into()),
     }
+}
+
+/// A predecessor's seller-sent digests for one store, merged into this
+/// delegate's: its entries this delegate lacks go before its own (they are
+/// older), the newest `MAX_SELLER_SENT_PER_STORE` kept. A held value that
+/// does not read is never written over.
+fn import_seller_sent<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) -> SecretImport {
+    use crate::messaging::{decode_seller_sent, encode_seller_sent, seller_sent_has_room};
+    let Some(incoming) = decode_seller_sent(value) else {
+        return SecretImport::Permanent("the predecessor's sent messages did not decode".into());
+    };
+    let held = match store.get_secret(key) {
+        None => Vec::new(),
+        Some(bytes) => match decode_seller_sent(&bytes) {
+            Some(held) => held,
+            None => {
+                return SecretImport::Retryable(
+                    "this delegate's own sent messages did not decode".into(),
+                )
+            }
+        },
+    };
+    if !seller_sent_has_room(store, key) {
+        return SecretImport::Retryable(format!(
+            "this delegate already keeps sent messages for {} stores",
+            harvest_common::delegate::MAX_SELLER_SENT_STORES
+        ));
+    }
+    let mut merged: Vec<[u8; 64]> = incoming
+        .into_iter()
+        .filter(|entry| !held.contains(entry))
+        .collect();
+    if merged.is_empty() && store.has_secret(key) {
+        return SecretImport::AlreadyAuthoritative;
+    }
+    merged.extend(held);
+    written(store.set_secret(key, &encode_seller_sent(&merged)))
 }
 
 /// The retired key of the issued-address list (`published_set` module
@@ -1175,6 +1226,7 @@ mod tests {
             Family::Refused,    // instant-checkout catching-up mark
             Family::Refused,    // instant-checkout fed scripts
             Family::Refused,    // instant-checkout store read (closed, not ours)
+            Family::SellerSent, // a seller's sent digests for one store
             Family::PublishedScripts,
             Family::Refused, // published scripts' count
             Family::Refused, // the active key's scan cursor

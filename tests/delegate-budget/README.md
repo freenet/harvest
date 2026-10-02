@@ -295,6 +295,13 @@ variable time, since dalek's constant-time `is_torsion_free` put it at
 mailbox rows do not move (one instant request: 4.5% to 4.6%). Both columns
 from one harness build, run on each WASM with `--wasm`.
 
+The same branch adds the sent-digest and read-state requests. With every
+kept conversation's digests at their cap (128 each, seeded in the
+delegate's encoding): `ListBuyerConversations (256)` 44.3% (34.3% without
+digests), `NoteBuyerSent` and `MarkConversationSeen` under 0.1%; with every
+store's seller digests at their cap (1,024 each, 64 stores):
+`NoteSellerSent` under 0.1%, `ListSellerSent (1024)` 0.6%.
+
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
 makes today is 18 (the wake-up with watch delegations: one per arm, and the

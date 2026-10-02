@@ -32,6 +32,8 @@ freenet-stdlib = { workspace = true }
 # permanently unrecoverable -- see src/migration.rs.
 freenet-migrate = { workspace = true, features = ["delegate"] }
 serde = { workspace = true }
+# The kept conversation's sent digests, as one CBOR byte string.
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 chrono = { workspace = true }
 rsa = { workspace = true }
