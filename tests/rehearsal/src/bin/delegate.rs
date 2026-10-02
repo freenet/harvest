@@ -1204,6 +1204,23 @@ async fn published_families(url: &str, wasm: &[u8]) {
         *outcomes.entry(format!("{outcome:?}")).or_default() += 1;
     }
     println!("twin imports: {outcomes:?}");
+    // Sealed as the walk seals a predecessor whose items all came back
+    // written: what releases a staged "folded into" record (`stage_folded`).
+    match node
+        .harvest(
+            &twin,
+            HarvestDelegateRequest::RecordPredecessorMarker {
+                predecessor,
+                marker: PredecessorMarkerState::Done { had_data: true },
+            },
+        )
+        .await
+    {
+        HarvestDelegateResponse::PredecessorMarkerRecorded { recorded, .. } => {
+            verdict(format!("the twin sealed the source Done (recorded={recorded})"), recorded)
+        }
+        other => panic!("RecordPredecessorMarker: {other:?}"),
+    }
     verdict(
         format!("every exported secret imported into the twin as Written ({} secrets)", exported.secrets.len()),
         outcomes.len() == 1 && outcomes.contains_key("Written"),
