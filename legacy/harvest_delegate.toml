@@ -245,3 +245,10 @@ description = "Superseded by store subkeys without the RSA record key: `GetStore
 date = "2026-09-30"
 code_hash = "d8088bf5f99b0fa8ea415a256482945d28572e643d6a85536663551bbe4a1e2c"
 delegate_key = "959b5b786380d1c7a609e00355a69e8d6e2ed05865b9fdfe918b0e381a24c3a8"
+
+[[entry]]
+version = "V29"
+description = "Superseded by bounded per-call work (harvest#206): with every cap filled, three handlers ran past a call's budget under the node's fuel metering, so on a slower or busy node they could reach its 5 s limit. A mailbox at its byte cap took 2.6x the budget to scan (it is now decoded by hand, each digest computed once, and opened in a randomly ordered, cost-bounded batch per run, the rest flagged for the next run); the heartbeat wake-up decoded every arm's whole ledger twice (1.9x; it now reads none, the retry flag lives beside the ledger as the new unexported secret `harvest:auto:retry:*`); the migration export spent 2x on per-byte serde encoding (the export and every outbound payload are now written directly, byte for byte as before). No request, response or import family changed; an imported ledger sets the retry flag. The parameters are unchanged (empty). The generation the subkeys fix shipped (harvest#203, `f8f0c3a`)."
+date = "2026-10-01"
+code_hash = "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03"
+delegate_key = "1c51568325a171b45ff957bceaf61bc05a686b8b2deab53deddb508e96925c6c"

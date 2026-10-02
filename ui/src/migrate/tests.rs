@@ -635,6 +635,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the generation harvest#179 shipped. Superseded by store subkeys
             // without the RSA record key (harvest#203).
             "d8088bf5f99b0fa8ea415a256482945d28572e643d6a85536663551bbe4a1e2c".to_string(),
+            // V29, from `git show f8f0c3a:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#203 shipped. Superseded by bounded
+            // per-call work (harvest#206).
+            "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03".to_string(),
         ],
     );
 }
