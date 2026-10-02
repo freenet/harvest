@@ -44,7 +44,9 @@ jobs:
 
       # Broken intra-doc links point readers at items that do not exist under
       # that name. --document-private-items so the private helpers' docs are
-      # checked too, and the whole workspace so no crate is left out.
+      # checked too, and the whole workspace so no crate is left out. Host
+      # target only: the UI's wasm32-only items are not documented here, as
+      # with the host clippy step above.
       - name: rustdoc (workspace, private items, warnings denied)
         run: cargo doc --locked --workspace --no-deps --document-private-items
         env:
