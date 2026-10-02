@@ -72,6 +72,15 @@ impl OrderFx {
         .with_derived_id()
     }
 
+    /// [`Self::order`] paying to `script`, created a minute ago rather than in
+    /// 2023, as a busy store's recent orders are.
+    pub fn order_on(&self, n: u32, script: Vec<u8>) -> Order {
+        let mut order = self.order(n, [0x5B; 32]);
+        order.payment_script_pubkey = script;
+        order.created_at = ts(1_790_000_000 - 60);
+        order.with_derived_id()
+    }
+
     /// The order at `Paid`, with a genuine SPV proof confirming at 100.
     pub fn paid(&self, order: Order) -> AuthorizedOrder {
         let (spv, txid, block_hash) = payment_proof(

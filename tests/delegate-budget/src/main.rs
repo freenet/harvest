@@ -630,8 +630,6 @@ fn scenario(r: &mut Runner) -> Result<()> {
         other => bail!("upcoming addresses: {}", brief(other)),
     };
 
-    published_scripts(r, &caps)?;
-
     // --- instant checkout (auto-invoice) -----------------------------------
     let bridge = SigningKey::from_bytes(&[22u8; 32]);
     let bridge_id = freenet_bitcoin_common::BridgeId(bridge.verifying_key().to_bytes());
@@ -1510,6 +1508,20 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
 
+    instant_decide(
+        r,
+        &InstantStore {
+            contract: store_contract,
+            verifying_key: store,
+            mailbox: mailbox_contract,
+            inbox,
+            fingerprint: &fingerprint,
+            tip_contract,
+            trusted: &trusted,
+            watched: &watched,
+        },
+    )?;
+
     // --- a migration import of a full ledger into a full ledger --------------
     // What a successor does with each ledger a predecessor exports: decode
     // both, merge, encode. The largest secret this delegate imports.
@@ -1604,32 +1616,301 @@ fn scenario(r: &mut Runner) -> Result<()> {
         &ledgers,
     )?;
 
+    // --- a seller's published orders, after the export ---------------------
+    // The payment-key handlers do not look at the export marker. Last
+    // because the spaced run is past the harness's fuel ceiling on a
+    // delegate without a per-call bound, which stops the scenario.
+    published_scripts(r, &caps)?;
+
     Ok(())
 }
 
-/// A seller's published orders, offered back to the delegate so its counter
-/// is raised past every one of them (harvest#77): `SetPaymentXpub` and
-/// `DeriveOrderAddress` derive from the counter on, and every script that
-/// matches pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further
-/// (`bitcoin::published_floor_matches`). The web app sends every order's
-/// script from every store it owns (`published_payment_scripts`), and all of
-/// a device's stores share one payment key, so the published list is bounded
-/// only by the stores times each store's order cap (`MAX_ORDERS`), every one
-/// of them an address this key derived in a row.
+/// The first store's instant-checkout arm, as [`instant_decide`] needs it.
+struct InstantStore<'a> {
+    contract: [u8; 32],
+    verifying_key: [u8; 32],
+    mailbox: [u8; 32],
+    inbox: [u8; 32],
+    fingerprint: &'a str,
+    tip_contract: [u8; 32],
+    trusted: &'a [freenet_bitcoin_common::BridgeId],
+    watched: &'a [Vec<u8>],
+}
+
+impl InstantStore<'_> {
+    fn arm(&self, watched_scripts: Vec<Vec<u8>>) -> Vec<u8> {
+        cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+            arm: Box::new(AutoInvoiceArm {
+                store_contract_id: self.contract.to_vec(),
+                store_verifying_key: self.verifying_key,
+                mailbox_contract_id: self.mailbox,
+                seller_fingerprint: self.fingerprint.to_string(),
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                tip_contract_id: self.tip_contract,
+                trusted_bridges: self.trusted.to_vec(),
+                address_code_hash: [0x56; 32],
+                watched_scripts,
+                watch_left_ms: 24 * 3600 * 1000,
+                watched_until_height: None,
+                presence_contract_id: Some([0x57; 32]),
+            }),
+        })
+    }
+}
+
+/// Instant checkout deciding a buyer's request against a full store
+/// (`auto_invoice::on_store_state`, `decide`): the store's `MAX_ORDERS`
+/// orders, all paid, on addresses contiguous from this device's counter, as
+/// a busy store's are on a device that has not seen them. `decide` raises the
+/// counter past every one before it invoices (`published_floor_scan`); since
+/// #216 a run that cannot finish the scan refuses the batch
+/// (`Refusal::CatchingUp`), keeps the count, and the request waits for the
+/// next run.
 ///
-/// Measured for one full store and for every store full. The counter is put
-/// back after each call, so the rest of the scenario sees the key as it was.
-fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
-    let xpub_key = b"harvest:bitcoin:payment-xpub:v1".to_vec();
-    let saved = r
+/// Driven as on a node: the request arrives in the store's mailbox, the
+/// delegate asks for the store, and the answer (with the context the GET
+/// carried) is the full store, repeated while the delegate is catching up.
+/// Every run before the last must have refused for that reason, and the last
+/// must publish one order on the address one past the store's last.
+///
+/// The orders are paid, so no store limit turns the request away once the
+/// counter has caught up. `decide` does not check an order's signature, so
+/// each is signed by a fixture key at its real size, with a genuine SPV
+/// payment proof.
+fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
+    use harvest_common::listing::{
+        AuthorizedListing, ChoiceGroup, DeliveryPrice, FixedCheckout, Listing, ListingId,
+        ListingKind, RegionPrice,
+    };
+    use harvest_common::sealed::{InstantSelection, MessageContent, PlaintextMessage};
+
+    let saved_xpub = r
         .host
         .state
         .secrets
-        .get(&xpub_key)
+        .get(XPUB_KEY)
         .cloned()
         .ok_or_else(|| anyhow!("no payment key is saved: update the harness"))?;
-    // Where the counter is, and the natively derived chain checked against
-    // the delegate's own next addresses.
+    let chain = fixture_chain()?;
+    let start = counter_now(r, &chain)?;
+    let n = harvest_common::store::MAX_ORDERS as u32;
+    let next = start + n;
+    // The seller's tab watches the address the invoice will use, and the
+    // ten after it.
+    r.quiet_app(at.arm(scripts_at(&chain, next..next + 10)?), "AutoInvoice")?;
+
+    let listing = Listing {
+        id: ListingId([0; 32]),
+        title: "Jam".into(),
+        description: String::new(),
+        kind: ListingKind::Sale,
+        price: None,
+        created_at: fixtures::ts(1_700_000_000),
+        checkout: Some(FixedCheckout {
+            unit_sats: 10_000,
+            delivery: DeliveryPrice::ByRegion(vec![RegionPrice {
+                region: "UK".into(),
+                sats: 2_000,
+            }]),
+        }),
+        choices: vec![ChoiceGroup {
+            name: "Flavour".into(),
+            options: vec!["Plum".into(), "Fig".into()],
+        }],
+    }
+    .with_derived_id();
+    let owner = ed25519_dalek::VerifyingKey::from_bytes(&at.verifying_key)?;
+    let fx = fixtures::OrderFx {
+        seller: SigningKey::from_bytes(&[12u8; 32]),
+        bridge: SigningKey::from_bytes(&[22u8; 32]),
+    };
+    let mut store = harvest_common::store::StoreStateV1 {
+        owner: Some(owner),
+        listings: harvest_common::store::ListingsV1 {
+            listings: vec![AuthorizedListing {
+                listing: listing.clone(),
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                certificate_pem: String::new(),
+            }],
+        },
+        ..Default::default()
+    };
+    for (k, script) in scripts_at(&chain, start..next)?.into_iter().enumerate() {
+        let order = fx.paid(fx.order_on(k as u32, script));
+        store.orders.orders.insert(order.order.id.clone(), order);
+    }
+    if store.orders.orders.len() != n as usize {
+        bail!(
+            "the full store holds {} orders, not {n}",
+            store.orders.orders.len()
+        );
+    }
+    let store_bytes = cbor(&store);
+    println!(
+        "  (full store: {} paid orders, {} KiB)",
+        store.orders.orders.len(),
+        store_bytes.len() / 1024
+    );
+
+    // The buyer's instant request, sealed to the store's inbox.
+    let buyer = StaticSecret::from([0xD0u8; 32]);
+    let tag = *PublicKey::from(&buyer).as_bytes();
+    let key = harvest_common::mailbox::conversation_key_from_dh(
+        &buyer.diffie_hellman(&PublicKey::from(at.inbox)).to_bytes(),
+        harvest_common::mailbox::MessageDirection::BuyerToSeller,
+    );
+    let now = r.host.state.now;
+    let conversation = harvest_common::mailbox::ConversationId([0xD0; 32]);
+    let request = fixtures::encrypt_message_seeded(
+        &PlaintextMessage {
+            conversation_id: conversation.clone(),
+            content: MessageContent::OrderRequest {
+                listing_id: listing.id.clone(),
+                quantity: 1,
+                shipping: "1 Lane".into(),
+                note: String::new(),
+                order_binding: [0xD1; 32],
+                buyer_receipt_key: Some([0xD2; 32]),
+                instant: Some(InstantSelection {
+                    nonce: [0xD3; 16],
+                    region: Some("UK".into()),
+                    choices: vec!["Fig".into()],
+                    expected_total_sats: 12_000,
+                    requested_at_ms: (now - chrono::Duration::seconds(5)).timestamp_millis(),
+                }),
+            },
+        },
+        &tag,
+        &key,
+        now - chrono::Duration::seconds(5),
+        40_000,
+    );
+    let out = r.notify(
+        "ContractNotification: mailbox (an instant request)",
+        at.mailbox,
+        cbor(&mailbox_state(vec![request])?),
+    )?;
+    let context = out
+        .iter()
+        .find_map(|m| match m {
+            OutboundDelegateMsg::GetContractRequest(get)
+                if get.contract_id == ContractInstanceId::new(at.contract) =>
+            {
+                Some(get.context.as_ref().to_vec())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!("the instant request asked nothing of the store: it was not batched")
+        })?;
+
+    let name = format!("GetContractResponse: store, {n} paid orders (instant decide)");
+    let counter = |r: &Runner| -> Result<u64> {
+        let v = secret_value(r, XPUB_KEY)?;
+        match field(&v, &["next_index"])? {
+            Value::Integer(i) => Ok(u64::try_from(i128::from(*i))?),
+            other => bail!("the payment counter is not a number: {}", brief(other)),
+        }
+    };
+    let mut count = counter(r)?;
+    let want = chain.script_at(next).map_err(|e| anyhow!("{e}"))?;
+    for _ in 0..=n {
+        let out = r.get_answer(&name, at.contract, store_bytes.clone(), context.clone())?;
+        let published: Vec<Vec<u8>> = out
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::UpdateContractRequest(u)
+                    if u.contract_id == ContractInstanceId::new(at.contract) =>
+                {
+                    Some(update_bytes(&u.update))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if published.is_empty() {
+            // Nothing published: the run must have refused for the catch-up
+            // (`Refusal::CatchingUp`), the one refusal that saves the counter
+            // it reached, short of the store's end.
+            let now_at = counter(r)?;
+            if now_at <= count || now_at >= u64::from(next) {
+                bail!(
+                    "{name}: published nothing, and the counter went from {count} to {now_at} \
+                     (the store ends at {next}): the request was refused for another reason, so \
+                     the decide was not measured"
+                );
+            }
+            count = now_at;
+            continue;
+        }
+        let scripts = published
+            .iter()
+            .filter_map(|bytes| ciborium::from_reader::<Value, _>(bytes.as_slice()).ok())
+            .flat_map(|v| byte_fields(&v, "payment_script_pubkey"))
+            .collect::<Vec<_>>();
+        if scripts != vec![want.clone()] {
+            bail!(
+                "{name}: published orders paying {} script(s), not one order at index {next} \
+                 (one past the store's last)",
+                scripts.len()
+            );
+        }
+        // Back as it was for the rest of the scenario.
+        r.host.state.secrets.insert(XPUB_KEY.to_vec(), saved_xpub);
+        r.quiet_app(at.arm(at.watched.to_vec()), "AutoInvoice")?;
+        return Ok(());
+    }
+    bail!("{name}: still catching up after {} runs", n + 1)
+}
+
+/// The bytes an update carries.
+fn update_bytes(data: &freenet_stdlib::prelude::UpdateData<'_>) -> Option<Vec<u8>> {
+    use freenet_stdlib::prelude::UpdateData;
+    match data {
+        UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+        UpdateData::State(s) => Some(s.as_ref().to_vec()),
+        _ => None,
+    }
+}
+
+/// Every value of a field named `name` anywhere in `v`, as bytes.
+fn byte_fields(v: &Value, name: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    match v {
+        Value::Map(entries) => {
+            for (k, val) in entries {
+                if matches!(k, Value::Text(t) if t == name) {
+                    if let Ok(b) = val.deserialized::<serde_bytes_vec::ByteVec>() {
+                        out.push(b.0);
+                        continue;
+                    }
+                }
+                out.extend(byte_fields(val, name));
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| out.extend(byte_fields(i, name))),
+        Value::Tag(_, inner) => out.extend(byte_fields(inner, name)),
+        _ => {}
+    }
+    out
+}
+
+/// The payment-key record's secret key (`bitcoin::BITCOIN_PAYMENT_XPUB_KEY`).
+const XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
+
+/// The fixture key's receiving chain, derived natively by the delegate's own
+/// code ([`bip32`]).
+fn fixture_chain() -> Result<bip32::ExternalChain> {
+    bip32::AccountXpub::parse(&fixtures::signet_vpub(0))
+        .and_then(|a| a.external_chain())
+        .map_err(|e| anyhow!("derive the fixture key's chain: {e}"))
+}
+
+/// Where the delegate's address counter is now, with the native chain
+/// checked against the next addresses the delegate itself reports, so a
+/// fixture script is the address the delegate would derive.
+fn counter_now(r: &mut Runner, chain: &bip32::ExternalChain) -> Result<u32> {
     let peeked = r.quiet_app(
         cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
             request_id: 410,
@@ -1645,9 +1926,6 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
         Some(Ok(Value::Integer(i))) => u32::try_from(i128::from(*i))?,
         _ => bail!("the next address carries no index: update the harness"),
     };
-    let chain = bip32::AccountXpub::parse(&fixtures::signet_vpub(0))
-        .and_then(|a| a.external_chain())
-        .map_err(|e| anyhow!("derive the fixture key's chain: {e}"))?;
     for (k, a) in upcoming.iter().enumerate() {
         let script = field(a, &["script_pubkey"])?
             .deserialized::<serde_bytes_vec::ByteVec>()
@@ -1661,53 +1939,200 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
             bail!("the natively derived address {k} is not the delegate's: update the harness");
         }
     }
+    Ok(start)
+}
 
+/// The scripts at `indexes` on the fixture key's receiving chain.
+fn scripts_at(
+    chain: &bip32::ExternalChain,
+    indexes: impl Iterator<Item = u32>,
+) -> Result<Vec<Vec<u8>>> {
+    indexes
+        .map(|i| chain.script_at(i).map_err(|e| anyhow!("{e}")))
+        .collect()
+}
+
+/// A seller's published orders, offered back to the delegate so its counter
+/// is raised past every one of them (harvest#77): `SetPaymentXpub` and
+/// `DeriveOrderAddress` derive from the counter on, and every script that
+/// matches pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further.
+/// Since #216 one call derives at most `FLOOR_SCAN_BUDGET` indices, keeps the
+/// count it reached and answers that it is still catching up; the web app
+/// asks again ([`catch_up`]).
+///
+/// * One full store (`MAX_ORDERS`), contiguous from the counter: driven to
+///   the end, which must put the count one past the last script.
+/// * Every store full (64 x `MAX_ORDERS`), contiguous: the web app sends
+///   every owned store's scripts (`published_payment_scripts`), and one
+///   delegate holds one payment key for every store. ONE call each, to show
+///   the per-call cost, which grows with the request (decoding it, the set
+///   of scripts) and not with the scan.
+/// * One full store with every script `PUBLISHED_INDEX_GAP - 1` unused
+///   indices after the last (abandoned invoices burn indices): the longest
+///   scan a store's scripts allow. Capped at [`SPACED_CALLS`] calls each.
+///
+/// The counter is put back after each run, so each starts where the others
+/// did.
+fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
+    let saved = r
+        .host
+        .state
+        .secrets
+        .get(XPUB_KEY)
+        .cloned()
+        .ok_or_else(|| anyhow!("no payment key is saved: update the harness"))?;
+    let chain = fixture_chain()?;
+    let start = counter_now(r, &chain)?;
     let per_store = harvest_common::store::MAX_ORDERS;
+    let gap = harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
     let all = caps.store_keys * per_store;
-    let scripts: Vec<Vec<u8>> = (0..all as u32)
-        .map(|k| chain.script_at(start + k).map_err(|e| anyhow!("{e}")))
-        .collect::<Result<_>>()?;
-    for (label, n) in [
-        ("one full store".to_string(), per_store),
-        (format!("{} full stores", caps.store_keys), all),
-    ] {
-        let published = scripts[..n].to_vec();
-        let set = r.app(
-            &format!("SetPaymentXpub ({n} published scripts, {label})"),
-            cbor(&BitcoinDelegateRequest::SetPaymentXpub {
+    let contiguous = scripts_at(&chain, start..start + all as u32)?;
+    // The first match may be `gap - 1` past the counter, and each next one
+    // `gap` past the last.
+    let spaced = scripts_at(
+        &chain,
+        (0..per_store as u32).map(|k| start + gap - 1 + k * gap),
+    )?;
+    // (what, the scripts, one past the last of them, at most this many calls)
+    type Run = (String, Vec<Vec<u8>>, u32, Option<usize>);
+    let runs: [Run; 3] = [
+        (
+            format!("{per_store} published scripts, one full store"),
+            contiguous[..per_store].to_vec(),
+            start + per_store as u32,
+            None,
+        ),
+        (
+            format!("{all} published scripts, {} full stores", caps.store_keys),
+            contiguous,
+            start + all as u32,
+            Some(1),
+        ),
+        (
+            format!("{per_store} published scripts {gap} apart, one full store"),
+            spaced,
+            start + gap - 1 + (per_store as u32 - 1) * gap + 1,
+            Some(SPACED_CALLS),
+        ),
+    ];
+    for (label, published, past_every, cap) in runs {
+        let n = published.len();
+        let past_every_v = Value::Integer(u64::from(past_every).into());
+        let set = catch_up(
+            r,
+            &format!("SetPaymentXpub ({label})"),
+            &cbor(&BitcoinDelegateRequest::SetPaymentXpub {
                 request_id: 411,
                 xpub: fixtures::signet_vpub(0),
                 network: freenet_bitcoin_common::BitcoinNetwork::Signet,
                 published_scripts: published.clone(),
             }),
             "PaymentXpubSet",
+            n,
+            cap,
         )?;
-        let matched = list_len(&set, &["PaymentXpubSet", "matched_scripts"])?;
-        if matched != n {
-            bail!("SetPaymentXpub matched {matched} of {n} published scripts, so the scan stopped short");
+        if let Some(set) = set {
+            let count = field(&set, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
+            if *count != past_every_v {
+                bail!(
+                    "SetPaymentXpub ({label}) finished at count {}, not {past_every}: the \
+                     scan stopped short",
+                    brief(count)
+                );
+            }
         }
-        r.host.state.secrets.insert(xpub_key.clone(), saved.clone());
-        let derived = r.app(
-            &format!("DeriveOrderAddress ({n} published scripts, {label})"),
-            cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
+        r.host
+            .state
+            .secrets
+            .insert(XPUB_KEY.to_vec(), saved.clone());
+        let derived = catch_up(
+            r,
+            &format!("DeriveOrderAddress ({label})"),
+            &cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
                 request_id: 412,
                 published_scripts: published,
             }),
             "OrderAddress",
+            n,
+            cap,
         )?;
-        let matched = list_len(&derived, &["OrderAddress", "matched_scripts"])?;
-        let index = field(&derived, &["OrderAddress", "result", "Ok", "index"])?;
-        if matched != n || *index != Value::Integer((start as u64 + n as u64).into()) {
-            bail!(
-                "DeriveOrderAddress matched {matched} of {n} published scripts and handed out \
-                 index {}, not {}: the scan stopped short",
-                brief(index),
-                start as usize + n
-            );
+        // One past the last published script: neither an address a
+        // published order already uses nor one beyond it.
+        if let Some(derived) = derived {
+            let index = field(&derived, &["OrderAddress", "result", "Ok", "index"])?;
+            if *index != past_every_v {
+                bail!(
+                    "DeriveOrderAddress ({label}) handed out index {}, not {past_every} (one \
+                     past the last published script)",
+                    brief(index)
+                );
+            }
         }
-        r.host.state.secrets.insert(xpub_key.clone(), saved.clone());
+        r.host
+            .state
+            .secrets
+            .insert(XPUB_KEY.to_vec(), saved.clone());
     }
     Ok(())
+}
+
+/// How many calls of each request the spaced published-script run makes.
+/// Driven to the end it is about 1,400 calls each (409,600 indices, about
+/// 300 of them a call): minutes of CI for no more information than a few
+/// dozen calls give, since each call's cost is bounded the same way.
+const SPACED_CALLS: usize = 32;
+
+/// Send `payload` until the answer is not the delegate's catch-up refusal,
+/// every call measured under `name`, and return that answer; or `None` when
+/// `max_calls` were made and it was still catching up.
+///
+/// Since #216 a scan of published scripts derives at most
+/// `FLOOR_SCAN_BUDGET` indices a call, saves the count it reached, and
+/// answers `Err("... the count is now at N. Enter the key again to
+/// continue.")` (or "Ask again to continue."); the web app sends the same
+/// request again with every script. Each refusal must move the count on, and
+/// with no `max_calls` the requests are bounded by `bound` (one per
+/// published script would do for a scan budget of a single index), so a
+/// delegate that never finishes fails the run. A delegate without the bound
+/// answers at once.
+fn catch_up(
+    r: &mut Runner,
+    name: &str,
+    payload: &[u8],
+    expect: &str,
+    bound: usize,
+    max_calls: Option<usize>,
+) -> Result<Option<Value>> {
+    let limit = max_calls.unwrap_or(bound.saturating_add(1)).max(1);
+    let mut last_count: Option<u64> = None;
+    for _ in 0..limit {
+        let outbound = r.send(name, payload.to_vec())?;
+        let response = first_app_payload(&outbound)
+            .ok_or_else(|| anyhow!("{name}: no application message in the answer"))?;
+        let value: Value = ciborium::from_reader(response.as_slice())
+            .with_context(|| format!("{name}: the answer is not CBOR"))?;
+        let refusal = match field(&value, &[expect, "result", "Err"]) {
+            Ok(Value::Text(why)) if why.ends_with("to continue.") => why.clone(),
+            _ => {
+                check_answer(name, &value, expect)?;
+                return Ok(Some(value));
+            }
+        };
+        let count: u64 = refusal
+            .split("the count is now at ")
+            .nth(1)
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|n| n.trim().parse().ok())
+            .ok_or_else(|| anyhow!("{name}: a catch-up refusal names no count: {refusal}"))?;
+        if last_count.is_some_and(|last| count <= last) {
+            bail!("{name}: the catch-up stayed at count {count}: it makes no progress");
+        }
+        last_count = Some(count);
+    }
+    if max_calls.is_some() {
+        return Ok(None);
+    }
+    bail!("{name}: still catching up after {limit} requests")
 }
 
 /// The export answers `freenet_migrate::ExportedSecrets`, not a Harvest
