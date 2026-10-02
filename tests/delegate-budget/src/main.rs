@@ -587,6 +587,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             xpub: fixtures::signet_vpub(0),
             network: BitcoinNetwork::Signet,
             published_scripts: Vec::new(),
+            resume: false,
         }),
         "PaymentXpubSet",
     )?;
@@ -1271,6 +1272,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
     set_retry(r, &all_arms, false)?;
+    wakeup_catch_up(r, &wakeup)?;
     // A node start forgets every delegation's subscriptions, rewriting each.
     r.background(
         &format!("Background: NodeStarted ({delegations})"),
@@ -1518,7 +1520,6 @@ fn scenario(r: &mut Runner) -> Result<()> {
             fingerprint: &fingerprint,
             tip_contract,
             trusted: &trusted,
-            watched: &watched,
         },
     )?;
 
@@ -1634,7 +1635,6 @@ struct InstantStore<'a> {
     fingerprint: &'a str,
     tip_contract: [u8; 32],
     trusted: &'a [freenet_bitcoin_common::BridgeId],
-    watched: &'a [Vec<u8>],
 }
 
 impl InstantStore<'_> {
@@ -1684,13 +1684,10 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
     };
     use harvest_common::sealed::{InstantSelection, MessageContent, PlaintextMessage};
 
-    let saved_xpub = r
-        .host
-        .state
-        .secrets
-        .get(XPUB_KEY)
-        .cloned()
-        .ok_or_else(|| anyhow!("no payment key is saved: update the harness"))?;
+    // Put back after: the run changes the counter, the store's arm and
+    // ledger, and (since #216) the published scripts the delegate holds,
+    // which the published-script runs below must start without.
+    let snapshot = r.host.state.secrets.clone();
     let chain = fixture_chain()?;
     let start = counter_now(r, &chain)?;
     let n = harvest_common::store::MAX_ORDERS as u32;
@@ -1831,14 +1828,22 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             .collect();
         if published.is_empty() {
             // Nothing published: the run must have refused for the catch-up
-            // (`Refusal::CatchingUp`), the one refusal that saves the counter
-            // it reached. That may be the store's end itself: a scan whose
-            // budget runs out on the last match has not yet looked
-            // `PUBLISHED_INDEX_GAP` past it, so the next run finishes.
+            // (`Refusal::CatchingUp`). Since #216 the store's status says so
+            // (`paused`); before it, the refusal was the one that kept a
+            // higher counter, up to the store's end (a scan whose budget ran
+            // out on the last match has not yet looked `PUBLISHED_INDEX_GAP`
+            // past it, so the next run finishes).
             let now_at = counter(r)?;
-            if now_at <= count || now_at > u64::from(next) {
+            let status =
+                r.quiet_app(at.arm(scripts_at(&chain, next..next + 10)?), "AutoInvoice")?;
+            let paused = field(&status, &["AutoInvoice", "result", "Ok", "paused"])
+                .ok()
+                .cloned();
+            let said = matches!(&paused, Some(Value::Text(why)) if why == CATCHING_UP_SHOWN);
+            if !said && (now_at <= count || now_at > u64::from(next)) {
                 bail!(
-                    "{name}: published nothing, and the counter went from {count} to {now_at} \
+                    "{name}: published nothing, its status is paused for {paused:?}, and the \
+                     counter went from {count} to {now_at} \
                      (the store ends at {next}): the request was refused for another reason, so \
                      the decide was not measured"
                 );
@@ -1859,8 +1864,7 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             );
         }
         // Back as it was for the rest of the scenario.
-        r.host.state.secrets.insert(XPUB_KEY.to_vec(), saved_xpub);
-        r.quiet_app(at.arm(at.watched.to_vec()), "AutoInvoice")?;
+        r.host.state.secrets = snapshot;
         return Ok(());
     }
     bail!("{name}: still catching up after {} runs", n + 1)
@@ -1897,6 +1901,10 @@ fn byte_fields(v: &Value, name: &str) -> Vec<Vec<u8>> {
     }
     out
 }
+
+/// How a store's status names `Refusal::CatchingUp` (`Refusal::explain`).
+const CATCHING_UP_SHOWN: &str =
+    "the payment counter is still catching up with this store's published orders";
 
 /// The payment-key record's secret key (`bitcoin::BITCOIN_PAYMENT_XPUB_KEY`).
 const XPUB_KEY: &[u8] = b"harvest:bitcoin:payment-xpub:v1";
@@ -1954,37 +1962,38 @@ fn scripts_at(
         .collect()
 }
 
-/// A seller's published orders, offered back to the delegate so its counter
-/// is raised past every one of them (harvest#77): `SetPaymentXpub` and
-/// `DeriveOrderAddress` derive from the counter on, and every script that
-/// matches pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further.
-/// Since #216 one call derives at most `FLOOR_SCAN_BUDGET` indices, keeps the
-/// count it reached and answers that it is still catching up; the web app
-/// asks again ([`catch_up`]).
+/// A seller's published orders, which the delegate's address counter must be
+/// raised past before it hands out an address (harvest#77).
 ///
-/// * One full store (`MAX_ORDERS`), contiguous from the counter: driven to
-///   the end, which must put the count one past the last script.
+/// Since #216 the delegate holds every script it is sent: the web app sends
+/// them as `AddPublishedScripts`, at most `MAX_SCRIPTS_PER_REQUEST` a
+/// request, then the key (`SetPaymentXpub`), and asks again (`resume`) while
+/// the delegate answers that its scan is still catching up; every address
+/// request (`DeriveOrderAddress`) goes through the same scan. A delegate that
+/// does not take `AddPublishedScripts` (V29) is sent the scripts with the
+/// request itself, as its web app did.
+///
+/// * One full store (`MAX_ORDERS`), contiguous from the counter: fed, then
+///   driven to the end, which must put the count one past the last script.
 /// * Every store full (64 x `MAX_ORDERS`), contiguous: the web app sends
 ///   every owned store's scripts (`published_payment_scripts`), and one
-///   delegate holds one payment key for every store. ONE call each, to show
-///   the per-call cost, which grows with the request (decoding it, the set
-///   of scripts) and not with the scan.
+///   delegate holds one payment key for every store. Fed in 64 requests, each
+///   measured, then ONE scan call, to show its cost is bounded per call.
 /// * One full store with every script `PUBLISHED_INDEX_GAP - 1` unused
 ///   indices after the last (abandoned invoices burn indices): the longest
-///   scan a store's scripts allow. Capped at [`SPACED_CALLS`] calls each.
+///   scan a store's scripts allow. Capped at [`SPACED_CALLS`] calls.
 ///
-/// The counter is put back after each run, so each starts where the others
-/// did.
+/// Each of `SetPaymentXpub` and `DeriveOrderAddress` starts from the same
+/// secrets (the key active, its counter where the scenario left it, nothing
+/// published held); the feeding is measured once a run, before
+/// `SetPaymentXpub`. The secrets are put back after, so the rest of the
+/// scenario sees the delegate as it was.
 fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
-    let saved = r
-        .host
-        .state
-        .secrets
-        .get(XPUB_KEY)
-        .cloned()
-        .ok_or_else(|| anyhow!("no payment key is saved: update the harness"))?;
+    let snapshot = r.host.state.secrets.clone();
     let chain = fixture_chain()?;
     let start = counter_now(r, &chain)?;
+    let additions = takes_additions(r)?;
+    r.host.state.secrets = snapshot.clone();
     let per_store = harvest_common::store::MAX_ORDERS;
     let gap = harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
     let all = caps.store_keys * per_store;
@@ -2020,21 +2029,37 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
     for (label, published, past_every, cap) in runs {
         let n = published.len();
         let past_every_v = Value::Integer(u64::from(past_every).into());
-        let set = catch_up(
-            r,
-            &format!("SetPaymentXpub ({label})"),
-            &cbor(&BitcoinDelegateRequest::SetPaymentXpub {
+        // Inline only for a delegate without `AddPublishedScripts`.
+        let inline = if additions {
+            Vec::new()
+        } else {
+            published.clone()
+        };
+
+        r.host.state.secrets = snapshot.clone();
+        if additions {
+            feed(r, &label, &published, true)?;
+        }
+        let set = |resume: bool| {
+            cbor(&BitcoinDelegateRequest::SetPaymentXpub {
                 request_id: 411,
                 xpub: fixtures::signet_vpub(0),
                 network: freenet_bitcoin_common::BitcoinNetwork::Signet,
-                published_scripts: published.clone(),
-            }),
+                published_scripts: inline.clone(),
+                resume,
+            })
+        };
+        let answer = catch_up(
+            r,
+            &format!("SetPaymentXpub ({label})"),
+            &set(false),
+            &set(true),
             "PaymentXpubSet",
             n,
             cap,
         )?;
-        if let Some(set) = set {
-            let count = field(&set, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
+        if let Some(answer) = answer {
+            let count = field(&answer, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
             if *count != past_every_v {
                 bail!(
                     "SetPaymentXpub ({label}) finished at count {}, not {past_every}: the \
@@ -2043,25 +2068,28 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
                 );
             }
         }
-        r.host
-            .state
-            .secrets
-            .insert(XPUB_KEY.to_vec(), saved.clone());
-        let derived = catch_up(
+
+        r.host.state.secrets = snapshot.clone();
+        if additions {
+            feed(r, &label, &published, false)?;
+        }
+        let derive = cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
+            request_id: 412,
+            published_scripts: inline,
+        });
+        let answer = catch_up(
             r,
             &format!("DeriveOrderAddress ({label})"),
-            &cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
-                request_id: 412,
-                published_scripts: published,
-            }),
+            &derive,
+            &derive,
             "OrderAddress",
             n,
             cap,
         )?;
         // One past the last published script: neither an address a
         // published order already uses nor one beyond it.
-        if let Some(derived) = derived {
-            let index = field(&derived, &["OrderAddress", "result", "Ok", "index"])?;
+        if let Some(answer) = answer {
+            let index = field(&answer, &["OrderAddress", "result", "Ok", "index"])?;
             if *index != past_every_v {
                 bail!(
                     "DeriveOrderAddress ({label}) handed out index {}, not {past_every} (one \
@@ -2070,11 +2098,97 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
                 );
             }
         }
-        r.host
-            .state
-            .secrets
-            .insert(XPUB_KEY.to_vec(), saved.clone());
     }
+    r.host.state.secrets = snapshot;
+    Ok(())
+}
+
+/// Whether the delegate takes `AddPublishedScripts` (#216 on); asked with
+/// none, so nothing is held. The caller puts the secrets back.
+fn takes_additions(r: &mut Runner) -> Result<bool> {
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(cbor(
+        &BitcoinDelegateRequest::AddPublishedScripts {
+            request_id: 413,
+            scripts: Vec::new(),
+        },
+    )));
+    let origin = r.origin.clone();
+    let Ok(outbound) = r.host.call(Some(&origin), &msg)?.result else {
+        return Ok(false);
+    };
+    let Some(answer) = first_app_payload(&outbound) else {
+        return Ok(false);
+    };
+    let value: Value = ciborium::from_reader(answer.as_slice()).context("not CBOR")?;
+    Ok(check_answer("AddPublishedScripts", &value, "PublishedScriptsAdded").is_ok())
+}
+
+/// Send `scripts` as `AddPublishedScripts` requests of at most
+/// `MAX_SCRIPTS_PER_REQUEST`, each measured when `measured`.
+fn feed(r: &mut Runner, label: &str, scripts: &[Vec<u8>], measured: bool) -> Result<()> {
+    let chunk = harvest_common::bitcoin_delegate::MAX_SCRIPTS_PER_REQUEST;
+    for part in scripts.chunks(chunk) {
+        let payload = cbor(&BitcoinDelegateRequest::AddPublishedScripts {
+            request_id: 414,
+            scripts: part.to_vec(),
+        });
+        if measured {
+            r.app(
+                &format!("AddPublishedScripts ({} of {label})", part.len()),
+                payload,
+                "PublishedScriptsAdded",
+            )?;
+        } else {
+            r.quiet_app(payload, "PublishedScriptsAdded")?;
+        }
+    }
+    Ok(())
+}
+
+/// The active payment key's counter, as the delegate holds it.
+fn active_counter(r: &Runner) -> Result<u64> {
+    let v = secret_value(r, XPUB_KEY)?;
+    match field(&v, &["next_index"])? {
+        Value::Integer(i) => Ok(u64::try_from(i128::from(*i))?),
+        other => bail!("the payment counter is not a number: {}", brief(other)),
+    }
+}
+
+/// A scheduled wake-up moves the active key's catch-up on by itself
+/// (`bitcoin::advance_on_wakeup`, `WAKEUP_SCAN_BUDGET`), on top of all the
+/// wake-up's other work: measured with one full store's scripts held and
+/// none of them scanned. The counter must move on. Skipped for a delegate
+/// without `AddPublishedScripts`, which holds no scripts. The secrets are put
+/// back after.
+fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
+    let snapshot = r.host.state.secrets.clone();
+    let chain = fixture_chain()?;
+    let start = counter_now(r, &chain)?;
+    if !takes_additions(r)? {
+        r.host.state.secrets = snapshot;
+        return Ok(());
+    }
+    r.host.state.secrets = snapshot.clone();
+    let per_store = harvest_common::store::MAX_ORDERS as u32;
+    feed(
+        r,
+        "one full store",
+        &scripts_at(&chain, start..start + per_store)?,
+        false,
+    )?;
+    r.host.state.now += chrono::Duration::minutes(5);
+    r.background(
+        "Background: heartbeat wake-up (payment counter catching up)",
+        wakeup,
+    )?;
+    let after = active_counter(r)?;
+    if after <= u64::from(start) {
+        bail!(
+            "the wake-up left the payment counter at {after}: it did not move the catch-up on, \
+             so that part of its cost was not measured"
+        );
+    }
+    r.host.state.secrets = snapshot;
     Ok(())
 }
 
@@ -2084,36 +2198,39 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
 /// dozen calls give, since each call's cost is bounded the same way.
 const SPACED_CALLS: usize = 32;
 
-/// Send `payload` until the answer is not the delegate's catch-up refusal,
-/// every call measured under `name`, and return that answer; or `None` when
-/// `max_calls` were made and it was still catching up.
+/// Send `first`, then `again` for as long as the answer is the delegate's
+/// catch-up refusal, every call measured under `name`, and return the first
+/// other answer; or `None` when `max_calls` were made and it was still
+/// catching up.
 ///
 /// Since #216 a scan of published scripts derives at most
-/// `FLOOR_SCAN_BUDGET` indices a call, saves the count it reached, and
-/// answers an `Err` starting `CATCHING_UP_PREFIX` and the count; the web
-/// app sends the same request again with every script. Each refusal must move the count on, and
-/// with no `max_calls` the requests are bounded by `bound` (one per
-/// published script would do for a scan budget of a single index), so a
-/// delegate that never finishes fails the run. A delegate without the bound
-/// answers at once.
+/// `FLOOR_SCAN_BUDGET` indices a call, keeps how far it got, and answers an
+/// `Err` starting `CATCHING_UP_PREFIX` and the count; the web app asks again.
+/// The refusal names the counter and the scan's cursor: the cursor must move
+/// on every call (the counter only when the scan matched), and with no
+/// `max_calls` the requests are bounded by `bound` + 2, far more than a scan
+/// budget of a single index needs, so a delegate that never finishes fails
+/// the run. A delegate without the bound answers at once.
 fn catch_up(
     r: &mut Runner,
     name: &str,
-    payload: &[u8],
+    first: &[u8],
+    again: &[u8],
     expect: &str,
     bound: usize,
     max_calls: Option<usize>,
 ) -> Result<Option<Value>> {
-    let limit = max_calls.unwrap_or(bound.saturating_add(1)).max(1);
-    let mut last_count: Option<u64> = None;
-    for _ in 0..limit {
+    let limit = max_calls.unwrap_or(bound.saturating_add(2)).max(1);
+    let prefix = harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX;
+    let mut last: Option<(u64, u64)> = None;
+    for call in 0..limit {
+        let payload = if call == 0 { first } else { again };
         let outbound = r.send(name, payload.to_vec())?;
         let response = first_app_payload(&outbound)
             .ok_or_else(|| anyhow!("{name}: no application message in the answer"))?;
         let value: Value = ciborium::from_reader(response.as_slice())
             .with_context(|| format!("{name}: the answer is not CBOR"))?;
-        // `CATCHING_UP_PREFIX`, the count reached, `;`, a sentence.
-        let prefix = harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX;
+        // `CATCHING_UP_PREFIX`, `{counter}/{cursor}`, `;`, a sentence.
         let refusal = match field(&value, &[expect, "result", "Err"]) {
             Ok(Value::Text(why)) if why.starts_with(prefix) => why.clone(),
             _ => {
@@ -2121,15 +2238,27 @@ fn catch_up(
                 return Ok(Some(value));
             }
         };
-        let count: u64 = refusal[prefix.len()..]
+        let figures: Vec<u64> = refusal[prefix.len()..]
             .split(';')
             .next()
-            .and_then(|n| n.trim().parse().ok())
-            .ok_or_else(|| anyhow!("{name}: a catch-up refusal names no count: {refusal}"))?;
-        if last_count.is_some_and(|last| count <= last) {
-            bail!("{name}: the catch-up stayed at count {count}: it makes no progress");
+            .unwrap_or_default()
+            .split('/')
+            .map(|n| n.trim().parse())
+            .collect::<Result<_, _>>()
+            .map_err(|_| anyhow!("{name}: a catch-up refusal names no count: {refusal}"))?;
+        let [counter, cursor] = figures[..] else {
+            bail!("{name}: a catch-up refusal is not counter/cursor: {refusal}");
+        };
+        // The cursor moves on every call; the counter only on a match.
+        if let Some((last_counter, last_cursor)) = last {
+            if cursor <= last_cursor || counter < last_counter {
+                bail!(
+                    "{name}: the catch-up went from {last_counter}/{last_cursor} to \
+                     {counter}/{cursor}: it makes no progress"
+                );
+            }
         }
-        last_count = Some(count);
+        last = Some((counter, cursor));
     }
     if max_calls.is_some() {
         return Ok(None);
