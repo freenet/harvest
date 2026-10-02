@@ -35,9 +35,10 @@ calibration (below).
 
 ## Running it
 
-A run takes about seven minutes, almost all of it the two 64-store
-published-script calls (over 800 billion fuel each) while they are over
-budget.
+A run takes under half a minute on #216's delegate. On a delegate without
+the per-call scan bound (V29) it takes about seven minutes: the 64-store
+published-script calls are over 800 billion fuel each, and the spaced run
+then stops the scenario at the harness's 1,000-billion fuel ceiling.
 
 ```sh
 cargo run --release --locked --manifest-path tests/delegate-budget/Cargo.toml
@@ -109,7 +110,8 @@ fails the run on any difference.
 | `InitEncryptionKey`, `DeriveConversationKeys` with 512 peers, store key and Ghost Key | 512 is the mailbox cap (`MAX_MESSAGES`), the most senders one request can name |
 | `RegisterStore`, `ListStores` | registry |
 | `SetPaymentXpub`, `DeriveOrderAddress`, `PeekOrderAddresses (10)`, `DeriveOrderAddress` with a foreign published script | BIP-32 derivation. The foreign script forces the full 100-index `PUBLISHED_INDEX_GAP` scan |
-| `SetPaymentXpub` and `DeriveOrderAddress`, each with the published scripts of one full store (`MAX_ORDERS`, 4096) and of every store full (64 x 4096): the addresses the configured key derives, in a row from its counter | every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further (`published_floor_matches`), so the scan runs as far as the scripts do. The web app sends every owned store's order scripts, and all stores share one payment key. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness, and checked against the delegate's next ten addresses; each call must match all of them, and the counter is put back after it |
+| `SetPaymentXpub` and `DeriveOrderAddress` with a seller's published scripts, run after the export (the payment key does not look at it): one full store (`MAX_ORDERS`, 4096) contiguous from the counter, driven to the end; every store full (64 x 4096), ONE call each; one full store with the scripts `PUBLISHED_INDEX_GAP` apart, 32 calls each | the counter is raised past every published order before an address is handed out, and every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further. Since #216 one call derives at most `FLOOR_SCAN_BUDGET` (384) indices, keeps the count, and answers that it is still catching up; the web app asks again, and so does the harness, requiring the count to move on each time and the final count (or the address handed out) to be one past the last published script. The 64-store input is real: since #181 a seller has one store per Ghost Key, but one delegate holds one payment key for every store, and the web app's `published_payment_scripts` sends every owned store's scripts. Its per-call cost grows with the request (decoding about 6 MiB, building the set of scripts), not with the scan, so one call shows it. The spaced run takes about 1,400 calls to finish; 32 show its per-call bound. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness and checked against the delegate's next ten addresses, and the counter is put back after each run |
+| instant checkout deciding a request against a full store: an instant `OrderRequest` in the first store's mailbox, then the store GET it asks for answered (with the GET's context) by a store of 4096 paid orders, each with a genuine SPV payment proof (about 18 MiB), on addresses contiguous from the counter; repeated while `decide` refuses with `CatchingUp` | `decide` raises the counter past every script the store has published before it invoices. The harness requires every run that publishes nothing to have kept a higher count short of the store's end (the `CatchingUp` refusal is the one that does), and the last run to publish exactly one order, paying the address one past the store's last. `decide` does not check an order's signature, so the orders are signed by a fixture key at their real size |
 | `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `STATUSES_CAP` for both statuses and oversold orders, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
 | tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
 | a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. 2.6x the budget on V29, fixed in #216: see below |
@@ -176,41 +178,51 @@ Same harness, same scenario, two builds of the delegate:
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
 Largest calls with every cap above filled, on the delegate main shipped
-before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…`), committed since.
-Both columns are one run each of the harness at commit `cfd2607`, so every
-row is the same scenario:
+before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…` before the scan
+bound, `69a6d296…` with it), committed since. Both columns are one run each
+of the harness at commit `c4e9a29`, so every row is the same scenario. A run
+of several calls is shown as its most expensive call:
 
 | call | V29 | #216 |
 |---|---:|---:|
-| `SetPaymentXpub`, 64 full stores' published scripts (262,144) | 834,583,191,788 (**20864.6%, over**) | 832,984,432,117 (**20824.6%, over**) |
-| `DeriveOrderAddress`, same | 834,576,950,789 (**20864.4%, over**) | 832,978,196,574 (**20824.5%, over**) |
-| `SetPaymentXpub`, one full store's published scripts (4,096) | 13,050,325,660 (**326.3%, over**) | 13,025,318,693 (**325.6%, over**) |
-| `DeriveOrderAddress`, same | 13,049,967,370 (**326.2%, over**) | 13,024,961,086 (**325.6%, over**) |
+| `SetPaymentXpub`, 64 full stores' published scripts (262,144), one call | 834,583,191,788 (**20864.6%, over**) | 7,849,863,318 (**196.2%, over**), still catching up |
+| `DeriveOrderAddress`, same | 834,576,950,789 (**20864.4%, over**) | 7,842,882,740 (**196.1%, over**), still catching up |
+| `SetPaymentXpub`, one full store's published scripts (4,096) | 13,050,325,660 (**326.3%, over**), 1 call | 1,322,330,495 (33.1%), 11 calls |
+| `DeriveOrderAddress`, same | 13,049,967,370 (**326.2%, over**), 1 call | 1,315,349,403 (32.9%), 11 calls |
+| `SetPaymentXpub`, one full store's scripts 100 apart | past the 1,000-billion ceiling (stops the scenario) | 1,322,007,531 (33.1%), 32 calls, not finished |
+| `DeriveOrderAddress`, same | (not reached) | 1,315,026,815 (32.9%), 32 calls, not finished |
+| instant decide against a store of 4,096 paid orders | 26,110,253,849 (**652.8%, over**), 1 run | 8,722,602,646 (**218.1%, over**), 11 runs (10 at about 7.65 billion) |
 | heartbeat wake-up, 8 full watch delegations | 105,767,562,302 (**2644.2%, over**) | 1,844,244,959 (46.1%) |
 | same, every store's mailbox waiting to be re-read | 105,758,544,149 (**2644.0%, over**) | 1,933,038,739 (48.3%) |
-| tip read answered, 8 full watch delegations | 101,067,360,752 (**2526.7%, over**) | 1,207,268,109 (30.2%) |
-| `ArmAutoInvoice`, 8 full watch delegations | 6,330,624,918 (**158.3%, over**) | 232,229,592 (5.8%) |
+| tip read answered, 8 full watch delegations | 101,067,360,752 (**2526.7%, over**) | 1,207,268,765 (30.2%) |
+| `ArmAutoInvoice`, 8 full watch delegations | 6,330,624,918 (**158.3%, over**) | 232,229,633 (5.8%) |
 | forced `Heartbeat`, 8 full watch delegations | 6,132,743,453 (**153.3%, over**) | 170,641,580 (4.3%) |
-| mailbox notification at the byte cap, plaintexts built to be slow to decode | 13,710,079,810 (**342.8%, over**) | 1,963,576,271 (49.1%) a run, 7 runs |
-| the wake-up's mailbox read answered, same mailbox | 13,640,295,281 (**341.0%, over**) | 1,866,775,454 (46.7%) a run |
-| mailbox notification at the byte cap | 10,389,383,503 (**259.7%, over**) | 1,359,396,238 (34.0%) a run, 7 runs |
-| `ExportSecrets`, 16 full ledgers | 8,074,583,065 (**201.9%, over**) | 1,083,347,801 (27.1%) |
+| mailbox notification at the byte cap, plaintexts built to be slow to decode | 13,710,079,810 (**342.8%, over**) | 1,963,465,605 (49.1%) a run, 7 runs |
+| the wake-up's mailbox read answered, same mailbox | 13,640,295,281 (**341.0%, over**) | 1,866,648,169 (46.7%) a run |
+| mailbox notification at the byte cap | 10,389,383,503 (**259.7%, over**) | 1,359,137,965 (34.0%) a run, 7 runs |
+| `ExportSecrets`, 16 full ledgers | 8,074,625,933 (**201.9%, over**) | 1,083,357,132 (27.1%) |
 | heartbeat wake-up, 16 full ledgers | 7,659,484,431 (**191.5%, over**) | 1,044,678,002 (26.1%), with 15 of the 16 retry flags missing (the seeded ledgers'; a missing flag means reading the ledger, the worst case) |
 | same, every store's mailbox waiting to be re-read | 7,660,135,838 (**191.5%, over**) | 168,491,440 (4.2%) |
 | `KeepPurchase`, the 1024th | 3,192,943,691 (79.8%) | 2,216,880,431 (55.4%) |
-| mailbox notification, 512 short messages | 3,189,665,483 (79.7%) | 794,663,288 (19.9%) a run, 4 runs |
+| mailbox notification, 512 short messages | 3,189,665,483 (79.7%) | 794,658,923 (19.9%) a run, 4 runs |
 | `ImportMigratedSecret`, full ledger into a full ledger | 3,079,750,200 (77.0%) | 1,254,631,664 (31.4%) |
+| mailbox notification, one instant request | 2,940,227,930 (73.5%) | 134,960,678 (3.4%) |
 | `ListKeptPurchases (1024)` | 2,906,374,863 (72.7%) | 2,201,595,405 (55.0%) |
 
-**#216 is still over budget on the published-script scan.** Each matching
-script lets `bitcoin::published_floor_matches` derive `PUBLISHED_INDEX_GAP`
-further, at about 3.2 million fuel a derivation, so the scan costs as much as
-the run of published addresses is long: one full store is 3.3x the budget,
-and every store full about 208x. The same scan runs in instant checkout's
-`decide` with every script one store has published (not driven here: see
-below). Scripts spaced up to `PUBLISHED_INDEX_GAP` apart, which abandoned
-invoices allow, would make one store's scan about 100x longer still. The fix
-belongs in the delegate; until it lands this harness is red on #216.
+**#216 is still over budget in two places.** The published-script scan is
+bounded per call since `FLOOR_SCAN_BUDGET` (384 derivations, about 1.2
+billion fuel), and one store's scripts, contiguous or spaced, now cost a
+third of the budget a call. What is left grows with the INPUT, not the scan:
+
+* One request carrying every store's scripts (262,144, about 6 MiB) costs
+  about 2x the budget before the scan starts.
+* Instant checkout's `decide` against a store of 4,096 paid orders (about
+  18 MiB of state) costs about 1.9x the budget on every catch-up run and
+  2.2x on the run that invoices, most of it in reading the store rather
+  than in the 384 derivations.
+
+The fixes belong in the delegate; until they land this harness is red on
+#216.
 
 **The V29 over-budget rows were real findings, not harness artefacts.**
 
@@ -235,7 +247,7 @@ reads, the delegations and payment key read once per run, a status that
 reads only the ledger fields it shows, and an export written without the
 stdlib's per-byte encoding. The PR has the details.
 
-On #216 every other call is within budget. The ones to watch each grow with
+Apart from those two, every call on #216 is within budget. The ones to watch each grow with
 a collection; at the caps the largest use 46-55% of the budget (`KeepPurchase`
 into a full store, `ListKeptPurchases (1024)`, the slow-plaintext mailbox run
 and its retry read, and the wake-up with full watch delegations).
@@ -254,10 +266,8 @@ delegation it reads for).
     and the certificate is `tests/fixtures/ghostkey-certificate.pem`, which
     the paths measured never check. A wake-up that SENDS a watch request
     (signs an inbox entry) is not driven.
-  * The instant-checkout decide path: the store GET answer that decides a
-    batch of up to 16 instant orders (`auto_invoice::on_store_state`,
-    `decide`), and the store UPDATE answer. This is the largest unmeasured
-    piece of crypto.
+  * The rest of the instant-checkout decide path: a batch of up to 16
+    instant requests (one is driven), and the store UPDATE answer.
   * A mailbox full of instant `OrderRequest`s: unlike the texts above, these
     are not marked read and are reopened on every notification.
   * `ImportMigratedSecret` of the RSA key (`harvest:rsa_pk:*`, which
