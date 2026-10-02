@@ -983,22 +983,12 @@ pub(crate) fn ReportForm(target: ComplaintTarget, back: super::router::Page) -> 
     let order_id = target.order_id();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
-    let (offer, message_to, store_page, paid_there) = {
+    let (offer, message_to, store_page) = {
         let state = APP_STATE.read();
-        let store_page = target.store_page(&state);
         (
             complaint_offer(&state, &target),
             target.conversation(&state),
-            store_page.clone(),
-            // Whether a message from the store page would go into a paid
-            // conversation, needing no Ghost Key (`compose_tag` continues
-            // the last conversation).
-            store_page.as_ref().is_some_and(|id| {
-                matches!(
-                    state.compose_gate_in(id, None),
-                    crate::voucher_flow::ComposeGate::PaidOrder { .. }
-                )
-            }),
+            target.store_page(&state),
         )
     };
     let short = order_id.short();
@@ -1028,23 +1018,22 @@ pub(crate) fn ReportForm(target: ComplaintTarget, back: super::router::Page) -> 
                         "Message the seller"
                     }
                 },
-                // This order's conversation is not on this device: a
-                // message from the store page starts or continues another
-                // one (msg1 critique MSG-11).
+                // This order's conversation is not on this device. A
+                // conversation is the store's, not the order's (page
+                // structure P8), so "Message the seller" opens the one a new
+                // message continues, which says what it needs (msg1 critique
+                // MSG-11; critique of round 4).
                 (None, Some(id)) => rsx! {
                     p { class: "text-muted small",
-                        if paid_there {
-                            "This order\u{2019}s messages aren\u{2019}t on this device. You can message the \
-                             seller in your conversation about another order with them."
-                        } else {
-                            "This order\u{2019}s messages aren\u{2019}t on this device. You can ask the \
-                             seller from their store\u{2019}s page; that needs a Ghost Key."
-                        }
+                        "The conversation this order was made in isn\u{2019}t on this device."
                     }
                     button {
                         class: "btn btn-primary",
-                        onclick: move |_| super::app::show_store(id.clone()),
-                        "Open their store"
+                        onclick: move |_| super::router::go(super::router::Page::Conversation {
+                            store: id.clone(),
+                            tag: None,
+                        }),
+                        "Message the seller"
                     }
                 },
                 (None, None) => rsx! {

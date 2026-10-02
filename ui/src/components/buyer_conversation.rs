@@ -52,7 +52,9 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                         let item = match &listing {
                             Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                             Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
-                            None => format!("Order {}", p.order_id.short()),
+                            None => super::purchases_view::unnamed_order(
+                                &state.store_name_of(&store).label(),
+                            ),
                         };
                         (
                             Page::Order {
@@ -191,7 +193,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                 }
             }
             aside { class: "col-side",
-                p { class: "side-lbl", "Your orders from this store" }
+                p { class: "side-lbl", "Orders in this conversation" }
                 if orders.is_empty() {
                     p { class: "text-muted small", "None in this conversation." }
                 }

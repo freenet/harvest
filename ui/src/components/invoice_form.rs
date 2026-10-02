@@ -135,7 +135,7 @@ pub(crate) fn CancelInvoice(
 
     if pending {
         return rsx! {
-            p { class: "text-muted", "Cancelling invoice {short}\u{2026}" }
+            p { class: "text-muted", "Cancelling order {short}\u{2026}" }
         };
     }
     // Said instead of a button the delegate would refuse: this device holds
@@ -151,7 +151,7 @@ pub(crate) fn CancelInvoice(
     if sent {
         return rsx! {
             p { class: "text-muted",
-                "Cancellation of invoice {short} sent. It shows here once the store has it."
+                "Cancellation of order {short} sent. It shows here once the store has it."
             }
         };
     }
@@ -161,7 +161,7 @@ pub(crate) fn CancelInvoice(
         }
         if confirming() {
             p { class: "text-warning",
-                "Cancel this invoice? The buyer will see that it\u{2019}s cancelled, and it "
+                "Cancel this order? The buyer will see that it\u{2019}s cancelled, and it "
                 "goes on your store\u{2019}s public record. You can\u{2019}t undo it. If they "
                 "have already paid, or pay anyway, the payment still counts and you owe them "
                 "the goods."
@@ -193,7 +193,7 @@ pub(crate) fn CancelInvoice(
                     problem.set(None);
                     confirming.set(true);
                 },
-                "Cancel invoice"
+                "Cancel order"
             }
         }
     }
@@ -391,7 +391,7 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                 " on mainnet or "
                 code { "vpub" }
                 " on signet and testnet. Harvest derives a fresh receiving "
-                "address from it for each invoice, so no address is ever reused."
+                "address from it for each order, so no address is ever reused."
             }
             p {
                 "In your wallet's settings, set the "
@@ -412,8 +412,8 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                     "is correct: addresses only mean anything relative to the key they come "
                     "from. Entering a key you have used before, here or on another device, "
                     "does not reuse its addresses: Harvest skips past every address your "
-                    "stores' published orders already name. Either way, invoices you have "
-                    "already issued are unaffected: they name an address, not a key."
+                    "stores' published orders already name. Either way, orders already "
+                    "placed are unaffected: they name an address, not a key."
                 }
             }
 
@@ -453,7 +453,7 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
                         xpub.set(String::new());
                         on_done.call(());
                     },
-                    "Save payment key"
+                    "Save payout wallet"
                 }
             }
         }

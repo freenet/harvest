@@ -673,7 +673,8 @@ fn home_content(state: &AppState, store: &SellerStore) -> HomeContent {
                 "Your Ghost Key backs {n} stores, and it can back only one, so buyers \
                  can\u{2019}t buy from any of them."
             ),
-            pill: Some("Buyers can\u{2019}t buy".to_string()),
+            // The header's pill already says buyers can't buy.
+            pill: None,
             thumb: None,
             page: seller_page(&id, SellerView::Settings),
         });
@@ -852,7 +853,14 @@ fn SellerHome(store: SellerStore) -> Element {
     let id = store.contract_id.clone();
     let (rows, notes, setup, numbers) = home_content(&APP_STATE.read(), &store);
 
+    // "Nothing needs you right now" would contradict a header pill saying
+    // buyers can't buy yet (what is left to set up is listed below) or that
+    // the store is closed for good, so the empty To do list is left out
+    // then (critique of round 4).
+    let quiet = store.details_resolved && rows.is_empty() && notes.is_empty();
+    let show_todo = !(quiet && (setup.is_some() || store.closed));
     rsx! {
+        if show_todo {
         section { class: "page-sec",
             h3 { class: "sec-lbl sec-lbl-first", "To do" }
             if !store.details_resolved {
@@ -892,9 +900,10 @@ fn SellerHome(store: SellerStore) -> Element {
                 }
             }
         }
+        }
         if let Some(setup) = setup {
             section { class: "page-sec",
-                h3 { class: "sec-lbl", "Finish setting up" }
+                h3 { class: if show_todo { "sec-lbl" } else { "sec-lbl sec-lbl-first" }, "Finish setting up" }
                 ul { class: "checklist",
                     li { class: "done", "Store opened" }
                     li { class: if setup.details { "done" } else { "" },
@@ -1188,7 +1197,7 @@ fn SellerOrders(store: SellerStore, filter: OrderFilter) -> Element {
                         "{row.sub}"
                         if row.new_message {
                             " \u{00b7} "
-                            strong { class: "rc-flag", "new message" }
+                            strong { class: "rc-flag", "Waiting for your reply" }
                         }
                     }
                 }

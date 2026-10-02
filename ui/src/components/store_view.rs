@@ -999,8 +999,12 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     let picture = super::item_image::listing_image(&l.id, &l.title);
     let network = crate::gateway::bitcoin_config::default_network();
     let test = super::pay_card::is_test_network(network);
-    // "Sold out" is said once, where the form would be.
+    // "Sold out" is said once, by the name.
     let stock = availability_words(&availability, false).filter(|w| w != "Sold out");
+    let sold_out = matches!(
+        availability,
+        harvest_common::listing::ListingAvailability::SoldOut
+    );
     let delivery = price_lines(&l).map(|(_, delivery)| delivery);
     // Why nothing can be bought here, in one line, in place of the form.
     let why_not = if offer.is_some() || own_preview {
@@ -1008,7 +1012,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     } else if browsing.closed || closed {
         Some("This store is closed right now, so this can\u{2019}t be bought.".to_string())
     } else if !availability.is_buyable() {
-        Some("This has sold out.".to_string())
+        Some("None are left.".to_string())
     } else if !l.offers_instant_checkout() {
         Some(NOT_PRICED.to_string())
     } else if browsing.unverified_listings.contains(&l.id) {
@@ -1024,9 +1028,18 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
         // The item's name and price head the page; the form is beside its
         // description (and its picture, when it has one).
         div { class: "item-head",
-            h2 { class: "item-title", "{l.title}" }
+            // Sold out is the item's status, so it sits by its name (rule:
+            // status lives in headers), and the price is muted.
+            if sold_out {
+                div { class: "page-title",
+                    h2 { class: "item-title", "{l.title}" }
+                    span { class: "pill", "Sold out" }
+                }
+            } else {
+                h2 { class: "item-title", "{l.title}" }
+            }
             if let Some((price, _)) = price_lines(&l) {
-                p { class: "item-price",
+                p { class: if sold_out { "item-price text-muted" } else { "item-price" },
                     "{price}"
                     if test {
                         span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }

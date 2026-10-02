@@ -98,7 +98,9 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                     None => match pending.as_ref() {
                         Some(p) => format!("{}\u{a0}\u{00d7}\u{a0}{}", p.title, p.quantity),
-                        None => format!("Order {}", purchase.order_id.short()),
+                        None => super::purchases_view::unnamed_order(
+                            &state.store_name_of(&store).label(),
+                        ),
                     },
                 };
                 let open = state.buyer_open(&store, now);
@@ -514,14 +516,17 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
     let short = order.short();
     let amount = super::pay_card::money(kept.order.order.amount_sats, kept.order.order.network);
     let status = order_status::kept_status(&APP_STATE.read(), &kept);
+    let title = super::purchases_view::unnamed_order(
+        store_name.as_deref().unwrap_or("a store you have used"),
+    );
     rsx! {
         {back}
         div { class: "page-title",
-            h2 { "Order {short}" }
+            h2 { "{title}" }
             span { class: "{status.pill_class()}", "{status.label()}" }
         }
         p { class: "page-meta",
-            "From {store_name.clone().unwrap_or_else(|| \"a store you have used\".to_string())} \u{00b7} ordered {order_status::short_date(kept.order.order.created_at)} \u{00b7} {amount}"
+            "Ordered {order_status::short_date(kept.order.order.created_at)} \u{00b7} {amount} \u{00b7} order {short}"
         }
         div { class: "panel",
             if paid {
@@ -577,7 +582,9 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
                             title.unwrap_or_else(|| "An item no longer listed".to_string())
                         )
                     })
-                    .unwrap_or_else(|| format!("Order {}", order.short()));
+                    .unwrap_or_else(|| {
+                        super::purchases_view::unnamed_order(&state.store_name_of(store).label())
+                    });
                 let stage_line = purchase
                     .as_ref()
                     .and_then(|p| p.paid.clone())
@@ -599,19 +606,24 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
                     stage_line,
                 )
             }
-            OrderAt::Kept(store_key) => (
-                Some(ComplaintTarget::Kept {
-                    store_key: *store_key,
-                    order_id: order.clone(),
-                }),
-                format!("Order {}", order.short()),
-                state
+            OrderAt::Kept(store_key) => {
+                let store_name = state
                     .browsing_stores
                     .iter()
                     .find(|(_, s)| s.owner == Some(*store_key))
-                    .map(|(id, _)| state.store_name_of(id).label()),
-                None,
-            ),
+                    .map(|(id, _)| state.store_name_of(id).label());
+                (
+                    Some(ComplaintTarget::Kept {
+                        store_key: *store_key,
+                        order_id: order.clone(),
+                    }),
+                    super::purchases_view::unnamed_order(
+                        store_name.as_deref().unwrap_or("a store you have used"),
+                    ),
+                    store_name,
+                    None,
+                )
+            }
         }
     };
     let order_page = Page::Order {

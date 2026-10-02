@@ -216,7 +216,7 @@ body::before {
        .store-head-acts, .chips, .two-col, .item-grid, .item-card,
        .item-page, .bill, .amount-field, .progress, .side-row, .switch-menu,
        .row-more-menu, .needs-menu, .open-steps > li, .todo-note,
-       .row-more > summary.btn,
+       .row-more > summary.btn, .seller-listing:has(.row-thumb),
        .item-grid:not(.gallery) .item-card:has(.item-card-img)) > * {
   margin-top: 0;
   margin-left: 0;
@@ -2119,6 +2119,12 @@ h4 {
   background: var(--bg-card);
 }
 
+/* In a list where some rows have a picture, a row without one keeps the
+   picture's room, so every row's words start at the same place. */
+:has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) > .rc-main {
+  margin-left: calc(3rem + var(--space-md));
+}
+
 .rc-flag {
   color: var(--amber);
   font-weight: 600;
@@ -2535,8 +2541,10 @@ h4 {
 .item-picture {
   grid-area: pic;
   width: 100%;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
+  /* Square and whole: a product photo is not cropped on its own page. */
+  aspect-ratio: 1;
+  object-fit: contain;
+  background: white;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
 }
@@ -2663,6 +2671,20 @@ h4 {
 
 .seller-listing-main {
   flex: 1;
+}
+
+/* Stacked on a phone, a picture stays beside the words it belongs to. */
+@media (max-width: 600px) {
+  .seller-listing:has(.row-thumb) {
+    display: grid;
+    grid-template-columns: 3.25rem minmax(0, 1fr);
+    column-gap: var(--space-md);
+    row-gap: var(--space-sm);
+  }
+
+  .seller-listing:has(.row-thumb) > .seller-listing-actions {
+    grid-column: 1 / -1;
+  }
 }
 
 .list-head {

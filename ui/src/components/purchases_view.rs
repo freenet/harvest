@@ -110,7 +110,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 item: match &listing {
                     Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
-                    None => format!("Order {}", purchase.order_id.short()),
+                    None => unnamed_order(&store.name),
                 },
                 store: store.name.clone(),
                 date: order.map(|o| o.order.created_at),
@@ -136,7 +136,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 at: OrderAt::Kept(kept.store_key),
                 order: kept.order.order.id.clone(),
             },
-            item: format!("Order {}", kept.order.order.id.short()),
+            item: unnamed_order(&store),
             store,
             date: Some(kept.order.order.created_at),
             amount: Some(super::pay_card::money(
@@ -532,7 +532,6 @@ pub fn BackupPage() -> Element {
              and report a problem, on another device."
         }
         section { class: "panel",
-            h3 { class: "panel-h", "Your backups" }
             p { class: "text-muted small",
                 "Each store you have bought from or written to has its own backup, which holds your \
                  orders and messages with it. Keep it private, like a password: anyone who has it \
@@ -611,6 +610,15 @@ fn unreachable_note(failed: usize) -> Option<String> {
              missing here. Reload to try again."
         )),
     }
+}
+
+/// What an order is called when this device cannot say what it was for:
+/// the item is named only inside the buyer's conversation with the store
+/// (`Order` carries no listing id, harvest#57), so a conversation that was
+/// forgotten, or an order restored from a backup, has no item to show. Never
+/// its code, which says nothing to a person.
+pub(crate) fn unnamed_order(store: &str) -> String {
+    format!("An order from {store}")
 }
 
 #[cfg(test)]
