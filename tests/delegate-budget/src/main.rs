@@ -781,6 +781,70 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
 
+    // The byte cap again, each message's plaintext written to cost the most
+    // to decode rather than a text: a valid message with an extra field of
+    // one-byte integers, which the decoder walks one by one. Anyone can
+    // encrypt their own plaintext to a store's inbox.
+    let hostile: Vec<harvest_common::mailbox::EncryptedMessage> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let mut seed = [0xA0u8; 32];
+            seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            let buyer = StaticSecret::from(seed);
+            let tag = *PublicKey::from(&buyer).as_bytes();
+            let shared = buyer.diffie_hellman(&PublicKey::from(inbox)).to_bytes();
+            let key = harvest_common::mailbox::conversation_key_from_dh(
+                &shared,
+                harvest_common::mailbox::MessageDirection::BuyerToSeller,
+            );
+            let id = harvest_common::mailbox::ConversationId([(i % 251) as u8; 32]);
+            let plaintext = Value::Map(vec![
+                (
+                    Value::Text("conversation_id".into()),
+                    Value::Array(id.0.iter().map(|b| Value::Integer((*b).into())).collect()),
+                ),
+                (
+                    Value::Text("content".into()),
+                    Value::Map(vec![(
+                        Value::Text("Text".into()),
+                        Value::Text(String::new()),
+                    )]),
+                ),
+                (
+                    Value::Text("pad".into()),
+                    Value::Array(vec![Value::Integer(0.into()); len.saturating_sub(64)]),
+                ),
+            ]);
+            fixtures::encrypt_bytes_seeded(
+                &cbor(&plaintext),
+                &id,
+                &tag,
+                &key,
+                r.host.state.now - chrono::Duration::seconds(i as i64),
+                20_000 + i as u64,
+            )
+        })
+        .collect();
+    let hostile_state = mailbox_state(hostile)?;
+    if hostile_state.messages.len() != big_state.messages.len() {
+        bail!("the hostile mailbox is not the byte-cap mailbox's shape");
+    }
+    drain_mailbox(
+        r,
+        "ContractNotification: mailbox (byte cap, plaintexts built to be slow)",
+        mailbox_contract,
+        store_contract,
+        cbor(&hostile_state),
+    )?;
+    let seen_hostile = ledger_seen(r, &ledger)?;
+    if seen_hostile != (seen_after + new).min(seen_cap) {
+        bail!(
+            "the hostile mailbox scan recorded {} of its {new} messages as read",
+            seen_hostile.saturating_sub(seen_after)
+        );
+    }
+
     // Every other arm's ledger at its caps, in the delegate's own encoding
     // (`auto_invoice::Ledger`, mirrored in `fixtures::ledger`): the wake-up
     // and the export decode each arm's ledger.
@@ -986,6 +1050,22 @@ fn scenario(r: &mut Runner) -> Result<()> {
             }),
         }),
         "KeptPurchases",
+    )?;
+    // A keep naming a conversation this node does not hold: the lookup by
+    // tag misses and the scan of every conversation runs to the end before
+    // the keep is refused.
+    let stranger = *PublicKey::from(&StaticSecret::from([0x5Au8; 32])).as_bytes();
+    r.app(
+        "KeepPurchase (a conversation not held, store full)",
+        cbor(&HarvestDelegateRequest::KeepPurchase {
+            keep: Box::new(PurchaseToKeep {
+                store_key: seller_store_key,
+                conversation: stranger,
+                order: orders.paid(orders.order(KEPT_PURCHASES as u32 + 1, last_receipt)),
+                complaint: None,
+            }),
+        }),
+        "KeepPurchaseRefused",
     )?;
     let kept = r.app(
         &format!("ListKeptPurchases ({KEPT_PURCHASES})"),

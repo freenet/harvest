@@ -159,18 +159,34 @@ pub fn encrypt_message_seeded(
     timestamp: DateTime<Utc>,
     nonce_seed: u64,
 ) -> harvest_common::mailbox::EncryptedMessage {
+    let bytes = harvest_common::to_cbor(plaintext).expect("encode plaintext");
+    encrypt_bytes_seeded(
+        &bytes,
+        &plaintext.conversation_id,
+        tag,
+        aes_key,
+        timestamp,
+        nonce_seed,
+    )
+}
+
+/// [`encrypt_message_seeded`] of any plaintext bytes: what a writer who
+/// encodes their own message can send.
+pub fn encrypt_bytes_seeded(
+    bytes: &[u8],
+    conversation_id: &harvest_common::mailbox::ConversationId,
+    tag: &[u8; 32],
+    aes_key: &[u8; 32],
+    timestamp: DateTime<Utc>,
+    nonce_seed: u64,
+) -> harvest_common::mailbox::EncryptedMessage {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
-    let bytes = harvest_common::to_cbor(plaintext).expect("encode plaintext");
-    let padded = harvest_common::mailbox::pad_to_bucket(&bytes);
+    let padded = harvest_common::mailbox::pad_to_bucket(bytes);
     let mut nonce = [0u8; 24];
     nonce.copy_from_slice(&blake3::hash(&nonce_seed.to_le_bytes()).as_bytes()[..24]);
-    let aad = harvest_common::mailbox::message_aad(
-        &plaintext.conversation_id,
-        tag.as_slice(),
-        &timestamp,
-        &nonce,
-    );
+    let aad =
+        harvest_common::mailbox::message_aad(conversation_id, tag.as_slice(), &timestamp, &nonce);
     let ciphertext = Aes256Gcm::new_from_slice(aes_key)
         .expect("32-byte key")
         .encrypt(
@@ -182,7 +198,7 @@ pub fn encrypt_message_seeded(
         )
         .expect("encrypt");
     harvest_common::mailbox::EncryptedMessage {
-        conversation_id: plaintext.conversation_id.clone(),
+        conversation_id: conversation_id.clone(),
         sender_public_key: tag.to_vec(),
         ciphertext,
         timestamp,
