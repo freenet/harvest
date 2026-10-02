@@ -1028,6 +1028,102 @@ mod tests {
             .collect()
     }
 
+    /// The scan before #206 bounded it, kept verbatim as the reference.
+    fn floor_unbounded(status: &mut PaymentXpubStatus, published: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut remaining: std::collections::HashSet<&[u8]> =
+            published.iter().map(Vec::as_slice).collect();
+        let mut matched = Vec::new();
+        if remaining.is_empty() {
+            return matched;
+        }
+        let chain = AccountXpub::parse(&status.xpub)
+            .unwrap()
+            .external_chain()
+            .unwrap();
+        let mut index = status.next_index;
+        let mut give_up_at = index.saturating_add(PUBLISHED_INDEX_GAP);
+        while index <= MAX_ORDER_INDEX && index < give_up_at && !remaining.is_empty() {
+            let script = chain.script_at(index).unwrap();
+            if remaining.remove(script.as_slice()) {
+                matched.push(script);
+                status.next_index = index + 1;
+                give_up_at = status.next_index.saturating_add(PUBLISHED_INDEX_GAP);
+            }
+            index += 1;
+        }
+        matched
+    }
+
+    /// #206, #183: the bounded scan, repeated with the same scripts until it
+    /// is complete (as each caller does: Err and ask again, or a refused
+    /// batch and the next run), reaches exactly the count the unbounded scan
+    /// reached and matches the same scripts, over random published sets:
+    /// contiguous runs, gaps up to and past `PUBLISHED_INDEX_GAP`, scripts
+    /// below the counter, foreign scripts, and runs longer than one call.
+    /// So bounding it never lets an address below the true floor out.
+    /// Mutated red by resuming past the count reached rather than from it.
+    #[test]
+    fn the_bounded_scan_repeated_reaches_the_unbounded_floor() {
+        let key = signet_vpub();
+        let chain = AccountXpub::parse(&key).unwrap().external_chain().unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for round in 0..24 {
+            let start = next(50) as u32;
+            let mut indices = Vec::new();
+            let mut at = start;
+            let count = 1 + next(if round % 3 == 0 { 900 } else { 60 });
+            for _ in 0..count {
+                // Mostly close, sometimes a gap of up to the limit, now and
+                // then past it (which ends the scan there).
+                at += match next(40) {
+                    0 => PUBLISHED_INDEX_GAP + next(20) as u32,
+                    1..=3 => next(u64::from(PUBLISHED_INDEX_GAP)) as u32,
+                    _ => 1 + next(3) as u32,
+                };
+                indices.push(at);
+            }
+            if start > 0 {
+                indices.push(start - 1);
+            }
+            let mut published: Vec<Vec<u8>> = indices
+                .iter()
+                .map(|&i| chain.script_at(i).unwrap())
+                .collect();
+            published.push(vec![0x00, 0x14, round as u8]);
+            let mut reference = PaymentXpubStatus {
+                xpub: key.clone(),
+                network: BitcoinNetwork::Signet,
+                next_index: start,
+            };
+            let mut want = floor_unbounded(&mut reference, &published);
+            want.sort();
+            let mut bounded = PaymentXpubStatus {
+                next_index: start,
+                ..reference.clone()
+            };
+            let mut got = Vec::new();
+            let mut calls = 0;
+            loop {
+                calls += 1;
+                assert!(calls < 100, "round {round}: no end");
+                let scan = published_floor_scan(&mut bounded, &published).unwrap();
+                got.extend(scan.matched);
+                if scan.complete {
+                    break;
+                }
+            }
+            got.sort();
+            assert_eq!(bounded.next_index, reference.next_index, "round {round}");
+            assert_eq!(got, want, "round {round}");
+        }
+    }
+
     /// **The reported case.** A fresh install holds no count, the same key is
     /// entered, and the store already publishes orders at indices 0-2. The
     /// next invoice must be index 3, not 0.
