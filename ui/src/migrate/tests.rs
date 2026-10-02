@@ -641,7 +641,8 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03".to_string(),
             // V30, from `git show d0fede7:ui/public/contracts/harvest_delegate.wasm`,
             // the generation harvest#216 shipped. Superseded by a heartbeat
-            // that says not taking orders whenever the delegate would refuse.
+            // that says not taking orders whenever the delegate would refuse,
+            // and by refusing twins of a buyer's X25519 tag.
             "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72".to_string(),
         ],
     );

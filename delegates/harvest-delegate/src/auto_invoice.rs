@@ -2262,6 +2262,13 @@ fn open_instant(
     let (tag, to_seller, from_seller) = conversation_keys(store_sk, &message.sender_public_key)?;
     let plaintext = decrypt_message(message, &to_seller).ok()?;
     match plaintext.content {
+        // A twin of a buyer's tag opens with the buyer's own keys, so
+        // whoever holds them could place a request under it: refused, as
+        // `messaging::conversation_keys_from` refuses to derive its keys
+        // (`messaging::is_canonical_tag`). Checked only for an instant
+        // request that has opened, the one message this delegate acts on, so
+        // the subgroup test's scalar multiplication is never paid for junk or
+        // a chat message.
         MessageContent::OrderRequest {
             listing_id,
             quantity,
@@ -2269,7 +2276,7 @@ fn open_instant(
             buyer_receipt_key,
             instant: Some(instant),
             ..
-        } => Some((
+        } if crate::messaging::is_canonical_tag(&tag) => Some((
             tag,
             from_seller,
             plaintext.conversation_id,
@@ -3548,9 +3555,25 @@ mod tests {
             at_ms: u64,
             sent_ms: u64,
         ) -> EncryptedMessage {
+            self.request_under(&self.tag(), listing, quantity, nonce, total, at_ms, sent_ms)
+        }
+
+        /// [`Buyer::request_dated`], sent under `tag`, which need not be
+        /// this buyer's own: a twin of it shares its keys.
+        #[allow(clippy::too_many_arguments)]
+        fn request_under(
+            &self,
+            tag: &[u8; 32],
+            listing: &Listing,
+            quantity: u32,
+            nonce: u8,
+            total: u64,
+            at_ms: u64,
+            sent_ms: u64,
+        ) -> EncryptedMessage {
             harvest_common::sealed::seal(
                 &self.keys().0,
-                &self.tag(),
+                tag,
                 &self.conversation,
                 MessageContent::OrderRequest {
                     listing_id: listing.id.clone(),
@@ -7094,6 +7117,42 @@ mod tests {
             global_refusal(&f.secrets, &f.record, None, NOW),
             Err(Refusal::NoFreshTip),
             "no tip"
+        );
+    }
+
+    /// A Buy now sent under a twin of the buyer's tag (bit 255 set, or the
+    /// tag plus a small-torsion point) opens with the buyer's own keys, so
+    /// whoever holds them could place it; it is not taken as a request, and nothing
+    /// is invoiced to it (harvest#205 review, S1). The buyer's own tag still
+    /// is. Mutated red by dropping the check in `open_instant`.
+    #[test]
+    fn a_request_under_a_twin_of_the_buyers_tag_is_not_opened() {
+        let buyer = Buyer::new(40);
+        let real = buyer.tag();
+        let mut twins = Vec::new();
+        let mut high = real;
+        high[31] |= 0x80;
+        twins.push(high);
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .unwrap();
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            twins.push((point + torsion).to_montgomery().to_bytes());
+        }
+        for (i, twin) in twins.iter().enumerate() {
+            let mut f = fixture();
+            let entry = buyer.request_under(twin, &jam(), 1, 1, 12_000, NOW - 5_000, NOW - 5_000);
+            let decided = run(&mut f, &[entry]);
+            assert!(decided.orders.is_empty(), "twin {i}: {:?}", decided.refused);
+            assert!(decided.replies.is_empty(), "twin {i}: nothing sent to it");
+            assert_eq!(counter(&f), 0, "twin {i}: no address spent");
+        }
+        let mut f = fixture();
+        assert_eq!(
+            run(&mut f, &[buyer.request(&jam(), 1, 1, 12_000)])
+                .orders
+                .len(),
+            1
         );
     }
 

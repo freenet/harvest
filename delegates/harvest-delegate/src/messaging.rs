@@ -190,6 +190,66 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
     conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
 }
 
+/// Whether `tag` is a conversation tag a seller derives keys for: the
+/// canonical 32-byte encoding (bit 255 clear, u below p = 2^255 - 19) of a
+/// point on Curve25519 in its prime-order subgroup.
+///
+/// X25519 gives every buyer key twins with the SAME shared secret, and so
+/// the same conversation keys and listing tags:
+///
+/// * encoding twins: X25519 ignores bit 255 and reduces u modulo p, so the
+///   same bytes with bit 255 set (and, for u < 19, u + p) are the same key;
+/// * torsion twins: the seller's scalar is clamped to a multiple of 8, so
+///   for each of the 7 non-trivial points Q of order dividing 8, P + Q gives
+///   the same secret as P. These are canonical and pass the contributory
+///   check.
+///
+/// Whoever holds a conversation's keys could write under any twin, and a
+/// reader keyed by tag would see a second conversation with the first one's
+/// keys, one that claims the first one's paid orders by listing tag. An
+/// honest buyer's tag is always b·G, canonical and torsion-free, so refusing
+/// twins costs nobody anything; the subgroup check also refuses points on
+/// the twist. The UI's `messaging::is_canonical_tag` (harvest#205) is the
+/// same rule. Applied wherever this delegate derives conversation keys from a
+/// buyer's tag: [`derive_conversation_keys`] and instant checkout's opening
+/// of a request (`auto_invoice::open_instant`).
+///
+/// Here rather than in harvest-common, which the UI could share: the shared
+/// WASM build unifies features, so a curve25519-dalek dependency in
+/// harvest-common moved all five contracts' code hashes. The subgroup check
+/// costs one scalar multiplication.
+pub(crate) fn is_canonical_tag(tag: &[u8]) -> bool {
+    let Ok(key) = <[u8; 32]>::try_from(tag) else {
+        return false;
+    };
+    canonical_encoding(&key)
+        && curve25519_dalek::montgomery::MontgomeryPoint(key)
+            .to_edwards(0)
+            .is_some_and(|point| torsion_free(&point))
+}
+
+/// `point.is_torsion_free()`, in variable time: `[ℓ]P` is the identity, as
+/// `[ℓ - 1]P + P` (ℓ - 1 is a scalar `Scalar` holds, ℓ itself reduces to 0).
+/// A tag is public, so nothing is gained by the constant-time
+/// multiplication, which cost about 1.7 X25519 agreements under the node's
+/// fuel metering and put `DeriveConversationKeys` for 512 peers at 100.6% of
+/// a call (`tests/delegate-budget`). Pinned against `is_torsion_free` by
+/// `the_fast_torsion_check_is_dalek_s`.
+fn torsion_free(point: &curve25519_dalek::edwards::EdwardsPoint) -> bool {
+    use curve25519_dalek::traits::IsIdentity;
+    use curve25519_dalek::{EdwardsPoint, Scalar};
+    (EdwardsPoint::vartime_double_scalar_mul_basepoint(&-Scalar::ONE, point, &Scalar::ZERO) + point)
+        .is_identity()
+}
+
+/// Whether `key` is the canonical encoding of a u-coordinate: bit 255 clear
+/// and below p. Below 2^255, the values at or above p are p..=2^255-1: 0x7f
+/// in the top byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+fn canonical_encoding(key: &[u8; 32]) -> bool {
+    let at_least_p = key[31] == 0x7f && key[1..31].iter().all(|b| *b == 0xff) && key[0] >= 0xed;
+    key[31] & 0x80 == 0 && !at_least_p
+}
+
 /// The conversation keys `secret` shares with each well-formed peer key.
 fn conversation_keys_from(
     request_id: RequestId,
@@ -200,6 +260,14 @@ fn conversation_keys_from(
     let derived = peer_public_keys
         .iter()
         .filter_map(|peer| {
+            // A twin of a buyer's tag (bit 255 set, u + p, or the tag plus a
+            // small-torsion point) has the same shared secret as the tag
+            // itself, so answering it would give a second conversation the
+            // first one's keys ([`is_canonical_tag`]). Checked first: the
+            // subgroup test is the dearer of the two.
+            if !is_canonical_tag(peer) {
+                return None;
+            }
             let bytes: [u8; 32] = peer.as_slice().try_into().ok()?;
             let shared = secret.diffie_hellman(&PublicKey::from(bytes));
             // A low-order point makes the shared secret all zeros, so the
@@ -1278,6 +1346,58 @@ mod tests {
             );
             assert_eq!(&found.seller_to_buyer, &expected.seller_to_buyer);
         }
+    }
+
+    /// A buyer's tag and every twin of it with the same shared secret:
+    /// bit 255 set, each small-torsion twin (`EIGHT_TORSION`), a point on
+    /// the twist, and u + p for u < 19. Only the canonical tag is answered
+    /// (harvest#205 review, S1). Mutated red by dropping either half of
+    /// `is_canonical_tag` or the check here.
+    #[test]
+    fn only_the_canonical_tag_of_a_buyer_key_is_answered() {
+        let mut store = MemSecrets::default();
+        init_encryption_key(&mut store, FP, false);
+        let answered = |peers: &[[u8; 32]]| {
+            let peers: Vec<Vec<u8>> = peers.iter().map(|p| p.to_vec()).collect();
+            keys(&derive_conversation_keys(&store, 1, FP, &peers, None))
+                .into_iter()
+                .map(|k| k.peer_public_key)
+                .collect::<Vec<_>>()
+        };
+        let real = *PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        assert_eq!(answered(&[real]), vec![real.to_vec()], "the canonical tag");
+
+        let mut high = real;
+        high[31] |= 0x80;
+        assert!(answered(&[high]).is_empty(), "the bit-255 twin");
+
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .expect("a real key is on the curve");
+        let mut twins = 0;
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            assert_ne!(twin, real);
+            assert_eq!(twin[31] & 0x80, 0, "precondition: canonical bytes");
+            assert!(answered(&[twin]).is_empty(), "a torsion twin");
+            twins += 1;
+        }
+        assert_eq!(twins, 7);
+
+        // u = 2 is not on Curve25519: a point on the twist.
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(answered(&[twist]).is_empty(), "a twist point");
+
+        // u + p for every u < 19: the same u to X25519, never canonical.
+        for u in 0u8..19 {
+            let mut over = [0xffu8; 32];
+            over[31] = 0x7f;
+            over[0] = 0xed + u;
+            assert!(answered(&[over]).is_empty(), "u + p for u = {u}");
+        }
+        // And the canonical tag still answered beside them all.
+        assert_eq!(answered(&[high, twist, real]), vec![real.to_vec()]);
     }
 
     /// A low-order peer point makes X25519 produce an all-zero shared secret,
@@ -2721,5 +2841,83 @@ mod buyer_conversation_backup_tests {
             &harvest_common::to_cbor(&record(secret)).unwrap(),
         );
         assert_eq!(conversation_secret_for_tag(&store, &tag), Some(secret));
+    }
+}
+
+#[cfg(test)]
+mod canonical_tag_tests {
+    use super::{canonical_encoding, is_canonical_tag};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// The rule itself, over the twins a buyer's tag has: bit 255, p and
+    /// above (u + p for u < 19), each small-torsion twin, a twist point and
+    /// a short slice refused; the real key and p - 1's encoding accepted.
+    /// Each twin is checked to give the real key's shared secret, so the
+    /// test is about twins and not arbitrary bytes. Mutated red by dropping
+    /// either half.
+    #[test]
+    fn only_canonical_prime_order_tags_are_tags() {
+        let real = *PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        let seller = StaticSecret::from([9u8; 32]);
+        let secret = |key: [u8; 32]| seller.diffie_hellman(&PublicKey::from(key)).to_bytes();
+        assert!(is_canonical_tag(&real));
+        assert!(!is_canonical_tag(&real[..31]));
+
+        let mut high = real;
+        high[31] |= 0x80;
+        assert_eq!(secret(high), secret(real), "precondition: a twin");
+        assert!(!is_canonical_tag(&high));
+
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        for u in 0u8..19 {
+            let mut over = p;
+            over[0] = 0xed + u;
+            assert!(!canonical_encoding(&over), "u + p for u = {u}");
+            assert!(!is_canonical_tag(&over));
+        }
+        let mut below_p = p;
+        below_p[0] = 0xec;
+        assert!(canonical_encoding(&below_p), "p - 1 is canonical");
+
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .unwrap();
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            assert_eq!(secret(twin), secret(real), "precondition: a twin");
+            assert!(canonical_encoding(&twin), "precondition: canonical bytes");
+            assert!(!is_canonical_tag(&twin), "a torsion twin");
+        }
+
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(canonical_encoding(&twist));
+        assert!(!is_canonical_tag(&twist), "a twist point");
+    }
+
+    /// The variable-time check answers as `is_torsion_free` does, for points
+    /// in the subgroup, each of them plus every small-torsion point, and the
+    /// torsion points alone. Mutated red by dropping the `+ point`.
+    #[test]
+    fn the_fast_torsion_check_is_dalek_s() {
+        use curve25519_dalek::constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION};
+        use curve25519_dalek::Scalar;
+        let mut checked = 0;
+        for seed in 1u8..=40 {
+            let p = ED25519_BASEPOINT_POINT * Scalar::from_bytes_mod_order([seed; 32]);
+            for q in EIGHT_TORSION.iter() {
+                for point in [p + q, *q] {
+                    assert_eq!(
+                        super::torsion_free(&point),
+                        point.is_torsion_free(),
+                        "seed {seed}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 40 * 8 * 2);
     }
 }
