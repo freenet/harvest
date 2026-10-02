@@ -104,6 +104,8 @@ pub(crate) struct MemSecrets {
     /// Set to make writes of keys under this prefix fail, and only those:
     /// a host that refuses one write of several.
     pub(crate) refused_prefix: Option<Vec<u8>>,
+    /// How many reads were asked of it, for tests that bound a call's work.
+    pub(crate) reads: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -117,6 +119,7 @@ impl SecretStore for MemSecrets {
     }
 
     fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.reads.set(self.reads.get() + 1);
         self.map.get(key).cloned()
     }
 

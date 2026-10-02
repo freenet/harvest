@@ -755,9 +755,10 @@ pub(crate) fn status_for_arm<S: SecretStore>(
 
 fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDelegationStatus {
     let watched = fresh_tip(secrets, held.network, now_ms).map_or(0, |tip| {
+        let vouching = Vouching::new(secrets, held);
         pool(secrets, held.network)
             .iter()
-            .take_while(|s| covers(secrets, held, s, tip.anchor.height))
+            .take_while(|s| covers(&vouching, held, s, tip.anchor.height))
             .count() as u32
     });
     WatchDelegationStatus {
@@ -774,11 +775,11 @@ fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDele
 
 /// Whether the bridge is confirmed watching `script` for this delegation
 /// through a horizon an invoice issued at `tip_height` can rely on.
-fn covers<S: SecretStore>(secrets: &S, held: &Held, script: &[u8], tip_height: u32) -> bool {
+fn covers(vouching: &Vouching, held: &Held, script: &[u8], tip_height: u32) -> bool {
     held.watched.iter().any(|w| {
         w.script == script
             && tip_height.saturating_add(WATCH_NEEDED_BLOCKS) <= w.until_height
-            && vouched(secrets, held, w)
+            && vouched(vouching, w)
     })
 }
 
@@ -786,8 +787,8 @@ fn covers<S: SecretStore>(secrets: &S, held: &Held, script: &[u8], tip_height: u
 /// now watches (it entered the pool, or an arm names it) would find it
 /// scanned whether or not this delegation still stands (codex, round 5 of
 /// #179), so such a watch no longer counts.
-fn vouched<S: SecretStore>(secrets: &S, held: &Held, w: &Watched) -> bool {
-    !canary_compromised(secrets, held, w.canary_index, &w.canary)
+fn vouched(vouching: &Vouching, w: &Watched) -> bool {
+    !vouching.compromised(w.canary_index, &w.canary)
 }
 
 /// I7's second source: the scripts this delegate's own confirmed requests
@@ -807,9 +808,10 @@ pub(crate) fn delegated_watched<S: SecretStore>(
         .iter()
         .filter(|h| h.network == network && bridges.contains(&h.bridge))
         .flat_map(|h| {
+            let vouching = Vouching::new(secrets, h);
             h.watched
                 .iter()
-                .filter(|w| covers(secrets, h, &w.script, tip_height))
+                .filter(|w| covers(&vouching, h, &w.script, tip_height))
                 .map(|w| (w.script.clone(), w.until_height))
                 .collect::<Vec<_>>()
         })
@@ -866,12 +868,36 @@ fn canary_floor(next_index: u32) -> u32 {
 /// into the tab's pool, or an arm names it. Its watermark then shows nothing
 /// about this delegate's request.
 fn canary_compromised<S: SecretStore>(secrets: &S, held: &Held, index: u32, script: &[u8]) -> bool {
-    let in_pool = crate::bitcoin::load_payment_xpub(secrets)
-        .is_none_or(|xpub| index < xpub.next_index.saturating_add(MAX_UPCOMING_ADDRESSES));
-    in_pool
-        || armed_for(secrets, held)
-            .iter()
-            .any(|r| r.arm.watched_scripts.iter().any(|s| s == script))
+    Vouching::new(secrets, held).compromised(index, script)
+}
+
+/// What [`canary_compromised`] reads, read once for every watch of one
+/// delegation: the counter and the scripts its armed stores name. Read per
+/// watch, a delegation's 64 watches each decoded the payment key and every
+/// arm, and [`covers`] asks per watch of every watch, so a status or a
+/// wake-up decoded them thousands of times over (#206).
+pub(crate) struct Vouching {
+    next_index: Option<u32>,
+    armed_scripts: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Vouching {
+    pub(crate) fn new<S: SecretStore>(secrets: &S, held: &Held) -> Self {
+        Vouching {
+            next_index: crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index),
+            armed_scripts: armed_for(secrets, held)
+                .into_iter()
+                .flat_map(|r| r.arm.watched_scripts)
+                .collect(),
+        }
+    }
+
+    fn compromised(&self, index: u32, script: &[u8]) -> bool {
+        let in_pool = self
+            .next_index
+            .is_none_or(|next| index < next.saturating_add(MAX_UPCOMING_ADDRESSES));
+        in_pool || self.armed_scripts.contains(script)
+    }
 }
 
 fn fresh_tip<S: SecretStore>(
@@ -909,14 +935,16 @@ fn refill_scripts<S: SecretStore>(
     let threshold = tip_height
         .saturating_add(WATCH_NEEDED_BLOCKS)
         .saturating_add(RENEW_MARGIN_BLOCKS);
+    let vouching = Vouching::new(secrets, held);
     let fresh = |script: &Vec<u8>| {
-        held.watched.iter().any(|w| {
-            w.script == *script && w.until_height >= threshold && vouched(secrets, held, w)
-        }) || armed.iter().any(|r| {
-            now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
-                && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
-                && r.arm.watched_scripts.contains(script)
-        })
+        held.watched
+            .iter()
+            .any(|w| w.script == *script && w.until_height >= threshold && vouched(&vouching, w))
+            || armed.iter().any(|r| {
+                now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
+                    && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
+                    && r.arm.watched_scripts.contains(script)
+            })
     };
     let pool = pool(secrets, held.network);
     if pool.iter().take(REFILL_BELOW).all(fresh) {
@@ -984,7 +1012,15 @@ fn due_read<S: SecretStore>(
     let probe = next.and_then(|next| {
         held.watched
             .iter()
-            .find(|w| w.script == next && covers(secrets, held, &w.script, tip.anchor.height))
+            .find(|w| {
+                w.script == next
+                    && covers(
+                        &Vouching::new(secrets, held),
+                        held,
+                        &w.script,
+                        tip.anchor.height,
+                    )
+            })
             .map(|w| w.canary.clone())
     });
     if let Some(canary) = probe {
@@ -3032,6 +3068,32 @@ mod tests {
             get.contract_id.as_bytes(),
             address_id(&secrets, &script_at(20)).as_slice()
         );
+    }
+
+    /// #206: which of a delegation's watches count is decided with one read
+    /// of the payment key and the arms for the delegation, not one per watch
+    /// (per watch of every watch, through `covers`): a full delegation's 64
+    /// watches read them thousands of times in each status and wake-up.
+    /// Mutated red by reading them per watch.
+    #[test]
+    fn a_full_delegation_is_vouched_for_with_one_read_of_the_arms() {
+        let mut secrets = delegated();
+        let mut h = held(&secrets);
+        h.watched = (0..WATCHED_CAP as u32)
+            .map(|i| Watched {
+                script: script_at(i),
+                until_height: TIP + 10_000,
+                canary: script_at(1_000 + i),
+                canary_contract: [0; 32],
+                canary_index: 1_000 + i,
+            })
+            .collect();
+        put_held(&mut secrets, &h);
+        let before = secrets.reads.get();
+        let got = delegated_watched(&secrets, BitcoinNetwork::Signet, &[bridge()], TIP);
+        let reads = secrets.reads.get() - before;
+        assert_eq!(got.len(), WATCHED_CAP, "every watch vouched for");
+        assert!(reads <= 8, "{reads} reads for one delegation");
     }
 
     /// Two delegations with work take turns, the least recently read first.

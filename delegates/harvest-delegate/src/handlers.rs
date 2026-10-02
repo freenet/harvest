@@ -56,6 +56,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::kept_purchases::kept_purchase_key(&[8u8; 32]),
         crate::auto_invoice::arm_key(&[9u8; 32]),
         crate::auto_invoice::ledger_key(&[9u8; 32]),
+        crate::auto_invoice::retry_key(&[9u8; 32]),
         crate::auto_invoice::tip_key(freenet_bitcoin_common::BitcoinNetwork::Signet),
         crate::auto_invoice::EXPORTED_KEY.to_vec(),
     ]

@@ -332,8 +332,9 @@ pub(crate) fn import_secret<S: SecretStore>(
                 // first, cleared after, and repaired on a re-import that
                 // finds the ledger already merged.
                 Ok((merged, retry_pending)) => {
-                    let flag = crate::auto_invoice::retry_key_for_ledger(key)
-                        .expect("a ledger key names its store");
+                    let Some(flag) = crate::auto_invoice::retry_key_for_ledger(key) else {
+                        return SecretImport::Permanent("a ledger key that names no store".into());
+                    };
                     if retry_pending && !crate::auto_invoice::sync_retry_flag(store, &flag, true) {
                         return SecretImport::Retryable("the retry flag was not saved".into());
                     }
@@ -983,6 +984,7 @@ mod tests {
             Family::KeptPurchase,
             Family::Refused,    // instant-checkout arm
             Family::AutoLedger, // instant-checkout ledger
+            Family::Refused,    // instant-checkout retry flag
             Family::Refused,    // instant-checkout tip
             Family::Refused,    // instant-checkout exported marker
         ];
