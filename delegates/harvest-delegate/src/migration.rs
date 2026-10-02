@@ -663,7 +663,7 @@ mod tests {
         );
         note_buyer_sent(&mut predecessor, 2, &id, &tag, &[7u8; 32]);
         mark_conversation_seen(&mut predecessor, 3, &id, &tag, 1_234);
-        note_seller_sent(&mut predecessor, 4, &id, &[1u8; 32], &[8u8; 32]);
+        note_seller_sent(&mut predecessor, 4, &[2u8; 32], &[1u8; 32], &[8u8; 32]);
         let payload = export_payload(
             &WithoutStoreKeys(&predecessor),
             Some(&harvest_origin()),
@@ -683,7 +683,7 @@ mod tests {
         };
         assert_eq!(conversations[0].sent_digests, vec![[7u8; 32]]);
         assert_eq!(conversations[0].seen_ms, Some(1_234));
-        let R::SellerSent { result, .. } = list_seller_sent(&successor, 6, &id) else {
+        let R::SellerSent { result, .. } = list_seller_sent(&successor, 6, &[2u8; 32]) else {
             panic!("a list")
         };
         assert_eq!(result, Ok(vec![([1u8; 32], [8u8; 32])]));

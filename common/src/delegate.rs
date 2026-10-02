@@ -280,13 +280,15 @@ pub enum HarvestDelegateRequest {
 
     /// The seller's half of [`Self::NoteBuyerSent`]: this seller's browser
     /// sent the mailbox entry with `digest` in the conversation with routing
-    /// tag `conversation`, on store `store_contract_id`. Kept per store, the
-    /// newest [`MAX_SELLER_SENT_PER_STORE`] across its conversations, for at
-    /// most [`MAX_SELLER_SENT_STORES`] stores. Answered with
-    /// [`HarvestDelegateResponse::SellerSentNoted`].
+    /// tag `conversation`, for the store whose verifying key is `store_key`.
+    /// By the store KEY, not the contract id: the key outlives a store
+    /// contract's re-key, and what was sent before one is still this
+    /// seller's. Kept per store, the newest [`MAX_SELLER_SENT_PER_STORE`]
+    /// across its conversations, for at most [`MAX_SELLER_SENT_STORES`]
+    /// stores. Answered with [`HarvestDelegateResponse::SellerSentNoted`].
     NoteSellerSent {
         request_id: RequestId,
-        store_contract_id: Vec<u8>,
+        store_key: [u8; 32],
         conversation: [u8; 32],
         digest: [u8; 32],
     },
@@ -295,7 +297,7 @@ pub enum HarvestDelegateRequest {
     /// with [`HarvestDelegateResponse::SellerSent`].
     ListSellerSent {
         request_id: RequestId,
-        store_contract_id: Vec<u8>,
+        store_key: [u8; 32],
     },
 
     // === Listing Management ===
@@ -1059,7 +1061,7 @@ pub enum HarvestDelegateResponse {
     /// The answer to [`HarvestDelegateRequest::NoteSellerSent`].
     SellerSentNoted {
         request_id: RequestId,
-        store_contract_id: Vec<u8>,
+        store_key: [u8; 32],
         result: Result<(), String>,
     },
 
@@ -1067,7 +1069,7 @@ pub enum HarvestDelegateResponse {
     /// `(conversation tag, entry digest)`, oldest first.
     SellerSent {
         request_id: RequestId,
-        store_contract_id: Vec<u8>,
+        store_key: [u8; 32],
         result: Result<Vec<SellerSentEntry>, String>,
     },
 
@@ -2167,12 +2169,12 @@ mod tests {
             },
             R::SellerSentNoted {
                 request_id: 22,
-                store_contract_id: store(),
+                store_key: [3u8; 32],
                 result: Ok(()),
             },
             R::SellerSent {
                 request_id: 23,
-                store_contract_id: store(),
+                store_key: [3u8; 32],
                 result: Ok(vec![([1u8; 32], [19u8; 32])]),
             },
         ]
@@ -2389,13 +2391,13 @@ mod tests {
             },
             Q::NoteSellerSent {
                 request_id: 23,
-                store_contract_id: store(),
+                store_key: [3u8; 32],
                 conversation: [1u8; 32],
                 digest: [19u8; 32],
             },
             Q::ListSellerSent {
                 request_id: 24,
-                store_contract_id: store(),
+                store_key: [3u8; 32],
             },
         ]
     }

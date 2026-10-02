@@ -1258,14 +1258,14 @@ pub(crate) fn mark_conversation_seen<S: SecretStore>(
 
 /// The seller's sent digests for one store
 /// (`HarvestDelegateRequest::NoteSellerSent`):
-/// `harvest:seller_sent:{store id, base58}`. Exported, and merged on import
+/// `harvest:seller_sent:{store verifying key, base58}`. Exported, and merged on import
 /// (`import::Family::SellerSent`).
 pub(crate) const SELLER_SENT_PREFIX_STR: &str = "harvest:seller_sent:";
 
-pub(crate) fn seller_sent_key(store_contract_id: &[u8]) -> Vec<u8> {
+pub(crate) fn seller_sent_key(store_key: &[u8; 32]) -> Vec<u8> {
     format!(
         "{SELLER_SENT_PREFIX_STR}{}",
-        bs58::encode(store_contract_id).into_string()
+        bs58::encode(store_key).into_string()
     )
     .into_bytes()
 }
@@ -1315,21 +1315,16 @@ pub(crate) fn seller_sent_has_room<S: SecretStore>(store: &S, key: &[u8]) -> boo
 pub(crate) fn note_seller_sent<S: SecretStore>(
     store: &mut S,
     request_id: RequestId,
-    store_contract_id: &[u8],
+    store_key: &[u8; 32],
     conversation: &[u8; 32],
     digest: &[u8; 32],
 ) -> HarvestDelegateResponse {
     let answer = |result| HarvestDelegateResponse::SellerSentNoted {
         request_id,
-        store_contract_id: store_contract_id.to_vec(),
+        store_key: *store_key,
         result,
     };
-    if store_contract_id.len() != STORE_CONTRACT_ID_BYTES {
-        return answer(Err(format!(
-            "a store is named by a {STORE_CONTRACT_ID_BYTES}-byte contract id"
-        )));
-    }
-    let key = seller_sent_key(store_contract_id);
+    let key = seller_sent_key(store_key);
     if !seller_sent_has_room(store, &key) {
         return answer(Err(format!(
             "this node keeps sent messages for at most {} stores",
@@ -1362,9 +1357,9 @@ pub(crate) fn note_seller_sent<S: SecretStore>(
 pub(crate) fn list_seller_sent<S: SecretStore>(
     store: &S,
     request_id: RequestId,
-    store_contract_id: &[u8],
+    store_key: &[u8; 32],
 ) -> HarvestDelegateResponse {
-    let result = match store.get_secret(&seller_sent_key(store_contract_id)) {
+    let result = match store.get_secret(&seller_sent_key(store_key)) {
         None => Ok(Vec::new()),
         Some(value) => decode_seller_sent(&value)
             .map(|entries| {
@@ -1382,7 +1377,7 @@ pub(crate) fn list_seller_sent<S: SecretStore>(
     };
     HarvestDelegateResponse::SellerSent {
         request_id,
-        store_contract_id: store_contract_id.to_vec(),
+        store_key: *store_key,
         result,
     }
 }
@@ -3249,6 +3244,7 @@ mod sent_and_seen_tests {
     use harvest_common::SecretImport;
 
     const STORE: &[u8] = &[3u8; 32];
+    const STORE_KEY: &[u8; 32] = &[3u8; 32];
 
     fn record(seed: u8) -> ([u8; 32], BuyerConversationRecord) {
         let secret = StaticSecret::from([seed; 32]);
@@ -3391,7 +3387,7 @@ mod sent_and_seen_tests {
 
     fn seller_sent(
         store: &MemSecrets,
-        id: &[u8],
+        id: &[u8; 32],
     ) -> Result<Vec<harvest_common::delegate::SellerSentEntry>, String> {
         match list_seller_sent(store, 1, id) {
             HarvestDelegateResponse::SellerSent { result, .. } => result,
@@ -3409,27 +3405,26 @@ mod sent_and_seen_tests {
     /// A seller's digests, per store and conversation: each once, oldest
     /// first, the newest `MAX_SELLER_SENT_PER_STORE` past the cap, stores
     /// apart. A note for one store past `MAX_SELLER_SENT_STORES` is refused,
-    /// as is a store id that is not 32 bytes, and a record that does not
-    /// read is never written over. Mutated red by dropping each guard.
+    /// and a record that does not read is never written over. Mutated red by dropping each guard.
     #[test]
     fn a_sellers_sent_digests_are_kept_per_store_and_capped() {
         let mut store = MemSecrets::default();
         let a = [1u8; 32];
         let b = [2u8; 32];
         assert_eq!(
-            noted(note_seller_sent(&mut store, 1, STORE, &a, &digest(0))),
+            noted(note_seller_sent(&mut store, 1, STORE_KEY, &a, &digest(0))),
             Ok(())
         );
         assert_eq!(
-            noted(note_seller_sent(&mut store, 2, STORE, &b, &digest(1))),
+            noted(note_seller_sent(&mut store, 2, STORE_KEY, &b, &digest(1))),
             Ok(())
         );
         assert_eq!(
-            noted(note_seller_sent(&mut store, 3, STORE, &a, &digest(0))),
+            noted(note_seller_sent(&mut store, 3, STORE_KEY, &a, &digest(0))),
             Ok(())
         );
         assert_eq!(
-            seller_sent(&store, STORE),
+            seller_sent(&store, STORE_KEY),
             Ok(vec![(a, digest(0)), (b, digest(1))])
         );
         assert_eq!(
@@ -3439,17 +3434,15 @@ mod sent_and_seen_tests {
         );
 
         for i in 2..MAX_SELLER_SENT_PER_STORE + 3 {
-            note_seller_sent(&mut store, 4, STORE, &a, &digest(i));
+            note_seller_sent(&mut store, 4, STORE_KEY, &a, &digest(i));
         }
-        let held = seller_sent(&store, STORE).unwrap();
+        let held = seller_sent(&store, STORE_KEY).unwrap();
         assert_eq!(held.len(), MAX_SELLER_SENT_PER_STORE);
         assert_eq!(held[0], (a, digest(3)), "the oldest went");
         assert_eq!(
             held.last(),
             Some(&(a, digest(MAX_SELLER_SENT_PER_STORE + 2)))
         );
-
-        assert!(noted(note_seller_sent(&mut store, 5, &[1u8; 31], &a, &digest(0))).is_err());
 
         let mut full = MemSecrets::default();
         for s in 0..MAX_SELLER_SENT_STORES {
@@ -3467,13 +3460,13 @@ mod sent_and_seen_tests {
         );
 
         let mut damaged = MemSecrets::default();
-        damaged.set_secret(&seller_sent_key(STORE), b"\x02junk");
-        assert!(noted(note_seller_sent(&mut damaged, 9, STORE, &a, &digest(0))).is_err());
+        damaged.set_secret(&seller_sent_key(STORE_KEY), b"\x02junk");
+        assert!(noted(note_seller_sent(&mut damaged, 9, STORE_KEY, &a, &digest(0))).is_err());
         assert_eq!(
-            damaged.get_secret(&seller_sent_key(STORE)).as_deref(),
+            damaged.get_secret(&seller_sent_key(STORE_KEY)).as_deref(),
             Some(&b"\x02junk"[..])
         );
-        assert!(seller_sent(&damaged, STORE).is_err());
+        assert!(seller_sent(&damaged, STORE_KEY).is_err());
     }
 
     /// A migration import of a conversation the successor already holds
@@ -3540,21 +3533,21 @@ mod sent_and_seen_tests {
     #[test]
     fn a_sellers_sent_digests_migrate_merged() {
         let a = [1u8; 32];
-        let key = seller_sent_key(STORE);
+        let key = seller_sent_key(STORE_KEY);
         let mut predecessor = MemSecrets::default();
-        note_seller_sent(&mut predecessor, 1, STORE, &a, &digest(1));
-        note_seller_sent(&mut predecessor, 2, STORE, &a, &digest(2));
+        note_seller_sent(&mut predecessor, 1, STORE_KEY, &a, &digest(1));
+        note_seller_sent(&mut predecessor, 2, STORE_KEY, &a, &digest(2));
         let value = predecessor.get_secret(&key).unwrap();
 
         let mut successor = MemSecrets::default();
-        note_seller_sent(&mut successor, 3, STORE, &a, &digest(2));
-        note_seller_sent(&mut successor, 4, STORE, &a, &digest(3));
+        note_seller_sent(&mut successor, 3, STORE_KEY, &a, &digest(2));
+        note_seller_sent(&mut successor, 4, STORE_KEY, &a, &digest(3));
         assert_eq!(
             crate::import::import_secret(&mut successor, &key, &value),
             SecretImport::Written
         );
         assert_eq!(
-            seller_sent(&successor, STORE),
+            seller_sent(&successor, STORE_KEY),
             Ok(vec![(a, digest(1)), (a, digest(2)), (a, digest(3))])
         );
         assert_eq!(

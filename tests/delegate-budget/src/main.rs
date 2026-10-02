@@ -1452,15 +1452,16 @@ fn scenario(r: &mut Runner) -> Result<()> {
         bail!("the recall after seeding digests lost conversations");
     }
 
-    // The seller's half: every store it keeps digests for at the per-store
-    // cap (`messaging::seller_sent_key`, format byte then 64-byte entries),
+    // The seller's half: every store key it keeps digests for at the
+    // per-store cap (`messaging::seller_sent_key`, format byte then 64-byte
+    // entries),
     // then a note past the cap and the list of one full store.
     let seller_cap = harvest_common::delegate::MAX_SELLER_SENT_PER_STORE;
     for s in 0..harvest_common::delegate::MAX_SELLER_SENT_STORES {
         let mut id = [0x90u8; 32];
         id[0] = s as u8;
         if s == 0 {
-            id = store_contract;
+            id = seller_store_key;
         }
         let mut value = vec![1u8];
         value.extend((0..seller_cap * 64).map(|i| (i % 253) as u8));
@@ -1473,7 +1474,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         "NoteSellerSent (a store at its cap)",
         cbor(&HarvestDelegateRequest::NoteSellerSent {
             request_id: 904,
-            store_contract_id: store_contract.to_vec(),
+            store_key: seller_store_key,
             conversation: first_conversation,
             digest: [0xfd; 32],
         }),
@@ -1483,7 +1484,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         &format!("ListSellerSent ({seller_cap})"),
         cbor(&HarvestDelegateRequest::ListSellerSent {
             request_id: 905,
-            store_contract_id: store_contract.to_vec(),
+            store_key: seller_store_key,
         }),
         "SellerSent",
     )?;

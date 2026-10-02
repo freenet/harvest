@@ -305,13 +305,16 @@ pub struct AppState {
     /// concludes is optional.
     pub pending_conversation_backups: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
 
-    /// The digests of entries this seller's browsers sent, per store, as
-    /// `(conversation tag, entry digest)`, oldest first: what the harvest
-    /// delegate keeps (`HarvestDelegateRequest::NoteSellerSent`), answered
-    /// by `ListSellerSent` and added to as this tab sends. What "You" is
-    /// given to on the seller's side after a reload
-    /// ([`Self::kept_as_sent`]).
-    pub seller_sent: HashMap<Vec<u8>, Vec<harvest_common::delegate::SellerSentEntry>>,
+    /// The digests of entries this seller's browsers sent, per store KEY
+    /// (it outlives a store contract's re-key), as `(conversation tag, entry
+    /// digest)`, oldest first: what the harvest delegate keeps
+    /// (`HarvestDelegateRequest::NoteSellerSent`), answered by
+    /// `ListSellerSent` and added to as this tab sends. What "You" is given
+    /// to on the seller's side after a reload ([`Self::kept_as_sent`]).
+    pub seller_sent: HashMap<[u8; 32], Vec<harvest_common::delegate::SellerSentEntry>>,
+    /// The store keys whose kept digests this tab has asked for, so the
+    /// store list answering again does not ask again.
+    pub seller_sent_listed: HashSet<[u8; 32]>,
 
     /// `ListBuyerConversations` requests in flight, as request id -> the
     /// store THIS browser asked about.
@@ -6631,28 +6634,42 @@ impl AppState {
         }
     }
 
+    /// The verifying key of `store_contract_id`, if this tab knows it: what
+    /// the seller's kept digests are filed under.
+    fn store_key_of(&self, store_contract_id: &[u8]) -> Option<[u8; 32]> {
+        self.browsing_stores
+            .get(store_contract_id)
+            .and_then(|store| store.store_verifying_key)
+            .or_else(|| {
+                self.my_stores
+                    .values()
+                    .flatten()
+                    .find(|r| r.store_contract_id == store_contract_id)
+                    .and_then(|r| r.store_verifying_key)
+            })
+    }
+
     /// The request that keeps `digest`, an entry this seller just sent in
     /// the conversation with routing tag `conversation` on their store
     /// `store_contract_id` (`NoteSellerSent`), and the same noted here.
+    /// `None` when this tab does not know the store's key.
     pub fn seller_sent_to_note(
         &mut self,
         store_contract_id: &[u8],
         conversation: &[u8; 32],
         digest: &[u8; 32],
-    ) -> harvest_common::HarvestDelegateRequest {
-        let held = self
-            .seller_sent
-            .entry(store_contract_id.to_vec())
-            .or_default();
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
+        let store_key = self.store_key_of(store_contract_id)?;
+        let held = self.seller_sent.entry(store_key).or_default();
         if !held.contains(&(*conversation, *digest)) {
             held.push((*conversation, *digest));
         }
-        harvest_common::HarvestDelegateRequest::NoteSellerSent {
+        Some(harvest_common::HarvestDelegateRequest::NoteSellerSent {
             request_id: self.next_messaging_request_id(),
-            store_contract_id: store_contract_id.to_vec(),
+            store_key,
             conversation: *conversation,
             digest: *digest,
-        }
+        })
     }
 
     /// [`Self::seller_sent_to_note`], dispatched. Fire-and-forget.
@@ -6662,27 +6679,39 @@ impl AppState {
         conversation: &[u8; 32],
         digest: &[u8; 32],
     ) {
-        let request = self.seller_sent_to_note(store_contract_id, conversation, digest);
-        self.send_to_harvest_delegate("keep the record of a sent message", &request);
-    }
-
-    /// The request for every sent digest the delegate keeps for one of this
-    /// seller's stores (`ListSellerSent`), answered into
-    /// [`Self::seller_sent`].
-    pub fn seller_sent_to_list(
-        &mut self,
-        store_contract_id: &[u8],
-    ) -> harvest_common::HarvestDelegateRequest {
-        harvest_common::HarvestDelegateRequest::ListSellerSent {
-            request_id: self.next_messaging_request_id(),
-            store_contract_id: store_contract_id.to_vec(),
+        if let Some(request) = self.seller_sent_to_note(store_contract_id, conversation, digest) {
+            self.send_to_harvest_delegate("keep the record of a sent message", &request);
         }
     }
 
+    /// The requests for the sent digests the delegate keeps for each of
+    /// this seller's stores not yet asked about this session
+    /// (`ListSellerSent`), answered into [`Self::seller_sent`]. Asked when
+    /// the store list arrives, so a reload's own messages read "You".
+    pub fn seller_sent_to_list(&mut self) -> Vec<harvest_common::HarvestDelegateRequest> {
+        let keys: Vec<[u8; 32]> = self
+            .my_stores
+            .values()
+            .flatten()
+            .filter_map(|r| r.store_verifying_key)
+            .collect();
+        let mut requests = Vec::new();
+        for store_key in keys {
+            if self.seller_sent_listed.insert(store_key) {
+                requests.push(harvest_common::HarvestDelegateRequest::ListSellerSent {
+                    request_id: self.next_messaging_request_id(),
+                    store_key,
+                });
+            }
+        }
+        requests
+    }
+
     /// [`Self::seller_sent_to_list`], dispatched.
-    pub fn list_seller_sent(&mut self, store_contract_id: &[u8]) {
-        let request = self.seller_sent_to_list(store_contract_id);
-        self.send_to_harvest_delegate("read the record of sent messages", &request);
+    pub fn list_seller_sent(&mut self) {
+        for request in self.seller_sent_to_list() {
+            self.send_to_harvest_delegate("read the record of sent messages", &request);
+        }
     }
 
     /// The delegate's answer to `ListSellerSent`: added to what this tab
@@ -6690,12 +6719,12 @@ impl AppState {
     /// was asked for is not lost).
     pub fn on_seller_sent(
         &mut self,
-        store_contract_id: Vec<u8>,
+        store_key: [u8; 32],
         result: Result<Vec<harvest_common::delegate::SellerSentEntry>, String>,
     ) {
         match result {
             Ok(kept) => {
-                let held = self.seller_sent.entry(store_contract_id).or_default();
+                let held = self.seller_sent.entry(store_key).or_default();
                 let local = std::mem::take(held);
                 *held = kept;
                 for entry in local {
@@ -9694,6 +9723,12 @@ impl AppState {
                     .iter()
                     .any(|sent| &sent.digest == digest)
             })
+            // After a reload: the digests the harvest delegate keeps for this
+            // side (`kept_as_sent`). The same first-hand record, written by
+            // this user's browser when it sent, and kept where a reload
+            // cannot lose it. Not scoped to the store: a digest names exact
+            // bytes this side produced, wherever they were filed.
+            || self.kept_as_sent(digest)
     }
 
     /// Record a message this browser sent, so the buyer can see what they
@@ -9709,6 +9744,7 @@ impl AppState {
     ) {
         // The sealed message rather than its nonce, so the digest cannot be
         // computed from anything but the bytes that were actually dispatched.
+        let digest = harvest_common::mailbox::entry_digest(sealed);
         self.browsing_stores
             .entry(store_contract_id.to_vec())
             .or_default()
@@ -9716,11 +9752,23 @@ impl AppState {
             .push(SentMessage {
                 text,
                 sent_at: chrono::Utc::now(),
-                digest: harvest_common::mailbox::entry_digest(sealed),
+                digest,
                 sealed: sealed.clone(),
                 not_arrived: None,
                 sent_to: None,
             });
+        // And kept by the harvest delegate, so "You" survives a reload: under
+        // the conversation it went into (its routing tag, which the entry
+        // carries), on this seller's own store or in this buyer's kept
+        // conversation.
+        let Ok(tag) = <[u8; 32]>::try_from(sealed.sender_public_key.as_slice()) else {
+            return;
+        };
+        if self.store_owner_fingerprint(store_contract_id).is_some() {
+            self.note_seller_sent(store_contract_id, &tag, &digest);
+        } else {
+            self.note_buyer_sent(store_contract_id, &tag, &digest);
+        }
     }
 
     /// [`Self::record_sent_message`] for a buyer's message to a seller,
@@ -13162,10 +13210,8 @@ impl AppState {
                 }
             }
             HarvestDelegateResponse::SellerSent {
-                store_contract_id,
-                result,
-                ..
-            } => self.on_seller_sent(store_contract_id, result),
+                store_key, result, ..
+            } => self.on_seller_sent(store_key, result),
 
             HarvestDelegateResponse::StoreRegistered {
                 ghostkey_fingerprint,
@@ -13187,6 +13233,9 @@ impl AppState {
                 self.store_lists_answered
                     .insert(ghostkey_fingerprint.clone());
                 self.merge_store_registrations(&ghostkey_fingerprint, stores);
+                // What this seller's browsers sent from these stores, so a
+                // reload's own messages read "You".
+                self.list_seller_sent();
                 self.refresh_same_address_orders();
                 self.republish_withheld();
                 // Which stores this device holds a key for decides wrap or
@@ -24135,52 +24184,112 @@ mod buyer_backup_tests {
         );
     }
 
-    /// The seller's sent digests: noted at once, listed from the delegate,
-    /// and a list answer that arrives after a note keeps the note. Mutated
-    /// red by replacing the held list with the answer, and by not noting
-    /// locally.
+    /// The seller's sent digests, by store key: noted at once, listed once
+    /// per store key when the store list arrives, and a list answer that
+    /// arrives after a note keeps the note. Mutated red by replacing the
+    /// held list with the answer, by not noting locally, and by listing a
+    /// store key twice.
     #[test]
     fn a_sellers_sent_digests_are_noted_and_listed() {
+        let key = [0x44; 32];
         let mut state = buyer_state();
+        state.my_stores.insert(
+            "fp".into(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![3u8; 32],
+                mailbox_contract_id: vec![4u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(key),
+            }],
+        );
         let tag = [0x55; 32];
         match state.seller_sent_to_note(STORE, &tag, &[0xe1; 32]) {
-            HarvestDelegateRequest::NoteSellerSent {
-                store_contract_id,
+            Some(HarvestDelegateRequest::NoteSellerSent {
+                store_key,
                 conversation,
                 digest,
                 ..
-            } => {
-                assert_eq!(store_contract_id, STORE);
+            }) => {
+                assert_eq!(store_key, key);
                 assert_eq!(conversation, tag);
                 assert_eq!(digest, [0xe1; 32]);
             }
             other => panic!("expected NoteSellerSent, got {other:?}"),
         }
         assert!(state.kept_as_sent(&[0xe1; 32]));
+        let asked = state.seller_sent_to_list();
         assert!(matches!(
-            state.seller_sent_to_list(STORE),
-            HarvestDelegateRequest::ListSellerSent { .. }
+            asked.as_slice(),
+            [HarvestDelegateRequest::ListSellerSent { store_key, .. }] if *store_key == key
         ));
+        assert!(state.seller_sent_to_list().is_empty(), "once per store key");
         state.on_delegate_response(HarvestDelegateResponse::SellerSent {
             request_id: 1,
-            store_contract_id: STORE.to_vec(),
+            store_key: key,
             result: Ok(vec![(tag, [0xe0; 32])]),
         });
         assert_eq!(
-            state.seller_sent[STORE],
+            state.seller_sent[&key],
             vec![(tag, [0xe0; 32]), (tag, [0xe1; 32])],
             "the kept ones, then this tab's note"
         );
         state.on_delegate_response(HarvestDelegateResponse::SellerSent {
             request_id: 2,
-            store_contract_id: STORE.to_vec(),
+            store_key: key,
             result: Err("refused".into()),
         });
         assert_eq!(
-            state.seller_sent[STORE].len(),
+            state.seller_sent[&key].len(),
             2,
             "a refusal keeps what is held"
         );
+    }
+
+    /// **A reload keeps "You".** A fresh state (nothing this tab sent) that
+    /// has loaded what the delegate kept credits this side with its own
+    /// messages, buyer and seller, through `authored_here`, which every
+    /// "You" on a message rests on; a digest it does not keep is not
+    /// credited. And a message sent here is noted to the delegate under
+    /// its conversation's tag. Mutated red by dropping `kept_as_sent` from
+    /// `authored_here`, and by not noting from `record_sent_message`.
+    #[test]
+    fn a_reload_keeps_you_on_this_sides_messages() {
+        let mut buyer = buyer_state();
+        let mut kept = recalled(9, false);
+        kept.sent_digests = vec![[0xb1; 32]];
+        deliver_recall(&mut buyer, vec![kept.clone()]);
+        assert!(
+            buyer.authored_here(STORE, &[0xb1; 32]),
+            "the buyer's own, after a reload"
+        );
+        assert!(!buyer.authored_here(STORE, &[0xb2; 32]));
+
+        let mut seller = AppState::default();
+        seller.on_delegate_response(HarvestDelegateResponse::SellerSent {
+            request_id: 1,
+            store_key: [0x44; 32],
+            result: Ok(vec![([0x55; 32], [0xc1; 32])]),
+        });
+        assert!(
+            seller.authored_here(STORE, &[0xc1; 32]),
+            "the seller's own, after a reload"
+        );
+        assert!(!seller.authored_here(STORE, &[0xc2; 32]));
+
+        // Sent here: noted under the conversation the entry names.
+        let sealed = harvest_common::mailbox::EncryptedMessage {
+            conversation_id: harvest_common::mailbox::ConversationId([9; 32]),
+            sender_public_key: kept.buyer_public_key.to_vec(),
+            ciphertext: vec![1, 2, 3],
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            nonce: [7; 24],
+        };
+        buyer.record_sent_message(STORE, "hi".into(), &sealed);
+        let digest = harvest_common::mailbox::entry_digest(&sealed);
+        assert!(buyer.browsing_stores[STORE].conversations[0]
+            .sent_digests
+            .contains(&digest));
     }
 
     /// Answer whichever recall is in flight, whoever asked for it -- which is

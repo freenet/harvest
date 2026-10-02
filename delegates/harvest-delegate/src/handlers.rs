@@ -221,21 +221,21 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
 
         HarvestDelegateRequest::NoteSellerSent {
             request_id,
-            store_contract_id,
+            store_key,
             conversation,
             digest,
         } => crate::messaging::note_seller_sent(
             store,
             request_id,
-            &store_contract_id,
+            &store_key,
             &conversation,
             &digest,
         ),
 
         HarvestDelegateRequest::ListSellerSent {
             request_id,
-            store_contract_id,
-        } => crate::messaging::list_seller_sent(store, request_id, &store_contract_id),
+            store_key,
+        } => crate::messaging::list_seller_sent(store, request_id, &store_key),
 
         // Backup. The export answers the secrets themselves, so its need for
         // the gate is obvious. `MarkConversationsBackedUp` is the one whose
