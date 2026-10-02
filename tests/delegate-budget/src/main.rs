@@ -17,6 +17,12 @@
 //! Usage:
 //!   harvest-delegate-budget [--wasm PATH] [--calibrate [REPS]]
 
+/// The delegate's own BIP-32 code, compiled in: the published-script
+/// fixtures are what the configured account key derives, by the code that
+/// derives them in the delegate. Only the derivation is used here.
+#[allow(dead_code)]
+#[path = "../../../delegates/harvest-delegate/src/bip32.rs"]
+mod bip32;
 mod fixtures;
 mod host;
 
@@ -84,6 +90,8 @@ fn caps() -> Result<Caps> {
 pub struct LedgerCaps {
     pub seen: usize,
     pub answered: usize,
+    /// `STATUSES_CAP`, which bounds both `statuses` and `oversold`.
+    pub statuses: usize,
     pub sales: usize,
     pub gap_orders: usize,
 }
@@ -190,6 +198,24 @@ impl Runner {
         let value: Value = ciborium::from_reader(response.as_slice())
             .with_context(|| format!("{name}: the answer is not CBOR"))?;
         check_answer(name, &value, expect)?;
+        Ok(value)
+    }
+
+    /// [`Self::app`] for a call made only to read the delegate's state:
+    /// not measured, and not in the report.
+    fn quiet_app(&mut self, payload: Vec<u8>, expect: &str) -> Result<Value> {
+        let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+        let origin = self.origin.clone();
+        let outbound = self
+            .host
+            .call(Some(&origin), &msg)?
+            .result
+            .map_err(|e| anyhow!("{expect}: the delegate returned an error: {e}"))?;
+        let response = first_app_payload(&outbound)
+            .ok_or_else(|| anyhow!("{expect}: no application message in the answer"))?;
+        let value: Value = ciborium::from_reader(response.as_slice())
+            .with_context(|| format!("{expect}: the answer is not CBOR"))?;
+        check_answer(expect, &value, expect)?;
         Ok(value)
     }
 
@@ -604,6 +630,8 @@ fn scenario(r: &mut Runner) -> Result<()> {
         other => bail!("upcoming addresses: {}", brief(other)),
     };
 
+    published_scripts(r, &caps)?;
+
     // --- instant checkout (auto-invoice) -----------------------------------
     let bridge = SigningKey::from_bytes(&[22u8; 32]);
     let bridge_id = freenet_bitcoin_common::BridgeId(bridge.verifying_key().to_bytes());
@@ -901,6 +929,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     let ledger_caps = LedgerCaps {
         seen: seen_cap,
         answered: delegate_cap("auto_invoice.rs", "ANSWERED_CAP")?,
+        statuses: delegate_cap("auto_invoice.rs", "STATUSES_CAP")?,
         sales: delegate_cap("auto_invoice.rs", "SALES_CAP")?,
         gap_orders: delegate_cap("auto_invoice.rs", "GAP_ORDERS_CAP")?,
     };
@@ -1525,6 +1554,8 @@ fn scenario(r: &mut Runner) -> Result<()> {
         for (list, cap) in [
             ("sales", ledger_caps.sales),
             ("gap_orders", ledger_caps.gap_orders),
+            ("statuses", ledger_caps.statuses),
+            ("oversold", ledger_caps.statuses),
         ] {
             let got = list_len(&merged, &[list])?;
             if got != cap {
@@ -1561,24 +1592,162 @@ fn scenario(r: &mut Runner) -> Result<()> {
         }),
     )?;
     let exported = first_app_payload(&out).ok_or_else(|| anyhow!("export answered nothing"))?;
+    // Every instant-checkout ledger: the export's largest entries, and the
+    // ones a cut-short export would drop first.
+    let ledgers: Vec<Vec<u8>> = all_arms
+        .iter()
+        .map(|c| format!("harvest:auto:ledger:{}", bs58::encode(c).into_string()).into_bytes())
+        .collect();
     freenet_migrate_check(
         &exported,
         KEPT_PURCHASES + buyer_conversations + caps.known_stores,
+        &ledgers,
     )?;
 
     Ok(())
 }
 
+/// A seller's published orders, offered back to the delegate so its counter
+/// is raised past every one of them (harvest#77): `SetPaymentXpub` and
+/// `DeriveOrderAddress` derive from the counter on, and every script that
+/// matches pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further
+/// (`bitcoin::published_floor_matches`). The web app sends every order's
+/// script from every store it owns (`published_payment_scripts`), and all of
+/// a device's stores share one payment key, so the published list is bounded
+/// only by the stores times each store's order cap (`MAX_ORDERS`), every one
+/// of them an address this key derived in a row.
+///
+/// Measured for one full store and for every store full. The counter is put
+/// back after each call, so the rest of the scenario sees the key as it was.
+fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
+    let xpub_key = b"harvest:bitcoin:payment-xpub:v1".to_vec();
+    let saved = r
+        .host
+        .state
+        .secrets
+        .get(&xpub_key)
+        .cloned()
+        .ok_or_else(|| anyhow!("no payment key is saved: update the harness"))?;
+    // Where the counter is, and the natively derived chain checked against
+    // the delegate's own next addresses.
+    let peeked = r.quiet_app(
+        cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
+            request_id: 410,
+            count: harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
+        }),
+        "UpcomingAddresses",
+    )?;
+    let upcoming = match field(&peeked, &["UpcomingAddresses", "result", "Ok"])? {
+        Value::Array(items) => items.clone(),
+        other => bail!("upcoming addresses: {}", brief(other)),
+    };
+    let start = match upcoming.first().map(|a| field(a, &["index"])) {
+        Some(Ok(Value::Integer(i))) => u32::try_from(i128::from(*i))?,
+        _ => bail!("the next address carries no index: update the harness"),
+    };
+    let chain = bip32::AccountXpub::parse(&fixtures::signet_vpub(0))
+        .and_then(|a| a.external_chain())
+        .map_err(|e| anyhow!("derive the fixture key's chain: {e}"))?;
+    for (k, a) in upcoming.iter().enumerate() {
+        let script = field(a, &["script_pubkey"])?
+            .deserialized::<serde_bytes_vec::ByteVec>()
+            .context("script_pubkey")?
+            .0;
+        if chain
+            .script_at(start + k as u32)
+            .map_err(|e| anyhow!("{e}"))?
+            != script
+        {
+            bail!("the natively derived address {k} is not the delegate's: update the harness");
+        }
+    }
+
+    let per_store = harvest_common::store::MAX_ORDERS;
+    let all = caps.store_keys * per_store;
+    let scripts: Vec<Vec<u8>> = (0..all as u32)
+        .map(|k| chain.script_at(start + k).map_err(|e| anyhow!("{e}")))
+        .collect::<Result<_>>()?;
+    for (label, n) in [
+        ("one full store".to_string(), per_store),
+        (format!("{} full stores", caps.store_keys), all),
+    ] {
+        let published = scripts[..n].to_vec();
+        let set = r.app(
+            &format!("SetPaymentXpub ({n} published scripts, {label})"),
+            cbor(&BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: 411,
+                xpub: fixtures::signet_vpub(0),
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                published_scripts: published.clone(),
+            }),
+            "PaymentXpubSet",
+        )?;
+        let matched = list_len(&set, &["PaymentXpubSet", "matched_scripts"])?;
+        if matched != n {
+            bail!("SetPaymentXpub matched {matched} of {n} published scripts, so the scan stopped short");
+        }
+        r.host.state.secrets.insert(xpub_key.clone(), saved.clone());
+        let derived = r.app(
+            &format!("DeriveOrderAddress ({n} published scripts, {label})"),
+            cbor(&BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 412,
+                published_scripts: published,
+            }),
+            "OrderAddress",
+        )?;
+        let matched = list_len(&derived, &["OrderAddress", "matched_scripts"])?;
+        let index = field(&derived, &["OrderAddress", "result", "Ok", "index"])?;
+        if matched != n || *index != Value::Integer((start as u64 + n as u64).into()) {
+            bail!(
+                "DeriveOrderAddress matched {matched} of {n} published scripts and handed out \
+                 index {}, not {}: the scan stopped short",
+                brief(index),
+                start as usize + n
+            );
+        }
+        r.host.state.secrets.insert(xpub_key.clone(), saved.clone());
+    }
+    Ok(())
+}
+
 /// The export answers `freenet_migrate::ExportedSecrets`, not a Harvest
-/// response. Checked only for being a non-empty CBOR value: its contents are
-/// `freenet-migrate`'s business and tested there.
-fn freenet_migrate_check(bytes: &[u8], at_least: usize) -> Result<()> {
+/// response. Checked for carrying at least `at_least` entries and every key
+/// in `required`: its encoding is `freenet-migrate`'s business and tested
+/// there.
+fn freenet_migrate_check(bytes: &[u8], at_least: usize, required: &[Vec<u8>]) -> Result<()> {
     let v: Value = ciborium::from_reader(bytes).context("export is not CBOR")?;
     // `freenet_migrate::ExportedSecrets { secrets: Vec<(key, value)>, .. }`.
-    let n = match field(&v, &["secrets"])? {
-        Value::Array(items) => items.len(),
+    let entries = match field(&v, &["secrets"])? {
+        Value::Array(items) => items,
         other => bail!("the export's secrets are not a list: {}", brief(other)),
     };
+    let n = entries.len();
+    let keys: std::collections::HashSet<Vec<u8>> = entries
+        .iter()
+        .map(|e| match e {
+            Value::Array(pair) if pair.len() == 2 => pair[0]
+                .deserialized::<serde_bytes_vec::ByteVec>()
+                .map(|k| k.0)
+                .context("an exported key is not bytes"),
+            other => bail!(
+                "an exported entry is not a (key, value) pair: {}",
+                brief(other)
+            ),
+        })
+        .collect::<Result<_>>()?;
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|k| !keys.contains(*k))
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "the export left out {} of the {} seeded ledgers ({missing:?}): it was cut short, \
+             so its cost was not measured",
+            missing.len(),
+            required.len()
+        );
+    }
     if n < at_least {
         bail!(
             "the export carried {n} entries, fewer than the {at_least} secrets seeded: it was \

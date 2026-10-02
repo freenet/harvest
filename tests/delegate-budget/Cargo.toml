@@ -41,3 +41,12 @@ blake3 = "1"
 # Mailbox fixtures, encrypted as `harvest_common::sealed` does but with a
 # seeded nonce (see `fixtures::encrypt_message_seeded`).
 aes-gcm = "0.10"
+# The delegate's own BIP-32 derivation (`delegates/harvest-delegate/src/bip32.rs`,
+# compiled in by path), so published-script fixtures are the addresses the
+# configured account key really derives. Same versions and features as the
+# delegate's.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hmac = { version = "0.12", default-features = false }
+ripemd = { version = "0.1", default-features = false }
+sha2 = "0.10"
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }

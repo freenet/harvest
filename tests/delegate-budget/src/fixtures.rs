@@ -250,7 +250,8 @@ fn id32(tag: u8, n: u32, i: usize) -> [u8; 32] {
     b
 }
 
-/// One arm's ledger with every list at its cap, `issued` invoices in the last
+/// One arm's ledger with every list at its cap (`statuses` and `oversold`
+/// share `STATUSES_CAP`), `issued` invoices in the last
 /// hour, and recent entries, so nothing is aged out on load.
 pub fn full_ledger(
     arm: u32,
@@ -264,11 +265,21 @@ pub fn full_ledger(
         seen: (0..caps.seen).map(|i| id32(0xA1, arm, i)).collect(),
         answered: (0..caps.answered).map(|i| id32(0xA2, arm, i)).collect(),
         issued_at_ms: (0..issued).map(|i| now_ms - 60_000 - i as u64).collect(),
-        statuses: Vec::new(),
+        // A status per listing the sales name, each still waiting for the
+        // store to show it.
+        statuses: (0..caps.statuses)
+            .map(|i| harvest_common::listing::ListingStatus {
+                listing: ListingId(id32(0xA4, arm, i)),
+                revision: 1_000 + i as u64,
+                availability: harvest_common::listing::ListingAvailability::Available {
+                    quantity: Some(1_000),
+                },
+            })
+            .collect(),
         sales: (0..caps.sales)
             .map(|i| Sale {
                 order: OrderId(id32(0xA3, arm, i)),
-                listing: ListingId(id32(0xA4, arm, i % 64)),
+                listing: ListingId(id32(0xA4, arm, i % caps.statuses)),
                 quantity: 1,
                 issued_at_ms: now_ms - 120_000,
                 anchor_height: 250_000,
@@ -278,7 +289,13 @@ pub fn full_ledger(
         settled: (0..caps.answered)
             .map(|i| OrderId(id32(0xA5, arm, i)))
             .collect(),
-        oversold: Vec::new(),
+        // Found a minute ago: shown for `OVERSOLD_SHOWN_MS`, so none ages out.
+        oversold: (0..caps.statuses)
+            .map(|i| Oversold {
+                order: OrderId(id32(0xA7, arm, i)),
+                found_at_ms: now_ms - 60_000,
+            })
+            .collect(),
         gap_orders: (0..caps.gap_orders)
             .map(|i| (OrderId(id32(0xA6, arm, i)), i as u32))
             .collect(),
