@@ -111,7 +111,7 @@ fails the run on any difference.
 | `RegisterStore`, `ListStores` | registry |
 | `SetPaymentXpub`, `DeriveOrderAddress`, `PeekOrderAddresses (10)`, `DeriveOrderAddress` with a foreign published script | BIP-32 derivation. The foreign script forces the full 100-index `PUBLISHED_INDEX_GAP` scan |
 | instant checkout deciding a request against a full store: an instant `OrderRequest` in the first store's mailbox, then the store GET it asks for answered (with the GET's context) by a store of 4096 paid orders, each with a genuine SPV payment proof (about 18 MiB), on addresses contiguous from the counter; repeated while `decide` refuses with `CatchingUp` | `decide` adds the store's published scripts to those the delegate holds and moves the payment key's scan on by a budget before it invoices; until the scan is complete it refuses (`CatchingUp`) and the request waits. The harness requires every run that publishes nothing to have been refused for that reason (the store's status says so), and the last run to publish exactly one order, paying the address one past the store's last. `decide` does not check an order's signature, so the orders are signed by a fixture key at their real size. Held to a 70% ceiling: see below |
-| a heartbeat wake-up with one full store's scripts held and none scanned, repeated until the catch-up is complete (each wake-up must move it on), then one more | a wake-up moves the payment key's catch-up on by itself (`advance_on_wakeup`, `WAKEUP_SCAN_BUDGET`), on top of all its other work, so instant checkout catches up with no tab open. The one after must change nothing. The scan's cursor is read from the delegate's secret (`[tag_len u16][tag][generation u32][base u32][at u32]`, mirrored); a cursor of another shape fails the run |
+| a heartbeat wake-up with one full store's scripts held and none scanned, the first with every store's mailbox waiting to be re-read too, repeated until the catch-up is complete (each wake-up must move it on), then one more | a wake-up moves the payment key's catch-up on by itself (`advance_on_wakeup`, `WAKEUP_SCAN_BUDGET`), on top of all its other work, so instant checkout catches up with no tab open. The one after must change nothing. The scan's cursor is read from the delegate's secret (`[tag_len u16][tag][generation u32][base u32][at u32]`, mirrored); a cursor of another shape fails the run |
 | `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `STATUSES_CAP` for both statuses and oversold orders, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
 | tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
 | a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. 2.6x the budget on V29, fixed in #216: see below |
@@ -125,7 +125,7 @@ fails the run on any difference.
 | `RememberStore` to the 1024 cap, `ListRememberedStores (1024)` | the buyer's remembered stores; the harness checks 1024 come back |
 | `ImportMigratedSecret` of one full ledger into another | what a successor does with each ledger a predecessor exports: decode both, merge, encode. The harness checks the outcome is `Written` and that the ledger written holds the incoming ledger's newest sale, with `sales`, `gap_orders`, `statuses` and `oversold` at their caps |
 | `ExportSecrets` | the migration export with the state above, after every instant-checkout step because it disarms instant checkout. The harness checks it carries at least as many entries as were seeded, and every seeded instant-checkout ledger by key |
-| a seller's published scripts, after the export (the payment key does not look at it), each run from the same secrets (the key active, nothing published held): sent as `AddPublishedScripts` requests of `MAX_SCRIPTS_PER_REQUEST` (4096), then `SetPaymentXpub` (with `resume` when asked again) or `DeriveOrderAddress`, repeated while the delegate answers `CATCHING_UP_PREFIX`. One full store contiguous from the counter, driven to the end; every store full (64 x 4096 = `MAX_HELD`), 64 additions each measured and then ONE scan call; one full store with its scripts `PUBLISHED_INDEX_GAP` apart, 32 calls | no address is handed out, and no key made active, until the counter is past every published script the delegate holds; every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further, so the scan is cut into budgets (`FLOOR_SCAN_BUDGET`). The harness requires the scan's cursor (in the refusal, `{counter}/{cursor}`) to move on with every call and the final count, or the address handed out, to be one past the last script. The 64-store input is real: one delegate holds one payment key for every store, and the web app sends every owned store's scripts. The spaced run takes about 1,400 calls to finish; 32 show its per-call bound. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness and checked against the delegate's next ten addresses. A delegate without `AddPublishedScripts` (V29) is sent the scripts with the request, as its web app did |
+| a seller's published scripts, after the export (the payment key does not look at it), each run from the same secrets (the key active, and the one script the foreign-script step above sent already held: since #216 a script sent with `DeriveOrderAddress` is kept like any other): sent as `AddPublishedScripts` requests of `MAX_SCRIPTS_PER_REQUEST` (4096), then `SetPaymentXpub` (with `resume` when asked again) or `DeriveOrderAddress`, repeated while the delegate answers `CATCHING_UP_PREFIX`. One full store contiguous from the counter, driven to the end; every store full (64 x 4096 = `MAX_HELD`), 64 additions each measured and then ONE scan call; one full store with its scripts `PUBLISHED_INDEX_GAP` apart, 32 calls | no address is handed out, and no key made active, until the counter is past every published script the delegate holds; every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further, so the scan is cut into budgets (`FLOOR_SCAN_BUDGET`). The harness requires the scan's cursor (in the refusal, `{counter}/{cursor}`) to move on with every call and the final count, or the address handed out, to be one past the last script. The 64-store input is real: one delegate holds one payment key for every store, and the web app sends every owned store's scripts. The spaced run takes about 1,400 calls to finish; 32 show its per-call bound. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness and checked against the delegate's next ten addresses. A delegate without `AddPublishedScripts` (V29) is sent the scripts with the request, as its web app did |
 | a new device: a key that is not the active one, entered after its store's 4096 scripts are sent; then a stale resume | the new key's scan runs in the pending slot while the active key goes on: after one call the harness checks the new key is pending beside the active one, and at the end that it is active at count 4096 with the pending slot emptied. Then tab A's new key part-way, tab B enters another key, and tab A's `resume` must be refused with `KEY_SUPERSEDED_PREFIX` and change nothing. Not on V29, which has no pending slot |
 
 ## Calibration
@@ -136,7 +136,13 @@ delegate's work on the reference machine, a fifth of the node's 5 s limit.
 Measured on **nova** (Intel i9-9900K, 3.6 GHz base, 16 threads) on 2026-09-30
 with `--calibrate 5`, at a load average of 9-13 from other work. The
 unmetered runs use an engine configured like the node's: Cranelift
-`OptLevel::None` and epoch interruption on. Time spent in host functions is
+`OptLevel::None` and epoch interruption on. (Since 2026-10-02 the engine
+also has the node's memory layout, `create_engine`'s 256 MiB reservation
+and 64 KiB guard, which makes Cranelift emit explicit bounds checks. That
+changes no fuel count, but measured side by side with the old layout on
+`ed88aa21…` it slows the guest by about 30%: the slowest rate, the export,
+went from about 3.7 to about 3.1 billion fuel/s. `BUDGET_FUEL` has not been
+re-set for it yet; the figures below are the 2026-09-30 ones.) Time spent in host functions is
 measured separately and was under 3 ms for every call, so these rates are the
 guest's own:
 
@@ -180,12 +186,11 @@ Same harness, same scenario, two builds of the delegate:
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
 Largest calls with every cap above filled, on the delegate main shipped
-before #216 (`cbe71dd9…`, V29) and on #216's final build (`ed88aa21…`).
-Both columns are one run each of the harness at commit `8aaa906` (the
-harness as of `2bd3b11`), so every row is the same scenario. A row of
-several calls shows its most expensive call. V29 is sent the published
-scripts with each request, as its web app did; it has no
-`AddPublishedScripts`, pending slot or wake-up catch-up:
+before #216 (`cbe71dd9…`, V29) and on main's since #216 (`ed88aa21…`).
+Both columns are one run each of the harness at commit `683f7ee`, so every
+row is the same scenario. A row of several calls shows its most expensive
+call. V29 is sent the published scripts with each request, as its web app
+did; it has no `AddPublishedScripts`, pending slot or wake-up catch-up:
 
 | call | V29 | #216 |
 |---|---:|---:|
@@ -195,7 +200,8 @@ scripts with each request, as its web app did; it has no
 | tip read answered, 8 full watch delegations | 101,067,360,752 (**2526.7%, over**) | 607,539,117 (15.2%) |
 | `ArmAutoInvoice`, 8 full watch delegations | 6,330,624,918 (**158.3%, over**) | 192,676,953 (4.8%) |
 | forced `Heartbeat`, 8 full watch delegations | 6,132,743,453 (**153.3%, over**) | 170,783,473 (4.3%) |
-| heartbeat wake-up moving one store's catch-up on, to the end | (not on V29: no `AddPublishedScripts`) | 2,229,458,742 (55.7%), 33 wake-ups |
+| heartbeat wake-up moving one store's catch-up on, to the end | (not on V29: no `AddPublishedScripts`) | 2,229,458,742 (55.7%), 32 wake-ups |
+| same, the first of them with every store's mailbox waiting to be re-read | (not on V29: no `AddPublishedScripts`) | 2,284,126,244 (57.1%) |
 | heartbeat wake-up once that catch-up is complete | (not on V29: no `AddPublishedScripts`) | 551,384,208 (13.8%) |
 | `SetPaymentXpub`, one full store's published scripts (4,096) | 13,050,327,747 (**326.3%, over**) | 1,221,560,677 (30.5%), 11 calls |
 | `DeriveOrderAddress`, same | 13,049,967,370 (**326.2%, over**) | 1,213,923,367 (30.3%), 11 calls |
@@ -234,7 +240,7 @@ the budget is still well under the node's 5 s limit. The ceiling
 
 The others to watch each grow with a collection: `KeepPurchase` into a full
 store and `ListKeptPurchases (1024)` (about 55%), a wake-up moving the
-catch-up on (about 56%), and the slow-plaintext mailbox run and its retry
+catch-up on (about 56%, 57% with every mailbox waiting), and the slow-plaintext mailbox run and its retry
 read (about 47-49%).
 
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
@@ -272,6 +278,11 @@ delegation it reads for).
 
   To add one, add a step to `scenario()` in `src/main.rs` with real inputs,
   and assert its answer (or the state it writes).
+* **Mirror drift below the top level.** The ledger and watch-delegation
+  mirrors are compared with the delegate's own encoding by top-level field
+  names only (and, for a delegation, one watch's field names). A nested type
+  that gains, loses or retypes a field (`Sale`, `Oversold`, the delegation
+  body) is not caught there; only where a step's answer depends on it.
 * **Record sizes.** Kept purchases are seeded at the size a minimal paid
   order has. A record may be much larger (`MAX_KEPT_PURCHASE_BYTES`, with a
   complaint and longer proofs); wasmtime charges a bulk copy one unit of fuel
