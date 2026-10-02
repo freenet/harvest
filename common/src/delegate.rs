@@ -2358,9 +2358,10 @@ mod tests {
             B::PaymentXpub { .. } => (7, true),
             B::OrderAddress { .. } => (8, false),
             B::UpcomingAddresses { .. } => (9, false),
+            B::PublishedScriptsAdded { .. } => (10, false),
         }
     }
-    const BITCOIN_RESPONSE_VARIANTS: usize = 10;
+    const BITCOIN_RESPONSE_VARIANTS: usize = 11;
 
     /// Every Bitcoin-surface request variant, as for [`classify_response`].
     fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
@@ -2377,9 +2378,10 @@ mod tests {
             B::GetPaymentXpub => (7, false),
             B::DeriveOrderAddress { .. } => (8, false),
             B::PeekOrderAddresses { .. } => (9, false),
+            B::AddPublishedScripts { .. } => (10, false),
         }
     }
-    const BITCOIN_REQUEST_VARIANTS: usize = 10;
+    const BITCOIN_REQUEST_VARIANTS: usize = 11;
 
     fn watch() -> crate::WatchedPayment {
         crate::WatchedPayment {
@@ -2457,6 +2459,10 @@ mod tests {
                 request_id: 42,
                 result: Ok(vec![]),
             },
+            B::PublishedScriptsAdded {
+                request_id: 42,
+                result: Ok(()),
+            },
         ]
     }
 
@@ -2495,6 +2501,7 @@ mod tests {
                 xpub: SECRET_TEXT.into(),
                 network: freenet_bitcoin_common::BitcoinNetwork::Signet,
                 published_scripts: vec![vec![2u8; 22]],
+                resume: true,
             },
             B::GetPaymentXpub,
             B::DeriveOrderAddress {
@@ -2504,6 +2511,10 @@ mod tests {
             B::PeekOrderAddresses {
                 request_id: 42,
                 count: 10,
+            },
+            B::AddPublishedScripts {
+                request_id: 42,
+                scripts: vec![vec![2u8; 22]],
             },
         ]
     }

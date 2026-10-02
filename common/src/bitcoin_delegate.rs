@@ -154,19 +154,31 @@ pub struct DerivedAddress {
 }
 
 /// How many consecutive derivation indices past the last published order the
-/// delegate scans before concluding there are none further up. Shared so the
-/// UI knows when an unmatched script may have come within reach again; see
-/// the delegate's `apply_published_floor`.
+/// delegate scans before concluding there are none further up; see the
+/// delegate's `advance_scan`.
 pub const PUBLISHED_INDEX_GAP: u32 = 100;
 
-/// How the delegate's `Err` starts when a `SetPaymentXpub` or
-/// `DeriveOrderAddress` was left short of the seller's published orders
-/// (harvest#206): its scan derives a bounded number of addresses a call and
-/// keeps the count it reached. Then comes the count reached, in decimal, then
-/// `;` and a sentence for a person. The UI recognises the answer by this
-/// prefix, asks again by itself, and shows the count as progress; nothing
-/// was handed out or set.
+/// How the delegate's `Err` starts when it cannot hand out an address, or
+/// make a key active, until its scan of the published scripts it holds has
+/// caught up (harvest#206): the scan derives a bounded number of addresses a
+/// call and keeps how far it got. Then come the counter and the scan
+/// cursor, in decimal, as `{counter}/{cursor}`, then `;` and a sentence for
+/// a person. The UI recognises the answer by this prefix, asks again by
+/// itself, and shows the figures as progress; nothing was handed out or set.
 pub const CATCHING_UP_PREFIX: &str = "catching up at ";
+
+/// How the delegate's `Err` starts when a `SetPaymentXpub` sent with
+/// `resume` finds that the key it was catching up is no longer the one held
+/// pending: another key was entered since, here or in another tab. Nothing
+/// was written. The UI stops that catch-up and says why.
+pub const KEY_SUPERSEDED_PREFIX: &str = "superseded: ";
+
+/// The most scripts the UI sends in one `AddPublishedScripts` (or with one
+/// `SetPaymentXpub`). One store's worth: a request's cost is mostly decoding
+/// its scripts, and the delegate holds them between requests, so a seller's
+/// many stores go over as many requests rather than one the node would stop
+/// (#206).
+pub const MAX_SCRIPTS_PER_REQUEST: usize = 4096;
 
 /// Requests the UI sends the delegate about Bitcoin payments.
 ///
@@ -226,11 +238,20 @@ pub enum BitcoinDelegateRequest {
         /// The network the seller says it is for. Rejected if the xpub's own
         /// version prefix disagrees.
         network: BitcoinNetwork,
-        /// See [`Self::DeriveOrderAddress`]'s field of the same name. Carried
-        /// here too so the count the payments panel shows straight after the
-        /// key is entered already accounts for the store's own orders.
+        /// Published payment scripts to add to those the delegate holds, as
+        /// [`Self::AddPublishedScripts`] does, before the key is scanned
+        /// against them. The UI sends every script as additions first and
+        /// the key after, so a key cannot be made active before the scripts
+        /// it is checked against have all arrived.
         #[serde(default)]
         published_scripts: Vec<Vec<u8>>,
+        /// Set when this continues a catch-up the delegate answered with
+        /// [`CATCHING_UP_PREFIX`]: if the key is not the one held pending
+        /// any more (another was entered since), the delegate answers
+        /// [`KEY_SUPERSEDED_PREFIX`] and writes nothing, rather than start
+        /// this key again over the newer one.
+        #[serde(default)]
+        resume: bool,
     },
 
     /// The configured payment xpub, if any, and how far derivation has got.
@@ -253,6 +274,11 @@ pub enum BitcoinDelegateRequest {
         /// highest index whose script appears here, so the count follows the
         /// public record rather than the device. Public data: every script
         /// here is already in a store contract.
+        ///
+        /// Since #206 the delegate holds every script it has been sent, and
+        /// these are only added to them ([`Self::AddPublishedScripts`]); the
+        /// UI sends none here. Kept for older UIs, whose full set is still
+        /// handled correctly, at their cost.
         #[serde(default)]
         published_scripts: Vec<Vec<u8>>,
     },
@@ -262,6 +288,16 @@ pub enum BitcoinDelegateRequest {
     /// the delegate may put one on an instant-checkout invoice (see
     /// `delegate::AutoInvoiceArm`). Capped at [`MAX_UPCOMING_ADDRESSES`].
     PeekOrderAddresses { request_id: u64, count: u32 },
+
+    /// Payment scripts of the seller's published orders, for the delegate to
+    /// hold and scan every key against before handing out an address
+    /// (harvest#77, #206). Additions only: duplicates are harmless, and
+    /// nothing is ever taken away by a request. At most
+    /// [`MAX_SCRIPTS_PER_REQUEST`] a request.
+    AddPublishedScripts {
+        request_id: u64,
+        scripts: Vec<Vec<u8>>,
+    },
 }
 
 /// The most addresses one `PeekOrderAddresses` answers. Also the most
@@ -297,8 +333,8 @@ pub enum BitcoinDelegateResponse {
     PaymentXpubSet {
         request_id: u64,
         result: Result<PaymentXpubStatus, String>,
-        /// The request's `published_scripts` that the delegate matched to an
-        /// index of this key. See `DeriveOrderAddress`.
+        /// Empty since #206: the delegate holds every script it is sent, so
+        /// there is nothing for the UI to account for. Kept for the wire.
         #[serde(default)]
         matched_scripts: Vec<Vec<u8>>,
     },
@@ -311,10 +347,7 @@ pub enum BitcoinDelegateResponse {
     OrderAddress {
         request_id: u64,
         result: Result<DerivedAddress, String>,
-        /// The request's `published_scripts` that the delegate matched to an
-        /// index of the stored key, i.e. that its counter now accounts for.
-        /// A script sent but not listed here was foreign, already below the
-        /// counter, or past the scan's gap, and the UI may offer it again.
+        /// Empty since #206, as for `PaymentXpubSet`. Kept for the wire.
         #[serde(default)]
         matched_scripts: Vec<Vec<u8>>,
     },
@@ -323,6 +356,11 @@ pub enum BitcoinDelegateResponse {
     UpcomingAddresses {
         request_id: u64,
         result: Result<Vec<DerivedAddress>, String>,
+    },
+    /// Answer to `AddPublishedScripts`: `Ok` once the scripts are held.
+    PublishedScriptsAdded {
+        request_id: u64,
+        result: Result<(), String>,
     },
 }
 
@@ -389,12 +427,14 @@ impl core::fmt::Debug for BitcoinDelegateRequest {
                 xpub: _,
                 network,
                 published_scripts,
+                resume,
             } => f
                 .debug_struct("SetPaymentXpub")
                 .field("request_id", request_id)
                 .field("xpub", &Redacted)
                 .field("network", network)
                 .field("published_scripts", published_scripts)
+                .field("resume", resume)
                 .finish(),
             Self::GetPaymentXpub => f.write_str("GetPaymentXpub"),
             Self::DeriveOrderAddress {
@@ -409,6 +449,14 @@ impl core::fmt::Debug for BitcoinDelegateRequest {
                 .debug_struct("PeekOrderAddresses")
                 .field("request_id", request_id)
                 .field("count", count)
+                .finish(),
+            Self::AddPublishedScripts {
+                request_id,
+                scripts,
+            } => f
+                .debug_struct("AddPublishedScripts")
+                .field("request_id", request_id)
+                .field("scripts", &scripts.len())
                 .finish(),
         }
     }

@@ -184,13 +184,13 @@ pub(crate) fn merge_ledger_bytes(
         .map_err(|e| e.to_string())
 }
 
-/// When `decide` last left this store's payment-counter scan short
-/// (harvest#206): CBOR of `Option<u64>`, the time, or `None` once a scan for
-/// it completed. While it is recent the store's status and heartbeat say
-/// instant checkout is catching up rather than taking orders
-/// ([`catching_up`]). Never a refusal `decide` checks: decide's own scan is
-/// what catches up, so it must go on running. Node-local, like the arm: not
-/// exported.
+/// What `decide` last found when it could not invoice for this store
+/// because of the payment counter (harvest#206): CBOR of
+/// `Option<CatchUpMark>`, `None` once a scan for it completed. While it
+/// stands, the store's status and heartbeat say so rather than read as taking
+/// orders ([`counter_refusal`]). Never a refusal `decide` checks: decide's own
+/// scan is what catches up, so it must go on running. Node-local, like the
+/// arm: not exported.
 pub(crate) fn catchup_key(store_contract_id: &[u8]) -> Vec<u8> {
     format!(
         "{AUTO_PREFIX}catchup:{}",
@@ -199,29 +199,68 @@ pub(crate) fn catchup_key(store_contract_id: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
-/// How long a [`catchup_key`] mark stands without being renewed. A store
-/// that is catching up is re-run at each wake-up (every five minutes) while
-/// its requests wait, and each short run writes the mark again; one not
-/// renewed for this long belongs to a catch-up nothing is driving any more
-/// (the requests that started it gave up), and the store's status goes back
-/// to what it was. The counter is still behind then, and the next request
-/// starts the catch-up again.
-pub(crate) const CATCHING_UP_SHOWN_MS: u64 = 30 * 60 * 1000;
-
-/// Whether `decide` is catching this store's payment counter up: a short
-/// scan marked within [`CATCHING_UP_SHOWN_MS`].
-fn catching_up<S: SecretStore>(secrets: &S, store_contract_id: &[u8], now_ms: u64) -> bool {
-    load::<_, Option<u64>>(secrets, &catchup_key(store_contract_id))
-        .flatten()
-        .is_some_and(|at| now_ms.saturating_sub(at) < CATCHING_UP_SHOWN_MS)
+/// A [`catchup_key`] mark.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct CatchUpMark {
+    /// When it was written; renewed by every run that finds the same.
+    at_ms: u64,
+    /// Which key it is about (`published_set::digest` of the key as
+    /// stored): a mark for a key that is no longer active says nothing.
+    key: [u8; 16],
+    /// The count the scan raised could not be kept (`CounterNotSaved`),
+    /// rather than the scan simply not being finished.
+    not_saved: bool,
 }
 
-/// Mark ([`catchup_key`]) that a scan for this store was left short, or
-/// clear the mark once one completed (written only when there is one).
-fn mark_catching_up<S: SecretStore>(secrets: &mut S, store_contract_id: &[u8], at_ms: Option<u64>) {
+/// How long a [`catchup_key`] mark stands without being renewed. A store
+/// that is catching up is re-run at each wake-up (every five minutes) while
+/// its requests wait, and each such run writes the mark again; one not
+/// renewed for this long belongs to a catch-up nothing is driving any more,
+/// and the store's status goes back to what it was.
+pub(crate) const CATCHING_UP_SHOWN_MS: u64 = 30 * 60 * 1000;
+
+/// What the store's status and heartbeat say about the payment counter: a
+/// recent [`catchup_key`] mark, for the key still active, whose catch-up is
+/// not since known to be complete (by whichever path completed it: a tab's
+/// request, another store's `decide`, a wake-up). `CounterNotSaved` when the
+/// mark says the count could not be kept.
+fn counter_refusal<S: SecretStore>(
+    secrets: &S,
+    store_contract_id: &[u8],
+    now_ms: u64,
+) -> Option<Refusal> {
+    let mark = load::<_, Option<CatchUpMark>>(secrets, &catchup_key(store_contract_id))
+        .flatten()
+        .filter(|m| now_ms.saturating_sub(m.at_ms) < CATCHING_UP_SHOWN_MS)?;
+    let active = crate::bitcoin::load_payment_xpub(secrets)?;
+    if crate::published_set::digest(active.xpub.as_bytes()) != mark.key {
+        return None;
+    }
+    if mark.not_saved {
+        return Some(Refusal::CounterNotSaved);
+    }
+    (!crate::bitcoin::active_scan_known_complete(secrets)).then_some(Refusal::CatchingUp)
+}
+
+/// Write a [`catchup_key`] mark for `xpub`, or clear one once a scan
+/// completed (written only when there is one).
+fn mark_counter<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    mark: Option<(u64, &str, bool)>,
+) {
     let key = catchup_key(store_contract_id);
-    if at_ms.is_some() || load::<_, Option<u64>>(secrets, &key).flatten().is_some() {
-        save(secrets, &key, &at_ms);
+    let value = mark.map(|(at_ms, xpub, not_saved)| CatchUpMark {
+        at_ms,
+        key: crate::published_set::digest(xpub.as_bytes()),
+        not_saved,
+    });
+    if value.is_some()
+        || load::<_, Option<CatchUpMark>>(secrets, &key)
+            .flatten()
+            .is_some()
+    {
+        save(secrets, &key, &value);
     }
 }
 
@@ -894,8 +933,7 @@ fn status_in<S: SecretStore>(
         paused: refusal_given(secrets, record, tip.as_ref(), &watched, now_ms)
             .err()
             .or(unreadable.then_some(Refusal::LedgerUnreadable))
-            .or(catching_up(secrets, &record.arm.store_contract_id, now_ms)
-                .then_some(Refusal::CatchingUp))
+            .or_else(|| counter_refusal(secrets, &record.arm.store_contract_id, now_ms))
             .map(|r| r.explain()),
         wallet_gap_paid_at_ms: ledger
             .gap_paid
@@ -976,7 +1014,7 @@ fn taking_orders_in<S: SecretStore>(
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
     if refusal_given(secrets, record, tip.as_ref(), &watched, now_ms).is_err()
-        || catching_up(secrets, &record.arm.store_contract_id, now_ms)
+        || counter_refusal(secrets, &record.arm.store_contract_id, now_ms).is_some()
     {
         return false;
     }
@@ -1516,7 +1554,7 @@ pub(crate) enum Refusal {
     NoWatchedAddress,
     CounterNotSaved,
     /// The payment counter is still being raised past this store's published
-    /// orders (`bitcoin::FloorScan`), over more runs than one.
+    /// orders (`bitcoin::advance_scan`), over more runs than one.
     CatchingUp,
     /// The store's ledger is held but does not decode: nothing is invoiced
     /// rather than invoicing again what it records as answered.
@@ -2624,8 +2662,12 @@ pub(crate) fn decide<S: SecretStore>(
         refuse_all(&mut decided, Refusal::NoPaymentKey);
         return decided;
     };
-    // Past every script this store has published (harvest#77), so a device
-    // whose counter is behind does not hand one out again.
+    // This store's published scripts join those the delegate holds, and the
+    // active key's scan moves on by a budget (harvest#77, #206). Until it is
+    // complete nothing is invoiced: the requests wait (`CatchingUp`, store
+    // wide, so the wake-up comes back for them), and the store is marked so
+    // its status and heartbeat say why. The scan's progress is kept, so the
+    // next run (and every wake-up) goes on from it.
     let published: Vec<Vec<u8>> = store
         .orders
         .orders
@@ -2633,28 +2675,42 @@ pub(crate) fn decide<S: SecretStore>(
         .map(|o| o.order.payment_script_pubkey.clone())
         .filter(|s| !s.is_empty())
         .collect();
-    match crate::bitcoin::published_floor_scan(&mut xpub, &published) {
-        Err(_) => {
+    let scan = crate::bitcoin::add_published(secrets, &published)
+        .map_err(crate::bitcoin::ScanError::NotSaved)
+        .and_then(|_| {
+            crate::bitcoin::advance_scan(
+                secrets,
+                crate::bitcoin::Slot::Active,
+                &mut xpub,
+                crate::bitcoin::FLOOR_SCAN_BUDGET,
+            )
+        });
+    match scan {
+        Err(crate::bitcoin::ScanError::Key(_)) => {
             refuse_all(&mut decided, Refusal::NoPaymentKey);
             return decided;
         }
-        // Left short: no address is handed out from a counter that may not
-        // be past every paid one. The counter it reached is kept, so the next
-        // run (the wake-up re-reads while requests wait) goes on from it.
-        //
-        // Marked (`catchup_key`) so the status and the heartbeat say so in
-        // the meantime, and the mark cleared once a scan completes.
-        Ok(scan) if !scan.complete => {
-            mark_catching_up(secrets, &arm.store_contract_id, Some(now_ms));
-            let why = if crate::bitcoin::save_payment_xpub(secrets, &xpub).is_ok() {
-                Refusal::CatchingUp
-            } else {
-                Refusal::CounterNotSaved
-            };
-            refuse_all(&mut decided, why);
+        // Said as it is: the status shows `CounterNotSaved`, not a catch-up
+        // that would never move.
+        Err(crate::bitcoin::ScanError::NotSaved(_)) => {
+            mark_counter(
+                secrets,
+                &arm.store_contract_id,
+                Some((now_ms, &xpub.xpub, true)),
+            );
+            refuse_all(&mut decided, Refusal::CounterNotSaved);
             return decided;
         }
-        Ok(_) => mark_catching_up(secrets, &arm.store_contract_id, None),
+        Ok(progress) if !progress.complete => {
+            mark_counter(
+                secrets,
+                &arm.store_contract_id,
+                Some((now_ms, &xpub.xpub, false)),
+            );
+            refuse_all(&mut decided, Refusal::CatchingUp);
+            return decided;
+        }
+        Ok(_) => mark_counter(secrets, &arm.store_contract_id, None),
     }
 
     let Some(mut ledger) = load_ledger_kept(secrets, &arm.store_contract_id) else {
@@ -2924,14 +2980,21 @@ fn decide_one<S: SecretStore>(
     // I7 then I2: the next address must be one the bridge was asked to
     // watch, by the tab or by this delegate ([`WatchSet`]); only then is it
     // spent, and the counter saved before anything names it.
-    let mut next = xpub.clone();
-    let derived = crate::bitcoin::apply_derive_order_address(&mut next)
-        .map_err(|_| Refusal::NoWatchedAddress)?;
-    if !watched.accepts(&derived.script_pubkey) {
-        return Err(Refusal::NoWatchedAddress);
-    }
-    crate::bitcoin::save_payment_xpub(secrets, &next).map_err(|_| Refusal::CounterNotSaved)?;
-    *xpub = next;
+    // Through the one way an address is handed out
+    // (`bitcoin::issue_next_address`), which also refuses while the scan is
+    // not complete.
+    use crate::bitcoin::NotIssued;
+    let derived =
+        crate::bitcoin::issue_next_address(secrets, crate::bitcoin::FLOOR_SCAN_BUDGET, |derived| {
+            watched.accepts(&derived.script_pubkey)
+        })
+        .map_err(|e| match e {
+            NotIssued::NoKey => Refusal::NoPaymentKey,
+            NotIssued::CatchingUp(_) => Refusal::CatchingUp,
+            NotIssued::Declined | NotIssued::Failed(_) => Refusal::NoWatchedAddress,
+            NotIssued::NotSaved(_) => Refusal::CounterNotSaved,
+        })?;
+    xpub.next_index = derived.index + 1;
 
     let order = Order {
         id: OrderId([0u8; 32]),
@@ -3920,7 +3983,9 @@ mod tests {
         let here = run(&mut g, &[other]);
         assert!(here.orders.is_empty());
         assert_eq!(here.refused[0].1, Refusal::AlreadyAnswered);
-        assert_eq!(counter(&g), 0);
+        // Nothing issued; the counter is past the order published elsewhere
+        // (its scan keeps what it raised, #206).
+        assert_eq!(counter(&g), 1);
     }
 
     /// I1, the ledger alone: a resend before the first answer has reached the
@@ -4188,7 +4253,7 @@ mod tests {
 
     /// I2. The counter is raised past the store's published scripts before
     /// deriving, so a device whose counter is behind does not reuse one.
-    /// Mutated red by removing the `published_floor_scan` call.
+    /// Mutated red by removing the `add_published` call.
     #[test]
     fn the_counter_moves_past_published_addresses() {
         let mut f = fixture();
@@ -6409,10 +6474,20 @@ mod tests {
         (f, last)
     }
 
-    /// #206: a short scan whose count the node will not keep is refused
+    /// The store's status and heartbeat, as one pair.
+    fn open_now(f: &Fixture, now: u64) -> (Option<String>, bool) {
+        let status = status_of(&f.secrets, &f.record, now);
+        (
+            status.paused,
+            taking_orders(&f.secrets, &f.record, now, &upcoming(&f.secrets)),
+        )
+    }
+
+    /// #206: a scan whose raised count the node will not keep is refused
     /// `CounterNotSaved`, not `CatchingUp` (which promises the next run goes
-    /// on from it), and nothing is invoiced. Mutated red by answering
-    /// `CatchingUp` whatever the save did.
+    /// on from it), nothing is invoiced, and the store's status and
+    /// heartbeat say that, not "catching up". Mutated red by answering
+    /// `CatchingUp` whatever the save did, and by marking it as a catch-up.
     #[test]
     fn a_short_scan_whose_count_is_not_kept_says_so() {
         let (mut f, _) = far_behind_fixture();
@@ -6431,6 +6506,10 @@ mod tests {
         );
         assert!(decided.undecided);
         assert_eq!(counter(&f), 0, "nothing was kept");
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::CounterNotSaved.explain()), false)
+        );
     }
 
     /// #206: while `decide` is catching the counter up, the store's status
@@ -6439,43 +6518,79 @@ mod tests {
     /// counting after `CATCHING_UP_SHOWN_MS`. And it is never a refusal that
     /// stops `decide` (the second run catches up and invoices). Mutated red
     /// by not reading the mark in `status_in`, in `taking_orders_in`, by not
-    /// clearing it when the scan completes, and by checking it in
-    /// `refusal_given`.
+    /// clearing it when the scan completes, by checking it in
+    /// `refusal_given`, and by not letting it lapse.
     #[test]
     fn the_status_and_heartbeat_say_when_instant_checkout_is_catching_up() {
         let (mut f, last) = far_behind_fixture();
-        let open = |f: &Fixture, now: u64| {
-            let status = status_of(&f.secrets, &f.record, now);
-            (
-                status.paused,
-                taking_orders(&f.secrets, &f.record, now, &upcoming(&f.secrets)),
-            )
-        };
-        assert_eq!(open(&f, NOW), (None, true), "taking orders before");
+        assert_eq!(open_now(&f, NOW), (None, true), "taking orders before");
         let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
         let first = run(&mut f, std::slice::from_ref(&entry));
         assert!(first.orders.is_empty());
         assert_eq!(
-            open(&f, NOW),
+            open_now(&f, NOW),
             (Some(Refusal::CatchingUp.explain()), false),
             "catching up"
         );
         let mark = catchup_key(&f.record.arm.store_contract_id);
-        save(&mut f.secrets, &mark, &Some(NOW - CATCHING_UP_SHOWN_MS));
-        assert_eq!(open(&f, NOW), (None, true), "a mark nothing renewed");
-        save(&mut f.secrets, &mark, &Some(NOW));
+        let held: CatchUpMark = load::<_, Option<CatchUpMark>>(&f.secrets, &mark)
+            .flatten()
+            .expect("marked");
+        save(
+            &mut f.secrets,
+            &mark,
+            &Some(CatchUpMark {
+                at_ms: NOW - CATCHING_UP_SHOWN_MS,
+                ..held.clone()
+            }),
+        );
+        assert_eq!(open_now(&f, NOW), (None, true), "a mark nothing renewed");
+        save(&mut f.secrets, &mark, &Some(held));
         let second = run(&mut f, std::slice::from_ref(&entry));
         assert_eq!(second.orders.len(), 1, "{:?}", second.refused);
         assert_eq!(
             second.orders[0].order.payment_script_pubkey,
             script_at(last)
         );
-        assert_eq!(open(&f, NOW).0, None, "caught up");
+        assert_eq!(open_now(&f, NOW).0, None, "caught up");
         assert_eq!(
-            load::<_, Option<u64>>(&f.secrets, &mark),
+            load::<_, Option<CatchUpMark>>(&f.secrets, &mark),
             Some(None),
             "cleared"
         );
+    }
+
+    /// #206 (D3): a mark `decide` left is ignored once the catch-up it was
+    /// about is over by another path: the active key's scan completed by a
+    /// tab's request (or another store's `decide`, or a wake-up), or the
+    /// active key changed. Mutated red by reading the mark alone.
+    #[test]
+    fn a_catch_up_mark_lapses_when_another_path_finishes_it() {
+        let (mut f, _) = far_behind_fixture();
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        run(&mut f, std::slice::from_ref(&entry));
+        assert_eq!(open_now(&f, NOW).0, Some(Refusal::CatchingUp.explain()));
+        // Finished elsewhere, as a tab's address request would.
+        let mut status = crate::bitcoin::load_payment_xpub(&f.secrets).unwrap();
+        while !crate::bitcoin::advance_scan(
+            &mut f.secrets,
+            crate::bitcoin::Slot::Active,
+            &mut status,
+            crate::bitcoin::FLOOR_SCAN_BUDGET,
+        )
+        .unwrap()
+        .complete
+        {}
+        assert_eq!(open_now(&f, NOW), (None, true), "completed elsewhere");
+
+        // Another key made active: the mark is about a key no longer used.
+        let (mut g, _) = far_behind_fixture();
+        run(&mut g, std::slice::from_ref(&entry));
+        assert_eq!(open_now(&g, NOW).0, Some(Refusal::CatchingUp.explain()));
+        let mut other = crate::bitcoin::load_payment_xpub(&g.secrets).unwrap();
+        other.xpub = format!(" {}", other.xpub);
+        crate::bitcoin::save_payment_xpub(&mut g.secrets, &other).unwrap();
+        assert_ne!(open_now(&g, NOW).0, Some(Refusal::CatchingUp.explain()));
     }
 
     /// Each whole-store refusal, as `global_refusal` gives it: the exact

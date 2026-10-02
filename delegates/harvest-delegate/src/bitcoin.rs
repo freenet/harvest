@@ -84,10 +84,12 @@ pub(crate) const BITCOIN_BRIDGE_KEY: &[u8] = b"harvest:bitcoin:bridge:v1";
 /// orders. That is harvest#77: a fresh install issued index 0 again and the
 /// new invoice settled itself against the old invoice's payment.
 ///
-/// So every derivation is also handed the scripts of the seller's own
-/// published orders, and [`apply_published_floor`] moves the counter past
-/// the highest index whose script it finds there. The counter is then the
-/// maximum of what this device handed out and what the network shows.
+/// So the delegate holds the scripts of the seller's own published orders,
+/// sent by the UI as additions and by instant checkout from each store it
+/// answers for ([`crate::published_set`]), and [`advance_scan`] moves the
+/// counter past the highest index whose script it finds there before
+/// [`issue_next_address`] hands one out. The counter is then the maximum of
+/// what this device handed out and what the network shows.
 ///
 /// That recovers the highest index ever PUBLISHED, which is not the highest
 /// ever HANDED OUT: an index whose invoice was abandoned before it was
@@ -192,26 +194,32 @@ fn save_pending_payment_xpub<S: SecretStore>(
 }
 
 /// Empty the pending slot, once its key is active or another key has been
-/// set in full. Written over rather than removed (this handler's store has no
-/// removal). A write the host refuses leaves a stale part-way count behind,
+/// set in full. Written over with empty bytes rather than removed (this
+/// handler's store has no removal). A write the host refuses leaves a stale part-way count behind,
 /// which is harmless: it is only read for a `SetPaymentXpub` of that same
 /// key, as a floor to resume from, and it is never handed out from.
 fn clear_pending_payment_xpub<S: SecretStore>(store: &mut S) {
-    if store.has_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY) {
-        if let Ok(bytes) = to_cbor(&None::<PaymentXpubStatus>) {
-            store.set_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY, &bytes);
-        }
+    // Empty bytes: what `import` treats as no slot at all.
+    if store
+        .get_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY)
+        .is_some_and(|held| !held.is_empty())
+    {
+        store.set_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY, &[]);
     }
 }
 
-/// The `Err` a request left short of the published orders answers with:
-/// [`harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX`], the count
-/// reached, and a sentence. The UI asks again by itself on seeing the prefix.
-pub(crate) fn catching_up_error(reached: u32) -> String {
+/// The `Err` a request answers while its key's scan has not caught up:
+/// [`harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX`], the counter and
+/// the cursor, and a sentence. The UI asks again by itself on seeing the
+/// prefix and shows the figures as progress.
+pub(crate) fn catching_up_error(progress: &Progress) -> String {
     format!(
-        "{}{reached}; this key has more published orders than one request can catch up \
-         with, so the count it reached is kept and the next request goes on from it",
-        harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX
+        "{}{}/{}; the published orders this key is checked against are still being \
+         scanned, a bounded number of addresses a request, and the next request goes on \
+         from here",
+        harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX,
+        progress.counter,
+        progress.cursor
     )
 }
 
@@ -369,7 +377,7 @@ fn apply_set_payment_xpub(
     })
 }
 
-/// How many consecutive indices past the last match [`apply_published_floor`]
+/// How many consecutive indices past the last match [`advance_scan`]
 /// derives before concluding there are no more published orders above it.
 ///
 /// Published orders are not contiguous: an invoice abandoned after its address
@@ -378,105 +386,338 @@ fn apply_set_payment_xpub(
 /// short of it -- and even then the store contract refuses to let that old
 /// order's payment settle a new one. Each step is one public-key derivation,
 /// so this is also the cost the scan adds to every invoice on a device whose
-/// count is already current. Defined in `harvest-common` because the UI uses
-/// it too, to decide when to offer the delegate an unmatched script again.
+/// count is already current (one more for each address handed out, and the
+/// whole gap again after scripts are added). Defined in `harvest-common`.
 pub(crate) use harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
 
-/// Raise `status.next_index` past every index of this key whose script
-/// appears in `published`, and return the new value.
-///
-/// `published` is the payment scripts of the seller's own published orders
-/// (see [`BitcoinDelegateRequest::DeriveOrderAddress`]). Scripts derived from
-/// some other key never match and are ignored, which is what keeps a seller
-/// who moved to a new wallet starting that wallet at 0.
-///
-/// Scans forward FROM the counter, not from 0: an index below the counter is
-/// already covered, so matching it could not raise anything. It stops after
-/// [`PUBLISHED_INDEX_GAP`] consecutive indices with no match, or when every
-/// published script has been matched, or at [`MAX_ORDER_INDEX`]. Never lowers
-/// the counter: a device ahead of the network (invoices derived but not yet
-/// published) keeps its count.
+/// The whole catch-up, run to its end against `published` from `status`'s
+/// counter, in a store of its own: what the unit tests below state the
+/// floor's rules against. Returns the counter reached.
 #[cfg(test)]
 fn apply_published_floor(
     status: &mut PaymentXpubStatus,
     published: &[Vec<u8>],
 ) -> Result<u32, String> {
-    published_floor_scan(status, published).map(|scan| {
-        assert!(scan.complete, "these tests stay inside one call's budget");
-        status.next_index
-    })
+    let mut store = crate::secrets::MemSecrets::default();
+    save_payment_xpub(&mut store, status)?;
+    add_published(&mut store, published)?;
+    loop {
+        let progress = advance_scan(&mut store, Slot::Active, status, FLOOR_SCAN_BUDGET)
+            .map_err(String::from)?;
+        if progress.complete {
+            return Ok(status.next_index);
+        }
+    }
 }
 
 /// How many indices one call's scan may derive (#206). Each is a public-key
 /// derivation, about 3.2 million units of the node's fuel, so this is about a
 /// third of a call. A device whose counter is far behind its published orders
-/// (a new device for a busy key; a store holds up to 4,096 orders and the UI
-/// sends every owned store's) catches up over several calls, the counter
-/// saved after each, rather than in one call the node would stop.
+/// (a new device for a busy key; a store holds up to 4,096 orders) catches up
+/// over several calls, the cursor saved after each, rather than in one call
+/// the node would stop.
 pub(crate) const FLOOR_SCAN_BUDGET: u32 = 384;
 
-/// What one call's scan found ([`published_floor_scan`]).
-#[derive(Debug, PartialEq)]
-pub(crate) struct FloorScan {
-    /// The published scripts it matched: the UI marks only these as
-    /// accounted for (PR #83 review, round 2, Should Fix 2).
-    pub matched: Vec<Vec<u8>>,
-    /// Whether it reached the end: no match left to find within
-    /// [`PUBLISHED_INDEX_GAP`] of the last. When it did not, the counter it
-    /// raised is a step on the way, and NO address may be handed out from it
-    /// (one past it may already be paid, harvest#77).
+/// How many indices a scheduled wake-up's scan may derive: a run that also
+/// signs heartbeats and reads the bridge, so a smaller share than a
+/// request's. Enough that instant checkout catches up with no tab open.
+pub(crate) const WAKEUP_SCAN_BUDGET: u32 = 128;
+
+/// Which key's scan: the active key, or the one held pending
+/// ([`BITCOIN_PAYMENT_XPUB_PENDING_KEY`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Active,
+    Pending,
+}
+
+impl Slot {
+    fn cursor_key(self) -> &'static [u8] {
+        match self {
+            Slot::Active => crate::published_set::CURSOR_ACTIVE_KEY,
+            Slot::Pending => crate::published_set::CURSOR_PENDING_KEY,
+        }
+    }
+
+    fn save_status<S: SecretStore>(
+        self,
+        store: &mut S,
+        status: &PaymentXpubStatus,
+    ) -> Result<(), String> {
+        match self {
+            Slot::Active => save_payment_xpub(store, status),
+            Slot::Pending => save_pending_payment_xpub(store, status),
+        }
+    }
+}
+
+/// How far a key's scan has got ([`advance_scan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Progress {
+    /// One past the last published index matched: what is handed out next.
+    pub counter: u32,
+    /// Every index in `[counter, cursor)` has been derived and is not a held
+    /// script.
+    pub cursor: u32,
+    /// The scan has gone [`PUBLISHED_INDEX_GAP`] past the counter with no
+    /// match (or nothing is held, or the key has no indices left): only now
+    /// may an address be handed out, or a pending key made active.
     pub complete: bool,
 }
 
-/// [`apply_published_floor`], returning the published scripts the scan
-/// MATCHED rather than the new count.
-///
-/// A script sent but not matched is foreign, below the counter, or
-/// beyond the gap, and only the last kind can ever matter again; the UI
-/// offers unmatched scripts again once the counter has moved on, which is
-/// when a beyond-gap one can come into reach.
-///
-/// At most [`FLOOR_SCAN_BUDGET`] indices a call: see [`FloorScan::complete`].
-pub(crate) fn published_floor_scan(
-    status: &mut PaymentXpubStatus,
-    published: &[Vec<u8>],
-) -> Result<FloorScan, String> {
-    let mut remaining: std::collections::HashSet<&[u8]> =
-        published.iter().map(Vec::as_slice).collect();
-    let mut matched = Vec::new();
-    if remaining.is_empty() {
-        return Ok(FloorScan {
-            matched,
-            complete: true,
-        });
-    }
-    let chain = AccountXpub::parse(&status.xpub)?.external_chain()?;
+/// Why [`advance_scan`] could not go on.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScanError {
+    /// The key does not parse or derive.
+    Key(String),
+    /// A counter the scan raised could not be kept: nothing after it was
+    /// written, and nothing may be handed out.
+    NotSaved(String),
+}
 
-    let mut index = status.next_index;
-    // The first index the scan may give up at: `PUBLISHED_INDEX_GAP` past the
-    // start, and pushed on by each match.
-    let mut give_up_at = index.saturating_add(PUBLISHED_INDEX_GAP);
-    let mut derived = 0;
-    while index <= MAX_ORDER_INDEX && index < give_up_at && !remaining.is_empty() {
-        if derived == FLOOR_SCAN_BUDGET {
-            return Ok(FloorScan {
-                matched,
-                complete: false,
-            });
+impl From<ScanError> for String {
+    fn from(e: ScanError) -> String {
+        match e {
+            ScanError::Key(e) | ScanError::NotSaved(e) => e,
         }
-        let script = chain.script_at(index)?;
-        derived += 1;
-        if remaining.remove(script.as_slice()) {
-            matched.push(script);
-            status.next_index = index + 1;
-            give_up_at = status.next_index.saturating_add(PUBLISHED_INDEX_GAP);
-        }
-        index += 1;
     }
-    Ok(FloorScan {
-        matched,
-        complete: true,
+}
+
+fn is_complete(counter: u32, cursor: u32, nothing_held: bool) -> bool {
+    nothing_held
+        || cursor >= counter.saturating_add(PUBLISHED_INDEX_GAP)
+        || cursor > MAX_ORDER_INDEX
+}
+
+/// Where `slot`'s scan stands for `status` without deriving anything: the
+/// saved cursor when it is for this key and the held scripts have not
+/// changed since, else the counter (a script added since may sit at any
+/// index from the counter up).
+fn cursor_for<S: SecretStore>(
+    store: &S,
+    slot: Slot,
+    status: &PaymentXpubStatus,
+    generation: u32,
+) -> u32 {
+    crate::published_set::Cursor::load(store, slot.cursor_key())
+        .filter(|c| {
+            c.tag == status.xpub.as_bytes()
+                && c.generation == generation
+                && status.next_index >= c.base
+        })
+        .map_or(status.next_index, |c| c.at.max(status.next_index))
+}
+
+/// Whether the active key's scan is known to be complete, from what is
+/// kept, without deriving: for the status a store shows. A cursor that does
+/// not say so (none kept, scripts added since) reads as not known.
+pub(crate) fn active_scan_known_complete<S: SecretStore>(store: &S) -> bool {
+    let Some(status) = load_payment_xpub(store) else {
+        return false;
+    };
+    let (generation, held) = crate::published_set::published_meta(store);
+    let cursor = cursor_for(store, Slot::Active, &status, generation);
+    is_complete(status.next_index, cursor, held == 0)
+}
+
+/// A scheduled wake-up's share of the catch-up: the active key's scan moved
+/// on by [`WAKEUP_SCAN_BUDGET`], so instant checkout catches up with no tab
+/// open. Nothing is handed out. Errors are left for the next request to
+/// report.
+pub(crate) fn advance_on_wakeup<S: SecretStore>(store: &mut S) {
+    if let Some(mut status) = load_payment_xpub(store) {
+        let _ = advance_scan(store, Slot::Active, &mut status, WAKEUP_SCAN_BUDGET);
+    }
+}
+
+/// Move `slot`'s scan on by at most `budget` derivations.
+///
+/// From the cursor, each index's script is looked for among the held
+/// published scripts ([`crate::published_set`]). A match raises the counter
+/// to one past it and the scan goes on from there; the scan is complete once
+/// it has gone [`PUBLISHED_INDEX_GAP`] past the counter with no match. That
+/// is the scan harvest#77 has always made, cut into budgets and run against
+/// every script the delegate has been sent rather than those one request
+/// carried.
+///
+/// A matched script stays held: below this key's counter it never matches
+/// again, and the next key entered (or this one entered afresh, starting at
+/// 0) needs it. Written in this order: the raised counter first (refused,
+/// nothing else is written: [`ScanError::NotSaved`]); then the cursor
+/// (refused, the next scan starts again from the counter).
+pub(crate) fn advance_scan<S: SecretStore>(
+    store: &mut S,
+    slot: Slot,
+    status: &mut PaymentXpubStatus,
+    budget: u32,
+) -> Result<Progress, ScanError> {
+    use crate::published_set::{digest, Cursor, DigestList, PUBLISHED_KEY};
+    let published = DigestList::load(store, PUBLISHED_KEY, b"");
+    let generation = published.generation();
+    let start = status.next_index;
+    let mut cursor = cursor_for(store, slot, status, generation);
+
+    let mut counter = status.next_index;
+    let mut derived = 0;
+    let nothing_held = published.is_empty();
+    if !is_complete(counter, cursor, nothing_held) {
+        let chain = AccountXpub::parse(&status.xpub)
+            .and_then(|a| a.external_chain())
+            .map_err(ScanError::Key)?;
+        while derived < budget && !is_complete(counter, cursor, nothing_held) {
+            let d = digest(&chain.script_at(cursor).map_err(ScanError::Key)?);
+            derived += 1;
+            if published.contains(&d) {
+                counter = cursor + 1;
+            }
+            cursor += 1;
+        }
+    }
+    if counter != start {
+        let mut raised = status.clone();
+        raised.next_index = counter;
+        slot.save_status(store, &raised)
+            .map_err(ScanError::NotSaved)?;
+        *status = raised;
+    }
+    if derived > 0 {
+        store.set_secret(
+            slot.cursor_key(),
+            &Cursor {
+                tag: status.xpub.as_bytes().to_vec(),
+                generation,
+                // No held script in `[counter, cursor)`: valid while the
+                // counter is not set below this.
+                base: counter,
+                at: cursor,
+            }
+            .encode(),
+        );
+    }
+    Ok(Progress {
+        counter,
+        cursor,
+        complete: is_complete(counter, cursor, nothing_held),
     })
+}
+
+/// Add published scripts to those held ([`crate::published_set`]): every
+/// one not already held and not an address the active key handed out
+/// itself. Any added sends every key's scan back to its counter. `Err` when
+/// the host refused the write: the scripts are not held, and the caller must
+/// not go on as though they were.
+pub(crate) fn add_published<S: SecretStore>(
+    store: &mut S,
+    scripts: &[Vec<u8>],
+) -> Result<usize, String> {
+    use crate::published_set::{digest, DigestList, ISSUED_KEY, PUBLISHED_KEY};
+    if scripts.is_empty() {
+        return Ok(0);
+    }
+    let active_tag = load_payment_xpub(store).map(|s| s.xpub.into_bytes());
+    let issued = active_tag
+        .as_deref()
+        .map(|tag| DigestList::load(store, ISSUED_KEY, tag));
+    let fresh: Vec<_> = scripts
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| digest(s))
+        .filter(|d| !issued.as_ref().is_some_and(|issued| issued.contains(d)))
+        .collect();
+    let mut published = DigestList::load(store, PUBLISHED_KEY, b"");
+    let added = published.insert(&fresh);
+    if added > 0 && !crate::published_set::save_published(store, &published) {
+        return Err(
+            "the node refused to store the published orders' addresses, so none can be \
+             checked against them yet"
+                .to_string(),
+        );
+    }
+    Ok(added)
+}
+
+/// Record that the active key handed out `script` ([`ISSUED_KEY`]), so the
+/// order it ends up on is not held as a published script when a tab sends
+/// it back. Best effort: a write refused only lets that script into the held
+/// set, where it never matches.
+///
+/// [`ISSUED_KEY`]: crate::published_set::ISSUED_KEY
+fn note_issued<S: SecretStore>(store: &mut S, xpub: &str, script: &[u8]) {
+    use crate::published_set::{digest, DigestList, ISSUED_KEY};
+    let mut issued = DigestList::load(store, ISSUED_KEY, xpub.as_bytes());
+    if issued.insert(&[digest(script)]) > 0 {
+        issued.save(store, ISSUED_KEY);
+    }
+}
+
+/// Why [`issue_next_address`] handed nothing out.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NotIssued {
+    /// No payment key is set.
+    NoKey,
+    /// The active key's scan has not caught up yet; it went on by a budget.
+    CatchingUp(Progress),
+    /// The caller's check turned the address down (instant checkout: not a
+    /// watched one). Nothing was spent.
+    Declined,
+    /// The key cannot hand out another address, or does not derive.
+    Failed(String),
+    /// A counter could not be kept, so nothing was handed out.
+    NotSaved(String),
+}
+
+impl NotIssued {
+    /// The `Err` a `DeriveOrderAddress` answers.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            NotIssued::NoKey => "no payment key is set for this store yet. Add your wallet's \
+                                 native SegWit account key before issuing an invoice."
+                .to_string(),
+            NotIssued::CatchingUp(progress) => catching_up_error(progress),
+            NotIssued::Declined => "that address was turned down".to_string(),
+            NotIssued::Failed(e) | NotIssued::NotSaved(e) => e.clone(),
+        }
+    }
+}
+
+/// **The one way an address is handed out** (#206). Every path that spends
+/// an index -- an invoice (`DeriveOrderAddress`), a raise past used
+/// addresses (the same request, harvest#183), and instant checkout
+/// (`auto_invoice::decide`) -- comes through here, and nothing else calls
+/// [`apply_derive_order_address`] or raises the counter to hand an index
+/// out (`only_the_choke_point_hands_out_an_index` pins it).
+///
+/// It moves the active key's scan on by at most `budget`, and refuses until
+/// the scan is complete: until every script the delegate holds has been
+/// looked for up to [`PUBLISHED_INDEX_GAP`] past the counter. Then it
+/// derives the address at the counter, lets `accept` turn it down (nothing
+/// spent), saves the counter past it BEFORE returning it, and records it as
+/// issued.
+pub(crate) fn issue_next_address<S: SecretStore>(
+    store: &mut S,
+    budget: u32,
+    accept: impl FnOnce(&DerivedAddress) -> bool,
+) -> Result<DerivedAddress, NotIssued> {
+    let mut status = load_payment_xpub(store).ok_or(NotIssued::NoKey)?;
+    let progress = advance_scan(store, Slot::Active, &mut status, budget).map_err(|e| match e {
+        ScanError::Key(e) => NotIssued::Failed(e),
+        ScanError::NotSaved(e) => NotIssued::NotSaved(e),
+    })?;
+    if !progress.complete {
+        return Err(NotIssued::CatchingUp(progress));
+    }
+    let mut next = status.clone();
+    let derived = apply_derive_order_address(&mut next).map_err(NotIssued::Failed)?;
+    if !accept(&derived) {
+        return Err(NotIssued::Declined);
+    }
+    // Saved BEFORE the address leaves here. If persisting fails the address
+    // is discarded rather than returned, because a caller that received it
+    // may show it to a buyer while the delegate still believes the index is
+    // unused.
+    save_payment_xpub(store, &next).map_err(NotIssued::NotSaved)?;
+    note_issued(store, &next.xpub, &derived.script_pubkey);
+    Ok(derived)
 }
 
 /// Hand out the next address and advance the counter.
@@ -487,9 +728,7 @@ pub(crate) fn published_floor_scan(
 /// (harmless, and bounded by the wallet's gap limit), whereas advancing only
 /// on success would re-issue an address that had already been shown to a
 /// buyer.
-pub(crate) fn apply_derive_order_address(
-    status: &mut PaymentXpubStatus,
-) -> Result<DerivedAddress, String> {
+fn apply_derive_order_address(status: &mut PaymentXpubStatus) -> Result<DerivedAddress, String> {
     if status.next_index > MAX_ORDER_INDEX {
         return Err(
             "this account key has handed out every address it can. Set a fresh account \
@@ -573,6 +812,92 @@ pub fn watch_order_payment<S: SecretStore>(
     );
     save_watches(store, &watches);
     watch
+}
+
+/// The `KEY_SUPERSEDED_PREFIX` answer to a resumed `SetPaymentXpub` whose key
+/// is no longer the one held pending.
+fn superseded_error() -> String {
+    format!(
+        "{}another payment key was entered since this one, so this one was not saved",
+        harvest_common::bitcoin_delegate::KEY_SUPERSEDED_PREFIX
+    )
+}
+
+/// Answer `SetPaymentXpub`: add the scripts it carries, then scan the key
+/// against everything held, and make it the active key only once that scan
+/// is complete (#206).
+///
+/// # Which slot the key's scan lives in
+///
+/// * The active key itself (entered again, say to correct the network): the
+///   active counter and cursor, as every address request moves them.
+/// * Any other key, or when none is held: the pending slot
+///   ([`BITCOIN_PAYMENT_XPUB_PENDING_KEY`]), with the active key, its
+///   counter and its scan left exactly as they were; promoted, with its
+///   cursor, once its scan is complete. A newer submission of another key
+///   replaces the one pending, unless the request is a `resume` of a
+///   catch-up, which then answers [`KEY_SUPERSEDED_PREFIX`] and writes
+///   nothing, so two tabs entering two keys cannot keep restarting each
+///   other.
+///
+/// Until it is complete the answer is `Err` ([`catching_up_error`]), so the
+/// UI shows progress and asks again; nothing is handed out from a key whose
+/// scan is not complete, whichever slot it is in.
+///
+/// [`KEY_SUPERSEDED_PREFIX`]: harvest_common::bitcoin_delegate::KEY_SUPERSEDED_PREFIX
+fn set_payment_key<S: SecretStore>(
+    store: &mut S,
+    xpub: &str,
+    network: BitcoinNetwork,
+    published_scripts: &[Vec<u8>],
+    resume: bool,
+) -> Result<PaymentXpubStatus, String> {
+    let active = load_payment_xpub(store);
+    let pending = load_pending_payment_xpub(store);
+    let is_active = active
+        .as_ref()
+        .is_some_and(|held| same_account(&held.xpub, xpub));
+    let is_pending = !is_active
+        && pending
+            .as_ref()
+            .is_some_and(|held| same_account(&held.xpub, xpub));
+    if resume && !is_active && !is_pending {
+        return Err(superseded_error());
+    }
+    let (slot, existing) = if is_active {
+        (Slot::Active, active.as_ref())
+    } else if is_pending {
+        (Slot::Pending, pending.as_ref())
+    } else {
+        // A count only means anything for its own key: another key starts
+        // at 0 (`apply_set_payment_xpub`).
+        (Slot::Pending, None)
+    };
+    let mut status = apply_set_payment_xpub(xpub, network, existing)?;
+    add_published(store, published_scripts)?;
+    if existing != Some(&status) {
+        // A new pending key, or a corrected network: kept before the scan,
+        // so a part-way count has a key to belong to.
+        slot.save_status(store, &status)?;
+    }
+    let progress =
+        advance_scan(store, slot, &mut status, FLOOR_SCAN_BUDGET).map_err(String::from)?;
+    if !progress.complete {
+        return Err(catching_up_error(&progress));
+    }
+    if slot == Slot::Pending {
+        save_payment_xpub(store, &status)?;
+        // Its scan goes with it: the cursor is tagged with the key.
+        if let Some(cursor) = store.get_secret(crate::published_set::CURSOR_PENDING_KEY) {
+            store.set_secret(crate::published_set::CURSOR_ACTIVE_KEY, &cursor);
+        }
+    }
+    // Whatever was pending is over, this key's own part-way slot included:
+    // this key was set in full.
+    if slot == Slot::Pending || pending.is_some() {
+        clear_pending_payment_xpub(store);
+    }
+    Ok(status)
 }
 
 /// Answer one Bitcoin request, for the Harvest web app only.
@@ -691,94 +1016,14 @@ pub fn handle<S: SecretStore>(
             xpub,
             network,
             published_scripts,
-        } => {
-            let active = load_payment_xpub(store);
-            let pending = load_pending_payment_xpub(store);
-            let mut matched_scripts = Vec::new();
-            // A key that is not the active one starts from the count its own
-            // earlier part-way scan reached, if that is the key held pending,
-            // and from 0 otherwise (`apply_set_payment_xpub` keeps a count
-            // only for the same key).
-            let is_active = active
-                .as_ref()
-                .is_some_and(|held| same_account(&held.xpub, &xpub));
-            let existing = if is_active {
-                active.as_ref()
-            } else {
-                pending.as_ref()
-            };
-            // A scan left short (`FloorScan::complete`) keeps the count it
-            // reached and answers Err (`catching_up_error`), so the UI asks
-            // again with every script and the scan goes on. Never Ok: the UI
-            // would record the scripts not yet reached as offered and
-            // unmatched, leave them out of its next address request, and
-            // that request's scan would then hand out an address of a
-            // published order (harvest#77). On Err the UI records nothing.
-            //
-            // WHERE the count is kept depends on the key:
-            //
-            // * Another key (or none held): in the pending slot, with the
-            //   active key and its counter left exactly as they were. See
-            //   `BITCOIN_PAYMENT_XPUB_PENDING_KEY` for the re-issue saving it
-            //   as active would cause.
-            //
-            // * The active key itself: on the active counter, as
-            //   `DeriveOrderAddress` and `decide` keep theirs. A tab's record
-            //   of what to leave out is about this same key's indices, and
-            //   the step only raises a count the record relies on never
-            //   falling. The count reached is one past a published order of
-            //   this key. The UI sends EVERY published script with a key, so
-            //   every script the scan did not match lies outside the indices
-            //   it derived: what a stale tab leaves out (a script unmatched
-            //   when it offered it, at a count no higher than the delegate's
-            //   then) is either below the new count, never handed out, or
-            //   past this scan. And a stale tab offers its unmatched scripts
-            //   again once the count it knows is `PUBLISHED_INDEX_GAP / 2`
-            //   (50) past where it offered them. Its next answer reports at
-            //   least the new count, which a short scan moves at least
-            //   `FLOOR_SCAN_BUDGET - PUBLISHED_INDEX_GAP + 1` (285), so after
-            //   that one request it offers them all.
-            //
-            //   That one request is the limit. When the last index the scan
-            //   derived matched, the count sits on an index it did not
-            //   derive, and a stale tab holding that very index as unmatched
-            //   would be handed it. That needs a script that was past the
-            //   gap when the tab offered it, with orders filling the gap
-            //   published or loaded since: the same precondition under which
-            //   a COMPLETE scan from that tab, its newly sent scripts
-            //   carrying the count up to the one it leaves out, hands it out
-            //   too (the UI's offer-again rule, PR #83). The pending slot
-            //   would not close it, since `DeriveOrderAddress` and `decide`
-            //   move this counter in the same steps.
-            //   `AppState::check_address_before_signing` is behind both.
-            let result = apply_set_payment_xpub(&xpub, network, existing).and_then(|mut status| {
-                let scan = published_floor_scan(&mut status, &published_scripts)?;
-                if !scan.complete {
-                    if is_active {
-                        save_payment_xpub(store, &status)?;
-                    } else {
-                        save_pending_payment_xpub(store, &status)?;
-                    }
-                    return Err(catching_up_error(status.next_index));
-                }
-                // Complete: this key is now the active one, and whatever
-                // was held pending is over, whichever key it was.
-                save_payment_xpub(store, &status)?;
-                if pending.is_some() {
-                    clear_pending_payment_xpub(store);
-                }
-                matched_scripts = scan.matched;
-                Ok(status)
-            });
-            if result.is_err() {
-                matched_scripts.clear();
-            }
-            BitcoinDelegateResponse::PaymentXpubSet {
-                request_id,
-                result,
-                matched_scripts,
-            }
-        }
+            resume,
+        } => BitcoinDelegateResponse::PaymentXpubSet {
+            request_id,
+            result: set_payment_key(store, &xpub, network, &published_scripts, resume),
+            // Nothing for the UI to account for any more: the delegate
+            // holds every script it is sent (`crate::published_set`).
+            matched_scripts: Vec::new(),
+        },
 
         BitcoinDelegateRequest::GetPaymentXpub => BitcoinDelegateResponse::PaymentXpub {
             status: load_payment_xpub(store),
@@ -787,48 +1032,23 @@ pub fn handle<S: SecretStore>(
         BitcoinDelegateRequest::DeriveOrderAddress {
             request_id,
             published_scripts,
-        } => {
-            let mut matched_scripts = Vec::new();
-            let result = match load_payment_xpub(store) {
-                None => Err(
-                    "no payment key is set for this store yet. Add your wallet's native \
-                     SegWit account key before issuing an invoice."
-                        .to_string(),
-                ),
-                // Raised to the network's count FIRST, so the index handed out
-                // is past every published order of this key (harvest#77). A
-                // scan left short hands out nothing: its counter is saved, so
-                // the next request goes on from it.
-                Some(mut status) => published_floor_scan(&mut status, &published_scripts)
-                    .and_then(|scan| {
-                        if scan.complete {
-                            matched_scripts = scan.matched;
-                            return Ok(());
-                        }
-                        save_payment_xpub(store, &status)?;
-                        Err(catching_up_error(status.next_index))
-                    })
-                    .and_then(|_| apply_derive_order_address(&mut status))
-                    .and_then(|derived| {
-                        // Save the advanced counter BEFORE the address leaves
-                        // here. If persisting fails the address is discarded
-                        // rather than returned, because a caller that received it
-                        // may show it to a buyer while the delegate still believes
-                        // the index is unused.
-                        save_payment_xpub(store, &status)?;
-                        Ok(derived)
-                    }),
-            };
-            if result.is_err() {
-                // Nothing was saved, so nothing the scan matched is on record.
-                matched_scripts.clear();
-            }
-            BitcoinDelegateResponse::OrderAddress {
-                request_id,
-                result,
-                matched_scripts,
-            }
-        }
+        } => BitcoinDelegateResponse::OrderAddress {
+            request_id,
+            // An older UI's scripts are additions like any others; held
+            // first, so the address is past them too.
+            result: add_published(store, &published_scripts).and_then(|_| {
+                issue_next_address(store, FLOOR_SCAN_BUDGET, |_| true).map_err(|e| e.message())
+            }),
+            matched_scripts: Vec::new(),
+        },
+
+        BitcoinDelegateRequest::AddPublishedScripts {
+            request_id,
+            scripts,
+        } => BitcoinDelegateResponse::PublishedScriptsAdded {
+            request_id,
+            result: add_published(store, &scripts).map(|_| ()),
+        },
 
         BitcoinDelegateRequest::PeekOrderAddresses { request_id, count } => {
             BitcoinDelegateResponse::UpcomingAddresses {
@@ -1190,16 +1410,19 @@ mod tests {
         matched
     }
 
-    /// #206, #183: the bounded scan, repeated with the same scripts until it
-    /// is complete (as each caller does: Err and ask again, or a refused
-    /// batch and the next run), reaches exactly the count the unbounded scan
-    /// reached and matches the same scripts, over random published sets:
-    /// contiguous runs, gaps up to and past `PUBLISHED_INDEX_GAP`, scripts
-    /// below the counter, foreign scripts, and runs longer than one call.
-    /// So bounding it never lets an address below the true floor out.
-    /// Mutated red by resuming past the count reached rather than from it.
+    /// #206, #183: the delegate-owned catch-up, run to completion, reaches
+    /// exactly the counter the unbounded reference scan reaches over the same
+    /// scripts, over random published sets: contiguous runs, gaps up to and
+    /// past `PUBLISHED_INDEX_GAP`, scripts below the counter, foreign
+    /// scripts, and runs longer than one call; the scripts arriving in random
+    /// chunks in random order, with scans of random budgets between them (so
+    /// additions arrive after part of the scan is done). And the first
+    /// address it hands out is that counter. So no arrival order or budget
+    /// lets an address below the true floor out. Mutated red by not sending a
+    /// scan back to its counter when a script is added, and by resuming past
+    /// the cursor.
     #[test]
-    fn the_bounded_scan_repeated_reaches_the_unbounded_floor() {
+    fn the_catch_up_reaches_the_unbounded_floor_whatever_the_arrival() {
         let key = signet_vpub();
         let chain = AccountXpub::parse(&key).unwrap().external_chain().unwrap();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -1207,7 +1430,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            state % n
+            state % n.max(1)
         };
         for round in 0..24 {
             let start = next(50) as u32;
@@ -1237,26 +1460,41 @@ mod tests {
                 network: BitcoinNetwork::Signet,
                 next_index: start,
             };
-            let mut want = floor_unbounded(&mut reference, &published);
-            want.sort();
-            let mut bounded = PaymentXpubStatus {
+            floor_unbounded(&mut reference, &published);
+
+            // Shuffled, then cut into chunks.
+            for i in (1..published.len()).rev() {
+                let j = next(i as u64 + 1) as usize;
+                published.swap(i, j);
+            }
+            let mut store = crate::secrets::MemSecrets::default();
+            let mut status = PaymentXpubStatus {
                 next_index: start,
                 ..reference.clone()
             };
-            let mut got = Vec::new();
-            let mut calls = 0;
-            loop {
-                calls += 1;
-                assert!(calls < 100, "round {round}: no end");
-                let scan = published_floor_scan(&mut bounded, &published).unwrap();
-                got.extend(scan.matched);
-                if scan.complete {
-                    break;
+            save_payment_xpub(&mut store, &status).unwrap();
+            let mut rest = published.as_slice();
+            while !rest.is_empty() {
+                let take = (1 + next(rest.len() as u64 / 2 + 1) as usize).min(rest.len());
+                add_published(&mut store, &rest[..take]).unwrap();
+                rest = &rest[take..];
+                if next(2) == 0 {
+                    advance_scan(&mut store, Slot::Active, &mut status, 1 + next(400) as u32)
+                        .unwrap();
                 }
             }
-            got.sort();
-            assert_eq!(bounded.next_index, reference.next_index, "round {round}");
-            assert_eq!(got, want, "round {round}");
+            let mut calls = 0;
+            while !advance_scan(&mut store, Slot::Active, &mut status, FLOOR_SCAN_BUDGET)
+                .unwrap()
+                .complete
+            {
+                calls += 1;
+                assert!(calls < 100, "round {round}: no end");
+            }
+            assert_eq!(status.next_index, reference.next_index, "round {round}");
+            let first =
+                issue_next_address(&mut store, FLOOR_SCAN_BUDGET, |_| true).expect("caught up");
+            assert_eq!(first.index, reference.next_index, "round {round}");
         }
     }
 
@@ -1423,6 +1661,7 @@ mod origin_gating_tests {
             xpub: key.to_string(),
             network: BitcoinNetwork::Bitcoin,
             published_scripts: Vec::new(),
+            resume: false,
         }
     }
 
@@ -1643,6 +1882,7 @@ mod origin_gating_tests {
                 xpub: SELLERS_KEY.to_string(),
                 network: BitcoinNetwork::Bitcoin,
                 published_scripts: published.clone(),
+                resume: false,
             },
         )
         .expect("authorized")
@@ -1706,6 +1946,7 @@ mod origin_gating_tests {
                 xpub: SELLERS_KEY.to_string(),
                 network: BitcoinNetwork::Bitcoin,
                 published_scripts: published.clone(),
+                resume: false,
             },
         )
         .expect("authorized")
@@ -1756,6 +1997,7 @@ mod origin_gating_tests {
                 xpub: SELLERS_KEY.into(),
                 network: BitcoinNetwork::Bitcoin,
                 published_scripts: sent.clone(),
+                resume: false,
             },
         )
         .expect("authorized")
@@ -1779,12 +2021,8 @@ mod origin_gating_tests {
             super::FLOOR_SCAN_BUDGET,
             "the count reached is kept"
         );
-        let (second, matched) = set(&mut store, 2);
+        let (second, _) = set(&mut store, 2);
         assert_eq!(second.expect("caught up").next_index, last + 1);
-        assert_eq!(
-            matched.len(),
-            (last + 1 - super::FLOOR_SCAN_BUDGET) as usize
-        );
         assert_eq!(load_payment_xpub(&store).unwrap().next_index, last + 1);
         assert_eq!(
             load_pending_payment_xpub(&store),
@@ -1796,7 +2034,7 @@ mod origin_gating_tests {
     /// The count a catching-up `Err` carries, read the way the UI reads it.
     fn reached(e: &str) -> Option<u32> {
         e.strip_prefix(harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX)?
-            .split(';')
+            .split(['/', ';'])
             .next()?
             .parse()
             .ok()
@@ -1825,6 +2063,7 @@ mod origin_gating_tests {
                 xpub: key.into(),
                 network: BitcoinNetwork::Bitcoin,
                 published_scripts: sent.to_vec(),
+                resume: false,
             },
         )
         .expect("authorized")
@@ -1861,14 +2100,11 @@ mod origin_gating_tests {
     /// #206, the cross-tab case. The seller's key K1 is active, at a count
     /// past its published orders. Tab A sets a different key K2, whose
     /// published orders (from another device) run past one call's scan, so
-    /// the set is left short. Tab B still holds K1's record of what to leave
-    /// out: K1's own orders accounted for, and K2's scripts, foreign to K1,
-    /// unmatched at K1's count. So B's address request carries none of them
-    /// (what `AppState::order_address_request` sends, pinned on the UI side
-    /// by `a_stale_tab_leaves_the_other_keys_scripts_out`). B must get K1's
-    /// next address, never K2's index past the part-way count, which a K2
-    /// order already names. Mutated red by saving a short scan for another
-    /// key as the active key.
+    /// the set is left short. Tab B, which has sent its scripts already and
+    /// so sends none, asks for an address. It must get K1's next address,
+    /// never K2's index past the part-way count, which a K2 order already
+    /// names. Mutated red by saving a short scan for another key as the
+    /// active key.
     #[test]
     fn a_key_left_short_is_not_handed_out_from_by_another_tab() {
         let k2 = attackers_key();
@@ -1883,7 +2119,7 @@ mod origin_gating_tests {
         let (short, _) = set_with(&mut store, &k2, 2, &everything);
         assert_eq!(reached(&short.unwrap_err()), Some(super::FLOOR_SCAN_BUDGET));
 
-        // Tab B: everything it knows of is accounted for or unmatched.
+        // Tab B: nothing to add.
         let derived = derive_with(&mut store, 3, &[]).expect("an address");
         assert!(
             !k2_orders.contains(&derived.script_pubkey),
@@ -1924,12 +2160,8 @@ mod origin_gating_tests {
 
         // Resumed: from 384, one more call reaches the end. From 0 it would
         // be short again.
-        let (second, matched) = set_with(&mut store, &k2, 2, &k2_orders);
+        let (second, _) = set_with(&mut store, &k2, 2, &k2_orders);
         assert_eq!(second.expect("caught up").next_index, last + 1);
-        assert_eq!(
-            matched.len(),
-            (last + 1 - super::FLOOR_SCAN_BUDGET) as usize
-        );
         let active = load_payment_xpub(&store).unwrap();
         assert!(same_account(&active.xpub, &k2));
         assert_eq!(active.next_index, last + 1);
@@ -1961,6 +2193,300 @@ mod origin_gating_tests {
             super::FLOOR_SCAN_BUDGET
         );
         assert_eq!(load_pending_payment_xpub(&store), None);
+    }
+
+    /// Another valid account key, different from both the seller's and
+    /// `attackers_key` (`byte` picks its chain code).
+    fn another_key(byte: u8) -> String {
+        let mut bytes = bs58::decode(SELLERS_KEY)
+            .with_check(None)
+            .into_vec()
+            .expect("the fixture key decodes");
+        bytes[13..45].copy_from_slice(&[byte; 32]);
+        bs58::encode(bytes).with_check().into_string()
+    }
+
+    fn add_with(store: &mut MemSecrets, id: u64, scripts: &[Vec<u8>]) -> Result<(), String> {
+        match handle(
+            store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::AddPublishedScripts {
+                request_id: id,
+                scripts: scripts.to_vec(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::PublishedScriptsAdded { result, .. } => result,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// #206 (D1): the boundary. A scan of a dense run stops after its 384th
+    /// index matched, so the counter sits on index 384, which no scan has
+    /// derived, and which a published order names. A stale tab that adds
+    /// nothing (it believes its scripts are all sent) then asks for an
+    /// address: it must never get 384, or any index the held scripts name.
+    /// The answer is "catching up" until the scan is through, then the index
+    /// past every published one. Mutated red by handing out from a scan that
+    /// is not complete, and by scanning only the request's scripts.
+    #[test]
+    fn a_stale_tab_that_adds_nothing_never_gets_a_held_index() {
+        // Long enough that the stale tab's own request cannot finish the
+        // scan either.
+        let last = super::FLOOR_SCAN_BUDGET * 2 + 116;
+        let orders = scripts_of(SELLERS_KEY, 0..last + 1);
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        // Tab A enters the same key again with every script: left short at
+        // the boundary.
+        let (short, _) = set_with(&mut store, SELLERS_KEY, 1, &orders);
+        let e = short.unwrap_err();
+        assert_eq!(reached(&e), Some(super::FLOOR_SCAN_BUDGET), "{e}");
+        assert!(orders.contains(&scripts_of(SELLERS_KEY, 384..385)[0]));
+        // Tab B, adding nothing.
+        let mut asks = 0;
+        let derived = loop {
+            asks += 1;
+            assert!(asks < 5, "no end");
+            match derive_with(&mut store, 10 + asks, &[]) {
+                Ok(d) => break d,
+                Err(e) => assert!(reached(&e).is_some(), "{e}"),
+            }
+        };
+        assert!(
+            !orders.contains(&derived.script_pubkey),
+            "{}",
+            derived.index
+        );
+        assert_eq!(derived.index, last + 1);
+    }
+
+    /// #206: scripts arriving in chunks, with address requests between
+    /// them: no address handed out ever names a script already held, and
+    /// once every chunk is in, the next is past them all. A chunk arriving
+    /// after a scan finished sends it back over the new scripts. Mutated red
+    /// by not restarting the scan when scripts are added.
+    #[test]
+    fn no_address_names_a_held_script_while_chunks_arrive() {
+        let orders = scripts_of(SELLERS_KEY, 0..1000);
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        let mut handed_out = Vec::new();
+        // Highest indices first, so an early complete scan is overtaken.
+        for (n, chunk) in orders.rchunks(300).enumerate() {
+            add_with(&mut store, n as u64, chunk).expect("held");
+            held.extend_from_slice(chunk);
+            for ask in 0..3 {
+                if let Ok(d) = derive_with(&mut store, 100 + 10 * n as u64 + ask, &[]) {
+                    assert!(!held.contains(&d.script_pubkey), "index {}", d.index);
+                    handed_out.push(d.index);
+                }
+            }
+        }
+        let derived = loop {
+            if let Ok(d) = derive_with(&mut store, 999, &[]) {
+                break d;
+            }
+        };
+        assert!(derived.index >= 1000, "{}", derived.index);
+        // Some went out before the low chunks arrived: those are the
+        // scripts the delegate had not been sent, which nothing can cover.
+        assert!(!handed_out.is_empty());
+    }
+
+    /// #206 (D4): a newer key replaces the one pending, and the older one
+    /// entered afresh starts again from 0. Entered as a `resume` of its old
+    /// catch-up it is refused as superseded instead, and nothing is written,
+    /// so two tabs with two keys cannot keep restarting each other. Mutated
+    /// red by resuming over another key's pending slot.
+    #[test]
+    fn a_newer_key_replaces_the_pending_one() {
+        let k2 = attackers_key();
+        let k3 = another_key(0xcd);
+        let mut orders = scripts_of(&k2, 0..super::FLOOR_SCAN_BUDGET + 50);
+        orders.extend(scripts_of(&k3, 0..super::FLOOR_SCAN_BUDGET + 50));
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        assert!(set_with(&mut store, &k2, 1, &orders).0.is_err());
+        assert!(same_account(
+            &load_pending_payment_xpub(&store).unwrap().xpub,
+            &k2
+        ));
+        assert!(set_with(&mut store, &k3, 2, &[]).0.is_err());
+        let pending = load_pending_payment_xpub(&store).unwrap();
+        assert!(same_account(&pending.xpub, &k3));
+        assert_eq!(pending.next_index, super::FLOOR_SCAN_BUDGET);
+
+        // K2 resumed: superseded, nothing written.
+        let before = store.get_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY);
+        let resumed = match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::SetPaymentXpub {
+                request_id: 3,
+                xpub: k2.clone(),
+                network: BitcoinNetwork::Bitcoin,
+                published_scripts: Vec::new(),
+                resume: true,
+            },
+        )
+        .unwrap()
+        {
+            BitcoinDelegateResponse::PaymentXpubSet { result, .. } => result,
+            other => panic!("{other:?}"),
+        };
+        assert!(resumed
+            .unwrap_err()
+            .starts_with(harvest_common::bitcoin_delegate::KEY_SUPERSEDED_PREFIX));
+        assert_eq!(store.get_secret(BITCOIN_PAYMENT_XPUB_PENDING_KEY), before);
+
+        // K2 entered afresh: from 0 again, over K3.
+        let (again, _) = set_with(&mut store, &k2, 4, &[]);
+        assert_eq!(reached(&again.unwrap_err()), Some(super::FLOOR_SCAN_BUDGET));
+        assert!(same_account(
+            &load_pending_payment_xpub(&store).unwrap().xpub,
+            &k2
+        ));
+        assert!(same_account(
+            &load_payment_xpub(&store).unwrap().xpub,
+            SELLERS_KEY
+        ));
+    }
+
+    /// #206: an address the active key handed out, sent back by a tab once
+    /// its order is published, is not held (it is below the counter by
+    /// construction); a script from elsewhere is. Mutated red by not
+    /// recording what was handed out.
+    #[test]
+    fn the_keys_own_addresses_are_not_held_when_sent_back() {
+        use crate::published_set::{DigestList, PUBLISHED_KEY};
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        let own = derive_with(&mut store, 1, &[]).expect("an address");
+        let elsewhere = scripts_of(SELLERS_KEY, 50..51);
+        add_with(
+            &mut store,
+            2,
+            &[own.script_pubkey.clone(), elsewhere[0].clone()],
+        )
+        .unwrap();
+        let held = DigestList::load(&store, PUBLISHED_KEY, b"");
+        assert_eq!(held.len(), 1);
+        assert!(held.contains(&crate::published_set::digest(&elsewhere[0])));
+    }
+
+    /// #206: a scheduled wake-up moves the active key's scan on by its
+    /// budget, with nothing handed out, so instant checkout catches up with
+    /// no tab open. Mutated red by dropping the wake-up's scan.
+    #[test]
+    fn a_wakeup_moves_the_scan_on() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        add_with(&mut store, 1, &scripts_of(SELLERS_KEY, 0..1000)).unwrap();
+        crate::background::on_background(
+            &mut store,
+            &crate::node_glue::BackgroundRun::Wakeup {
+                tag: crate::node_glue::HEARTBEAT_TAG.to_vec(),
+            },
+            1_800_000_000_000,
+        );
+        assert_eq!(
+            load_payment_xpub(&store).unwrap().next_index,
+            super::WAKEUP_SCAN_BUDGET
+        );
+    }
+
+    /// #206: only the choke point hands out an index. In the delegate's
+    /// non-test code, `apply_derive_order_address` is called only from
+    /// `issue_next_address`, and the counter is moved only by the scan
+    /// (`advance_scan`), the derivation itself, a migration's merge, and
+    /// `decide` mirroring the index the choke point just handed out. Fails
+    /// for any new call site. Mutated red by adding one.
+    #[test]
+    fn only_the_choke_point_hands_out_an_index() {
+        fn non_test(source: &str) -> String {
+            let mut out = String::new();
+            let mut lines = source.lines();
+            while let Some(line) = lines.next() {
+                if line.trim_start() == "#[cfg(test)]" {
+                    let mut depth = 0i32;
+                    let mut opened = false;
+                    for item in lines.by_ref() {
+                        depth += item.matches('{').count() as i32;
+                        depth -= item.matches('}').count() as i32;
+                        opened |= item.contains('{');
+                        if (opened && depth <= 0) || (!opened && item.trim_end().ends_with(';')) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let at = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let end = source[at..].find("\n}\n").expect("end");
+            &source[at..at + end]
+        }
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut derive_calls = Vec::new();
+        let mut counter_writes = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let code = non_test(&std::fs::read_to_string(&path).unwrap());
+            derive_calls.extend(
+                code.matches("apply_derive_order_address(")
+                    .map(|_| name.clone()),
+            );
+            counter_writes.extend(
+                code.matches(".next_index = ")
+                    .chain(code.matches("next_index += "))
+                    .map(|_| name.clone()),
+            );
+        }
+        derive_calls.sort();
+        counter_writes.sort();
+        // The definition and the one call.
+        assert_eq!(
+            derive_calls,
+            ["bitcoin.rs", "bitcoin.rs"],
+            "{derive_calls:?}"
+        );
+        let bitcoin = non_test(include_str!("bitcoin.rs"));
+        assert!(body(&bitcoin, "pub(crate) fn issue_next_address")
+            .contains("apply_derive_order_address(&mut next)"));
+        assert_eq!(
+            counter_writes,
+            ["auto_invoice.rs", "bitcoin.rs", "bitcoin.rs", "import.rs"],
+            "{counter_writes:?}"
+        );
+        assert!(
+            body(&bitcoin, "pub(crate) fn advance_scan").contains("raised.next_index = counter")
+        );
+        assert!(body(&bitcoin, "fn apply_derive_order_address")
+            .contains("status.next_index = index + 1"));
+        let auto = non_test(include_str!("auto_invoice.rs"));
+        let mirror = auto
+            .find("xpub.next_index = derived.index + 1")
+            .expect("the mirror");
+        let issue = auto
+            .find("crate::bitcoin::issue_next_address(")
+            .expect("the call");
+        assert!(
+            issue < mirror,
+            "the mirror follows the choke point's answer"
+        );
     }
 
     /// #206: a pending slot that a migration does not carry only restarts
@@ -2055,50 +2581,5 @@ mod origin_gating_tests {
         };
         assert_eq!(asks, 3, "two short scans, then the address");
         assert_eq!(derived.index, *published.last().unwrap() + 1);
-    }
-
-    /// **PR #83 round 2, Should Fix 2.** The delegate reports which of the
-    /// scripts it was sent it actually matched, so the UI marks only those as
-    /// accounted for. A foreign script and one beyond the scan's gap are sent
-    /// but not matched, and must not be reported.
-    #[test]
-    fn the_delegate_reports_only_the_scripts_it_matched() {
-        let chain = crate::bip32::AccountXpub::parse(SELLERS_KEY)
-            .expect("parse")
-            .external_chain()
-            .expect("chain");
-        let mine: Vec<Vec<u8>> = (0..2)
-            .map(|i| chain.script_at(i).expect("derive"))
-            .collect();
-        let beyond_gap = chain
-            .script_at(2 + PUBLISHED_INDEX_GAP + 5)
-            .expect("derive");
-        let foreign = vec![0x00, 0x14, 0xee];
-        let mut sent = mine.clone();
-        sent.push(beyond_gap);
-        sent.push(foreign);
-
-        let mut store = MemSecrets::default();
-        seller_sets(&mut store, SELLERS_KEY);
-        match handle(
-            &mut store,
-            Some(&harvest()),
-            BitcoinDelegateRequest::DeriveOrderAddress {
-                request_id: 9,
-                published_scripts: sent,
-            },
-        )
-        .expect("authorized")
-        {
-            BitcoinDelegateResponse::OrderAddress {
-                result,
-                matched_scripts,
-                ..
-            } => {
-                assert_eq!(result.expect("derived").index, 2);
-                assert_eq!(matched_scripts, mine);
-            }
-            other => panic!("expected OrderAddress, got {other:?}"),
-        }
     }
 }

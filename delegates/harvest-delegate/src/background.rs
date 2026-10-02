@@ -54,6 +54,10 @@ pub(crate) fn on_background<S: SecretStore>(
                 return Vec::new();
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
+            // The payment counter's catch-up goes on with no tab open
+            // (#206), before the heartbeats say whether the store is taking
+            // orders.
+            crate::bitcoin::advance_on_wakeup(secrets);
             // The delegated watch's one read (the bridge inbox, or an
             // address contract) first in the list. Order in the list is not
             // order of execution: the node handles a run's GETs first, then
