@@ -90,6 +90,14 @@ state, filled to their caps. The caps are read from the delegate's own source
 `SEEN_CAP`), so raising one there raises the fixture with it; a renamed
 constant fails the run.
 
+The ledger and the watch delegation are crate-private types, seeded through
+mirrors in `src/fixtures.rs`. Most of their fields are `serde(default)`, so a
+mirror that drifts still decodes. The harness therefore compares each
+mirror's field names with a copy the delegate wrote itself (the first
+store's ledger after its mailbox scans, the merged ledger after the import,
+a delegation and one of its watches after `NodeStarted` rewrites them), and
+fails the run on any difference.
+
 | step | why it is here |
 |---|---|
 | `CreateStoreKey` to the 64-key cap, `GetStoreSubkeys` x8 | the #203 call. Its old cost depended on the store key, so one key proves nothing. Every key is created so the export below carries all of them |
@@ -100,11 +108,15 @@ constant fails the run.
 | `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
 | tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
 | a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. 2.6x the budget on V29, fixed in #216: see below |
+| a third mailbox notification at the byte cap, each plaintext a valid message with an extra field of one-byte integers (`hostile_mailbox`) | anyone can encrypt their own plaintext to a store's inbox, and this one is the slowest to decode. The harness decrypts every message natively with the delegate's key and associated data first (a message the delegate cannot open is refused cheaply), and checks afterwards that every one of its digests is in the ledger's seen list (the list is already at `SEEN_CAP`, so its length proves nothing) |
 | the watch delegations at their caps (`MAX_DELEGATIONS`, each with `WATCHED_CAP` watches that all count, and its subscription lists full), seeded straight into the secret store in the delegate's own encoding, for bridges every store trusts; then the tip read's answer (every store's status), a re-arm, a forced `Heartbeat`, the wake-up (also with every mailbox waiting) and `NodeStarted` | every store's status and heartbeat walks every delegation's watches, and the wake-up looks at each delegation for its one read. The harness checks every status counts the delegation's watches, that the wake-up went on to a canary read, and that the node start rewrote every delegation |
-| `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass |
+| `Installed`, `NodeStarted`, heartbeat wake-up (also with every store's mailbox waiting to be re-read) | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass; the waiting wake-up must ask for every store's mailbox |
+| one of that wake-up's mailbox reads answered, with the context it carried, by the first store's mailbox at the byte cap with slow plaintexts none of it read yet | the read the wake-up asks for is decided as a mailbox change is (`on_mailbox_retry`). The harness checks the answer recorded some of its messages as read |
 | `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap; the harness checks 256 come back |
 | `KeepPurchase` (paid, genuine SPV proof) into an empty store, then 1022 seeded straight into the secret store in the delegate's own encoding, then `KeepPurchase` of the 1024th at the last conversation, then `ListKeptPurchases (1024)` | the kept-purchase cap. A keep ends by listing everything kept, so a keep into a full store is its worst case. The harness checks all 1024 come back |
+| `KeepPurchase` naming a conversation this node does not hold, store full | the lookup misses and the scan of every conversation runs to the end before the keep is refused. The harness checks the refusal is that one ("does not hold the conversation") |
 | `RememberStore` to the 1024 cap, `ListRememberedStores (1024)` | the buyer's remembered stores; the harness checks 1024 come back |
+| `ImportMigratedSecret` of one full ledger into another | what a successor does with each ledger a predecessor exports: decode both, merge, encode. The harness checks the outcome is `Written` and that the ledger written holds the incoming ledger's newest sale, with `sales` and `gap_orders` at their caps |
 | `ExportSecrets` | the migration export with the state above, run last because it disarms instant checkout. The harness checks it carries at least as many entries as were seeded |
 
 ## Calibration
@@ -159,22 +171,27 @@ Same harness, same scenario, two builds of the delegate:
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
 Largest calls with every cap above filled, on the delegate main shipped
-before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…`), committed since:
+before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…`), committed since.
+Both columns are one run each of the harness at commit `93bedce`, so every
+row is the same scenario:
 
 | call | V29 | #216 |
 |---|---:|---:|
-| heartbeat wake-up, 8 full watch delegations | 105,657,572,367 (**2641.4%, over**) | 1,844,244,959 (46.1%) |
-| same, every store's mailbox waiting to be re-read | (no such flag) | 1,933,038,739 (48.3%) |
-| tip read answered, 8 full watch delegations | 100,994,539,412 (**2524.9%, over**) | 1,160,031,164 (29.0%) |
+| heartbeat wake-up, 8 full watch delegations | 105,657,468,897 (**2641.4%, over**) | 1,844,244,959 (46.1%) |
+| same, every store's mailbox waiting to be re-read | 105,648,549,560 (**2641.2%, over**) | 1,933,038,739 (48.3%) |
+| tip read answered, 8 full watch delegations | 100,994,539,664 (**2524.9%, over**) | 1,160,031,749 (29.0%) |
 | `ArmAutoInvoice`, 8 full watch delegations | 6,325,868,100 (**158.1%, over**) | 229,071,409 (5.7%) |
-| forced `Heartbeat`, 8 full watch delegations | 6,132,699,703 (**153.3%, over**) | 170,641,580 (4.3%) |
-| mailbox notification at the byte cap | 10,389,656,844 (**259.7%, over**) | 1,359,396,238 (34.0%) a run, 7 runs |
-| same, plaintexts built to be slow to decode | (not measured) | 1,963,576,271 (49.1%) a run |
-| `ExportSecrets`, 16 full ledgers | 7,973,492,968 (**199.3%, over**) | 1,069,857,082 (26.7%) |
-| heartbeat wake-up, 16 full ledgers | 7,549,169,942 (**188.7%, over**) | 1,030,396,802 (25.8%), every retry flag missing (the worst case) |
+| forced `Heartbeat`, 8 full watch delegations | 6,132,743,453 (**153.3%, over**) | 170,641,580 (4.3%) |
+| mailbox notification at the byte cap, plaintexts built to be slow to decode | 13,710,079,810 (**342.8%, over**) | 1,963,576,271 (49.1%) a run, 7 runs |
+| the wake-up's mailbox read answered, same mailbox | 13,640,295,281 (**341.0%, over**) | 1,866,775,454 (46.7%) a run |
+| mailbox notification at the byte cap | 10,389,383,503 (**259.7%, over**) | 1,359,396,238 (34.0%) a run, 7 runs |
+| `ExportSecrets`, 16 full ledgers | 7,973,546,791 (**199.3%, over**) | 1,069,857,947 (26.7%) |
+| heartbeat wake-up, 16 full ledgers | 7,549,393,734 (**188.7%, over**) | 1,030,396,802 (25.8%), with 15 of the 16 retry flags missing (the seeded ledgers'; a missing flag means reading the ledger, the worst case) |
+| same, every store's mailbox waiting to be re-read | 7,550,045,501 (**188.8%, over**) | 168,491,440 (4.2%) |
 | `KeepPurchase`, the 1024th | 3,192,943,691 (79.8%) | 2,216,880,431 (55.4%) |
-| mailbox notification, 512 short messages | 3,189,562,696 (79.7%) | 794,663,288 (19.9%) a run, 4 runs |
-| `ListKeptPurchases (1024)` | 2,906,368,755 (72.7%) | 2,201,595,405 (55.0%) |
+| mailbox notification, 512 short messages | 3,189,665,483 (79.7%) | 794,663,288 (19.9%) a run, 4 runs |
+| `ImportMigratedSecret`, full ledger into a full ledger | 3,055,912,486 (76.4%) | 1,230,851,466 (30.8%) |
+| `ListKeptPurchases (1024)` | 2,906,374,863 (72.7%) | 2,201,595,405 (55.0%) |
 
 **The V29 over-budget rows were real findings, not harness artefacts.**
 
@@ -199,8 +216,10 @@ reads, the delegations and payment key read once per run, a status that
 reads only the ledger fields it shows, and an export written without the
 stdlib's per-byte encoding. The PR has the details.
 
-The others are within budget, and they are the handlers to watch: each grows
-with a collection, and at its cap the top three use 73-80% of the budget.
+On #216 every call is within budget. The ones to watch each grow with a
+collection; at the caps the largest use 46-55% of the budget (`KeepPurchase`
+into a full store, `ListKeptPurchases (1024)`, the slow-plaintext mailbox run
+and its retry read, and the wake-up with full watch delegations).
 
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
@@ -222,7 +241,9 @@ delegation it reads for).
     piece of crypto.
   * A mailbox full of instant `OrderRequest`s: unlike the texts above, these
     are not marked read and are reopened on every notification.
-  * `ImportMigratedSecret` (parses an RSA key), `ExportBuyerConversation`
+  * `ImportMigratedSecret` of the RSA key (`harvest:rsa_pk:*`, which
+    parses an RSA key; the ledger import is driven above),
+    `ExportBuyerConversation`
     and `ImportBuyerConversation`, and the migration markers
     (`GetMigrationMarker`, `SetMigrationMarker`, `GetPredecessorMarker`,
     `RecordPredecessorMarker`).
@@ -244,7 +265,7 @@ delegation it reads for).
   read and a decrypt.
 * **Slow hardware.** The 5x margin is measured on a desktop-class CPU. A
   Raspberry Pi-class peer can run unoptimised Cranelift code several times
-  slower, which uses most of that margin on its own; the calls at 70-78% are
+  slower, which uses most of that margin on its own; the calls at 46-55% are
   then the ones at risk.
 * **Anything but one call.** The node's limit is per call. A flow that makes
   many calls is bounded per call, not in total.
