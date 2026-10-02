@@ -567,10 +567,18 @@ fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport
             "this delegate's own published scripts did not decode".into(),
         );
     };
-    if held.insert_as_oldest(&incoming.digests()) == 0 {
-        return SecretImport::AlreadyAuthoritative;
+    match held.insert_as_oldest(&incoming.digests()) {
+        (0, _) => SecretImport::AlreadyAuthoritative,
+        // Said as it is: a list full of this delegate's own, newer, scripts
+        // keeps none of the predecessor's, which count as older (#206
+        // review). Nothing is written.
+        (_, 0) => SecretImport::Permanent(
+            "the held published scripts are full of newer ones, so the predecessor's (older) \
+             were not kept"
+                .into(),
+        ),
+        _ => written(crate::published_set::save_published(store, &held)),
     }
-    written(crate::published_set::save_published(store, &held))
 }
 
 /// A standalone secret: written only if this delegate holds nothing under the
@@ -1082,6 +1090,33 @@ mod tests {
         // The import counts as sent before this delegate's own, so eviction
         // takes it first. (Mutated red by importing as the newest.)
         assert_eq!(merged.by_age()[0], digest(b"a"));
+    }
+
+    /// #206 review: an import into a held list full of this delegate's own
+    /// (newer) scripts keeps none of the predecessor's, and says so rather
+    /// than reporting them written; nothing is written. Mutated red by
+    /// answering `Written`.
+    #[test]
+    fn an_import_into_a_full_list_says_none_was_kept() {
+        use crate::published_set::{digest, DigestList, MAX_HELD, PUBLISHED_KEY};
+        let mut full = DigestList::empty();
+        let own: Vec<_> = (0..MAX_HELD as u32)
+            .map(|n| digest(&n.to_le_bytes()))
+            .collect();
+        full.insert(&own);
+        let mut store = MemSecrets::default();
+        crate::published_set::save_published(&mut store, &full);
+        let mut theirs = DigestList::empty();
+        theirs.insert(&[digest(b"theirs")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+        let before = store.get_secret(PUBLISHED_KEY);
+        assert!(matches!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::Permanent(_)
+        ));
+        assert_eq!(store.get_secret(PUBLISHED_KEY), before, "nothing written");
     }
 
     /// Every key shape this delegate writes has a family decided on purpose.

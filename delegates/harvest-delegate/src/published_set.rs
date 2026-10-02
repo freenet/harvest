@@ -34,14 +34,19 @@
 //!
 //! # Eviction, the one residual
 //!
-//! Past [`MAX_HELD`] held scripts, those sent longest ago go first: a script
-//! sent again (every tab sends every script it knows on load) is fresh
-//! again. What can go is therefore a script no tab has sent for longer than
-//! [`MAX_HELD`] others have been sent since: in practice an order pruned
-//! from its store (a store keeps [`harvest_common::store::MAX_ORDERS`]),
-//! which no tab can send any more either. A migration's imported scripts
-//! count as older than every script this delegate holds, so they go before
-//! any of its own.
+//! Past [`MAX_HELD`] held scripts, those sent longest ago go first. A script
+//! sent again is stamped as sent now once its stamp is older than half the
+//! cap (every tab sends every script it knows on load, and `decide` its
+//! store's whenever they change), so a script that is sent again goes to
+//! the back. What can go is therefore a script nothing has sent while about
+//! [`MAX_HELD`] others were: an order pruned from its store (a store keeps
+//! [`harvest_common::store::MAX_ORDERS`]), which no tab can send any more
+//! either, but ALSO a live order of a store that no tab on this device has
+//! loaded and that no instant checkout here answers for, once that many
+//! other scripts have been sent since it last was. A migration's imported
+//! scripts count as older than every script this delegate holds, so they go
+//! before any of its own, and an import into a list already full of its own
+//! keeps none of them and says so.
 //!
 //! # A list that does not read
 //!
@@ -126,8 +131,8 @@ pub(crate) const MAX_HELD: usize =
 
 pub(crate) type Digest = [u8; 16];
 
-const RECORD: usize = 20;
-const VERSION: u8 = 1;
+const RECORD: usize = 24;
+const VERSION: u8 = 2;
 
 /// The digest a script is held under.
 pub(crate) fn digest(script: &[u8]) -> Digest {
@@ -142,13 +147,27 @@ pub(crate) fn digest(script: &[u8]) -> Digest {
 /// A sorted list of digests, each with the sequence number it was last sent
 /// under, as it is stored:
 ///
-/// `[version u8][generation u32][next_seq u32][tag_len u16][tag][records]`,
-/// each record `[digest 16][seq u32]`, sorted by digest. Integers are little
+/// `[version u8][generation u32][next_seq u64][tag_len u16][tag][records]`,
+/// each record `[digest 16][seq u64]`, sorted by digest. Integers are little
 /// endian; the tag is empty. The generation rises whenever an entry is
-/// added, which is what sends every scan back to its counter ([`Cursor`]).
+/// added or evicted, which is what sends every scan back to its counter
+/// ([`Cursor`]) and makes `decide` feed its store again. Sequence numbers
+/// are 64-bit: they never wrap.
 pub(crate) struct DigestList {
     bytes: Vec<u8>,
     records_at: usize,
+}
+
+const HEADER: usize = 15;
+
+/// What [`DigestList::insert`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Inserted {
+    /// Digests not held before.
+    pub added: usize,
+    /// Whether the list changed at all (anything added, stamped again or
+    /// evicted): only then is it written.
+    pub changed: bool,
 }
 
 impl DigestList {
@@ -156,7 +175,7 @@ impl DigestList {
     pub(crate) fn empty() -> Self {
         let mut bytes = vec![VERSION];
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         let records_at = bytes.len();
         Self { bytes, records_at }
@@ -164,11 +183,11 @@ impl DigestList {
 
     /// Read a stored list. `None` when it is not one.
     pub(crate) fn decode(bytes: Vec<u8>) -> Option<Self> {
-        if bytes.first() != Some(&VERSION) || bytes.len() < 11 {
+        if bytes.first() != Some(&VERSION) || bytes.len() < HEADER {
             return None;
         }
-        let tag_len = u16::from_le_bytes([bytes[9], bytes[10]]) as usize;
-        let records_at = 11usize.checked_add(tag_len)?;
+        let tag_len = u16::from_le_bytes([bytes[13], bytes[14]]) as usize;
+        let records_at = HEADER.checked_add(tag_len)?;
         if bytes.len() < records_at || !(bytes.len() - records_at).is_multiple_of(RECORD) {
             return None;
         }
@@ -192,13 +211,13 @@ impl DigestList {
         u32::from_le_bytes(self.bytes[1..5].try_into().expect("4 bytes"))
     }
 
-    fn next_seq(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[5..9].try_into().expect("4 bytes"))
+    fn next_seq(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[5..13].try_into().expect("8 bytes"))
     }
 
-    fn set_header(&mut self, generation: u32, next_seq: u32) {
+    fn set_header(&mut self, generation: u32, next_seq: u64) {
         self.bytes[1..5].copy_from_slice(&generation.to_le_bytes());
-        self.bytes[5..9].copy_from_slice(&next_seq.to_le_bytes());
+        self.bytes[5..13].copy_from_slice(&next_seq.to_le_bytes());
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -214,9 +233,13 @@ impl DigestList {
         &self.bytes[at..at + 16]
     }
 
-    fn seq_at(&self, i: usize) -> u32 {
+    fn seq_at(&self, i: usize) -> u64 {
         let at = self.records_at + i * RECORD + 16;
-        u32::from_le_bytes(self.bytes[at..at + 4].try_into().expect("4 bytes"))
+        u64::from_le_bytes(self.bytes[at..at + 8].try_into().expect("8 bytes"))
+    }
+
+    fn age_at(&self, i: usize) -> u64 {
+        self.next_seq().wrapping_sub(self.seq_at(i))
     }
 
     /// Every digest held, in digest order.
@@ -224,6 +247,22 @@ impl DigestList {
         (0..self.len())
             .map(|i| self.digest_at(i).try_into().expect("16 bytes"))
             .collect()
+    }
+
+    /// Every digest held, the one sent longest ago first: the order
+    /// eviction takes them in.
+    #[cfg(test)]
+    pub(crate) fn by_age(&self) -> Vec<Digest> {
+        let mut held: Vec<(u64, Digest)> = (0..self.len())
+            .map(|i| {
+                (
+                    self.age_at(i),
+                    self.digest_at(i).try_into().expect("16 bytes"),
+                )
+            })
+            .collect();
+        held.sort_by(|a, b| b.0.cmp(&a.0));
+        held.into_iter().map(|(_, d)| d).collect()
     }
 
     /// Where `d` is held: a binary search over the records in place.
@@ -240,21 +279,12 @@ impl DigestList {
         None
     }
 
-    /// Every digest held, the one sent longest ago first: the order
-    /// eviction takes them in.
+    /// Make every entry `by` stamps older, as if that many others had been
+    /// sent since: for tests of what a stale re-send does.
     #[cfg(test)]
-    pub(crate) fn by_age(&self) -> Vec<Digest> {
-        let base = self.next_seq();
-        let mut held: Vec<(u32, Digest)> = (0..self.len())
-            .map(|i| {
-                (
-                    base.wrapping_sub(self.seq_at(i)),
-                    self.digest_at(i).try_into().expect("16 bytes"),
-                )
-            })
-            .collect();
-        held.sort_by(|a, b| b.0.cmp(&a.0));
-        held.into_iter().map(|(_, d)| d).collect()
+    pub(crate) fn age_for_test(&mut self, by: u64) {
+        let generation = self.generation();
+        self.set_header(generation, self.next_seq() + by);
     }
 
     /// Whether `d` is held.
@@ -262,63 +292,76 @@ impl DigestList {
         self.position(d).is_some()
     }
 
-    /// Hold every digest of `new`, as sent now: one not held is added, one
-    /// held already is marked sent now (so eviction, which takes the scripts
-    /// sent longest ago, does not take a script tabs keep sending). The
-    /// generation rises if any was added. Past [`MAX_HELD`], those sent
-    /// longest ago go. Returns how many were added. One merge pass, however
-    /// many arrive.
-    pub(crate) fn insert(&mut self, new: &[Digest]) -> usize {
+    /// Hold every digest of `new`, as sent now: one not held is added; one
+    /// held is stamped as sent now only once it is older than half the cap
+    /// (so eviction, which takes what was sent longest ago, does not take a
+    /// script tabs keep sending, while a pass of scripts all held recently
+    /// changes nothing and so writes nothing). Past [`MAX_HELD`], those sent
+    /// longest ago go.
+    pub(crate) fn insert(&mut self, new: &[Digest]) -> Inserted {
         self.insert_capped(new, MAX_HELD)
     }
 
-    pub(crate) fn insert_capped(&mut self, new: &[Digest], cap: usize) -> usize {
+    pub(crate) fn insert_capped(&mut self, new: &[Digest], cap: usize) -> Inserted {
+        let stale = (cap / 2) as u64;
         let mut seq = self.next_seq();
-        let mut stamped: Vec<(Digest, u32)> = Vec::with_capacity(new.len());
+        let mut stamped: Vec<(Digest, u64)> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
+        let mut added = 0;
         for d in new {
-            if seen.insert(*d) {
-                stamped.push((*d, seq));
-                seq = seq.wrapping_add(1);
+            if !seen.insert(*d) {
+                continue;
             }
+            match self.position(d) {
+                Some(i) if self.age_at(i) <= stale => continue,
+                Some(_) => {}
+                None => added += 1,
+            }
+            stamped.push((*d, seq));
+            seq += 1;
         }
         if stamped.is_empty() {
-            return 0;
+            return Inserted {
+                added: 0,
+                changed: false,
+            };
         }
-        let added = stamped.iter().filter(|(d, _)| !self.contains(d)).count();
         self.merge(stamped, added, cap, seq);
-        added
+        Inserted {
+            added,
+            changed: true,
+        }
     }
 
     /// Hold every digest of `new` not held already, as sent before anything
     /// held here (a migration's import): eviction takes them before any of
-    /// this delegate's own. Returns how many were added.
-    pub(crate) fn insert_as_oldest(&mut self, new: &[Digest]) -> usize {
+    /// this delegate's own. Returns how many were added and how many of
+    /// those are still held (a full list of newer scripts evicts them at
+    /// once).
+    pub(crate) fn insert_as_oldest(&mut self, new: &[Digest]) -> (usize, usize) {
         let base = self.next_seq();
-        let oldest = (0..self.len())
-            .map(|i| base.wrapping_sub(self.seq_at(i)))
-            .max()
-            .unwrap_or(0);
+        let oldest = (0..self.len()).map(|i| self.age_at(i)).max().unwrap_or(0);
         let mut fresh: Vec<Digest> = new.iter().filter(|d| !self.contains(d)).copied().collect();
         fresh.sort_unstable();
         fresh.dedup();
         let added = fresh.len();
         if added == 0 {
-            return 0;
+            return (0, 0);
         }
-        let stamped: Vec<(Digest, u32)> = fresh
-            .into_iter()
+        let stamped: Vec<(Digest, u64)> = fresh
+            .iter()
             .enumerate()
-            .map(|(k, d)| (d, base.wrapping_sub(oldest).wrapping_sub(1 + k as u32)))
+            .map(|(k, d)| (*d, base.wrapping_sub(oldest).wrapping_sub(1 + k as u64)))
             .collect();
         self.merge(stamped, added, MAX_HELD, base);
-        added
+        let kept = fresh.iter().filter(|d| self.contains(d)).count();
+        (added, kept)
     }
 
     /// Merge `stamped` in (a digest held already takes the new sequence
-    /// number), raise the generation if `added`, set the next sequence
-    /// number, and evict past `cap`.
-    fn merge(&mut self, mut stamped: Vec<(Digest, u32)>, added: usize, cap: usize, next: u32) {
+    /// number), set the next sequence number, evict past `cap`, and raise
+    /// the generation if anything was added or evicted.
+    fn merge(&mut self, mut stamped: Vec<(Digest, u64)>, added: usize, cap: usize, next: u64) {
         stamped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut out = Vec::with_capacity(self.bytes.len() + added * RECORD);
         out.extend_from_slice(&self.bytes[..self.records_at]);
@@ -344,33 +387,28 @@ impl DigestList {
             out.extend_from_slice(&d);
             out.extend_from_slice(&s.to_le_bytes());
         }
-        let generation = if added > 0 {
-            self.generation().wrapping_add(1)
-        } else {
-            self.generation()
-        };
+        let generation = self.generation();
         self.bytes = out;
         self.set_header(generation, next);
         let over = self.len().saturating_sub(cap);
         if over > 0 {
             self.evict_oldest(over);
         }
+        if added > 0 || over > 0 {
+            self.set_header(generation.wrapping_add(1), next);
+        }
     }
 
-    /// Drop the `count` entries sent longest ago: the largest ages, counted
-    /// back from the next sequence number so a wrapped counter still orders
-    /// them. Sequence numbers are unique among those held, so exactly
-    /// `count` go.
+    /// Drop the `count` entries sent longest ago: the largest ages.
+    /// Sequence numbers are unique among those held, so exactly `count` go.
     fn evict_oldest(&mut self, count: usize) {
-        let base = self.next_seq();
-        let age = |list: &Self, i: usize| base.wrapping_sub(list.seq_at(i));
-        let mut ages: Vec<u32> = (0..self.len()).map(|i| age(self, i)).collect();
+        let mut ages: Vec<u64> = (0..self.len()).map(|i| self.age_at(i)).collect();
         let cut = ages.len() - count;
         let threshold = *ages.select_nth_unstable(cut).1;
         let mut out = Vec::with_capacity(self.bytes.len());
         out.extend_from_slice(&self.bytes[..self.records_at]);
         for i in 0..self.len() {
-            if age(self, i) >= threshold {
+            if self.age_at(i) >= threshold {
                 continue;
             }
             let at = self.records_at + i * RECORD;
@@ -441,9 +479,9 @@ mod tests {
     #[test]
     fn the_list_holds_finds_and_round_trips() {
         let mut list = DigestList::empty();
-        assert_eq!(list.insert(&[d(3), d(1), d(2), d(1)]), 3);
+        assert_eq!(list.insert(&[d(3), d(1), d(2), d(1)]).added, 3);
         assert_eq!(list.generation(), 1);
-        assert_eq!(list.insert(&[d(2)]), 0);
+        assert_eq!(list.insert(&[d(2)]).added, 0);
         assert_eq!(list.generation(), 1, "nothing new, no new generation");
         for n in 1..=3 {
             assert!(list.contains(&d(n)));
@@ -493,7 +531,7 @@ mod tests {
         let mut list = DigestList::empty();
         list.insert_capped(&[d(1), d(2), d(3)], 3);
         let generation = list.generation();
-        assert_eq!(list.insert_capped(&[d(1)], 3), 0, "re-sent");
+        assert_eq!(list.insert_capped(&[d(1)], 3).added, 0, "re-sent");
         assert_eq!(list.generation(), generation);
         list.insert_capped(&[d(4)], 3);
         assert!(list.contains(&d(1)), "sent again, so not the oldest");
@@ -501,7 +539,7 @@ mod tests {
 
         let mut list = DigestList::empty();
         list.insert_capped(&[d(10), d(11)], MAX_HELD);
-        assert_eq!(list.insert_as_oldest(&[d(20), d(10)]), 1);
+        assert_eq!(list.insert_as_oldest(&[d(20), d(10)]), (1, 1));
         list.insert_capped(&[d(12)], 3);
         assert!(!list.contains(&d(20)), "the import went first");
         assert!(list.contains(&d(10)) && list.contains(&d(11)) && list.contains(&d(12)));
@@ -521,6 +559,41 @@ mod tests {
             DigestList::load(&store, PUBLISHED_KEY).err(),
             Some(Unreadable)
         );
+    }
+
+    /// #206 review: sequence numbers are 64-bit, so a list whose stamps have
+    /// passed 2^32 still evicts what was sent longest ago. Mutated red by
+    /// stamping in 32 bits.
+    #[test]
+    fn stamps_past_two_to_the_thirty_two_still_order() {
+        let mut list = DigestList::empty();
+        list.set_header(0, u64::from(u32::MAX) - 1);
+        list.insert_capped(&[d(1)], 3);
+        list.insert_capped(&[d(2)], 3);
+        list.insert_capped(&[d(3)], 3);
+        list.insert_capped(&[d(4)], 3);
+        assert!(!list.contains(&d(1)), "the oldest, stamped before 2^32");
+        assert!(list.contains(&d(2)) && list.contains(&d(3)) && list.contains(&d(4)));
+    }
+
+    /// #206 review: scripts sent again that were stamped recently change
+    /// nothing (so nothing is rewritten); one older than half the cap is
+    /// stamped again. Mutated red by stamping every re-send.
+    #[test]
+    fn a_recent_re_send_changes_nothing() {
+        let mut list = DigestList::empty();
+        let first = list.insert_capped(&[d(1), d(2)], 100);
+        assert!(first.changed);
+        assert_eq!(
+            list.insert_capped(&[d(1), d(2)], 100),
+            Inserted {
+                added: 0,
+                changed: false
+            }
+        );
+        // Fifty other stamps later, d(1) is older than half the cap.
+        list.insert_capped(&(10..61).map(d).collect::<Vec<_>>(), 100);
+        assert!(list.insert_capped(&[d(1)], 100).changed);
     }
 
     #[test]

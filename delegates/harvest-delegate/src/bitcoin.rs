@@ -634,15 +634,22 @@ pub(crate) fn add_published<S: SecretStore>(
     }
     let mut published =
         DigestList::load(store, PUBLISHED_KEY).map_err(|_| UNREADABLE_PUBLISHED.to_string())?;
-    let added = published.insert(&fresh);
-    if !crate::published_set::save_published(store, &published) {
+    let inserted = published.insert(&fresh);
+    // Written only when it changed. A refused write fails the addition only
+    // when it added something: when every script was held already, all a
+    // refusal loses is the mark that they were sent again, and refusing an
+    // address for that would refuse it for nothing (#206 review).
+    if inserted.changed
+        && !crate::published_set::save_published(store, &published)
+        && inserted.added > 0
+    {
         return Err(
             "the node refused to store the published orders' addresses, so none can be \
              checked against them yet"
                 .to_string(),
         );
     }
-    Ok(added)
+    Ok(inserted.added)
 }
 
 /// Why [`issue_next_address`] handed nothing out.
@@ -2515,6 +2522,40 @@ mod origin_gating_tests {
         );
     }
 
+    /// #206 review: scripts all held already are not written again, and a
+    /// refused write then refuses nothing: the address still goes out.
+    /// Mutated red by rewriting the list on every addition, and by refusing
+    /// on a refused write that added nothing.
+    #[test]
+    fn scripts_already_held_write_nothing_and_refuse_nothing() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        let orders = scripts_of(SELLERS_KEY, 0..3);
+        add_with(&mut store, 1, &orders).unwrap();
+        let writes = store.write_log.len();
+        add_with(&mut store, 2, &orders).unwrap();
+        assert!(
+            !store.write_log[writes..]
+                .iter()
+                .any(|k| k.as_slice() == crate::published_set::PUBLISHED_KEY),
+            "nothing written"
+        );
+        store.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
+        let derived = derive_with(&mut store, 3, &orders).expect("an address");
+        assert_eq!(derived.index, 3);
+        // Held long enough ago to be stamped again: the write is refused,
+        // and that refuses nothing either.
+        store.refused_prefix = None;
+        let mut held =
+            crate::published_set::DigestList::load(&store, crate::published_set::PUBLISHED_KEY)
+                .unwrap();
+        held.age_for_test(crate::published_set::MAX_HELD as u64);
+        crate::published_set::save_published(&mut store, &held);
+        store.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
+        let derived = derive_with(&mut store, 4, &orders).expect("still an address");
+        assert_eq!(derived.index, 4);
+    }
+
     /// #206 review: a held-list write the node refuses: an address request
     /// carrying scripts hands nothing out.
     #[test]
@@ -2612,7 +2653,7 @@ mod origin_gating_tests {
     }
 
     /// Every use of `pattern` in `code`, as the item it is in: the nearest
-    /// `fn` or `struct` above it.
+    /// `fn`, `struct` or `const` above it.
     fn uses(code: &str, pattern: &str) -> Vec<String> {
         let lines: Vec<&str> = code.lines().collect();
         let mut found = Vec::new();
@@ -2629,7 +2670,8 @@ mod origin_gating_tests {
                             .unwrap_or(t);
                         let t = t
                             .strip_prefix("fn ")
-                            .or_else(|| t.strip_prefix("struct "))?;
+                            .or_else(|| t.strip_prefix("struct "))
+                            .or_else(|| t.strip_prefix("const "))?;
                         Some(
                             t.split(|c: char| !(c.is_alphanumeric() || c == '_'))
                                 .next()
@@ -2688,9 +2730,14 @@ mod origin_gating_tests {
     /// counter saved only by the choke point, the scan and a key's set; the
     /// counter's secret written only by its saver; a counter built or moved
     /// only by those, a migration's merge, and `decide`'s mirror of what the
-    /// choke point just handed out. Fails for any new use. Mutated red by
-    /// the review's bypass (an `order_address` call, a counter built by
-    /// literal, and `save_payment_xpub` in a new function).
+    /// choke point just handed out; `mem::replace(&mut` nowhere; and the
+    /// counter's secret named (or spelled out) only where it is defined,
+    /// loaded, saved and sorted on import, so no local bound to it can be
+    /// written elsewhere. Fails for any new use. Mutated red by the review's
+    /// bypass (an `order_address` call, a counter built by literal, and
+    /// `save_payment_xpub` in a new function), and by each of: a path call
+    /// `AccountXpub::order_address(`, a `mem::replace(&mut` of the counter,
+    /// and a write through a local bound to the key.
     #[test]
     fn only_the_choke_point_hands_out_an_index() {
         let pinned: &[(&str, &[&str])] = &[
@@ -2701,14 +2748,34 @@ mod origin_gating_tests {
                     "bitcoin.rs::issue_next_address",
                 ],
             ),
+            // Any call, method or path (`AccountXpub::order_address(..)`).
             (
-                ".order_address(",
+                "order_address(",
                 &[
+                    "bip32.rs::order_address",
+                    "bitcoin.rs::apply_derive_order_address",
                     "bitcoin.rs::apply_derive_order_address",
                     "bitcoin.rs::apply_set_payment_xpub",
+                    "bitcoin.rs::issue_next_address",
                     "bitcoin.rs::upcoming_addresses",
                 ],
             ),
+            ("mem::replace(&mut", &[]),
+            // The counter's secret, named or spelled out: a local bound to it
+            // can only be bound where it is named.
+            (
+                "BITCOIN_PAYMENT_XPUB_KEY",
+                &[
+                    // Its definition, and the pending slot's doc naming it.
+                    "bitcoin.rs::BITCOIN_PAYMENT_XPUB_KEY",
+                    "bitcoin.rs::BITCOIN_PAYMENT_XPUB_KEY",
+                    "bitcoin.rs::load_payment_xpub",
+                    "bitcoin.rs::save_payment_xpub",
+                    // A comparison, choosing the import's family.
+                    "import.rs::family",
+                ],
+            ),
+            ("payment-xpub:v1", &["bitcoin.rs::BITCOIN_PAYMENT_XPUB_KEY"]),
             (
                 "save_payment_xpub(",
                 &[
@@ -2748,13 +2815,15 @@ mod origin_gating_tests {
                 &["bitcoin.rs::apply_set_payment_xpub"],
             ),
         ];
-        for (pattern, allowed) in pinned {
-            assert_eq!(
-                uses_in_delegate(pattern),
-                allowed.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                "{pattern}"
-            );
-        }
+        let wrong: Vec<String> = pinned
+            .iter()
+            .filter_map(|(pattern, allowed)| {
+                let found = uses_in_delegate(pattern);
+                (found != allowed.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+                    .then(|| format!("{pattern}: {found:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
         let auto = non_test(include_str!("auto_invoice.rs"));
         let mirror = auto
             .find("xpub.next_index = derived.index + 1")
