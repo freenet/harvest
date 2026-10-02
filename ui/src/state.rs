@@ -1284,6 +1284,24 @@ fn spawn_order_address_request(request_id: u64) {
     });
 }
 
+/// Send the payment key again under `request_id`, for a catch-up
+/// (harvest#206). If the send fails the catch-up ends there and says so.
+#[cfg(target_arch = "wasm32")]
+fn spawn_payment_key_resend(request_id: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        use dioxus::prelude::WritableExt;
+
+        if let Err(e) = crate::gateway::bitcoin_ops::resend_payment_xpub(request_id).await {
+            dioxus::logger::tracing::error!("Failed to send the payment key again: {e}");
+            let mut state = crate::gateway::APP_STATE.write();
+            state.abandon_payment_key_request(request_id);
+            state
+                .notifications
+                .push(format!("Could not save your payment key: {e}"));
+        }
+    });
+}
+
 /// Read a derived address's contract once, without subscribing, and end the
 /// wait after [`ADDRESS_REUSE_CHECK_TIMEOUT_MS`] whatever happens. The answer
 /// arrives through the ordinary response path (`on_contract_state`, or the
@@ -9689,17 +9707,19 @@ impl AppState {
     /// why) simply stops being shown; an edit sent and not seen is ended by
     /// its landing ([`Self::settle_details_publishing`]), a refusal
     /// ([`Self::end_sent_details_publishing`]), or its send failing
-    /// ([`Self::end_details_publishing`]).
+    /// ([`Self::end_details_publishing`]). And the payment counter's
+    /// catch-up line while one is out ([`Self::catch_up_line`]).
     pub fn progress_notices(&self) -> Vec<String> {
         let under_way = self
             .publishing_details
             .iter()
             .any(|p| p.sent || self.details_edit_in_flight(&p.store, p.version));
+        let mut notices = Vec::new();
         if under_way {
-            vec![PUBLISHING_DETAILS.to_string()]
-        } else {
-            Vec::new()
+            notices.push(PUBLISHING_DETAILS.to_string());
         }
+        notices.extend(self.catch_up_line());
+        notices
     }
 
     /// Whether the details edit at `version` for `store` (a write
@@ -11513,6 +11533,9 @@ impl AppState {
         self.bitcoin
             .scripts_in_flight
             .insert(request_id, (published_scripts.clone(), 0));
+        self.bitcoin
+            .xpub_sets
+            .insert(request_id, (xpub.clone(), network));
         harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
             request_id,
             xpub,
@@ -11528,6 +11551,7 @@ impl AppState {
         self.auto_invoice.raise_requests.remove(&request_id);
         self.bitcoin.in_flight.remove(&request_id);
         self.bitcoin.scripts_in_flight.remove(&request_id);
+        self.bitcoin.catch_ups.remove(&request_id);
     }
 
     /// Forget everything held for an address request that will never be
@@ -11537,6 +11561,144 @@ impl AppState {
         self.bitcoin.in_flight.remove(&request_id);
         self.bitcoin.scripts_in_flight.remove(&request_id);
         self.address_skips.remove(&request_id);
+        self.bitcoin.catch_ups.remove(&request_id);
+    }
+
+    /// Forget a payment key sent again during a catch-up that could not be
+    /// sent (harvest#206).
+    pub fn abandon_payment_key_request(&mut self, request_id: u64) {
+        self.bitcoin.in_flight.remove(&request_id);
+        self.bitcoin.scripts_in_flight.remove(&request_id);
+        self.bitcoin.xpub_sets.remove(&request_id);
+        self.bitcoin.catch_ups.remove(&request_id);
+    }
+
+    /// The `SetPaymentXpub` to send again, under `request_id`, for a key the
+    /// delegate is still catching up with (harvest#206): the same key and
+    /// network, and every published script, as `set_payment_xpub_request`
+    /// builds it. `None` when no key is held for that id.
+    pub fn payment_key_resend_request(
+        &mut self,
+        request_id: u64,
+    ) -> Option<harvest_common::BitcoinDelegateRequest> {
+        let (xpub, network) = self.bitcoin.xpub_sets.get(&request_id).cloned()?;
+        Some(self.set_payment_xpub_request(request_id, xpub, network))
+    }
+
+    /// The most rounds one catch-up may take for `published` scripts sent.
+    ///
+    /// A provable bound, not a guess: a round left short derived
+    /// `FLOOR_SCAN_BUDGET` indices without going `PUBLISHED_INDEX_GAP` (100)
+    /// past a match, so it matched at least three of the scripts sent, each
+    /// at an index above every earlier round's (the count only rises), so no
+    /// script is matched in two rounds. Two more for the round that
+    /// completes and slack.
+    fn catch_up_round_limit(published: usize) -> u32 {
+        u32::try_from(published / 3)
+            .unwrap_or(u32::MAX)
+            .saturating_add(2)
+    }
+
+    /// The delegate answered request `answered` that it is still catching up
+    /// and has reached `reached`: the id to ask again under, registered as
+    /// in flight, or `None` once the catch-up should stop (past
+    /// [`Self::catch_up_round_limit`], or a count that did not rise since
+    /// the last round, which a working delegate never answers).
+    fn next_catch_up_round(&mut self, answered: u64, reached: u32) -> Option<u64> {
+        let last = self.bitcoin.catch_ups.remove(&answered);
+        let rounds = last.map_or(0, |c| c.rounds) + 1;
+        let rose = last.is_none_or(|c| reached > c.reached);
+        let limit = Self::catch_up_round_limit(self.published_payment_scripts().len());
+        if !rose || rounds > limit {
+            warn!(
+                "The payment counter stopped catching up at {reached} after {rounds} rounds \
+                 (risen: {rose})"
+            );
+            return None;
+        }
+        let request_id = self.bitcoin.next_request_id();
+        self.bitcoin.in_flight.insert(request_id);
+        self.bitcoin
+            .catch_ups
+            .insert(request_id, CatchUp { rounds, reached });
+        self.bitcoin.catch_up_reached = reached;
+        Some(request_id)
+    }
+
+    /// The progress line shown while a catch-up is out (harvest#206): the
+    /// count the delegate reached against the orders the seller's stores
+    /// have published. That is an index against a number of orders, so
+    /// "about": the two agree for a seller whose invoices all came from one
+    /// key, and an address that was handed out and never published (an
+    /// abandoned invoice) puts the count ahead. Past the orders, only the
+    /// count is given.
+    /// An address request answered "catching up" (harvest#206): ask again
+    /// under a new id, for the invoice or the raise it was, or end it as a
+    /// failed one would be once the catch-up stops.
+    fn ask_again_while_catching_up(&mut self, request_id: u64, reached: u32) {
+        self.bitcoin.scripts_in_flight.remove(&request_id);
+        let raise = self.auto_invoice.raise_requests.remove(&request_id);
+        let invoice = self.pending_invoices.remove(&request_id);
+        let skips = self.address_skips.remove(&request_id);
+        if !raise && invoice.is_none() {
+            // Abandoned meanwhile: nothing is waiting for it.
+            self.bitcoin.catch_ups.remove(&request_id);
+            return;
+        }
+        let Some(next) = self.next_catch_up_round(request_id, reached) else {
+            if invoice.is_some() {
+                self.notifications.push(
+                    "Couldn't get a payment address: Harvest could not finish catching up \
+                     with your earlier orders. Issue the invoice again to carry on from where \
+                     it stopped."
+                        .to_string(),
+                );
+            }
+            return;
+        };
+        if raise {
+            self.auto_invoice.raise_requests.insert(next);
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::gateway::bitcoin_ops::derive_order_address(next).await {
+                    dioxus::logger::tracing::warn!(
+                        "could not move the payment counter past used addresses: {e}"
+                    );
+                    use dioxus::prelude::WritableExt;
+                    crate::gateway::APP_STATE
+                        .write()
+                        .abandon_raise_request(next);
+                }
+            });
+        }
+        if let Some(invoice) = invoice {
+            self.pending_invoices.insert(next, invoice);
+            if let Some(skips) = skips {
+                self.address_skips.insert(next, skips);
+            }
+            #[cfg(target_arch = "wasm32")]
+            spawn_order_address_request(next);
+        }
+    }
+
+    pub fn catch_up_line(&self) -> Option<String> {
+        if self.bitcoin.catch_ups.is_empty() {
+            return None;
+        }
+        let reached = self.bitcoin.catch_up_reached;
+        let published = self.published_payment_scripts().len() as u64;
+        Some(if u64::from(reached) <= published {
+            format!(
+                "Catching up on your earlier orders\u{2026} {} of about {}",
+                with_thousands(reached.into()),
+                with_thousands(published)
+            )
+        } else {
+            format!(
+                "Catching up on your earlier orders\u{2026} {} addresses checked",
+                with_thousands(reached.into())
+            )
+        })
     }
 
     /// The delegate's address counter as last reported, 0 when unknown.
@@ -13194,6 +13356,32 @@ impl AppState {
                 matched_scripts,
             } => {
                 self.bitcoin.in_flight.remove(&request_id);
+                let key = self.bitcoin.xpub_sets.remove(&request_id);
+                // Still catching up with the published orders (harvest#206):
+                // nothing was set, and the key goes again as it was, with
+                // every script, until the delegate has it all. The seller is
+                // not asked to enter it again; a progress line shows how far
+                // it has got.
+                if let (Err(e), Some((xpub, network))) = (&result, key) {
+                    if let Some(reached) = catching_up_at(e) {
+                        self.bitcoin.scripts_in_flight.remove(&request_id);
+                        match self.next_catch_up_round(request_id, reached) {
+                            Some(next) => {
+                                self.bitcoin.xpub_sets.insert(next, (xpub, network));
+                                #[cfg(target_arch = "wasm32")]
+                                spawn_payment_key_resend(next);
+                            }
+                            None => self.notifications.push(
+                                "Your payment key is not saved yet: Harvest could not finish \
+                                 checking it against your earlier orders. Save it again to \
+                                 carry on from where it stopped."
+                                    .to_string(),
+                            ),
+                        }
+                        return;
+                    }
+                }
+                self.bitcoin.catch_ups.remove(&request_id);
                 match result {
                     Ok(status) => {
                         // Replaced, not extended: the counter now belongs to
@@ -13249,6 +13437,24 @@ impl AppState {
                 matched_scripts,
             } => {
                 self.bitcoin.in_flight.remove(&request_id);
+                // Still catching up with the published orders (harvest#206):
+                // no address was handed out, and the same request (a raise or
+                // an invoice) goes again under a new id, the invoice waiting
+                // meanwhile, until one comes back. The stored counter is
+                // re-read below as after any answer.
+                if let Some(reached) = result.as_ref().err().and_then(|e| catching_up_at(e)) {
+                    self.ask_again_while_catching_up(request_id, reached);
+                    #[cfg(target_arch = "wasm32")]
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = crate::gateway::bitcoin_ops::get_payment_xpub().await {
+                            dioxus::logger::tracing::error!(
+                                "Failed to refresh the payment key: {e}"
+                            );
+                        }
+                    });
+                    return;
+                }
+                self.bitcoin.catch_ups.remove(&request_id);
                 // A raise past used addresses (harvest#183), not an invoice:
                 // the address is dropped, and it is enough that the counter
                 // moved. The re-read below brings the new count, which makes
@@ -14602,6 +14808,17 @@ pub struct BitcoinState {
     /// The scripts sent with each outstanding `DeriveOrderAddress` /
     /// `SetPaymentXpub` and the counter at the time, keyed by request id.
     pub scripts_in_flight: HashMap<u64, (Vec<Vec<u8>>, u32)>,
+    /// The key and network each outstanding `SetPaymentXpub` named, so one
+    /// the delegate answers "catching up" can be sent again as it was
+    /// (harvest#206).
+    pub xpub_sets: HashMap<u64, (String, BitcoinNetwork)>,
+    /// The requests sent again because the delegate was still catching its
+    /// counter up with the seller's published orders (harvest#206), by
+    /// request id: how many rounds so far and the count last reached. While
+    /// any is out, a progress line says so ([`AppState::catch_up_line`]).
+    pub catch_ups: HashMap<u64, CatchUp>,
+    /// The count the delegate last said it had reached while catching up.
+    pub catch_up_reached: u32,
     /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
     /// key configured" from "we have not asked yet", so the seller is not
     /// prompted to add one before we know whether they already have.
@@ -14673,6 +14890,41 @@ pub struct BitcoinState {
     /// against different `wanted` lists, so sharing one would have each
     /// forget the other's entries on every tick.
     pub tip_rereads: crate::address_reread::AddressRereads,
+}
+
+/// One request in a catch-up (harvest#206): see [`BitcoinState::catch_ups`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CatchUp {
+    /// How many times the delegate has answered "catching up" so far.
+    pub rounds: u32,
+    /// The count it said it had reached the last time.
+    pub reached: u32,
+}
+
+/// The count a delegate `Err` says it reached, when the `Err` is the
+/// delegate catching its counter up with the published orders rather than a
+/// refusal (`harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX`).
+pub(crate) fn catching_up_at(error: &str) -> Option<u32> {
+    error
+        .strip_prefix(harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX)?
+        .split(';')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `n` with its thousands separated by commas, for the progress line.
+fn with_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl BitcoinState {
@@ -19124,6 +19376,296 @@ mod invoice_tests {
             assert!(state.bitcoin.accounted_scripts.is_empty(), "{next:?}");
             assert!(state.bitcoin.unmatched_scripts.is_empty(), "{next:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Catching the delegate's counter up (harvest#206)
+    // -----------------------------------------------------------------
+
+    /// The delegate's answer while it is still catching up, as it words it.
+    fn catching_up(reached: u32) -> String {
+        format!(
+            "{}{reached}; this key has more published orders than one request can catch up \
+             with, so the count it reached is kept and the next request goes on from it",
+            harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX
+        )
+    }
+
+    /// A seller with `n` published orders on `STORE_ID`.
+    fn seller_with_orders(n: u8) -> AppState {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .expect("store")
+            .orders = (0..n).map(|i| with_script(&[0x00, 0x14, i])).collect();
+        state
+    }
+
+    /// The one catch-up request out, and its id.
+    fn the_catch_up(state: &AppState) -> u64 {
+        assert_eq!(
+            state.bitcoin.catch_ups.len(),
+            1,
+            "{:?}",
+            state.bitcoin.catch_ups
+        );
+        *state.bitcoin.catch_ups.keys().next().unwrap()
+    }
+
+    /// #206: a payment key the delegate is still catching up with is sent
+    /// again by itself, as it was (same key and network, every published
+    /// script, a fresh id), with a progress line and no error shown; the
+    /// seller is never asked to enter it again. When it is set the line
+    /// goes. Mutated red by not sending it again, and by sending only the
+    /// scripts not yet accounted for.
+    #[test]
+    fn a_key_still_catching_up_is_sent_again_by_itself() {
+        let mut state = seller_with_orders(30);
+        // Something already accounted for in this tab: a resend still
+        // carries it, as every set does.
+        state.bitcoin.accounted_scripts.insert(vec![0x00, 0x14, 0]);
+        let first = state.bitcoin.next_request_id();
+        state.bitcoin.in_flight.insert(first);
+        state.set_payment_xpub_request(first, "vpub-new".into(), BitcoinNetwork::Testnet4);
+        assert!(state.progress_notices().is_empty());
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: first,
+            result: Err(catching_up(12)),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.notifications.is_empty(), "{:?}", state.notifications);
+        let next = the_catch_up(&state);
+        assert_ne!(next, first);
+        assert!(state.bitcoin.in_flight.contains(&next));
+        assert!(!state.bitcoin.in_flight.contains(&first));
+        assert_eq!(
+            state.progress_notices(),
+            vec!["Catching up on your earlier orders\u{2026} 12 of about 30".to_string()]
+        );
+        match state.payment_key_resend_request(next) {
+            Some(harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
+                request_id,
+                xpub,
+                network,
+                published_scripts,
+            }) => {
+                assert_eq!(request_id, next);
+                assert_eq!(xpub, "vpub-new");
+                assert_eq!(network, BitcoinNetwork::Testnet4);
+                assert_eq!(published_scripts, state.published_payment_scripts());
+                assert_eq!(published_scripts.len(), 30);
+            }
+            other => panic!("expected the key again, got {other:?}"),
+        }
+        // The key on record is untouched meanwhile.
+        assert_eq!(
+            state.bitcoin.payment_xpub.as_ref().unwrap().xpub,
+            "vpub-placeholder"
+        );
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+            request_id: next,
+            result: Ok(PaymentXpubStatus {
+                xpub: "vpub-new".into(),
+                network: BitcoinNetwork::Testnet4,
+                next_index: 31,
+            }),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.progress_notices().is_empty());
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert!(state.bitcoin.xpub_sets.is_empty());
+        assert_eq!(
+            state.bitcoin.payment_xpub.as_ref().unwrap().xpub,
+            "vpub-new"
+        );
+        assert!(state.notifications.is_empty());
+    }
+
+    /// #206: the repeats are bounded. A count that does not rise ends the
+    /// catch-up at once, and one that does ends after
+    /// `catch_up_round_limit` rounds; either way the seller is told, and
+    /// nothing more is sent. An ordinary refusal is shown as before and
+    /// starts nothing. Mutated red by dropping each bound.
+    #[test]
+    fn a_catch_up_that_does_not_progress_or_runs_past_its_bound_stops() {
+        let answer = |state: &mut AppState, id: u64, result: Result<PaymentXpubStatus, String>| {
+            state.on_bitcoin_delegate_response(BitcoinDelegateResponse::PaymentXpubSet {
+                request_id: id,
+                result,
+                matched_scripts: Vec::new(),
+            })
+        };
+        // Not rising.
+        let mut state = seller_with_orders(9);
+        state.set_payment_xpub_request(1, "vpub-new".into(), BitcoinNetwork::Signet);
+        answer(&mut state, 1, Err(catching_up(400)));
+        let next = the_catch_up(&state);
+        answer(&mut state, next, Err(catching_up(400)));
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert_eq!(state.notifications.len(), 1, "{:?}", state.notifications);
+        assert!(state.progress_notices().is_empty());
+
+        // Rising, past the bound: nine scripts allow 9 / 3 + 2 = 5 rounds.
+        let mut state = seller_with_orders(9);
+        assert_eq!(AppState::catch_up_round_limit(9), 5);
+        state.set_payment_xpub_request(1, "vpub-new".into(), BitcoinNetwork::Signet);
+        let mut id = 1;
+        for round in 1..=5u32 {
+            answer(&mut state, id, Err(catching_up(round * 300)));
+            assert!(state.notifications.is_empty(), "round {round}");
+            id = the_catch_up(&state);
+        }
+        answer(&mut state, id, Err(catching_up(6 * 300)));
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert_eq!(state.notifications.len(), 1);
+
+        // An ordinary refusal: shown, nothing sent again.
+        let mut state = seller_with_orders(9);
+        state.set_payment_xpub_request(1, "vpub-new".into(), BitcoinNetwork::Signet);
+        answer(
+            &mut state,
+            1,
+            Err("that account key is not for signet".into()),
+        );
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert_eq!(state.notifications.len(), 1);
+    }
+
+    /// #206: an invoice whose address request the delegate answers "catching
+    /// up" waits, asked again under a new id with what an address request
+    /// carries, and is completed by the address that comes back. Mutated
+    /// red by dropping the invoice (the old behaviour: "Couldn't get a
+    /// payment address").
+    #[test]
+    fn an_invoice_waits_while_the_counter_catches_up() {
+        let mut state = seller_with_orders(30);
+        state.issue_invoice(invoice()).expect("accepted");
+        let first = *state.pending_invoices.keys().next().expect("registered");
+        assert_eq!(
+            match state.order_address_request(first) {
+                harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                    published_scripts,
+                    ..
+                } => published_scripts.len(),
+                other => panic!("{other:?}"),
+            },
+            30
+        );
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: first,
+            result: Err(catching_up(384)),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.notifications.is_empty(), "{:?}", state.notifications);
+        let next = the_catch_up(&state);
+        assert!(
+            state.pending_invoices.contains_key(&next),
+            "the invoice waits"
+        );
+        assert!(!state.pending_invoices.contains_key(&first));
+        assert!(!state.bitcoin.scripts_in_flight.contains_key(&first));
+        assert_eq!(
+            state.progress_notices(),
+            vec!["Catching up on your earlier orders\u{2026} 384 addresses checked".to_string()]
+        );
+        // Asked again with everything an address request carries (nothing
+        // was recorded from the answer that caught up).
+        match state.order_address_request(next) {
+            harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id,
+                published_scripts,
+            } => {
+                assert_eq!(request_id, next);
+                assert_eq!(published_scripts.len(), 30);
+            }
+            other => panic!("{other:?}"),
+        }
+        state.on_bitcoin_delegate_response(address_answer(next, 31));
+        settle_reuse_checks_as_fresh(&mut state);
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert!(state.progress_notices().is_empty());
+        assert!(state.pending_invoices.is_empty());
+        assert_eq!(state.pending_signatures.len(), 1, "the invoice is signed");
+    }
+
+    /// #206: a raise past used addresses (harvest#183) the delegate answers
+    /// "catching up" goes again as a raise, quietly, until it is answered.
+    /// One whose invoice or raise is gone meanwhile is not. Mutated red by
+    /// not asking again.
+    #[test]
+    fn a_raise_is_asked_again_while_the_counter_catches_up() {
+        let mut state = seller_with_orders(3);
+        state.bitcoin.in_flight.insert(9);
+        state.auto_invoice.raise_requests.insert(9);
+        state.order_address_request(9);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: 9,
+            result: Err(catching_up(384)),
+            matched_scripts: Vec::new(),
+        });
+        let next = the_catch_up(&state);
+        assert_eq!(
+            state.auto_invoice.raise_requests,
+            std::collections::HashSet::from([next])
+        );
+        assert!(state.notifications.is_empty());
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: next,
+            result: Ok(derived(400)),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.auto_invoice.raise_requests.is_empty());
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert!(state.pending_signatures.is_empty(), "a raise signs nothing");
+
+        // Nothing waiting on it (abandoned): not asked again.
+        state.bitcoin.in_flight.insert(20);
+        state.on_bitcoin_delegate_response(BitcoinDelegateResponse::OrderAddress {
+            request_id: 20,
+            result: Err(catching_up(800)),
+            matched_scripts: Vec::new(),
+        });
+        assert!(state.bitcoin.catch_ups.is_empty());
+        assert!(state.auto_invoice.raise_requests.is_empty());
+    }
+
+    /// #206, the UI half of the delegate's
+    /// `a_key_left_short_is_not_handed_out_from_by_another_tab`: a tab that
+    /// holds key K1's record (its own orders accounted for, another key's
+    /// scripts unmatched at K1's count) leaves all of them out of its next
+    /// address request, whatever key another tab has since entered. That
+    /// empty request is what the delegate test sends as tab B.
+    #[test]
+    fn a_stale_tab_leaves_the_other_keys_scripts_out() {
+        let mut state = seller_with_orders(6);
+        state.bitcoin.payment_xpub.as_mut().unwrap().next_index = 11;
+        for i in 0..3u8 {
+            state.bitcoin.accounted_scripts.insert(vec![0x00, 0x14, i]);
+        }
+        for i in 3..6u8 {
+            state
+                .bitcoin
+                .unmatched_scripts
+                .insert(vec![0x00, 0x14, i], 11);
+        }
+        match state.order_address_request(1) {
+            harvest_common::BitcoinDelegateRequest::DeriveOrderAddress {
+                published_scripts,
+                ..
+            } => assert!(published_scripts.is_empty(), "{published_scripts:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_progress_line_groups_thousands() {
+        assert_eq!(with_thousands(0), "0");
+        assert_eq!(with_thousands(384), "384");
+        assert_eq!(with_thousands(1_200), "1,200");
+        assert_eq!(with_thousands(1_234_567), "1,234,567");
+        assert_eq!(catching_up_at(&catching_up(1_200)), Some(1_200));
+        assert_eq!(catching_up_at("the node refused"), None);
     }
 
     // -----------------------------------------------------------------

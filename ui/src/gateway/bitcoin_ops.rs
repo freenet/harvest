@@ -181,6 +181,27 @@ pub async fn set_payment_xpub(
     Err("bitcoin operations require WASM".into())
 }
 
+/// Send the payment key again, under an id the CALLER allocated, while the
+/// delegate catches its counter up with the published orders (harvest#206).
+/// The request is `AppState::payment_key_resend_request`: the same key and
+/// network, and every published script.
+#[cfg(target_arch = "wasm32")]
+pub async fn resend_payment_xpub(request_id: u64) -> Result<(), String> {
+    let (delegate_key, request) = {
+        let mut state = APP_STATE.write();
+        let key = state
+            .harvest_delegate_key
+            .clone()
+            .ok_or("harvest delegate not yet registered")?;
+        let request = state
+            .payment_key_resend_request(request_id)
+            .ok_or("no payment key held for that request")?;
+        (key, request)
+    };
+    let payload = to_cbor(&request).map_err(|e| format!("serialize SetPaymentXpub: {e}"))?;
+    super::send_delegate_message(&delegate_key, payload).await
+}
+
 /// Fetch the configured payment xpub, if any.
 ///
 /// Unlike the request helpers above this allocates no request id: like
