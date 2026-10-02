@@ -2119,18 +2119,6 @@ h4 {
   background: var(--bg-card);
 }
 
-/* In a list where some rows have a picture, a row without one keeps the
-   picture's room, so every row's words start at the same place. */
-:has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) {
-  padding-left: calc(1.25rem + 3rem + var(--space-md));
-}
-
-@media (max-width: 600px) {
-  :has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) {
-    padding-left: calc(2 * var(--space-md) + 2.6rem);
-  }
-}
-
 .rc-flag {
   color: var(--amber);
   font-weight: 600;
