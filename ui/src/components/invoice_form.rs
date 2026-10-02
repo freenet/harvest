@@ -555,37 +555,21 @@ pub fn PayoutWallet() -> Element {
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
-            [
-                crate::state::CatchUpKind::Key,
-                crate::state::CatchUpKind::Address,
-            ]
-            .into_iter()
-            .filter_map(|kind| state.catch_up_line(kind).map(|line| (kind, line)))
-            .collect::<Vec<_>>(),
+            !state.catch_up_lines().is_empty(),
         )
     };
     rsx! {
-        // Above the panel, not instead of it (U1): the key on file and the
-        // way to change it stay where they are.
-        for (kind, line) in catching_up {
-            p { class: "text-muted text-italic", "{line}" }
-            p { class: "text-muted", {catch_up_note(kind)} }
+        // What it means, above the panel (U1); the progress itself is in the
+        // notification bar, shown once (#206 review).
+        if catching_up {
+            p { class: "text-muted",
+                "Harvest is checking your key against your earlier orders, a few hundred \
+                 addresses at a time, and carries on by itself: keep this page open until it \
+                 has finished. The key on file, if any, stays in use until a new one is saved, \
+                 and invoices wait."
+            }
         }
         PaymentKeyPanel { xpub, xpub_loaded }
-    }
-}
-
-/// What a catch-up means for the seller, by what it is for (harvest#206).
-fn catch_up_note(kind: crate::state::CatchUpKind) -> &'static str {
-    match kind {
-        crate::state::CatchUpKind::Key => {
-            "Harvest carries on by itself, a few hundred addresses at a time. The key on \
-             file, if any, stays in use until the new one is saved."
-        }
-        crate::state::CatchUpKind::Address => {
-            "Harvest carries on by itself, a few hundred addresses at a time; invoices wait \
-             until it has finished."
-        }
     }
 }
 

@@ -81,11 +81,10 @@ fn is_store_key(key: &[u8]) -> bool {
     key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
         || (key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
             && !crate::auto_invoice::is_ledger_key(key))
-        // The published list's count, this node's scan cursors and the
-        // addresses it handed out: a successor rebuilds or does without them
+        // The published list's count and this node's scan cursors: a
+        // successor rebuilds or does without them
         // (`published_set`). The list itself goes.
         || key == crate::published_set::PUBLISHED_META_KEY
-        || key == crate::published_set::ISSUED_KEY
         || key == crate::published_set::CURSOR_ACTIVE_KEY
         || key == crate::published_set::CURSOR_PENDING_KEY
 }

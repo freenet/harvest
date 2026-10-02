@@ -166,8 +166,8 @@ pub async fn configure_bridge(_endpoint: BridgeEndpoint) -> Result<(), String> {
 pub fn set_payment_xpub(xpub: String, network: freenet_bitcoin_common::BitcoinNetwork) {
     let requests = {
         let mut state = APP_STATE.write();
-        let mut requests = state.begin_payment_key(xpub, network);
-        requests.extend(state.requests_after_sync());
+        let mut requests = state.begin_payment_key(xpub, network, crate::state::now_ms());
+        requests.extend(state.requests_after_sync(crate::state::now_ms()));
         requests
     };
     crate::state::spawn_bitcoin_requests(requests);

@@ -334,6 +334,7 @@ async fn seed(url: &str, wasm: &[u8], out: &str) {
                 xpub: signet_vpub(),
                 network: freenet_bitcoin_common_network(),
                 published_scripts: Vec::new(),
+                resume: false,
             },
         )
         .await
