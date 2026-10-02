@@ -549,12 +549,17 @@ fn notification_bar() -> Element {
     // put it away: before, they stacked up to eight deep above every screen
     // and never left (the 2026-09-27 friction report).
     let (notices, hidden) = distinct_notices(&app_state.notifications);
-    if notices.is_empty() && progress.is_empty() {
-        return rsx! {};
-    }
+    // Always rendered, so the live region below is in the page before its
+    // first line arrives (a region added with its content is not announced
+    // by every screen reader); unstyled while there is nothing to show.
+    let bar_class = if notices.is_empty() && progress.is_empty() {
+        ""
+    } else {
+        "notification-bar"
+    };
 
     rsx! {
-        div { class: "notification-bar",
+        div { class: "{bar_class}",
             for notice in notices {
                 div { key: "{notice}", class: "notice-row",
                     p { "{notice}" }

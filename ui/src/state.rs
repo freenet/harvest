@@ -681,12 +681,11 @@ pub struct AppState {
     /// for this tab's published scripts to be held by the delegate (#206):
     /// sent by `requests_after_sync`.
     pub invoices_waiting_for_scripts: Vec<u64>,
-    /// The buyer requests this session has signed an invoice for, by
-    /// `order_binding` and by instant-checkout request id, so a second
-    /// accept is refused between the signature and the order showing in the
-    /// store (#206 review, U5).
-    pub answered_bindings: HashSet<[u8; 32]>,
-    pub answered_requests: HashSet<[u8; 32]>,
+    /// The orders this session signed, by id, so a second invoice for the
+    /// request one answers is refused between the signature and the order
+    /// showing in the store (#206 review, U5): released when the store shows
+    /// that order cancelled, or when its submission fails.
+    pub signed_orders: HashMap<harvest_common::payment::OrderId, harvest_common::payment::Order>,
     /// For each of this seller's own orders, the OTHER own orders on the same
     /// payment address and network that are not cancelled, with their payment
     /// windows. Output of [`AppState::refresh_same_address_orders`].
@@ -1353,10 +1352,12 @@ fn spawn_addition_deadline(request_id: u64) {
 fn spawn_additions_retry(backoff_ms: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
-        gloo_timers::future::TimeoutFuture::new(backoff_ms as u32 + 50).await;
-        crate::gateway::APP_STATE
-            .write()
-            .send_due_script_additions();
+        gloo_timers::future::TimeoutFuture::new(backoff_ms as u32).await;
+        // The timer ends the backoff itself: a clock read here could land a
+        // moment early and send nothing (#206 review).
+        let mut state = crate::gateway::APP_STATE.write();
+        state.bitcoin.additions_retry_at_ms = None;
+        state.send_due_script_additions();
     });
 }
 
@@ -9789,7 +9790,7 @@ impl AppState {
     /// its landing ([`Self::settle_details_publishing`]), a refusal
     /// ([`Self::end_sent_details_publishing`]), or its send failing
     /// ([`Self::end_details_publishing`]). And the payment counter's
-    /// catch-up line while one is out ([`Self::catch_up_line`]).
+    /// catch-up lines while one is out ([`Self::catch_up_lines`]).
     pub fn progress_notices(&self) -> Vec<String> {
         self.progress_notice_parts()
             .into_iter()
@@ -11608,38 +11609,70 @@ impl AppState {
 
     /// Whether the buyer request `invoice` answers already has an invoice:
     /// see the check in [`Self::issue_invoice`].
+    ///
+    /// A request is identified as the seller's inbox identifies it
+    /// (`components::message_view::unanswered_requests`): an instant one by
+    /// its request id alone; one asked in a conversation by its order
+    /// binding, its listing (as the conversation's listing tag) and the
+    /// buyer's receipt key. The binding and the receipt key are fixed per
+    /// conversation, so a second request in one conversation for another
+    /// listing is another request. An order counts while it is not shown
+    /// cancelled in the store; an order this session signed counts until
+    /// the store shows THAT order cancelled, or its submission failed.
     fn request_already_invoiced(&self, invoice: &PendingInvoice) -> bool {
-        let binding = invoice.order_binding;
-        let request = invoice.answers_request.map(|a| a.request_id);
-        if binding.is_none() && request.is_none() {
+        let instant = invoice.answers_request.map(|a| a.request_id);
+        let tag = invoice.reply_to.and_then(|conversation| {
+            self.conversation_keys
+                .get(conversation.as_slice())
+                .map(|keys| keys.listing_tag(&invoice.listing_id))
+        });
+        let manual = match (instant, invoice.order_binding, tag) {
+            (None, Some(binding), Some(tag)) => Some((binding, tag)),
+            _ => None,
+        };
+        if instant.is_none() && manual.is_none() {
             return false;
         }
-        let same_order = |order: &harvest_common::payment::Order| {
-            (binding.is_some() && order.order_binding == binding)
-                || (request.is_some() && order.request_id == request)
+        let answers = |order: &harvest_common::payment::Order| match instant {
+            Some(request) => order.request_id == Some(request),
+            None => manual.is_some_and(|(binding, tag)| {
+                order.request_id.is_none()
+                    && order.order_binding == Some(binding)
+                    && order.listing_tag == Some(tag)
+                    && order.buyer_receipt_key == invoice.buyer_receipt_key
+            }),
         };
-        let same_invoice = |held: &PendingInvoice| {
-            (binding.is_some() && held.order_binding == binding)
-                || (request.is_some() && held.answers_request.map(|a| a.request_id) == request)
+        let same_invoice = |held: &PendingInvoice| match instant {
+            Some(request) => held.answers_request.map(|a| a.request_id) == Some(request),
+            None => {
+                held.answers_request.is_none()
+                    && held.reply_to == invoice.reply_to
+                    && held.order_binding == invoice.order_binding
+                    && held.listing_id == invoice.listing_id
+                    && held.buyer_receipt_key == invoice.buyer_receipt_key
+            }
         };
-        let in_store = |cancelled: bool| {
+        let store_shows = |id: &harvest_common::payment::OrderId| {
             self.browsing_stores
                 .get(&invoice.store_contract_id)
-                .is_some_and(|store| {
-                    store.orders.iter().any(|o| {
-                        same_order(&o.order)
-                            && (o.status == harvest_common::payment::OrderStatus::Cancelled)
-                                == cancelled
-                    })
-                })
+                .and_then(|store| store.orders.iter().find(|o| &o.order.id == id))
+                .map(|o| o.status)
         };
-        if in_store(false) {
-            return true;
-        }
-        // Signed this session and not since cancelled in the store.
-        let signed = binding.is_some_and(|b| self.answered_bindings.contains(&b))
-            || request.is_some_and(|r| self.answered_requests.contains(&r));
-        self.pending_invoices.values().any(same_invoice)
+        let in_store = self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_some_and(|store| {
+                store.orders.iter().any(|o| {
+                    answers(&o.order) && o.status != harvest_common::payment::OrderStatus::Cancelled
+                })
+            });
+        let signed = self.signed_orders.iter().any(|(id, order)| {
+            answers(order)
+                && store_shows(id) != Some(harvest_common::payment::OrderStatus::Cancelled)
+        });
+        in_store
+            || signed
+            || self.pending_invoices.values().any(same_invoice)
             || self
                 .address_reuse_checks
                 .values()
@@ -11647,8 +11680,13 @@ impl AppState {
             || self
                 .pending_signatures
                 .iter()
-                .any(|p| matches!(p, PendingSignature::Order(o) if same_order(&o.order)))
-            || (signed && !in_store(true))
+                .any(|p| matches!(p, PendingSignature::Order(o) if answers(&o.order)))
+    }
+
+    /// An order this session signed could not be submitted: it never
+    /// reaches the store, so the request it answers may be invoiced again.
+    pub fn on_order_submit_failed(&mut self, order_id: &harvest_common::payment::OrderId) {
+        self.signed_orders.remove(order_id);
     }
 
     /// The request that asks the delegate for invoice `request_id`'s address.
@@ -11699,9 +11737,14 @@ impl AppState {
             .filter(|s| !self.bitcoin.scripts_sent.contains(s) && !sending.contains(s))
             .collect();
         let mut requests = Vec::new();
+        let pass = self.bitcoin.next_addition_pass;
+        if !due.is_empty() {
+            self.bitcoin.next_addition_pass += 1;
+        }
         for chunk in due.chunks(harvest_common::bitcoin_delegate::MAX_SCRIPTS_PER_REQUEST) {
             let request_id = self.bitcoin.next_request_id();
             self.bitcoin.in_flight.insert(request_id);
+            self.bitcoin.addition_pass.insert(request_id, pass);
             self.bitcoin
                 .additions_in_flight
                 .insert(request_id, chunk.to_vec());
@@ -11736,14 +11779,18 @@ impl AppState {
     /// store state or key entry starts afresh.
     pub fn on_additions_failed(&mut self, request_id: u64, now_ms: u64) {
         self.bitcoin.in_flight.remove(&request_id);
-        if self
-            .bitcoin
-            .additions_in_flight
-            .remove(&request_id)
-            .is_none()
-        {
+        let Some(scripts) = self.bitcoin.additions_in_flight.remove(&request_id) else {
+            return;
+        };
+        // Kept, so a late `Ok` still counts them held (its scripts are also
+        // due again meanwhile: a duplicate costs nothing).
+        self.bitcoin.additions_timed_out.insert(request_id, scripts);
+        let pass = self.bitcoin.addition_pass.remove(&request_id);
+        if pass.is_some() && pass == self.bitcoin.last_failed_pass {
+            // This pass's failure is counted already.
             return;
         }
+        self.bitcoin.last_failed_pass = pass;
         self.bitcoin.addition_failures += 1;
         if self.bitcoin.addition_failures < MAX_ADDITION_ATTEMPTS {
             let backoff = ADDITION_BACKOFF_MS << (self.bitcoin.addition_failures - 1);
@@ -11754,9 +11801,12 @@ impl AppState {
         }
         self.bitcoin.addition_failures = 0;
         self.bitcoin.additions_retry_at_ms = None;
+        self.bitcoin.last_failed_pass = None;
         // Whatever else is in flight belongs to the same attempt.
-        for id in std::mem::take(&mut self.bitcoin.additions_in_flight).into_keys() {
+        for (id, scripts) in std::mem::take(&mut self.bitcoin.additions_in_flight) {
             self.bitcoin.in_flight.remove(&id);
+            self.bitcoin.addition_pass.remove(&id);
+            self.bitcoin.additions_timed_out.insert(id, scripts);
         }
         if self.bitcoin.key_waiting.take().is_some() {
             self.notifications.push(
@@ -11783,17 +11833,27 @@ impl AppState {
     }
 
     /// The delegate's answer to an `AddPublishedScripts`.
+    ///
+    /// A late `Ok` for an addition already counted failed still counts its
+    /// scripts held, and resets nothing; only an answer to one still in
+    /// flight resets the failures.
     pub fn on_scripts_added(&mut self, request_id: u64, result: Result<(), String>, now_ms: u64) {
+        if let Some(scripts) = self.bitcoin.additions_timed_out.remove(&request_id) {
+            if result.is_ok() {
+                self.bitcoin.scripts_sent.extend(scripts);
+            }
+            return;
+        }
         match result {
             Ok(()) => {
                 self.bitcoin.in_flight.remove(&request_id);
-                let scripts = self
-                    .bitcoin
-                    .additions_in_flight
-                    .remove(&request_id)
-                    .unwrap_or_default();
+                self.bitcoin.addition_pass.remove(&request_id);
+                let Some(scripts) = self.bitcoin.additions_in_flight.remove(&request_id) else {
+                    return;
+                };
                 self.bitcoin.scripts_sent.extend(scripts);
                 self.bitcoin.addition_failures = 0;
+                self.bitcoin.last_failed_pass = None;
                 // What waited for them: a key, invoices.
                 #[cfg(target_arch = "wasm32")]
                 self.send_due_script_additions();
@@ -11845,15 +11905,19 @@ impl AppState {
         // An entry is a fresh start: no backoff left over.
         self.bitcoin.additions_retry_at_ms = None;
         self.bitcoin.addition_failures = 0;
+        self.bitcoin.last_failed_pass = None;
         self.script_additions_due(now_ms)
     }
 
     /// What waited for the scripts to be held, once they are: the payment
     /// key's `SetPaymentXpub`, and the invoices whose address requests were
     /// held back. Their ids are registered; the caller sends them.
-    pub fn requests_after_sync(&mut self) -> Vec<harvest_common::BitcoinDelegateRequest> {
+    pub fn requests_after_sync(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<harvest_common::BitcoinDelegateRequest> {
         let synced = self.scripts_synced();
-        self.requests_after_sync_when(synced)
+        self.requests_after_sync_when(synced, now_ms)
     }
 
     /// [`Self::requests_after_sync`], with whether the scripts are held
@@ -11862,6 +11926,7 @@ impl AppState {
     fn requests_after_sync_when(
         &mut self,
         synced: bool,
+        now_ms: u64,
     ) -> Vec<harvest_common::BitcoinDelegateRequest> {
         if !synced {
             return Vec::new();
@@ -11871,6 +11936,20 @@ impl AppState {
             let request_id = self.bitcoin.next_request_id();
             self.bitcoin.in_flight.insert(request_id);
             self.bitcoin.key_requests.insert(request_id, key);
+            // The first send has a deadline like every later round (#206
+            // review): "Saving your payment key" never stands for ever.
+            self.bitcoin.catch_ups.insert(
+                request_id,
+                CatchUp {
+                    kind: CatchUpKind::Key,
+                    stalled: 0,
+                    counter: 0,
+                    cursor: 0,
+                    sent_ms: now_ms,
+                },
+            );
+            #[cfg(target_arch = "wasm32")]
+            spawn_catch_up_deadline(request_id);
             requests.extend(self.key_request(request_id, false));
         }
         for request_id in std::mem::take(&mut self.invoices_waiting_for_scripts) {
@@ -12173,7 +12252,7 @@ impl AppState {
         let synced = requests.is_empty()
             && self.bitcoin.additions_in_flight.is_empty()
             && self.bitcoin.additions_retry_at_ms.is_none();
-        requests.extend(self.requests_after_sync_when(synced));
+        requests.extend(self.requests_after_sync_when(synced, now_ms()));
         spawn_bitcoin_requests(requests);
     }
 
@@ -12210,6 +12289,7 @@ impl AppState {
                 .values()
                 .filter(|c| c.kind == kind)
                 .max_by_key(|c| c.sent_ms)
+                .filter(|c| c.cursor > 0)
                 .map(|c| format!("{} addresses checked", with_thousands(c.cursor.into())))
         };
         let mut lines = Vec::new();
@@ -12227,7 +12307,13 @@ impl AppState {
                 latest(CatchUpKind::Key).unwrap_or_default(),
             ));
         }
-        if let Some(figure) = latest(CatchUpKind::Address) {
+        if self
+            .bitcoin
+            .catch_ups
+            .values()
+            .any(|c| c.kind == CatchUpKind::Address)
+        {
+            let figure = latest(CatchUpKind::Address).unwrap_or_default();
             lines.push((
                 "Catching up on your earlier orders\u{2026}".to_string(),
                 figure,
@@ -13217,10 +13303,10 @@ impl AppState {
             Some(PendingSignature::Order(pending)) => {
                 let authorized = authorize_new_order(pending.order, scoped_payload, signature);
                 // Answered: no second invoice for this request until the
-                // store shows this one cancelled (U5).
-                self.answered_bindings
-                    .extend(authorized.order.order_binding);
-                self.answered_requests.extend(authorized.order.request_id);
+                // store shows this one cancelled, or it cannot be submitted
+                // (U5).
+                self.signed_orders
+                    .insert(authorized.order.id.clone(), authorized.order.clone());
                 info!(
                     "Constructed AuthorizedOrder {} for {} sats",
                     authorized.order.id.short(),
@@ -13250,18 +13336,18 @@ impl AppState {
                 #[cfg(target_arch = "wasm32")]
                 {
                     let store_id = pending.store_contract_id;
+                    let order_id = authorized.order.id.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Err(e) =
                             crate::gateway::store_ops::submit_order_by_id(&store_id, authorized)
                                 .await
                         {
                             dioxus::logger::tracing::error!("Failed to publish the invoice: {}", e);
-                            crate::gateway::APP_STATE
-                                .write()
-                                .notifications
-                                .push(format!(
-                                    "The invoice was signed but could not be published: {e}"
-                                ));
+                            let mut state = crate::gateway::APP_STATE.write();
+                            state.on_order_submit_failed(&order_id);
+                            state.notifications.push(format!(
+                                "The invoice was signed but could not be published: {e}"
+                            ));
                         }
                     });
                 }
@@ -15241,8 +15327,18 @@ pub struct BitcoinState {
     pub scripts_sent: std::collections::BTreeSet<Vec<u8>>,
     /// The scripts of each `AddPublishedScripts` in flight, by request id.
     pub additions_in_flight: HashMap<u64, Vec<Vec<u8>>>,
-    /// Failed additions in a row (`AppState::on_additions_failed`).
+    /// Failed passes of additions in a row (`AppState::on_additions_failed`).
     pub addition_failures: u32,
+    /// The pass each addition in flight was sent in, and the next pass's
+    /// number: failures are counted once per pass, however many chunks it
+    /// had.
+    pub addition_pass: HashMap<u64, u64>,
+    pub next_addition_pass: u64,
+    /// The last pass a failure was counted for.
+    pub last_failed_pass: Option<u64>,
+    /// The scripts of additions counted failed while unanswered, so a late
+    /// `Ok` still counts them held.
+    pub additions_timed_out: HashMap<u64, Vec<Vec<u8>>>,
     /// Until when no addition is sent, after one failed.
     pub additions_retry_at_ms: Option<u64>,
     /// Whether a pass of additions is already scheduled
@@ -15259,7 +15355,7 @@ pub struct BitcoinState {
     pub superseded_key_requests: HashSet<u64>,
     /// The requests sent again because the delegate was still catching up
     /// (harvest#206), by request id. While any is out, a progress line says
-    /// so ([`AppState::catch_up_line`]).
+    /// so ([`AppState::catch_up_lines`]).
     pub catch_ups: HashMap<u64, CatchUp>,
     /// Whether `GetPaymentXpub` has answered at least once. Distinguishes "no
     /// key configured" from "we have not asked yet", so the seller is not
@@ -19859,9 +19955,9 @@ mod invoice_tests {
             additions(&due).iter().map(|(_, n)| *n).collect::<Vec<_>>(),
             [30]
         );
-        assert!(state.requests_after_sync().is_empty(), "scripts in flight");
+        assert!(state.requests_after_sync(0).is_empty(), "scripts in flight");
         added(&mut state, additions(&due)[0].0, Ok(()));
-        let after = state.requests_after_sync();
+        let after = state.requests_after_sync(0);
         match after.as_slice() {
             [harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
                 xpub,
@@ -19877,7 +19973,7 @@ mod invoice_tests {
             }
             other => panic!("expected the key, got {other:?}"),
         }
-        assert!(state.requests_after_sync().is_empty(), "once");
+        assert!(state.requests_after_sync(0).is_empty(), "once");
         let debug = format!("{:?}", state.bitcoin);
         assert!(!debug.contains("vpub-new-secret"), "{debug}");
     }
@@ -19893,7 +19989,7 @@ mod invoice_tests {
         sync(&mut state);
         state.begin_payment_key("vpub-new".into(), BitcoinNetwork::Testnet4, 0);
         sync(&mut state);
-        let first = match state.requests_after_sync().as_slice() {
+        let first = match state.requests_after_sync(0).as_slice() {
             [harvest_common::BitcoinDelegateRequest::SetPaymentXpub { request_id, .. }] => {
                 *request_id
             }
@@ -19964,7 +20060,7 @@ mod invoice_tests {
         let key_sent = |state: &mut AppState| {
             state.begin_payment_key("vpub-new".into(), BitcoinNetwork::Signet, 0);
             sync(state);
-            match state.requests_after_sync().as_slice() {
+            match state.requests_after_sync(0).as_slice() {
                 [harvest_common::BitcoinDelegateRequest::SetPaymentXpub { request_id, .. }] => {
                     *request_id
                 }
@@ -20080,7 +20176,7 @@ mod invoice_tests {
         sync(&mut state);
         state.begin_payment_key("vpub-older".into(), BitcoinNetwork::Signet, 0);
         sync(&mut state);
-        let older = match state.requests_after_sync().as_slice() {
+        let older = match state.requests_after_sync(0).as_slice() {
             [harvest_common::BitcoinDelegateRequest::SetPaymentXpub { request_id, .. }] => {
                 *request_id
             }
@@ -20092,7 +20188,7 @@ mod invoice_tests {
         assert_eq!(state.notifications.len(), 1, "told the newer replaces it");
         assert!(state.bitcoin.catch_ups.is_empty());
         sync(&mut state);
-        let newer = match state.requests_after_sync().as_slice() {
+        let newer = match state.requests_after_sync(0).as_slice() {
             [harvest_common::BitcoinDelegateRequest::SetPaymentXpub {
                 request_id, xpub, ..
             }] => {
@@ -20105,7 +20201,11 @@ mod invoice_tests {
         assert!(state
             .on_payment_key_answer(older_round, Err(catching_up(2, 768)), 0)
             .is_empty());
-        assert!(state.bitcoin.catch_ups.is_empty());
+        assert_eq!(
+            state.bitcoin.catch_ups.keys().copied().collect::<Vec<_>>(),
+            vec![newer],
+            "only the newer key's first send, with its deadline"
+        );
         assert_eq!(state.notifications.len(), 1);
         // The newer one carries on.
         let again = state.on_payment_key_answer(newer, Err(catching_up(1, 384)), 0);
@@ -20140,11 +20240,11 @@ mod invoice_tests {
         let first = *state.pending_invoices.keys().next().expect("registered");
         assert_eq!(state.invoices_waiting_for_scripts, [first]);
         assert!(
-            state.requests_after_sync().is_empty(),
+            state.requests_after_sync(0).is_empty(),
             "not before the scripts"
         );
         sync(&mut state);
-        match state.requests_after_sync().as_slice() {
+        match state.requests_after_sync(0).as_slice() {
             [harvest_common::BitcoinDelegateRequest::DeriveOrderAddress { request_id, .. }] => {
                 assert_eq!(*request_id, first)
             }
@@ -20283,97 +20383,230 @@ mod invoice_tests {
         assert!(!held(&state, 1_000 + RAISE_RETRY_MS));
     }
 
-    /// #206 review (U5): one invoice per buyer request through every stage:
-    /// its reuse check, its signature, signed and not yet in the store, and
-    /// in the store; a second request in the same conversation (another
-    /// binding) may be invoiced; a request whose invoice the store shows
-    /// cancelled may be invoiced again. Mutated red by dropping each stage,
-    /// and by keying on the conversation.
+    /// #206 review (U5): one invoice per buyer request, through every stage:
+    /// waiting for its address, its reuse check, its signature, signed (the
+    /// real signature path) and not yet in the store, and in the store. A
+    /// request is what the seller's inbox counts as one: in one conversation
+    /// (one binding, one receipt key) a request for another listing is
+    /// another request, and so is another instant request. Signed orders are
+    /// released one by one: when the store shows THAT order cancelled, or
+    /// when its submission failed. Mutated red by dropping each stage, by
+    /// keying a request on its conversation, by releasing every request of a
+    /// conversation on one cancellation, and by not releasing on a failed
+    /// submission.
     #[test]
     fn one_invoice_per_request_at_every_stage() {
-        let with_binding = |b: u8| {
+        let conversation = [9u8; 32];
+        let keys = crate::messaging::ConversationKeys {
+            to_seller: [1; 32],
+            from_seller: [2; 32],
+        };
+        let other_listing = ListingId::from_label("Gadget");
+        let asking = |listing: &ListingId| {
             let mut i = invoice();
-            i.reply_to = Some([9; 32]);
-            i.order_binding = Some([b; 32]);
+            i.reply_to = Some(conversation);
+            i.order_binding = Some([5; 32]);
+            i.buyer_receipt_key = Some([6; 32]);
+            i.listing_id = listing.clone();
             i
         };
         let mut state = seller_with_orders(3);
         sync(&mut state);
-        state.conversation_keys.insert(
-            vec![9; 32],
-            crate::messaging::ConversationKeys {
-                to_seller: [1; 32],
-                from_seller: [2; 32],
-            },
-        );
-        state.issue_invoice(with_binding(1)).expect("first");
+        state.conversation_keys.insert(conversation.to_vec(), keys);
+        state.issue_invoice(asking(&listing_id())).expect("first");
         assert!(
-            state.issue_invoice(with_binding(1)).is_err(),
+            state.issue_invoice(asking(&listing_id())).is_err(),
             "waiting for its address"
         );
         assert!(
-            state.issue_invoice(with_binding(2)).is_ok(),
-            "another request, same conversation"
+            state.issue_invoice(asking(&other_listing)).is_ok(),
+            "another listing, same conversation: another request"
         );
-        // At its reuse check.
-        let id = *state
-            .pending_invoices
-            .iter()
-            .find(|(_, i)| i.order_binding == Some([1; 32]))
-            .unwrap()
-            .0;
-        state.on_bitcoin_delegate_response(address_answer(id, 40));
+        // Through its reuse check and its signature.
+        let id_of = |state: &AppState, listing: &ListingId| {
+            *state
+                .pending_invoices
+                .iter()
+                .find(|(_, i)| &i.listing_id == listing)
+                .unwrap()
+                .0
+        };
+        let first = id_of(&state, &listing_id());
+        state.on_bitcoin_delegate_response(address_answer(first, 40));
         assert!(!state.address_reuse_checks.is_empty());
         assert!(
-            state.issue_invoice(with_binding(1)).is_err(),
+            state.issue_invoice(asking(&listing_id())).is_err(),
             "at its reuse check"
         );
-        // At its signature.
         settle_reuse_checks_as_fresh(&mut state);
         assert!(
-            state.issue_invoice(with_binding(1)).is_err(),
+            state.issue_invoice(asking(&listing_id())).is_err(),
             "at its signature"
         );
-        // Signed, not yet in the store.
-        state
+        let order_request = state
             .pending_signatures
-            .retain(|p| !matches!(p, PendingSignature::Order(_)));
-        state.answered_bindings.insert([1; 32]);
-        assert!(state.issue_invoice(with_binding(1)).is_err(), "signed");
-        // In the store, cancelled: may be invoiced again.
-        let mut o = with_script(&[0x00, 0x14, 0x77]);
-        o.order.order_binding = Some([1; 32]);
-        o.status = harvest_common::payment::OrderStatus::Cancelled;
-        state
-            .browsing_stores
-            .get_mut(STORE_ID.as_slice())
-            .unwrap()
-            .orders
-            .push(o.clone());
-        sync(&mut state);
-        assert!(state.issue_invoice(with_binding(1)).is_ok(), "cancelled");
-        // In the store, live: refused, whatever this session knows.
-        let mut state = seller_with_orders(3);
-        sync(&mut state);
-        state.conversation_keys.insert(
-            vec![9; 32],
-            crate::messaging::ConversationKeys {
-                to_seller: [1; 32],
-                from_seller: [2; 32],
-            },
+            .iter()
+            .find(|p| matches!(p, PendingSignature::Order(_)))
+            .expect("the invoice is queued")
+            .clone();
+        state.on_delegate_response(store_key_answer_for(&order_request));
+        assert!(
+            !state
+                .pending_signatures
+                .iter()
+                .any(|p| matches!(p, PendingSignature::Order(_))),
+            "signed"
         );
-        o.status = harvest_common::payment::OrderStatus::AwaitingPayment;
+        assert!(
+            state.issue_invoice(asking(&listing_id())).is_err(),
+            "signed, not in the store"
+        );
+        let signed = state
+            .signed_orders
+            .values()
+            .next()
+            .expect("recorded")
+            .clone();
+        // In the store, live: still refused; then shown cancelled: released.
+        let mut shown = with_script(&signed.payment_script_pubkey);
+        shown.order = signed.clone();
         state
             .browsing_stores
             .get_mut(STORE_ID.as_slice())
             .unwrap()
             .orders
-            .push(o);
+            .push(shown.clone());
         sync(&mut state);
         assert!(
-            state.issue_invoice(with_binding(1)).is_err(),
+            state.issue_invoice(asking(&listing_id())).is_err(),
             "in the store"
         );
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .unwrap()
+            .orders
+            .last_mut()
+            .unwrap()
+            .status = harvest_common::payment::OrderStatus::Cancelled;
+        assert!(
+            state.issue_invoice(asking(&listing_id())).is_ok(),
+            "that order cancelled"
+        );
+
+        // Another conversation's cancellation releases nothing here, and a
+        // failed submission releases its own request.
+        let mut state = seller_with_orders(3);
+        sync(&mut state);
+        state.conversation_keys.insert(conversation.to_vec(), keys);
+        let mut other = signed.clone();
+        other.listing_tag = Some([0; 32]);
+        state
+            .signed_orders
+            .insert(signed.id.clone(), signed.clone());
+        assert!(
+            state.issue_invoice(asking(&listing_id())).is_err(),
+            "signed earlier"
+        );
+        let mut cancelled = with_script(&[0x00, 0x14, 0x55]);
+        cancelled.order = other;
+        cancelled.order.id = harvest_common::payment::OrderId([4; 32]);
+        cancelled.status = harvest_common::payment::OrderStatus::Cancelled;
+        state
+            .browsing_stores
+            .get_mut(STORE_ID.as_slice())
+            .unwrap()
+            .orders
+            .push(cancelled);
+        sync(&mut state);
+        assert!(
+            state.issue_invoice(asking(&listing_id())).is_err(),
+            "not that order"
+        );
+        state.on_order_submit_failed(&signed.id);
+        assert!(
+            state.issue_invoice(asking(&listing_id())).is_ok(),
+            "its submission failed"
+        );
+
+        // Instant requests: by request id alone.
+        let mut state = seller_with_orders(3);
+        sync(&mut state);
+        let instant = |id: u8| {
+            let mut i = invoice();
+            i.answers_request = Some(harvest_common::payment::AnsweredRequest {
+                request_id: [id; 32],
+                requested_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            });
+            i
+        };
+        state.issue_invoice(instant(7)).expect("first");
+        assert!(state.issue_invoice(instant(7)).is_err(), "the same request");
+        assert!(state.issue_invoice(instant(8)).is_ok(), "another request");
+    }
+
+    /// #206 review: the first send of an entered key has a deadline, like
+    /// every later round: "Saving your payment key" shows from the entry,
+    /// and an unanswered first send ends it and tells the seller. Mutated
+    /// red by giving the first send no deadline.
+    #[test]
+    fn the_first_key_send_has_a_deadline() {
+        let mut state = seller_with_orders(3);
+        sync(&mut state);
+        state.begin_payment_key("vpub-new".into(), BitcoinNetwork::Signet, 0);
+        assert!(state
+            .catch_up_lines()
+            .iter()
+            .any(|(l, f)| l.starts_with("Saving your payment key") && f.is_empty()));
+        sync(&mut state);
+        let first = match state.requests_after_sync(100).as_slice() {
+            [harvest_common::BitcoinDelegateRequest::SetPaymentXpub { request_id, .. }] => {
+                *request_id
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(the_catch_up(&state), first);
+        state.expire_catch_up(first, 100 + CATCH_UP_STALL_MS);
+        assert!(state.catch_up_lines().is_empty());
+        assert!(state.bitcoin.key_requests.is_empty());
+        assert_eq!(state.notifications.len(), 1);
+    }
+
+    /// #206 review: failures are counted once per pass, however many chunks
+    /// it had; an answer to an addition still in flight resets them, a late
+    /// `Ok` for one already counted failed only counts its scripts held; and
+    /// entering a key starts with no backoff. Mutated red by counting per
+    /// chunk, by not resetting on a success, by resetting on a late `Ok`, by
+    /// dropping a late `Ok`'s scripts, and by keeping the backoff over a key
+    /// entry.
+    #[test]
+    fn additions_count_failures_per_pass() {
+        use harvest_common::bitcoin_delegate::MAX_SCRIPTS_PER_REQUEST;
+        let mut state = seller_with_orders(MAX_SCRIPTS_PER_REQUEST as u32 + 3);
+        let pass = additions(&state.script_additions_due(0));
+        assert_eq!(pass.len(), 2, "one pass, two chunks");
+        state.on_scripts_added(pass[0].0, Err("refused".into()), 0);
+        state.on_additions_failed(pass[1].0, 0);
+        assert_eq!(state.bitcoin.addition_failures, 1, "one pass, one failure");
+        // The unanswered one answers late: its scripts count, nothing resets.
+        state.on_scripts_added(pass[1].0, Ok(()), 1);
+        assert_eq!(state.bitcoin.addition_failures, 1);
+        assert_eq!(state.bitcoin.scripts_sent.len(), 3);
+        // A success of one still in flight resets the count.
+        let again = additions(&state.script_additions_due(ADDITION_BACKOFF_MS));
+        assert_eq!(again.len(), 1);
+        state.on_scripts_added(again[0].0, Ok(()), ADDITION_BACKOFF_MS);
+        assert_eq!(state.bitcoin.addition_failures, 0);
+        assert!(state.scripts_synced());
+
+        // A key entry starts with no backoff left over.
+        let mut state = seller_with_orders(3);
+        let first = additions(&state.script_additions_due(0));
+        state.on_scripts_added(first[0].0, Err("refused".into()), 0);
+        assert!(state.script_additions_due(1).is_empty(), "backing off");
+        assert!(!state
+            .begin_payment_key("vpub-new".into(), BitcoinNetwork::Signet, 1)
+            .is_empty());
     }
 
     #[test]

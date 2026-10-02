@@ -167,7 +167,7 @@ pub fn set_payment_xpub(xpub: String, network: freenet_bitcoin_common::BitcoinNe
     let requests = {
         let mut state = APP_STATE.write();
         let mut requests = state.begin_payment_key(xpub, network, crate::state::now_ms());
-        requests.extend(state.requests_after_sync());
+        requests.extend(state.requests_after_sync(crate::state::now_ms()));
         requests
     };
     crate::state::spawn_bitcoin_requests(requests);
