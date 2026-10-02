@@ -810,8 +810,9 @@ h4 {
 }
 
 /* Messages: one conversation, as bubbles (mockup msgs(); message_view
-   ChatLines). Near-monochrome: your own on parchment, the other side on the
-   page colour. Long words wrap rather than widen the page at 390 px. */
+   ChatLines). The other side on the left, white with a green edge; your own
+   on the right, on parchment; a message not confirmed as yours on neither
+   side (below). Long words wrap rather than widen the page at 390 px. */
 .bubbles {
   display: grid;
   gap: var(--space-sm);
@@ -821,8 +822,9 @@ h4 {
 .bubble {
   max-width: 80%;
   justify-self: start;
-  background: var(--bg);
+  background: white;
   border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
   border-radius: var(--radius-lg);
   padding: var(--space-sm) var(--space-md);
   white-space: pre-wrap;
@@ -832,6 +834,8 @@ h4 {
 .bubble.mine {
   justify-self: end;
   background: var(--color-parchment);
+  border-left-width: 1px;
+  border-left-color: var(--border);
 }
 
 /* In this side's direction, not sent from this device: in its place in
@@ -842,7 +846,9 @@ h4 {
   justify-self: stretch;
   max-width: none;
   border-style: dashed;
-  background: var(--bg-card);
+  border-left-width: 1px;
+  border-left-color: var(--border);
+  background: transparent;
   color: var(--text-secondary);
 }
 
@@ -2868,15 +2874,19 @@ a.btn {
    words their room. */
 .item-grid:not(.gallery):has(.item-card-img) {
   grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  /* Every card the height of the tallest, so a row with a picture and one
+     without line up. */
+  grid-auto-rows: 1fr;
+  align-items: stretch;
 }
 
 .item-grid:not(.gallery) .item-card:has(.item-card-img) {
-  grid-template-columns: 3.75rem minmax(0, 1fr);
+  grid-template-columns: 5.5rem minmax(0, 1fr);
 }
 
 .item-grid:not(.gallery) .item-card-img {
-  width: 3.75rem;
-  height: 3.75rem;
+  width: 5.5rem;
+  height: 5.5rem;
 }
 
 .item-card-price .test-coins {
