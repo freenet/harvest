@@ -6759,6 +6759,34 @@ mod tests {
             }
             store.orders.orders.insert(signed.order.id.clone(), signed);
         }
+        // A listing with photos (harvest images PR 2), so the light read is
+        // compared with the whole decode on the photo references too.
+        let mut photographed = store.listings.listings[0].clone();
+        photographed.listing.images = (0..4u8)
+            .map(|i| harvest_common::listing_image::ListingImage {
+                full: harvest_common::listing_image::ImageBlob {
+                    hash: harvest_common::store::Bytes32([i + 1; 32]),
+                    len: 150_000,
+                    width: 1600,
+                    height: 1200,
+                },
+                thumb: (i == 0).then_some(harvest_common::listing_image::ImageBlob {
+                    hash: harvest_common::store::Bytes32([99; 32]),
+                    len: 20_000,
+                    width: 400,
+                    height: 300,
+                }),
+                colour: [i, 2, 3],
+                alt: if i == 0 {
+                    "Jar, front".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
+        photographed.listing = photographed.listing.clone().with_derived_id();
+        store.listings.listings.push(photographed);
+        store.listings.normalize();
         store.info.scoped_payload = vec![1, 2, 3];
         store
     }

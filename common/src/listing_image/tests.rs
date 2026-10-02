@@ -246,24 +246,48 @@ fn a_description_may_not_hide_characters() {
         p[1].alt = alt.to_string();
         images_problem(&p)
     };
-    assert_eq!(with_alt("Jar of honey, lid off, côte view"), None);
+    // Real writing that needs joiners, marks, selectors or tags.
+    for fine in [
+        "Jar of honey, lid off, côte view",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} family picnic",
+        "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308} flag",
+        "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+        "\u{05D3}\u{05D1}\u{05E9} 500g\u{200F}",
+        "\u{8702}\u{871C}\u{7F50}",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+        "\u{2764}\u{FE0F}",
+    ] {
+        assert_eq!(with_alt(fine), None, "{fine:?} must be accepted");
+    }
     for hidden in [
         "line\nbreak",
         "tab\there",
+        "nul\0",
         "\u{202E}esrever",
-        "zero\u{200B}width",
         "\u{2066}isolate\u{2069}",
+        "zero\u{200B}width",
+        "word\u{2060}joiner",
+        "invisible\u{2062}times",
         "bom\u{FEFF}",
         "mongolian\u{180E}vs",
         "deprecated\u{206A}format",
         "nominal\u{206F}digits",
-        "nul\0",
+        "hangul\u{3164}filler",
+        "choseong\u{115F}filler",
+        "jungseong\u{1160}filler",
+        "soft\u{00AD}hyphen",
+        "grapheme\u{034F}joiner",
+        "half\u{FFA0}width",
+        "annotated\u{FFF9}x\u{FFFA}y\u{FFFB}",
     ] {
         assert!(with_alt(hidden).is_some(), "{hidden:?} must be refused");
     }
 }
 
-/// A listing WITH photos, pinned the same way: its encoding is the preimage of
+/// A listing WITH photos, pinned. Unlike the pin above, these bytes were
+/// computed by this code (the field is new, so no earlier code could), and
+/// the hashes' byte-string form (`5820`) was checked by hand. It catches a
+/// later drift, not a wrong encoding today. Its encoding is the preimage of
 /// its id and its signature, so once photographed listings exist, a change to
 /// how a photo reference encodes (field order, a dropped `skip_serializing_if`,
 /// the hash's byte-string form) would move their ids and the store migration
