@@ -715,7 +715,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "ArmAutoInvoice (filling to the cap)",
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
-                vetted_scripts: watched.clone(),
+                    vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: mailbox,
@@ -985,7 +985,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "ArmAutoInvoice (re-arm, full ledger)",
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
-                vetted_scripts: watched.clone(),
+                    vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: *mailbox,
@@ -1225,7 +1225,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             &format!("ArmAutoInvoice (re-arm, {delegations})"),
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
-                vetted_scripts: watched.clone(),
+                    vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: *mailbox,
@@ -1923,6 +1923,66 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         now - chrono::Duration::seconds(5),
         40_000,
     );
+    // A mailbox full of valid instant requests, each from its own buyer:
+    // every one opens and pays the subgroup check on its tag
+    // (`messaging::is_canonical_tag`, in `open_instant`), on top of the
+    // agreement and the decryption `OPEN_FIXED_COST` stands for. One run
+    // (the most one run opens); the delegate's state is put back after.
+    {
+        let before = r.host.state.secrets.clone();
+        let requests: Vec<_> = (0..harvest_common::mailbox::MAX_MESSAGES as u64)
+            .map(|i| {
+                let mut seed = [0xE0u8; 32];
+                seed[..8].copy_from_slice(&i.to_le_bytes());
+                let buyer = StaticSecret::from(seed);
+                let tag = *PublicKey::from(&buyer).as_bytes();
+                let key = harvest_common::mailbox::conversation_key_from_dh(
+                    &buyer.diffie_hellman(&PublicKey::from(at.inbox)).to_bytes(),
+                    harvest_common::mailbox::MessageDirection::BuyerToSeller,
+                );
+                fixtures::encrypt_message_seeded(
+                    &PlaintextMessage {
+                        conversation_id: harvest_common::mailbox::ConversationId(seed),
+                        content: MessageContent::OrderRequest {
+                            listing_id: listing.id.clone(),
+                            quantity: 1,
+                            shipping: "1 Lane".into(),
+                            note: String::new(),
+                            order_binding: seed,
+                            buyer_receipt_key: Some([0xD2; 32]),
+                            instant: Some(InstantSelection {
+                                nonce: [0xD3; 16],
+                                region: Some("UK".into()),
+                                choices: vec!["Fig".into()],
+                                expected_total_sats: 12_000,
+                                requested_at_ms: (now - chrono::Duration::seconds(5))
+                                    .timestamp_millis(),
+                            }),
+                        },
+                    },
+                    &tag,
+                    &key,
+                    now - chrono::Duration::seconds(5),
+                    41_000 + i,
+                )
+            })
+            .collect();
+        let n_requests = requests.len();
+        let out = r.notify(
+            &format!(
+                "ContractNotification: mailbox ({n_requests} instant requests, one buyer each)"
+            ),
+            at.mailbox,
+            cbor(&mailbox_state(requests)?),
+        )?;
+        if !out.iter().any(|m| {
+            matches!(m, OutboundDelegateMsg::GetContractRequest(get)
+                if get.contract_id == ContractInstanceId::new(at.contract))
+        }) {
+            bail!("the full mailbox of instant requests asked nothing of the store");
+        }
+        r.host.state.secrets = before;
+    }
     let out = r.notify(
         "ContractNotification: mailbox (an instant request)",
         at.mailbox,

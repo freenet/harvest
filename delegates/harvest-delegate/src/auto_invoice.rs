@@ -2426,6 +2426,12 @@ fn within_age(message: &EncryptedMessage, now_ms: u64) -> bool {
 pub(crate) const OPEN_BUDGET: usize = 851_968;
 
 /// The X25519 agreement in [`OPEN_BUDGET`]'s units: about 4 KiB of AES-GCM.
+///
+/// An opened instant request also pays the subgroup check on its tag
+/// (`messaging::is_canonical_tag`, about another agreement), which this does
+/// not count: only a message that decrypts as an instant request pays it,
+/// and junk never does. A mailbox of 512 valid requests from 512 buyers, the
+/// worst case for it, is 45.1% of a call per run (`tests/delegate-budget`).
 pub(crate) const OPEN_FIXED_COST: usize = 4096;
 
 /// Fresh randomness from the node, for [`open_within_budget`]'s order.

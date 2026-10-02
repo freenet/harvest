@@ -316,6 +316,10 @@ Review round 1 of the same branch gives every arm a second list of up to
 decodes: the wake-up with full delegations 43.9% to 55.3%, the catch-up
 wake-ups to 58.2-61.3%, the plain wake-up 18.9% to 19.8%.
 
+A mailbox full of valid instant requests, 512 buyers, each request paying
+the subgroup check on its tag in `open_instant`: 45.1% of a call for the
+run that opens them.
+
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
 makes today is 18 (the wake-up with watch delegations: one per arm, and the
