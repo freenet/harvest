@@ -1094,6 +1094,7 @@ mod tests {
             Family::Refused,    // instant-checkout tip
             Family::Refused,    // instant-checkout exported marker
             Family::Refused,    // instant-checkout catching-up mark
+            Family::Refused,    // instant-checkout fed scripts
             Family::PublishedScripts,
             Family::Refused, // published scripts' count
             Family::Refused, // addresses this key handed out

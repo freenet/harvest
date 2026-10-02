@@ -65,14 +65,16 @@ pub(crate) const PUBLISHED_META_KEY: &[u8] = b"harvest:bitcoin:published-meta:v1
 
 /// Save the published list and its [`PUBLISHED_META_KEY`]. Whether the list
 /// was kept.
+///
+/// The count goes first: if the list is then refused, the count names a
+/// generation the list does not have, which only ever reads as "changed
+/// since" (a scan not known complete, `decide` feeding its store again),
+/// never as "unchanged" over a list that did change.
 pub(crate) fn save_published<S: SecretStore>(store: &mut S, list: &DigestList) -> bool {
-    if !list.save(store, PUBLISHED_KEY) {
-        return false;
-    }
     let mut meta = list.generation().to_le_bytes().to_vec();
     meta.extend_from_slice(&(list.len() as u32).to_le_bytes());
     store.set_secret(PUBLISHED_META_KEY, &meta);
-    true
+    list.save(store, PUBLISHED_KEY)
 }
 
 /// The published list's generation and length, from its

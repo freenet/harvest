@@ -1765,6 +1765,56 @@ pub(crate) fn on_notification<S: SecretStore>(
     None
 }
 
+/// What `decide` last fed of a store's published scripts
+/// ([`feed_published`]): a digest of them and the published list's
+/// generation after. Node-local, not exported.
+pub(crate) fn fed_key(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{AUTO_PREFIX}fed:{}",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+/// Add a store's published scripts to those the delegate holds
+/// (`bitcoin::add_published`), unless exactly these were fed already and
+/// the held list has not changed since (its generation, which rises with
+/// every addition and so with every eviction). Then a run hashes the
+/// scripts once, as one digest, rather than looking each up (#206).
+fn feed_published<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    published: &[Vec<u8>],
+) -> Result<(), String> {
+    let mut hasher = blake3::Hasher::new();
+    for script in published {
+        hasher.update(&(script.len() as u32).to_le_bytes());
+        hasher.update(script);
+    }
+    let digest = *hasher.finalize().as_bytes();
+    let key = fed_key(store_contract_id);
+    let (generation, _) = crate::published_set::published_meta(secrets);
+    let mut fed = digest.to_vec();
+    fed.extend_from_slice(&generation.to_le_bytes());
+    if secrets.get_secret(&key).as_deref() == Some(fed.as_slice()) {
+        return Ok(());
+    }
+    crate::bitcoin::add_published(secrets, published)?;
+    let (generation, _) = crate::published_set::published_meta(secrets);
+    let mut fed = digest.to_vec();
+    fed.extend_from_slice(&generation.to_le_bytes());
+    secrets.set_secret(&key, &fed);
+    Ok(())
+}
+
+/// A store's state as instant checkout reads it: only what it uses
+/// (`fast_cbor::decode_store_light`), or the whole state when that declines.
+/// Decoding every order's payment proof was most of a run's cost at a few
+/// thousand paid orders (#206).
+fn read_store(state: &[u8]) -> Option<StoreStateV1> {
+    crate::fast_cbor::decode_store_light(state).or_else(|| from_cbor(state).ok())
+}
+
 fn on_store_change<S: SecretStore>(
     secrets: &mut S,
     record: &ArmRecord,
@@ -1774,7 +1824,7 @@ fn on_store_change<S: SecretStore>(
     let Some(store_sk) = store_key(secrets, &record.arm.store_verifying_key) else {
         return Vec::new();
     };
-    let Ok(store) = from_cbor::<StoreStateV1>(state) else {
+    let Some(store) = read_store(state) else {
         return Vec::new();
     };
     if store.owner != Some(store_sk.verifying_key()) {
@@ -2383,7 +2433,7 @@ pub(crate) fn on_store_state<S: SecretStore>(
     let Some(record) = load_arm(secrets, &batch.store_contract_id) else {
         return Some(Vec::new());
     };
-    let Some(store) = state.and_then(|s| from_cbor::<StoreStateV1>(s).ok()) else {
+    let Some(store) = state.and_then(read_store) else {
         return Some(Vec::new());
     };
     let decided = decide(secrets, &record, &store, &batch.entries, now_ms);
@@ -2675,7 +2725,7 @@ pub(crate) fn decide<S: SecretStore>(
         .map(|o| o.order.payment_script_pubkey.clone())
         .filter(|s| !s.is_empty())
         .collect();
-    let scan = crate::bitcoin::add_published(secrets, &published)
+    let scan = feed_published(secrets, &arm.store_contract_id, &published)
         .map_err(crate::bitcoin::ScanError::NotSaved)
         .and_then(|_| {
             crate::bitcoin::advance_scan(
@@ -3128,12 +3178,14 @@ fn paid_scripts<S: SecretStore>(secrets: &S) -> Vec<(i64, Vec<u8>)> {
 fn note_paid_scripts<S: SecretStore>(secrets: &mut S, store: &StoreStateV1) {
     let mut held = paid_scripts(secrets);
     let mut changed = false;
+    // Looked up in a set: a scan of `held` per order, as `held` grows inside
+    // the loop, was about n^2/2 comparisons (898M fuel at 4,096 paid orders,
+    // measured by the #206 harness).
+    let mut known: std::collections::HashSet<Vec<u8>> =
+        held.iter().map(|(_, s)| s.clone()).collect();
     for order in store.orders.orders.values() {
         let script = &order.order.payment_script_pubkey;
-        if order.status == OrderStatus::Paid
-            && !script.is_empty()
-            && !held.iter().any(|(_, s)| s == script)
-        {
+        if order.status == OrderStatus::Paid && !script.is_empty() && known.insert(script.clone()) {
             held.push((order.order.created_at.timestamp_millis(), script.clone()));
             changed = true;
         }
@@ -6591,6 +6643,219 @@ mod tests {
         other.xpub = format!(" {}", other.xpub);
         crate::bitcoin::save_payment_xpub(&mut g.secrets, &other).unwrap();
         assert_ne!(open_now(&g, NOW).0, Some(Refusal::CatchingUp.explain()));
+    }
+
+    /// A store's state with some paid orders carrying genuine SPV proofs
+    /// and signatures, others awaiting payment or cancelled, listing
+    /// statuses, a closing, and fields instant checkout does not read.
+    fn a_full_store(f: &Fixture) -> StoreStateV1 {
+        let mut store = f.store.clone();
+        for n in 0..12u16 {
+            let order = crate::kept_purchases::fixtures::order(n, 1);
+            let mut signed = sign_order(&store_sk(), order).unwrap();
+            match n % 3 {
+                0 => {
+                    signed.status = OrderStatus::Paid;
+                    signed.payment_proof = Some(crate::kept_purchases::fixtures::proof(
+                        &signed.order,
+                        n as u8,
+                    ));
+                }
+                1 => {
+                    signed.status = OrderStatus::Cancelled;
+                    signed.status_scoped_payload = Some(vec![7; 40]);
+                    signed.status_signature = Some(vec![8; 64]);
+                }
+                _ => {}
+            }
+            store.orders.orders.insert(signed.order.id.clone(), signed);
+        }
+        store.info.scoped_payload = vec![1, 2, 3];
+        store
+    }
+
+    /// What instant checkout reads of a store, from a whole decode: the
+    /// fields it uses, each order's terms and status, nothing else.
+    fn what_decide_reads(store: &StoreStateV1) -> StoreStateV1 {
+        let mut orders = store.orders.clone();
+        for o in orders.orders.values_mut() {
+            o.scoped_payload.clear();
+            o.signature.clear();
+            o.payment_proof = None;
+            o.status_scoped_payload = None;
+            o.status_signature = None;
+        }
+        StoreStateV1 {
+            owner: store.owner,
+            listings: store.listings.clone(),
+            orders,
+            listing_statuses: store.listing_statuses.clone(),
+            closed: store.closed.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// #206: the light read of a store is exactly what a whole decode gives
+    /// for every field instant checkout uses, over stores with genuine SPV
+    /// proofs and signatures, and declines what is not a store (falling back
+    /// to the whole decode). `decide` reaches the same outcome from it.
+    /// Mutated red by reading an order's status from the wrong field, and
+    /// by dropping a used field.
+    #[test]
+    fn the_light_store_read_is_what_decide_reads_of_the_whole() {
+        let f = fixture();
+        let store = a_full_store(&f);
+        assert!(store
+            .orders
+            .orders
+            .values()
+            .any(|o| o.payment_proof.is_some()));
+        let bytes = to_cbor(&store).unwrap();
+        let light = crate::fast_cbor::decode_store_light(&bytes).expect("a store");
+        let whole: StoreStateV1 = from_cbor(&bytes).unwrap();
+        assert_eq!(light, what_decide_reads(&whole));
+        assert_eq!(read_store(&bytes), Some(light.clone()));
+        // An empty store, and one with no orders key.
+        let empty = to_cbor(&StoreStateV1::default()).unwrap();
+        assert_eq!(
+            crate::fast_cbor::decode_store_light(&empty),
+            Some(what_decide_reads(&StoreStateV1::default()))
+        );
+        // Not a store: declined, and the whole decode answers.
+        assert_eq!(crate::fast_cbor::decode_store_light(b"\x01"), None);
+        assert_eq!(read_store(b"\x01"), None);
+        // decide from the light read and from the whole: the same.
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let mut a = fixture();
+        a.store = light;
+        let mut b = fixture();
+        b.store = whole;
+        let (da, db) = (
+            run(&mut a, std::slice::from_ref(&entry)),
+            run(&mut b, std::slice::from_ref(&entry)),
+        );
+        assert_eq!(da.orders.len(), db.orders.len());
+        assert_eq!(
+            da.orders.iter().map(|o| &o.order).collect::<Vec<_>>(),
+            db.orders.iter().map(|o| &o.order).collect::<Vec<_>>()
+        );
+        assert_eq!(da.refused, db.refused);
+        assert_eq!(counter(&a), counter(&b));
+    }
+
+    /// The paid-scripts record as `note_paid_scripts` kept it before #206,
+    /// kept verbatim as the reference: a scan of `held` per order.
+    fn note_paid_scripts_scanning(held: &mut Vec<(i64, Vec<u8>)>, store: &StoreStateV1) -> bool {
+        let mut changed = false;
+        for order in store.orders.orders.values() {
+            let script = &order.order.payment_script_pubkey;
+            if order.status == OrderStatus::Paid
+                && !script.is_empty()
+                && !held.iter().any(|(_, s)| s == script)
+            {
+                held.push((order.order.created_at.timestamp_millis(), script.clone()));
+                changed = true;
+            }
+        }
+        if changed {
+            held.sort();
+            let excess = held.len().saturating_sub(PAID_SCRIPTS_CAP);
+            held.drain(..excess);
+        }
+        changed
+    }
+
+    /// #206: `note_paid_scripts` with a set is the scanning one, over
+    /// records with scripts already held, repeated scripts across orders,
+    /// empty scripts, unpaid orders, and past the cap. Mutated red by
+    /// counting a repeated script twice.
+    #[test]
+    fn note_paid_scripts_is_the_scanning_one() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..20 {
+            let mut f = fixture();
+            let held: Vec<(i64, Vec<u8>)> = (0..next(40))
+                .map(|i| (i as i64, vec![0x00, 0x14, (next(300) % 256) as u8, i as u8]))
+                .collect();
+            save(&mut f.secrets, PAID_SCRIPTS_KEY, &held);
+            let count = if round % 5 == 0 {
+                PAID_SCRIPTS_CAP + 50
+            } else {
+                1 + next(80) as usize
+            };
+            for i in 0..count {
+                let script = match next(10) {
+                    0 => Vec::new(),
+                    1 => held.first().map_or(vec![1], |(_, s)| s.clone()),
+                    2 => vec![0x00, 0x14, 0xee, (i % 3) as u8],
+                    _ => vec![0x00, 0x14, (i >> 8) as u8, i as u8, 0xaa],
+                };
+                let mut o = order_on(script);
+                o.created_at =
+                    chrono::DateTime::from_timestamp_millis(1_700_000_000_000 + i as i64).unwrap();
+                o.request_id = Some([(i % 251) as u8; 32]);
+                let mut o = sign_order(&store_sk(), o.with_derived_id()).unwrap();
+                o.status = if next(4) == 0 {
+                    OrderStatus::AwaitingPayment
+                } else {
+                    OrderStatus::Paid
+                };
+                f.store.orders.orders.insert(o.order.id.clone(), o);
+            }
+            let mut want = held.clone();
+            let changed = note_paid_scripts_scanning(&mut want, &f.store);
+            note_paid_scripts(&mut f.secrets, &f.store);
+            let got = paid_scripts(&f.secrets);
+            if changed {
+                assert_eq!(got, want, "round {round}");
+            } else {
+                assert_eq!(got, held, "round {round}");
+            }
+        }
+    }
+
+    /// #206: `decide` feeds a store's scripts to the held list once, and
+    /// again only when they change or the held list does (an eviction
+    /// changes its generation): a store whose held scripts were lost is fed
+    /// again, not skipped. Mutated red by skipping on the scripts alone, and
+    /// by feeding every run.
+    #[test]
+    fn a_store_is_fed_again_when_the_held_list_changed() {
+        use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
+        let mut f = fixture();
+        unpaid_orders_on(&mut f, 0..3, NOW - 1_000);
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        run(&mut f, std::slice::from_ref(&entry));
+        let held = |f: &Fixture| DigestList::load(&f.secrets, PUBLISHED_KEY, b"");
+        assert!(held(&f).contains(&digest(&script_at(0))));
+        let writes = f.secrets.write_log.len();
+        let looked_up = f.secrets.reads_under(crate::published_set::ISSUED_KEY);
+        run(&mut f, std::slice::from_ref(&entry));
+        assert!(
+            !f.secrets.write_log[writes..]
+                .iter()
+                .any(|k| k.as_slice() == PUBLISHED_KEY),
+            "nothing new, nothing written"
+        );
+        assert_eq!(
+            f.secrets.reads_under(crate::published_set::ISSUED_KEY),
+            looked_up,
+            "the same scripts are not looked up again"
+        );
+        // The held list lost them (as an eviction would), at a later
+        // generation.
+        let mut emptied = DigestList::empty(b"");
+        emptied.insert(&[digest(b"elsewhere")]);
+        emptied.insert(&[digest(b"elsewhere too")]);
+        crate::published_set::save_published(&mut f.secrets, &emptied);
+        run(&mut f, std::slice::from_ref(&entry));
+        assert!(held(&f).contains(&digest(&script_at(0))), "fed again");
     }
 
     /// Each whole-store refusal, as `global_refusal` gives it: the exact
