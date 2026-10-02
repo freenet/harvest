@@ -1944,6 +1944,7 @@ mod predecessor_generation_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let old = signed(
             Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: v1_listing_id("seller-fp", &created_at, "Ghost Pepper"),
@@ -1999,6 +2000,7 @@ mod predecessor_generation_tests {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let good = signed(
             Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([0u8; 32]),
@@ -2047,6 +2049,7 @@ mod uncarried_tests {
     fn listing_with_a_foreign_id(key: &SigningKey, title: &str) -> AuthorizedListing {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             // Not `with_derived_id`. Any id that is not the one these terms

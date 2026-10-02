@@ -1808,6 +1808,7 @@ mod inbox_tests {
     fn listing(id: ListingId, title: &str) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id,

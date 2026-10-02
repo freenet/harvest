@@ -159,15 +159,15 @@ pub struct Listing {
     /// Skipped when empty, for the same reason as `checkout`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<ChoiceGroup>,
+    /// Photos, cover first (`crate::listing_image`). Skipped when empty, as above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::listing_image::ListingImage>,
 }
 
-/// The most choice groups a listing may offer, options per group, and
-/// characters in any one name. Checked by [`Listing::checkout_problem`] and
-/// [`Listing::choices_problem`], which the UI applies before signing and the
-/// seller's delegate applies before auto-invoicing. The store contract does
-/// not enforce them: only the store key's holder can add a listing, so an
-/// oversized one costs nobody but them, the same exposure listings already
-/// carry.
+/// The most choice groups a listing may offer, options per group, and characters
+/// in any one name, applied by [`Listing::checkout_problem`] and [`Listing::choices_problem`]
+/// before signing and auto-invoicing. The store contract does not enforce them (an
+/// oversized listing costs only its seller); photos differ, see `crate::listing_image`.
 pub const MAX_CHOICE_GROUPS: usize = 4;
 pub const MAX_CHOICE_OPTIONS: usize = 12;
 pub const MAX_DELIVERY_REGIONS: usize = 12;
@@ -699,6 +699,7 @@ mod tests {
     ) -> AuthorizedListing {
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
@@ -845,6 +846,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         let ts = DateTime::from_timestamp(1700000000, 0).unwrap();
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId::from_label("Widget"),
@@ -1018,6 +1020,7 @@ mod listing_identity_tests {
     fn listing_priced(price: &str) -> Listing {
         let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
@@ -1122,6 +1125,7 @@ mod listing_identity_tests {
     fn the_listing_id_derivation_is_pinned() {
         let created_at = DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
@@ -1232,6 +1236,7 @@ mod instant_terms_tests {
 
     fn listing(checkout: Option<FixedCheckout>, choices: Vec<ChoiceGroup>) -> Listing {
         Listing {
+            images: Vec::new(),
             id: ListingId([0; 32]),
             title: "Mug".into(),
             description: String::new(),

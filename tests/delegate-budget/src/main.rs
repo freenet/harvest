@@ -1712,6 +1712,7 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
     r.quiet_app(at.arm(scripts_at(&chain, next..next + 10)?), "AutoInvoice")?;
 
     let listing = Listing {
+        images: Vec::new(),
         id: ListingId([0; 32]),
         title: "Jam".into(),
         description: String::new(),

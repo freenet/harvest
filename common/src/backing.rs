@@ -1463,6 +1463,7 @@ mod tests {
         let closure = closure_by(&store_key(), &store_key());
         let listing = {
             let listing = crate::listing::Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: crate::listing::ListingId([0; 32]),
@@ -2123,6 +2124,7 @@ mod tests {
             record_public_key: None,
         };
         let listing = crate::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: crate::listing::ListingId([0; 32]),

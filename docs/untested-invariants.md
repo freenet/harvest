@@ -190,11 +190,12 @@ on documentation-integrity is the lead's.
 | 272 | The `to_cbor` here is "Infallible … cannot fail", justifying an `expect` inside contract code. | **No**, and not straightforwardly testable — it is a claim about the shape of the type, and a breach is a panic inside the contract rather than a wrong answer. |
 | 388 | `enforce_order_cap`'s ranking is "a pure function of the *content* of `orders`, not of the sequence in which entries were inserted". | **Yes** — `pruning_is_order_independent`. Listed because three neighbouring claims cite it. |
 
-`ListingsV1` has no cap and no `verify` guard of either kind, and claims none.
-Orders are capped at 4096 and mailbox messages at 512, both with a `verify`
-guard; listings are bounded only by the seller's own signature being required
-on each one. That asymmetry is deliberate as far as the code shows, but it is
-stated nowhere, so a reader who generalises from `MAX_ORDERS` will be wrong.
+`ListingsV1` has no cap on the NUMBER of listings, and claims none. Orders are
+capped at 4096 and mailbox messages at 512, both with a `verify` guard;
+listings are bounded only by the seller's own signature being required on
+each one. Since listing photos (harvest images PR 2), each listing's PHOTO
+REFERENCES are capped, in both `verify` and `apply_delta`; see "Listing photos"
+below. The number of listings is still unbounded.
 
 ## `common/src/payment.rs`
 
@@ -1489,6 +1490,25 @@ A node stops a delegate call after 5 s of wall clock, and the web app then gets 
 |---|---|---|
 | `tests/delegate-budget` | Every driven handler's single call stays under 3,000,000,000 fuel (about 1 s of copy-heavy work on nova with the node's engine and memory layout) and 64 secret writes, with each collection it walks filled to its cap. | **Yes, for the driven handlers** -- red on the pre-#203 delegate (`GetStoreSubkeys` 3.4x-16.6x); caps are read from the delegate source, every step asserts its answer or the state it writes, and the memory cap is the node's (a smaller cap turns it red). **Red on V29** (main's delegate before #216, `cbe71dd9…`) on real findings: with the watch delegations full, the heartbeat wake-up (3526%), the tip read's answer (3369%), a re-arm (211%) and a forced heartbeat (204%); instant checkout's decide against a full store (870%); the byte-cap mailbox scan (346%), the same with plaintexts built to be slow to decode (457%) and the wake-up's mailbox read answered with it (455%); the export (269%) and heartbeat wake-up (255%) with every arm's ledger full; and the published-script scan (435% for one store, about 27,800% for all 64). Main's delegate since #216 (`ed88aa21…`, a re-key) is **green**: every call within budget, the largest 85% (instant checkout's decide against a store of 4,096 paid orders), then the payment counter's catch-up wake-ups (74-76%) and a keep into a full store (74%). The published-script scan costs about 41% a call: the delegate holds the scripts (`AddPublishedScripts`) and scans them in budgets, driven by the harness to the end for one store, a new key (pending slot, promotion, a stale resume refused) and the wake-ups. Figures and the commit that produced them: `tests/delegate-budget/README.md`. |
 | same | Handlers not driven, record sizes above the minimal fixture, secret READ time, slower-than-desktop hardware, and flows of many calls. | **No** -- listed in `tests/delegate-budget/README.md`, "What it does not cover". |
+
+## Listing photos (added 2026-10-01)
+
+A listing names its photos inside its signed terms (`Listing.images`, rules in
+`common/src/listing_image.rs`). The store enforces bounds on each listing's
+photo references; the image bytes live in image contracts (see the section
+above).
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `listing_image::images_problem` | At most 8 photos; the cover has a thumbnail and no other photo does; each image 1 byte to 256 KiB (thumbnail 64 KiB); edges 1 to 2048 (thumbnail 400); a description of at most 200 characters with none of the listed hidden characters (`is_hidden_char`: controls, line and paragraph separators, direction overrides and isolates, and a fixed list of invisible characters; joiners, direction marks, variation selectors and tags are allowed, since real writing and emoji need them); no full photo twice. | **Yes** -- a test per bound at and over its edge, red with each check removed or loosened (mutation sweep re-run on the final set, 2026-10-02), plus `the_limits_are_the_chosen_ones`, which pins the values themselves, since every other test is written in terms of the constants. |
+| `store.rs` `ListingsV1::verify` and `apply_delta` | Both call `check_listing_images`, so neither a whole state nor a delta admits an over-cap listing. | **Yes** -- `a_listing_with_too_many_photos_is_refused_by_delta_and_by_state`, red with either call removed. |
+| `Listing.images` | Inside the signed terms: a listing's photos cannot be changed after signing, and they are part of its id. | **Yes** -- the same store test swaps one photo on a signed listing and sees `verify` refuse it; `photos_are_part_of_a_listings_identity`. |
+| `Listing.images`'s `skip_serializing_if` | A listing without photos encodes, and so is identified and signed, exactly as before photos existed. | **Yes** -- `a_listing_without_photos_encodes_and_is_identified_as_before`, whose bytes and id were computed by `main` before the field existed (b658341). |
+| `ListingImage` and `ImageBlob` encodings | Fixed: they are the preimage of every photographed listing's id and signature. | **Yes** -- `a_listing_with_photos_encodes_as_pinned`. A change to field order, a `skip_serializing_if` or the hash's byte-string form fails it. |
+| `listing_image` limits copied from `harvest_image` | Agree with the image contract's. | **Yes** -- `the_copied_limits_agree_with_the_image_contracts` (`harvest-image` is a dev-dependency only). |
+| `len`, `width`, `height` | The store bounds what a listing DECLARES, not the bytes behind a hash. | Not a guard: stated so nobody reads it as one. The buyer's display path checks the fetched bytes against the reference. |
+| `ui/src/components/listing_form.rs` | An edit keeps the listing's photos; a photo-only change is never a count-only edit. | **Yes** -- `an_edit_keeps_the_listings_photos`, `same_terms_notices_the_photos`. |
+| The current store WASM | Accepts a four-photo listing and refuses a nine-photo one, and carries a pre-photo listing from V25 with its id unchanged. | **By hand** -- `tests/rehearsal` scenario 5 on an isolated network-mode node, 2026-10-01. Not in CI. |
 
 ## The four that matter
 

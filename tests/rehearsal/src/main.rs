@@ -204,6 +204,7 @@ fn make_listing(sk: &SigningKey, fingerprint: &str, title: &str, at: i64) -> Aut
     let listing = Listing {
         checkout: None,
         choices: Vec::new(),
+        images: Vec::new(),
         id: ListingId::from_label(title),
         title: title.to_string(),
         description: format!("{title} -- written by the rehearsal harness"),
@@ -999,16 +1000,18 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
     let params = current_params(&vk);
     let (old_container, old_id) = container(&wasm, params.clone());
     let (curr_container, curr_id) = container(current, params);
+    let curr_key = curr_container.key();
     println!("  V{} instance {old_id}; current instance {curr_id}", newest.generation);
     assert!(
         migrate::store_candidate_ids(&vk).unwrap().contains(&old_id),
         "the walk must reach the generation state is planted at"
     );
+    let planted_listing = make_listing(&seller, &fp, "newest-listing", 1_758_000_000);
     let planted = StoreStateV1 {
         owner: Some(vk),
         info: make_info(&seller, &fp, "Newest Generation Store", 4),
         listings: harvest_common::store::ListingsV1 {
-            listings: vec![make_listing(&seller, &fp, "newest-listing", 1_758_000_000)],
+            listings: vec![planted_listing.clone()],
         },
         ..Default::default()
     };
@@ -1041,6 +1044,83 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
             for l in &s.listings.listings {
                 l.verify(&vk).expect("a carried listing still verifies");
             }
+            // Listing photos (harvest images PR 2): a listing from before
+            // photos keeps its id across the generation change.
+            assert_eq!(
+                s.listings.listings[0].listing.id, planted_listing.listing.id,
+                "a pre-photo listing's id must not move"
+            );
+        }
+        other => panic!("current generation did not read back: {other:?}"),
+    }
+
+    // The current contract takes a listing WITH photos, and refuses one over
+    // the cap, through its real `update_state` and `validate_state`.
+    let with_photos = |n: usize, title: &str| {
+        let mut a = make_listing(&seller, &fp, title, 1_759_000_000);
+        a.listing.images = (0..n)
+            .map(|i| harvest_common::listing_image::ListingImage {
+                full: harvest_common::listing_image::ImageBlob {
+                    hash: harvest_common::store::Bytes32([i as u8 + 1; 32]),
+                    len: 150_000,
+                    width: 1600,
+                    height: 1200,
+                },
+                thumb: (i == 0).then_some(harvest_common::listing_image::ImageBlob {
+                    hash: harvest_common::store::Bytes32([99; 32]),
+                    len: 20_000,
+                    width: 400,
+                    height: 300,
+                }),
+                colour: [140, 110, 70],
+                alt: if i == 0 { "Jar, front".into() } else { String::new() },
+            })
+            .collect();
+        a.listing = a.listing.clone().with_derived_id();
+        let (scoped_payload, signature) = scoped_sign(&seller, &a.listing);
+        a.scoped_payload = scoped_payload;
+        a.signature = signature;
+        a
+    };
+    let photographed = with_photos(4, "photographed-listing");
+    let mut next = planted.clone();
+    next.listings.listings.push(photographed.clone());
+    next.listings.normalize();
+    node.update_state(curr_key, harvest_common::to_cbor(&next).unwrap())
+        .await
+        .expect("the current contract accepts a listing with four photos");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: StoreStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            let held = s
+                .listings
+                .listings
+                .iter()
+                .find(|l| l.listing.id == photographed.listing.id)
+                .expect("the photographed listing is held");
+            assert_eq!(held.listing.images.len(), 4);
+            held.verify(&vk).expect("and still verifies");
+            println!("  current generation holds the photographed listing with 4 photos");
+        }
+        other => panic!("current generation did not read back: {other:?}"),
+    }
+    let mut over = next.clone();
+    over.listings.listings.push(with_photos(9, "over-the-cap"));
+    over.listings.normalize();
+    let refused = node.update_state(curr_key, harvest_common::to_cbor(&over).unwrap()).await;
+    println!("  nine photos: {refused:?}");
+    let err = refused.expect_err("the current contract must refuse a listing with nine photos");
+    assert!(
+        err.contains("at most 8 photos"),
+        "refused for the photo cap, not something else: {err}"
+    );
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let s: StoreStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert!(
+                s.listings.listings.iter().all(|l| l.listing.title != "over-the-cap"),
+                "the refused listing must not be held"
+            );
         }
         other => panic!("current generation did not read back: {other:?}"),
     }
@@ -1193,6 +1273,9 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         (23, Code),
         // V24: always-open stores (`e275bae`). Still the store code.
         (24, Code),
+        // V25: the delegated watch key (`d73fb6c`, harvest#179), unchanged
+        // through #212. Superseded by listing photos. Still the store code.
+        (25, Code),
     ]
 };
 
