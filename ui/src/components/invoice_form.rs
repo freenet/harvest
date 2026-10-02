@@ -56,7 +56,10 @@ fn offered_networks() -> &'static [BitcoinNetwork] {
 /// invoice with no buyer's request behind it has nobody to pay it.
 #[component]
 pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> Element {
-    let (to_send, others, titles, live, needs_reissue, loaded) = {
+    // One buyer conversation open at a time, so the guidance line above its
+    // reply box is on screen once (`message_view::SELLER_GUIDANCE`).
+    let open_thread = use_signal(|| None as super::message_view::OpenThread);
+    let (to_send, others, titles, requests, live, needs_reissue, loaded, inbox, questions, homes) = {
         let state = APP_STATE.read();
         let store = state.browsing_stores.get(&store_contract_id);
         // The same list as "Needs you" (`AppState::seller_orders_to_send`).
@@ -78,13 +81,23 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             .map(|order| order.order.id.clone())
             .collect();
         // What each other order was for, from the buyer's request, so a row
-        // names the item rather than only a reference.
-        let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = others
+        // names the item rather than only a reference; and, for a paid one,
+        // where it went (review of #205, U1: after Mark as sent the address
+        // was on no screen, in exactly the window a buyer may say it never
+        // arrived). Hidden once the complaint window closes.
+        let requests: std::collections::HashMap<
+            harvest_common::payment::OrderId,
+            crate::state::SellerRequest,
+        > = others
             .iter()
             .zip(state.seller_order_requests(&store_contract_id, &others))
-            .filter_map(|(order, request)| match request {
+            .map(|(order, request)| (order.order.id.clone(), request))
+            .collect();
+        let titles: std::collections::HashMap<harvest_common::payment::OrderId, String> = requests
+            .iter()
+            .filter_map(|(id, request)| match request {
                 crate::state::SellerRequest::Found(r) => Some((
-                    order.order.id.clone(),
+                    id.clone(),
                     format!(
                         "{} \u{00d7} {}",
                         r.title.as_deref().unwrap_or("An item no longer listed"),
@@ -94,10 +107,26 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 _ => None,
             })
             .collect();
+        // Each order's conversation goes under its card; one with no card
+        // of its own, if it holds a question or a request waiting for a hand
+        // answer, goes under Questions (the round-6 critique: no mailbox
+        // dump under the orders).
+        let inbox = super::message_view::seller_inbox(&state, &store_contract_id);
+        let listed: Vec<&harvest_common::payment::AuthorizedOrder> =
+            to_send.iter().chain(others.iter()).collect();
+        let listed_ids: Vec<&harvest_common::payment::OrderId> =
+            listed.iter().map(|order| &order.order.id).collect();
+        let questions = super::message_view::seller_questions(&inbox, &listed_ids);
+        let sending: std::collections::HashSet<&harvest_common::payment::OrderId> =
+            to_send.iter().map(|order| &order.order.id).collect();
+        let homes = super::message_view::thread_homes(&inbox, &listed, |order| {
+            sending.contains(&order.order.id)
+        });
         (
             to_send,
             others,
             titles,
+            requests,
             // Cloned once outside the render loop below; taking a fresh read
             // guard per order would be a borrow per row for no gain.
             state.bitcoin.clone(),
@@ -105,7 +134,28 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
             // "No orders yet" and "this store's state has not arrived" look
             // alike through an empty list.
             state.store_details_are_resolved(&store_contract_id),
+            inbox,
+            questions,
+            homes,
         )
+    };
+    // This order's conversation, if it is shown under this card; else
+    // whether it is shown under another of the buyer's orders
+    // (`message_view::thread_homes`: one that needs the seller, then the
+    // newest). Looked up in one map built per render, not by a scan of
+    // every conversation per card (review after 01f2bcf).
+    let by_order = inbox.by_order();
+    let thread_for = |id: &harvest_common::payment::OrderId| {
+        by_order
+            .get(id)
+            .map(|thread| ((*thread).clone(), homes.get(&thread.tag) == Some(id)))
+    };
+    // Where a card's conversation is shown under another order: that
+    // conversation and the order it is under, for the pointer button.
+    let elsewhere = |id: &harvest_common::payment::OrderId| {
+        thread_for(id)
+            .filter(|(_, home)| !home)
+            .and_then(|(thread, _)| homes.get(&thread.tag).cloned().map(|home| (thread, home)))
     };
 
     rsx! {
@@ -121,6 +171,9 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                     key: "{order.order.id}",
                     store_contract_id: store_contract_id.clone(),
                     order: order.clone(),
+                    thread: thread_for(&order.order.id).filter(|(_, home)| *home).map(|(t, _)| t),
+                    elsewhere: elsewhere(&order.order.id),
+                    open_thread,
                 }
             }
             if !others.is_empty() {
@@ -128,7 +181,10 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                 for order in others.iter() {
                     // One keyed node per invoice, wrapping both, because a
                     // `key` is only honoured on the first node of a block.
-                    div { key: "{order.order.id}",
+                    // One group per order, so its title, card, address and
+                    // controls read as one thing (the msg1 screenshots: the
+                    // address sat loose below the card).
+                    div { key: "{order.order.id}", class: "earlier-order",
                         // Said above the card rather than inside it, because
                         // it is about what the SELLER should do and
                         // `OrderCard` is shared with the buyer's view. An
@@ -146,28 +202,73 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
                         if let Some(what) = titles.get(&order.order.id) {
                             h4 { class: "order-title", "{what}" }
                         }
+                        // The address and controls inside the order's own box.
                         super::bitcoin_view::OrderCard {
                             order: order.clone(),
                             live: super::bitcoin_view::live_address_for_order(&live, &order.order),
-                        }
-                        if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
-                            CancelInvoice {
-                                store_contract_id: store_contract_id.clone(),
-                                order_id: order.order.id.clone(),
-                            }
-                        }
-                        // A paid order past every window can still be marked
-                        // as sent late, which extends the buyer's time to
-                        // report a problem (`despatch_preconditions`); the
-                        // control hides itself once a despatch is recorded.
-                        if order.status == harvest_common::payment::OrderStatus::Paid {
-                            MarkDespatched {
-                                store_contract_id: store_contract_id.clone(),
-                                order_id: order.order.id.clone(),
-                            }
+                            footer: rsx! {
+                                if matches!(
+                                    order.status,
+                                    harvest_common::payment::OrderStatus::Paid
+                                        | harvest_common::payment::OrderStatus::PaymentReversed
+                                ) {
+                                    if let Some(request) = requests.get(&order.order.id) {
+                                        SellerRequestView { request: request.clone(), quiet_when_missing: true }
+                                    }
+                                }
+                                if order.status == harvest_common::payment::OrderStatus::AwaitingPayment {
+                                    CancelInvoice {
+                                        store_contract_id: store_contract_id.clone(),
+                                        order_id: order.order.id.clone(),
+                                    }
+                                }
+                                // A paid order past every window can still be marked
+                                // as sent late, which extends the buyer's time to
+                                // report a problem (`despatch_preconditions`); the
+                                // control hides itself once a despatch is recorded.
+                                if order.status == harvest_common::payment::OrderStatus::Paid {
+                                    MarkDespatched {
+                                        store_contract_id: store_contract_id.clone(),
+                                        order_id: order.order.id.clone(),
+                                    }
+                                }
+                                match (thread_for(&order.order.id), elsewhere(&order.order.id)) {
+                                    (Some((thread, true)), _) => rsx! {
+                                        super::message_view::SellerThreadToggle {
+                                            store_contract_id: store_contract_id.clone(),
+                                            thread,
+                                            under: Some(order.order.id.clone()),
+                                            open_thread,
+                                        }
+                                    },
+                                    (_, Some((thread, home))) => rsx! {
+                                        super::message_view::SellerThreadPointer { thread, home, open_thread }
+                                    },
+                                    _ => rsx! {},
+                                }
+                            },
                         }
                     }
                 }
+            }
+            // At most two quiet lines, never a card per entry (round-6
+            // critique 10-3), inside the card they are about (msg1 critique
+            // MSG-9): what could not be read, and buyer text held back for
+            // coming with neither a Ghost Key nor a paid order.
+            if inbox.unreadable > 0 {
+                p { class: "text-muted small", "{super::message_view::SOME_UNREADABLE}" }
+            }
+            if inbox.held_back > 0 {
+                p { class: "text-muted small",
+                    "{super::message_view::hidden_unvouched_line(inbox.held_back)}"
+                }
+            }
+        }
+        if !questions.is_empty() {
+            super::message_view::SellerQuestions {
+                store_contract_id: store_contract_id.clone(),
+                threads: questions,
+                open_thread,
             }
         }
     }
@@ -184,6 +285,22 @@ pub fn StorePayments(store_contract_id: Vec<u8>, seller_fingerprint: String) -> 
 pub(crate) fn SellerOrderCard(
     store_contract_id: Vec<u8>,
     order: harvest_common::payment::AuthorizedOrder,
+    /// This order's conversation with its buyer, when this device can read
+    /// it: shown under the card behind a Messages button.
+    #[props(default)]
+    thread: Option<super::message_view::SellerThread>,
+    /// Which conversation is open on this screen (`StorePayments`); `None`
+    /// where the card is shown without its conversation.
+    #[props(default)]
+    open_thread: Option<Signal<super::message_view::OpenThread>>,
+    /// The buyer's conversation, when it is shown under another of their
+    /// order cards (`message_view::thread_homes`: one that needs the seller,
+    /// then the newest), and that order: the card shows a button naming it.
+    #[props(default)]
+    elsewhere: Option<(
+        super::message_view::SellerThread,
+        harvest_common::payment::OrderId,
+    )>,
 ) -> Element {
     use crate::state::SellerRequest;
     let (request, tip_height, stage, twins, oversold) = {
@@ -297,40 +414,80 @@ pub(crate) fn SellerOrderCard(
             if let Some((late, line)) = send_by {
                 p { class: if late { "text-warning" } else { "" }, strong { "{line}" } }
             }
-            match &request {
-                SellerRequest::Found(r) => rsx! {
-                    p { class: "order-label", "Send to" }
-                    p { class: "order-ship-to", "{r.shipping}" }
-                    if let Some(region) = &r.region {
-                        p { class: "text-muted small", "Delivery region: {region}" }
-                    }
-                    if !r.choices.is_empty() {
-                        p { class: "text-muted small", "{r.choices.join(\" \u{00b7} \")}" }
-                    }
-                    if !r.note.trim().is_empty() {
-                        p { class: "order-label", "Note from the buyer" }
-                        p { class: "order-ship-to", "{r.note}" }
-                    }
-                },
-                SellerRequest::Conflict => rsx! {
-                    p { class: "text-warning",
-                        "The buyer sent more than one version of this order (a different address, \
-                         quantity or choice). Read their messages on the Orders tab, and ask them \
-                         which is right before sending."
-                    }
-                },
-                SellerRequest::NotFound => rsx! {
-                    p { class: "text-muted",
-                        "What to send and where is in the buyer\u{2019}s messages on the Orders \
-                         tab. If they can\u{2019}t be read on this device, open Harvest where you \
-                         set up the store."
-                    }
-                },
-            }
+            SellerRequestView { request: request.clone() }
             MarkDespatched {
                 store_contract_id: store_contract_id.clone(),
                 order_id: order.order.id.clone(),
             }
+            if let (Some((thread, home)), Some(open_thread)) = (elsewhere, open_thread) {
+                super::message_view::SellerThreadPointer { thread, home, open_thread }
+            }
+            if let (Some(thread), Some(open_thread)) = (thread, open_thread) {
+                super::message_view::SellerThreadToggle {
+                    store_contract_id: store_contract_id.clone(),
+                    thread,
+                    under: Some(order.order.id.clone()),
+                    open_thread,
+                }
+            }
+        }
+    }
+}
+
+/// What the buyer asked for, as an order card shows it
+/// (`AppState::seller_order_request`): the request, each version of it when
+/// they differ, or where to look when it can't be read here.
+/// `quiet_when_missing` says nothing in that last case (an older order).
+#[component]
+pub(crate) fn SellerRequestView(
+    request: crate::state::SellerRequest,
+    #[props(default)] quiet_when_missing: bool,
+) -> Element {
+    use crate::state::SellerRequest;
+    match request {
+        SellerRequest::Found(request) => rsx! {
+            RequestView { request }
+        },
+        SellerRequest::Conflict(versions) => rsx! {
+            p { class: "text-warning",
+                "The buyer sent more than one version of this order. Ask them which is right \
+                 before sending."
+            }
+            for (i , version) in versions.into_iter().enumerate() {
+                div { key: "{i}", class: "request-card",
+                    p { class: "order-label", "Version {i + 1}: {version.quantity}" }
+                    RequestView { request: version }
+                }
+            }
+        },
+        SellerRequest::NotFound if quiet_when_missing => rsx! {},
+        SellerRequest::NotFound => rsx! {
+            p { class: "text-muted",
+                "This order\u{2019}s details can\u{2019}t be read on this device. Open Harvest \
+                 where you set up the store, or ask the buyer."
+            }
+        },
+    }
+}
+
+/// Where to send it, the buyer's picks named by their group, and the note:
+/// every field a version of an order can differ in (review of #205, L2).
+/// After the complaint window the address reads
+/// [`crate::fulfilment::ADDRESS_HIDDEN`] and the note is gone.
+#[component]
+pub(crate) fn RequestView(request: crate::state::SellerOrderRequest) -> Element {
+    rsx! {
+        p { class: "order-label", "Send to" }
+        p { class: "order-ship-to", "{request.shipping}" }
+        if let Some(region) = &request.region {
+            p { class: "text-muted small", "Delivery region: {region}" }
+        }
+        if !request.choices.is_empty() {
+            p { class: "text-muted small", "{request.choices.join(\" \u{00b7} \")}" }
+        }
+        if !request.note.trim().is_empty() {
+            p { class: "order-label", "Note from the buyer" }
+            p { class: "order-ship-to", "{request.note}" }
         }
     }
 }

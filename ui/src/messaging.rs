@@ -123,6 +123,39 @@ impl ConversationKeys {
     pub fn listing_tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
         harvest_common::mailbox::listing_tag(&self.from_seller, listing)
     }
+
+    /// [`Self::listing_tag`] for many listings: the conversation's tag key
+    /// derived once, then one keyed hash per listing (review after 6c61839:
+    /// the seller's inbox tags every listing in every conversation, and a
+    /// store's listings are grow-only and uncapped, so deriving the key again
+    /// per listing doubled the work). Checked equal to
+    /// `harvest_common::mailbox::listing_tag` by
+    /// `a_listing_tagger_gives_the_shared_tags`.
+    pub fn listing_tagger(&self) -> ListingTagger {
+        let mut hasher = blake3::Hasher::new_derive_key(LISTING_TAG_CONTEXT);
+        hasher.update(&harvest_common::mailbox::listing_tag_key(&self.from_seller));
+        ListingTagger(hasher)
+    }
+}
+
+/// The derivation context of `harvest_common::mailbox::listing_tag`, which
+/// [`ConversationKeys::listing_tagger`] repeats so it can derive the tag key
+/// once; the test `a_listing_tagger_gives_the_shared_tags` fails if the two
+/// drift.
+const LISTING_TAG_CONTEXT: &str = "harvest/listing-tag/v1";
+
+/// One conversation's listing tags, its tag key already derived
+/// ([`ConversationKeys::listing_tagger`]).
+#[derive(Clone)]
+pub struct ListingTagger(blake3::Hasher);
+
+impl ListingTagger {
+    /// The tag a published order carries for `listing` in this conversation.
+    pub fn tag(&self, listing: &harvest_common::listing::ListingId) -> [u8; 32] {
+        let mut hasher = self.0.clone();
+        hasher.update(&listing.0);
+        *hasher.finalize().as_bytes()
+    }
 }
 
 /// Deliberately opaque: a `Debug` that printed these would put both
@@ -339,6 +372,11 @@ impl BuyerConversation {
         self.keys.listing_tag(listing)
     }
 
+    /// [`ConversationKeys::listing_tagger`] for this conversation.
+    pub fn listing_tagger(&self) -> ListingTagger {
+        self.keys.listing_tagger()
+    }
+
     /// The ephemeral secret, for this crate's tests only.
     ///
     /// Exists so a test can check that the binding computed here is the
@@ -419,11 +457,11 @@ impl BuyerConversation {
         )
     }
 
-    /// Seal one plain-text message for the seller: the pre-voucher format,
-    /// which a seller no longer shows. For this crate's tests of the
-    /// conversation mechanics; a buyer's message goes out through
-    /// [`Self::seal_vouched`].
-    #[cfg(test)]
+    /// Seal one plain-text message for the seller, with no voucher. A seller
+    /// shows it only in a conversation one of their store's paid orders
+    /// opens (`crate::order_threads`), so a buyer's message goes out this way
+    /// only from `AppState::compose_plain_to_seller`, which checks that
+    /// first; anywhere else it goes through [`Self::seal_vouched`].
     pub fn seal(&self, text: String) -> Result<EncryptedMessage, String> {
         seal(
             &self.keys.to_seller,
@@ -797,6 +835,77 @@ impl MailboxEntry {
     }
 }
 
+/// Whether `tag` is a conversation tag this app will read: the canonical
+/// 32-byte encoding (bit 255 clear, u below p = 2^255 - 19) of a point on
+/// Curve25519 in its prime-order subgroup.
+///
+/// X25519 gives every buyer key twins with the SAME shared secret, and so
+/// the same conversation keys and listing tags:
+///
+/// * encoding twins: X25519 ignores bit 255 and reduces u modulo p, so the
+///   same bytes with bit 255 set (and, for u < 19, u + p) are the same key;
+/// * torsion twins: the seller's scalar is clamped to a multiple of 8, so
+///   for each of the 7 non-trivial points Q of order dividing 8, P + Q gives
+///   the same secret as P. These are canonical and pass the delegate's
+///   contributory check (review round 2 of #205, confirmed on the Cargo.lock
+///   versions of curve25519-dalek and x25519-dalek).
+///
+/// Whoever holds a conversation's keys could write under any twin, and a
+/// reader keyed by tag would see a second conversation with the first one's
+/// keys: one that claims the first one's paid orders (`crate::order_threads`)
+/// and could take its place under an order card. An honest buyer's tag is
+/// always b·G, canonical and torsion-free, so refusing twins costs nobody
+/// anything; the prime-order check also refuses points on the twist. The
+/// harvest delegate does not check either yet; the UI does not ask it for a
+/// twin's keys (`AppState::conversation_keys_to_request`) and never reads
+/// one ([`read_mailbox`]).
+///
+/// The subgroup check costs a scalar multiplication and a mailbox holds up
+/// to 512 entries read on every render, so each tag's verdict is remembered.
+pub fn is_canonical_tag(tag: &[u8]) -> bool {
+    let Ok(key) = <[u8; 32]>::try_from(tag) else {
+        return false;
+    };
+    if !canonical_encoding(&key) {
+        return false;
+    }
+    thread_local! {
+        static VERDICTS: std::cell::RefCell<std::collections::HashMap<[u8; 32], bool>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(verdict) = VERDICTS.with(|v| v.borrow().get(&key).copied()) {
+        return verdict;
+    }
+    let verdict = in_prime_order_subgroup(&key);
+    VERDICTS.with(|v| {
+        let mut verdicts = v.borrow_mut();
+        // Far past honest use (a mailbox holds 512 entries); bounds a
+        // session watching a mailbox churn.
+        if verdicts.len() >= 4096 {
+            verdicts.clear();
+        }
+        verdicts.insert(key, verdict);
+    });
+    verdict
+}
+
+/// Whether `key` is the canonical encoding of a u-coordinate: bit 255 clear
+/// and below p. Below 2^255, the values at or above p are p..=2^255-1: 0x7f
+/// in the top byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+fn canonical_encoding(key: &[u8; 32]) -> bool {
+    let at_least_p = key[31] == 0x7f && key[1..31].iter().all(|b| *b == 0xff) && key[0] >= 0xed;
+    key[31] & 0x80 == 0 && !at_least_p
+}
+
+/// Whether the canonical u-coordinate `key` is a point of Curve25519 (not
+/// its twist) in the prime-order subgroup. Either Edwards sign serves: the
+/// two differ by negation, which keeps a point in or out of the subgroup.
+fn in_prime_order_subgroup(key: &[u8; 32]) -> bool {
+    curve25519_dalek::montgomery::MontgomeryPoint(*key)
+        .to_edwards(0)
+        .is_some_and(|point| point.is_torsion_free())
+}
+
 /// What an entry that did not open says, whatever the decoder said: see
 /// [`read_mailbox`].
 pub(crate) const UNREADABLE_WHY: &str =
@@ -825,6 +934,19 @@ pub fn read_mailbox(
         .map(|message| {
             let conversation = message.sender_public_key.clone();
             let digest = harvest_common::mailbox::entry_digest(message);
+            // A tag that is not the canonical encoding of its X25519 key is
+            // never read, whatever keys are on hand: it shares its keys with
+            // the canonical twin, so reading it would give that conversation
+            // a second, writer-chosen routing tag ([`is_canonical_tag`]).
+            if !is_canonical_tag(&conversation) {
+                return MailboxEntry::Unreadable {
+                    conversation,
+                    nonce: message.nonce,
+                    digest,
+                    timestamp: message.timestamp,
+                    why: UNREADABLE_WHY.to_string(),
+                };
+            }
             let Some(pair) = keys.get(&conversation) else {
                 return MailboxEntry::Unreadable {
                     conversation,
@@ -882,6 +1004,76 @@ pub fn read_mailbox(
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
+
+    /// **The listing tagger gives exactly the shared derivation's tags**
+    /// (review after 6c61839), for several keys and listings. Red if the
+    /// context string or the order of inputs drifts from
+    /// `harvest_common::mailbox::listing_tag`.
+    #[test]
+    fn a_listing_tagger_gives_the_shared_tags() {
+        for secret in [[1u8; 32], [7u8; 32], [0xab; 32]] {
+            let keys = ConversationKeys::from_shared_secret(&secret);
+            let tagger = keys.listing_tagger();
+            for listing in [[0u8; 32], [9u8; 32], [0xfe; 32]] {
+                let id = harvest_common::listing::ListingId(listing);
+                assert_eq!(tagger.tag(&id), keys.listing_tag(&id));
+            }
+        }
+    }
+
+    /// **Only the canonical encoding of an X25519 key is a conversation
+    /// tag.** A real key passes; the same bytes with bit 255 set, p itself,
+    /// and anything not 32 bytes do not; p - 1 does. Red with either check
+    /// dropped.
+    #[test]
+    fn only_canonical_x25519_tags_are_tags() {
+        let real = *x25519_dalek::PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        assert!(is_canonical_tag(&real));
+        let mut twin = real;
+        twin[31] |= 0x80;
+        assert!(!is_canonical_tag(&twin));
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        assert!(!is_canonical_tag(&p), "p itself reduces to 0");
+        let mut below_p = p;
+        below_p[0] = 0xec;
+        assert!(
+            canonical_encoding(&below_p),
+            "p - 1 is a canonical encoding"
+        );
+        assert!(!canonical_encoding(&p) && !canonical_encoding(&twin));
+        assert!(!is_canonical_tag(&real[..31]));
+
+        // Torsion twins (review round 2 of #205): canonical bytes, same
+        // shared secret with any clamped scalar, outside the prime-order
+        // subgroup. Red with the subgroup check dropped.
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .expect("a real key is on the curve");
+        let seller = StaticSecret::from([9u8; 32]);
+        let secret = |key: [u8; 32]| {
+            seller
+                .diffie_hellman(&x25519_dalek::PublicKey::from(key))
+                .to_bytes()
+        };
+        let mut twins = 0;
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            if twin == real {
+                continue;
+            }
+            assert_eq!(secret(twin), secret(real), "precondition: the same secret");
+            assert!(twin[31] & 0x80 == 0, "precondition: canonical bytes");
+            assert!(!is_canonical_tag(&twin), "a torsion twin is refused");
+            twins += 1;
+        }
+        assert!(twins > 0);
+        // A point on the twist is refused too: u = 2 is not on Curve25519.
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(!is_canonical_tag(&twist));
+    }
     use aes_gcm::{Aes256Gcm, Nonce};
     use harvest_common::mailbox::MAX_MESSAGES;
     use std::collections::HashMap;

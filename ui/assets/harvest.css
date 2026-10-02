@@ -212,7 +212,7 @@ body::before {
        .seller-listing, .seller-listing-actions, .own-store-banner,
        .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
        .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
-       .needs-hit) > * {
+       .needs-hit, .bubbles) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -371,10 +371,10 @@ h4 {
   transition: all 0.15s ease;
 }
 
-.listing-card:hover {
-  border-color: var(--accent);
-  box-shadow: 0 2px 12px rgba(74, 103, 65, 0.08);
-}
+/* No hover highlight on a listing card: none is clickable as a whole (a
+   listing's Buy is its own button; an order card is not a link), and on a
+   touch screen :hover stuck after a tap (msg1 critique MSG-15; review after
+   b9c727f). A clickable row (.rowcard) keeps its own. */
 
 .listing-header {
   display: flex;
@@ -837,6 +837,7 @@ h4 {
 
 .order-ship-to {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .orders-earlier {
@@ -848,6 +849,128 @@ h4 {
    elsewhere may still wrap on a narrow phone. */
 .seller-order .btc-pill {
   white-space: nowrap;
+}
+
+/* Messages: one conversation, as bubbles (mockup msgs(); message_view
+   ChatLines). Near-monochrome: your own on parchment, the other side on the
+   page colour. Long words wrap rather than widen the page at 390 px. */
+.bubbles {
+  display: grid;
+  gap: var(--space-sm);
+  margin: var(--space-sm) 0 var(--space-md);
+}
+
+.bubble {
+  max-width: 80%;
+  justify-self: start;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-sm) var(--space-md);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bubble.mine {
+  justify-self: end;
+  background: var(--color-parchment);
+}
+
+/* In this side's direction, not sent from this device: in its place in
+   time, but on neither side (full width, dashed, neutral), never the filled
+   "You" bubble (message_view::UNCONFIRMED; msg1 critique MSG-1, and the
+   review after b9c727f). */
+.bubble.unconfirmed {
+  justify-self: stretch;
+  max-width: none;
+  border-style: dashed;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+
+/* The complaint step's question, a heading rather than a footnote (msg1
+   critique MSG-12). */
+.complaint-question {
+  font-size: 0.95rem;
+  margin: var(--space-md) 0 var(--space-xs);
+}
+
+.bubble-who,
+.bubble-note {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: normal;
+}
+
+.bubble-who {
+  margin-bottom: var(--space-xs);
+}
+
+.bubble-note {
+  margin: var(--space-xs) 0;
+  color: var(--text-secondary);
+}
+
+/* A step that is not a message ("An order was declined"). */
+.msg-event {
+  justify-self: center;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+/* One conversation opened under its order, or a question. */
+.thread {
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+}
+
+.thread-toggle {
+  margin-top: var(--space-sm);
+}
+
+/* A request waiting for the seller's hand answer, inside its thread. */
+.request-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  margin: var(--space-sm) 0;
+}
+
+/* A question from a buyer with no order card of its own. */
+.question-row + .question-row {
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--border);
+}
+
+.question-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media (max-width: 600px) {
+  .bubble {
+    max-width: 92%;
+  }
+}
+
+/* An earlier order: its title, card, address and controls as one group. */
+.earlier-order {
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-md);
+}
+
+/* Between groups only, as the sibling-margin rules do: not under the
+   "Other orders" heading. */
+.earlier-order + .earlier-order {
+  margin-top: var(--space-lg);
 }
 
 /* An earlier order's item, named above its card. */

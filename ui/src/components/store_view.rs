@@ -836,8 +836,12 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     class: "btn btn-outline",
                     disabled: owned,
                     title: owned.then_some("This is your own store"),
+                    aria_expanded: if show_messages() { "true" } else { "false" },
                     onclick: move |_| show_messages.toggle(),
-                    if show_messages() { "Hide messages" } else { "Ask the seller a question" }
+                    // The same label open or closed: it names the card it
+                    // opens, which is headed "Ask ... a question" (msg1
+                    // critique MSG-8).
+                    "Ask the seller a question"
                 }
             }
             if show_messages() && !owned {

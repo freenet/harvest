@@ -2000,6 +2000,7 @@ dependencies = [
  "bs58",
  "chrono",
  "ciborium",
+ "curve25519-dalek",
  "dioxus",
  "ed25519-dalek",
  "freenet-bitcoin-common",

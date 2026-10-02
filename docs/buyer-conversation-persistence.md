@@ -663,10 +663,16 @@ change; in Phase 2 they will.
 
 * **It does not persist `authored_here`.** The entry digests of messages this
   tab sent are the only authorship this browser can establish, and they are
-  not kept. After a reload the buyer's own messages are described by direction
-  ("Addressed to the seller") rather than as "You, from this tab". Both are
-  truthful; the second is less specific. What is at stake in this change is the
-  ability to READ the thread, which is unaffected.
+  not kept. "You" is given only to a message whose digest this tab holds
+  (`components::message_view::who`), so after a reload the buyer's own
+  earlier messages stay in their place in time but are drawn full width,
+  dashed and neutral (on neither side), labelled "Not confirmed as yours", with one line under the conversation
+  saying they may be the buyer's own from earlier or another device, and that
+  one they don't recognise isn't theirs. The seller's replies keep their
+  "Seller" label. Keeping the digests across a reload would need the delegate
+  to keep them with the conversation, which is a wire change and not made.
+  What is at stake in this change is the ability to READ the thread, which is
+  unaffected.
 * **It does not stop a pasted backup becoming the active thread.** A restored
   conversation is sorted by its own `created_at`, which came from the string,
   so a backup somebody else supplied can be the one the buyer's next message

@@ -106,7 +106,8 @@ pub fn MyPurchases() -> Element {
             h2 { "Purchases" }
             p { class: "text-muted small",
                 "Kept by the Freenet node on this device, not in the network, so they do not follow "
-                "you to another computer. A conversation can be backed up from inside it."
+                "you to another computer. Back up a conversation from its store\u{2019}s page, under \
+                 Ask the seller a question."
             }
             if loading {
                 p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }

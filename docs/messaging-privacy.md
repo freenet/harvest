@@ -68,9 +68,18 @@ mailbox that authenticates exactly as the seller's own reply would.
 Only a per-message signature could distinguish two holders of one secret, and
 that is a different mechanism from this one. **Anything whose authenticity
 matters must carry its own signature and must not rest on which key decrypted
-it.** The UI reports which direction a message was addressed, names only what
-the current tab sent as authored, and says on screen that direction is not
-proof of authorship.
+it.** The UI labels a message "You" only when this device sent it; a message
+in your own direction that this device did not send (your own from another
+device or from before a reload, or one the other party sealed as yours) is
+kept in its place in time but drawn on neither side (full width, dashed,
+on a neutral background), labelled "Not confirmed as yours", never as your
+own bubble, and never counted as a message; one line under the
+conversation says these may be yours from earlier or another device, and
+that one you don't recognise isn't yours. The other party's direction is labelled with their role ("Buyer",
+"Seller"): if you sealed one of those yourself, you are the only person it
+can mislead. Since paid-order messaging (2026-09-30) a paid buyer needs no
+Ghost Key to try this, which is why "You" is never given by direction
+(`components::message_view::who`).
 
 "What the current tab sent" is recognised by a digest of the whole mailbox
 entry, not by its nonce. The distinction is the subject of the next section
@@ -312,10 +321,12 @@ the party who can create the collision could publish the plaintext instead.
 ## A buyer who writes shows that seller a Ghost Key
 
 Added 2026-09-26. **Buyer-to-seller messages require a Ghost Key
-(anti-spam); buying itself does not.** The mailbox is open-write, so the gate
-cannot live only in the buyer's compose box: a script writes past it. The
-seller's browser therefore shows buyer text only when it carries a voucher
-that verifies for the conversation it arrived in
+(anti-spam); buying itself does not.** Since 2026-09-30 a buyer with a paid
+order writes in that order's conversation without one (below). The mailbox
+is open-write, so the gate cannot live only in the buyer's compose box: a
+script writes past it. The seller's browser therefore shows buyer text only
+when it carries a voucher that verifies for the conversation it arrived in,
+or in a conversation one of the store's paid orders opened
 (`components::message_view::shown_to_seller`), and says how many it left out.
 
 The voucher is per conversation. The buyer's Ghost Key signs, through the
@@ -353,15 +364,87 @@ fewer buyer texts, and junk written into the 4 KiB class (which costs a
 flooder nothing) evicts them sooner than it would have evicted 1 KiB text.
 
 What opens a conversation to the seller: a voucher that verifies for it, or
-a Buy now in it whose order the store has PAID (money, which no spammer
-spends to write). A request to buy on its own opens nothing, because it
-costs nothing to send. In a conversation that is not open the seller still
-sees every step (a request, a decline, an acceptance), so buying needs no
-Ghost Key, but not the free text in them: a request's note and shipping
-address (the address shows once it is paid) and a decline's reason are
-blanked, and text in either direction is left out (both parties hold both
-keys, so direction alone cannot be trusted). The count the seller is shown
-is of buyer text left out or blanked; a blanked address is not counted.
+one of the store's own orders that is paid (`Paid`, or `PaymentReversed`:
+money was spent) and belongs to it, by its request id (a Buy now) or by the
+conversation's keyed listing tag (a quote invoice, or a Buy now whose request
+has left the mailbox). The rule is `ui/src/order_threads.rs`. Nothing a buyer
+sends is read as evidence of payment: not the order's binding (it is
+published, so anyone can copy it), not an `OrderAccepted` message (either
+party can write one naming any order). A request to buy on its own opens
+nothing, because it costs nothing to send.
+
+In an open conversation the buyer's plain text is shown, so **a buyer whose
+order is paid writes in that order's conversation without a Ghost Key**
+(Ian, 2026-09-30). Their app offers that only by a rule that is a strict
+subset of the seller's (`AppState::paid_conversation`: their own node takes
+the order as paid, the store's copy is `Paid`), and seals the text into
+that conversation. It costs the paid buyer no pseudonym: the seller learns
+nothing new about them. What it costs the seller: one paid order opens
+unlimited plain text in that conversation, bounded only by the mailbox caps.
+
+**On signet, "paid" means paid in test coins,** which anyone can get free
+from a faucet. So until mainnet the paid path is not a spam cost at all: a
+spammer can buy a cheap listing with test coins and write freely in that
+one conversation (one conversation per paid order; they still cannot write
+in anyone else's). Money is the bar only once orders are in real bitcoin.
+
+**"Paid" means the order's address was paid, not that this buyer paid.**
+The evidence is the payment proof on the store's own order: some output to
+the order's address covered its amount inside its window. On a reused
+address (harvest#77) one payment can fall inside two orders' windows, so a
+second order can read as paid on another order's money; the seller's card
+warns about that twin. A buyer with such an order can write without a Ghost
+Key in its conversation, which costs them what the order would have cost
+nobody.
+
+**What closes an opened conversation again.** Rule (ii) matches the order's
+listing tag against listings named by requests in the conversation and
+listings the store lists. A store's listings set is grow-only (an edited or
+withdrawn listing stays in it), so an order stays matched after its request
+leaves the bounded mailbox, even if the mailbox is flooded to evict it. What
+can close it: the request gone AND the listing not in the store's listings
+(a store whose listings did not come across a migration), the order pruned
+from the store by its order cap (`MAX_ORDERS`, oldest out), or the store's copy of
+the order dropping from `Paid`. Then the seller's inbox holds the buyer's
+plain text back, and says it could not match it to a paid order.
+
+**Conversation tags must be canonical and torsion-free.** A tag has twins
+that give the same shared secret, and so the same keys and listing tags:
+the same bytes with bit 255 set (X25519 ignores it), u + p for small u
+(X25519 reduces modulo p), and seven torsion twins P + Q for the points Q of
+order dividing 8 (the seller's scalar is clamped to a multiple of 8, so the
+torsion part vanishes). The torsion twins are canonical bytes and pass the
+delegate's contributory check. A twin written by the buyer would read as a
+second conversation with the first one's keys, claiming its paid orders and
+able to take its place under an order card. The UI reads only tags that are
+canonical encodings of a point in Curve25519's prime-order subgroup
+(`messaging::is_canonical_tag`; an honest tag is b·G, so always is), and never
+asks the delegate for another tag's keys; the delegate itself does not check
+yet. An order is also filed first under the conversation whose request names
+it, since the request id hashes that conversation's own tag; only a quote
+invoice, or a Buy now whose request has left the mailbox, is matched by its
+listing tag alone.
+
+In a conversation that is not open the seller still sees every step (a
+request, a decline, an acceptance), so buying needs no Ghost Key, but not the
+free text in them: a request's note and shipping address (the address shows
+once it is paid) and a decline's reason are blanked, and text in either
+direction is left out (both parties hold both keys, so direction alone cannot
+be trusted). The count the seller is shown is of buyer text left out, and of
+notes or picks blanked on a quote request (the one kind the seller is asked
+to answer); an unpaid Buy now's blanked note is not counted, since the store
+answers it and the seller never sees it, and a blanked address is not
+counted.
+
+**After the complaint window the seller's app hides the buyer's address**
+(Ian, 2026-09-30): the order card and any request of that order read
+"Address hidden: the time to report a problem with this order has passed.",
+and the note goes too. Hidden, not deleted: it stays encrypted in the store's
+mailbox contract (no owner delete; entries leave only by its caps), the store
+key can decrypt it for the store's life, and a mailbox migration copies it.
+With no chain tip the window can't be judged and the address stays, and a
+paid order never marked as sent keeps it too: the seller still owes it and
+may send it late, which extends the buyer's window.
 
 A buyer's plain text sealed before the gate existed, and the seller's own
 replies in a conversation nothing opens, are no longer shown to the seller.

@@ -58,6 +58,9 @@ pub(crate) struct SellerStore {
     pub listings: usize,
     /// Buyers' requests still waiting for an invoice.
     pub requests: usize,
+    /// Buyer conversations waiting for the seller's reply
+    /// (`message_view::awaiting_reply`, msg1 critique MSG-3).
+    pub replies: usize,
     /// The store's record as its badge reads (`RecordLoad::badge`): "No
     /// complaints" only once the record has been read, and complaints counted
     /// the way the store page counts them.
@@ -122,10 +125,10 @@ pub(crate) fn orders_to_send(
 
 impl SellerStore {
     /// What needs the seller at this store: requests waiting for an invoice,
-    /// paid orders waiting to be sent, and payments to confirm. Never an
-    /// unpaid Buy now. The count on its Orders tab and its card on Stores.
+    /// paid orders waiting to be sent, payments to confirm, and buyers
+    /// waiting for a reply. Never an unpaid Buy now. The count on its Orders tab and its card on Stores.
     pub(crate) fn needs_you(&self) -> usize {
-        self.requests + self.to_send + self.to_confirm
+        self.requests + self.to_send + self.to_confirm + self.replies
     }
 }
 
@@ -275,6 +278,7 @@ pub(crate) fn seller_stores(state: &AppState) -> Vec<SellerStore> {
                     })
                     .unwrap_or(0),
                 requests: super::message_view::requests_awaiting_invoice(state, id),
+                replies: super::message_view::replies_awaited(state, id),
                 record: browsing
                     .map(|b| b.record_badge().1)
                     .unwrap_or_else(|| crate::state::RecordLoad::Loading.badge(0).1),
@@ -862,15 +866,14 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
                         fingerprint: store.fingerprint.clone(),
                     }
                 },
-                // Orders first: the tab is named for them, and the buyers'
-                // messages under them can run to many screens (the
+                // Each order carries its own conversation, and questions
+                // follow the orders: no mailbox dump under them (the
                 // 2026-09-30 critique found the orders ~9,700px down).
                 Tab::Orders => rsx! {
                     super::invoice_form::StorePayments {
                         store_contract_id: store.contract_id.clone(),
                         seller_fingerprint: store.fingerprint.clone(),
                     }
-                    super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                 },
                 Tab::Settings => rsx! {
                     Settings { store: store.clone(), editing_details }
@@ -1028,6 +1031,18 @@ fn Overview(store: SellerStore, tab: Signal<Tab>, editing_details: Signal<bool>)
                             "1 buyer is waiting for an invoice."
                         } else {
                             "{store.requests} buyers are waiting for an invoice."
+                        }
+                    }
+                    button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
+                }
+            }
+            if store.replies > 0 {
+                div { class: "need row-between",
+                    strong {
+                        if store.replies == 1 {
+                            "1 buyer is waiting for your reply."
+                        } else {
+                            "{store.replies} buyers are waiting for your reply."
                         }
                     }
                     button { class: "btn btn-sm btn-primary", onclick: move |_| go(Tab::Orders), "Open orders" }
