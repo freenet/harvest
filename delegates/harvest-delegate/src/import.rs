@@ -975,6 +975,9 @@ mod tests {
             Family::Watches,
             Family::Standalone, // bridge config
             Family::PaymentXpub,
+            // A payment key still catching up: into its own slot, never as
+            // the active key (`bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`).
+            Family::Standalone,
             Family::Standalone, // migration and notice markers
             Family::BuyerConversation,
             Family::KnownStore,
@@ -987,6 +990,7 @@ mod tests {
             Family::Refused,    // instant-checkout retry flag
             Family::Refused,    // instant-checkout tip
             Family::Refused,    // instant-checkout exported marker
+            Family::Refused,    // instant-checkout catching-up mark
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(

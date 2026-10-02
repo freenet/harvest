@@ -45,6 +45,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::bitcoin::BITCOIN_WATCHES_KEY.to_vec(),
         crate::bitcoin::BITCOIN_BRIDGE_KEY.to_vec(),
         crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY.to_vec(),
+        crate::bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY.to_vec(),
         crate::markers::marker_secret_key("v1.store.aa.bb"),
         crate::messaging::buyer_conversation_key(&[3u8; 32], &[4u8; 32]),
         crate::known_stores::known_store_key("3Bn8xWqLd6Tz9Kf2"),
@@ -59,6 +60,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::auto_invoice::retry_key(&[9u8; 32]),
         crate::auto_invoice::tip_key(freenet_bitcoin_common::BitcoinNetwork::Signet),
         crate::auto_invoice::EXPORTED_KEY.to_vec(),
+        crate::auto_invoice::catchup_key(&[9u8; 32]),
     ]
 }
 
