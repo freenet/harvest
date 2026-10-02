@@ -219,6 +219,17 @@ impl Runner {
         Ok(value)
     }
 
+    /// Send an application message unmeasured, ignoring the answer.
+    fn quiet_send(&mut self, payload: &[u8]) -> Result<()> {
+        let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload.to_vec()));
+        let origin = self.origin.clone();
+        self.host
+            .call(Some(&origin), &msg)?
+            .result
+            .map_err(|e| anyhow!("the delegate returned an error: {e}"))?;
+        Ok(())
+    }
+
     fn send(&mut self, name: &str, payload: Vec<u8>) -> Result<Vec<OutboundDelegateMsg>> {
         let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
         let origin = self.origin.clone();
@@ -2100,6 +2111,7 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
         }
     }
     r.host.state.secrets = snapshot;
+    pending_key(r)?;
     Ok(())
 }
 
@@ -2169,6 +2181,7 @@ fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
         return Ok(());
     }
     r.host.state.secrets = snapshot.clone();
+    let began = r.host.state.now;
     let per_store = harvest_common::store::MAX_ORDERS as u32;
     feed(
         r,
@@ -2176,17 +2189,205 @@ fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
         &scripts_at(&chain, start..start + per_store)?,
         false,
     )?;
+    let catching = "Background: heartbeat wake-up (payment counter catching up)";
+    let gap = harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
+    let end = u64::from(start + per_store);
+    // Each wake-up moves the scan on by `WAKEUP_SCAN_BUDGET`; bounded well
+    // past what that needs.
+    let wakeups = (per_store + gap) as usize + 2;
+    let mut last = (u64::from(start), u64::from(start));
+    let mut done = None;
+    for n in 1..=wakeups {
+        r.host.state.now += chrono::Duration::minutes(5);
+        r.background(catching, wakeup)?;
+        let counter = active_counter(r)?;
+        let at = active_cursor(r)?.unwrap_or(counter);
+        if (counter, at) <= last || counter > end {
+            bail!(
+                "wake-up {n} took the catch-up from {}/{} to {counter}/{at}: it did not move \
+                 it on, so its cost was not measured",
+                last.0,
+                last.1
+            );
+        }
+        last = (counter, at);
+        if counter == end && at >= end + u64::from(gap) {
+            done = Some(n);
+            break;
+        }
+    }
+    let Some(n) = done else {
+        bail!("{wakeups} wake-ups did not finish one store's catch-up");
+    };
+    println!("  (the wake-ups finished one store's catch-up in {n})");
+    // And once it is complete, a wake-up's share is a check of the cursor.
     r.host.state.now += chrono::Duration::minutes(5);
     r.background(
-        "Background: heartbeat wake-up (payment counter catching up)",
+        "Background: heartbeat wake-up (payment counter caught up)",
         wakeup,
     )?;
-    let after = active_counter(r)?;
-    if after <= u64::from(start) {
+    let after = (active_counter(r)?, active_cursor(r)?.unwrap_or(0));
+    if after != last {
+        bail!("a wake-up after the catch-up was complete moved it from {last:?} to {after:?}");
+    }
+    r.host.state.secrets = snapshot;
+    // The scenario's clock as one wake-up left it, as before this step.
+    r.host.state.now = began + chrono::Duration::minutes(5);
+    Ok(())
+}
+
+/// The active key's scan cursor (`published_set::Cursor`, stored as
+/// `[tag_len u16][tag][generation u32][base u32][at u32]`): how far its scan
+/// has derived. `None` when none is saved; a cursor of another shape fails
+/// the run.
+fn active_cursor(r: &Runner) -> Result<Option<u64>> {
+    let Some(bytes) = r.host.state.secrets.get(CURSOR_ACTIVE_KEY) else {
+        return Ok(None);
+    };
+    let tag_len = bytes
+        .get(..2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .ok_or_else(|| anyhow!("the scan cursor is too short: update the harness"))?;
+    match bytes.get(2 + tag_len..) {
+        Some(rest) if rest.len() == 12 => {
+            Ok(Some(u64::from(u32::from_le_bytes(rest[8..12].try_into()?))))
+        }
+        _ => {
+            bail!("the scan cursor is not [tag_len][tag][generation][base][at]: update the harness")
+        }
+    }
+}
+
+/// `published_set::CURSOR_ACTIVE_KEY`.
+const CURSOR_ACTIVE_KEY: &[u8] = b"harvest:bitcoin:cursor-active:v1";
+
+/// `bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`.
+const XPUB_PENDING_KEY: &[u8] = b"harvest:bitcoin:payment-xpub-pending:v1";
+
+/// The account key a payment-key record holds (`None` for no record, or the
+/// emptied pending slot).
+fn held_key(r: &Runner, key: &[u8]) -> Result<Option<String>> {
+    match r.host.state.secrets.get(key) {
+        None => Ok(None),
+        Some(b) if b.is_empty() => Ok(None),
+        Some(_) => match secret_value(r, key)? {
+            Value::Null => Ok(None),
+            v => match field(&v, &["xpub"])? {
+                Value::Text(t) => Ok(Some(t.clone())),
+                other => bail!("a payment key record's xpub: {}", brief(other)),
+            },
+        },
+    }
+}
+
+/// A new device: a key that is not the active one, entered with a store's
+/// published scripts held. Its scan runs in the pending slot, the active
+/// key going on handing out addresses meanwhile, and only once complete is
+/// it made active (#216). Then the stale case: a tab resuming a key's
+/// catch-up after another key was entered since is refused with
+/// `KEY_SUPERSEDED_PREFIX`, and writes nothing. Skipped for a delegate
+/// without `AddPublishedScripts`, which has no pending slot. The secrets are
+/// put back after.
+fn pending_key(r: &mut Runner) -> Result<()> {
+    let snapshot = r.host.state.secrets.clone();
+    if !takes_additions(r)? {
+        r.host.state.secrets = snapshot;
+        return Ok(());
+    }
+    r.host.state.secrets = snapshot.clone();
+    let (old, new, newer) = (
+        fixtures::signet_vpub(0),
+        fixtures::signet_vpub(1),
+        fixtures::signet_vpub(2),
+    );
+    let chain = bip32::AccountXpub::parse(&new)
+        .and_then(|a| a.external_chain())
+        .map_err(|e| anyhow!("derive the new key's chain: {e}"))?;
+    let per_store = harvest_common::store::MAX_ORDERS;
+    let label = format!("{per_store} published scripts, a new key");
+    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, true)?;
+    let set = |xpub: &str, resume: bool| {
+        cbor(&BitcoinDelegateRequest::SetPaymentXpub {
+            request_id: 415,
+            xpub: xpub.to_string(),
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            published_scripts: Vec::new(),
+            resume,
+        })
+    };
+    let name = format!("SetPaymentXpub ({label})");
+    // One call: still catching up, the new key held pending and the old one
+    // still active.
+    if catch_up(
+        r,
+        &name,
+        &set(&new, false),
+        &set(&new, true),
+        "PaymentXpubSet",
+        per_store,
+        Some(1),
+    )?
+    .is_some()
+    {
+        bail!("{name}: done in one call, so the pending slot was not exercised");
+    }
+    if held_key(r, XPUB_KEY)?.as_deref() != Some(old.as_str())
+        || held_key(r, XPUB_PENDING_KEY)?.as_deref() != Some(new.as_str())
+    {
+        bail!("{name}: part-way, the new key is not held pending beside the active one");
+    }
+    // Resumed to the end: promoted, past every script, the slot emptied.
+    let done = catch_up(
+        r,
+        &name,
+        &set(&new, true),
+        &set(&new, true),
+        "PaymentXpubSet",
+        per_store,
+        None,
+    )?
+    .ok_or_else(|| anyhow!("{name}: never finished"))?;
+    let count = field(&done, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
+    if *count != Value::Integer((per_store as u64).into())
+        || held_key(r, XPUB_KEY)?.as_deref() != Some(new.as_str())
+        || held_key(r, XPUB_PENDING_KEY)?.is_some()
+    {
         bail!(
-            "the wake-up left the payment counter at {after}: it did not move the catch-up on, \
-             so that part of its cost was not measured"
+            "{name}: finished at count {} without the new key made active and the pending \
+             slot emptied",
+            brief(count)
         );
+    }
+
+    // The stale resume: tab A's new key part-way, tab B enters another (it
+    // has no published scripts, so it is made active at once), then tab A
+    // asks again.
+    r.host.state.secrets = snapshot.clone();
+    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, false)?;
+    r.quiet_send(&set(&new, false))?;
+    r.app(
+        "SetPaymentXpub (another new key, entered in another tab)",
+        set(&newer, false),
+        "PaymentXpubSet",
+    )?;
+    let out = r.send("SetPaymentXpub (a stale resume)", set(&new, true))?;
+    let answer: Value = ciborium::from_reader(
+        first_app_payload(&out)
+            .ok_or_else(|| anyhow!("a stale resume answered nothing"))?
+            .as_slice(),
+    )?;
+    let prefix = harvest_common::bitcoin_delegate::KEY_SUPERSEDED_PREFIX;
+    match field(&answer, &["PaymentXpubSet", "result", "Err"]) {
+        Ok(Value::Text(why)) if why.starts_with(prefix) => {}
+        _ => bail!(
+            "a stale resume was not refused as superseded: {}",
+            brief(&answer)
+        ),
+    }
+    if held_key(r, XPUB_KEY)?.as_deref() != Some(newer.as_str())
+        || held_key(r, XPUB_PENDING_KEY)?.is_some()
+    {
+        bail!("a stale resume changed which key is active or pending");
     }
     r.host.state.secrets = snapshot;
     Ok(())
@@ -2660,8 +2861,29 @@ struct Row {
     timing: Option<(Duration, Duration)>,
 }
 
-fn over_budget(fuel: Option<u64>) -> bool {
-    fuel.is_none_or(|f| f > BUDGET_FUEL)
+/// The most fuel a call named `name` may consume: [`BUDGET_FUEL`], except
+/// where a row is held to a tighter ceiling ([`DECIDE_CEILING_PERCENT`]).
+fn ceiling(name: &str) -> u64 {
+    if name.starts_with(DECIDE_ROW) {
+        BUDGET_FUEL / 100 * DECIDE_CEILING_PERCENT
+    } else {
+        BUDGET_FUEL
+    }
+}
+
+/// Instant checkout's decide against a full store is held to this share of
+/// the budget, not the whole of it. The aim for a handler whose cost grows
+/// with a collection is about 60% at the cap (headroom for a slower CPU and
+/// a loaded node, README "Calibration"); decide at 4,096 paid orders sits
+/// at about 64% on #216, accepted because 70% of the budget is still well
+/// under the node's 5 s limit. The ceiling keeps it from creeping further.
+const DECIDE_CEILING_PERCENT: u64 = 70;
+
+/// The report rows of instant checkout's decide ([`instant_decide`]).
+const DECIDE_ROW: &str = "GetContractResponse: store,";
+
+fn over_budget(name: &str, fuel: Option<u64>) -> bool {
+    fuel.is_none_or(|f| f > ceiling(name))
 }
 
 /// Print the table, write the GitHub step summary, and say whether every
@@ -2673,7 +2895,9 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
             Some(row) => {
                 row.calls += 1;
                 row.host_writes = row.host_writes.max(m.host_writes);
-                if over_budget(m.fuel) || (!over_budget(row.fuel) && m.fuel > row.fuel) {
+                if over_budget(&m.name, m.fuel)
+                    || (!over_budget(&row.name, row.fuel) && m.fuel > row.fuel)
+                {
                     row.fuel = m.fuel;
                     row.host_calls = m.host_calls;
                     row.timing = m.timing;
@@ -2691,7 +2915,7 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     }
     let over: Vec<&str> = rows
         .iter()
-        .filter(|r| over_budget(r.fuel) || r.host_writes > BUDGET_WRITES)
+        .filter(|r| over_budget(&r.name, r.fuel) || r.host_writes > BUDGET_WRITES)
         .map(|r| r.name.as_str())
         .collect();
 
@@ -2724,7 +2948,7 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
             format!("{:.1}%", f as f64 * 100.0 / BUDGET_FUEL as f64)
         });
         let fuel = r.fuel.map_or("past the ceiling".into(), group);
-        let flag = if over_budget(r.fuel) || r.host_writes > BUDGET_WRITES {
+        let flag = if over_budget(&r.name, r.fuel) || r.host_writes > BUDGET_WRITES {
             "OVER"
         } else {
             ""
@@ -2806,9 +3030,9 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     } else {
         for name in &over {
             eprintln!(
-                "::error::{name} exceeds the per-call budget of {} fuel or {BUDGET_WRITES} \
+                "::error::{name} exceeds its per-call ceiling of {} fuel or {BUDGET_WRITES} \
                  secret writes",
-                group(BUDGET_FUEL)
+                group(ceiling(name))
             );
         }
     }
