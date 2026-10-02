@@ -741,24 +741,21 @@ pub(crate) fn update_delegation<S: SecretStore>(
     Ok(status_of(secrets, &held, now_ms))
 }
 
-/// The delegation this store's arm can use, as the tab is told it.
-pub(crate) fn status_for_arm<S: SecretStore>(
-    secrets: &S,
-    arm: &AutoInvoiceArm,
-    now_ms: u64,
-) -> Option<WatchDelegationStatus> {
-    all_held(secrets)
-        .into_iter()
-        .find(|h| h.network == arm.network && arm.trusted_bridges.contains(&h.bridge))
-        .map(|h| status_of(secrets, &h, now_ms))
+fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDelegationStatus {
+    let pool = pool(secrets, held.network);
+    status_with(secrets, held, &Vouching::new(secrets, held), &pool, now_ms)
 }
 
-fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDelegationStatus {
+fn status_with<S: SecretStore>(
+    secrets: &S,
+    held: &Held,
+    vouching: &Vouching,
+    pool: &[Vec<u8>],
+    now_ms: u64,
+) -> WatchDelegationStatus {
     let watched = fresh_tip(secrets, held.network, now_ms).map_or(0, |tip| {
-        let vouching = Vouching::new(secrets, held);
-        pool(secrets, held.network)
-            .iter()
-            .take_while(|s| covers(&vouching, held, s, tip.anchor.height))
+        pool.iter()
+            .take_while(|s| covers(vouching, held, s, tip.anchor.height))
             .count() as u32
     });
     WatchDelegationStatus {
@@ -791,31 +788,108 @@ fn vouched(vouching: &Vouching, w: &Watched) -> bool {
     !vouching.compromised(w.canary_index, &w.canary)
 }
 
-/// I7's second source: the scripts this delegate's own confirmed requests
-/// have the bridge watching far enough past `tip_height`, each with the
-/// horizon asked, for a store on `network` trusting `bridges`: the union
-/// across every delegation it holds for them. A stalled delegation still
-/// counts what its probes keep finding scanned; a probe that finds it not
-/// scanned clears it; and a watch whose canary can no longer vouch for it
-/// ([`vouched`]) does not count.
+/// [`Delegations::watched`], reading the delegations for one store.
+#[cfg(test)]
 pub(crate) fn delegated_watched<S: SecretStore>(
     secrets: &S,
     network: BitcoinNetwork,
     bridges: &[BridgeId],
     tip_height: u32,
 ) -> Vec<(Vec<u8>, u32)> {
-    all_held(secrets)
-        .iter()
-        .filter(|h| h.network == network && bridges.contains(&h.bridge))
-        .flat_map(|h| {
-            let vouching = Vouching::new(secrets, h);
-            h.watched
-                .iter()
-                .filter(|w| covers(&vouching, h, &w.script, tip_height))
-                .map(|w| (w.script.clone(), w.until_height))
-                .collect::<Vec<_>>()
+    Delegations::read(secrets).watched(network, bridges, tip_height)
+}
+
+/// Every delegation held, each with what vouches for its watches, read once
+/// for a run that asks about many stores (a wake-up's heartbeats, a tip
+/// read's statuses): asked per store, each read every delegation and, per
+/// delegation, every arm again (#206).
+pub(crate) struct Delegations {
+    held: Vec<(Held, Vouching)>,
+    xpub: Option<harvest_common::PaymentXpubStatus>,
+    upcoming: std::cell::OnceCell<Vec<harvest_common::DerivedAddress>>,
+}
+
+impl Delegations {
+    pub(crate) fn read<S: SecretStore>(secrets: &S) -> Self {
+        let xpub = crate::bitcoin::load_payment_xpub(secrets);
+        let next_index = xpub.as_ref().map(|xpub| xpub.next_index);
+        let arms = arms(secrets);
+        Delegations {
+            held: all_held(secrets)
+                .into_iter()
+                .map(|h| {
+                    let vouching = Vouching::of(next_index, &arms, &h);
+                    (h, vouching)
+                })
+                .collect(),
+            xpub,
+            upcoming: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The addresses instant checkout would issue next
+    /// (`auto_invoice::upcoming`), derived on first use and then kept.
+    pub(crate) fn upcoming(&self) -> &[harvest_common::DerivedAddress] {
+        self.upcoming.get_or_init(|| {
+            self.xpub
+                .as_ref()
+                .and_then(|xpub| {
+                    crate::bitcoin::upcoming_addresses(xpub, MAX_UPCOMING_ADDRESSES).ok()
+                })
+                .unwrap_or_default()
         })
-        .collect()
+    }
+
+    /// [`pool`], from what was read.
+    fn pool(&self, network: BitcoinNetwork) -> Vec<Vec<u8>> {
+        match &self.xpub {
+            Some(xpub) if xpub.network == network => self
+                .upcoming()
+                .iter()
+                .map(|a| a.script_pubkey.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// I7's second source: the scripts this delegate's own confirmed requests
+    /// have the bridge watching far enough past `tip_height`, each with the
+    /// horizon asked, for a store on `network` trusting `bridges`: the union
+    /// across every delegation it holds for them. A stalled delegation still
+    /// counts what its probes keep finding scanned; a probe that finds it not
+    /// scanned clears it; and a watch whose canary can no longer vouch for it
+    /// ([`vouched`]) does not count.
+    pub(crate) fn watched(
+        &self,
+        network: BitcoinNetwork,
+        bridges: &[BridgeId],
+        tip_height: u32,
+    ) -> Vec<(Vec<u8>, u32)> {
+        self.held
+            .iter()
+            .filter(|(h, _)| h.network == network && bridges.contains(&h.bridge))
+            .flat_map(|(h, vouching)| {
+                h.watched
+                    .iter()
+                    .filter(|w| covers(vouching, h, &w.script, tip_height))
+                    .map(|w| (w.script.clone(), w.until_height))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The delegation this store's arm can use, as the tab is told it.
+    pub(crate) fn status_for_arm<S: SecretStore>(
+        &self,
+        secrets: &S,
+        arm: &AutoInvoiceArm,
+        now_ms: u64,
+    ) -> Option<WatchDelegationStatus> {
+        self.held
+            .iter()
+            .find(|(h, _)| h.network == arm.network && arm.trusted_bridges.contains(&h.bridge))
+            .map(|(h, vouching)| status_with(secrets, h, vouching, &self.pool(h.network), now_ms))
+    }
 }
 
 /// The delegate's next addresses, as scripts, from the counter on.
@@ -883,11 +957,20 @@ pub(crate) struct Vouching {
 
 impl Vouching {
     pub(crate) fn new<S: SecretStore>(secrets: &S, held: &Held) -> Self {
+        let next_index = crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index);
+        Vouching::of(next_index, &arms(secrets), held)
+    }
+
+    /// From the counter and the arms, already read.
+    fn of(next_index: Option<u32>, arms: &[ArmRecord], held: &Held) -> Self {
         Vouching {
-            next_index: crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index),
-            armed_scripts: armed_for(secrets, held)
-                .into_iter()
-                .flat_map(|r| r.arm.watched_scripts)
+            next_index,
+            armed_scripts: arms
+                .iter()
+                .filter(|r| {
+                    r.arm.network == held.network && r.arm.trusted_bridges.contains(&held.bridge)
+                })
+                .flat_map(|r| r.arm.watched_scripts.iter().cloned())
                 .collect(),
         }
     }
@@ -3094,6 +3177,41 @@ mod tests {
         let reads = secrets.reads.get() - before;
         assert_eq!(got.len(), WATCHED_CAP, "every watch vouched for");
         assert!(reads <= 8, "{reads} reads for one delegation");
+    }
+
+    /// #206: a wake-up's heartbeats, and a tip read's statuses, read each
+    /// delegation and each arm a bounded number of times however many
+    /// stores are armed, not once per store (per delegation, per watch).
+    /// Mutated red by reading the delegations per store.
+    #[test]
+    fn many_stores_read_each_delegation_a_bounded_number_of_times() {
+        let mut secrets = delegated();
+        let mut record = arm_record(&secrets);
+        // A presence contract, so each store's heartbeat is worked out.
+        record.arm.presence_contract_id = Some([9; 32]);
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
+            &record,
+        );
+        for n in 2..=16u8 {
+            let mut other = record.clone();
+            other.arm.store_contract_id = vec![n; 32];
+            save(
+                &mut secrets,
+                &crate::auto_invoice::arm_key(&[n; 32]),
+                &other,
+            );
+        }
+        let deleg = format!("{}watchdeleg:", crate::auto_invoice::AUTO_PREFIX).into_bytes();
+        let before = secrets.reads_under(&deleg);
+        let sent = crate::auto_invoice::heartbeats(&mut secrets, NOW);
+        assert_eq!(sent.len(), 16, "a heartbeat for every store");
+        let heartbeats = secrets.reads_under(&deleg) - before;
+        assert!(
+            heartbeats <= 2,
+            "{heartbeats} delegation reads for 16 heartbeats"
+        );
     }
 
     /// Two delegations with work take turns, the least recently read first.

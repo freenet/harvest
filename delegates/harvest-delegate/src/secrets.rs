@@ -106,6 +106,8 @@ pub(crate) struct MemSecrets {
     pub(crate) refused_prefix: Option<Vec<u8>>,
     /// How many reads were asked of it, for tests that bound a call's work.
     pub(crate) reads: std::cell::Cell<usize>,
+    /// Every key read, in order.
+    pub(crate) read_log: std::cell::RefCell<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -120,6 +122,7 @@ impl SecretStore for MemSecrets {
 
     fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.reads.set(self.reads.get() + 1);
+        self.read_log.borrow_mut().push(key.to_vec());
         self.map.get(key).cloned()
     }
 
@@ -163,6 +166,15 @@ impl MemSecrets {
             writes_fail: true,
             ..Self::default()
         }
+    }
+
+    /// How many reads of keys under `prefix` were asked of it.
+    pub(crate) fn reads_under(&self, prefix: &[u8]) -> usize {
+        self.read_log
+            .borrow()
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .count()
     }
 
     /// A store whose host refuses writes of keys under `prefix` only.

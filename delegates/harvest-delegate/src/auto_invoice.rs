@@ -79,6 +79,8 @@ use harvest_common::sealed::{decrypt_message, InstantSelection, MessageContent};
 use harvest_common::store::{StoreStateV1, StoreStateV1Delta};
 use harvest_common::{from_cbor, to_cbor};
 
+use crate::watch_delegation::Delegations;
+
 /// Every secret this module writes starts with this, under `harvest:` so the
 /// migration tests hold it to the export prefix. Only the ledgers are
 /// exported ([`is_ledger_key`], `migration::is_store_key`): an arm describes
@@ -537,6 +539,7 @@ pub(crate) fn mailbox_retries<S: SecretStore>(
     if secrets.has_secret(EXPORTED_KEY) {
         return Vec::new();
     }
+    let delegations = Delegations::read(secrets);
     arms(secrets)
         .iter()
         // Every ledger write writes the flag (`save_ledger`, and the import
@@ -553,7 +556,8 @@ pub(crate) fn mailbox_retries<S: SecretStore>(
         // kept, so the first wake-up after it lifts reads.
         .filter(|record| {
             let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
-            global_refusal(secrets, record, tip.as_ref(), now_ms).is_ok()
+            let watched = watch_set_in(&delegations, record, tip.as_ref(), now_ms);
+            refusal_given(secrets, record, tip.as_ref(), &watched, now_ms).is_ok()
         })
         .filter_map(|record| {
             let context = to_cbor(&MailboxRetry {
@@ -611,6 +615,61 @@ pub(crate) fn arms<S: SecretStore>(secrets: &S) -> Vec<ArmRecord> {
         .iter()
         .filter_map(|key| load(secrets, key))
         .collect()
+}
+
+/// What a store's status shows of its ledger. Read without decoding the rest
+/// ([`crate::fast_cbor::map_fields`]): a tip read sends the status of every
+/// armed store, and decoding sixteen full ledgers for it took most of a
+/// call's budget (#206).
+#[derive(Default, PartialEq, Debug)]
+struct LedgerShown {
+    issued_at_ms: Vec<u64>,
+    oversold: Vec<Oversold>,
+    gap_paid: Option<(u64, u32)>,
+    capped: Option<(u64, String)>,
+}
+
+impl LedgerShown {
+    fn of(ledger: Ledger) -> Self {
+        LedgerShown {
+            issued_at_ms: ledger.issued_at_ms,
+            oversold: ledger.oversold,
+            gap_paid: ledger.gap_paid,
+            capped: ledger.capped,
+        }
+    }
+
+    fn issued_last_day(&self, now_ms: u64) -> usize {
+        self.issued_at_ms
+            .iter()
+            .filter(|at| now_ms.saturating_sub(**at) < DAY_MS)
+            .count()
+    }
+}
+
+fn load_ledger_shown<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> LedgerShown {
+    let Some(bytes) = secrets.get_secret(&ledger_key(store_contract_id)) else {
+        return LedgerShown::default();
+    };
+    ledger_shown(&bytes)
+        .unwrap_or_else(|| LedgerShown::of(from_cbor::<Ledger>(&bytes).unwrap_or_default()))
+}
+
+/// [`LedgerShown`] from a ledger's bytes, field by field, or `None` when any
+/// of it does not read (the caller then decodes the whole ledger).
+fn ledger_shown(bytes: &[u8]) -> Option<LedgerShown> {
+    let fields =
+        crate::fast_cbor::map_fields(bytes, &["issued_at_ms", "oversold", "gap_paid", "capped"])?;
+    let mut shown = LedgerShown::default();
+    for (i, value) in fields {
+        match i {
+            0 => shown.issued_at_ms = from_cbor(value).ok()?,
+            1 => shown.oversold = from_cbor(value).ok()?,
+            2 => shown.gap_paid = from_cbor(value).ok()?,
+            _ => shown.capped = from_cbor(value).ok()?,
+        }
+    }
+    Some(shown)
 }
 
 fn load_ledger<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Ledger {
@@ -702,10 +761,21 @@ pub(crate) fn arm<S: SecretStore>(
 }
 
 fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> AutoInvoiceStatus {
+    status_in(secrets, &Delegations::read(secrets), record, now_ms)
+}
+
+/// [`status_of`], with the delegations already read.
+fn status_in<S: SecretStore>(
+    secrets: &S,
+    delegations: &Delegations,
+    record: &ArmRecord,
+    now_ms: u64,
+) -> AutoInvoiceStatus {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
-    let ledger = load_ledger(secrets, &record.arm.store_contract_id);
-    let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
-    let (remaining, run_until_ms) = accepted_run(secrets, record, &watched, now_ms);
+    let ledger = load_ledger_shown(secrets, &record.arm.store_contract_id);
+    let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
+    let (remaining, run_until_ms) =
+        accepted_run_of(delegations.upcoming(), record, &watched, now_ms);
     AutoInvoiceStatus {
         armed_at_ms: record.armed_at_ms,
         watched_remaining: remaining,
@@ -722,7 +792,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
             .filter(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS)
             .map(|o| o.order.clone())
             .collect(),
-        paused: global_refusal(secrets, record, tip.as_ref(), now_ms)
+        paused: refusal_given(secrets, record, tip.as_ref(), &watched, now_ms)
             .err()
             .map(|r| r.explain()),
         wallet_gap_paid_at_ms: ledger
@@ -739,7 +809,7 @@ fn status_of<S: SecretStore>(secrets: &S, record: &ArmRecord, now_ms: u64) -> Au
             .filter(|(at, _)| now_ms.saturating_sub(*at) < CAPPED_SHOWN_MS)
             .map(|(_, why)| why.clone()),
         last_wakeup_ms: load::<_, u64>(secrets, WAKEUP_KEY),
-        watch_delegation: crate::watch_delegation::status_for_arm(secrets, &record.arm, now_ms),
+        watch_delegation: delegations.status_for_arm(secrets, &record.arm, now_ms),
     }
 }
 
@@ -782,18 +852,31 @@ pub(crate) fn note_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) {
 /// The same answer as [`status_of`]'s `paused` and `watched_remaining`,
 /// without reading the ledger, which neither needs: the wake-up asks this for
 /// every arm, and a full ledger is the costliest secret a store has (#206).
+#[cfg(test)]
 fn taking_orders<S: SecretStore>(
     secrets: &S,
     record: &ArmRecord,
     now_ms: u64,
     upcoming: &[harvest_common::DerivedAddress],
 ) -> bool {
+    let delegations = Delegations::read(secrets);
+    assert_eq!(delegations.upcoming(), upcoming, "the same addresses");
+    taking_orders_in(secrets, &delegations, record, now_ms)
+}
+
+/// [`taking_orders`], with the delegations already read.
+fn taking_orders_in<S: SecretStore>(
+    secrets: &S,
+    delegations: &Delegations,
+    record: &ArmRecord,
+    now_ms: u64,
+) -> bool {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
-    if global_refusal(secrets, record, tip.as_ref(), now_ms).is_err() {
+    let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
+    if refusal_given(secrets, record, tip.as_ref(), &watched, now_ms).is_err() {
         return false;
     }
-    let watched = watch_set(secrets, record, tip.as_ref(), now_ms);
-    accepted_run_of(upcoming, record, &watched, now_ms).0 > 0
+    accepted_run_of(delegations.upcoming(), record, &watched, now_ms).0 > 0
 }
 
 /// Sign a heartbeat for `record`'s store and send it to its presence
@@ -810,8 +893,8 @@ pub(crate) fn heartbeat<S: SecretStore>(
     harvest_common::presence::SignedHeartbeat,
     OutboundDelegateMsg,
 )> {
-    let upcoming = upcoming(secrets);
-    heartbeat_with(secrets, record, now_ms, force, &upcoming)
+    let delegations = Delegations::read(secrets);
+    heartbeat_with(secrets, record, now_ms, force, &delegations)
 }
 
 /// [`heartbeat`] with the upcoming addresses already derived.
@@ -820,7 +903,7 @@ fn heartbeat_with<S: SecretStore>(
     record: &ArmRecord,
     now_ms: u64,
     force: bool,
-    upcoming: &[harvest_common::DerivedAddress],
+    delegations: &Delegations,
 ) -> Option<(
     harvest_common::presence::SignedHeartbeat,
     OutboundDelegateMsg,
@@ -830,7 +913,7 @@ fn heartbeat_with<S: SecretStore>(
     if secrets.has_secret(EXPORTED_KEY) {
         return None;
     }
-    let taking = taking_orders(secrets, record, now_ms, upcoming);
+    let taking = taking_orders_in(secrets, delegations, record, now_ms);
     let key = beat_key(&record.arm.store_contract_id);
     if !force {
         if let Some(last) = load::<_, BeatRecord>(secrets, &key) {
@@ -902,10 +985,12 @@ fn note_presence_seen<S: SecretStore>(secrets: &mut S, record: &ArmRecord, state
 
 /// A heartbeat for every armed store that is due one: the wake-up's work.
 pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<OutboundDelegateMsg> {
-    let upcoming = upcoming(secrets);
+    // Heartbeats change nothing the delegations, the arms or the payment key
+    // read: read once (and the upcoming addresses derived once) for all.
+    let delegations = Delegations::read(secrets);
     arms(secrets)
         .iter()
-        .filter_map(|record| heartbeat_with(secrets, record, now_ms, false, &upcoming))
+        .filter_map(|record| heartbeat_with(secrets, record, now_ms, false, &delegations))
         .map(|(_, message)| message)
         .collect()
 }
@@ -1182,31 +1267,9 @@ pub(crate) fn merge_ledgers(held: &mut Ledger, incoming: Ledger) -> bool {
 /// every Buy now with "no watched address" (review round 1 of
 /// freenet/harvest#179). What a heartbeat's `taking_orders`, and the store
 /// page, rest on.
-fn accepted_run<S: SecretStore>(
-    secrets: &S,
-    record: &ArmRecord,
-    watched: &WatchSet,
-    now_ms: u64,
-) -> (u32, u64) {
-    accepted_run_of(&upcoming(secrets), record, watched, now_ms)
-}
-
-/// The addresses instant checkout would issue next, from the seller's
-/// payment key: derived once per run, not once per store (all stores share
-/// the key).
-pub(crate) fn upcoming<S: SecretStore>(secrets: &S) -> Vec<harvest_common::DerivedAddress> {
-    crate::bitcoin::load_payment_xpub(secrets)
-        .and_then(|status| {
-            crate::bitcoin::upcoming_addresses(
-                &status,
-                harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
-            )
-            .ok()
-        })
-        .unwrap_or_default()
-}
-
-/// [`accepted_run`] over addresses already derived.
+///
+/// Over the upcoming addresses, derived once per run, not once per store (all
+/// stores share the payment key: `Delegations::upcoming`).
 fn accepted_run_of(
     upcoming: &[harvest_common::DerivedAddress],
     record: &ArmRecord,
@@ -1223,6 +1286,21 @@ fn accepted_run_of(
         until = until.min(this);
     }
     (count, if count == 0 { 0 } else { until })
+}
+
+/// The addresses instant checkout would issue next, from the seller's
+/// payment key, as `Delegations::upcoming` derives them.
+#[cfg(test)]
+pub(crate) fn upcoming<S: SecretStore>(secrets: &S) -> Vec<harvest_common::DerivedAddress> {
+    crate::bitcoin::load_payment_xpub(secrets)
+        .and_then(|status| {
+            crate::bitcoin::upcoming_addresses(
+                &status,
+                harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
+            )
+            .ok()
+        })
+        .unwrap_or_default()
 }
 
 /// The payment scripts I7 accepts now, from its two sources.
@@ -1281,6 +1359,16 @@ pub(crate) fn watch_set<S: SecretStore>(
     tip: Option<&TipCache>,
     now_ms: u64,
 ) -> WatchSet {
+    watch_set_in(&Delegations::read(secrets), record, tip, now_ms)
+}
+
+/// [`watch_set`], with the delegations already read.
+fn watch_set_in(
+    delegations: &Delegations,
+    record: &ArmRecord,
+    tip: Option<&TipCache>,
+    now_ms: u64,
+) -> WatchSet {
     let arm = &record.arm;
     let arm_time_live = now_ms.saturating_add(WATCH_NEEDED_MS) < record.watched_until_ms;
     let arm_height_live = match (arm.watched_until_height, tip) {
@@ -1288,12 +1376,7 @@ pub(crate) fn watch_set<S: SecretStore>(
         _ => true,
     };
     let delegated = tip.map_or_else(Vec::new, |tip| {
-        crate::watch_delegation::delegated_watched(
-            secrets,
-            arm.network,
-            &arm.trusted_bridges,
-            tip.anchor.height,
-        )
+        delegations.watched(arm.network, &arm.trusted_bridges, tip.anchor.height)
     });
     WatchSet {
         arm_time_live,
@@ -1436,8 +1519,19 @@ fn global_refusal<S: SecretStore>(
     tip: Option<&TipCache>,
     now_ms: u64,
 ) -> Result<BlockAnchor, Refusal> {
-    let arm = &record.arm;
     let watched = watch_set(secrets, record, tip, now_ms);
+    refusal_given(secrets, record, tip, &watched, now_ms)
+}
+
+/// [`global_refusal`], with the store's watch set already worked out.
+fn refusal_given<S: SecretStore>(
+    secrets: &S,
+    record: &ArmRecord,
+    tip: Option<&TipCache>,
+    watched: &WatchSet,
+    now_ms: u64,
+) -> Result<BlockAnchor, Refusal> {
+    let arm = &record.arm;
     // Lapsed only when neither source has anything: the delegate's own
     // watches keep a store taking orders after the tab's have lapsed. Not
     // judged without a tip, which the delegate's watches are measured
@@ -1761,13 +1855,14 @@ fn on_tip_read<S: SecretStore>(
     if let Some(state) = state {
         note_tip(secrets, first.arm.network, state);
     }
+    let delegations = Delegations::read(secrets);
     Some(
         armed
             .iter()
             .filter_map(|record| {
                 let status = HarvestDelegateResponse::AutoInvoice {
                     store_contract_id: record.arm.store_contract_id.clone(),
-                    result: Ok(status_of(secrets, record, now_ms)),
+                    result: Ok(status_in(secrets, &delegations, record, now_ms)),
                 };
                 to_cbor(&status).ok().map(|bytes| {
                     OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(bytes))
@@ -3339,6 +3434,73 @@ mod tests {
             );
             assert_eq!(fast, slow, "round {round}");
         }
+    }
+
+    /// #206: what a status shows of a ledger, read field by field without
+    /// decoding the rest, is what decoding the whole ledger shows: full and
+    /// small ledgers, each of the four fields present or absent (an older
+    /// ledger lacks some), statuses and long strings among the skipped
+    /// fields. Anything that is not a ledger map is declined and decoded
+    /// whole. Mutated red by reading a field from the wrong slot.
+    #[test]
+    fn the_status_reads_a_ledger_as_the_whole_decode_does() {
+        let full = |n: usize| Ledger {
+            seen: (0..n).map(|i| [i as u8; 32]).collect(),
+            answered: (0..n).map(|i| [i as u8 ^ 0x55; 32]).collect(),
+            issued_at_ms: (0..n as u64).map(|i| NOW - i * 1_000).collect(),
+            statuses: vec![ListingStatus {
+                listing: ListingId([3; 32]),
+                revision: 4,
+                availability: ListingAvailability::default(),
+            }],
+            sales: Vec::new(),
+            settled: (0..n).map(|i| OrderId([i as u8; 32])).collect(),
+            oversold: (0..n.min(8))
+                .map(|i| Oversold {
+                    order: OrderId([i as u8 + 1; 32]),
+                    found_at_ms: NOW - i as u64,
+                })
+                .collect(),
+            gap_orders: (0..n).map(|i| (OrderId([7; 32]), i as u32)).collect(),
+            gap_paid: Some((NOW - 5, 140)),
+            capped: Some((NOW - 9, "x".repeat(300))),
+            retry_pending: true,
+        };
+        for ledger in [Ledger::default(), full(3), full(SEEN_CAP)] {
+            let bytes = to_cbor(&ledger).unwrap();
+            assert_eq!(
+                ledger_shown(&bytes),
+                Some(LedgerShown::of(ledger.clone())),
+                "{} seen",
+                ledger.seen.len()
+            );
+        }
+        // An older ledger, without the later fields: as serde defaults them.
+        let mut value = ciborium::Value::serialized(&full(3)).unwrap();
+        let ciborium::Value::Map(fields) = &mut value else {
+            panic!()
+        };
+        fields.retain(|(k, _)| {
+            !matches!(k, ciborium::Value::Text(t) if t == "oversold" || t == "gap_paid" || t == "capped")
+        });
+        let mut older = Vec::new();
+        ciborium::into_writer(&value, &mut older).unwrap();
+        assert_eq!(
+            ledger_shown(&older),
+            Some(LedgerShown::of(from_cbor::<Ledger>(&older).unwrap()))
+        );
+        // Not a ledger map: declined, and the load falls back.
+        assert_eq!(ledger_shown(b"\x80"), None);
+        let mut secrets = MemSecrets::default();
+        let mut indefinite = to_cbor(&full(3)).unwrap();
+        indefinite[0] = 0xbf;
+        indefinite.push(0xff);
+        assert_eq!(ledger_shown(&indefinite), None);
+        secrets.set_secret(&ledger_key(&[1; 32]), &indefinite);
+        assert_eq!(
+            load_ledger_shown(&secrets, &[1; 32]),
+            LedgerShown::of(from_cbor::<Ledger>(&indefinite).unwrap())
+        );
     }
 
     /// A text from the `i`th buyer, `len` characters long: what instant
@@ -5887,7 +6049,7 @@ mod tests {
     /// flag the wake-up reads cannot fall behind the ledger (`import.rs`
     /// writes imported ledgers and syncs the flag itself, pinned by its own
     /// tests). Outside the tests, a ledger key is formed only in
-    /// `save_ledger` and `load_ledger`, and no other `save(` or `set_secret(`
+    /// `save_ledger` and the two loads, and no other `save(` or `set_secret(`
     /// call mentions a ledger. Mutated red by a bare `save` of a ledger.
     #[test]
     fn every_ledger_write_goes_through_save_ledger() {
@@ -5900,6 +6062,7 @@ mod tests {
         let outside = code
             .replace(body("fn save_ledger<"), "")
             .replace(body("fn load_ledger<"), "")
+            .replace(body("fn load_ledger_shown<"), "")
             .lines()
             // Doc comments name the key without forming one.
             .filter(|l| !l.trim_start().starts_with("//"))

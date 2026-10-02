@@ -149,6 +149,65 @@ impl<'a> Reader<'a> {
     }
 }
 
+impl Reader<'_> {
+    /// Past one whole item, of any kind, without reading it: a head and what
+    /// it counts. Indefinite lengths, and nesting past 64, are declined.
+    fn skip(&mut self, depth: u32) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        let b = *self.bytes.get(self.at)?;
+        let major = b >> 5;
+        if major == 7 {
+            // A simple value or a float: its size is in its head.
+            self.at += match b & 0x1f {
+                0..=23 => 1,
+                24 => 2,
+                25 => 3,
+                26 => 5,
+                27 => 9,
+                _ => return None,
+            };
+            return (self.at <= self.bytes.len()).then_some(());
+        }
+        let n = self.head(major)?;
+        match major {
+            0 | 1 => Some(()),
+            2 | 3 => self.take(usize::try_from(n).ok()?).map(|_| ()),
+            4 => (0..n).try_for_each(|_| self.skip(depth + 1)),
+            5 => (0..n).try_for_each(|_| {
+                self.skip(depth + 1)?;
+                self.skip(depth + 1)
+            }),
+            6 => self.skip(depth + 1),
+            _ => None,
+        }
+    }
+}
+
+/// The encoded value of each of `wanted`'s fields in a CBOR map with text
+/// keys, found without decoding the others (they are skipped by their
+/// heads), or `None` when `bytes` is not one such map, wholly. A field
+/// absent is absent from the answer; one present twice is declined. The
+/// caller decodes each value as the type would.
+pub(crate) fn map_fields<'a>(bytes: &'a [u8], wanted: &[&str]) -> Option<Vec<(usize, &'a [u8])>> {
+    let mut r = Reader { bytes, at: 0 };
+    let n = r.head(5)?;
+    let mut found: Vec<(usize, &'a [u8])> = Vec::new();
+    for _ in 0..n {
+        let key = r.text()?;
+        let start = r.at;
+        r.skip(0)?;
+        if let Some(i) = wanted.iter().position(|w| *w == key) {
+            if found.iter().any(|(j, _)| *j == i) {
+                return None;
+            }
+            found.push((i, &bytes[start..r.at]));
+        }
+    }
+    (r.at == bytes.len()).then_some(found)
+}
+
 /// `MailboxStateV1` as ciborium writes it, or `None` for anything else (the
 /// caller then decodes generically).
 ///
@@ -394,5 +453,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A map's fields are found by skipping the others by their heads, for
+    /// every kind of item ciborium writes (negative and large integers,
+    /// floats, booleans, null, bytes, text, nested arrays and maps, tags),
+    /// and the slice found is exactly the field's encoding. Truncations, a
+    /// repeated field, trailing bytes and indefinite lengths are declined.
+    #[test]
+    fn map_fields_skips_every_kind_of_item() {
+        use ciborium::Value;
+        let odd = Value::Array(vec![
+            Value::Integer((-5).into()),
+            Value::Integer(u64::MAX.into()),
+            Value::Float(1.5),
+            Value::Float(f64::from(1.1f32)),
+            Value::Float(0.1),
+            Value::Bool(true),
+            Value::Null,
+            Value::Bytes(vec![1; 300]),
+            Value::Text("é".repeat(40)),
+            Value::Map(vec![(Value::Integer(1.into()), Value::Array(vec![]))]),
+            Value::Tag(1, Box::new(Value::Integer(7.into()))),
+        ]);
+        let map = Value::Map(vec![
+            (Value::Text("skip".into()), odd.clone()),
+            (Value::Text("want".into()), odd.clone()),
+            (Value::Text("also".into()), Value::Integer(3.into())),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&map, &mut bytes).unwrap();
+        let found = map_fields(&bytes, &["want", "absent"]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 0);
+        let mut want = Vec::new();
+        ciborium::into_writer(&odd, &mut want).unwrap();
+        assert_eq!(found[0].1, want.as_slice());
+        for cut in 0..bytes.len() {
+            assert_eq!(map_fields(&bytes[..cut], &["want"]), None, "cut at {cut}");
+        }
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(map_fields(&long, &["want"]), None);
+        let twice = Value::Map(vec![
+            (Value::Text("want".into()), Value::Null),
+            (Value::Text("want".into()), Value::Null),
+        ]);
+        let mut twice_bytes = Vec::new();
+        ciborium::into_writer(&twice, &mut twice_bytes).unwrap();
+        assert_eq!(map_fields(&twice_bytes, &["want"]), None);
+        // Each width of simple value and float, written by hand: ciborium
+        // writes the shortest that holds a value, so not every width shows
+        // up above.
+        for skipped in [
+            &[0xf4][..],
+            &[0xf8, 0x20],
+            &[0xf9, 0x3c, 0x00],
+            &[0xfa, 0x3f, 0x8c, 0xcc, 0xcd],
+            &[0xfb, 0x3f, 0xb9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a],
+        ] {
+            let mut raw = vec![0xa2, 0x61, b's'];
+            raw.extend_from_slice(skipped);
+            raw.extend_from_slice(&[0x61, b'w', 0x01]);
+            assert_eq!(
+                map_fields(&raw, &["w"]),
+                Some(vec![(0, &[0x01][..])]),
+                "{skipped:02x?}"
+            );
+        }
+        assert_eq!(map_fields(&[0xbf, 0xff], &["want"]), None);
+        assert_eq!(map_fields(&[0xa1, 0x61, b'a', 0x9f, 0xff], &["a"]), None);
     }
 }
