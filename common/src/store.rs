@@ -4077,13 +4077,29 @@ mod order_tests {
         let whole = ListingsV1 {
             listings: vec![too_many],
         };
-        whole
+        let err = whole
             .verify(&parent(), &p)
             .expect_err("a state holding a listing with nine photos must not verify");
+        assert!(err.contains("photos"), "{err}");
         let whole = ListingsV1 {
             listings: vec![fine],
         };
         whole.verify(&parent(), &p).expect("eight photos verify");
+
+        // The photos are inside the signed terms: swapping one on a signed
+        // listing, even for another valid reference, breaks its signature.
+        let mut swapped = with_photos(2);
+        swapped.listing.images[1].full.hash = Bytes32([250; 32]);
+        swapped.listing = swapped.listing.clone().with_derived_id();
+        let err = ListingsV1 {
+            listings: vec![swapped],
+        }
+        .verify(&parent(), &p)
+        .expect_err("a listing whose photos were changed after signing must not verify");
+        assert!(
+            !err.contains("photos"),
+            "refused for its signature, not a cap: {err}"
+        );
     }
 
     /// A delta naming the same listing twice must not store it twice.

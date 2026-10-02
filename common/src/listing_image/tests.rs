@@ -15,7 +15,10 @@ fn blob(seed: u8, width: u16, height: u16) -> ImageBlob {
 fn photo(seed: u8, thumb: bool) -> ListingImage {
     ListingImage {
         full: blob(seed, 1600, 1200),
-        thumb: thumb.then(|| blob(seed.wrapping_add(100), 400, 300)),
+        thumb: thumb.then(|| ImageBlob {
+            len: 20_000,
+            ..blob(seed.wrapping_add(100), 400, 300)
+        }),
         colour: [120, 90, 60],
         alt: String::new(),
     }
@@ -209,4 +212,75 @@ fn check_listing_images_names_the_listing() {
 fn the_copied_limits_agree_with_the_image_contracts() {
     assert_eq!(MAX_IMAGE_BYTES, harvest_image::MAX_IMAGE_BYTES);
     assert_eq!(MAX_IMAGE_EDGE, harvest_image::MAX_IMAGE_EDGE);
+}
+
+/// The limits Ian chose and the store enforces, written out, so a change to
+/// one is a change to this test too (every other test is written in terms of
+/// the constant and would follow it silently).
+#[test]
+fn the_limits_are_the_chosen_ones() {
+    assert_eq!(MAX_IMAGES_HARD, 8);
+    assert_eq!(MAX_IMAGES_UI, 4);
+    assert_eq!(MAX_ALT_CHARS, 200);
+    assert_eq!(MAX_THUMB_EDGE, 400);
+    assert_eq!(MAX_THUMB_BYTES, 64 * 1024);
+    assert_eq!(MAX_IMAGE_BYTES, 256 * 1024);
+    assert_eq!(MAX_IMAGE_EDGE, 2048);
+}
+
+#[test]
+fn a_thumbnail_is_bounded_in_bytes_tighter_than_a_photo() {
+    let with_thumb_len = |len: u32| {
+        let mut p = photos(1);
+        p[0].thumb.as_mut().unwrap().len = len;
+        images_problem(&p)
+    };
+    assert_eq!(with_thumb_len(MAX_THUMB_BYTES as u32), None);
+    assert!(with_thumb_len(MAX_THUMB_BYTES as u32 + 1).is_some());
+}
+
+#[test]
+fn a_description_may_not_hide_characters() {
+    let with_alt = |alt: &str| {
+        let mut p = photos(2);
+        p[1].alt = alt.to_string();
+        images_problem(&p)
+    };
+    assert_eq!(with_alt("Jar of honey, lid off, côte view"), None);
+    for hidden in [
+        "line\nbreak",
+        "tab\there",
+        "\u{202E}esrever",
+        "zero\u{200B}width",
+        "\u{2066}isolate\u{2069}",
+        "bom\u{FEFF}",
+        "nul\0",
+    ] {
+        assert!(with_alt(hidden).is_some(), "{hidden:?} must be refused");
+    }
+}
+
+/// A listing WITH photos, pinned the same way: its encoding is the preimage of
+/// its id and its signature, so once photographed listings exist, a change to
+/// how a photo reference encodes (field order, a dropped `skip_serializing_if`,
+/// the hash's byte-string form) would move their ids and the store migration
+/// would discard them. Covers a cover with thumbnail and description, and a
+/// second photo with neither.
+#[test]
+fn a_listing_with_photos_encodes_as_pinned() {
+    const PINNED_CBOR: &str = "a96269649820187b181f184818ce18601832188e1882189818e218b518ee186f18d218aa185b18e218dc182718961887184218bd186718491618fa185018f4186a187b182c657469746c657350696e6e6564206a6172206f6620686f6e65796b6465736372697074696f6e782a5072652d70686f746f206c697374696e672c20697473206964206d757374206e65766572206d6f76652e646b696e646453616c65657072696365f66a637265617465645f617474323032362d30392d32315431343a31333a32305a68636865636b6f7574a269756e69745f736174731952086864656c6976657279a1684279526567696f6e81a266726567696f6e6255536473617473190bb86763686f6963657381a2646e616d656453697a65676f7074696f6e738265536d616c6c654c6172676566696d6167657382a46466756c6ca4646861736858200101010101010101010101010101010101010101010101010101010101010101636c656e1a000186a0657769647468190640666865696768741904b0657468756d62a4646861736858206565656565656565656565656565656565656565656565656565656565656565636c656e194e206577696474681901906668656967687419012c66636f6c6f7572831878185a183c63616c747046726f6e74206f6620746865206a6172a26466756c6ca4646861736858200202020202020202020202020202020202020202020202020202020202020202636c656e1a000186a0657769647468190640666865696768741904b066636f6c6f7572831878185a183c";
+    const PINNED_ID: &str = "9HcpGLtZJZgF3CPRsyMjnw864khPpNCZgKxVdc2DZYS7";
+    let mut listing = pinned();
+    listing.images = vec![
+        ListingImage {
+            alt: "Front of the jar".into(),
+            ..photo(1, true)
+        },
+        photo(2, false),
+    ];
+    let listing = listing.with_derived_id();
+    assert_eq!(hex::encode(crate::to_cbor(&listing).unwrap()), PINNED_CBOR);
+    assert_eq!(listing.id.to_string(), PINNED_ID);
+    let decoded: Listing = crate::from_cbor(&hex::decode(PINNED_CBOR).unwrap()).unwrap();
+    assert_eq!(decoded, listing);
 }

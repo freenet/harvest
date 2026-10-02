@@ -17,8 +17,18 @@
 //! costs every BUYER who opens the listing a network fetch. So the contract
 //! refuses a listing naming more than [`MAX_IMAGES_HARD`] photos, or a photo
 //! whose declared size or dimensions no image contract would accept. The UI's
-//! own limit, [`MAX_IMAGES_UI`], is lower, so it can be raised to the hard cap
-//! later without a re-key.
+//! own limit, [`MAX_IMAGES_UI`], is lower (the upload path applies it), so it
+//! can be raised to the hard cap later without a re-key.
+//!
+//! # These bound what a listing DECLARES, not the bytes behind it
+//!
+//! `len`, `width` and `height` are the seller's own statements about the image
+//! a hash names; the store cannot fetch it. So a dishonest seller can point a
+//! thumbnail reference at any image contract, which is bounded only by that
+//! contract's own caps (256 KiB, 2048 px). The reader (the buyer's display
+//! path) is what holds a reference to its bytes: it checks the BLAKE3 hash,
+//! the length and the dimensions it decodes against the reference, and shows
+//! the colour block instead when they disagree.
 //!
 //! # `harvest_image`'s limits are copied, not imported
 //!
@@ -54,17 +64,28 @@ pub const MAX_ALT_CHARS: usize = 200;
 /// The longest edge, in pixels, of the cover's thumbnail.
 pub const MAX_THUMB_EDGE: u16 = 400;
 
+/// The largest thumbnail a listing may declare, in bytes. The upload path aims
+/// at about 30 KiB; this leaves room for a busy photo.
+pub const MAX_THUMB_BYTES: usize = 64 * 1024;
+
+const _: () = assert!(MAX_IMAGES_UI <= MAX_IMAGES_HARD);
+const _: () = assert!(MAX_THUMB_BYTES <= MAX_IMAGE_BYTES);
+
 /// One photo on a listing.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct ListingImage {
-    /// The photo, long edge at most 1600 px by the UI's choice.
+    /// The photo. The upload path makes it at most 1600 px on its long edge;
+    /// the store allows up to [`MAX_IMAGE_EDGE`].
     pub full: ImageBlob,
-    /// A small copy for grids and rows. On the cover (the first photo) only.
+    /// A small copy for grids and rows (at most [`MAX_THUMB_EDGE`] px and
+    /// [`MAX_THUMB_BYTES`]). On the cover (the first photo) only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<ImageBlob>,
     /// The photo's average colour, shown while it loads or if it never does.
     pub colour: [u8; 3],
-    /// What the photo shows, for screen readers. Optional.
+    /// What the photo shows, for screen readers. Optional; at most
+    /// [`MAX_ALT_CHARS`] characters, none of them a control, direction or
+    /// zero-width character.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub alt: String,
 }
@@ -75,18 +96,19 @@ pub struct ListingImage {
 pub struct ImageBlob {
     /// BLAKE3 of the exact bytes, which is the image contract's parameters.
     pub hash: Bytes32,
-    /// The bytes' length, checked by a reader against what it fetched.
+    /// The bytes' length, as the seller declares it; a reader checks it against
+    /// what it fetched (see the module docs).
     pub len: u32,
     pub width: u16,
     pub height: u16,
 }
 
 impl ImageBlob {
-    fn problem(&self, max_edge: u16) -> Option<String> {
-        if self.len == 0 || self.len as usize > MAX_IMAGE_BYTES {
+    fn problem(&self, max_edge: u16, max_bytes: usize) -> Option<String> {
+        if self.len == 0 || self.len as usize > max_bytes {
             return Some(format!(
-                "a photo must be 1 to {} bytes, not {}",
-                MAX_IMAGE_BYTES, self.len
+                "a photo must be 1 to {max_bytes} bytes, not {}",
+                self.len
             ));
         }
         if self.width == 0 || self.height == 0 || self.width > max_edge || self.height > max_edge {
@@ -109,12 +131,12 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
         ));
     }
     for (i, image) in images.iter().enumerate() {
-        if let Some(problem) = image.full.problem(MAX_IMAGE_EDGE) {
+        if let Some(problem) = image.full.problem(MAX_IMAGE_EDGE, MAX_IMAGE_BYTES) {
             return Some(problem);
         }
         match (&image.thumb, i) {
             (Some(thumb), 0) => {
-                if let Some(problem) = thumb.problem(MAX_THUMB_EDGE) {
+                if let Some(problem) = thumb.problem(MAX_THUMB_EDGE, MAX_THUMB_BYTES) {
                     return Some(format!("the cover's thumbnail: {problem}"));
                 }
             }
@@ -127,6 +149,11 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
                 "a photo's description is at most {MAX_ALT_CHARS} characters"
             ));
         }
+        if image.alt.chars().any(is_hidden_char) {
+            return Some("a photo's description has a control or invisible character".into());
+        }
+        // Full photos only: the cover's thumbnail is a different image
+        // contract, and may even share bytes with a full photo.
         if images[..i]
             .iter()
             .any(|earlier| earlier.full.hash == image.full.hash)
@@ -135,6 +162,22 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
         }
     }
     None
+}
+
+/// A character that does not show as itself: a control (newlines included),
+/// a direction override or isolate, or a zero-width character. Each lets a
+/// description display, or be read aloud, as something other than what it
+/// says.
+fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// [`images_problem`] for one listing, as the error the store's merge

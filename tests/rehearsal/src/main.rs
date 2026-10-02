@@ -1109,7 +1109,11 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
     over.listings.normalize();
     let refused = node.update_state(curr_key, harvest_common::to_cbor(&over).unwrap()).await;
     println!("  nine photos: {refused:?}");
-    assert!(refused.is_err(), "the current contract must refuse a listing with nine photos");
+    let err = refused.expect_err("the current contract must refuse a listing with nine photos");
+    assert!(
+        err.contains("at most 8 photos"),
+        "refused for the photo cap, not something else: {err}"
+    );
     match node.get(curr_id).await {
         GetOutcome::State(bytes) => {
             let s: StoreStateV1 = harvest_common::from_cbor(&bytes).unwrap();
