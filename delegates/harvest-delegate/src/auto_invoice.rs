@@ -1793,20 +1793,25 @@ fn feed_published<S: SecretStore>(
     }
     let digest = *hasher.finalize().as_bytes();
     let key = fed_key(store_contract_id);
+    // The list's OWN generation, read from the list, not its separate count:
+    // a count written while the list's write was refused names a
+    // generation the list never had, and recorded as fed it would match a
+    // later real one that evicted this store's scripts (#206 review).
     let marker = |secrets: &S| {
-        crate::published_set::published_meta(secrets).map(|(generation, _)| {
-            let mut fed = digest.to_vec();
-            fed.extend_from_slice(&generation.to_le_bytes());
-            fed
-        })
+        crate::published_set::DigestList::load(secrets, crate::published_set::PUBLISHED_KEY)
+            .map(|list| {
+                let mut fed = digest.to_vec();
+                fed.extend_from_slice(&list.generation().to_le_bytes());
+                fed
+            })
+            .map_err(|_| crate::bitcoin::UNREADABLE_PUBLISHED.to_string())
     };
-    if marker(secrets).is_some_and(|fed| secrets.get_secret(&key).as_deref() == Some(&fed[..])) {
+    if secrets.get_secret(&key).as_deref() == Some(&marker(secrets)?[..]) {
         return Ok(());
     }
     crate::bitcoin::add_published(secrets, published)?;
-    if let Some(fed) = marker(secrets) {
-        secrets.set_secret(&key, &fed);
-    }
+    let fed = marker(secrets)?;
+    secrets.set_secret(&key, &fed);
     Ok(())
 }
 
@@ -6615,6 +6620,52 @@ mod tests {
         );
     }
 
+    /// #206 review: what `decide` records as fed is the held list's own
+    /// generation. A count written while the list's write was refused names
+    /// a generation the list never had; were that recorded, a later real
+    /// one (an eviction taking this store's scripts) would match it and the
+    /// store would not be fed again. Mutated red by recording the count's
+    /// generation.
+    #[test]
+    fn what_was_fed_is_the_lists_own_generation() {
+        use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
+        let mut f = fixture();
+        unpaid_orders_on(&mut f, 0..3, NOW - 1_000);
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        run(&mut f, std::slice::from_ref(&entry));
+        // A tab's addition whose list write the node refuses, after the
+        // count was written: count G+1, list G.
+        let held = DigestList::load(&f.secrets, PUBLISHED_KEY).unwrap();
+        let generation = held.generation();
+        f.secrets.refused_prefix = Some(PUBLISHED_KEY.to_vec());
+        assert!(crate::bitcoin::add_published(&mut f.secrets, &[vec![0x51, 0x20, 7]]).is_err());
+        assert_eq!(
+            crate::published_set::published_meta(&f.secrets).map(|(g, _)| g),
+            Some(generation + 1)
+        );
+        f.secrets.refused_prefix = None;
+        run(&mut f, std::slice::from_ref(&entry));
+        // A real G+1 that lost this store's scripts (an eviction).
+        let mut list = DigestList::empty();
+        let mut n = 0u32;
+        while list.generation() < generation + 1 {
+            list.insert(&[digest(&n.to_le_bytes())]);
+            n += 1;
+        }
+        assert_eq!(list.generation(), generation + 1);
+        crate::published_set::save_published(&mut f.secrets, &list);
+        assert!(!DigestList::load(&f.secrets, PUBLISHED_KEY)
+            .unwrap()
+            .contains(&digest(&script_at(0))));
+        run(&mut f, std::slice::from_ref(&entry));
+        assert!(
+            DigestList::load(&f.secrets, PUBLISHED_KEY)
+                .unwrap()
+                .contains(&digest(&script_at(0))),
+            "fed again"
+        );
+    }
+
     /// #206 review: a held published list the node will not write, or one
     /// that does not read, refuses the batch `CounterNotSaved` and invoices
     /// nothing; the status says so. Mutated red by going on when the
@@ -6882,8 +6933,8 @@ mod tests {
         );
         assert_eq!(
             f.secrets.reads_under(PUBLISHED_KEY),
-            looked_up + 1,
-            "read once, by the scan: the same scripts are not added again"
+            looked_up + 2,
+            "read twice (its generation, and the scan): the same scripts are not added again"
         );
         // The held list lost them (as an eviction would), at a later
         // generation.

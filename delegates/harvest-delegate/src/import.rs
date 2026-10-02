@@ -569,14 +569,14 @@ fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport
     };
     match held.insert_as_oldest(&incoming.digests()) {
         (0, _) => SecretImport::AlreadyAuthoritative,
-        // Said as it is: a list full of this delegate's own, newer, scripts
-        // keeps none of the predecessor's, which count as older (#206
-        // review). Nothing is written.
-        (_, 0) => SecretImport::Permanent(
-            "the held published scripts are full of newer ones, so the predecessor's (older) \
-             were not kept"
-                .into(),
-        ),
+        // A list full of this delegate's own, newer, scripts keeps none or
+        // only some of the predecessor's, which count as older: said as it
+        // is, and nothing written, rather than reported written (#206
+        // review).
+        (added, kept) if kept < added => SecretImport::Permanent(format!(
+            "the held published scripts are full of newer ones: only {kept} of the \
+             predecessor's {added} would be kept, so none were"
+        )),
         _ => written(crate::published_set::save_published(store, &held)),
     }
 }
@@ -1116,6 +1116,32 @@ mod tests {
             import_secret(&mut store, PUBLISHED_KEY, &value),
             SecretImport::Permanent(_)
         ));
+        assert_eq!(store.get_secret(PUBLISHED_KEY), before, "nothing written");
+    }
+
+    /// #206 review: an import into a nearly full list that would keep only
+    /// some of the predecessor's scripts keeps none and says so, rather than
+    /// reporting them written. Mutated red by writing what fits.
+    #[test]
+    fn a_partial_import_says_so_and_writes_nothing() {
+        use crate::published_set::{digest, DigestList, MAX_HELD, PUBLISHED_KEY};
+        let mut nearly = DigestList::empty();
+        let own: Vec<_> = (0..MAX_HELD as u32 - 1)
+            .map(|n| digest(&n.to_le_bytes()))
+            .collect();
+        nearly.insert(&own);
+        let mut store = MemSecrets::default();
+        crate::published_set::save_published(&mut store, &nearly);
+        let mut theirs = DigestList::empty();
+        theirs.insert(&[digest(b"a"), digest(b"b")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+        let before = store.get_secret(PUBLISHED_KEY);
+        match import_secret(&mut store, PUBLISHED_KEY, &value) {
+            SecretImport::Permanent(why) => assert!(why.contains("only 1 of"), "{why}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(store.get_secret(PUBLISHED_KEY), before, "nothing written");
     }
 
