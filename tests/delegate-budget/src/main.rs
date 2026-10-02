@@ -30,7 +30,7 @@ use ciborium::Value;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractNotification, DelegateContext,
-    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, WrappedState,
+    GetContractResponse, InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, WrappedState,
 };
 use harvest_common::bitcoin_delegate::BitcoinDelegateRequest;
 use harvest_common::delegate::{
@@ -100,24 +100,55 @@ struct Caps {
 /// renamed or reshaped constant fails the run rather than leaving a stale
 /// fixture size.
 fn delegate_cap(file: &str, name: &str) -> Result<usize> {
+    Ok(usize::try_from(delegate_const(file, name, "usize")?)?)
+}
+
+/// [`delegate_cap`] for a `u32` constant.
+fn delegate_u32(file: &str, name: &str) -> Result<u32> {
+    Ok(u32::try_from(delegate_const(file, name, "u32")?)?)
+}
+
+/// `const {name}: {ty} = ...;` in the delegate's `src/{file}`, evaluated: a
+/// sum of products of literals and the public constants named in
+/// [`known_const`]. Anything else fails the run.
+fn delegate_const(file: &str, name: &str, ty: &str) -> Result<u64> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../delegates/harvest-delegate/src")
         .join(file);
     let src = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let needle = format!("const {name}: usize = ");
+    let needle = format!("const {name}: {ty} = ");
     let found = src.matches(&needle).count();
     if found != 1 {
         bail!("{name} occurs {found} times in {file}, expected once: update the harness");
     }
     let rest = src.split(&needle).nth(1).unwrap_or_default();
-    rest.split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .replace('_', "")
-        .parse()
-        .with_context(|| format!("{name} in {file} is not a plain number"))
+    let expr = rest.split(';').next().unwrap_or_default();
+    expr.split('+')
+        .map(|term| {
+            term.split('*').try_fold(1u64, |acc, factor| {
+                let factor = factor.trim();
+                let value = match known_const(factor) {
+                    Some(v) => v,
+                    None => factor.replace('_', "").parse().with_context(|| {
+                        format!("{name} in {file} is not a sum of known terms: {factor}")
+                    })?,
+                };
+                Ok::<_, anyhow::Error>(acc * value)
+            })
+        })
+        .sum()
 }
+
+/// The constants a delegate constant may be written in terms of.
+fn known_const(name: &str) -> Option<u64> {
+    match name {
+        "MAX_ANCHOR_AGE_BLOCKS" => Some(harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS.into()),
+        _ => None,
+    }
+}
+
+/// The height of the tip the bridge publishes in this scenario.
+const TIP_HEIGHT: u32 = 250_000;
 
 /// The mailbox cap (`harvest_common::mailbox::MAX_MESSAGES`): the most
 /// distinct senders one `DeriveConversationKeys` can name.
@@ -184,6 +215,28 @@ impl Runner {
         let msg = InboundDelegateMsg::ContractNotification(ContractNotification {
             contract_id: ContractInstanceId::new(contract),
             new_state: WrappedState::new(state),
+            context: DelegateContext::default(),
+        });
+        let timing = self.time(None, &msg)?;
+        let outcome = self.host.call(None, &msg)?;
+        self.record(name, &outcome, timing);
+        outcome
+            .result
+            .map_err(|e| anyhow!("{name}: the delegate returned an error: {e}"))
+    }
+
+    /// The answer to a GET the delegate sent (here with no context: what an
+    /// arm's own tip read carries). Delivered with no origin, like a
+    /// notification.
+    fn get_answer(
+        &mut self,
+        name: &str,
+        contract: [u8; 32],
+        state: Vec<u8>,
+    ) -> Result<Vec<OutboundDelegateMsg>> {
+        let msg = InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id: ContractInstanceId::new(contract),
+            state: Some(WrappedState::new(state)),
             context: DelegateContext::default(),
         });
         let timing = self.time(None, &msg)?;
@@ -554,6 +607,19 @@ fn scenario(r: &mut Runner) -> Result<()> {
     let bridge = SigningKey::from_bytes(&[22u8; 32]);
     let bridge_id = freenet_bitcoin_common::BridgeId(bridge.verifying_key().to_bytes());
     let (mailbox_contract, tip_contract) = ([0x53u8; 32], [0x54u8; 32]);
+    // Every store trusts as many bridges as the delegate holds watch
+    // delegations for, so each delegation seeded below serves every store
+    // (`watch_delegation::armed_for`) and every walk of them does its work.
+    let max_delegations = delegate_cap("watch_delegation.rs", "MAX_DELEGATIONS")?;
+    let trusted: Vec<freenet_bitcoin_common::BridgeId> = std::iter::once(bridge_id)
+        .chain((1..max_delegations).map(|i| {
+            freenet_bitcoin_common::BridgeId(
+                SigningKey::from_bytes(&[22u8 + i as u8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            )
+        }))
+        .collect();
     r.app(
         "ArmAutoInvoice",
         cbor(&HarvestDelegateRequest::ArmAutoInvoice {
@@ -564,7 +630,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 seller_fingerprint: fingerprint.clone(),
                 network: BitcoinNetwork::Signet,
                 tip_contract_id: tip_contract,
-                trusted_bridges: vec![bridge_id],
+                trusted_bridges: trusted.clone(),
                 address_code_hash: [0x56; 32],
                 watched_scripts: watched.clone(),
                 watch_left_ms: 24 * 3600 * 1000,
@@ -608,7 +674,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                     seller_fingerprint: fingerprint.clone(),
                     network: BitcoinNetwork::Signet,
                     tip_contract_id: tip_contract,
-                    trusted_bridges: vec![bridge_id],
+                    trusted_bridges: trusted.clone(),
                     address_code_hash: [0x56; 32],
                     watched_scripts: watched.clone(),
                     watch_left_ms: 24 * 3600 * 1000,
@@ -619,11 +685,14 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "AutoInvoice",
         )?;
     }
-    r.app(
-        "GetWatchKey",
-        cbor(&HarvestDelegateRequest::GetWatchKey),
-        "WatchKey",
-    )?;
+    let watch_key = bytes32(field(
+        &r.app(
+            "GetWatchKey",
+            cbor(&HarvestDelegateRequest::GetWatchKey),
+            "WatchKey",
+        )?,
+        &["WatchKey", "result", "Ok"],
+    )?)?;
 
     // The bridge's tip contract changes: instant checkout caches the tip it
     // needs before it will issue anything (`auto_invoice::note_tip`).
@@ -633,7 +702,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         &freenet_bitcoin_common::TipEntryBody {
             network: BitcoinNetwork::Signet,
             anchor: freenet_bitcoin_common::BlockAnchor {
-                height: 250_000,
+                height: TIP_HEIGHT,
                 hash: freenet_bitcoin_common::BlockHash([0x61; 32]),
             },
             prev_hash: freenet_bitcoin_common::BlockHash([0x60; 32]),
@@ -651,10 +720,11 @@ fn scenario(r: &mut Runner) -> Result<()> {
         [tip],
     )
     .map_err(|e| anyhow!("tip state: {e}"))?;
+    let tip_bytes = freenet_bitcoin_common::to_cbor(&tip_state).map_err(|e| anyhow!("{e}"))?;
     r.notify(
         "ContractNotification: bridge tip",
         tip_contract,
-        freenet_bitcoin_common::to_cbor(&tip_state).map_err(|e| anyhow!("{e}"))?,
+        tip_bytes.clone(),
     )?;
     if !r
         .host
@@ -883,7 +953,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                     seller_fingerprint: fingerprint.clone(),
                     network: BitcoinNetwork::Signet,
                     tip_contract_id: tip_contract,
-                    trusted_bridges: vec![bridge_id],
+                    trusted_bridges: trusted.clone(),
                     address_code_hash: [0x56; 32],
                     watched_scripts: watched.clone(),
                     watch_left_ms: 24 * 3600 * 1000,
@@ -926,6 +996,219 @@ fn scenario(r: &mut Runner) -> Result<()> {
     if woke.is_empty() {
         bail!(
             "the heartbeat wake-up sent nothing: it returned early, so its cost was not measured"
+        );
+    }
+    // The same with every store's mailbox waiting to be re-read (the flag
+    // beside each ledger, `auto_invoice::retry_key`), which anyone can bring
+    // about by filling a mailbox: each flagged store is checked for whether
+    // it can take orders before its mailbox is asked for.
+    let gets = |out: &[OutboundDelegateMsg]| {
+        out.iter()
+            .filter(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_)))
+            .count()
+    };
+    let all_arms: Vec<[u8; 32]> = std::iter::once(store_contract)
+        .chain(extra_arms.iter().map(|(contract, _, _)| *contract))
+        .collect();
+    set_retry(r, &all_arms, true)?;
+    r.host.state.now += chrono::Duration::minutes(5);
+    let woke_waiting = r.background(
+        "Background: heartbeat wake-up (every mailbox waiting)",
+        &wakeup,
+    )?;
+    if gets(&woke_waiting) < gets(&woke) + all_arms.len() {
+        bail!(
+            "the wake-up with every mailbox waiting asked for {} more reads, not {}: some stores \
+             were not checked, so the cost was not measured",
+            gets(&woke_waiting).saturating_sub(gets(&woke)),
+            all_arms.len()
+        );
+    }
+    set_retry(r, &all_arms, false)?;
+
+    // --- delegated watches (`watch_delegation`) -------------------------------
+    // Every delegation the delegate holds, each for a bridge every store
+    // trusts and full: `WATCHED_CAP` confirmed watches that all count, in the
+    // delegate's own encoding (`watch_delegation::Held`, mirrored in
+    // `fixtures::full_delegation`). Each store's status and heartbeat walks
+    // every delegation's watches (`auto_invoice::watch_set`,
+    // `watch_delegation::delegated_watched`), and the wake-up looks at each
+    // delegation for a read (`watch_delegation::on_wakeup`).
+    let pool: Vec<Vec<u8>> = match field(
+        &r.app(
+            "PeekOrderAddresses (10, for the delegations)",
+            cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
+                request_id: 404,
+                count: harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
+            }),
+            "UpcomingAddresses",
+        )?,
+        &["UpcomingAddresses", "result", "Ok"],
+    )? {
+        Value::Array(items) => items
+            .iter()
+            .map(|a| {
+                field(a, &["script_pubkey"])?
+                    .deserialized::<serde_bytes_vec::ByteVec>()
+                    .map(|b| b.0)
+                    .context("script_pubkey")
+            })
+            .collect::<Result<_>>()?,
+        other => bail!("upcoming addresses: {}", brief(other)),
+    };
+    let delegation_caps = fixtures::DelegationCaps {
+        watched: delegate_cap("watch_delegation.rs", "WATCHED_CAP")?,
+        subscribed: delegate_cap("watch_delegation.rs", "SUBSCRIBED_CAP")?,
+        ever_subscribed: delegate_cap("watch_delegation.rs", "EVER_SUBSCRIBED_CAP")?,
+    };
+    if delegation_caps.watched < pool.len() {
+        bail!("WATCHED_CAP is below the delegate's next addresses: update the harness");
+    }
+    // Every watch counts for an invoice issued now (at least
+    // `WATCH_NEEDED_BLOCKS` past the tip) and is due renewal (inside
+    // `RENEW_MARGIN_BLOCKS` of that), so the wake-up goes on to choose a
+    // canary for a refill.
+    let until_height = TIP_HEIGHT
+        + delegate_u32("auto_invoice.rs", "WATCH_NEEDED_BLOCKS")?
+        + delegate_u32("watch_delegation.rs", "RENEW_MARGIN_BLOCKS")?
+        - 1;
+    let now_ms = r.host.state.now.timestamp_millis() as u64;
+    for (n, bridge) in trusted.iter().enumerate() {
+        r.host.state.secrets.insert(
+            format!(
+                "harvest:auto:watchdeleg:{}",
+                bs58::encode(bridge.0).into_string()
+            )
+            .into_bytes(),
+            cbor(&fixtures::full_delegation(
+                n as u32,
+                *bridge,
+                &ghost,
+                watch_key,
+                &pool,
+                until_height,
+                now_ms,
+                &delegation_caps,
+            )),
+        );
+    }
+    let delegations = format!(
+        "{max_delegations} delegations x {} watches",
+        delegation_caps.watched
+    );
+
+    // The tip read an arm asks for is answered: every store naming that tip
+    // contract is told its status again, each with its delegation's
+    // (`auto_invoice::on_tip_read`).
+    let statuses = r.get_answer(
+        &format!("GetContractResponse: bridge tip ({delegations})"),
+        tip_contract,
+        tip_bytes,
+    )?;
+    let mut counted = 0;
+    for m in &statuses {
+        if let OutboundDelegateMsg::ApplicationMessage(a) = m {
+            let status: Value = ciborium::from_reader(a.payload.as_slice())
+                .context("a status sent on the tip read is not CBOR")?;
+            if status_watched(&status)? == pool.len() as i128 {
+                counted += 1;
+            }
+        }
+    }
+    if counted != all_arms.len() {
+        bail!(
+            "{counted} of the {} store statuses sent on the tip read counted the delegation's watches: \
+             the seeded delegations were not read, so their cost was not measured",
+            all_arms.len()
+        );
+    }
+    // A re-arm answers one store's status.
+    if let Some((contract, store_key, mailbox)) = extra_arms.first() {
+        let status = r.app(
+            &format!("ArmAutoInvoice (re-arm, {delegations})"),
+            cbor(&HarvestDelegateRequest::ArmAutoInvoice {
+                arm: Box::new(AutoInvoiceArm {
+                    store_contract_id: contract.to_vec(),
+                    store_verifying_key: *store_key,
+                    mailbox_contract_id: *mailbox,
+                    seller_fingerprint: fingerprint.clone(),
+                    network: BitcoinNetwork::Signet,
+                    tip_contract_id: tip_contract,
+                    trusted_bridges: trusted.clone(),
+                    address_code_hash: [0x56; 32],
+                    watched_scripts: watched.clone(),
+                    watch_left_ms: 24 * 3600 * 1000,
+                    watched_until_height: None,
+                    presence_contract_id: Some([0x57; 32]),
+                }),
+            }),
+            "AutoInvoice",
+        )?;
+        if status_watched(&status)? != pool.len() as i128 {
+            bail!(
+                "the re-arm's status counted {} delegated watches, not {}",
+                status_watched(&status)?,
+                pool.len()
+            );
+        }
+    }
+    r.app(
+        &format!("Heartbeat (forced, {delegations})"),
+        cbor(&HarvestDelegateRequest::Heartbeat {
+            store_contract_id: store_contract.to_vec(),
+            force: true,
+        }),
+        "Heartbeat",
+    )?;
+    // The wake-up's own read goes first: a canary candidate's GET, which only
+    // a delegation found due a refill gets (`watch_delegation::due_read`).
+    let canary_read = |out: &[OutboundDelegateMsg]| {
+        out.first().is_some_and(|m| match m {
+            OutboundDelegateMsg::GetContractRequest(get) => {
+                ciborium::from_reader::<Value, _>(get.context.as_ref())
+                    .ok()
+                    .and_then(|c| field(&c, &["kind"]).ok().cloned())
+                    == Some(Value::Text("Canary".into()))
+            }
+            _ => false,
+        })
+    };
+    r.host.state.now += chrono::Duration::minutes(5);
+    let woke_deleg = r.background(
+        &format!("Background: heartbeat wake-up ({delegations})"),
+        &wakeup,
+    )?;
+    if !canary_read(&woke_deleg) {
+        bail!(
+            "the wake-up with {delegations} sent no canary read: it did not walk the \
+             delegations to a read, so its cost was not measured"
+        );
+    }
+    set_retry(r, &all_arms, true)?;
+    r.host.state.now += chrono::Duration::minutes(5);
+    let woke_deleg_waiting = r.background(
+        &format!("Background: heartbeat wake-up ({delegations}, every mailbox waiting)"),
+        &wakeup,
+    )?;
+    if !canary_read(&woke_deleg_waiting)
+        || gets(&woke_deleg_waiting) < gets(&woke_deleg) + all_arms.len()
+    {
+        bail!(
+            "the wake-up with {delegations} and every mailbox waiting did not read for a \
+             delegation and check every store, so its cost was not measured"
+        );
+    }
+    set_retry(r, &all_arms, false)?;
+    // A node start forgets every delegation's subscriptions, rewriting each.
+    r.background(
+        &format!("Background: NodeStarted ({delegations})"),
+        &[0x0a, 0, 0, 0, 1, 0, 0, 0, 0],
+    )?;
+    let rewritten = r.measured.last().map_or(0, |m| m.host_writes);
+    if rewritten < max_delegations as u64 {
+        bail!(
+            "the node start rewrote {rewritten} secrets, fewer than the {max_delegations} \
+             delegations: it did not walk them, so its cost was not measured"
         );
     }
 
@@ -1231,6 +1514,53 @@ fn count_array_somewhere(v: &Value) -> usize {
 }
 
 /// How many message digests the instant-checkout ledger records as read.
+/// Flag every store's mailbox as waiting to be re-read, or clear the flag:
+/// in the ledger (`Ledger::retry_pending`, which every generation keeps and
+/// main's wake-up reads) and beside it (`auto_invoice::retry_key`, which a
+/// generation since #206 reads instead of decoding every ledger), so the
+/// state is the one the delegate itself writes and either generation sees it.
+fn set_retry(r: &mut Runner, stores: &[[u8; 32]], waiting: bool) -> Result<()> {
+    for contract in stores {
+        let id = bs58::encode(contract).into_string();
+        let ledger_key = format!("harvest:auto:ledger:{id}").into_bytes();
+        let bytes = r
+            .host
+            .state
+            .secrets
+            .get(&ledger_key)
+            .ok_or_else(|| anyhow!("store {id} has no ledger to flag"))?;
+        let mut ledger: Value =
+            ciborium::from_reader(bytes.as_slice()).context("a ledger is not CBOR")?;
+        let Value::Map(fields) = &mut ledger else {
+            bail!("a ledger is not a map: update the harness");
+        };
+        let flag = fields
+            .iter_mut()
+            .find(|(k, _)| matches!(k, Value::Text(t) if t == "retry_pending"))
+            .ok_or_else(|| anyhow!("a ledger has no retry_pending: update the harness"))?;
+        flag.1 = Value::Bool(waiting);
+        r.host.state.secrets.insert(ledger_key, cbor(&ledger));
+        r.host.state.secrets.insert(
+            format!("harvest:auto:retry:{id}").into_bytes(),
+            if waiting { b"1" } else { b"0" }.to_vec(),
+        );
+    }
+    Ok(())
+}
+
+/// The `watched` count of the watch delegation an `AutoInvoice` status
+/// reports: the delegation's watches that cover the delegate's next
+/// addresses (`watch_delegation::status_of`).
+fn status_watched(status: &Value) -> Result<i128> {
+    match field(
+        status,
+        &["AutoInvoice", "result", "Ok", "watch_delegation", "watched"],
+    )? {
+        Value::Integer(i) => Ok(i128::from(*i)),
+        other => bail!("the status reports no delegated watches: {}", brief(other)),
+    }
+}
+
 fn ledger_seen(r: &Runner, key: &str) -> Result<usize> {
     let bytes = r
         .host

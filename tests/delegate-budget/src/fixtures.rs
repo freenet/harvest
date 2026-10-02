@@ -285,3 +285,184 @@ pub fn full_ledger(
         retry_pending: false,
     }
 }
+
+/// A byte string CBOR-encoded as one (`serialize_bytes`), as
+/// `freenet_bitcoin_inbox::ByteBuf` encodes, rather than as an array of
+/// integers, which is how a plain `Vec<u8>` encodes.
+struct Bytes(Vec<u8>);
+
+impl serde::Serialize for Bytes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.0)
+    }
+}
+
+/// `freenet_bitcoin_inbox::Delegation`.
+#[derive(serde::Serialize)]
+struct Delegation {
+    scoped_payload: Bytes,
+    signature: Bytes,
+}
+
+/// `freenet_bitcoin_inbox::DelegationBody`. Its `watch_key` is a
+/// `WatchKeyId`, which encodes as `BridgeId` does (32 bytes, as a byte
+/// string: `impl_bytes32_serde!`).
+#[derive(serde::Serialize)]
+struct DelegationBody {
+    bridge: BridgeId,
+    watch_key: BridgeId,
+    issued_mainnet_height: u32,
+    expires_mainnet_height: Option<u32>,
+}
+
+/// `freenet_bitcoin_inbox::DELEGATION_DOMAIN`: the prefix of what the Ghost
+/// Key signs for a delegation.
+const DELEGATION_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-watch-delegation/v1\0";
+
+/// A watch delegation as the Harvest delegate holds it
+/// (`delegates/harvest-delegate/src/watch_delegation.rs`, `Held`, `Watched`): a
+/// crate-private type, mirrored field for field, as [`Ledger`] is. A drift is
+/// caught where it is used (each status must count the delegation's watches,
+/// and the wake-up must read for it), not silently.
+#[derive(serde::Serialize)]
+struct Held {
+    network: BitcoinNetwork,
+    bridge: BridgeId,
+    ghostkey: [u8; 32],
+    certificate_pem: String,
+    delegation: Delegation,
+    issued_mainnet_height: u32,
+    inbox_contract_id: [u8; 32],
+    ui_made_at_ms: u64,
+    own_made_at_ms: u64,
+    outstanding: Option<()>,
+    unconfirmed: Option<()>,
+    watched: Vec<Watched>,
+    failures: u32,
+    last_failure_ms: Option<u64>,
+    last_read_ms: u64,
+    last_probe_ms: Option<u64>,
+    canary: Option<()>,
+    canary_next: u32,
+    canary_tries: u32,
+    defer_until_ms: Option<u64>,
+    subscribed: Vec<([u8; 32], u64)>,
+    subscribing: Vec<[u8; 32]>,
+    ever_subscribed: Vec<[u8; 32]>,
+}
+
+#[derive(serde::Serialize)]
+struct Watched {
+    script: Vec<u8>,
+    until_height: u32,
+    canary: Vec<u8>,
+    canary_contract: [u8; 32],
+    canary_index: u32,
+}
+
+/// The delegation caps a seeded delegation is filled to.
+pub struct DelegationCaps {
+    pub watched: usize,
+    pub subscribed: usize,
+    pub ever_subscribed: usize,
+}
+
+/// A P2WPKH-shaped script no wallet here derives.
+fn script(tag: u8, n: u32, i: usize) -> Vec<u8> {
+    let mut s = vec![0x00, 0x14];
+    s.extend_from_slice(&id32(tag, n, i)[..20]);
+    s
+}
+
+/// The `n`th watch delegation, for `bridge`, held at its caps: `caps.watched`
+/// confirmed watches that all count for an invoice issued now, the
+/// delegate's next addresses (`pool`) last (the newest, as requests add
+/// them), with older addresses before them.
+///
+/// What makes a watch count (`watch_delegation::covers`, `vouched`): its
+/// horizon is at least `WATCH_NEEDED_BLOCKS` past the tip, and its canary
+/// can still vouch for it: an index past the pool (the counter plus
+/// `MAX_UPCOMING_ADDRESSES`) and a script no arm names. Each horizon is
+/// `until_height`, which the caller puts short of the renewal margin, so the
+/// wake-up also finds the delegation due a refill and goes on to choose a
+/// canary: its longest path.
+///
+/// The delegation is genuine (the Ghost Key's signature over the body naming
+/// `bridge` and `watch_key`, as the vault signs it); the certificate is the
+/// repository's fixture. Neither is checked on the paths measured with it
+/// (only `SetWatchDelegation` and sending a request check them), so they are
+/// here for their size.
+#[allow(clippy::too_many_arguments)]
+pub fn full_delegation(
+    n: u32,
+    bridge: BridgeId,
+    ghost: &SigningKey,
+    watch_key: [u8; 32],
+    pool: &[Vec<u8>],
+    until_height: u32,
+    now_ms: u64,
+    caps: &DelegationCaps,
+) -> impl serde::Serialize {
+    let issued = 900_000;
+    let mut payload = DELEGATION_DOMAIN.to_vec();
+    payload.extend(
+        freenet_bitcoin_common::to_cbor(&DelegationBody {
+            bridge,
+            watch_key: BridgeId(watch_key),
+            issued_mainnet_height: issued,
+            expires_mainnet_height: None,
+        })
+        .expect("encode delegation body"),
+    );
+    let (scoped, signature) = vault_sign(ghost, payload);
+    // Past any pool and any arm's addresses, as `next_canary` chooses them.
+    let canary_base = 1_000 + n * caps.watched as u32;
+    let older = caps.watched.saturating_sub(pool.len());
+    let scripts = (0..older)
+        .map(|i| script(0xB0, n, i))
+        .chain(pool.iter().cloned());
+    Held {
+        network: BitcoinNetwork::Signet,
+        bridge,
+        ghostkey: ghost.verifying_key().to_bytes(),
+        certificate_pem: include_str!("../../fixtures/ghostkey-certificate.pem").into(),
+        delegation: Delegation {
+            scoped_payload: Bytes(scoped),
+            signature: Bytes(signature),
+        },
+        issued_mainnet_height: issued,
+        inbox_contract_id: id32(0xB1, n, 0),
+        ui_made_at_ms: now_ms - 3_600_000,
+        own_made_at_ms: now_ms - 3_600_000,
+        outstanding: None,
+        unconfirmed: None,
+        watched: scripts
+            .take(caps.watched)
+            .enumerate()
+            .map(|(i, script_pubkey)| Watched {
+                script: script_pubkey,
+                until_height,
+                canary: script(0xB2, n, i),
+                canary_contract: id32(0xB3, n, i),
+                canary_index: canary_base + i as u32,
+            })
+            .collect(),
+        failures: 0,
+        last_failure_ms: None,
+        // Distinct, so which delegation a wake-up reads is fixed.
+        last_read_ms: now_ms - 3_600_000 - u64::from(n),
+        // Probed just now: the wake-up goes past the probe to the refill.
+        last_probe_ms: Some(now_ms),
+        canary: None,
+        canary_next: canary_base + caps.watched as u32,
+        canary_tries: 0,
+        defer_until_ms: None,
+        subscribed: (0..caps.subscribed)
+            .map(|i| (id32(0xB4, n, i), now_ms - 3_600_000))
+            .collect(),
+        subscribing: Vec::new(),
+        ever_subscribed: (0..caps.ever_subscribed)
+            .map(|i| id32(0xB5, n, i))
+            .collect(),
+    }
+}

@@ -100,6 +100,7 @@ constant fails the run.
 | `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
 | tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
 | a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. **Over budget today**: see below |
+| the watch delegations at their caps (`MAX_DELEGATIONS`, each with `WATCHED_CAP` watches that all count, and its subscription lists full), seeded straight into the secret store in the delegate's own encoding, for bridges every store trusts; then the tip read's answer (every store's status), a re-arm, a forced `Heartbeat`, the wake-up (also with every mailbox waiting) and `NodeStarted` | every store's status and heartbeat walks every delegation's watches, and the wake-up looks at each delegation for its one read. The harness checks every status counts the delegation's watches, that the wake-up went on to a canary read, and that the node start rewrote every delegation |
 | `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass |
 | `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap; the harness checks 256 come back |
 | `KeepPurchase` (paid, genuine SPV proof) into an empty store, then 1022 seeded straight into the secret store in the delegate's own encoding, then `KeepPurchase` of the 1024th at the last conversation, then `ListKeptPurchases (1024)` | the kept-purchase cap. A keep ends by listing everything kept, so a keep into a full store is its worst case. The harness checks all 1024 come back |
@@ -163,13 +164,17 @@ filled:
 | call | fuel | share of budget |
 |---|---:|---:|
 | mailbox notification at the byte cap | 10,389,656,844 | **259.7%, over** |
+| heartbeat wake-up, 8 full watch delegations | 105,657,572,367 | **2641.4%, over** |
+| tip read answered, 8 full watch delegations | 100,994,539,412 | **2524.9%, over** |
+| `ArmAutoInvoice`, 8 full watch delegations | 6,325,868,100 | **158.1%, over** |
+| forced `Heartbeat`, 8 full watch delegations | 6,132,699,703 | **153.3%, over** |
 | `ExportSecrets`, 16 full ledgers | 7,973,492,968 | **199.3%, over** |
 | heartbeat wake-up, 16 full ledgers | 7,549,169,942 | **188.7%, over** |
 | `KeepPurchase`, the 1024th | 3,192,943,691 | 79.8% |
 | mailbox notification, 512 short messages | 3,189,562,696 | 79.7% |
 | `ListKeptPurchases (1024)` | 2,906,368,755 | 72.7% |
 
-**The three over-budget rows are real findings, not harness artefacts.**
+**The over-budget rows are real findings, not harness artefacts.**
 
 * The byte-cap mailbox: any buyer can fill a store's mailbox this way, and
   instant checkout's first scan of it does 2.6x the budget. Part of the cost
@@ -181,6 +186,13 @@ filled:
   twice). A busy seller's ledgers reach these caps over weeks of instant
   orders, and the wake-up runs every few minutes: if it runs past the node's
   limit, heartbeats stop and the store reads as closed.
+* Every store's status and heartbeat decodes every delegation and, per
+  watch, the payment key and every arm (`watch_delegation::vouched`), so the
+  work grows as stores x delegations x watches x stores. A seller who has
+  delegated watching for a few bridges gets there by using it: the watches
+  accumulate as addresses are refilled. #216 reads the payment key and the
+  arms once per delegation (`Vouching`): the wake-up drops to 6,059,777,768
+  (151.5%) and the tip read to 11,308,954,105 (282.7%), still over.
 
 The fixes are in the delegate (digest once; bound the messages opened per
 notification; keep less per arm, or read only what a run needs), so they are
@@ -191,13 +203,18 @@ with a collection, and at its cap the top three use 73-80% of the budget.
 
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
-makes today is 17 (the wake-up and the export, one per arm).
+makes today is 18 (the wake-up with watch delegations: one per arm, and the
+delegation it reads for).
 
 ## What it does not cover
 
 * **Handlers not driven**:
   * `SetWatchDelegation` and `UpdateWatchDelegation` need a Ghost Key
-    certificate; so the delegated-watch part of the wake-up does no work here.
+    certificate under Freenet's authority. The delegations are seeded
+    instead: the delegation is signed by the Ghost Key as the vault signs it,
+    and the certificate is `tests/fixtures/ghostkey-certificate.pem`, which
+    the paths measured never check. A wake-up that SENDS a watch request
+    (signs an inbox entry) is not driven.
   * The instant-checkout decide path: the store GET answer that decides a
     batch of up to 16 instant orders (`auto_invoice::on_store_state`,
     `decide`), and the store UPDATE answer. This is the largest unmeasured
