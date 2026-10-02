@@ -159,6 +159,15 @@ pub struct DerivedAddress {
 /// the delegate's `apply_published_floor`.
 pub const PUBLISHED_INDEX_GAP: u32 = 100;
 
+/// How the delegate's `Err` starts when a `SetPaymentXpub` or
+/// `DeriveOrderAddress` was left short of the seller's published orders
+/// (harvest#206): its scan derives a bounded number of addresses a call and
+/// keeps the count it reached. Then comes the count reached, in decimal, then
+/// `;` and a sentence for a person. The UI recognises the answer by this
+/// prefix, asks again by itself, and shows the count as progress; nothing
+/// was handed out or set.
+pub const CATCHING_UP_PREFIX: &str = "catching up at ";
+
 /// Requests the UI sends the delegate about Bitcoin payments.
 ///
 /// `Debug` is written by hand so `SetPaymentXpub` can redact its xpub; see

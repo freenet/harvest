@@ -550,22 +550,40 @@ fn invoices_issued_by(
 /// The payout wallet, as My store > Settings shows it.
 #[component]
 pub fn PayoutWallet() -> Element {
-    let (xpub, xpub_loaded) = {
+    let (xpub, xpub_loaded, catching_up) = {
         let state = APP_STATE.read();
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
+            state.catch_up_line(),
         )
     };
     rsx! {
-        PaymentKeyPanel { xpub, xpub_loaded }
+        PaymentKeyPanel { xpub, xpub_loaded, catching_up }
     }
 }
 
-/// Show the configured payment key, or take one.
+/// Show the configured payment key, or take one. While the delegate is
+/// catching its address count up with the seller's earlier orders
+/// (harvest#206), says so: a key entered then is not in use until it has.
 #[component]
-fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded: bool) -> Element {
+fn PaymentKeyPanel(
+    xpub: Option<harvest_common::PaymentXpubStatus>,
+    xpub_loaded: bool,
+    catching_up: Option<String>,
+) -> Element {
     let mut editing = use_signal(|| false);
+
+    if let Some(line) = catching_up {
+        return rsx! {
+            p { class: "text-muted text-italic", "{line}" }
+            p { class: "text-muted",
+                "Harvest is checking which addresses from your key your stores' orders \
+                 already use, a few hundred at a time, and carries on by itself. There is \
+                 nothing you need to do. A new key is used once this has finished."
+            }
+        };
+    }
 
     // Not "no key configured" -- we have not asked yet. Prompting here would
     // tell a seller who already has one that they do not.
