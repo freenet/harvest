@@ -84,8 +84,8 @@ pub struct ListingImage {
     /// The photo's average colour, shown while it loads or if it never does.
     pub colour: [u8; 3],
     /// What the photo shows, for screen readers. Optional; at most
-    /// [`MAX_ALT_CHARS`] characters, none of them a control, direction or
-    /// zero-width character.
+    /// [`MAX_ALT_CHARS`] characters, none of them a control, a direction
+    /// override or an invisible format character (see `is_hidden_char`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub alt: String,
 }
@@ -164,20 +164,37 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
     None
 }
 
-/// A character that does not show as itself: a control (newlines included),
-/// a direction override or isolate, or a zero-width character. Each lets a
-/// description display, or be read aloud, as something other than what it
-/// says.
+/// A character that hides or rewrites what a description says: a control
+/// (newlines included), a direction override or isolate (which reorder the
+/// text around them), or an invisible character with no job in ordinary
+/// writing (soft hyphen, combining grapheme joiner, zero-width space, word joiner and invisible operators, BOM, the
+/// Mongolian vowel separator, the deprecated format characters, Hangul
+/// fillers, interlinear annotation marks). Each lets a description display,
+/// or be read aloud, as something other than what it says.
+///
+/// Deliberately ALLOWED, because real writing needs them: the zero-width
+/// joiner and non-joiner (emoji sequences such as families and the rainbow
+/// flag; Persian and several Indic scripts), the left-to-right, right-to-left
+/// and Arabic letter marks (mixed-direction text), variation selectors, and
+/// tag characters (subdivision flags). Changing this set changes what the
+/// store contract accepts, so it is a re-key.
 fn is_hidden_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061C}'
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{115F}'
+                | '\u{1160}'
                 | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
+                | '\u{200B}'
                 | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{3164}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
         )
 }
 
