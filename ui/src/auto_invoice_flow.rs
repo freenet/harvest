@@ -33,9 +33,11 @@
 //! its bridge watch requests to the delegate's watch key
 //! ([`AppState::plan_watch_delegation`]): the vault signs a
 //! `freenet_bitcoin_inbox::DelegationBody` and the delegate keeps it
-//! (`SetWatchDelegation`). From then on the delegate asks the bridge to watch
-//! its next addresses itself, on its five-minute wake-ups, so the store keeps
-//! taking orders with Harvest closed. This tab keeps the delegate told which
+//! (`SetWatchDelegation`). From then on the delegate keeps the bridge
+//! watching the addresses this tab armed (the window it read clear) itself,
+//! on its five-minute wake-ups, so the store keeps taking orders with Harvest
+//! closed until that window is used; it never watches or invoices past it
+//! (harvest#198). This tab keeps the delegate told which
 //! inbox the bridge serves and the latest `made_at_ms` it has sent
 //! (`UpdateWatchDelegation`), and dates its own requests above the
 //! delegate's: the two share one timeline per Ghost Key.
@@ -439,13 +441,11 @@ impl AppState {
     /// delegation with it (a re-key or a new device), so the case #183 hit
     /// has nothing to withdraw at first.
     ///
-    /// Nor can it see past the window. Once the window is clear and the
-    /// delegation sent, the delegate watches and invoices from its own
-    /// counter onward, past the ten addresses read here (with the tab closed,
-    /// or between two re-reads). A lost counter whose old history has ten or
-    /// more unpaid addresses before a paid one reads clear here and the
-    /// delegate can then reach the paid one. Closing that needs the delegate
-    /// to read addresses itself: harvest#198.
+    /// The delegate does not reach past the window (harvest#198): its own
+    /// delegated watches count only for scripts an arm names, and it renews
+    /// only those, so with the tab closed instant checkout stops at the end
+    /// of the window read here (its heartbeat then says not taking orders)
+    /// rather than invoicing an address nobody read.
     fn current_upcoming(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let (network, upcoming) = self.upcoming_unvetted()?;
         // Read under the address contract an order would name NOW: a verdict

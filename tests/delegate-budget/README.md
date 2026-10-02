@@ -302,6 +302,15 @@ digests), `NoteBuyerSent` and `MarkConversationSeen` under 0.1%; with every
 store's seller digests at their cap (1,024 each, 64 stores):
 `NoteSellerSent` under 0.1%, `ListSellerSent (1024)` 0.6%.
 
+harvest#198 on the same branch raises the window (`MAX_UPCOMING_ADDRESSES`)
+from 10 to 25, so every call that derives it costs more: `ArmAutoInvoice`
+2.2% to 5.4%, `PeekOrderAddresses` 2.1% to 5.3%, the tip read with full
+delegations 20.3% to 24.2%, the plain heartbeat wake-up 15.2% to 18.9%.
+The wake-up with full delegations first doubled (61.5% to 122.9%, over),
+because each delegation derived the window twice; it is now derived once
+per wake-up for every delegation, and that row is 43.9% (the catch-up
+wake-ups 50.3-53.4%, from 74.4-76.2%).
+
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
 makes today is 18 (the wake-up with watch delegations: one per arm, and the

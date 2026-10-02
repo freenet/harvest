@@ -40,7 +40,10 @@
 //!   watch outlasts the invoice's payment window: one the seller's UI had
 //!   watched (see [`AutoInvoiceArm`]), or one this delegate asked for itself
 //!   with the watch key the seller's Ghost Key delegated to it
-//!   (`crate::watch_delegation`); see [`WatchSet`]. Without this a payment
+//!   (`crate::watch_delegation`), and that only for a script the arm names
+//!   (harvest#198: the tab arms only a window whose address contracts it
+//!   read clear, so nothing is invoiced on an address nobody read); see
+//!   [`WatchSet`]. Without this a payment
 //!   made before the seller next opened Harvest would never be seen, because
 //!   the bridge does not look back (freenet-bitcoin#7).
 //!
@@ -1636,8 +1639,18 @@ fn watch_set_in(
         (Some(until), Some(tip)) => tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) <= until,
         _ => true,
     };
+    // The delegation renews, it does not extend (harvest#198): its watches
+    // count only for a script this store's arm names. The tab arms only a
+    // window whose address contracts it has read clear, so nothing the
+    // delegate invoices on is an address nobody read; with the tab closed
+    // the store stops at the end of that window (`NoWatchedAddress`, and its
+    // heartbeat says so) rather than invoicing addresses past it.
     let delegated = tip.map_or_else(Vec::new, |tip| {
-        delegations.watched(arm.network, &arm.trusted_bridges, tip.anchor.height)
+        delegations
+            .watched(arm.network, &arm.trusted_bridges, tip.anchor.height)
+            .into_iter()
+            .filter(|(script, _)| arm.watched_scripts.contains(script))
+            .collect()
     });
     WatchSet {
         arm_time_live,
@@ -5752,8 +5765,9 @@ mod tests {
             .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(_))));
     }
 
-    /// I7's second source, end to end: the tab's watch has lapsed and named
-    /// nothing, the delegate's own delegated Watch is sent, read by the bridge
+    /// I7's second source, end to end: the tab's own watch of the window it
+    /// armed (read clear) has lapsed, the delegate's own delegated Watch is
+    /// sent, read by the bridge
     /// (a real removal in a real inbox), and the next Buy now is then invoiced
     /// on the first address it named. Before the removal, and once the tip
     /// nears the horizon asked for, the store waits for the seller instead.
@@ -5765,7 +5779,17 @@ mod tests {
         use crate::watch_delegation::test_support as wd;
         let mut secrets = wd::delegated();
         let record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
-        assert!(record.arm.watched_scripts.is_empty() && record.watched_until_ms <= NOW);
+        assert!(
+            record.watched_until_ms <= NOW,
+            "the tab's own watch has lapsed"
+        );
+        assert_eq!(
+            record.arm.watched_scripts,
+            (0..harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES)
+                .map(script_at)
+                .collect::<Vec<_>>(),
+            "the window the tab read clear"
+        );
         let base = fixture();
         let mut f = Fixture {
             secrets: MemSecrets::default(),
@@ -5795,7 +5819,14 @@ mod tests {
             NOW,
             &upcoming(&f.secrets)
         ));
-        wd::wake_and_scan(&mut f.secrets, &script_at(20), Some(wd::TIP), NOW + 600_000);
+        let first_canary = harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES
+            + crate::watch_delegation::CANARY_MARGIN;
+        wd::wake_and_scan(
+            &mut f.secrets,
+            &script_at(first_canary),
+            Some(wd::TIP),
+            NOW + 600_000,
+        );
         assert!(taking_orders(
             &f.secrets,
             &f.record,
@@ -5804,8 +5835,9 @@ mod tests {
         ));
         let status = status_of(&f.secrets, &f.record, NOW);
         assert_eq!(status.paused, None);
-        assert_eq!(status.watched_remaining, 10);
-        assert!(status.watch_delegation.is_some_and(|d| d.watched == 10));
+        let pool = harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES;
+        assert_eq!(status.watched_remaining, pool);
+        assert!(status.watch_delegation.is_some_and(|d| d.watched == pool));
         let ok = run(&mut f, &[buyer.request(&jam(), 1, 2, 12_000)]);
         assert_eq!(ok.orders.len(), 1, "{:?}", ok.refused);
         assert_eq!(ok.orders[0].order.payment_script_pubkey, script_at(0));
@@ -5817,22 +5849,91 @@ mod tests {
         assert_eq!(near.refused[0].1, Refusal::WatchLapsed);
     }
 
-    /// With the tab's watch live, a next address only the delegate had
-    /// watched is invoiced too: the two sources are one set. Mutated red by
-    /// dropping the delegated source from `WatchSet::accepts`.
+    /// harvest#198: a delegated watch counts only for a script the store's
+    /// arm names. The delegate has the next addresses watched, but the arm
+    /// names another window (another key's, say, after an A to B to A key
+    /// change, until the tab re-reads and re-arms), and the tab's own watch
+    /// has lapsed: nothing is invoiced, the refusal is `WatchLapsed` (no
+    /// watch counts for this store), and the heartbeat says not taking
+    /// orders. Once the arm names the window, the delegate's watch of the
+    /// next address is what invoices it. Mutated red by dropping the arm
+    /// filter in `watch_set_in`, and the delegated source from
+    /// `WatchSet::accepts`.
     #[test]
-    fn the_tabs_and_the_delegates_watches_are_one_set() {
+    fn a_delegated_watch_counts_only_for_a_script_the_arm_names() {
         use crate::watch_delegation::test_support as wd;
         let mut secrets = wd::delegated();
         wd::send_read_confirm(&mut secrets, wd::TIP, NOW);
         let mut f = fixture();
         f.secrets = secrets;
         f.record.arm.trusted_bridges = vec![wd::bridge()];
-        // The tab watches index 1 only; index 0 is the delegate's.
-        f.record.arm.watched_scripts = vec![script_at(1)];
-        let decided = run(&mut f, &[Buyer::new(81).request(&jam(), 1, 1, 12_000)]);
+        f.record.watched_until_ms = NOW;
+        f.record.arm.watched_scripts = (100..110).map(script_at).collect();
+        let entry = Buyer::new(81).request(&jam(), 1, 1, 12_000);
+        let refused = run(&mut f, std::slice::from_ref(&entry));
+        assert!(refused.orders.is_empty());
+        assert_eq!(refused.refused[0].1, Refusal::WatchLapsed);
+        assert_eq!(counter(&f), 0);
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::WatchLapsed.explain()), false)
+        );
+        f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        let decided = run(&mut f, &[entry]);
         assert_eq!(decided.orders.len(), 1, "{:?}", decided.refused);
         assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(0));
+    }
+
+    /// harvest#183 / #198 with the tab closed: the counter was reset over a
+    /// history whose paid address lies past the window the tab read clear.
+    /// The tab armed the window (0..10); the delegate also holds credits for
+    /// the addresses past it (from refills before the reset). Ten sales use
+    /// the window; the eleventh is refused (`NoWatchedAddress`, and the
+    /// heartbeat says so) and index 10 is never issued, however many
+    /// wake-ups run, since the refill asks only for armed scripts. Mutated
+    /// red by dropping either filter.
+    #[test]
+    fn the_183_scenario_with_the_tab_closed() {
+        use crate::watch_delegation::test_support as wd;
+        let mut secrets = wd::delegated();
+        let until = wd::TIP + crate::watch_delegation::REQUEST_AHEAD_BLOCKS;
+        wd::confirm_watched(
+            &mut secrets,
+            &(0..30).map(script_at).collect::<Vec<_>>(),
+            until,
+        );
+        let mut f = fixture();
+        f.secrets = secrets;
+        f.record.arm.trusted_bridges = vec![wd::bridge()];
+        f.record.watched_until_ms = NOW;
+        f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        save(
+            &mut f.secrets,
+            &arm_key(&f.record.arm.store_contract_id),
+            &f.record,
+        );
+        for i in 0..10u8 {
+            let decided = run(&mut f, &[Buyer::new(100 + i).request(&jam(), 1, i, 12_000)]);
+            assert_eq!(decided.orders.len(), 1, "sale {i}: {:?}", decided.refused);
+            assert_eq!(
+                decided.orders[0].order.payment_script_pubkey,
+                script_at(u32::from(i))
+            );
+        }
+        let eleventh = run(&mut f, &[Buyer::new(120).request(&jam(), 1, 1, 12_000)]);
+        assert!(eleventh.orders.is_empty());
+        assert_eq!(eleventh.refused[0].1, Refusal::NoWatchedAddress);
+        assert_eq!(counter(&f), 10, "index 10 never issued");
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::NoWatchedAddress.explain()), false)
+        );
+        let h = wd::held(&f.secrets);
+        assert!(
+            crate::watch_delegation::refill_scripts_for_test(&f.secrets, &h, wd::TIP, NOW)
+                .is_empty(),
+            "nothing past the window is asked for"
+        );
     }
 
     /// Without a tip the reason given is `NoFreshTip`, not a lapsed watch:
@@ -5876,6 +5977,8 @@ mod tests {
             u2,
         );
         wd::set_counter(&mut secrets, 6);
+        // The tab armed the window from the counter.
+        wd::arm_window(&mut secrets, 6);
         let record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
         let status = status_of(&secrets, &record, NOW);
         assert_eq!(status.watched_remaining, 10);
@@ -5895,7 +5998,7 @@ mod tests {
         );
         wd::set_counter(&mut secrets, 6);
         let mut record: ArmRecord = load(&secrets, &arm_key(&[1; 32])).unwrap();
-        record.arm.watched_scripts = (6..10).map(script_at).collect();
+        record.arm.watched_scripts = (6..16).map(script_at).collect();
         record.watched_until_ms = NOW + WATCH_NEEDED_MS + 60_000;
         assert_eq!(status_of(&secrets, &record, NOW).watched_remaining, 10);
         record.watched_until_ms = NOW + WATCH_NEEDED_MS;

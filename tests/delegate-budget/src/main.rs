@@ -615,7 +615,10 @@ fn scenario(r: &mut Runner) -> Result<()> {
         "OrderAddress",
     )?;
     let upcoming = r.app(
-        "PeekOrderAddresses (10)",
+        &format!(
+            "PeekOrderAddresses ({})",
+            harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES
+        ),
         cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
             request_id: 402,
             count: harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
@@ -1113,7 +1116,10 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // delegation for a read (`watch_delegation::on_wakeup`).
     let pool: Vec<Vec<u8>> = match field(
         &r.app(
-            "PeekOrderAddresses (10, for the delegations)",
+            &format!(
+                "PeekOrderAddresses ({}, for the delegations)",
+                harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES
+            ),
             cbor(&BitcoinDelegateRequest::PeekOrderAddresses {
                 request_id: 404,
                 count: harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES,
