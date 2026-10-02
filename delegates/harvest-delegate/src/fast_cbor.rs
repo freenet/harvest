@@ -179,7 +179,21 @@ impl Reader<'_> {
             3 => std::str::from_utf8(self.take(usize::try_from(n).ok()?)?)
                 .ok()
                 .map(|_| ()),
-            4 => (0..n).try_for_each(|_| self.skip(depth + 1)),
+            // An array of small unsigned integers is how ciborium writes a
+            // `Vec<u8>` (an SPV proof, a signature): passed over a byte or
+            // two at a time without a call per element, which is what makes
+            // skipping a store's payment proofs cheaper than decoding them.
+            4 => (0..n).try_for_each(|_| match *self.bytes.get(self.at)? {
+                0..=0x17 => {
+                    self.at += 1;
+                    Some(())
+                }
+                0x18 => {
+                    self.at += 2;
+                    (self.at <= self.bytes.len()).then_some(())
+                }
+                _ => self.skip(depth + 1),
+            }),
             5 => (0..n).try_for_each(|_| {
                 self.skip(depth + 1)?;
                 self.skip(depth + 1)
@@ -211,6 +225,119 @@ pub(crate) fn map_fields<'a>(bytes: &'a [u8], wanted: &[&str]) -> Option<Vec<(us
         }
     }
     (r.at == bytes.len()).then_some(found)
+}
+
+/// A store's state as instant checkout reads it (#206): only the fields it
+/// uses (`owner`, `listings`, `orders`, `listing_statuses`, `closed`), each
+/// order with only its terms and status. Everything else -- the store's
+/// info, backings, custody copies, fulfilment, retirements, and each order's
+/// signatures and payment proof (about 4.5 KiB an order, mostly the SPV
+/// proof) -- is passed over by its CBOR heads rather than decoded, and left
+/// empty. `None` for anything that is not such a state (the caller then
+/// decodes it whole), including one without `info`, which a whole decode
+/// requires.
+///
+/// What it does not do that a whole decode does: check the fields it skips
+/// are well formed beyond their CBOR heads. The state comes from the store
+/// contract, which validated it whole; nothing here reads them.
+pub(crate) fn decode_store_light(bytes: &[u8]) -> Option<harvest_common::StoreStateV1> {
+    use harvest_common::from_cbor;
+    // One pass: every byte is read once, by the decoder of a field kept or
+    // by `skip`. (Finding the fields first and parsing them after read the
+    // payment proofs four times over.)
+    let mut r = Reader { bytes, at: 0 };
+    let n = r.head(5)?;
+    let mut store = harvest_common::StoreStateV1::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for _ in 0..n {
+        let key = r.text()?;
+        if seen.contains(&key) {
+            return None;
+        }
+        seen.push(key);
+        let start = r.at;
+        if key == "orders" {
+            store.orders = r.orders_light()?;
+            continue;
+        }
+        r.skip(0)?;
+        let value = &bytes[start..r.at];
+        match key {
+            "owner" => store.owner = from_cbor(value).ok()?,
+            "listings" => store.listings = from_cbor(value).ok()?,
+            "listing_statuses" => store.listing_statuses = from_cbor(value).ok()?,
+            "closed" => store.closed = from_cbor(value).ok()?,
+            _ => {}
+        }
+    }
+    // A whole decode requires these.
+    if r.at != bytes.len() || !seen.contains(&"info") || !seen.contains(&"listings") {
+        return None;
+    }
+    Some(store)
+}
+
+impl Reader<'_> {
+    /// `OrdersV1`, each order with only `order` and `status` decoded and the
+    /// rest passed over.
+    fn orders_light(&mut self) -> Option<harvest_common::store::OrdersV1> {
+        use harvest_common::from_cbor;
+        use harvest_common::payment::{AuthorizedOrder, OrderId, OrderStatus};
+        let mut orders = harvest_common::store::OrdersV1::default();
+        let fields = self.head(5)?;
+        let mut seen_orders = false;
+        for _ in 0..fields {
+            let key = self.text()?;
+            if key != "orders" || seen_orders {
+                if key == "orders" {
+                    return None;
+                }
+                self.skip(0)?;
+                continue;
+            }
+            seen_orders = true;
+            let count = self.head(5)?;
+            for _ in 0..count {
+                let key_at = self.at;
+                self.skip(0)?;
+                let id: OrderId = from_cbor(&self.bytes[key_at..self.at]).ok()?;
+                let order_fields = self.head(5)?;
+                let mut order = None;
+                let mut status = None;
+                for _ in 0..order_fields {
+                    let name = self.text()?;
+                    let at = self.at;
+                    self.skip(0)?;
+                    let value = &self.bytes[at..self.at];
+                    match name {
+                        "order" if order.is_none() => order = Some(from_cbor(value).ok()?),
+                        "status" if status.is_none() => {
+                            status = Some(from_cbor::<OrderStatus>(value).ok()?)
+                        }
+                        "order" | "status" => return None,
+                        _ => {}
+                    }
+                }
+                let replaced = orders.orders.insert(
+                    id,
+                    AuthorizedOrder {
+                        order: order?,
+                        scoped_payload: Vec::new(),
+                        signature: Vec::new(),
+                        status: status?,
+                        payment_proof: None,
+                        status_scoped_payload: None,
+                        status_signature: None,
+                    },
+                );
+                if replaced.is_some() {
+                    // A key twice: not a map ciborium would have written.
+                    return None;
+                }
+            }
+        }
+        Some(orders)
+    }
 }
 
 /// `MailboxStateV1` as ciborium writes it, or `None` for anything else (the

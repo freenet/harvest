@@ -257,6 +257,13 @@ pub(crate) enum Family {
     /// An instant-checkout ledger: merged by order id and request id, so the
     /// sales a predecessor issued still come off the stock when paid.
     AutoLedger,
+    /// The published scripts the delegate holds (`published_set`): merged,
+    /// so neither side's are lost and every scan starts again over both.
+    PublishedScripts,
+    /// The payment key held pending (`bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`):
+    /// into its own slot, never as the active key, and only where this
+    /// delegate holds none (an emptied slot counts as none).
+    PendingPaymentXpub,
     /// Everything else: written only if absent.
     Standalone,
 }
@@ -282,6 +289,19 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::Watches
     } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY {
         Family::PaymentXpub
+    } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY {
+        Family::PendingPaymentXpub
+    } else if key == crate::published_set::PUBLISHED_KEY {
+        Family::PublishedScripts
+    } else if key == crate::published_set::PUBLISHED_META_KEY
+        || key == crate::published_set::ISSUED_KEY
+        || key == crate::published_set::CURSOR_ACTIVE_KEY
+        || key == crate::published_set::CURSOR_PENDING_KEY
+    {
+        // Derived from the list, or describing this node's own scans and
+        // addresses: rebuilt here, and losing them only restarts a scan
+        // (`published_set`).
+        Family::Refused
     } else if key.starts_with(b"harvest:rsa_sk:") || key.starts_with(b"harvest:rsa_pk:") {
         Family::RsaHalf
     } else if key.starts_with(crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes()) {
@@ -399,6 +419,14 @@ pub(crate) fn import_secret<S: SecretStore>(
         ),
         Family::RsaHalf => import_rsa_half(store, key, value),
         Family::PaymentXpub => import_payment_xpub(store, key, value),
+        Family::PendingPaymentXpub => {
+            if store.get_secret(key).is_some_and(|held| !held.is_empty()) {
+                SecretImport::AlreadyAuthoritative
+            } else {
+                written(store.set_secret(key, value))
+            }
+        }
+        Family::PublishedScripts => import_published(store, value),
         Family::BuyerConversation => copy_within_cap(
             store,
             key,
@@ -513,6 +541,23 @@ fn import_payment_xpub<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) 
         Ok(bytes) => written(store.set_secret(key, &bytes)),
         Err(_) => SecretImport::Retryable("could not encode the payment key".into()),
     }
+}
+
+/// A predecessor's published scripts, merged into this delegate's: every
+/// digest it held that this one does not is added (in its order, as the
+/// newest), which also starts every scan again over them.
+fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport {
+    use crate::published_set::{DigestList, PUBLISHED_KEY};
+    let Some(incoming) = DigestList::decode(value.to_vec()) else {
+        return SecretImport::Permanent(
+            "the predecessor's published scripts did not decode".into(),
+        );
+    };
+    let mut held = DigestList::load(store, PUBLISHED_KEY, b"");
+    if held.insert(&incoming.digests()) == 0 {
+        return SecretImport::AlreadyAuthoritative;
+    }
+    written(crate::published_set::save_published(store, &held))
 }
 
 /// A standalone secret: written only if this delegate holds nothing under the
@@ -963,6 +1008,64 @@ mod tests {
         );
     }
 
+    /// #206 (D4): a predecessor's pending payment key lands in a slot this
+    /// delegate emptied (its own catch-up finished), and never over one it
+    /// still holds. Mutated red by treating an emptied slot as held, and by
+    /// writing over a held one.
+    #[test]
+    fn a_pending_key_is_imported_into_an_emptied_slot_only() {
+        let key = crate::bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY;
+        let mut emptied = MemSecrets::default();
+        emptied.set_secret(key, &[]);
+        assert_eq!(
+            import_secret(&mut emptied, key, &xpub("vpubA", 4)),
+            SecretImport::Written
+        );
+        assert_eq!(emptied.get_secret(key), Some(xpub("vpubA", 4)));
+        assert_eq!(
+            import_secret(&mut emptied, key, &xpub("vpubB", 9)),
+            SecretImport::AlreadyAuthoritative
+        );
+        assert_eq!(emptied.get_secret(key), Some(xpub("vpubA", 4)));
+    }
+
+    /// #206: a predecessor's published scripts are merged into this
+    /// delegate's, neither side's lost, and a scan over them starts again.
+    /// Mutated red by importing them as a standalone secret.
+    #[test]
+    fn published_scripts_are_merged() {
+        use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
+        let mut theirs = DigestList::empty(b"");
+        theirs.insert(&[digest(b"a"), digest(b"b")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+
+        let mut store = MemSecrets::default();
+        let mut ours = DigestList::empty(b"");
+        ours.insert(&[digest(b"b"), digest(b"c")]);
+        crate::published_set::save_published(&mut store, &ours);
+        let before = ours.generation();
+        assert_eq!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::Written
+        );
+        let merged = DigestList::load(&store, PUBLISHED_KEY, b"");
+        assert_eq!(merged.len(), 3);
+        for s in [b"a", b"b", b"c"] {
+            assert!(merged.contains(&digest(s)));
+        }
+        assert!(merged.generation() > before, "scans start again");
+        assert_eq!(
+            crate::published_set::published_meta(&store),
+            (merged.generation(), 3)
+        );
+        assert_eq!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::AlreadyAuthoritative
+        );
+    }
+
     /// Every key shape this delegate writes has a family decided on purpose.
     /// A new shape fails here until somebody says which rule it needs.
     #[test]
@@ -977,7 +1080,7 @@ mod tests {
             Family::PaymentXpub,
             // A payment key still catching up: into its own slot, never as
             // the active key (`bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`).
-            Family::Standalone,
+            Family::PendingPaymentXpub,
             Family::Standalone, // migration and notice markers
             Family::BuyerConversation,
             Family::KnownStore,
@@ -991,6 +1094,12 @@ mod tests {
             Family::Refused,    // instant-checkout tip
             Family::Refused,    // instant-checkout exported marker
             Family::Refused,    // instant-checkout catching-up mark
+            Family::Refused,    // instant-checkout fed scripts
+            Family::PublishedScripts,
+            Family::Refused, // published scripts' count
+            Family::Refused, // addresses this key handed out
+            Family::Refused, // the active key's scan cursor
+            Family::Refused, // the pending key's scan cursor
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(

@@ -420,7 +420,7 @@ pub(crate) mod fixtures {
 
     /// A bridge-signed proof that `order` was paid; `seed` varies the block,
     /// so two seeds are two different, equally valid proofs.
-    fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
+    pub(crate) fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
         let bridge = bridge_key();
         let (spv, txid, block_hash) = payment_proof(
             &order.payment_script_pubkey,
