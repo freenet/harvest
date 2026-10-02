@@ -99,7 +99,7 @@ constant fails the run.
 | `SetPaymentXpub`, `DeriveOrderAddress`, `PeekOrderAddresses (10)`, `DeriveOrderAddress` with a foreign published script | BIP-32 derivation. The foreign script forces the full 100-index `PUBLISHED_INDEX_GAP` scan |
 | `ArmAutoInvoice` to the 16-arm cap (each watching the 10 upcoming addresses), forced `Heartbeat`, `GetWatchKey`; then every other arm's ledger seeded at its caps (`SEEN_CAP`, `ANSWERED_CAP`, `SALES_CAP`, `GAP_ORDERS_CAP`, 99 invoices today) in the delegate's own encoding, and one re-arm that must read the seeded count back | instant checkout. Every arm is taken and full, so the wake-up, resubscribe and export walk the worst state the caps allow |
 | tip notification, then a mailbox notification with 512 unread short messages from 512 buyers (the COUNT cap), in the contract's canonical order and passing its `verify` | instant checkout opening every unread message (one X25519 + AES-GCM each). The harness checks the tip was cached and decodes the ledger to check all 512 were recorded as read, so a refused scan cannot pass as a cheap one |
-| a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. **Over budget today**: see below |
+| a second mailbox notification at the BYTE cap: 512 new messages, each size class as full as `SIZE_CLASS_CAPS` allows (24/64/128/296, about 3.3 MiB of ciphertext), canonical order, passing `verify` | anyone can write to a store's mailbox, and decoding, hashing and decrypting grow with bytes. 2.6x the budget on V29, fixed in #216: see below |
 | the watch delegations at their caps (`MAX_DELEGATIONS`, each with `WATCHED_CAP` watches that all count, and its subscription lists full), seeded straight into the secret store in the delegate's own encoding, for bridges every store trusts; then the tip read's answer (every store's status), a re-arm, a forced `Heartbeat`, the wake-up (also with every mailbox waiting) and `NodeStarted` | every store's status and heartbeat walks every delegation's watches, and the wake-up looks at each delegation for its one read. The harness checks every status counts the delegation's watches, that the wake-up went on to a canary read, and that the node start rewrote every delegation |
 | `Installed`, `NodeStarted`, heartbeat wake-up | runs the node starts on its own. Each must answer (resubscribes, a heartbeat), so an early return cannot pass |
 | `StoreBuyerConversation` x256, `ListBuyerConversations (256)` | the buyer's conversation cap; the harness checks 256 come back |
@@ -158,45 +158,46 @@ Same harness, same scenario, two builds of the delegate:
 | main before #203 (blake3 `d8088bf5…`, the build live when the bug was found) | 10,167,507,014 - 49,739,927,758 fuel (2.5x - 12.4x budget), 1.0 - 5.1 s unmetered | **exit 1**, all eight over |
 | #203, committed on main since (blake3 `cbe71dd9…`, RSA derivation removed) | 2,455,085 - 2,457,153 fuel (0.06%) | exit 0 |
 
-Largest calls on the committed delegate (`cbe71dd9…`), with every cap above
-filled:
+Largest calls with every cap above filled, on the delegate main shipped
+before #216 (`cbe71dd9…`, V29) and on #216's (`7270ec63…`), committed since:
 
-| call | fuel | share of budget |
+| call | V29 | #216 |
 |---|---:|---:|
-| mailbox notification at the byte cap | 10,389,656,844 | **259.7%, over** |
-| heartbeat wake-up, 8 full watch delegations | 105,657,572,367 | **2641.4%, over** |
-| tip read answered, 8 full watch delegations | 100,994,539,412 | **2524.9%, over** |
-| `ArmAutoInvoice`, 8 full watch delegations | 6,325,868,100 | **158.1%, over** |
-| forced `Heartbeat`, 8 full watch delegations | 6,132,699,703 | **153.3%, over** |
-| `ExportSecrets`, 16 full ledgers | 7,973,492,968 | **199.3%, over** |
-| heartbeat wake-up, 16 full ledgers | 7,549,169,942 | **188.7%, over** |
-| `KeepPurchase`, the 1024th | 3,192,943,691 | 79.8% |
-| mailbox notification, 512 short messages | 3,189,562,696 | 79.7% |
-| `ListKeptPurchases (1024)` | 2,906,368,755 | 72.7% |
+| heartbeat wake-up, 8 full watch delegations | 105,657,572,367 (**2641.4%, over**) | 1,844,244,959 (46.1%) |
+| same, every store's mailbox waiting to be re-read | (no such flag) | 1,933,038,739 (48.3%) |
+| tip read answered, 8 full watch delegations | 100,994,539,412 (**2524.9%, over**) | 1,160,031,164 (29.0%) |
+| `ArmAutoInvoice`, 8 full watch delegations | 6,325,868,100 (**158.1%, over**) | 229,071,409 (5.7%) |
+| forced `Heartbeat`, 8 full watch delegations | 6,132,699,703 (**153.3%, over**) | 170,641,580 (4.3%) |
+| mailbox notification at the byte cap | 10,389,656,844 (**259.7%, over**) | 1,359,396,238 (34.0%) a run, 7 runs |
+| same, plaintexts built to be slow to decode | (not measured) | 1,963,576,271 (49.1%) a run |
+| `ExportSecrets`, 16 full ledgers | 7,973,492,968 (**199.3%, over**) | 1,069,857,082 (26.7%) |
+| heartbeat wake-up, 16 full ledgers | 7,549,169,942 (**188.7%, over**) | 1,030,396,802 (25.8%), every retry flag missing (the worst case) |
+| `KeepPurchase`, the 1024th | 3,192,943,691 (79.8%) | 2,216,880,431 (55.4%) |
+| mailbox notification, 512 short messages | 3,189,562,696 (79.7%) | 794,663,288 (19.9%) a run, 4 runs |
+| `ListKeptPurchases (1024)` | 2,906,368,755 (72.7%) | 2,201,595,405 (55.0%) |
 
-**The over-budget rows are real findings, not harness artefacts.**
+**The V29 over-budget rows were real findings, not harness artefacts.**
 
 * The byte-cap mailbox: any buyer can fill a store's mailbox this way, and
-  instant checkout's first scan of it does 2.6x the budget. Part of the cost
-  is the sort hashing every ciphertext on every comparison: computing each
-  digest once brings it to 179.9% (and the 512-message scan from 79.7% to
-  62.8%). The rest is decoding the mailbox (ciphertexts are CBOR integer
-  arrays, not byte strings) and decrypting every new message.
-* The wake-up and the export decode every arm's whole ledger (the wake-up
+  instant checkout's first scan of it did 2.6x the budget: the sort hashed
+  every ciphertext on every comparison, the mailbox was decoded generically
+  (ciphertexts are CBOR integer arrays, not byte strings), and every new
+  message was decrypted in one run.
+* The wake-up and the export decoded every arm's whole ledger (the wake-up
   twice). A busy seller's ledgers reach these caps over weeks of instant
   orders, and the wake-up runs every few minutes: if it runs past the node's
   limit, heartbeats stop and the store reads as closed.
-* Every store's status and heartbeat decodes every delegation and, per
-  watch, the payment key and every arm (`watch_delegation::vouched`), so the
-  work grows as stores x delegations x watches x stores. A seller who has
-  delegated watching for a few bridges gets there by using it: the watches
-  accumulate as addresses are refilled. #216 reads the payment key and the
-  arms once per delegation (`Vouching`): the wake-up drops to 6,059,777,768
-  (151.5%) and the tip read to 11,308,954,105 (282.7%), still over.
+* Every store's status and heartbeat decoded every delegation and, per
+  watch of every watch, the payment key and every arm
+  (`watch_delegation::vouched`), so the work grew as stores x delegations x
+  watches x stores. A seller who has delegated watching for a few bridges
+  gets there by using it: the watches accumulate as addresses are refilled.
 
-The fixes are in the delegate (digest once; bound the messages opened per
-notification; keep less per arm, or read only what a run needs), so they are
-a re-key, and this check stays red until they land.
+#216 fixes them in the delegate (a re-key): each digest once, a bounded and
+randomly ordered opening per mailbox run with a retry flag the wake-up
+reads, the delegations and payment key read once per run, a status that
+reads only the ledger fields it shows, and an export written without the
+stdlib's per-byte encoding. The PR has the details.
 
 The others are within budget, and they are the handlers to watch: each grows
 with a collection, and at its cap the top three use 73-80% of the budget.
