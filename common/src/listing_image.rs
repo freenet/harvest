@@ -149,8 +149,11 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
                 "a photo's description is at most {MAX_ALT_CHARS} characters"
             ));
         }
-        if image.alt.chars().any(is_hidden_char) {
-            return Some("a photo's description has a control or invisible character".into());
+        if let Some(c) = image.alt.chars().find(|&c| is_hidden_char(c)) {
+            return Some(format!(
+                "a photo's description has a hidden character (U+{:04X})",
+                u32::from(c)
+            ));
         }
         // Full photos only: the cover's thumbnail is a different image
         // contract, and may even share bytes with a full photo.
@@ -165,7 +168,7 @@ pub fn images_problem(images: &[ListingImage]) -> Option<String> {
 }
 
 /// A character that hides or rewrites what a description says: a control
-/// (newlines included), a direction override or isolate (which reorder the
+/// (newlines included, and the line and paragraph separators), a direction override or isolate (which reorder the
 /// text around them), or an invisible character with no job in ordinary
 /// writing (soft hyphen, combining grapheme joiner, zero-width space, word joiner and invisible operators, BOM, the
 /// Mongolian vowel separator, the deprecated format characters, Hangul
@@ -189,8 +192,8 @@ fn is_hidden_char(c: char) -> bool {
                 | '\u{180E}'
                 | '\u{200B}'
                 | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{2060}'..='\u{206F}'
                 | '\u{3164}'
                 | '\u{FEFF}'
                 | '\u{FFA0}'

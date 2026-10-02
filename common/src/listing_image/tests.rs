@@ -256,6 +256,13 @@ fn a_description_may_not_hide_characters() {
         "\u{8702}\u{871C}\u{7F50}",
         "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
         "\u{2764}\u{FE0F}",
+        "abc\u{200E}123 left-to-right mark",
+        "\u{0639}\u{0633}\u{0644}\u{061C} 500",
+        "1\u{FE0F}\u{20E3} keycap",
+        "\u{1F44B}\u{1F3FD} skin tone",
+        "\u{1F1F3}\u{1F1F1} regional indicators",
+        "\u{0E19}\u{0E49}\u{0E33}\u{0E1C}\u{0E36}\u{0E49}\u{0E07}",
+        "e\u{0301} combining accent",
     ] {
         assert_eq!(with_alt(fine), None, "{fine:?} must be accepted");
     }
@@ -278,7 +285,19 @@ fn a_description_may_not_hide_characters() {
         "soft\u{00AD}hyphen",
         "grapheme\u{034F}joiner",
         "half\u{FFA0}width",
-        "annotated\u{FFF9}x\u{FFFA}y\u{FFFB}",
+        "a\u{202A}b",
+        "a\u{202B}b",
+        "a\u{202C}b",
+        "a\u{202D}b",
+        "a\u{2061}b",
+        "a\u{2063}b",
+        "a\u{2064}b",
+        "a\u{2065}b",
+        "a\u{FFF9}b",
+        "a\u{FFFA}b",
+        "a\u{FFFB}b",
+        "line\u{2028}sep",
+        "para\u{2029}sep",
     ] {
         assert!(with_alt(hidden).is_some(), "{hidden:?} must be refused");
     }
