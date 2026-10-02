@@ -713,7 +713,13 @@ pub struct AutoInvoiceStatus {
     /// listed for two weeks from when it was found.
     #[serde(default)]
     pub oversold: Vec<crate::payment::OrderId>,
-    /// Why the next request would wait for the seller, if it would.
+    /// Why the store is not taking orders, if it is not: the reason the
+    /// delegate would turn every Buy now away (a lapsed watch, no payment
+    /// key or one for another network, no recent block, every watched
+    /// address used, the store closed or not this seller's, the payment
+    /// counter catching up or not saved, an unreadable ledger), in its own
+    /// words. `None` exactly when the store's heartbeat says taking orders,
+    /// apart from an unreadable ledger, which a heartbeat does not read.
     pub paused: Option<String>,
     /// When, in the last two weeks, a buyer paid an address past a run of 20
     /// or more unpaid ones: a wallet with the usual gap limit may not show

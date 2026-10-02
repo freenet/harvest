@@ -19,7 +19,7 @@
 //!   of that this module skips a request whose order the store already holds,
 //!   or which its own ledger records as answered, before it derives anything.
 //! - **I2, no address reuse.** Addresses come only from
-//!   [`crate::bitcoin::apply_derive_order_address`], after the counter has been
+//!   [`crate::bitcoin::issue_next_address`], after the counter has been
 //!   raised past the store's published scripts, and only after every refusal
 //!   check has passed, so a refused request burns nothing.
 //! - **I3, the last item goes once.** Requests in one run are decided in one
@@ -197,6 +197,70 @@ pub(crate) fn catchup_key(store_contract_id: &[u8]) -> Vec<u8> {
         bs58::encode(store_contract_id).into_string()
     )
     .into_bytes()
+}
+
+/// What the store's state said the last time this delegate read it, for
+/// the refusals only that state can give (`StoreClosed`, `NotOurStore`):
+/// one byte, written by [`note_store_read`] from every read of the state
+/// (`decide`, a store notification) when it differs. The wake-up reads this
+/// instead of the store, which it does not fetch, so a heartbeat says "not
+/// taking orders" for a store `decide` would refuse (harvest#198 lane, item
+/// 2). Absent means no read has refused, which is how every store starts.
+/// Node-local, like the arm: not exported.
+pub(crate) fn store_read_key(store_contract_id: &[u8]) -> Vec<u8> {
+    format!(
+        "{AUTO_PREFIX}store:{}",
+        bs58::encode(store_contract_id).into_string()
+    )
+    .into_bytes()
+}
+
+const STORE_READ_OPEN: &[u8] = b"o";
+const STORE_READ_CLOSED: &[u8] = b"c";
+const STORE_READ_NOT_OURS: &[u8] = b"n";
+
+/// The refusal a store's state gives on its own, as `decide` checks it: not
+/// signed by `owner` (including a store nobody has published to), then
+/// closed.
+fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> {
+    if store.owner.as_ref() != Some(owner) {
+        Some(Refusal::NotOurStore)
+    } else if !store.closed.is_empty() {
+        Some(Refusal::StoreClosed)
+    } else {
+        None
+    }
+}
+
+/// Record what a read of the store's state said ([`store_read_key`]),
+/// written only when it changed: a store notification arrives with every
+/// order and status, and the answer almost never changes.
+fn note_store_read<S: SecretStore>(
+    secrets: &mut S,
+    store_contract_id: &[u8],
+    refusal: Option<&Refusal>,
+) {
+    let value = match refusal {
+        Some(Refusal::NotOurStore) => STORE_READ_NOT_OURS,
+        Some(Refusal::StoreClosed) => STORE_READ_CLOSED,
+        _ => STORE_READ_OPEN,
+    };
+    let key = store_read_key(store_contract_id);
+    if secrets.get_secret(&key).as_deref() != Some(value) {
+        secrets.set_secret(&key, value);
+    }
+}
+
+/// The refusal the last read of the store's state gave ([`store_read_key`]).
+fn store_read_refusal<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Option<Refusal> {
+    match secrets
+        .get_secret(&store_read_key(store_contract_id))
+        .as_deref()
+    {
+        Some(STORE_READ_NOT_OURS) => Some(Refusal::NotOurStore),
+        Some(STORE_READ_CLOSED) => Some(Refusal::StoreClosed),
+        _ => None,
+    }
 }
 
 /// A [`catchup_key`] mark.
@@ -930,10 +994,8 @@ fn status_in<S: SecretStore>(
             .filter(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS)
             .map(|o| o.order.clone())
             .collect(),
-        paused: refusal_given(secrets, record, tip.as_ref(), &watched, now_ms)
-            .err()
+        paused: not_taking_given(secrets, record, tip.as_ref(), &watched, remaining, now_ms)
             .or(unreadable.then_some(Refusal::LedgerUnreadable))
-            .or_else(|| counter_refusal(secrets, &record.arm.store_contract_id, now_ms))
             .map(|r| r.explain()),
         wallet_gap_paid_at_ms: ledger
             .gap_paid
@@ -1004,21 +1066,53 @@ fn taking_orders<S: SecretStore>(
     taking_orders_in(secrets, &delegations, record, now_ms)
 }
 
-/// [`taking_orders`], with the delegations already read.
+/// `taking_orders`, with the delegations already read.
 fn taking_orders_in<S: SecretStore>(
     secrets: &S,
     delegations: &Delegations,
     record: &ArmRecord,
     now_ms: u64,
 ) -> bool {
+    not_taking_in(secrets, delegations, record, now_ms).is_none()
+}
+
+/// Why a Buy now would be refused for the whole store now, if it would:
+/// what a heartbeat's `taking_orders` and the status's `paused` both rest
+/// on, so buyers never see a store open while the delegate refuses it. In
+/// the order `decide` checks: [`refusal_given`], then what the last read of
+/// the store's state said ([`store_read_refusal`]), then the payment
+/// counter ([`counter_refusal`]), then no watched address left to issue
+/// (`NoWatchedAddress`, the empty [`accepted_run_of`]).
+///
+/// Not the ledger: a heartbeat does not read it (#206), so
+/// `LedgerUnreadable` is added by the status alone.
+fn not_taking_in<S: SecretStore>(
+    secrets: &S,
+    delegations: &Delegations,
+    record: &ArmRecord,
+    now_ms: u64,
+) -> Option<Refusal> {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
-    if refusal_given(secrets, record, tip.as_ref(), &watched, now_ms).is_err()
-        || counter_refusal(secrets, &record.arm.store_contract_id, now_ms).is_some()
-    {
-        return false;
-    }
-    accepted_run_of(delegations.upcoming(), record, &watched, now_ms).0 > 0
+    let run = accepted_run_of(delegations.upcoming(), record, &watched, now_ms).0;
+    not_taking_given(secrets, record, tip.as_ref(), &watched, run, now_ms)
+}
+
+/// [`not_taking_in`], with the tip, the watch set and the run worked out.
+fn not_taking_given<S: SecretStore>(
+    secrets: &S,
+    record: &ArmRecord,
+    tip: Option<&TipCache>,
+    watched: &WatchSet,
+    run: u32,
+    now_ms: u64,
+) -> Option<Refusal> {
+    let id = &record.arm.store_contract_id;
+    refusal_given(secrets, record, tip, watched, now_ms)
+        .err()
+        .or_else(|| store_read_refusal(secrets, id))
+        .or_else(|| counter_refusal(secrets, id, now_ms))
+        .or((run == 0).then_some(Refusal::NoWatchedAddress))
 }
 
 /// Sign a heartbeat for `record`'s store and send it to its presence
@@ -1137,7 +1231,8 @@ pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<Ou
         .collect()
 }
 
-/// The tab's heartbeat request ([`HarvestDelegateRequest::Heartbeat`]): the
+/// The tab's heartbeat request
+/// ([`harvest_common::delegate::HarvestDelegateRequest::Heartbeat`]): the
 /// answer, and the update to send.
 pub(crate) fn heartbeat_request<S: SecretStore>(
     secrets: &mut S,
@@ -1835,7 +1930,9 @@ fn on_store_change<S: SecretStore>(
     let Some(store) = read_store(state) else {
         return Vec::new();
     };
-    if store.owner != Some(store_sk.verifying_key()) {
+    let read = store_refusal(&store, &store_sk.verifying_key());
+    note_store_read(secrets, &record.arm.store_contract_id, read.as_ref());
+    if read == Some(Refusal::NotOurStore) {
         return Vec::new();
     }
     note_paid_scripts(secrets, &store);
@@ -2707,12 +2804,10 @@ pub(crate) fn decide<S: SecretStore>(
         return decided;
     };
     let owner = store_sk.verifying_key();
-    if store.owner != Some(owner) {
-        refuse_all(&mut decided, Refusal::NotOurStore);
-        return decided;
-    }
-    if !store.closed.is_empty() {
-        refuse_all(&mut decided, Refusal::StoreClosed);
+    let read = store_refusal(store, &owner);
+    note_store_read(secrets, &arm.store_contract_id, read.as_ref());
+    if let Some(why) = read {
+        refuse_all(&mut decided, why);
         return decided;
     }
     decided.owner = Some(owner);
@@ -7000,6 +7095,110 @@ mod tests {
             Err(Refusal::NoFreshTip),
             "no tip"
         );
+    }
+
+    /// harvest#198 lane, item 2: whenever `decide` would turn a Buy now away
+    /// for the whole store, the status says why (`paused`, that refusal's
+    /// words) and the heartbeat says not taking orders. Each refusal a
+    /// heartbeat can see: a lapsed watch, no payment key, a payment key for
+    /// another network, no fresh tip, every watched address used, and,
+    /// from the last read of the store's state, closed and not this
+    /// seller's (`CatchingUp` and `CounterNotSaved` have their own tests).
+    /// Mutated red by dropping each of `not_taking_given`'s checks, by not
+    /// noting the read in `decide` or in `on_store_change`, and by keeping
+    /// the old reading after a store reads open.
+    #[test]
+    fn the_heartbeat_says_not_taking_orders_whenever_decide_refuses() {
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let says = |f: &mut Fixture, why: Refusal, what: &str| {
+            assert_eq!(
+                run(f, std::slice::from_ref(&entry)).refused,
+                vec![(entry_digest(&entry), why.clone())],
+                "{what}: decide"
+            );
+            assert_eq!(
+                open_now(f, NOW),
+                (Some(why.explain()), false),
+                "{what}: status and heartbeat"
+            );
+            let record = f.record.clone();
+            let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+            assert!(!beat.heartbeat.taking_orders, "{what}: the heartbeat sent");
+        };
+        assert_eq!(open_now(&fixture(), NOW), (None, true), "taking orders");
+
+        let mut f = fixture();
+        f.record.watched_until_ms = NOW;
+        says(&mut f, Refusal::WatchLapsed, "watch lapsed");
+
+        let mut f = fixture();
+        f.secrets = {
+            let mut s = MemSecrets::default();
+            crate::store_keys::keep(&mut s, &store_sk());
+            let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+            save(&mut s, &tip_key(BitcoinNetwork::Signet), &tip);
+            s
+        };
+        says(&mut f, Refusal::NoPaymentKey, "no payment key");
+
+        let mut f = fixture();
+        let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Testnet4), &tip);
+        f.record.arm.network = BitcoinNetwork::Testnet4;
+        says(&mut f, Refusal::NetworkMismatch, "another network");
+
+        let mut f = fixture();
+        let mut old: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        old.block_time = 1;
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &old);
+        says(&mut f, Refusal::NoFreshTip, "no fresh tip");
+
+        let mut f = fixture();
+        f.record.arm.watched_scripts = vec![script_at(7)];
+        says(&mut f, Refusal::NoWatchedAddress, "no watched address");
+
+        // The store's own refusals are what the last read of its state said:
+        // decide's read, then a store notification's.
+        let mut f = fixture();
+        let owner = store_sk().verifying_key();
+        let closure = harvest_common::backing::AuthorizedClosure {
+            closure: harvest_common::backing::StoreClosure { store: owner },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+        };
+        let open = f.store.clone();
+        f.store
+            .closed
+            .records
+            .insert(harvest_common::store::Bytes32(owner.to_bytes()), closure);
+        let closed = f.store.clone();
+        says(&mut f, Refusal::StoreClosed, "closed, read by decide");
+        f.store = open.clone();
+        assert_eq!(run(&mut f, std::slice::from_ref(&entry)).orders.len(), 1);
+        assert_eq!(open_now(&f, NOW), (None, true), "decide read it open again");
+
+        let id: [u8; 32] = f.record.arm.store_contract_id.clone().try_into().unwrap();
+        let notify = |f: &mut Fixture, store: &StoreStateV1| {
+            on_notification(&mut f.secrets, &id, &to_cbor(store).unwrap(), NOW).unwrap();
+        };
+        notify(&mut f, &closed);
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::StoreClosed.explain()), false),
+            "closed, read from a notification"
+        );
+        let mut theirs = open.clone();
+        theirs.owner = Some(SigningKey::from_bytes(&[0x66; 32]).verifying_key());
+        notify(&mut f, &theirs);
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::NotOurStore.explain()), false),
+            "not ours, read from a notification"
+        );
+        notify(&mut f, &open);
+        assert_eq!(open_now(&f, NOW), (None, true), "read open again");
+        f.store = theirs;
+        says(&mut f, Refusal::NotOurStore, "not ours, read by decide");
     }
 
     /// A batch turned away for a reason only the seller lifts settles the

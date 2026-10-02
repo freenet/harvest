@@ -1174,6 +1174,7 @@ mod tests {
             Family::Refused,    // instant-checkout exported marker
             Family::Refused,    // instant-checkout catching-up mark
             Family::Refused,    // instant-checkout fed scripts
+            Family::Refused,    // instant-checkout store read (closed, not ours)
             Family::PublishedScripts,
             Family::Refused, // published scripts' count
             Family::Refused, // the active key's scan cursor

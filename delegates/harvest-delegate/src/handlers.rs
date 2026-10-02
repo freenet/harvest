@@ -62,6 +62,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::auto_invoice::EXPORTED_KEY.to_vec(),
         crate::auto_invoice::catchup_key(&[9u8; 32]),
         crate::auto_invoice::fed_key(&[9u8; 32]),
+        crate::auto_invoice::store_read_key(&[9u8; 32]),
         crate::published_set::PUBLISHED_KEY.to_vec(),
         crate::published_set::PUBLISHED_META_KEY.to_vec(),
         crate::published_set::CURSOR_ACTIVE_KEY.to_vec(),
