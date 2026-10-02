@@ -6784,9 +6784,17 @@ mod tests {
                 },
             })
             .collect();
-        photographed.listing = photographed.listing.clone().with_derived_id();
+        photographed.listing = photographed.listing.with_derived_id();
         store.listings.listings.push(photographed);
         store.listings.normalize();
+        assert!(
+            store
+                .listings
+                .listings
+                .iter()
+                .any(|l| l.listing.images.len() == 4),
+            "the photographed listing is in the fixture"
+        );
         store.info.scoped_payload = vec![1, 2, 3];
         store
     }
