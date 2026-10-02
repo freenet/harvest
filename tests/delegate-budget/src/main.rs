@@ -1832,9 +1832,11 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         if published.is_empty() {
             // Nothing published: the run must have refused for the catch-up
             // (`Refusal::CatchingUp`), the one refusal that saves the counter
-            // it reached, short of the store's end.
+            // it reached. That may be the store's end itself: a scan whose
+            // budget runs out on the last match has not yet looked
+            // `PUBLISHED_INDEX_GAP` past it, so the next run finishes.
             let now_at = counter(r)?;
-            if now_at <= count || now_at >= u64::from(next) {
+            if now_at <= count || now_at > u64::from(next) {
                 bail!(
                     "{name}: published nothing, and the counter went from {count} to {now_at} \
                      (the store ends at {next}): the request was refused for another reason, so \
@@ -2088,9 +2090,8 @@ const SPACED_CALLS: usize = 32;
 ///
 /// Since #216 a scan of published scripts derives at most
 /// `FLOOR_SCAN_BUDGET` indices a call, saves the count it reached, and
-/// answers `Err("... the count is now at N. Enter the key again to
-/// continue.")` (or "Ask again to continue."); the web app sends the same
-/// request again with every script. Each refusal must move the count on, and
+/// answers an `Err` starting `CATCHING_UP_PREFIX` and the count; the web
+/// app sends the same request again with every script. Each refusal must move the count on, and
 /// with no `max_calls` the requests are bounded by `bound` (one per
 /// published script would do for a scan budget of a single index), so a
 /// delegate that never finishes fails the run. A delegate without the bound
@@ -2111,17 +2112,18 @@ fn catch_up(
             .ok_or_else(|| anyhow!("{name}: no application message in the answer"))?;
         let value: Value = ciborium::from_reader(response.as_slice())
             .with_context(|| format!("{name}: the answer is not CBOR"))?;
+        // `CATCHING_UP_PREFIX`, the count reached, `;`, a sentence.
+        let prefix = harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX;
         let refusal = match field(&value, &[expect, "result", "Err"]) {
-            Ok(Value::Text(why)) if why.ends_with("to continue.") => why.clone(),
+            Ok(Value::Text(why)) if why.starts_with(prefix) => why.clone(),
             _ => {
                 check_answer(name, &value, expect)?;
                 return Ok(Some(value));
             }
         };
-        let count: u64 = refusal
-            .split("the count is now at ")
-            .nth(1)
-            .and_then(|rest| rest.split('.').next())
+        let count: u64 = refusal[prefix.len()..]
+            .split(';')
+            .next()
             .and_then(|n| n.trim().parse().ok())
             .ok_or_else(|| anyhow!("{name}: a catch-up refusal names no count: {refusal}"))?;
         if last_count.is_some_and(|last| count <= last) {
