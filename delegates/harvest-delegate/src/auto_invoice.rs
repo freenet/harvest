@@ -655,12 +655,14 @@ impl LedgerShown {
     }
 }
 
-fn load_ledger_shown<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> LedgerShown {
+/// What a status shows of a store's ledger, or `None` when one is held that
+/// does not decode (`load_ledger_kept` stops every run on it, which the
+/// status must say).
+fn load_ledger_shown<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Option<LedgerShown> {
     let Some(bytes) = secrets.get_secret(&ledger_key(store_contract_id)) else {
-        return LedgerShown::default();
+        return Some(LedgerShown::default());
     };
-    ledger_shown(&bytes)
-        .unwrap_or_else(|| LedgerShown::of(from_cbor::<Ledger>(&bytes).unwrap_or_default()))
+    ledger_shown(&bytes).or_else(|| from_cbor::<Ledger>(&bytes).ok().map(LedgerShown::of))
 }
 
 /// [`LedgerShown`] from a ledger's bytes, field by field, or `None` when any
@@ -826,7 +828,9 @@ fn status_in<S: SecretStore>(
     now_ms: u64,
 ) -> AutoInvoiceStatus {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
-    let ledger = load_ledger_shown(secrets, &record.arm.store_contract_id);
+    let shown = load_ledger_shown(secrets, &record.arm.store_contract_id);
+    let unreadable = shown.is_none();
+    let ledger = shown.unwrap_or_default();
     let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
     let (remaining, run_until_ms) =
         accepted_run_of(delegations.upcoming(), record, &watched, now_ms);
@@ -848,6 +852,7 @@ fn status_in<S: SecretStore>(
             .collect(),
         paused: refusal_given(secrets, record, tip.as_ref(), &watched, now_ms)
             .err()
+            .or(unreadable.then_some(Refusal::LedgerUnreadable))
             .map(|r| r.explain()),
         wallet_gap_paid_at_ms: ledger
             .gap_paid
@@ -1465,6 +1470,9 @@ pub(crate) enum Refusal {
     NoFreshTip,
     NoWatchedAddress,
     CounterNotSaved,
+    /// The payment counter is still being raised past this store's published
+    /// orders (`bitcoin::FloorScan`), over more runs than one.
+    CatchingUp,
     /// The store's ledger is held but does not decode: nothing is invoiced
     /// rather than invoicing again what it records as answered.
     LedgerUnreadable,
@@ -1538,6 +1546,7 @@ impl Refusal {
                 | Refusal::NoWatchedAddress
                 | Refusal::CounterNotSaved
                 | Refusal::LedgerUnreadable
+                | Refusal::CatchingUp
         )
     }
 
@@ -1558,6 +1567,9 @@ impl Refusal {
                 "every watched payment address is used; open Harvest to watch more".into()
             }
             Refusal::CounterNotSaved => "the address counter could not be saved".into(),
+            Refusal::CatchingUp => {
+                "the payment counter is still catching up with this store's published orders".into()
+            }
             Refusal::LedgerUnreadable => {
                 "this store's instant-checkout record could not be read".into()
             }
@@ -2159,14 +2171,19 @@ fn on_mailbox_ordered<S: SecretStore>(
     let Some(store_sk) = store_key(secrets, &record.arm.store_verifying_key) else {
         return Vec::new();
     };
+    // Before the mailbox is decoded: a ledger that does not decode stops the
+    // run (`load_ledger_kept`), and its flag is cleared so the wake-up does
+    // not come back for it at every heartbeat; the status says why
+    // (`Refusal::LedgerUnreadable`).
+    let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
+        sync_retry_flag(secrets, &retry_key(&record.arm.store_contract_id), false);
+        return Vec::new();
+    };
     // The hand-written decoder first: same bytes, a fraction of the work
     // (`fast_cbor`); anything it does not recognise goes the generic way.
     let Some(mailbox) =
         crate::fast_cbor::decode_mailbox(state).or_else(|| from_cbor::<MailboxStateV1>(state).ok())
     else {
-        return Vec::new();
-    };
-    let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
         return Vec::new();
     };
     let mut ledger_changed = false;
@@ -2571,9 +2588,24 @@ pub(crate) fn decide<S: SecretStore>(
         .map(|o| o.order.payment_script_pubkey.clone())
         .filter(|s| !s.is_empty())
         .collect();
-    if crate::bitcoin::published_floor_matches(&mut xpub, &published).is_err() {
-        refuse_all(&mut decided, Refusal::NoPaymentKey);
-        return decided;
+    match crate::bitcoin::published_floor_scan(&mut xpub, &published) {
+        Err(_) => {
+            refuse_all(&mut decided, Refusal::NoPaymentKey);
+            return decided;
+        }
+        // Left short: no address is handed out from a counter that may not
+        // be past every paid one. The counter it reached is kept, so the next
+        // run (the wake-up re-reads while requests wait) goes on from it.
+        Ok(scan) if !scan.complete => {
+            let why = if crate::bitcoin::save_payment_xpub(secrets, &xpub).is_ok() {
+                Refusal::CatchingUp
+            } else {
+                Refusal::CounterNotSaved
+            };
+            refuse_all(&mut decided, why);
+            return decided;
+        }
+        Ok(_) => {}
     }
 
     let Some(mut ledger) = load_ledger_kept(secrets, &arm.store_contract_id) else {
@@ -3593,7 +3625,7 @@ mod tests {
         assert_eq!(ledger_shown(&indefinite), None);
         secrets.set_secret(&ledger_key(&[1; 32]), &indefinite);
         assert_eq!(
-            load_ledger_shown(&secrets, &[1; 32]),
+            load_ledger_shown(&secrets, &[1; 32]).unwrap(),
             LedgerShown::of(from_cbor::<Ledger>(&indefinite).unwrap())
         );
     }
@@ -4107,7 +4139,7 @@ mod tests {
 
     /// I2. The counter is raised past the store's published scripts before
     /// deriving, so a device whose counter is behind does not reuse one.
-    /// Mutated red by removing the `published_floor_matches` call.
+    /// Mutated red by removing the `published_floor_scan` call.
     #[test]
     fn the_counter_moves_past_published_addresses() {
         let mut f = fixture();
@@ -6205,9 +6237,10 @@ mod tests {
     }
 
     /// A ledger held that does not decode is never written over with an
-    /// empty one: a mailbox run, a store change and a batch all stop, and
-    /// the batch is refused rather than invoiced again. Mutated red by
-    /// reading it as empty.
+    /// empty one: a mailbox run, a store change, a refused update and a
+    /// batch all stop, and the batch is refused rather than invoiced again;
+    /// the wake-up stops re-reading the mailbox and the status says why.
+    /// Mutated red by reading it as empty.
     #[test]
     fn an_unreadable_ledger_is_never_written_over() {
         let mut f = fixture();
@@ -6226,9 +6259,83 @@ mod tests {
             .iter()
             .all(|(_, why)| *why == Refusal::LedgerUnreadable));
         assert!(decided.undecided);
+        // A refused update of an earlier batch, and a store change.
+        let context = to_cbor(&PendingReplies {
+            magic: REPLIES_MAGIC,
+            mailbox_contract_id: f.record.arm.mailbox_contract_id,
+            store_contract_id: id.clone(),
+            replies: Vec::new(),
+            retry: vec![(entry_digest(&entry), [1; 32])],
+            orders: Vec::new(),
+        })
+        .unwrap();
+        on_store_update_answer(&mut f.secrets, &Err("refused".into()), &context);
+        let store = to_cbor(&f.store).unwrap();
+        on_notification(&mut f.secrets, &[1; 32], &store, NOW);
         assert_eq!(
             f.secrets.get_secret(&ledger_key(&id)).as_deref(),
             Some(b"not a ledger".as_slice())
+        );
+        // The wake-up does not come back for it, and the seller is told.
+        f.secrets.set_secret(&retry_key(&id), b"1");
+        on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+        assert_eq!(
+            f.secrets.get_secret(&retry_key(&id)).as_deref(),
+            Some(b"0".as_slice())
+        );
+        assert!(mailbox_retries(&f.secrets, NOW).is_empty());
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).paused,
+            Some(Refusal::LedgerUnreadable.explain())
+        );
+    }
+
+    /// #206: a store whose published orders are far past this device's
+    /// counter is refused (`CatchingUp`) while the counter catches up, one
+    /// bounded scan a run with the count kept, and the request waits; once
+    /// caught up it is invoiced at an address past every published order.
+    /// Mutated red by invoicing from a scan left short, and by not keeping
+    /// the count.
+    #[test]
+    fn a_batch_waits_while_the_counter_catches_up() {
+        use crate::bitcoin::FLOOR_SCAN_BUDGET;
+        let mut f = fixture();
+        let last = FLOOR_SCAN_BUDGET + 20;
+        unpaid_orders_on(&mut f, 0..last, NOW - 1_000);
+        // Paid, so no store limit turns the request away once caught up.
+        for order in f.store.orders.orders.values_mut() {
+            order.status = OrderStatus::Paid;
+        }
+        // As the seller's tab watches them: every published address and the
+        // ten after.
+        f.record.arm.watched_scripts = (0..last + 10).map(script_at).collect();
+        save(
+            &mut f.secrets,
+            &arm_key(&f.record.arm.store_contract_id),
+            &f.record,
+        );
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let first = run(&mut f, std::slice::from_ref(&entry));
+        assert!(first.orders.is_empty());
+        assert!(first
+            .refused
+            .iter()
+            .all(|(_, why)| *why == Refusal::CatchingUp));
+        assert!(first.undecided);
+        assert_eq!(counter(&f), FLOOR_SCAN_BUDGET, "the count reached is kept");
+        let second = run(&mut f, std::slice::from_ref(&entry));
+        assert!(
+            second
+                .refused
+                .iter()
+                .all(|(_, why)| *why != Refusal::CatchingUp),
+            "{:?}",
+            second.refused
+        );
+        assert_eq!(second.orders.len(), 1, "{:?}", second.refused);
+        assert_eq!(
+            second.orders[0].order.payment_script_pubkey,
+            script_at(last)
         );
     }
 
