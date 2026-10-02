@@ -266,7 +266,9 @@ pub enum HarvestDelegateRequest {
     /// in unix milliseconds, of the newest message they have seen in it. A
     /// store's reply newer than this is a "New reply". Never lowered (the
     /// later of the held and the sent time is kept), so two tabs cannot
-    /// make a seen reply new again. Handed back on
+    /// make a seen reply new again. A message's time is its writer's to
+    /// choose, so the UI clamps what it sends to `PRESENCE_SKEW_MS` past its
+    /// own clock: a reply dated far ahead cannot pin this. Handed back on
     /// [`RecalledConversation::seen_ms`]; held in the conversation's record,
     /// so it is capped with it and goes when it is forgotten or evicted.
     /// Fire-and-forget: answered with

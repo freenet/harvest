@@ -936,7 +936,7 @@ pub(crate) fn export_buyer_conversation<S: SecretStore>(
         )));
     };
 
-    let Some(conversation) = store
+    let Some(mut conversation) = store
         .get_secret(&buyer_conversation_key(store_contract_id, buyer_public_key))
         .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
     else {
@@ -948,6 +948,13 @@ pub(crate) fn export_buyer_conversation<S: SecretStore>(
         ));
     };
 
+    // Not what was noted on it (its sent digests, its seen time): a backup
+    // string is bounded (`MAX_BACKUP_STRING_BYTES`), and a full set of
+    // digests would put it past that, so it would not restore. A migration
+    // carries them (`import::Family::BuyerConversation`); a restored
+    // conversation shows the buyer's own messages as not confirmed.
+    conversation.sent.clear();
+    conversation.seen_ms = None;
     exported(
         encode_backup(&BuyerConversationBackupV2 {
             store_contract_id: id,
@@ -1205,6 +1212,24 @@ pub(crate) fn merge_held_conversation<S: SecretStore>(
         Ok(bytes) if store.set_secret(key, &bytes) => SecretImport::Written,
         _ => SecretImport::Retryable("the node refused the merged conversation".into()),
     })
+}
+
+/// A predecessor's conversation record as this delegate keeps it: its sent
+/// digests cut to the newest `MAX_SENT_DIGESTS`, which a predecessor (or a
+/// hand-built export) need not have kept to. `None` when it does not decode,
+/// so the caller copies it as it is (and recall then skips it, as before).
+pub(crate) fn capped_incoming_conversation(value: &[u8]) -> Option<Vec<u8>> {
+    let mut record = harvest_common::from_cbor::<BuyerConversationRecord>(value).ok()?;
+    let cap = harvest_common::delegate::MAX_SENT_DIGESTS * 32;
+    if record.sent.len() % 32 != 0 {
+        record.sent.clear();
+    }
+    if record.sent.len() <= cap {
+        return None;
+    }
+    let excess = record.sent.len() - cap;
+    record.sent.drain(..excess);
+    harvest_common::to_cbor(&record).ok()
 }
 
 /// `HarvestDelegateRequest::NoteBuyerSent`: keep the digest of an entry this
@@ -3525,6 +3550,55 @@ mod sent_and_seen_tests {
         );
     }
 
+    /// Review round 1 of batch 2 (blocking): a conversation's backup string
+    /// carries neither its sent digests nor its seen time, so one at the
+    /// digest cap still fits `MAX_BACKUP_STRING_BYTES` and restores. Mutated
+    /// red by exporting the record as it is.
+    #[test]
+    fn a_full_digest_list_still_backs_up_and_restores() {
+        let (mut store, tag) = kept(1);
+        for i in 0..MAX_SENT_DIGESTS {
+            note_buyer_sent(&mut store, 2, STORE, &tag, &digest(i));
+        }
+        mark_conversation_seen(&mut store, 3, STORE, &tag, 9);
+        let HarvestDelegateResponse::BuyerConversationExported {
+            result: Ok(backup), ..
+        } = export_buyer_conversation(&store, 4, STORE, &tag)
+        else {
+            panic!("exported")
+        };
+        let mut fresh = MemSecrets::default();
+        let HarvestDelegateResponse::BuyerConversationImported { result, .. } =
+            import_buyer_conversation(&mut fresh, 5, &backup.0)
+        else {
+            panic!("an import answer")
+        };
+        assert!(
+            matches!(result, Ok(ImportedConversation::Imported { .. })),
+            "{result:?}"
+        );
+        assert!(recalled(&fresh, &tag).sent_digests.is_empty());
+    }
+
+    /// A predecessor's record for a conversation this delegate does not hold
+    /// is cut to the newest `MAX_SENT_DIGESTS` on import. Mutated red by
+    /// copying it as it is.
+    #[test]
+    fn an_imported_conversation_is_capped() {
+        let (tag, mut theirs) = record(1);
+        theirs.sent = (0..MAX_SENT_DIGESTS + 7).flat_map(digest).collect();
+        let key = buyer_conversation_key(STORE, &tag);
+        let mut store = MemSecrets::default();
+        let value = harvest_common::to_cbor(&theirs).unwrap();
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::Written
+        );
+        let sent = recalled(&store, &tag).sent_digests;
+        assert_eq!(sent.len(), MAX_SENT_DIGESTS);
+        assert_eq!(sent[0], digest(7), "the newest kept");
+    }
+
     /// A seller's digests migrate merged: the predecessor's that the
     /// successor lacks go first (older), the cap keeps the newest, and the
     /// store cap and an unreadable held record are respected. Mutated red
@@ -3569,7 +3643,7 @@ mod sent_and_seen_tests {
         }
         assert!(matches!(
             crate::import::import_secret(&mut full, &key, &value),
-            SecretImport::Retryable(_)
+            SecretImport::Permanent(_)
         ));
         assert!(matches!(
             crate::import::import_secret(&mut full, &key, b"\x02"),

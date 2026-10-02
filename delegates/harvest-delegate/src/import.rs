@@ -444,7 +444,8 @@ pub(crate) fn import_secret<S: SecretStore>(
                 None => copy_within_cap(
                     store,
                     key,
-                    value,
+                    &crate::messaging::capped_incoming_conversation(value)
+                        .unwrap_or_else(|| value.to_vec()),
                     crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
                     crate::messaging::MAX_BUYER_CONVERSATIONS,
                 ),
@@ -581,7 +582,9 @@ fn import_seller_sent<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) -
         },
     };
     if !seller_sent_has_room(store, key) {
-        return SecretImport::Retryable(format!(
+        // Permanent: nothing this delegate does frees a store's slot, so a
+        // retry would fail the same way for ever.
+        return SecretImport::Permanent(format!(
             "this delegate already keeps sent messages for {} stores",
             harvest_common::delegate::MAX_SELLER_SENT_STORES
         ));
