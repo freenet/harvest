@@ -143,15 +143,57 @@ pub struct Heartbeat {
     /// Whether the store can issue payment details now. False closes the
     /// store as surely as silence does.
     pub taking_orders: bool,
+    /// Why not, in a word a buyer can be shown, when `taking_orders` is
+    /// false; never set when it is true ([`SignedHeartbeat::verify`] refuses
+    /// that). The seller's own delegate keeps the detailed reason.
+    ///
+    /// Absent from the encoding when `None`, so a heartbeat without one
+    /// encodes exactly as one did before this field existed and still
+    /// passes the exact-envelope check. A reader built before it decodes a
+    /// heartbeat WITH one (unknown fields are ignored), but re-encodes it
+    /// without, so its envelope check refuses it: an old reader sees no
+    /// valid not-taking heartbeat, which reads closed, as the heartbeat
+    /// says. Old readers follow the previous presence address in any case
+    /// (`legacy/presence_contract.toml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<NotTakingReason>,
+}
+
+/// Why a store is not taking orders, as its heartbeat tells buyers
+/// ([`Heartbeat::reason`]). Coarse on purpose: a buyer needs to know
+/// whether to come back, not which of the seller's checks failed.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotTakingReason {
+    /// The seller paused the whole store. Reserved: nothing sends it yet.
+    Paused,
+    /// The store is closed for good, or is not this seller's.
+    ClosedForGood,
+    /// The store is catching up with its published orders; it reopens by
+    /// itself, usually within minutes.
+    CatchingUp,
+    /// Anything else the seller has to put right (a lapsed watch, no
+    /// payment key, no recent block, no address left to issue).
+    Unavailable,
 }
 
 impl Heartbeat {
+    /// A heartbeat with no reason: taking orders, or not taking them for a
+    /// reason the signer does not give.
     pub fn new(seq: u64, at_ms: u64, taking_orders: bool) -> Self {
         Self {
             kind: HeartbeatKind::HarvestPresenceV1,
             seq,
             at_ms,
             taking_orders,
+            reason: None,
+        }
+    }
+
+    /// A heartbeat saying the store is not taking orders, and why.
+    pub fn not_taking(seq: u64, at_ms: u64, reason: NotTakingReason) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::new(seq, at_ms, false)
         }
     }
 }
@@ -201,6 +243,9 @@ impl SignedHeartbeat {
                  {HEARTBEAT_SIGNATURE_BYTES}",
                 self.signature.len()
             ));
+        }
+        if self.heartbeat.taking_orders && self.heartbeat.reason.is_some() {
+            return Err("a heartbeat taking orders gives no reason for not taking them".into());
         }
         let payload = crate::to_cbor(&self.heartbeat)?;
         if !crate::backing::is_exact_harvest_envelope(&self.scoped_payload, &payload) {
@@ -359,8 +404,9 @@ pub enum ClosedWhy {
     /// The latest heartbeat is older than [`PRESENCE_FRESH_MS`].
     Stale { age_ms: u64 },
     /// The seller is online, and says the store cannot issue payment
-    /// details.
-    NotTakingOrders,
+    /// details, with the reason its heartbeat gives (`None` from a signer
+    /// that gives none).
+    NotTakingOrders(Option<NotTakingReason>),
     /// The heartbeat is dated more than [`PRESENCE_SKEW_MS`] ahead of the
     /// reader's clock.
     FromTheFuture,
@@ -401,7 +447,7 @@ pub fn presence_verdict(state: Option<&PresenceStateV1>, now_ms: u64) -> Presenc
         return Presence::Closed(ClosedWhy::Stale { age_ms });
     }
     if !signed.heartbeat.taking_orders {
-        return Presence::Closed(ClosedWhy::NotTakingOrders);
+        return Presence::Closed(ClosedWhy::NotTakingOrders(signed.heartbeat.reason));
     }
     Presence::Open
 }
@@ -422,6 +468,69 @@ mod tests {
 
     fn signed(at_ms: u64, taking_orders: bool) -> SignedHeartbeat {
         SignedHeartbeat::sign(&store_key(), Heartbeat::new(at_ms, at_ms, taking_orders)).unwrap()
+    }
+
+    /// The reason a not-taking heartbeat carries: it verifies and reaches
+    /// the verdict; a heartbeat without one encodes exactly as before the
+    /// field existed (so it still passes the exact-envelope check); one
+    /// taking orders with a reason is refused; and a reader built before the
+    /// field decodes a heartbeat that has one but cannot re-encode it to its
+    /// envelope, so it refuses it rather than misreading it. Mutated red by
+    /// serializing an absent reason, by dropping the taking-with-reason
+    /// refusal, and by not passing the reason to the verdict.
+    #[test]
+    fn a_reason_travels_and_an_old_heartbeat_still_verifies() {
+        #[derive(Serialize, Deserialize)]
+        struct BeforeTheReason {
+            kind: HeartbeatKind,
+            seq: u64,
+            at_ms: u64,
+            taking_orders: bool,
+        }
+        let plain = Heartbeat::new(7, 8, false);
+        let old = BeforeTheReason {
+            kind: HeartbeatKind::HarvestPresenceV1,
+            seq: 7,
+            at_ms: 8,
+            taking_orders: false,
+        };
+        assert_eq!(
+            crate::to_cbor(&plain).unwrap(),
+            crate::to_cbor(&old).unwrap()
+        );
+
+        for reason in [
+            NotTakingReason::Paused,
+            NotTakingReason::ClosedForGood,
+            NotTakingReason::CatchingUp,
+            NotTakingReason::Unavailable,
+        ] {
+            let signed =
+                SignedHeartbeat::sign(&store_key(), Heartbeat::not_taking(1_000, 1_000, reason))
+                    .unwrap();
+            signed.verify(&store_key().verifying_key()).unwrap();
+            let back: Heartbeat =
+                crate::from_cbor(&crate::to_cbor(&signed.heartbeat).unwrap()).unwrap();
+            assert_eq!(back.reason, Some(reason));
+            assert_eq!(
+                presence_verdict(Some(&state(signed.clone())), 1_000),
+                Presence::Closed(ClosedWhy::NotTakingOrders(Some(reason)))
+            );
+            // An old reader: decodes, but its own encoding is not the signed
+            // one, so the envelope check fails.
+            let as_old: BeforeTheReason =
+                crate::from_cbor(&crate::to_cbor(&signed.heartbeat).unwrap()).unwrap();
+            let payload = crate::to_cbor(&as_old).unwrap();
+            assert!(!crate::backing::is_exact_harvest_envelope(
+                &signed.scoped_payload,
+                &payload
+            ));
+        }
+
+        let mut lying = Heartbeat::not_taking(1_000, 1_000, NotTakingReason::CatchingUp);
+        lying.taking_orders = true;
+        let lying = SignedHeartbeat::sign(&store_key(), lying).unwrap();
+        assert!(lying.verify(&store_key().verifying_key()).is_err());
     }
 
     fn state(h: SignedHeartbeat) -> PresenceStateV1 {
@@ -702,7 +811,7 @@ mod tests {
         // Fresh, but not taking orders.
         assert_eq!(
             v(&at(now, false)),
-            Presence::Closed(ClosedWhy::NotTakingOrders)
+            Presence::Closed(ClosedWhy::NotTakingOrders(None))
         );
         // Stale and not taking orders: stale is the reason.
         assert!(matches!(

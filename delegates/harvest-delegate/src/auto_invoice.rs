@@ -1042,6 +1042,11 @@ fn beat_key(store_contract_id: &[u8]) -> Vec<u8> {
 struct BeatRecord {
     at_ms: u64,
     taking_orders: bool,
+    /// The reason it gave for not taking them (`Heartbeat::reason`), so a
+    /// change of reason goes out at once as a change of `taking_orders`
+    /// does.
+    #[serde(default)]
+    reason: Option<harvest_common::presence::NotTakingReason>,
     /// The `seq` it was signed with (`harvest_common::presence::Heartbeat`).
     #[serde(default)]
     seq: u64,
@@ -1074,6 +1079,7 @@ fn taking_orders<S: SecretStore>(
 }
 
 /// `taking_orders`, with the delegations already read.
+#[cfg(test)]
 fn taking_orders_in<S: SecretStore>(
     secrets: &S,
     delegations: &Delegations,
@@ -1159,11 +1165,13 @@ fn heartbeat_with<S: SecretStore>(
     if secrets.has_secret(EXPORTED_KEY) {
         return None;
     }
-    let taking = taking_orders_in(secrets, delegations, record, now_ms);
+    let reason = not_taking_in(secrets, delegations, record, now_ms).map(|r| r.for_buyers());
+    let taking = reason.is_none();
     let key = beat_key(&record.arm.store_contract_id);
     if !force {
         if let Some(last) = load::<_, BeatRecord>(secrets, &key) {
             if last.taking_orders == taking
+                && last.reason == reason
                 && now_ms >= last.at_ms
                 && now_ms - last.at_ms < HEARTBEAT_MIN_GAP_MS
             {
@@ -1175,7 +1183,11 @@ fn heartbeat_with<S: SecretStore>(
     // Rising through a clock that jumps back (see `Heartbeat::seq`).
     let seq = load::<_, BeatRecord>(secrets, &key)
         .map_or(now_ms, |last| now_ms.max(last.seq.saturating_add(1)));
-    let signed = SignedHeartbeat::sign(&store_sk, Heartbeat::new(seq, now_ms, taking)).ok()?;
+    let beat = match reason {
+        None => Heartbeat::new(seq, now_ms, true),
+        Some(reason) => Heartbeat::not_taking(seq, now_ms, reason),
+    };
+    let signed = SignedHeartbeat::sign(&store_sk, beat).ok()?;
     let delta = to_cbor(&signed).ok()?;
     save(
         secrets,
@@ -1183,6 +1195,7 @@ fn heartbeat_with<S: SecretStore>(
         &BeatRecord {
             at_ms: now_ms,
             taking_orders: taking,
+            reason,
             seq,
         },
     );
@@ -1223,6 +1236,7 @@ fn note_presence_seen<S: SecretStore>(secrets: &mut S, record: &ArmRecord, state
     let mut next = held.unwrap_or(BeatRecord {
         at_ms: 0,
         taking_orders: false,
+        reason: None,
         seq: 0,
     });
     next.seq = seen;
@@ -1710,6 +1724,21 @@ impl Refusal {
                 "Your computer's clock is ahead of the right time. Set it right, then try again.",
             ),
             _ => None,
+        }
+    }
+
+    /// What a heartbeat tells buyers when this refusal stops the store
+    /// taking orders (`harvest_common::presence::Heartbeat::reason`):
+    /// coarse, since the buyer needs to know only whether to come back. The
+    /// seller sees the detailed reason (`AutoInvoiceStatus::paused`).
+    /// `Paused` is reserved for a whole-store pause, which nothing here
+    /// gives yet.
+    pub(crate) fn for_buyers(&self) -> harvest_common::presence::NotTakingReason {
+        use harvest_common::presence::NotTakingReason as R;
+        match self {
+            Refusal::StoreClosed | Refusal::NotOurStore => R::ClosedForGood,
+            Refusal::CatchingUp => R::CatchingUp,
+            _ => R::Unavailable,
         }
     }
 
@@ -7193,6 +7222,11 @@ mod tests {
             let record = f.record.clone();
             let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
             assert!(!beat.heartbeat.taking_orders, "{what}: the heartbeat sent");
+            assert_eq!(
+                beat.heartbeat.reason,
+                Some(why.for_buyers()),
+                "{what}: the buyers' reason"
+            );
         };
         assert_eq!(open_now(&fixture(), NOW), (None, true), "taking orders");
 
@@ -7268,6 +7302,54 @@ mod tests {
         assert_eq!(open_now(&f, NOW), (None, true), "read open again");
         f.store = theirs;
         says(&mut f, Refusal::NotOurStore, "not ours, read by decide");
+    }
+
+    /// What buyers are told for each refusal (harvest#219): closed and not
+    /// ours are closed for good, catching up is back soon, and everything
+    /// else is unavailable; a store taking orders sends no reason. A change
+    /// of reason while still not taking orders goes out at once, inside the
+    /// interval. Mutated red by mapping any refusal elsewhere, by sending a
+    /// reason while taking orders, and by not comparing the reason.
+    #[test]
+    fn a_heartbeat_tells_buyers_why_in_a_word() {
+        use harvest_common::presence::NotTakingReason as R;
+        for (refusal, want) in [
+            (Refusal::StoreClosed, R::ClosedForGood),
+            (Refusal::NotOurStore, R::ClosedForGood),
+            (Refusal::CatchingUp, R::CatchingUp),
+            (Refusal::WatchLapsed, R::Unavailable),
+            (Refusal::NoPaymentKey, R::Unavailable),
+            (Refusal::NoFreshTip, R::Unavailable),
+            (Refusal::NoWatchedAddress, R::Unavailable),
+            (Refusal::NetworkMismatch, R::Unavailable),
+            (Refusal::CounterNotSaved, R::Unavailable),
+            (Refusal::NoStoreKey, R::Unavailable),
+            (Refusal::LedgerUnreadable, R::Unavailable),
+        ] {
+            assert_eq!(refusal.for_buyers(), want, "{refusal:?}");
+        }
+        let mut f = fixture();
+        let record = f.record.clone();
+        let (open, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert!(open.heartbeat.taking_orders);
+        assert_eq!(open.heartbeat.reason, None);
+        open.verify(&store_sk().verifying_key()).unwrap();
+
+        let mut lapsed = record.clone();
+        lapsed.watched_until_ms = NOW;
+        let (first, _) = heartbeat(&mut f.secrets, &lapsed, NOW + 1_000, false).unwrap();
+        assert_eq!(first.heartbeat.reason, Some(R::Unavailable));
+        first.verify(&store_sk().verifying_key()).unwrap();
+        // Still not taking, now for another reason: sent at once.
+        note_store_read(
+            &mut f.secrets,
+            &record.arm.store_contract_id,
+            Some(&Refusal::StoreClosed),
+        );
+        let (second, _) = heartbeat(&mut f.secrets, &record, NOW + 2_000, false)
+            .expect("a new reason goes out inside the interval");
+        assert_eq!(second.heartbeat.reason, Some(R::ClosedForGood));
+        assert!(heartbeat(&mut f.secrets, &record, NOW + 3_000, false).is_none());
     }
 
     /// A batch turned away for a reason only the seller lifts settles the
