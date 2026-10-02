@@ -41,6 +41,14 @@
 //!      as `store.parameters` / `store.state` / `store.code` for `fdev
 //!      publish` at an earlier store generation, so a store re-key has a
 //!      real state to carry; harvest#53 Phase B)
+//!   delegate seed-ledgers <ws-url-with-authToken> <delegate.wasm> <seeded.json>
+//!     (after `seed`: import FULL instant-checkout ledgers, one per arm the
+//!      delegate allows, each at every cap, into the seeded generation through
+//!      its own `ImportMigratedSecret`, and add them to `seeded.json`; `check`
+//!      then asks the successor's own export for each, harvest#206)
+//!   delegate time-export <ws-url-with-authToken> <delegate.wasm> <generation-number>
+//!     (the wall time of that generation's `ExportSecrets` as a client sees
+//!      it, and what it exported; run after the walk, since an export disarms)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
@@ -75,6 +83,17 @@ struct Seeded {
     xpub: String,
     /// `RecalledConversation::buyer_public_key`, a function of the secret.
     conversation_buyer_public_key: [u8; 32],
+    /// Full instant-checkout ledgers imported by `seed-ledgers` (none when it
+    /// was not run): the key, and the bytes the seeded generation was given.
+    #[serde(default)]
+    ledgers: Vec<SeededLedger>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SeededLedger {
+    key: String,
+    value_hex: String,
+    retry_pending: bool,
 }
 
 struct Node {
@@ -125,6 +144,10 @@ impl Node {
     }
 
     async fn ask(&mut self, key: &DelegateKey, payload: Vec<u8>) -> Vec<u8> {
+        self.ask_within(key, payload, 20).await
+    }
+
+    async fn ask_within(&mut self, key: &DelegateKey, payload: Vec<u8>, secs: u64) -> Vec<u8> {
         self.api
             .send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
                 key: key.clone(),
@@ -136,8 +159,8 @@ impl Node {
             .await
             .expect("send delegate message");
         loop {
-            match tokio::time::timeout(Duration::from_secs(20), self.api.recv()).await {
-                Err(_) => panic!("no delegate answer within 20s"),
+            match tokio::time::timeout(Duration::from_secs(secs), self.api.recv()).await {
+                Err(_) => panic!("no delegate answer within {secs}s"),
                 Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
                     for value in values {
                         if let OutboundDelegateMsg::ApplicationMessage(msg) = value {
@@ -266,6 +289,7 @@ async fn read_back(node: &mut Node, key: &DelegateKey) -> Seeded {
         remembered,
         xpub,
         conversation_buyer_public_key,
+        ledgers: Vec::new(),
     }
 }
 
@@ -474,6 +498,55 @@ async fn check(url: &str, wasm: &[u8], seeded: &str, predecessor_hex: &str) {
         compare("remembered store", got.remembered.contains(code), format!("{:?}", got.remembered));
     }
     println!("full read-back of the successor: {got:#?}");
+    // Last: an export disarms the delegate that answers it.
+    if !expected.ledgers.is_empty() {
+        let (exported, elapsed) = export_of(&mut node, &key, 0).await;
+        println!(
+            "the successor's ExportSecrets: {} secrets, {} bytes, {elapsed:?}",
+            exported.secrets.len(),
+            exported
+                .secrets
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+        );
+        for ledger in &expected.ledgers {
+            let seeded = hex::decode(&ledger.value_hex).unwrap();
+            let held = exported
+                .secrets
+                .iter()
+                .find(|(k, _)| k == ledger.key.as_bytes())
+                .map(|(_, v)| v);
+            let (ok, detail) = match held {
+                None => (false, "not exported by the successor".to_string()),
+                Some(held) => match (cbor_value(held), cbor_value(&seeded)) {
+                    (Ok(a), Ok(b)) => (
+                        a == b,
+                        format!(
+                            "{} bytes, CBOR values {}, bytes {}{}",
+                            held.len(),
+                            if a == b { "equal" } else { "DIFFER" },
+                            if *held == seeded {
+                                "identical"
+                            } else {
+                                "differ"
+                            },
+                            if ledger.retry_pending {
+                                ", retry_pending=true"
+                            } else {
+                                ""
+                            }
+                        ),
+                    ),
+                    (a, b) => (
+                        false,
+                        format!("did not decode: {:?} {:?}", a.err(), b.err()),
+                    ),
+                },
+            };
+            compare(&format!("full ledger {}", ledger.key), ok, detail);
+        }
+    }
     if failures.is_empty() {
         println!("REHEARSAL PASSED: every seeded secret is answered by the successor");
     } else {
@@ -729,6 +802,232 @@ fn seed_store_state(seeded: &str, out_dir: &str) {
     println!("seller store {} with 1 custody copy written to {out_dir}", params.code());
 }
 
+/// A CBOR value with every map's entries in one order, so two encodings of
+/// the same ledger compare equal however a writer ordered its fields.
+fn cbor_value(bytes: &[u8]) -> Result<ciborium::Value, String> {
+    fn canon(v: ciborium::Value) -> ciborium::Value {
+        use ciborium::Value;
+        match v {
+            Value::Array(items) => Value::Array(items.into_iter().map(canon).collect()),
+            Value::Map(entries) => {
+                let mut entries: Vec<(Vec<u8>, Value, Value)> = entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let k = canon(k);
+                        let mut sort_key = Vec::new();
+                        ciborium::into_writer(&k, &mut sort_key).unwrap();
+                        (sort_key, k, canon(v))
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Map(entries.into_iter().map(|(_, k, v)| (k, v)).collect())
+            }
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(canon(*inner))),
+            other => other,
+        }
+    }
+    ciborium::from_reader::<ciborium::Value, _>(bytes)
+        .map(canon)
+        .map_err(|e| e.to_string())
+}
+
+/// Ask `key` for its migration export, and how long the answer took.
+async fn export_of(
+    node: &mut Node,
+    key: &DelegateKey,
+    generation: u32,
+) -> (freenet_migrate::ExportedSecrets, Duration) {
+    let request = harvest_common::to_cbor(
+        &harvest_common::migration::HarvestMigrationRequest::ExportSecrets {
+            source_generation: generation,
+        },
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let payload = node.ask_within(key, request, 120).await;
+    let elapsed = started.elapsed();
+    let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).expect("an export");
+    (exported, elapsed)
+}
+
+/// The instant-checkout ledger as the delegate stores it
+/// (`delegates/harvest-delegate/src/auto_invoice.rs`, `Ledger`, `Sale`,
+/// `Oversold`): crate-private, so mirrored field for field and in field
+/// order, as `tests/delegate-budget`'s fixtures mirror it. A drift shows up
+/// as a refused import or a ledger the successor does not export unchanged.
+#[derive(Serialize)]
+struct MirrorLedger {
+    seen: Vec<[u8; 32]>,
+    answered: Vec<[u8; 32]>,
+    issued_at_ms: Vec<u64>,
+    statuses: Vec<harvest_common::listing::ListingStatus>,
+    sales: Vec<MirrorSale>,
+    settled: Vec<harvest_common::payment::OrderId>,
+    oversold: Vec<MirrorOversold>,
+    gap_orders: Vec<(harvest_common::payment::OrderId, u32)>,
+    gap_paid: Option<(u64, u32)>,
+    capped: Option<(u64, String)>,
+    retry_pending: bool,
+}
+
+#[derive(Serialize)]
+struct MirrorSale {
+    order: harvest_common::payment::OrderId,
+    listing: harvest_common::listing::ListingId,
+    quantity: u32,
+    issued_at_ms: u64,
+    anchor_height: u32,
+    decremented: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct MirrorOversold {
+    order: harvest_common::payment::OrderId,
+    found_at_ms: u64,
+}
+
+/// A `const NAME: usize = N;` of the delegate's source, so the ledgers are
+/// at the caps the delegate under test enforces rather than a copy of them.
+fn delegate_cap(name: &str) -> usize {
+    const SOURCE: &str = include_str!("../../../../delegates/harvest-delegate/src/auto_invoice.rs");
+    let needle = format!("const {name}: usize = ");
+    let at = SOURCE
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} is not in auto_invoice.rs"))
+        + needle.len();
+    SOURCE[at..]
+        .split(';')
+        .next()
+        .unwrap()
+        .trim()
+        .replace('_', "")
+        .parse()
+        .unwrap()
+}
+
+fn id32(tag: u8, n: u32, i: usize) -> [u8; 32] {
+    let mut b = [tag; 32];
+    b[1..5].copy_from_slice(&n.to_le_bytes());
+    b[5..13].copy_from_slice(&(i as u64).to_le_bytes());
+    b
+}
+
+/// One arm's ledger with every capped list at its cap, `MAX_PER_DAY - 1`
+/// invoices in the last minute, and recent sales (`tests/delegate-budget`'s
+/// `full_ledger`). In the form a merge leaves it (`issued_at_ms` ascending),
+/// so the successor's merge into an empty ledger must return it unchanged.
+fn full_ledger(arm: u32, now_ms: u64, retry_pending: bool) -> MirrorLedger {
+    use harvest_common::listing::ListingId;
+    use harvest_common::payment::OrderId;
+    let issued = delegate_cap("MAX_PER_DAY") - 1;
+    MirrorLedger {
+        seen: (0..delegate_cap("SEEN_CAP"))
+            .map(|i| id32(0xA1, arm, i))
+            .collect(),
+        answered: (0..delegate_cap("ANSWERED_CAP"))
+            .map(|i| id32(0xA2, arm, i))
+            .collect(),
+        issued_at_ms: (0..issued)
+            .map(|i| now_ms - 60_000 - (issued - i) as u64)
+            .collect(),
+        statuses: Vec::new(),
+        sales: (0..delegate_cap("SALES_CAP"))
+            .map(|i| MirrorSale {
+                order: OrderId(id32(0xA3, arm, i)),
+                listing: ListingId(id32(0xA4, arm, i % 64)),
+                quantity: 1,
+                issued_at_ms: now_ms - 120_000,
+                anchor_height: 250_000,
+                decremented: None,
+            })
+            .collect(),
+        // `settled` is capped at ANSWERED_CAP (`merge_ledgers`).
+        settled: (0..delegate_cap("ANSWERED_CAP"))
+            .map(|i| OrderId(id32(0xA5, arm, i)))
+            .collect(),
+        oversold: Vec::new(),
+        gap_orders: (0..delegate_cap("GAP_ORDERS_CAP"))
+            .map(|i| (OrderId(id32(0xA6, arm, i)), i as u32))
+            .collect(),
+        gap_paid: None,
+        capped: None,
+        retry_pending,
+    }
+}
+
+/// Import a full ledger for each of `MAX_ARMS` stores into `wasm`'s delegate
+/// through its own `ImportMigratedSecret`, the first with `retry_pending`,
+/// and add them to `seeded`.
+async fn seed_ledgers(url: &str, wasm: &[u8], seeded_path: &str) {
+    let mut seeded: Seeded = serde_json::from_slice(&std::fs::read(seeded_path).unwrap()).unwrap();
+    let mut node = Node::connect(url).await;
+    let key = node.register(wasm).await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let arms = delegate_cap("MAX_ARMS");
+    for arm in 0..arms as u32 {
+        let store_contract_id = id32(0xC0, arm, 0);
+        let ledger_key = format!(
+            "harvest:auto:ledger:{}",
+            bs58::encode(store_contract_id).into_string()
+        );
+        let retry_pending = arm == 0;
+        let value = harvest_common::to_cbor(&full_ledger(arm, now_ms, retry_pending)).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = match node
+            .harvest(
+                &key,
+                HarvestDelegateRequest::ImportMigratedSecret {
+                    predecessor: [0x29; 32],
+                    key: ledger_key.clone().into_bytes(),
+                    value: harvest_common::delegate::MigratedSecretValue(value.clone()),
+                },
+            )
+            .await
+        {
+            HarvestDelegateResponse::MigratedSecretImported { outcome, .. } => outcome,
+            other => panic!("ImportMigratedSecret: {other:?}"),
+        };
+        println!(
+            "ledger {arm} ({} bytes) into {key}: {outcome:?} in {:?}",
+            value.len(),
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome,
+            harvest_common::delegate::SecretImport::Written,
+            "the seeded generation took the ledger"
+        );
+        seeded.ledgers.push(SeededLedger {
+            key: ledger_key,
+            value_hex: hex::encode(&value),
+            retry_pending,
+        });
+    }
+    std::fs::write(seeded_path, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+    println!("seeded {} full ledgers into {key}", seeded.ledgers.len());
+}
+
+/// How long `wasm`'s delegate takes to answer `ExportSecrets`, as a client
+/// sees it, and what it exported.
+async fn time_export(url: &str, wasm: &[u8], generation: u32) {
+    let mut node = Node::connect(url).await;
+    let key = node.register(wasm).await;
+    let (exported, elapsed) = export_of(&mut node, &key, generation).await;
+    let ledgers = exported
+        .secrets
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"harvest:auto:ledger:"))
+        .count();
+    println!(
+        "V{generation} ExportSecrets: {} secrets ({ledgers} ledgers), {} bytes, answered in {elapsed:?}",
+        exported.secrets.len(),
+        exported.secrets.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -743,6 +1042,10 @@ async fn main() {
         Some("check-store") => check_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("recover-store") => recover_store(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
         Some("seed-store-state") => seed_store_state(&args[2], &args[3]),
+        Some("seed-ledgers") => seed_ledgers(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4]).await,
+        Some("time-export") => {
+            time_export(&args[2], &std::fs::read(&args[3]).unwrap(), args[4].parse().expect("a generation number")).await
+        }
         Some("seed-convo") => seed_convo(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         _ => {
             eprintln!("usage: delegate seed|touch|check ... (see the module docs)");

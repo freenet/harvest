@@ -38,6 +38,11 @@
 #             pass the unregistered generation and import the older one.
 #   newest:   the newest predecessor holds the data (the common upgrade); every
 #             older generation is unregistered and must not stop the walk.
+#             It also holds a FULL instant-checkout ledger for every arm the
+#             delegate allows (`delegate seed-ledgers`, harvest#206): the
+#             largest export and import there is. The successor must then
+#             export each one unchanged (merged into nothing), and the
+#             predecessor's own export is timed after the walk.
 #
 # In both the walk must report the seeded generation `imported`, must reach a
 # verdict on every generation (no "stopped", "current delegate unavailable",
@@ -129,6 +134,11 @@ scenario() {
   # Seeded through the predecessor's own handlers, before the app first loads.
   "$HARNESS" seed "$URL&authToken=$(token)" "$d/predecessor.wasm" "$d/seeded.json" > "$d/seed.log" 2>&1 \
     || { echo "   FAIL: seeding $gen (see $d/seed.log)"; FAILED=1; stop_node; return; }
+  if [ "$name" = newest ]; then
+    "$HARNESS" seed-ledgers "$URL&authToken=$(token)" "$d/predecessor.wasm" "$d/seeded.json" > "$d/seed-ledgers.log" 2>&1 \
+      || { echo "   FAIL: seeding full ledgers into $gen (see $d/seed-ledgers.log)"; FAILED=1; stop_node; return; }
+    echo "   $(tail -1 "$d/seed-ledgers.log")"
+  fi
   node "$HERE/load-ui.js" "$PAGE" "$d/load.log" 150 || true
   local walk
   walk=$(grep -oE "delegate migration: V[0-9]+.*" "$d/load.log" | head -1 || true)
@@ -142,10 +152,18 @@ scenario() {
   fi
   if "$HARNESS" check "$URL&authToken=$(token)" "$NEWUI/harvest_delegate.wasm" "$d/seeded.json" "$key" \
       > "$d/check.txt" 2>&1; then
-    grep -E "^(OK|FAIL)" "$d/check.txt" | sed 's/^/   /'
+    grep -E "^(OK|FAIL)|ExportSecrets" "$d/check.txt" | sed 's/^/   /'
   else
-    grep -E "^(OK|FAIL)|panicked|assertion" "$d/check.txt" | sed 's/^/   /'
+    grep -E "^(OK|FAIL)|ExportSecrets|panicked|assertion" "$d/check.txt" | sed 's/^/   /'
     echo "   FAIL: the current delegate did not answer every seeded secret (see $d/check.txt)"; ok=0
+  fi
+  if [ "$name" = newest ]; then
+    # After the walk: an export disarms the generation that answers it.
+    if "$HARNESS" time-export "$URL&authToken=$(token)" "$d/predecessor.wasm" "${gen#V}" > "$d/time-export.txt" 2>&1; then
+      echo "   $(grep ExportSecrets "$d/time-export.txt")"
+    else
+      echo "   FAIL: $gen did not answer ExportSecrets with full ledgers (see $d/time-export.txt)"; ok=0
+    fi
   fi
   local peers
   peers=$(cat "$d"/node/log/*.log 2>/dev/null | grep -c "Adding connection to peer" || true)
