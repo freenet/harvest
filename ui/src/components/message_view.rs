@@ -1739,6 +1739,11 @@ pub(crate) fn requests_awaiting_invoice(
     let Some(store) = state.browsing_stores.get(store_contract_id) else {
         return 0;
     };
+    // A store closed for good can never invoice again (harvest#181), so a
+    // request there is nothing the seller can do.
+    if store.closed {
+        return 0;
+    }
     count_unanswered(
         state.mailbox_entries(store_contract_id),
         &store.listings,

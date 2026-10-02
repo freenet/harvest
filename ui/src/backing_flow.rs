@@ -74,6 +74,30 @@ pub(crate) const NO_BLOCK_FOR_BACKING: &str =
     "Harvest has not loaded a recent Bitcoin block yet, and a store's backing has to name \
      one. Wait for the chain data to load and try again.";
 
+/// What a seller is told when "Create store" is sent while My Store is still
+/// finding out whether the Ghost Key already backs a store (harvest#181).
+pub(crate) const STILL_CHECKING_GHOST_KEY: &str =
+    "Harvest is still checking whether this Ghost Key already has a store. Wait a moment and \
+     try again.";
+
+/// Why "Create store" (or "Move this store") is refused under `gate`, in
+/// the seller's terms; `None` when it may go on (harvest#181).
+pub(crate) fn creation_refusal(gate: &crate::index_flow::CreationGate) -> Option<String> {
+    use crate::index_flow::CreationGate;
+    match gate {
+        CreationGate::Ready | CreationGate::Unconfirmed => None,
+        CreationGate::Checking => Some(STILL_CHECKING_GHOST_KEY.into()),
+        CreationGate::BacksStore(name) => Some(format!(
+            "this Ghost Key already has a store, {name}. One Ghost Key can back only one store, \
+             so use a different Ghost Key for another"
+        )),
+        CreationGate::ListsUnloadedStore(code) => Some(format!(
+            "this Ghost Key already has a store (code {code}). One Ghost Key can back only one \
+             store, so use a different Ghost Key for another"
+        )),
+    }
+}
+
 /// How many blocks behind the newest known one a new backing is dated.
 ///
 /// A reader leaves out a backing dated above ITS tip
@@ -129,7 +153,6 @@ impl AppState {
         seller_verifying_key_bytes: [u8; 32],
         details: StoreDetails,
         carried_listings: Vec<Listing>,
-        another_store: bool,
     ) -> Result<u64, String> {
         if self.store_creation_in_flight.is_some() {
             return Err("a store is already being created; wait for it to finish".into());
@@ -152,7 +175,6 @@ impl AppState {
         self.store_creation_in_flight = Some(fingerprint.clone());
         let store_key_request = self.next_messaging_request_id();
         self.pending_store_creation = Some(PendingStoreCreation {
-            another_store,
             ghostkey_fingerprint: fingerprint,
             seller_verifying_key_bytes,
             certificate_pem: String::new(),
@@ -164,6 +186,25 @@ impl AppState {
             carried_listings,
         });
         Ok(store_key_request)
+    }
+
+    /// [`Self::begin_store_creation`] for a seller's own "Create store",
+    /// refused while My Store is still finding out what the Ghost Key already
+    /// backs (harvest#181). The form can be opened under one answer and sent
+    /// under another: an index that arrives meanwhile and lists a store still
+    /// loading puts the gate back to Checking, and the later section 6.2
+    /// check only sees stores that have loaded.
+    pub(crate) fn begin_own_store_creation(
+        &mut self,
+        fingerprint: String,
+        seller_verifying_key_bytes: [u8; 32],
+        details: StoreDetails,
+    ) -> Result<u64, String> {
+        let gate = self.store_creation_gate(&fingerprint, &seller_verifying_key_bytes);
+        if let Some(why) = creation_refusal(&gate) {
+            return Err(why);
+        }
+        self.begin_store_creation(fingerprint, seller_verifying_key_bytes, details, Vec::new())
     }
 
     /// The name of a loaded store whose current backing is the Ghost Key
@@ -250,20 +291,14 @@ impl AppState {
                     self.resumable_backing = None;
                 }
                 // Section 6.2 again, now the key is known: a store of this
-                // key is the one being resumed, not another store. The
-                // seller can say they meant a second store (see
-                // `SecondStoreOffer`), and then this does not apply.
+                // key is the one being resumed, not another store. No way
+                // round it (harvest#181): a second store under one Ghost Key
+                // makes both count for nothing.
                 let backer = pending.seller_verifying_key_bytes;
-                let deliberate = pending.another_store;
-                let refused = (!deliberate)
-                    .then(|| self.store_backed_by(&backer, Some(key)))
-                    .flatten();
-                if let Some(name) = refused {
-                    self.offer_second_store(&name);
+                if let Some(name) = self.store_backed_by(&backer, Some(key)) {
                     self.store_creation_failed(&format!(
-                        "this Ghost Key already backs {name}. A Ghost Key backs one store at a \
-                         time: use a different Ghost Key, or open a second store under this one \
-                         on purpose"
+                        "this Ghost Key already has a store, {name}. One Ghost Key can back \
+                         only one store, so use a different Ghost Key for another"
                     ));
                     return;
                 }
@@ -281,6 +316,14 @@ impl AppState {
                 }
                 self.start_store_creation_if_ready();
             }
+            // The delegate's own refusal under section 6.2 still offers "a
+            // second store on purpose", which this build no longer has
+            // (harvest#181); its text is fixed in the delegate, so it is
+            // said again here in the terms the seller can act on.
+            Err(why) if why.contains("second store") => self.store_creation_failed(
+                "this Ghost Key already has a store. One Ghost Key can back only one store, so \
+                 use a different Ghost Key for another",
+            ),
             Err(why) => {
                 self.store_creation_failed(&format!("no key could be made for the store: {why}"))
             }
@@ -666,42 +709,6 @@ impl AppState {
             })
     }
 
-    /// Remember the creation the section 6.2 refusal just stopped, so My
-    /// Store can ask whether the seller meant a second store under this
-    /// Ghost Key. Called before `store_creation_failed`, which takes the
-    /// pending creation away.
-    fn offer_second_store(&mut self, other_store: &str) {
-        let Some(pending) = self.pending_store_creation.as_ref() else {
-            return;
-        };
-        self.second_store_offer = Some(crate::state::SecondStoreOffer {
-            fingerprint: pending.ghostkey_fingerprint.clone(),
-            seller_verifying_key_bytes: pending.seller_verifying_key_bytes,
-            other_store: other_store.to_string(),
-            details: StoreDetails {
-                store_name: pending.store_name.clone(),
-                description: pending.description.clone(),
-            },
-            carried_listings: pending.carried_listings.clone(),
-        });
-    }
-
-    /// The seller said yes to a second store under this Ghost Key: start the
-    /// creation again, this time telling the delegate it is deliberate.
-    pub(crate) fn confirm_second_store(&mut self) -> Result<u64, String> {
-        let offer = self
-            .second_store_offer
-            .take()
-            .ok_or("there is no store waiting on that answer")?;
-        self.begin_store_creation(
-            offer.fingerprint,
-            offer.seller_verifying_key_bytes,
-            offer.details,
-            offer.carried_listings,
-            true,
-        )
-    }
-
     /// Move the Ghost Key `fingerprint`'s pre-revision-2 store onto a new
     /// store key. Returns the `CreateStoreKey` request id to send.
     pub(crate) fn move_legacy_store(
@@ -717,7 +724,6 @@ impl AppState {
             seller_verifying_key_bytes,
             details,
             listings,
-            false,
         )
     }
 }
@@ -855,7 +861,6 @@ pub(crate) mod tests {
 
     fn creation_ready() -> PendingStoreCreation {
         PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: ghost().verifying_key().to_bytes(),
             certificate_pem: "CERT".to_string(),
@@ -946,7 +951,6 @@ pub(crate) mod tests {
                     description: String::new(),
                 },
                 Vec::new(),
-                false,
             )
             .expect("started");
         {
@@ -991,7 +995,6 @@ pub(crate) mod tests {
                 ghost().verifying_key().to_bytes(),
                 StoreDetails::default(),
                 Vec::new(),
-                false,
             )
             .expect("started");
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
@@ -1020,7 +1023,6 @@ pub(crate) mod tests {
                 ghost().verifying_key().to_bytes(),
                 StoreDetails::default(),
                 Vec::new(),
-                false,
             )
         };
         start(&mut state).expect("the first starts");
@@ -1050,7 +1052,6 @@ pub(crate) mod tests {
                     description: String::new(),
                 },
                 Vec::new(),
-                false,
             )
             .expect("started");
         let pending = state.pending_store_creation.as_mut().unwrap();
@@ -1142,7 +1143,7 @@ pub(crate) mod tests {
         assert!(state
             .notifications
             .iter()
-            .any(|n| n.contains("already backs")));
+            .any(|n| n.contains("already has a store")));
     }
 
     /// A delegate Error while the creation waits for its store key releases
@@ -1189,12 +1190,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A refusal under section 6.2 is escapable: the seller is offered the
-    /// second store, and confirming starts the creation again with
-    /// `another_store`, which the delegate's own rule honours. Mutated red
-    /// by not recording the offer and by not carrying the flag.
+    /// A refusal under section 6.2 is final (harvest#181): no second store
+    /// is offered, and the delegate is never told a second store is
+    /// deliberate. Mutated red by starting the creation again.
     #[test]
-    fn a_refused_second_store_can_be_confirmed() {
+    fn a_ghost_key_that_backs_a_store_is_refused_a_second() {
         let mut state = AppState::default();
         load_backed(&mut state, 9, 0x62, vec![signed_backing(0x62, 0x61, 10)]);
         let request = started(&mut state);
@@ -1204,43 +1204,58 @@ pub(crate) mod tests {
                 .verifying_key()
                 .to_bytes()),
         });
-        let offer = state.second_store_offer.clone().expect("offered");
-        assert_eq!(offer.fingerprint, FINGERPRINT);
-        assert_eq!(offer.details.store_name, "Bean Shop");
         assert!(state.store_creation_in_flight.is_none());
+        assert!(state.pending_store_creation.is_none());
+        assert!(queued_statement(&state).is_none(), "nothing is backed");
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("use a different Ghost Key")));
+    }
 
-        state.confirm_second_store().expect("started again");
-        assert!(state.second_store_offer.is_none(), "answered");
-        assert!(
-            state
-                .pending_store_creation
-                .as_ref()
-                .is_some_and(|p| p.another_store),
-            "the delegate is told it is deliberate"
+    /// Each gate answer maps to going on or to a refusal that says why.
+    #[test]
+    fn creation_refusal_says_why_for_each_gate() {
+        use crate::index_flow::CreationGate;
+        assert_eq!(creation_refusal(&CreationGate::Ready), None);
+        assert_eq!(creation_refusal(&CreationGate::Unconfirmed), None);
+        assert_eq!(
+            creation_refusal(&CreationGate::Checking).as_deref(),
+            Some(STILL_CHECKING_GHOST_KEY)
         );
+        assert!(
+            creation_refusal(&CreationGate::BacksStore("Bean Shop".into()))
+                .unwrap()
+                .contains("already has a store, Bean Shop")
+        );
+        assert!(
+            creation_refusal(&CreationGate::ListsUnloadedStore("abc".into()))
+                .unwrap()
+                .contains("(code abc)")
+        );
+    }
 
-        // And this tab's own check lets it through now.
-        let request = state
-            .pending_store_creation
-            .as_ref()
-            .and_then(|p| p.store_key_request)
-            .expect("a key was asked for");
-        {
-            let pending = state.pending_store_creation.as_mut().unwrap();
-            pending.certificate_pem = "CERT".to_string();
-            pending.encryption_public_key = Some([1; 32]);
-        }
+    /// The delegate's own refusal of a second store still offers one "on
+    /// purpose", which this build no longer has (harvest#181): the seller is
+    /// told what they can do instead. Mutated red by passing the delegate's
+    /// text through.
+    #[test]
+    fn the_delegates_second_store_refusal_is_said_in_this_builds_terms() {
+        let mut state = AppState::default();
+        let request = started(&mut state);
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
             request_id: request,
-            result: Ok(SigningKey::from_bytes(&[0x64; 32])
-                .verifying_key()
-                .to_bytes()),
+            result: Err(
+                "this Ghost Key already backs a store on this device. A Ghost Key backs \
+                         one store at a time: use a different Ghost Key, or open a second store \
+                         under this one on purpose"
+                    .into(),
+            ),
         });
-        assert!(
-            queued_statement(&state).is_some(),
-            "the second store is being backed: {:?}",
-            state.notifications
-        );
+        assert!(state.store_creation_in_flight.is_none());
+        let said = state.notifications.last().expect("told");
+        assert!(said.contains("use a different Ghost Key"), "{said}");
+        assert!(!said.contains("on purpose"), "{said}");
     }
 
     /// A store made before revision 2 that has not loaded holds back
@@ -1288,7 +1303,6 @@ pub(crate) mod tests {
                 ghost().verifying_key().to_bytes(),
                 StoreDetails::default(),
                 Vec::new(),
-                false,
             )
             .expect("started");
         state.on_delegate_response(HarvestDelegateResponse::StoreKeyCreated {
@@ -1298,7 +1312,7 @@ pub(crate) mod tests {
         assert!(state
             .notifications
             .iter()
-            .any(|n| n.contains("already backs Bean Shop")));
+            .any(|n| n.contains("already has a store, Bean Shop")));
         assert!(state.store_creation_in_flight.is_none());
         assert!(queued_statement(&state).is_none(), "nothing signed");
     }
@@ -1314,7 +1328,6 @@ pub(crate) mod tests {
                 ghost().verifying_key().to_bytes(),
                 StoreDetails::default(),
                 Vec::new(),
-                false,
             )
             .expect_err("no tip");
         assert_eq!(err, NO_BLOCK_FOR_BACKING);
@@ -1484,12 +1497,22 @@ pub(crate) mod tests {
     /// A signed backing of the store keyed by `store` seed by the Ghost Key
     /// `backer` seed, dated `height`.
     pub(crate) fn signed_backing(store: u8, backer: u8, height: u32) -> AuthorizedBacking {
+        signed_backing_with_cert(store, backer, height, format!("CERT-{backer}"))
+    }
+
+    /// [`signed_backing`] naming its own certificate.
+    pub(crate) fn signed_backing_with_cert(
+        store: u8,
+        backer: u8,
+        height: u32,
+        certificate_pem: String,
+    ) -> AuthorizedBacking {
         let store_key = SigningKey::from_bytes(&[store; 32]);
         let ghost = SigningKey::from_bytes(&[backer; 32]);
         let statement = BackingStatement {
             store: store_key.verifying_key(),
             backer: ghost.verifying_key(),
-            certificate_pem: format!("CERT-{backer}"),
+            certificate_pem,
             network: BitcoinNetwork::Signet,
             block: BlockAnchor {
                 height,

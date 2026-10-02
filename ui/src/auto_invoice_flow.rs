@@ -1608,6 +1608,18 @@ impl AppState {
             _ => Vec::new(),
         }
     }
+
+    /// The alerts about orders already paid (oversold), without the ones
+    /// about selling: what a store closed for good still shows (harvest#181).
+    pub fn instant_checkout_order_alerts(&self, store_contract_id: &[u8]) -> Vec<String> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(status)) => instant_checkout_alerts(&AutoInvoiceStatus {
+                capped: None,
+                ..status.clone()
+            }),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Read an upcoming address's contract ([`AddressVet`]), and count it clear

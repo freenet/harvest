@@ -269,7 +269,6 @@ pub async fn create_store_contracts(
     backing: harvest_common::backing::AuthorizedBacking,
 ) -> Result<(), String> {
     let crate::state::PendingStoreCreation {
-        another_store: _,
         ghostkey_fingerprint: seller_fingerprint,
         seller_verifying_key_bytes,
         certificate_pem,
@@ -913,6 +912,43 @@ pub async fn submit_listing_status_by_id(
     .await
 }
 
+/// The update that closes a store for good (harvest#181): its backer's
+/// retirement and the closure, both signed by the store key, in ONE delta,
+/// which the contract applies all or nothing, so neither can land without
+/// the other.
+pub(crate) fn close_delta(
+    owner: ed25519_dalek::VerifyingKey,
+    retirement: harvest_common::backing::AuthorizedRetirement,
+    closure: harvest_common::backing::AuthorizedClosure,
+) -> harvest_common::store::StoreStateV1Delta {
+    harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
+        retirements: Some(vec![retirement]),
+        closed: Some(vec![closure]),
+        ..Default::default()
+    }
+}
+
+/// Close one of our stores for good (harvest#181), with [`close_delta`].
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_close_by_id(
+    store_contract_id: &[u8],
+    retirement: harvest_common::backing::AuthorizedRetirement,
+    closure: harvest_common::backing::AuthorizedClosure,
+) -> Result<(), String> {
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, _origin, owner) =
+        owned_store_key(store_contract_id, "no store to close").await?;
+    let delta_bytes = harvest_common::to_cbor(&close_delta(owner, retirement, closure))
+        .map_err(|e| format!("serialize store close delta: {e}"))?;
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await
+}
+
 /// Publish a store's signed details to its contract.
 ///
 /// Separate from creation because it cannot happen during it: the details
@@ -1241,6 +1277,7 @@ mod tests {
             "submit_store_info_by_id",
             "submit_despatch_by_id",
             "submit_order_by_id",
+            "submit_close_by_id",
         ] {
             assert!(
                 body_of(writer).contains("owned_store_key("),
@@ -1249,7 +1286,7 @@ mod tests {
         }
         assert!(body_of("submit_settled_order_by_id").contains("settlement_store_key("));
         // One send per writer above: a new store write has to join the list.
-        assert_eq!(src.matches("super::update_contract(").count(), 7);
+        assert_eq!(src.matches("super::update_contract(").count(), 8);
     }
 
     /// Each turn of a waiting write (harvest#164): a store on its current

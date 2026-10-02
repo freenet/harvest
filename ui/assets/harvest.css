@@ -1310,6 +1310,35 @@ h4 {
   margin-bottom: var(--space-xs);
 }
 
+/* One Ghost Key behind two stores (harvest#181): the stores involved, one
+   row each, with that store's Close button at the row's end. */
+.conflict-stores {
+  list-style: none;
+  padding: 0;
+  margin: var(--space-md) 0;
+}
+
+.conflict-stores li {
+  padding: var(--space-sm) 0;
+  border-top: 1px solid var(--border);
+}
+
+.conflict-stores li:last-child {
+  border-bottom: 1px solid var(--border);
+}
+
+/* A permanent, destructive action. */
+.btn-danger {
+  background: var(--color-terracotta);
+  border: 1px solid var(--color-terracotta);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #a85a2f;
+  border-color: #a85a2f;
+}
+
 .checklist {
   list-style: none;
 }
