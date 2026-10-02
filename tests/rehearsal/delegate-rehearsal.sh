@@ -45,6 +45,9 @@
 #             predecessor's own export is timed after the walk, and the
 #             successor's retry flag beside each ledger is read off the
 #             stopped node's disk (unexported, and no request reads it).
+#             Then the families the NEXT re-key imports from this generation
+#             (`delegate published-families`): its export, with published
+#             scripts added, imported into a twin of it.
 #
 # In both the walk must report the seeded generation `imported`, must reach a
 # verdict on every generation (no "stopped", "current delegate unavailable",
@@ -165,6 +168,13 @@ scenario() {
       echo "   $(grep ExportSecrets "$d/time-export.txt")"
     else
       echo "   FAIL: $gen did not answer ExportSecrets with full ledgers (see $d/time-export.txt)"; ok=0
+    fi
+    # The families the NEXT re-key will import from this generation (#206).
+    if "$HARNESS" published-families "$URL&authToken=$(token)" "$NEWUI/harvest_delegate.wasm" > "$d/families.txt" 2>&1; then
+      echo "   $(tail -1 "$d/families.txt")"
+    else
+      grep -E "^FAIL|panicked" "$d/families.txt" | sed 's/^/   /'
+      echo "   FAIL: the published-script families (see $d/families.txt)"; ok=0
     fi
   fi
   local peers

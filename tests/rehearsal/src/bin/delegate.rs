@@ -55,6 +55,13 @@
 //!      KEK; the flag is unexported and no request reads it. The ledger itself
 //!      is decrypted the same way and compared, so a wrong derivation fails
 //!      rather than reading as an absent flag)
+//!   delegate published-families <ws-url-with-authToken> <delegate.wasm>
+//!     (after `check`: give the current delegate published scripts and a scan,
+//!      export it, and import every exported secret into a TWIN of it (the
+//!      same code under other parameters, so another key, empty) through its
+//!      own `ImportMigratedSecret`, as the next re-key will; then the import
+//!      families #206 added: the published list, the pending-key slot, and
+//!      the keys that must be refused, harvest#206)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
@@ -117,8 +124,14 @@ impl Node {
     }
 
     async fn register(&mut self, wasm: &[u8]) -> DelegateKey {
+        self.register_with(wasm, harvest_common::delegate::DELEGATE_PARAMETERS).await
+    }
+
+    /// Register `wasm` under `params`: other parameters give the same code
+    /// another key, and so a delegate of its own, empty (`published-families`).
+    async fn register_with(&mut self, wasm: &[u8], params: &[u8]) -> DelegateKey {
         let code = DelegateCode::from(wasm.to_vec());
-        let params = Parameters::from(harvest_common::delegate::DELEGATE_PARAMETERS);
+        let params = Parameters::from(params.to_vec());
         let delegate = Delegate::from((&code, &params));
         let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
         let key = container.key().clone();
@@ -1089,6 +1102,181 @@ fn read_flags(secrets_dir: &str, delegate: &str, seeded: &str) {
     println!("RETRY FLAGS: all {} as seeded", seeded.ledgers.len());
 }
 
+/// The digests a stored published list holds (`published_set::DigestList`:
+/// `[version 2][generation u32][next_seq u64][tag_len u16][tag]` then
+/// 24-byte records, the digest first).
+fn published_digests(bytes: &[u8]) -> Option<std::collections::BTreeSet<[u8; 16]>> {
+    if bytes.first() != Some(&2) || bytes.len() < 15 {
+        return None;
+    }
+    let at = 15 + u16::from_le_bytes([bytes[13], bytes[14]]) as usize;
+    if bytes.len() < at || (bytes.len() - at) % 24 != 0 {
+        return None;
+    }
+    Some(bytes[at..].chunks(24).map(|r| r[..16].try_into().unwrap()).collect())
+}
+
+async fn import_into(
+    node: &mut Node,
+    key: &DelegateKey,
+    predecessor: [u8; 32],
+    secret: &[u8],
+    value: Vec<u8>,
+) -> harvest_common::delegate::SecretImport {
+    let request = HarvestDelegateRequest::ImportMigratedSecret {
+        predecessor,
+        key: secret.to_vec(),
+        value: harvest_common::delegate::MigratedSecretValue(value),
+    };
+    let bytes = node.ask(key, harvest_common::to_cbor(&request).unwrap()).await;
+    match harvest_common::from_cbor::<HarvestDelegateResponse>(&bytes) {
+        Ok(HarvestDelegateResponse::MigratedSecretImported { outcome, .. }) => outcome,
+        other => panic!("ImportMigratedSecret: {other:?}"),
+    }
+}
+
+/// The families #206 added, checked the way the NEXT re-key will meet them:
+/// the current delegate's own export imported into a twin of it.
+async fn published_families(url: &str, wasm: &[u8]) {
+    use harvest_common::delegate::SecretImport;
+    const PUBLISHED: &[u8] = b"harvest:bitcoin:published:v1";
+    const META: &[u8] = b"harvest:bitcoin:published-meta:v1";
+    const CURSOR_ACTIVE: &[u8] = b"harvest:bitcoin:cursor-active:v1";
+    const CURSOR_PENDING: &[u8] = b"harvest:bitcoin:cursor-pending:v1";
+    const PENDING: &[u8] = b"harvest:bitcoin:payment-xpub-pending:v1";
+    const RETIRED_ISSUED: &[u8] = b"harvest:bitcoin:issued:v1";
+    let mut failures: Vec<String> = Vec::new();
+    let mut verdict = |what: String, ok: bool| {
+        println!("{} {what}", if ok { "OK  " } else { "FAIL" });
+        if !ok {
+            failures.push(what);
+        }
+    };
+    let mut node = Node::connect(url).await;
+    let source = node.register(wasm).await;
+
+    // Two requests' worth of published scripts (P2WPKH-shaped), then a scan.
+    let per = harvest_common::bitcoin_delegate::MAX_SCRIPTS_PER_REQUEST;
+    for batch in 0..2u32 {
+        let scripts: Vec<Vec<u8>> = (0..per as u32)
+            .map(|i| {
+                let mut s = vec![0x00, 0x14];
+                s.extend_from_slice(&blake3::hash(&[batch.to_le_bytes(), i.to_le_bytes()].concat()).as_bytes()[..20]);
+                s
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let answer = node
+            .bitcoin(&source, BitcoinDelegateRequest::AddPublishedScripts { request_id: 60 + batch as u64, scripts })
+            .await;
+        let ok = matches!(answer, BitcoinDelegateResponse::PublishedScriptsAdded { result: Ok(()), .. });
+        verdict(format!("AddPublishedScripts of {per} scripts in {:?}: {answer:?}", started.elapsed()), ok);
+    }
+    let peek = node.bitcoin(&source, BitcoinDelegateRequest::PeekOrderAddresses { request_id: 62, count: 1 }).await;
+    println!("PeekOrderAddresses (a scan over the held scripts): {peek:?}");
+
+    let (exported, elapsed) = export_of(&mut node, &source, 0).await;
+    println!("source export: {} secrets in {elapsed:?}", exported.secrets.len());
+    let held = |k: &[u8]| exported.secrets.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let source_published = held(PUBLISHED).and_then(|v| published_digests(&v));
+    verdict(
+        format!(
+            "the export carries the published list: {:?} digests",
+            source_published.as_ref().map(|d| d.len())
+        ),
+        source_published.as_ref().is_some_and(|d| d.len() >= 2 * per),
+    );
+    for k in [META, CURSOR_ACTIVE, CURSOR_PENDING] {
+        verdict(format!("the export leaves out {}", String::from_utf8_lossy(k)), held(k).is_none());
+    }
+
+    // The twin: the same code, another key, nothing held.
+    let twin = node.register_with(wasm, b"rehearsal-twin").await;
+    assert_ne!(twin, source);
+    let predecessor: [u8; 32] = source.bytes().try_into().expect("a 32-byte delegate key");
+    let mut outcomes: std::collections::BTreeMap<String, usize> = Default::default();
+    for (k, v) in &exported.secrets {
+        let outcome = import_into(&mut node, &twin, predecessor, k, v.clone()).await;
+        let name = String::from_utf8_lossy(k).into_owned();
+        if !matches!(outcome, SecretImport::Written) {
+            verdict(format!("import of {name} into the twin: {outcome:?}"), false);
+        }
+        *outcomes.entry(format!("{outcome:?}")).or_default() += 1;
+    }
+    println!("twin imports: {outcomes:?}");
+    verdict(
+        format!("every exported secret imported into the twin as Written ({} secrets)", exported.secrets.len()),
+        outcomes.len() == 1 && outcomes.contains_key("Written"),
+    );
+    let again = import_into(&mut node, &twin, predecessor, PUBLISHED, held(PUBLISHED).unwrap()).await;
+    verdict(format!("the published list again: {again:?}"), again == SecretImport::AlreadyAuthoritative);
+
+    // The pending-key slot, into its own slot and only where none is held.
+    let pending = |next_index: u32| {
+        harvest_common::to_cbor(&Some(harvest_common::bitcoin_delegate::PaymentXpubStatus {
+            xpub: signet_vpub(),
+            network: freenet_bitcoin_common_network(),
+            next_index,
+        }))
+        .unwrap()
+    };
+    let first = import_into(&mut node, &twin, predecessor, PENDING, pending(7)).await;
+    verdict(format!("a pending key into an empty slot: {first:?}"), first == SecretImport::Written);
+    let second = import_into(&mut node, &twin, predecessor, PENDING, pending(9)).await;
+    verdict(
+        format!("a second pending key over a held one: {second:?}"),
+        second == SecretImport::AlreadyAuthoritative,
+    );
+    for k in [META, CURSOR_ACTIVE, CURSOR_PENDING, RETIRED_ISSUED] {
+        let outcome = import_into(&mut node, &twin, predecessor, k, vec![0; 8]).await;
+        verdict(
+            format!("{} is refused: {outcome:?}", String::from_utf8_lossy(k)),
+            matches!(outcome, SecretImport::Permanent(_)),
+        );
+    }
+
+    // What the twin now holds, by its own export.
+    let (twin_export, _) = export_of(&mut node, &twin, 0).await;
+    let twin_held = |k: &[u8]| twin_export.secrets.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let twin_published = twin_held(PUBLISHED).and_then(|v| published_digests(&v));
+    verdict(
+        format!(
+            "the twin holds the same published digests ({:?})",
+            twin_published.as_ref().map(|d| d.len())
+        ),
+        twin_published.is_some() && twin_published == source_published,
+    );
+    verdict(
+        "the twin holds the first pending key, not the second".into(),
+        twin_held(PENDING) == Some(pending(7)),
+    );
+    for k in [META, CURSOR_ACTIVE, CURSOR_PENDING, RETIRED_ISSUED] {
+        verdict(
+            format!("the twin's export has no {}", String::from_utf8_lossy(k)),
+            twin_held(k).is_none(),
+        );
+    }
+    let mut differ = Vec::new();
+    for (k, v) in &exported.secrets {
+        if k == PUBLISHED {
+            continue;
+        }
+        if twin_held(k).map(|t| cbor_value(&t).ok() == cbor_value(v).ok() || t == *v) != Some(true) {
+            differ.push(String::from_utf8_lossy(k).into_owned());
+        }
+    }
+    verdict(
+        format!("every other exported secret reads back from the twin unchanged (differ: {differ:?})"),
+        differ.is_empty(),
+    );
+    if failures.is_empty() {
+        println!("PUBLISHED FAMILIES: all checks passed");
+    } else {
+        println!("PUBLISHED FAMILIES: {} failed", failures.len());
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1107,6 +1295,7 @@ async fn main() {
         Some("time-export") => {
             time_export(&args[2], &std::fs::read(&args[3]).unwrap(), args[4].parse().expect("a generation number")).await
         }
+        Some("published-families") => published_families(&args[2], &std::fs::read(&args[3]).unwrap()).await,
         Some("read-flags") => read_flags(&args[2], &args[3], &args[4]),
         Some("seed-convo") => seed_convo(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         _ => {
