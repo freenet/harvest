@@ -134,7 +134,7 @@ fn handle_contract_response(response: ContractResponse) {
                 // A store of ours may have new orders: their payment scripts
                 // go to the delegate (#206).
                 #[cfg(target_arch = "wasm32")]
-                app.send_due_script_additions();
+                app.schedule_script_additions();
             }
 
             // Subscribe to the reputation contract if we found one

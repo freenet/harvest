@@ -544,7 +544,7 @@ fn notification_bar() -> Element {
     let app_state = crate::gateway::APP_STATE.read();
     // Notices that last only while something is under way (harvest#166)
     // come after the ones that stay, and end by themselves.
-    let progress = app_state.progress_notices();
+    let progress = app_state.progress_notice_parts();
     // Each notice once, however often it was raised, and each with a way to
     // put it away: before, they stacked up to eight deep above every screen
     // and never left (the 2026-09-27 friction report).
@@ -569,8 +569,19 @@ fn notification_bar() -> Element {
                     }
                 }
             }
-            for notice in progress.iter() {
-                p { "{notice}" }
+            // One stable live region (#206 review): a screen reader is told
+            // when a line appears or goes, not at every figure, which is
+            // hidden from it.
+            div { role: "status", aria_live: "polite",
+                for (line, figure) in progress.iter() {
+                    p { key: "{line}",
+                        "{line}"
+                        if !figure.is_empty() {
+                            " "
+                            span { aria_hidden: "true", "{figure}" }
+                        }
+                    }
+                }
             }
             if hidden > 0 {
                 p { class: "text-muted small",
