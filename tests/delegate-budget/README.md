@@ -285,6 +285,16 @@ measured with the node's engine. Until 2026-10-02 decide was held to 70% of
 an older budget that was 30% too generous (see Calibration); that ceiling
 is gone.
 
+**The next re-key (harvest#198 lane, branch `fix/delegate-rekey-batch2`)**
+moves one row: `DeriveConversationKeys` for 512 peers, store key and Ghost
+Key, from 1,506,290,189 (50.2%) on main's delegate (`ed88aa21…`) to
+2,667,647,573 (88.9%), now the largest call. The delegate refuses twins of a
+buyer's X25519 tag, which costs a subgroup check per peer; the check is
+variable time, since dalek's constant-time `is_torsion_free` put it at
+100.6%. Instant checkout checks only an opened instant request, so the
+mailbox rows do not move (one instant request: 4.5% to 4.6%). Both columns
+from one harness build, run on each WASM with `--wasm`.
+
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
 makes today is 18 (the wake-up with watch delegations: one per arm, and the

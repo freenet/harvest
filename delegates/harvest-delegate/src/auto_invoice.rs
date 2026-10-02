@@ -994,9 +994,16 @@ fn status_in<S: SecretStore>(
             .filter(|o| now_ms.saturating_sub(o.found_at_ms) < OVERSOLD_SHOWN_MS)
             .map(|o| o.order.clone())
             .collect(),
-        paused: not_taking_given(secrets, record, tip.as_ref(), &watched, remaining, now_ms)
-            .or(unreadable.then_some(Refusal::LedgerUnreadable))
-            .map(|r| r.explain()),
+        paused: not_taking_given(
+            secrets,
+            record,
+            tip.as_ref(),
+            &watched,
+            || remaining,
+            now_ms,
+        )
+        .or(unreadable.then_some(Refusal::LedgerUnreadable))
+        .map(|r| r.explain()),
         wallet_gap_paid_at_ms: ledger
             .gap_paid
             .map(|(at, _)| at)
@@ -1094,17 +1101,20 @@ fn not_taking_in<S: SecretStore>(
 ) -> Option<Refusal> {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let watched = watch_set_in(delegations, record, tip.as_ref(), now_ms);
-    let run = accepted_run_of(delegations.upcoming(), record, &watched, now_ms).0;
+    let run = || accepted_run_of(delegations.upcoming(), record, &watched, now_ms).0;
     not_taking_given(secrets, record, tip.as_ref(), &watched, run, now_ms)
 }
 
-/// [`not_taking_in`], with the tip, the watch set and the run worked out.
+/// [`not_taking_in`], with the tip and the watch set worked out. `run` is
+/// asked for last, and only when nothing else refuses: it derives the
+/// upcoming addresses (ten BIP-32 derivations) the first time a run needs
+/// them, which a forced heartbeat for a store refused anyway never did.
 fn not_taking_given<S: SecretStore>(
     secrets: &S,
     record: &ArmRecord,
     tip: Option<&TipCache>,
     watched: &WatchSet,
-    run: u32,
+    run: impl FnOnce() -> u32,
     now_ms: u64,
 ) -> Option<Refusal> {
     let id = &record.arm.store_contract_id;
@@ -1112,7 +1122,7 @@ fn not_taking_given<S: SecretStore>(
         .err()
         .or_else(|| store_read_refusal(secrets, id))
         .or_else(|| counter_refusal(secrets, id, now_ms))
-        .or((run == 0).then_some(Refusal::NoWatchedAddress))
+        .or_else(|| (run() == 0).then_some(Refusal::NoWatchedAddress))
 }
 
 /// Sign a heartbeat for `record`'s store and send it to its presence
