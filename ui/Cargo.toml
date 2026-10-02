@@ -9,6 +9,9 @@ description = "Harvest decentralized marketplace UI"
 [features]
 default = []
 no-sync = []
+# A test fixture, never in a shipped build: draws a stand-in picture for some
+# listings so the layouts can be looked at with pictures (`item_image`).
+image-preview = []
 
 [dependencies]
 harvest-common = { workspace = true, features = ["custody"] }

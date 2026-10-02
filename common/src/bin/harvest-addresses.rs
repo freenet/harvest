@@ -66,6 +66,14 @@ use harvest_common::store::StoreParameters;
 
 const DEFAULT_WASM_DIR: &str = "target/wasm32-unknown-unknown/release";
 
+/// The image contract's parameters are one BLAKE3 hash, the image's own
+/// (`harvest_image`), with no struct and no encoding that could change. So
+/// its address moves only with its code hash, and any fixed 32 bytes stand
+/// in for an image here. Written out rather than imported so this file still
+/// compiles at a merge base that predates `harvest-image` (see the module
+/// docs on being run from another worktree).
+const IMAGE_PLACEHOLDER_PARAMS: [u8; 32] = [0x1A; 32];
+
 /// Which stdlib addressing scheme an artifact uses. Both are
 /// `BLAKE3(code_hash || params)`, but each goes through its own stdlib type so
 /// that neither is a re-derivation maintained here.
@@ -153,14 +161,31 @@ fn run() -> Result<(), String> {
             placeholder_params_cbor::<PresenceParameters>()?,
         ),
         (
+            "image_contract",
+            Kind::Contract,
+            IMAGE_PLACEHOLDER_PARAMS.to_vec(),
+        ),
+        (
             "harvest_delegate",
             Kind::Delegate,
             DELEGATE_PARAMETERS.to_vec(),
         ),
     ];
 
+    // Only for the drift guard's merge-base run, where an artifact this PR
+    // introduces has no WASM yet (the build there runs with the same
+    // variable). Its row is then absent, and the comparison reports it as
+    // NEW, which fails until acknowledged. Without this, one new artifact
+    // made the whole base derivation fail and every OTHER artifact's
+    // address went unchecked on that PR.
+    let allow_missing = std::env::var("HARVEST_ALLOW_MISSING_CRATES").as_deref() == Ok("1");
+
     println!("# artifact\tkind\tcode_hash\tparams_len\tparams_hex\taddress");
     for (name, kind, params) in artifacts {
+        if allow_missing && !dir.join(format!("{name}.wasm")).exists() {
+            eprintln!("warning: no {name}.wasm here; not deriving its address");
+            continue;
+        }
         let wasm = read_wasm(&dir, name)?;
         let (code_hash, address) = derive(&kind, &wasm, &params);
         println!(

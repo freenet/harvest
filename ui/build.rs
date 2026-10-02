@@ -42,6 +42,11 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
         "legacy_presence_contract.rs",
         "LEGACY_PRESENCE_CONTRACT",
     ),
+    (
+        "image_contract.toml",
+        "legacy_image_contract.rs",
+        "LEGACY_IMAGE_CONTRACT",
+    ),
 ];
 
 /// Registries that may have no rows, and why. An artifact belongs here only
@@ -55,7 +60,10 @@ const CONTRACT_REGISTRIES: &[(&str, &str, &str)] = &[
 /// the current address, so its registry stays empty for good. See the header
 /// of `legacy/presence_contract.toml`. If a row is ever added there, the
 /// guard below fails until this entry goes.
-const MAY_BE_EMPTY: &[&str] = &["presence_contract.toml"];
+///
+/// `image_contract.toml` is a TEMPORARY entry: the image contract is new and
+/// has no predecessor yet.
+const MAY_BE_EMPTY: &[&str] = &["presence_contract.toml", "image_contract.toml"];
 
 const DELEGATE_REGISTRY: (&str, &str, &str) = (
     "harvest_delegate.toml",

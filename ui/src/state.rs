@@ -35,6 +35,8 @@ pub enum SellerRequest {
 /// ([`AppState::seller_order_request`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SellerOrderRequest {
+    /// The listing the buyer asked for.
+    pub listing_id: Option<harvest_common::listing::ListingId>,
     /// The listing's title, while the store still lists it.
     pub title: Option<String>,
     pub quantity: u32,
@@ -448,6 +450,30 @@ pub struct AppState {
     /// The Ghost Key indexes this tab follows, by index contract id
     /// (harvest#93 phase 1c). See `index_flow`.
     pub ghostkey_indexes: HashMap<Vec<u8>, crate::index_flow::IndexView>,
+    /// Ghost Keys (by fingerprint) whose index migration walk has ended in a
+    /// way that settles what the key backs this session (harvest#181). See
+    /// `index_flow::IndexWalkEnd` and `AppState::store_creation_gate`.
+    pub index_walks_done: HashSet<String>,
+    /// Ghost Keys (by fingerprint) whose index wait has been started, and
+    /// those whose wait has run out (`index_flow::INDEX_SETTLE_WAIT_MS`).
+    pub index_waits_started: HashSet<String>,
+    pub index_waits_elapsed: HashSet<String>,
+    /// Earlier-generation Ghost Key indexes recovered by the index migration
+    /// walk, by Ghost Key (harvest#181). See `index_flow::IndexWalkEnd`.
+    pub recovered_indexes: HashMap<[u8; 32], harvest_common::ghostkey_index::GhostKeyIndexV1>,
+    /// Stores being closed for good, by id, with the signed halves so far
+    /// (`crate::closure_flow`, harvest#181).
+    pub closing_stores: HashMap<Vec<u8>, crate::closure_flow::ClosingStore>,
+    /// Closes handed to the node, by store key, until the store's state
+    /// shows it closed (`crate::closure_flow`, harvest#181).
+    pub closes_sent: HashMap<[u8; 32], crate::closure_flow::CloseSent>,
+    /// Off-target only: closes ready to publish, recorded instead of sent.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub closes_ready: Vec<(
+        Vec<u8>,
+        harvest_common::backing::AuthorizedRetirement,
+        harvest_common::backing::AuthorizedClosure,
+    )>,
 
     /// Store keys whose backing this session has published into their
     /// backer's index, so it is published at most once per session.
@@ -637,11 +663,6 @@ pub struct AppState {
     /// marker while the PUTs ran on, so a second creation could start and a
     /// late failure of the first would then wipe it.
     pub store_publishing: bool,
-
-    /// A creation refused because its Ghost Key already backs a store, kept
-    /// so the seller can be asked whether they meant to open a second one
-    /// (harvest#93 section 6.2). Cleared when they answer either way.
-    pub second_store_offer: Option<SecondStoreOffer>,
 
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
@@ -876,11 +897,6 @@ pub struct AppState {
 /// that supply the rest of its inputs. See `start_store_creation_if_ready`.
 #[derive(Clone, Debug)]
 pub struct PendingStoreCreation {
-    /// The seller said, on purpose, that this Ghost Key may back a second
-    /// store (harvest#93 section 6.2). Carried into `CreateStoreKey` so the
-    /// delegate's own one-store rule lets it through, and it turns off this
-    /// tab's check too.
-    pub another_store: bool,
     pub ghostkey_fingerprint: String,
     pub seller_verifying_key_bytes: [u8; 32],
     /// Filled by the ghostkey delegate's `Certificate` (or `GhostKeyDetail`)
@@ -1365,6 +1381,10 @@ pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
 // node), short enough that "Checking" does not look like a hang.
 const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
 
+/// Why nothing is invoiced at a store closed for good (harvest#181).
+pub(crate) const STORE_CLOSED_INVOICE: &str =
+    "this store is closed for good, so it can't take orders any more";
+
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
     of Harvest, and an invoice issued now could reuse a payment address. Harvest moves it once \
@@ -1722,6 +1742,11 @@ pub enum PendingSignature {
     /// Harvest delegate's watch key (`crate::auto_invoice_flow`). A
     /// background request, handled as the watch requests are.
     WatchDelegation(Box<crate::auto_invoice_flow::PendingWatchDelegation>),
+    /// The retirement of a store's backer, half of closing it for good
+    /// (`crate::closure_flow`, harvest#181).
+    Retirement(Box<crate::closure_flow::PendingRetirement>),
+    /// A store's closure, the other half.
+    Closure(Box<crate::closure_flow::PendingClosure>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1758,6 +1783,8 @@ impl PendingSignature {
                     backing: pending.statement.clone(),
                 })
             }
+            PendingSignature::Retirement(pending) => harvest_common::to_cbor(&pending.retirement),
+            PendingSignature::Closure(pending) => harvest_common::to_cbor(&pending.closure),
         }
     }
 
@@ -1777,7 +1804,9 @@ impl PendingSignature {
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
             | PendingSignature::Despatch(_)
-            | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
+            | PendingSignature::BackingAcceptance(_)
+            | PendingSignature::Retirement(_)
+            | PendingSignature::Closure(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_)
             | PendingSignature::WatchDelegation(_)
             | PendingSignature::BackingStatement(_)
@@ -1810,24 +1839,6 @@ impl PendingSignature {
             _ => None,
         }
     }
-}
-
-/// A refused creation, waiting on the seller's answer to "open a second
-/// store under this Ghost Key anyway?".
-///
-/// The refusal alone is a dead end: a Ghost Key that already backs a store
-/// cannot back another, and nothing in this build can take a backing off a
-/// store (harvest#104), so the only other way forward is a different Ghost
-/// Key. Some sellers do want two stores under one key, so the refusal is
-/// escapable rather than final.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SecondStoreOffer {
-    pub fingerprint: String,
-    pub seller_verifying_key_bytes: [u8; 32],
-    /// The store this Ghost Key already backs, as the refusal named it.
-    pub other_store: String,
-    pub details: StoreDetails,
-    pub carried_listings: Vec<harvest_common::listing::Listing>,
 }
 
 /// What a seller has typed to issue one invoice, before it has an address.
@@ -4308,7 +4319,14 @@ impl AppState {
                 store.backing = view;
             }
         }
-        let currents = self.browsing_stores.values().filter_map(|store| {
+        // An earlier generation of a store whose current one is loaded is
+        // left out: it never receives the store's later records, so a
+        // retirement there (closing one of two stores, harvest#181) would
+        // never take effect on this device.
+        let currents = self.browsing_stores.iter().filter_map(|(id, store)| {
+            if self.superseded_generation(id) {
+                return None;
+            }
             let view = store.backing.as_ref()?;
             if !view.certificate_status.is_verified() {
                 return None;
@@ -7365,6 +7383,7 @@ impl AppState {
                     Some((
                         answering.order.id.clone(),
                         SellerOrderRequest {
+                            listing_id: Some(listing_id.clone()),
                             title: listing.map(|l| l.title.clone()),
                             quantity: *quantity,
                             shipping: shipping.clone(),
@@ -7432,6 +7451,17 @@ impl AppState {
         store_contract_id: &[u8],
         purchase: &BuyerPurchase,
     ) -> Option<(Option<String>, u32)> {
+        self.purchase_listing(store_contract_id, purchase)
+            .map(|(_, title, quantity)| (title, quantity))
+    }
+
+    /// [`Self::purchase_item`] with the listing the buyer asked for, which a
+    /// purchase's row and page show the item's picture by, when it has one.
+    pub fn purchase_listing(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<(harvest_common::listing::ListingId, Option<String>, u32)> {
         use crate::messaging::{Addressing, MessageContent};
         let store = self.browsing_stores.get(store_contract_id)?;
         let conversation = store
@@ -7472,7 +7502,64 @@ impl AppState {
             .iter()
             .find(|l| l.listing.id == listing_id)
             .map(|l| l.listing.title.clone());
-        Some((title, quantity))
+        Some((listing_id, title, quantity))
+    }
+
+    /// Where the buyer asked for `purchase` to be sent, as they typed it in
+    /// their own request: the address, the note, and the region and picks
+    /// (named by their group). The order page shows it under "Sending to".
+    /// `None` when the request is not in this device's thread, or two
+    /// requests under the order's id disagree.
+    pub fn purchase_ship_to(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<SellerOrderRequest> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)?;
+        let asked: Vec<SellerOrderRequest> = conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    shipping,
+                    note,
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&purchase.conversation)
+                        .is_some_and(|request| request.order_id() == purchase.order_id) =>
+                {
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == listing_id)
+                        .map(|l| &l.listing);
+                    Some(SellerOrderRequest {
+                        title: listing.map(|l| l.title.clone()),
+                        listing_id: Some(listing_id),
+                        quantity,
+                        shipping,
+                        note,
+                        region: selection.region.clone(),
+                        choices: labelled_choices(
+                            listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                            &selection.choices,
+                        ),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let first = asked.first()?.clone();
+        asked.iter().all(|other| *other == first).then_some(first)
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for
@@ -11469,8 +11556,26 @@ impl AppState {
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
             Some(PendingSignature::Despatch(_)) => "the despatch",
             Some(PendingSignature::BackingAcceptance(_)) => "your new store",
+            Some(PendingSignature::Retirement(_) | PendingSignature::Closure(_)) => {
+                "the store's closing"
+            }
             _ => "your store",
         };
+        // Closing a store needs both halves: one refused, the close stops.
+        let closing = match &withdrawn {
+            Some(PendingSignature::Retirement(p)) => Some(p.store_contract_id.clone()),
+            Some(PendingSignature::Closure(p)) => Some(p.store_contract_id.clone()),
+            _ => None,
+        };
+        if let Some(store_contract_id) = closing {
+            self.abandon_close(&store_contract_id);
+            warn!("store key did not sign {what}: {reason}");
+            self.notifications.push(format!(
+                "{} ({reason})",
+                crate::closure_flow::CLOSE_NOT_SAVED
+            ));
+            return;
+        }
         warn!("store key did not sign {what}: {reason}");
         if let Some(PendingSignature::Listing(listing)) = &withdrawn {
             self.on_listing_published(&listing.listing.id, false);
@@ -11564,6 +11669,16 @@ impl AppState {
                 "this store belongs to {owner}, so only that identity can issue invoices \
                  on it"
             ));
+        }
+        // Closing for good is permanent and buyers refuse to pay a closed
+        // store (`PaymentBlocker::StoreClosed`), so nothing is issued there
+        // (harvest#181).
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_some_and(|store| store.closed)
+        {
+            return Err(STORE_CLOSED_INVOICE.to_string());
         }
         // A listing its seller took down is not one to start a fresh sale of
         // (harvest#70). An invoice answering a buyer's request is allowed
@@ -12678,6 +12793,12 @@ impl AppState {
             }
             Some(PendingSignature::ListingStatus(pending)) => {
                 self.on_listing_status_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Retirement(pending)) => {
+                self.on_retirement_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Closure(pending)) => {
+                self.on_closure_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
                 self.details_sent(&pending.store_contract_id, pending.info.version);
@@ -16467,7 +16588,6 @@ mod tests {
 
     fn pending_creation() -> PendingStoreCreation {
         PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [7u8; 32],
             certificate_pem: String::new(),
@@ -17164,6 +17284,8 @@ mod tests {
                 | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_)
+                | PendingSignature::Closure(_)
                 | PendingSignature::MessageVoucher(_) => None,
             })
     }
@@ -17900,6 +18022,8 @@ mod tests {
                 | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_)
+                | PendingSignature::Closure(_)
                 | PendingSignature::MessageVoucher(_) => None,
             })
             .collect();
@@ -18349,7 +18473,6 @@ mod tests {
     fn a_ghostkey_error_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -18385,7 +18508,6 @@ mod tests {
     fn key_not_found_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -19786,6 +19908,24 @@ mod invoice_tests {
         );
     }
 
+    /// A store closed for good issues nothing (harvest#181): buyers refuse
+    /// to pay it, and closing is permanent. Mutated red by dropping the
+    /// closed check in `issue_invoice`.
+    #[test]
+    fn a_store_closed_for_good_cannot_issue_an_invoice() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .entry(STORE_ID.to_vec())
+            .or_default()
+            .closed = true;
+        assert_eq!(
+            state.issue_invoice(invoice()),
+            Err(STORE_CLOSED_INVOICE.to_string())
+        );
+        assert!(state.pending_invoices.is_empty());
+    }
+
     /// **A seller who cannot see the chain issues nothing at all.**
     ///
     /// The alternative is worse than it looks: an unanchored invoice is one
@@ -21050,7 +21190,6 @@ mod mailbox_read_tests {
         // reaching for the wrong fingerprint would most naturally pick up.
         let mut state = AppState {
             pending_store_creation: Some(PendingStoreCreation {
-                another_store: false,
                 ghostkey_fingerprint: "someone-else".to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 certificate_pem: String::new(),
@@ -21399,7 +21538,6 @@ mod delegate_correlation_tests {
     fn with_another_creation_in_flight() -> AppState {
         AppState {
             pending_store_creation: Some(PendingStoreCreation {
-                another_store: false,
                 ghostkey_fingerprint: THEIRS.to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 // Empty on purpose: `start_store_creation_if_ready` gates on
@@ -25086,7 +25224,7 @@ mod buy_flow_tests {
         );
     }
 
-    /// **My store's overview counts the orders a seller must reissue, and
+    /// **The seller's Home tab counts the orders a seller must reissue, and
     /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
     /// fresh one and a cancelled one do not. Pins the composition in
     /// `my_store::seller_stores` (seller filter, `needs_reissue`, and

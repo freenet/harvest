@@ -1865,7 +1865,6 @@ mod tests {
         );
 
         state.pending_store_creation = Some(crate::state::PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: backer_vk().to_bytes(),
             certificate_pem: String::new(),
@@ -2082,7 +2081,6 @@ mod tests {
         let mut state = AppState::default();
         state.store_creation_in_flight = Some("fp".to_string());
         state.pending_store_creation = Some(crate::state::PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: backer_vk().to_bytes(),
             certificate_pem: String::new(),
@@ -2126,7 +2124,6 @@ mod tests {
             let mut state = AppState::default();
             state.store_creation_in_flight = Some("fp".to_string());
             state.pending_store_creation = Some(crate::state::PendingStoreCreation {
-                another_store: false,
                 ghostkey_fingerprint: FINGERPRINT.to_string(),
                 seller_verifying_key_bytes: backer_vk().to_bytes(),
                 certificate_pem: String::new(),

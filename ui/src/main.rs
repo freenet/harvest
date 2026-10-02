@@ -7,6 +7,7 @@ mod auto_invoice_flow;
 mod backing_flow;
 mod bitcoin_generation;
 mod bitcoin_inbox;
+mod closure_flow;
 mod components;
 mod custody_flow;
 mod delegate_migrate;

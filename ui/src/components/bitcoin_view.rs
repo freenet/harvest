@@ -593,6 +593,10 @@ pub(crate) fn OrderCard(
     /// part of the order (msg1-msg3 screenshots: they sat below the box).
     #[props(default)]
     footer: Option<Element>,
+    /// On an order's own page, whose title already says the item, the
+    /// amount and the status: no box and no header line of its own.
+    #[props(default)]
+    plain: bool,
 ) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
@@ -668,17 +672,19 @@ pub(crate) fn OrderCard(
     let order_id = o.id.clone();
 
     rsx! {
-        div { class: "listing-card",
-            div { class: "listing-header",
-                span { class: "listing-price",
-                    "{super::pay_card::amount_text(o.amount_sats, o.network)}"
-                    if super::pay_card::is_test_network(o.network) {
-                        span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+        div { class: if plain { "order-plain" } else { "listing-card" },
+            if !plain {
+                div { class: "listing-header",
+                    span { class: "listing-price",
+                        "{super::pay_card::amount_text(o.amount_sats, o.network)}"
+                        if super::pay_card::is_test_network(o.network) {
+                            span { class: "test-coins", "{super::pay_card::TEST_COIN_NOTE}" }
+                        }
                     }
+                    span { class: "{status_class}", "{status_text}" }
                 }
-                span { class: "{status_class}", "{status_text}" }
             }
-            if !buyer {
+            if !buyer && !plain {
                 p { class: "text-muted", "Order {o.id.short()}" }
             }
             if let Some(note) = stage_note {
@@ -758,6 +764,7 @@ pub(crate) fn OrderCard(
                         network: o.network,
                         confirmations: o.required_confirmations,
                         order_ref: o.id.short(),
+                        titled: !plain,
                     }
                 }
             } else if destination.payable() && buyer {
@@ -786,6 +793,7 @@ pub(crate) fn OrderCard(
                     network: o.network,
                     confirmations: o.required_confirmations,
                     order_ref: o.id.short(),
+                    titled: !plain,
                 }
             } else if destination.payable() {
                 // The seller's own view of an unpaid invoice: the same
