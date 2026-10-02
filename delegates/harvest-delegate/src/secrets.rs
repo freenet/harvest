@@ -108,6 +108,8 @@ pub(crate) struct MemSecrets {
     pub(crate) reads: std::cell::Cell<usize>,
     /// Every key read, in order.
     pub(crate) read_log: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// Every key written, in order.
+    pub(crate) write_log: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -139,6 +141,7 @@ impl SecretStore for MemSecrets {
         {
             return false;
         }
+        self.write_log.push(key.to_vec());
         self.map.insert(key.to_vec(), value.to_vec());
         true
     }

@@ -137,18 +137,23 @@ pub(crate) fn sync_retry_flag<S: SecretStore>(secrets: &mut S, key: &[u8], pendi
 ///
 /// The two writes are ordered so that a failure or a call stopped between
 /// them errs toward a retry: a pending flag is written BEFORE the ledger
-/// (left alone, it only costs a re-read), and a cleared one after it. The
-/// ledger is written even when its flag cannot be, so what it records is
-/// kept (the next mailbox change still answers what it leaves undecided,
-/// and the next run puts the flag right); the save reports either failure.
+/// (left alone, it only costs a re-read), and a cleared one after it. Whether
+/// the LEDGER was saved, which is what callers act on (`decide` publishes
+/// only what it recorded). A flag that could not be written is not lost: a
+/// missing one sends the wake-up to the ledger (`mailbox_retries`), and the
+/// next mailbox run puts a wrong one right. (A host that refuses a "1" over a
+/// "0" and then accepts the ledger leaves that retry to the next mailbox
+/// change, as before the flag existed.)
 fn save_ledger<S: SecretStore>(secrets: &mut S, store_contract_id: &[u8], ledger: &Ledger) -> bool {
     let flag = retry_key(store_contract_id);
-    let flagged = !ledger.retry_pending || sync_retry_flag(secrets, &flag, true);
+    if ledger.retry_pending {
+        sync_retry_flag(secrets, &flag, true);
+    }
     let saved = save(secrets, &ledger_key(store_contract_id), ledger);
     if saved && !ledger.retry_pending {
         sync_retry_flag(secrets, &flag, false);
     }
-    flagged && saved
+    saved
 }
 
 /// Whether `key` is one of the ledgers ([`ledger_key`]): the one part of
@@ -543,12 +548,15 @@ pub(crate) fn mailbox_retries<S: SecretStore>(
     arms(secrets)
         .iter()
         // Every ledger write writes the flag (`save_ledger`, and the import
-        // of a predecessor's ledger), so no flag means nothing pending.
+        // of a predecessor's ledger); one missing (a write the host refused)
+        // is answered by the ledger itself.
         .filter(|record| {
-            secrets
-                .get_secret(&retry_key(&record.arm.store_contract_id))
-                .as_deref()
-                == Some(b"1")
+            let id = &record.arm.store_contract_id;
+            match secrets.get_secret(&retry_key(id)).as_deref() {
+                Some(b"1") => true,
+                Some(_) => false,
+                None => ledger_retry_pending(secrets, id),
+            }
         })
         // Only while the store can take orders: a run turned away (a lapsed
         // watch, a missing key, a tip too old) stops before reading anything,
@@ -656,20 +664,53 @@ fn load_ledger_shown<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> L
 }
 
 /// [`LedgerShown`] from a ledger's bytes, field by field, or `None` when any
-/// of it does not read (the caller then decodes the whole ledger).
+/// of it does not read (the caller then decodes the whole ledger). The
+/// fields skipped are checked only for their shape and for the presence of
+/// those a ledger cannot lack, so a ledger this delegate wrote reads as the
+/// whole decode reads it; one damaged inside a skipped field may show here
+/// what the whole decode would refuse.
 fn ledger_shown(bytes: &[u8]) -> Option<LedgerShown> {
-    let fields =
-        crate::fast_cbor::map_fields(bytes, &["issued_at_ms", "oversold", "gap_paid", "capped"])?;
+    const FIELDS: [&str; 7] = [
+        "issued_at_ms",
+        "oversold",
+        "gap_paid",
+        "capped",
+        // Without a `serde(default)`: present in every ledger.
+        "seen",
+        "answered",
+        "statuses",
+    ];
+    let fields = crate::fast_cbor::map_fields(bytes, &FIELDS)?;
+    let has = |i: usize| fields.iter().any(|(j, _)| *j == i);
+    if !(has(0) && has(4) && has(5) && has(6)) {
+        return None;
+    }
     let mut shown = LedgerShown::default();
     for (i, value) in fields {
         match i {
             0 => shown.issued_at_ms = from_cbor(value).ok()?,
             1 => shown.oversold = from_cbor(value).ok()?,
             2 => shown.gap_paid = from_cbor(value).ok()?,
-            _ => shown.capped = from_cbor(value).ok()?,
+            3 => shown.capped = from_cbor(value).ok()?,
+            _ => {}
         }
     }
     Some(shown)
+}
+
+/// A ledger's `retry_pending`, read without decoding the rest (as
+/// [`ledger_shown`] reads its fields), for a wake-up that finds a flag
+/// missing.
+fn ledger_retry_pending<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> bool {
+    let Some(bytes) = secrets.get_secret(&ledger_key(store_contract_id)) else {
+        return false;
+    };
+    match crate::fast_cbor::map_fields(&bytes, &["retry_pending"]) {
+        Some(fields) => fields
+            .first()
+            .is_some_and(|(_, value)| from_cbor::<bool>(value).unwrap_or(true)),
+        None => from_cbor::<Ledger>(&bytes).is_ok_and(|l| l.retry_pending),
+    }
 }
 
 fn load_ledger<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> Ledger {
@@ -2226,35 +2267,32 @@ pub(crate) fn on_store_state<S: SecretStore>(
     Some(decided.into_messages(&record.arm))
 }
 
-/// After a batch is decided, the retry flag its run left set says whether
-/// anything still waits: that run's backlog, or an entry of the batch that
-/// `decide` left undecided (a store-wide stop part way, a ledger it could
-/// not save). Cleared instead when the whole store was turned away for a
-/// reason a wake-up cannot change and only the seller lifts (a closed store,
-/// a key gone), so it is not re-read at every wake-up meanwhile; a tip too
-/// old is not such a reason. A refused UPDATE sets it again
+/// After a batch is decided: the retry flag its run set while it waited
+/// (`on_mailbox_ordered`) is kept when anything still waits, that run's
+/// backlog or an entry `decide` left undecided, and otherwise left for the
+/// next mailbox run to settle, which reads the whole mailbox: this batch
+/// cannot tell whether another (a refused UPDATE of an earlier one) set it
+/// too. Cleared only when the store itself turns every request away for
+/// good (closed, or not this seller's), which no wake-up can change; the
+/// other whole-store refusals are the wake-up's to wait out
+/// (`mailbox_retries`). A refused UPDATE sets it again
 /// (`on_store_update_answer`).
 fn settle_batch_retry<S: SecretStore>(secrets: &mut S, batch: &PendingBatch, decided: &Decided) {
-    let mut ledger = load_ledger(secrets, &batch.store_contract_id);
-    let undecided = batch
-        .entries
+    let id = &batch.store_contract_id;
+    let for_good = decided
+        .refused
         .iter()
-        .any(|entry| !ledger.seen.contains(&entry_digest(entry)));
-    let turned_away = decided.refused.iter().any(|(_, why)| {
-        matches!(
-            why,
-            Refusal::WatchLapsed
-                | Refusal::NoStoreKey
-                | Refusal::NotOurStore
-                | Refusal::StoreClosed
-                | Refusal::NoPaymentKey
-                | Refusal::NetworkMismatch
-        )
-    });
-    let waiting = (batch.backlog || undecided) && !turned_away;
-    if ledger.retry_pending != waiting {
-        ledger.retry_pending = waiting;
-        save_ledger(secrets, &batch.store_contract_id, &ledger);
+        .any(|(_, why)| matches!(why, Refusal::NotOurStore | Refusal::StoreClosed));
+    if for_good {
+        let mut ledger = load_ledger(secrets, id);
+        if ledger.retry_pending {
+            ledger.retry_pending = false;
+            save_ledger(secrets, id, &ledger);
+        }
+    } else if batch.backlog || decided.undecided {
+        // The run that sent this batch set the ledger's flag; only the key
+        // the wake-up reads may need writing again.
+        sync_retry_flag(secrets, &retry_key(id), true);
     }
 }
 
@@ -2339,6 +2377,9 @@ pub(crate) struct Decided {
     /// digest. For tests and the log.
     pub refused: Vec<([u8; 32], Refusal)>,
     pub owner: Option<VerifyingKey>,
+    /// Some of the entries were left undecided, unseen: the whole store
+    /// turned away, a store-wide stop part way, or the ledger not saved.
+    pub undecided: bool,
 }
 
 impl Decided {
@@ -2467,6 +2508,7 @@ pub(crate) fn decide<S: SecretStore>(
         for e in entries {
             decided.refused.push((entry_digest(e), why.clone()));
         }
+        decided.undecided = !entries.is_empty();
     };
     let anchor = match global_refusal(secrets, record, tip.as_ref(), now_ms) {
         Ok(anchor) => anchor,
@@ -2580,6 +2622,7 @@ pub(crate) fn decide<S: SecretStore>(
                 decided.refused.push((digest, why));
                 if store_wide {
                     // Everything after this waits too, unseen.
+                    decided.undecided = true;
                     break;
                 }
                 ledger.saw(digest);
@@ -2590,7 +2633,10 @@ pub(crate) fn decide<S: SecretStore>(
     // order or decrement sent but not recorded would lose its hold, or be
     // decremented again.
     if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
-        return Decided::default();
+        return Decided {
+            undecided: true,
+            ..Decided::default()
+        };
     }
     decided
 }
@@ -3440,8 +3486,9 @@ mod tests {
     /// decoding the rest, is what decoding the whole ledger shows: full and
     /// small ledgers, each of the four fields present or absent (an older
     /// ledger lacks some), statuses and long strings among the skipped
-    /// fields. Anything that is not a ledger map is declined and decoded
-    /// whole. Mutated red by reading a field from the wrong slot.
+    /// fields; and so is its `retry_pending`, read the same way. Anything
+    /// that is not a ledger map is declined and decoded whole. Mutated red
+    /// by reading a field from the wrong slot.
     #[test]
     fn the_status_reads_a_ledger_as_the_whole_decode_does() {
         let full = |n: usize| Ledger {
@@ -3466,8 +3513,17 @@ mod tests {
             capped: Some((NOW - 9, "x".repeat(300))),
             retry_pending: true,
         };
-        for ledger in [Ledger::default(), full(3), full(SEEN_CAP)] {
+        let mut quiet = full(3);
+        quiet.retry_pending = false;
+        for ledger in [Ledger::default(), full(3), quiet, full(SEEN_CAP)] {
             let bytes = to_cbor(&ledger).unwrap();
+            // And the wake-up's read of a flag gone missing.
+            let mut secrets = MemSecrets::default();
+            secrets.set_secret(&ledger_key(&[1; 32]), &bytes);
+            assert_eq!(
+                ledger_retry_pending(&secrets, &[1; 32]),
+                ledger.retry_pending
+            );
             assert_eq!(
                 ledger_shown(&bytes),
                 Some(LedgerShown::of(ledger.clone())),
@@ -3489,6 +3545,15 @@ mod tests {
             ledger_shown(&older),
             Some(LedgerShown::of(from_cbor::<Ledger>(&older).unwrap()))
         );
+        // A ledger lacking a field every ledger has: declined.
+        let mut value = ciborium::Value::serialized(&full(3)).unwrap();
+        let ciborium::Value::Map(fields) = &mut value else {
+            panic!()
+        };
+        fields.retain(|(k, _)| !matches!(k, ciborium::Value::Text(t) if t == "seen"));
+        let mut lacking = Vec::new();
+        ciborium::into_writer(&value, &mut lacking).unwrap();
+        assert_eq!(ledger_shown(&lacking), None, "no seen");
         // Not a ledger map: declined, and the load falls back.
         assert_eq!(ledger_shown(b"\x80"), None);
         let mut secrets = MemSecrets::default();
@@ -5204,8 +5269,9 @@ mod tests {
 
     /// A wake-up re-reads the mailbox of a store whose update was refused,
     /// and the answer is decided as a mailbox change is: the undecided
-    /// request goes to the store read again, and the flag clears once it is
-    /// decided. Mutated red by never asking, and by not clearing the flag.
+    /// request goes to the store read again, and once it is decided the next
+    /// read of the mailbox clears the flag. Mutated red by never asking, and
+    /// by not clearing the flag.
     #[test]
     fn a_wake_up_retries_requests_a_refused_update_left_undecided() {
         use crate::node_glue::{BackgroundRun, HEARTBEAT_TAG};
@@ -5264,6 +5330,26 @@ mod tests {
             NOW,
         )
         .unwrap();
+        // Decided; the next read of the whole mailbox settles the flag.
+        let again = crate::background::on_background(&mut f.secrets, &wake, NOW + 1);
+        let [read] = again
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::GetContractRequest(g) => Some(g),
+                _ => None,
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("{again:?}")
+        };
+        on_get_answer(
+            &mut f.secrets,
+            &[2; 32],
+            Some(&mailbox),
+            read.context.as_ref(),
+            NOW,
+        )
+        .expect("ours");
         assert!(!load_ledger(&f.secrets, &f.record.arm.store_contract_id).retry_pending);
         // Nothing more to retry.
         let later =
@@ -5918,14 +6004,14 @@ mod tests {
             "the fixture is lapsed"
         );
         assert!(mailbox_retries(&f.secrets, NOW).is_empty(), "lapsed");
-        assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()), "kept");
     }
 
     /// A refused store update reaches the wake-up through the flag; the run
     /// it starts keeps the flag while its batch waits on the store GET (a GET
-    /// that fails leaves it set), and deciding the batch settles it. Mutated
+    /// that fails leaves it set) and after (a batch cannot tell what else
+    /// waits), and the next read of the whole mailbox settles it. Mutated
     /// red by saving that ledger without its flag, by clearing the flag when
-    /// the batch is sent, and by not settling it once decided.
+    /// the batch is sent or decided, and by not settling it.
     #[test]
     fn a_refused_update_reaches_the_wakeup_and_its_run_clears_it() {
         let mut f = fixture();
@@ -5966,10 +6052,19 @@ mod tests {
         on_store_state(&mut f.secrets, None, &batch, NOW).unwrap();
         assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()), "a failed GET");
         assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1);
-        // It answers: decided, and settled.
+        // It answers: decided. The flag waits for a read of the whole
+        // mailbox, which alone can tell nothing else waits.
         let store = to_cbor(&f.store).unwrap();
         let answered = on_store_state(&mut f.secrets, Some(&store), &batch, NOW).unwrap();
         assert!(!answered.is_empty(), "the request is decided");
+        assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()));
+        let out = on_mailbox_retry(
+            &mut f.secrets,
+            &context.store_contract_id,
+            Some(&state),
+            NOW,
+        );
+        assert!(out.is_empty(), "nothing left to batch");
         assert_eq!(flag(&f).as_deref(), Some(b"0".as_slice()));
         assert!(mailbox_retries(&f.secrets, NOW).is_empty());
     }
@@ -5987,32 +6082,159 @@ mod tests {
         assert_eq!(flag(&f).as_deref(), Some(b"0".as_slice()));
     }
 
-    /// A pending flag is written before its ledger, so a ledger write that
-    /// fails (or a call stopped between the two) leaves the flag erring
-    /// toward a retry; a flag that cannot be written fails the save but
-    /// still lets the ledger keep what it records. Mutated red by writing
-    /// the flag after the ledger, and by ignoring the flag's result.
+    /// A pending flag is written before its ledger and a cleared one after,
+    /// so a ledger write that fails (or a call stopped between the two)
+    /// leaves the flag erring toward a retry. The save answers whether the
+    /// LEDGER was saved, and a flag the host refused is answered by the
+    /// ledger. Mutated red by writing a pending flag after the ledger, by
+    /// clearing one before it, and by reading a missing flag as nothing
+    /// waiting.
     #[test]
     fn a_pending_flag_is_written_before_its_ledger() {
-        let ledger = Ledger {
+        let pending = Ledger {
             retry_pending: true,
             ..Default::default()
         };
+        let mut secrets = MemSecrets::default();
+        assert!(save_ledger(&mut secrets, &[1; 32], &pending));
+        assert_eq!(
+            secrets.write_log,
+            vec![retry_key(&[1; 32]), ledger_key(&[1; 32])]
+        );
+        let mut secrets = MemSecrets::default();
+        secrets.set_secret(&retry_key(&[1; 32]), b"1");
+        secrets.write_log.clear();
+        assert!(save_ledger(&mut secrets, &[1; 32], &Ledger::default()));
+        assert_eq!(
+            secrets.write_log,
+            vec![ledger_key(&[1; 32]), retry_key(&[1; 32])]
+        );
+        // The ledger refused: a pending flag stands, a cleared one is kept.
         let mut secrets = MemSecrets::refusing_writes_under(ledger_key(&[1; 32]));
-        assert!(!save_ledger(&mut secrets, &[1; 32], &ledger));
+        assert!(!save_ledger(&mut secrets, &[1; 32], &pending));
         assert_eq!(
             secrets.get_secret(&retry_key(&[1; 32])).as_deref(),
             Some(b"1".as_slice())
         );
-        let mut secrets = MemSecrets::refusing_writes_under(retry_key(&[1; 32]));
-        assert!(!save_ledger(&mut secrets, &[1; 32], &ledger));
-        assert!(secrets.get_secret(&ledger_key(&[1; 32])).is_some());
+        assert!(!save_ledger(&mut secrets, &[1; 32], &Ledger::default()));
+        assert_eq!(
+            secrets.get_secret(&retry_key(&[1; 32])).as_deref(),
+            Some(b"1".as_slice())
+        );
+        // The flag refused: the ledger is saved, and the wake-up finds it.
+        let mut f = fixture();
+        let id = f.record.arm.store_contract_id.clone();
+        let mut secrets = MemSecrets::refusing_writes_under(retry_key(&id));
+        for (key, value) in f.secrets.list_secrets(b"").into_iter().map(|k| {
+            let v = f.secrets.get_secret(&k).unwrap();
+            (k, v)
+        }) {
+            secrets.set_secret(&key, &value);
+        }
+        f.secrets = secrets;
+        assert!(save_ledger(&mut f.secrets, &id, &pending));
+        assert!(f.secrets.get_secret(&retry_key(&id)).is_none());
+        assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1);
+    }
+
+    /// A batch partly decided (a store-wide stop part way: no watched
+    /// address left for the second request) keeps the flag, so the wake-up
+    /// comes back for the rest; a key lost meanwhile is written again by
+    /// the save `decide` makes. Mutated red by clearing the flag once a
+    /// batch is decided.
+    #[test]
+    fn a_batch_decided_part_way_keeps_the_retry() {
+        let mut f = fixture();
+        f.record.arm.watched_scripts.truncate(1);
+        save(
+            &mut f.secrets,
+            &arm_key(&f.record.arm.store_contract_id),
+            &f.record,
+        );
+        let state = to_cbor(&MailboxStateV1 {
+            messages: vec![
+                Buyer::new(40).request(&jam(), 1, 1, 12_000),
+                Buyer::new(41).request(&jam(), 1, 1, 12_000),
+            ],
+        })
+        .unwrap();
+        let out = on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+        let [OutboundDelegateMsg::GetContractRequest(get)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let batch = get.context.as_ref().to_vec();
+        // As a failed write would leave it: the key says nothing waits.
+        f.secrets
+            .set_secret(&retry_key(&f.record.arm.store_contract_id), b"0");
+        let store = to_cbor(&f.store).unwrap();
+        on_store_state(&mut f.secrets, Some(&store), &batch, NOW).unwrap();
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert_eq!(ledger.seen.len(), 1, "one decided, one left");
+        assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()));
+        assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1);
+    }
+
+    /// Each whole-store refusal, as `global_refusal` gives it: the exact
+    /// reason, in the order checked. Mutated red by dropping or reordering a
+    /// check.
+    #[test]
+    fn every_whole_store_refusal_is_the_one_it_says() {
+        let refusal = |f: &Fixture| {
+            let tip: Option<TipCache> = load(&f.secrets, &tip_key(BitcoinNetwork::Signet));
+            global_refusal(&f.secrets, &f.record, tip.as_ref(), NOW)
+        };
+        assert!(refusal(&fixture()).is_ok());
+        let mut f = fixture();
+        f.record.arm.store_verifying_key = [0x42; 32];
+        assert_eq!(refusal(&f), Err(Refusal::NoStoreKey));
+        // Neither a store key nor a payment key: the store key is asked first.
+        let mut f = fixture();
+        f.record.arm.store_verifying_key = [0x42; 32];
+        f.secrets = {
+            let mut s = MemSecrets::default();
+            let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+            save(&mut s, &tip_key(BitcoinNetwork::Signet), &tip);
+            s
+        };
+        assert_eq!(refusal(&f), Err(Refusal::NoStoreKey), "both missing");
+        let mut f = fixture();
+        f.secrets = {
+            let mut s = MemSecrets::default();
+            crate::store_keys::keep(&mut s, &store_sk());
+            let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+            save(&mut s, &tip_key(BitcoinNetwork::Signet), &tip);
+            s
+        };
+        assert_eq!(refusal(&f), Err(Refusal::NoPaymentKey));
+        let mut f = fixture();
+        let mut other = f.record.clone();
+        other.arm.network = BitcoinNetwork::Testnet4;
+        let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Testnet4), &tip);
+        f.record = other;
+        assert_eq!(refusal(&f), Err(Refusal::NetworkMismatch));
+        let mut f = fixture();
+        let mut old: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        old.block_time = 1;
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &old);
+        assert_eq!(refusal(&f), Err(Refusal::NoFreshTip));
+        let mut f = fixture();
+        f.record.watched_until_ms = 0;
+        f.record.arm.watch_left_ms = 0;
+        assert_eq!(refusal(&f), Err(Refusal::WatchLapsed));
+        let f = fixture();
+        assert_eq!(
+            global_refusal(&f.secrets, &f.record, None, NOW),
+            Err(Refusal::NoFreshTip),
+            "no tip"
+        );
     }
 
     /// A batch turned away for a reason only the seller lifts settles the
     /// flag rather than bringing the mailbox back at every wake-up; one held
-    /// for a tip too old keeps it. Mutated red by keeping it for every
-    /// refusal, and by clearing it for a stale tip.
+    /// for a tip too old keeps it, writing it again if it had gone. Mutated
+    /// red by keeping it for every refusal, by clearing it for a stale tip,
+    /// and by not writing it for a batch left undecided.
     #[test]
     fn a_turned_away_batch_settles_the_flag_and_a_stale_tip_keeps_it() {
         let run = |f: &mut Fixture| {
@@ -6040,6 +6262,10 @@ mod tests {
         let mut old: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
         old.block_time = 1;
         save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &old);
+        // As a failed write would leave it: decide saves nothing here, so
+        // the settling is what puts it back.
+        f.secrets
+            .set_secret(&retry_key(&f.record.arm.store_contract_id), b"0");
         let store = to_cbor(&f.store).unwrap();
         on_store_state(&mut f.secrets, Some(&store), &batch, NOW).unwrap();
         assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()), "a stale tip");
@@ -6049,7 +6275,7 @@ mod tests {
     /// flag the wake-up reads cannot fall behind the ledger (`import.rs`
     /// writes imported ledgers and syncs the flag itself, pinned by its own
     /// tests). Outside the tests, a ledger key is formed only in
-    /// `save_ledger` and the two loads, and no other `save(` or `set_secret(`
+    /// `save_ledger` and the loads, and no other `save(` or `set_secret(`
     /// call mentions a ledger. Mutated red by a bare `save` of a ledger.
     #[test]
     fn every_ledger_write_goes_through_save_ledger() {
@@ -6063,6 +6289,7 @@ mod tests {
             .replace(body("fn save_ledger<"), "")
             .replace(body("fn load_ledger<"), "")
             .replace(body("fn load_ledger_shown<"), "")
+            .replace(body("fn ledger_retry_pending<"), "")
             .lines()
             // Doc comments name the key without forming one.
             .filter(|l| !l.trim_start().starts_with("//"))

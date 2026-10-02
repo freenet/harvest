@@ -3180,9 +3180,9 @@ mod tests {
     }
 
     /// #206: a wake-up's heartbeats, and a tip read's statuses, read each
-    /// delegation and each arm a bounded number of times however many
-    /// stores are armed, not once per store (per delegation, per watch).
-    /// Mutated red by reading the delegations per store.
+    /// delegation a bounded number of times however many stores are armed,
+    /// not once per store. Mutated red by reading the delegations per store,
+    /// in either.
     #[test]
     fn many_stores_read_each_delegation_a_bounded_number_of_times() {
         let mut secrets = delegated();
@@ -3212,6 +3212,138 @@ mod tests {
             heartbeats <= 2,
             "{heartbeats} delegation reads for 16 heartbeats"
         );
+        // A tip read answers with every store's status.
+        let tip_id = record.arm.tip_contract_id;
+        let before = secrets.reads_under(&deleg);
+        let statuses =
+            crate::auto_invoice::on_get_answer(&mut secrets, &tip_id, None, &[], NOW).unwrap();
+        assert_eq!(statuses.len(), 16, "a status for every store");
+        let reads = secrets.reads_under(&deleg) - before;
+        assert!(reads <= 2, "{reads} delegation reads for 16 statuses");
+    }
+
+    /// #206: a store's delegation status worked out from the delegations
+    /// read once (`Delegations::status_for_arm`, with the shared pool and
+    /// vouching) is the status worked out for it alone (`status_of`): with a
+    /// watch whose canary is in the pool, a watch an arm names as its canary,
+    /// two bridges, and no payment key. Mutated red by a wrong network check
+    /// on the shared pool, and by vouching from every arm.
+    #[test]
+    fn a_status_from_the_delegations_read_once_is_the_status_alone() {
+        use crate::secrets::RemovableSecrets;
+        let check = |secrets: &MemSecrets| {
+            let read = Delegations::read(secrets);
+            for record in crate::auto_invoice::arms(secrets) {
+                let alone = all_held(secrets)
+                    .into_iter()
+                    .find(|h| {
+                        h.network == record.arm.network
+                            && record.arm.trusted_bridges.contains(&h.bridge)
+                    })
+                    .map(|h| status_of(secrets, &h, NOW));
+                assert_eq!(read.status_for_arm(secrets, &record.arm, NOW), alone);
+            }
+            // The delegated watches, by the per-watch reads this replaced:
+            // the counter and the delegation's own armed stores, read for
+            // each watch.
+            for h in all_held(secrets) {
+                let vouched = |w: &Watched| {
+                    let in_pool = crate::bitcoin::load_payment_xpub(secrets).is_none_or(|x| {
+                        w.canary_index < x.next_index.saturating_add(MAX_UPCOMING_ADDRESSES)
+                    });
+                    !in_pool
+                        && !armed_for(secrets, &h)
+                            .iter()
+                            .any(|r| r.arm.watched_scripts.contains(&w.canary))
+                };
+                let alone: Vec<(Vec<u8>, u32)> = h
+                    .watched
+                    .iter()
+                    .filter(|w| {
+                        h.watched.iter().any(|x| {
+                            x.script == w.script
+                                && TIP.saturating_add(WATCH_NEEDED_BLOCKS) <= x.until_height
+                                && vouched(x)
+                        })
+                    })
+                    .map(|w| (w.script.clone(), w.until_height))
+                    .collect();
+                assert_eq!(read.watched(h.network, &[h.bridge], TIP), alone);
+            }
+        };
+        let mut secrets = delegated();
+        // The first store names watch 8's canary: it no longer vouches.
+        let mut first = arm_record(&secrets);
+        first.arm.watched_scripts.push(script_at(1_008));
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &first,
+        );
+        let mut h = held(&secrets);
+        h.watched = (0..12u32)
+            .map(|i| Watched {
+                script: script_at(i),
+                until_height: TIP + 10_000,
+                canary: script_at(1_000 + i),
+                canary_contract: [0; 32],
+                // One in the pool; the others clean unless an arm names them.
+                canary_index: if i == 5 { 3 } else { 1_000 + i },
+            })
+            .collect();
+        put_held(&mut secrets, &h);
+        check(&secrets);
+        assert!(
+            Delegations::read(&secrets)
+                .status_for_arm(&secrets, &arm_record(&secrets).arm, NOW)
+                .is_some_and(|s| s.watched > 0),
+            "some watches count, so the comparison is not of zeros"
+        );
+        let counted = Delegations::read(&secrets).watched(h.network, &[h.bridge], TIP);
+        assert_eq!(
+            counted.len(),
+            10,
+            "all but the pool's canary and the named one"
+        );
+        // A second bridge, trusted by a second store only.
+        let other = BridgeId(SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes());
+        let mut second = arm_record(&secrets);
+        second.arm.store_contract_id = vec![2; 32];
+        second.arm.trusted_bridges = vec![other];
+        // Names watch 7's canary, but trusts only the other bridge: it says
+        // nothing about the first delegation.
+        second.arm.watched_scripts = vec![script_at(1_007)];
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[2; 32]),
+            &second,
+        );
+        let watch = get_watch_key(&mut secrets).unwrap();
+        let mut grant = grant_on(other, watch, sender_height(FLOOR), 0);
+        grant.inbox_contract_id = [0x2d; 32];
+        set_delegation(&mut secrets, grant, NOW).unwrap();
+        let mut h2 = load_held(&secrets, &other).unwrap();
+        h2.watched = h.watched.clone();
+        put_held(&mut secrets, &h2);
+        check(&secrets);
+        // A delegation, and a store, on a network the payment key is not
+        // on: no pool for it.
+        let mut h3 = load_held(&secrets, &other).unwrap();
+        h3.network = BitcoinNetwork::Testnet4;
+        put_held(&mut secrets, &h3);
+        second.arm.network = BitcoinNetwork::Testnet4;
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[2; 32]),
+            &second,
+        );
+        let tip: TipCache = load(&secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        save(&mut secrets, &tip_key(BitcoinNetwork::Testnet4), &tip);
+        check(&secrets);
+        // No payment key.
+        assert!(secrets.remove_secret(crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY));
+        assert!(Delegations::read(&secrets).upcoming().is_empty());
+        check(&secrets);
     }
 
     /// Two delegations with work take turns, the least recently read first.

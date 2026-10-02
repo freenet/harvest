@@ -173,7 +173,12 @@ impl Reader<'_> {
         let n = self.head(major)?;
         match major {
             0 | 1 => Some(()),
-            2 | 3 => self.take(usize::try_from(n).ok()?).map(|_| ()),
+            2 => self.take(usize::try_from(n).ok()?).map(|_| ()),
+            // Text is checked as ciborium checks it, so a value it would
+            // refuse is not passed over as if it were fine.
+            3 => std::str::from_utf8(self.take(usize::try_from(n).ok()?)?)
+                .ok()
+                .map(|_| ()),
             4 => (0..n).try_for_each(|_| self.skip(depth + 1)),
             5 => (0..n).try_for_each(|_| {
                 self.skip(depth + 1)?;
@@ -521,6 +526,34 @@ mod tests {
                 "{skipped:02x?}"
             );
         }
+        // Integer heads of every width, skipped.
+        for skipped in [
+            &[0x17][..],
+            &[0x18, 0xff],
+            &[0x19, 0xff, 0xff],
+            &[0x1a, 0xff, 0xff, 0xff, 0xff],
+            &[0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            let mut raw = vec![0xa2, 0x61, b's'];
+            raw.extend_from_slice(skipped);
+            raw.extend_from_slice(&[0x61, b'w', 0x01]);
+            assert_eq!(
+                map_fields(&raw, &["w"]),
+                Some(vec![(0, &[0x01][..])]),
+                "{skipped:02x?}"
+            );
+        }
+        // Nesting: 64 arrays deep is skipped, 66 is declined.
+        let nested = |depth: usize| {
+            let mut raw = vec![0xa1, 0x61, b's'];
+            raw.extend(std::iter::repeat_n(0x81, depth));
+            raw.push(0x00);
+            raw
+        };
+        assert!(map_fields(&nested(64), &["w"]).is_some());
+        assert_eq!(map_fields(&nested(66), &["w"]), None);
+        // Text that is not UTF-8, skipped: declined, as ciborium refuses it.
+        assert_eq!(map_fields(&[0xa1, 0x61, b's', 0x61, 0xff], &["w"]), None);
         assert_eq!(map_fields(&[0xbf, 0xff], &["want"]), None);
         assert_eq!(map_fields(&[0xa1, 0x61, b'a', 0x9f, 0xff], &["a"]), None);
     }
