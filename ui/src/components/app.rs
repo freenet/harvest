@@ -444,7 +444,7 @@ async fn harvest_delegate_ready() {
             .payment_xpub_loaded = true;
     }
     // And never wait on its answer forever (harvest#163): an answer can
-    // still be lost, and the page would sit on "Checking your payment key".
+    // still be lost, and the page would sit on "Checking your payout wallet".
     // Asked once more, then the form is shown.
     wasm_bindgen_futures::spawn_local(async {
         gloo_timers::future::TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS).await;

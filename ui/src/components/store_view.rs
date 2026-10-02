@@ -1004,6 +1004,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     let sold_out = matches!(
         availability,
         harvest_common::listing::ListingAvailability::SoldOut
+            | harvest_common::listing::ListingAvailability::Available { quantity: Some(0) }
     );
     let delivery = price_lines(&l).map(|(_, delivery)| delivery);
     // Why nothing can be bought here, in one line, in place of the form.

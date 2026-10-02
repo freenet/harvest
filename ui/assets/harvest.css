@@ -2121,8 +2121,14 @@ h4 {
 
 /* In a list where some rows have a picture, a row without one keeps the
    picture's room, so every row's words start at the same place. */
-:has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) > .rc-main {
-  margin-left: calc(3rem + var(--space-md));
+:has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) {
+  padding-left: calc(1.25rem + 3rem + var(--space-md));
+}
+
+@media (max-width: 600px) {
+  :has(> .rowcard .row-thumb) > .rowcard:not(:has(.row-thumb)) {
+    padding-left: calc(2 * var(--space-md) + 2.6rem);
+  }
 }
 
 .rc-flag {
@@ -2896,9 +2902,8 @@ a.btn {
    words their room. */
 .item-grid:not(.gallery):has(.item-card-img) {
   grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
-  /* Every card the height of the tallest, so a row with a picture and one
-     without line up. */
-  grid-auto-rows: 1fr;
+  /* Cards in a row are the height of the tallest, so one with a picture
+     and one without line up. */
   align-items: stretch;
 }
 

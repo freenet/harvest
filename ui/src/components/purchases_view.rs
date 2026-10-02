@@ -71,7 +71,7 @@ enum PurchasesTab {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OrderRow {
     pub page: Page,
-    /// "Aran skein × 1", or "Order 7SvqF" when the request isn't here.
+    /// "Aran skein × 1", or `unnamed_order` when the item can't be named here.
     pub item: String,
     pub store: String,
     pub date: Option<chrono::DateTime<chrono::Utc>>,
@@ -110,7 +110,7 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
                 item: match &listing {
                     Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
-                    None => unnamed_order(&store.name),
+                    None => unnamed_order(state.store_name_of(id).name()),
                 },
                 store: store.name.clone(),
                 date: order.map(|o| o.order.created_at),
@@ -125,18 +125,21 @@ pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
     }
     let shown = shown_order_ids(state, &stores);
     for kept in super::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown) {
-        let store = state
+        let found = state
             .browsing_stores
             .iter()
             .find(|(_, s)| s.owner == Some(kept.store_key))
-            .map(|(id, _)| state.store_name_of(id).label())
+            .map(|(id, _)| state.store_name_of(id));
+        let item = unnamed_order(found.as_ref().and_then(|n| n.name()));
+        let store = found
+            .map(|n| n.label())
             .unwrap_or_else(|| "A store you have used".to_string());
         rows.push(OrderRow {
             page: Page::Order {
                 at: OrderAt::Kept(kept.store_key),
                 order: kept.order.order.id.clone(),
             },
-            item: unnamed_order(&store),
+            item,
             store,
             date: Some(kept.order.order.created_at),
             amount: Some(super::pay_card::money(
@@ -612,19 +615,38 @@ fn unreachable_note(failed: usize) -> Option<String> {
     }
 }
 
-/// What an order is called when this device cannot say what it was for:
-/// the item is named only inside the buyer's conversation with the store
-/// (`Order` carries no listing id, harvest#57), so a conversation that was
-/// forgotten, or an order restored from a backup, has no item to show. Never
-/// its code, which says nothing to a person.
-pub(crate) fn unnamed_order(store: &str) -> String {
-    format!("An order from {store}")
+/// What an order is called when this device cannot say what it was for.
+/// The item is named only inside the buyer's conversation with the store
+/// (`Order` carries no listing id, harvest#57), and only for a Buy now
+/// (`AppState::purchase_listing`): an order the seller made by hand, one
+/// from a forgotten conversation, or one restored from a backup has no item
+/// to show. Named by its store when the store's name is known, never by its
+/// code, which says nothing to a person; the code is beside it.
+pub(crate) fn unnamed_order(store: Option<&str>) -> String {
+    match store {
+        Some(store) => format!("An order from {store}"),
+        None => "An order".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::BrowsingStore;
+
+    /// An order this device can't name is named by its store, and only by a
+    /// name the store published, never "Loading…" (review of round 4); never
+    /// by its code. Mutated red by passing `label()` instead of `name()`.
+    #[test]
+    fn an_unnamed_order_is_named_by_its_store_or_not_at_all() {
+        assert_eq!(
+            super::unnamed_order(Some("Bean Shop")),
+            "An order from Bean Shop"
+        );
+        assert_eq!(super::unnamed_order(None), "An order");
+        let loading = crate::state::StoreName::Loading;
+        assert_eq!(super::unnamed_order(loading.name()), "An order");
+    }
 
     fn named(name: &str) -> BrowsingStore {
         BrowsingStore {

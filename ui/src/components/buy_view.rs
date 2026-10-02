@@ -1025,7 +1025,9 @@ pub(crate) fn ReportForm(target: ComplaintTarget, back: super::router::Page) -> 
                 // MSG-11; critique of round 4).
                 (None, Some(id)) => rsx! {
                     p { class: "text-muted small",
-                        "The conversation this order was made in isn\u{2019}t on this device."
+                        "The conversation this order was made in isn\u{2019}t on this device. A \
+                         message goes to your other conversation with the seller, so mention \
+                         order {short}."
                     }
                     button {
                         class: "btn btn-primary",

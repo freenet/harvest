@@ -144,7 +144,7 @@ pub(crate) fn CancelInvoice(
     if let Some(why) = unsignable {
         return rsx! {
             p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Invoice {short} cannot be cancelled from this device yet: {why}"
+                "Order {short} can\u{2019}t be cancelled from this device yet: {why}"
             }
         };
     }
@@ -342,7 +342,7 @@ fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded:
     // tell a seller who already has one that they do not.
     if !xpub_loaded {
         return rsx! {
-            p { class: "text-muted text-italic", "Checking your payment key\u{2026}" }
+            p { class: "text-muted text-italic", "Checking your payout wallet\u{2026}" }
         };
     }
 
@@ -468,7 +468,7 @@ fn save_payment_key(xpub: String, network: BitcoinNetwork) {
             APP_STATE
                 .write()
                 .notifications
-                .push(format!("Could not save your payment key: {e}"));
+                .push(format!("Could not save your payout wallet: {e}"));
         }
     });
     #[cfg(not(target_arch = "wasm32"))]

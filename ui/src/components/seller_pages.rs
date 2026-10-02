@@ -853,9 +853,10 @@ fn SellerHome(store: SellerStore) -> Element {
     let id = store.contract_id.clone();
     let (rows, notes, setup, numbers) = home_content(&APP_STATE.read(), &store);
 
-    // "Nothing needs you right now" would contradict a header pill saying
-    // buyers can't buy yet (what is left to set up is listed below) or that
-    // the store is closed for good, so the empty To do list is left out
+    // With nothing to do, "Nothing needs you right now" would sit above a
+    // Finish setting up list (and usually under a header pill saying buyers
+    // can't buy until it is done), or on a store closed for good, whose
+    // header already says all there is; so the empty To do list is left out
     // then (critique of round 4).
     let quiet = store.details_resolved && rows.is_empty() && notes.is_empty();
     let show_todo = !(quiet && (setup.is_some() || store.closed));
@@ -1381,7 +1382,7 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                     // cancel.
                     if view.needs_reissue {
                         p { class: "text-warning",
-                            "This invoice has expired: it is too old for a buyer\u{2019}s software to \
+                            "This order has expired: it is too old for a buyer\u{2019}s software to \
                              accept, so nobody can pay it now. Cancel it; the buyer can order again."
                         }
                     }

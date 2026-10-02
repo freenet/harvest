@@ -98,9 +98,9 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                     None => match pending.as_ref() {
                         Some(p) => format!("{}\u{a0}\u{00d7}\u{a0}{}", p.title, p.quantity),
-                        None => super::purchases_view::unnamed_order(
-                            &state.store_name_of(&store).label(),
-                        ),
+                        None => {
+                            super::purchases_view::unnamed_order(state.store_name_of(&store).name())
+                        }
                     },
                 };
                 let open = state.buyer_open(&store, now);
@@ -481,11 +481,12 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
             .cloned()
             .map(|kept| {
                 let seen_paid = state.kept_seen_paid(&kept);
+                // Only a name the store has published, for the title.
                 let store_name = state
                     .browsing_stores
                     .iter()
                     .find(|(_, s)| s.owner == Some(store_key))
-                    .map(|(id, _)| state.store_name_of(id).label());
+                    .and_then(|(id, _)| state.store_name_of(id).name().map(str::to_string));
                 let complaint = super::buy_view::complaint_offer(
                     &state,
                     &ComplaintTarget::Kept {
@@ -516,9 +517,7 @@ fn KeptOrder(store_key: [u8; 32], order: OrderId) -> Element {
     let short = order.short();
     let amount = super::pay_card::money(kept.order.order.amount_sats, kept.order.order.network);
     let status = order_status::kept_status(&APP_STATE.read(), &kept);
-    let title = super::purchases_view::unnamed_order(
-        store_name.as_deref().unwrap_or("a store you have used"),
-    );
+    let title = super::purchases_view::unnamed_order(store_name.as_deref());
     rsx! {
         {back}
         div { class: "page-title",
@@ -583,7 +582,7 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
                         )
                     })
                     .unwrap_or_else(|| {
-                        super::purchases_view::unnamed_order(&state.store_name_of(store).label())
+                        super::purchases_view::unnamed_order(state.store_name_of(store).name())
                     });
                 let stage_line = purchase
                     .as_ref()
@@ -611,15 +610,17 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
                     .browsing_stores
                     .iter()
                     .find(|(_, s)| s.owner == Some(*store_key))
-                    .map(|(id, _)| state.store_name_of(id).label());
+                    .map(|(id, _)| state.store_name_of(id));
+                let title = super::purchases_view::unnamed_order(
+                    store_name.as_ref().and_then(|n| n.name()),
+                );
+                let store_name = store_name.map(|n| n.label());
                 (
                     Some(ComplaintTarget::Kept {
                         store_key: *store_key,
                         order_id: order.clone(),
                     }),
-                    super::purchases_view::unnamed_order(
-                        store_name.as_deref().unwrap_or("a store you have used"),
-                    ),
+                    title,
                     store_name,
                     None,
                 )
@@ -635,7 +636,8 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
         h2 { class: "page-h", "Report a problem" }
         p { class: "page-meta",
             "{item}"
-            if let Some(ref name) = store_name {
+            // Not when the item is already named by its store.
+            if let Some(ref name) = store_name.as_ref().filter(|n| !item.contains(n.as_str())) {
                 " \u{00b7} {name}"
             }
         }

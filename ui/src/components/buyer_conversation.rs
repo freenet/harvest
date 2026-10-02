@@ -53,7 +53,7 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                             Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
                             Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
                             None => super::purchases_view::unnamed_order(
-                                &state.store_name_of(&store).label(),
+                                state.store_name_of(&store).name(),
                             ),
                         };
                         (
@@ -62,15 +62,22 @@ pub(crate) fn BuyerConversationPage(store: Vec<u8>, tag: Option<[u8; 32]>) -> El
                                 order: p.order_id.clone(),
                             },
                             item,
-                            // With its date: two orders of one item would
+                            // With its date, and its code when the item
+                            // can't be named: two such orders would
                             // otherwise read alike.
-                            match p.commitment.as_ref().or(p.paid.as_ref()) {
-                                Some(o) => format!(
+                            match (p.commitment.as_ref().or(p.paid.as_ref()), &listing) {
+                                (Some(o), Some(_)) => format!(
                                     "{} \u{00b7} {}",
                                     status.label(),
                                     super::order_status::short_date(o.order.created_at)
                                 ),
-                                None => status.label().to_string(),
+                                (Some(o), None) => format!(
+                                    "{} \u{00b7} {} \u{00b7} order {}",
+                                    status.label(),
+                                    super::order_status::short_date(o.order.created_at),
+                                    p.order_id.short()
+                                ),
+                                (None, _) => status.label().to_string(),
                             },
                             status.ended(),
                         )
