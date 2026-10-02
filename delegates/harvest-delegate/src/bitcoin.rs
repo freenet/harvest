@@ -635,14 +635,13 @@ pub(crate) fn add_published<S: SecretStore>(
     let mut published =
         DigestList::load(store, PUBLISHED_KEY).map_err(|_| UNREADABLE_PUBLISHED.to_string())?;
     let inserted = published.insert(&fresh);
-    // Written only when it changed. A refused write fails the addition only
-    // when it added something: when every script was held already, all a
-    // refusal loses is the mark that they were sent again, and refusing an
-    // address for that would refuse it for nothing (#206 review).
-    if inserted.changed
-        && !crate::published_set::save_published(store, &published)
-        && inserted.added > 0
-    {
+    // Written only when it changed (a script added, or one held stamped as
+    // sent again): a pass of scripts all held recently writes nothing and
+    // so cannot be refused. A write that was needed and refused fails the
+    // addition, re-stamps included: the UI would otherwise count those
+    // scripts sent while their stamps were never kept, and near the cap
+    // eviction could take them (#206 review, codex).
+    if inserted.changed && !crate::published_set::save_published(store, &published) {
         return Err(
             "the node refused to store the published orders' addresses, so none can be \
              checked against them yet"
@@ -2522,10 +2521,13 @@ mod origin_gating_tests {
         );
     }
 
-    /// #206 review: scripts all held already are not written again, and a
-    /// refused write then refuses nothing: the address still goes out.
-    /// Mutated red by rewriting the list on every addition, and by refusing
-    /// on a refused write that added nothing.
+    /// #206 review: scripts all held recently are not written again, so a
+    /// host refusing writes refuses nothing: the address still goes out. A
+    /// re-send that has to stamp scripts again (held long enough ago) needs
+    /// the write, and a refused one fails the request: nothing goes out and
+    /// the UI does not count them sent. Mutated red by rewriting the list on
+    /// every addition, and by answering Ok when a needed re-stamp was not
+    /// kept.
     #[test]
     fn scripts_already_held_write_nothing_and_refuse_nothing() {
         let mut store = MemSecrets::default();
@@ -2543,8 +2545,8 @@ mod origin_gating_tests {
         store.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
         let derived = derive_with(&mut store, 3, &orders).expect("an address");
         assert_eq!(derived.index, 3);
-        // Held long enough ago to be stamped again: the write is refused,
-        // and that refuses nothing either.
+        // Held long enough ago to be stamped again: the write is needed,
+        // and refused it fails the request.
         store.refused_prefix = None;
         let mut held =
             crate::published_set::DigestList::load(&store, crate::published_set::PUBLISHED_KEY)
@@ -2552,8 +2554,12 @@ mod origin_gating_tests {
         held.age_for_test(crate::published_set::MAX_HELD as u64);
         crate::published_set::save_published(&mut store, &held);
         store.refused_prefix = Some(b"harvest:bitcoin:published".to_vec());
-        let derived = derive_with(&mut store, 4, &orders).expect("still an address");
-        assert_eq!(derived.index, 4);
+        assert!(
+            derive_with(&mut store, 4, &orders).is_err(),
+            "the stamps were not kept"
+        );
+        assert!(add_with(&mut store, 5, &orders).is_err());
+        assert_eq!(load_payment_xpub(&store).unwrap().next_index, 4);
     }
 
     /// #206 review: a held-list write the node refuses: an address request

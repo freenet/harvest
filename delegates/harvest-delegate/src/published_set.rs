@@ -34,19 +34,22 @@
 //!
 //! # Eviction, the one residual
 //!
-//! Past [`MAX_HELD`] held scripts, those sent longest ago go first. A script
-//! sent again is stamped as sent now once its stamp is older than half the
-//! cap (every tab sends every script it knows on load, and `decide` its
-//! store's whenever they change), so a script that is sent again goes to
-//! the back. What can go is therefore a script nothing has sent while about
-//! [`MAX_HELD`] others were: an order pruned from its store (a store keeps
+//! Past [`MAX_HELD`] held scripts, those stamped longest ago go first. A
+//! script sent again is stamped as sent now only once its stamp is older
+//! than half the cap (so a pass of scripts all held recently writes
+//! nothing). After any send its stamp is therefore at most `MAX_HELD / 2`
+//! old, and an entry is kept while fewer than `MAX_HELD` entries are newer:
+//! the guarantee is that a script survives at least about `MAX_HELD / 2`
+//! further stamps after it was last sent, not `MAX_HELD`. Every tab sends
+//! every script it knows on load, and `decide` its store's whenever they
+//! change. What can go is a script nothing has sent while that many others
+//! were: an order pruned from its store (a store keeps
 //! [`harvest_common::store::MAX_ORDERS`]), which no tab can send any more
 //! either, but ALSO a live order of a store that no tab on this device has
-//! loaded and that no instant checkout here answers for, once that many
-//! other scripts have been sent since it last was. A migration's imported
-//! scripts count as older than every script this delegate holds, so they go
-//! before any of its own, and an import into a list already full of its own
-//! keeps none of them and says so.
+//! loaded and that no instant checkout here answers for. A migration's
+//! imported scripts count as older than every script this delegate holds,
+//! so they go before any of its own; an import into a list too full to
+//! keep all of them keeps none and says so.
 //!
 //! # A list that does not read
 //!

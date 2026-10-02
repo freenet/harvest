@@ -1312,7 +1312,7 @@ pub(crate) fn spawn_bitcoin_requests(requests: Vec<harvest_common::BitcoinDelega
             #[allow(clippy::wildcard_enum_match_arm)]
             match request {
                 Req::AddPublishedScripts { request_id, .. } => {
-                    state.on_additions_failed(request_id, now_ms())
+                    state.on_additions_failed(request_id, now_ms(), false)
                 }
                 Req::SetPaymentXpub { request_id, .. } => {
                     state.abandon_payment_key_request(request_id);
@@ -1342,22 +1342,23 @@ fn spawn_addition_deadline(request_id: u64) {
         gloo_timers::future::TimeoutFuture::new(ADDITION_WAIT_MS as u32).await;
         let mut state = crate::gateway::APP_STATE.write();
         if state.bitcoin.additions_in_flight.contains_key(&request_id) {
-            state.on_additions_failed(request_id, now_ms());
+            state.on_additions_failed(request_id, now_ms(), true);
         }
     });
 }
 
 /// Send the additions again once their backoff is over.
 #[cfg(target_arch = "wasm32")]
-fn spawn_additions_retry(backoff_ms: u64) {
+fn spawn_additions_retry(at_ms: u64, backoff_ms: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         use dioxus::prelude::WritableExt;
         gloo_timers::future::TimeoutFuture::new(backoff_ms as u32).await;
-        // The timer ends the backoff itself: a clock read here could land a
-        // moment early and send nothing (#206 review).
-        let mut state = crate::gateway::APP_STATE.write();
-        state.bitcoin.additions_retry_at_ms = None;
-        state.send_due_script_additions();
+        // The timer ends the backoff it was set for itself (a clock read here
+        // could land a moment early and send nothing), and only that one: a
+        // newer backoff, or none, is left alone (#206 review).
+        crate::gateway::APP_STATE
+            .write()
+            .on_additions_backoff_over(at_ms);
     });
 }
 
@@ -11572,18 +11573,15 @@ impl AppState {
         // One invoice per buyer request (U5): the accept button's guard is
         // local to its component, and an invoice can now wait several rounds
         // while the counter catches up, so a second press must not issue a
-        // second. A request is its `order_binding` (or its instant-checkout
-        // id), not its conversation: a buyer may ask twice in one
-        // conversation, and each ask may be invoiced. Checked through every
-        // stage: waiting for an address, its reuse check, its signature,
-        // signed and on its way to the store, and in the store (unless
-        // cancelled there).
-        if self.request_already_invoiced(&invoice) {
-            return Err(
-                "an invoice for this request is already being issued; it will appear once it \
-                 is ready"
-                    .to_string(),
-            );
+        // second. A request is identified as the seller's inbox identifies
+        // it (`request_already_invoiced`), not by its conversation: a second
+        // request in one conversation, for another listing or another
+        // instant request, may be invoiced. Checked through every stage:
+        // waiting for an address, its reuse check, its signature, signed and
+        // on its way to the store, and in the store (unless cancelled
+        // there).
+        if let Some(why) = self.request_already_invoiced(&invoice) {
+            return Err(why.to_string());
         }
 
         // Register before sending, and un-register if the send fails: the
@@ -11619,7 +11617,10 @@ impl AppState {
     /// listing is another request. An order counts while it is not shown
     /// cancelled in the store; an order this session signed counts until
     /// the store shows THAT order cancelled, or its submission failed.
-    fn request_already_invoiced(&self, invoice: &PendingInvoice) -> bool {
+    ///
+    /// The answer says which: an invoice still being issued, or an order
+    /// that answers it already.
+    fn request_already_invoiced(&self, invoice: &PendingInvoice) -> Option<&'static str> {
         let instant = invoice.answers_request.map(|a| a.request_id);
         let tag = invoice.reply_to.and_then(|conversation| {
             self.conversation_keys
@@ -11631,7 +11632,7 @@ impl AppState {
             _ => None,
         };
         if instant.is_none() && manual.is_none() {
-            return false;
+            return None;
         }
         let answers = |order: &harvest_common::payment::Order| match instant {
             Some(request) => order.request_id == Some(request),
@@ -11670,9 +11671,13 @@ impl AppState {
             answers(order)
                 && store_shows(id) != Some(harvest_common::payment::OrderStatus::Cancelled)
         });
-        in_store
-            || signed
-            || self.pending_invoices.values().any(same_invoice)
+        if in_store || signed {
+            return Some(
+                "this request is already answered by an invoice; cancel that one first if it \
+                 is wrong",
+            );
+        }
+        let issuing = self.pending_invoices.values().any(same_invoice)
             || self
                 .address_reuse_checks
                 .values()
@@ -11680,7 +11685,11 @@ impl AppState {
             || self
                 .pending_signatures
                 .iter()
-                .any(|p| matches!(p, PendingSignature::Order(o) if answers(&o.order)))
+                .any(|p| matches!(p, PendingSignature::Order(o) if answers(&o.order)));
+        issuing.then_some(
+            "an invoice for this request is already being issued; it will appear once it is \
+             ready",
+        )
     }
 
     /// An order this session signed could not be submitted: it never
@@ -11777,31 +11786,42 @@ impl AppState {
     /// [`MAX_ADDITION_ATTEMPTS`] failures in a row, what waits on them (a key
     /// being saved, invoices) is dropped and the seller told, and the next
     /// store state or key entry starts afresh.
-    pub fn on_additions_failed(&mut self, request_id: u64, now_ms: u64) {
+    ///
+    /// `may_answer_late` is for one that went unanswered (its deadline): its
+    /// scripts are kept so a late `Ok` still counts them held. A refusal or
+    /// a send that failed is final, and keeps nothing.
+    pub fn on_additions_failed(&mut self, request_id: u64, now_ms: u64, may_answer_late: bool) {
         self.bitcoin.in_flight.remove(&request_id);
         let Some(scripts) = self.bitcoin.additions_in_flight.remove(&request_id) else {
             return;
         };
-        // Kept, so a late `Ok` still counts them held (its scripts are also
-        // due again meanwhile: a duplicate costs nothing).
-        self.bitcoin.additions_timed_out.insert(request_id, scripts);
+        if may_answer_late {
+            self.bitcoin.additions_timed_out.insert(request_id, scripts);
+        }
         let pass = self.bitcoin.addition_pass.remove(&request_id);
-        if pass.is_some() && pass == self.bitcoin.last_failed_pass {
-            // This pass's failure is counted already.
+        let counts = pass.is_some_and(|pass| {
+            self.bitcoin.last_succeeded_pass.is_none_or(|ok| pass > ok)
+                && self.bitcoin.failed_passes.insert(pass)
+        });
+        if !counts {
+            // A pass already counted, or one no newer than a pass that
+            // succeeded since: its scripts are simply due again.
+            #[cfg(target_arch = "wasm32")]
+            self.send_due_script_additions();
             return;
         }
-        self.bitcoin.last_failed_pass = pass;
         self.bitcoin.addition_failures += 1;
         if self.bitcoin.addition_failures < MAX_ADDITION_ATTEMPTS {
             let backoff = ADDITION_BACKOFF_MS << (self.bitcoin.addition_failures - 1);
-            self.bitcoin.additions_retry_at_ms = Some(now_ms.saturating_add(backoff));
+            let at = now_ms.saturating_add(backoff);
+            self.bitcoin.additions_retry_at_ms = Some(at);
             #[cfg(target_arch = "wasm32")]
-            spawn_additions_retry(backoff);
+            spawn_additions_retry(at, backoff);
             return;
         }
         self.bitcoin.addition_failures = 0;
         self.bitcoin.additions_retry_at_ms = None;
-        self.bitcoin.last_failed_pass = None;
+        self.bitcoin.failed_passes.clear();
         // Whatever else is in flight belongs to the same attempt.
         for (id, scripts) in std::mem::take(&mut self.bitcoin.additions_in_flight) {
             self.bitcoin.in_flight.remove(&id);
@@ -11832,6 +11852,17 @@ impl AppState {
         }
     }
 
+    /// The backoff set to end at `at_ms` is over (its timer fired): ended,
+    /// and what is due sent, only if it is still the current one.
+    pub fn on_additions_backoff_over(&mut self, at_ms: u64) {
+        if self.bitcoin.additions_retry_at_ms != Some(at_ms) {
+            return;
+        }
+        self.bitcoin.additions_retry_at_ms = None;
+        #[cfg(target_arch = "wasm32")]
+        self.send_due_script_additions();
+    }
+
     /// The delegate's answer to an `AddPublishedScripts`.
     ///
     /// A late `Ok` for an addition already counted failed still counts its
@@ -11847,13 +11878,14 @@ impl AppState {
         match result {
             Ok(()) => {
                 self.bitcoin.in_flight.remove(&request_id);
-                self.bitcoin.addition_pass.remove(&request_id);
+                let pass = self.bitcoin.addition_pass.remove(&request_id);
                 let Some(scripts) = self.bitcoin.additions_in_flight.remove(&request_id) else {
                     return;
                 };
                 self.bitcoin.scripts_sent.extend(scripts);
                 self.bitcoin.addition_failures = 0;
-                self.bitcoin.last_failed_pass = None;
+                self.bitcoin.failed_passes.clear();
+                self.bitcoin.last_succeeded_pass = self.bitcoin.last_succeeded_pass.max(pass);
                 // What waited for them: a key, invoices.
                 #[cfg(target_arch = "wasm32")]
                 self.send_due_script_additions();
@@ -11862,7 +11894,8 @@ impl AppState {
             }
             Err(e) => {
                 warn!("The delegate did not take published scripts: {e}");
-                self.on_additions_failed(request_id, now_ms);
+                // Final: a refusal has no late answer to wait for.
+                self.on_additions_failed(request_id, now_ms, false);
             }
         }
     }
@@ -11905,7 +11938,7 @@ impl AppState {
         // An entry is a fresh start: no backoff left over.
         self.bitcoin.additions_retry_at_ms = None;
         self.bitcoin.addition_failures = 0;
-        self.bitcoin.last_failed_pass = None;
+        self.bitcoin.failed_passes.clear();
         self.script_additions_due(now_ms)
     }
 
@@ -15334,8 +15367,11 @@ pub struct BitcoinState {
     /// had.
     pub addition_pass: HashMap<u64, u64>,
     pub next_addition_pass: u64,
-    /// The last pass a failure was counted for.
-    pub last_failed_pass: Option<u64>,
+    /// The passes a failure was counted for since the last success, and the
+    /// newest pass that succeeded: a failure counts once per pass, and not
+    /// at all for a pass no newer than one that succeeded.
+    pub failed_passes: HashSet<u64>,
+    pub last_succeeded_pass: Option<u64>,
     /// The scripts of additions counted failed while unanswered, so a late
     /// `Ok` still counts them held.
     pub additions_timed_out: HashMap<u64, Vec<Vec<u8>>>,
@@ -19912,8 +19948,8 @@ mod invoice_tests {
             "not again while in flight"
         );
         let ids: Vec<u64> = additions(&due).iter().map(|(id, _)| *id).collect();
-        added(&mut state, ids[0], Ok(()));
         added(&mut state, ids[1], Err("refused".into()));
+        added(&mut state, ids[0], Ok(()));
         assert!(!state.scripts_synced());
         assert!(state.script_additions_due(0).is_empty(), "backing off");
         let again = state.script_additions_due(ADDITION_BACKOFF_MS);
@@ -20138,7 +20174,7 @@ mod invoice_tests {
             for id in ids {
                 // Refused, or (the deadline's call) unanswered: the same.
                 if attempt % 2 == 0 {
-                    state.on_additions_failed(id, now);
+                    state.on_additions_failed(id, now, true);
                 } else {
                     state.on_scripts_added(id, Err("refused".into()), now);
                 }
@@ -20415,7 +20451,10 @@ mod invoice_tests {
         state.conversation_keys.insert(conversation.to_vec(), keys);
         state.issue_invoice(asking(&listing_id())).expect("first");
         assert!(
-            state.issue_invoice(asking(&listing_id())).is_err(),
+            state
+                .issue_invoice(asking(&listing_id()))
+                .unwrap_err()
+                .contains("being issued"),
             "waiting for its address"
         );
         assert!(
@@ -20478,7 +20517,10 @@ mod invoice_tests {
             .push(shown.clone());
         sync(&mut state);
         assert!(
-            state.issue_invoice(asking(&listing_id())).is_err(),
+            state
+                .issue_invoice(asking(&listing_id()))
+                .unwrap_err()
+                .contains("already answered"),
             "in the store"
         );
         state
@@ -20586,7 +20628,7 @@ mod invoice_tests {
         let pass = additions(&state.script_additions_due(0));
         assert_eq!(pass.len(), 2, "one pass, two chunks");
         state.on_scripts_added(pass[0].0, Err("refused".into()), 0);
-        state.on_additions_failed(pass[1].0, 0);
+        state.on_additions_failed(pass[1].0, 0, true);
         assert_eq!(state.bitcoin.addition_failures, 1, "one pass, one failure");
         // The unanswered one answers late: its scripts count, nothing resets.
         state.on_scripts_added(pass[1].0, Ok(()), 1);
@@ -20607,6 +20649,53 @@ mod invoice_tests {
         assert!(!state
             .begin_payment_key("vpub-new".into(), BitcoinNetwork::Signet, 1)
             .is_empty());
+    }
+
+    /// #206 review: a failure counts once per pass, never for a pass no
+    /// newer than one that succeeded since (a late timeout from an older
+    /// pass), and a refusal is final (nothing kept for a late answer); a
+    /// backoff's timer ends only the backoff it was set for. Mutated red by
+    /// counting a pass twice when its chunks fail apart, by counting an
+    /// older pass's timeout after a newer success, by keeping a refused
+    /// chunk, and by letting a stale timer end a newer backoff.
+    #[test]
+    fn additions_failures_count_per_pass_and_refusals_are_final() {
+        use harvest_common::bitcoin_delegate::MAX_SCRIPTS_PER_REQUEST;
+        let mut state = seller_with_orders(MAX_SCRIPTS_PER_REQUEST as u32 * 2 + 3);
+        let first = additions(&state.script_additions_due(0));
+        assert_eq!(first.len(), 3);
+        // Two chunks of one pass fail apart: one failure.
+        state.on_scripts_added(first[0].0, Err("refused".into()), 0);
+        assert!(
+            state.bitcoin.additions_timed_out.is_empty(),
+            "a refusal is final"
+        );
+        let at = state.bitcoin.additions_retry_at_ms.expect("backing off");
+        state.on_additions_failed(first[1].0, 1, true);
+        assert_eq!(state.bitcoin.addition_failures, 1);
+        // A newer pass succeeds; then the older pass's last chunk times out.
+        let second = additions(&state.script_additions_due(at));
+        for (id, _) in &second {
+            state.on_scripts_added(*id, Ok(()), at);
+        }
+        assert_eq!(state.bitcoin.addition_failures, 0);
+        state.on_additions_failed(first[2].0, at + 1, true);
+        assert_eq!(state.bitcoin.addition_failures, 0, "older than a success");
+        // A backoff's timer ends only its own backoff.
+        let third = additions(&state.script_additions_due(at + 2));
+        let (id, _) = third
+            .first()
+            .expect("the timed-out chunk's scripts, due again");
+        state.on_scripts_added(*id, Err("refused".into()), at + 2);
+        let current = state.bitcoin.additions_retry_at_ms.expect("backing off");
+        state.on_additions_backoff_over(at);
+        assert_eq!(
+            state.bitcoin.additions_retry_at_ms,
+            Some(current),
+            "a stale timer"
+        );
+        state.on_additions_backoff_over(current);
+        assert_eq!(state.bitcoin.additions_retry_at_ms, None);
     }
 
     #[test]
