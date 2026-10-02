@@ -19,7 +19,7 @@
 //!   of that this module skips a request whose order the store already holds,
 //!   or which its own ledger records as answered, before it derives anything.
 //! - **I2, no address reuse.** Addresses come only from
-//!   [`crate::bitcoin::apply_derive_order_address`], after the counter has been
+//!   `crate::bitcoin::apply_derive_order_address`, after the counter has been
 //!   raised past the store's published scripts, and only after every refusal
 //!   check has passed, so a refused request burns nothing.
 //! - **I3, the last item goes once.** Requests in one run are decided in one
@@ -1004,7 +1004,7 @@ fn taking_orders<S: SecretStore>(
     taking_orders_in(secrets, &delegations, record, now_ms)
 }
 
-/// [`taking_orders`], with the delegations already read.
+/// `taking_orders`, with the delegations already read.
 fn taking_orders_in<S: SecretStore>(
     secrets: &S,
     delegations: &Delegations,
@@ -1137,7 +1137,7 @@ pub(crate) fn heartbeats<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<Ou
         .collect()
 }
 
-/// The tab's heartbeat request ([`HarvestDelegateRequest::Heartbeat`]): the
+/// The tab's heartbeat request ([`harvest_common::delegate::HarvestDelegateRequest::Heartbeat`]): the
 /// answer, and the update to send.
 pub(crate) fn heartbeat_request<S: SecretStore>(
     secrets: &mut S,

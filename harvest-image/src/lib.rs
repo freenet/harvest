@@ -174,7 +174,7 @@ struct Segment<'a> {
 
 /// A JPEG split into its parts. Structural only: every length is in bounds,
 /// there is exactly one scan, and it is followed by end-of-image. No policy
-/// about WHICH segments appear; that is [`sniff`]'s job and [`strip`]'s.
+/// about WHICH segments appear; that is [`sniff`]'s job and [`strip()`]'s.
 struct Parsed<'a> {
     /// The segments before the scan, in order.
     head: Vec<Segment<'a>>,

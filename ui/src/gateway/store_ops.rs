@@ -209,7 +209,7 @@ fn store_info_delta_bytes(
 /// older contract, so the update is refused, or accepted where no buyer reads
 /// (harvest#164). A write to our own store therefore never reaches here while
 /// the registration names an earlier generation of a store with a store key:
-/// see [`current_store_write`]. What still can is a store from before revision
+/// see `current_store_write`. What still can is a store from before revision
 /// 2, whose generation cannot be derived, and one registered by a NEWER build
 /// than this tab's, which this build cannot know is current; that is why the
 /// caller is told how its key was found and can say so.
@@ -735,7 +735,7 @@ async fn settlement_store_key(
 ///
 /// The buyer's cancel is checked in full against `owner`, the key the delta
 /// names, and refused unless it is the buyer's signature rather than the
-/// store key's: a seller's cancel is sent through [`submit_order_by_id`], so
+/// store key's: a seller's cancel is sent through `submit_order_by_id`, so
 /// a store-key-signed record arriving here means a caller is on the wrong
 /// path, and saying so beats sending it quietly.
 pub(crate) fn keyless_publishable(

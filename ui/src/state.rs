@@ -2532,7 +2532,7 @@ pub enum PaymentBlocker {
     /// done nothing wrong, with `is_temporary` classifying it as walk-away
     /// and no way for either side to recover. Both are fixed: the sentence
     /// says the order expired and to ask for another, and the remedy is
-    /// [`Remedy::AskTheSeller`].
+    /// `Remedy::AskTheSeller`.
     ///
     /// Refusing is still right in both cases. An expired order is one readers
     /// are about to stop counting as open exposure, so paying it buys the

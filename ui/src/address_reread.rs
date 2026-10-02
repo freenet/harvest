@@ -87,7 +87,7 @@
 //! is "the payable window, once a tip is known", not "the payable window".
 //!
 //! Entries for addresses the caller stops naming are forgotten by
-//! [`Self::retain`], which runs on any tick that has something to send. Two
+//! [`AddressRereads::retain`], which runs on any tick that has something to send. Two
 //! consequences worth knowing: when the LAST unsettled order settles there is
 //! nothing to send, so its entry is pruned on some later tick rather than at
 //! once; and an order that vanishes from a store's state and comes back --

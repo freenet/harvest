@@ -52,7 +52,7 @@ use freenet_stdlib::prelude::DelegateCtx;
 /// **Not exercisable off wasm32.** Like every other `DelegateCtx` secret
 /// method, `remove_secret` is a `false`-returning stub on native
 /// (`delegate_host.rs:424`, the `#[cfg(not(target_family = "wasm"))]` arm),
-/// so [`MemSecrets`] is what the tests drive. What the tests can therefore
+/// so `MemSecrets` is what the tests drive. What the tests can therefore
 /// state is that this crate asks for removal and reports honestly on the
 /// answer -- not that the node performed it.
 pub(crate) trait RemovableSecrets {

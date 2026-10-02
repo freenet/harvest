@@ -56,7 +56,7 @@ pub(crate) fn apply_gateway_error(state: &mut crate::state::AppState, error: &st
 /// The contract an UPDATE refusal names, and the node's reason (harvest#161).
 ///
 /// freenet-core reports a refused update as an error that names the contract
-/// only in its English text ("update error for contract <id>, reason: ...")
+/// only in its English text ("update error for contract `<id>`, reason: ...")
 /// and carries no request id; see `prime`'s module docs for the same limit.
 /// Anything not in that shape is `None`, so a change of wording loses the
 /// notice, never mis-attributes it.

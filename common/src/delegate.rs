@@ -1193,7 +1193,7 @@ pub enum HarvestDelegateResponse {
 /// message read as a reply -- see [`crate::mailbox::MessageDirection`].
 ///
 /// `Debug` prints the peer key and redacts both conversation keys; see
-/// [`Redacted`].
+/// `Redacted`.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct ConversationKey {
     /// The buyer ephemeral public key these were derived against, echoed back
@@ -1215,7 +1215,7 @@ pub struct ConversationKey {
 /// `the_secret_never_leaves_the_delegate`.
 ///
 /// The two direction keys are still secrets -- each reads or forges one side
-/// of the thread -- so `Debug` redacts them; see [`Redacted`].
+/// of the thread -- so `Debug` redacts them; see `Redacted`.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RecalledConversation {
     /// The conversation's routing tag, which is what matches it to messages

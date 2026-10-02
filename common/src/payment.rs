@@ -148,7 +148,7 @@ use serde::{Deserialize, Serialize};
 /// survive the re-key. Orders are short-lived by construction -- they expire
 /// after [`MAX_ANCHOR_AGE_BLOCKS`] -- which is what makes that acceptable
 /// for orders and NOT what makes it acceptable for listings; see
-/// [`ListingId`].
+/// [`crate::listing::ListingId`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct OrderId(pub [u8; 32]);
 
@@ -975,7 +975,7 @@ pub enum ProofError {
     NoAnchor,
     /// The value that reached the script confirmed in a block at or below
     /// the order's anchor, i.e. before the order existed. See
-    /// [`verify_on_chain_proof`] for why that payment cannot be this order's.
+    /// `verify_on_chain_proof` for why that payment cannot be this order's.
     PaymentPredatesOrder {
         /// The highest block height, among the refused outpoints, at which
         /// one of them confirmed.

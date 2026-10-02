@@ -42,6 +42,14 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace
 
+      # Broken intra-doc links point readers at items that do not exist under
+      # that name. --document-private-items so the private helpers' docs are
+      # checked too, and the whole workspace so no crate is left out.
+      - name: rustdoc (workspace, private items, warnings denied)
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # `harvest-common`'s `address-guard` feature is OFF by default, and
       # deliberately: that crate compiles into all three contracts and the
       # delegate, and adding this code ungated moved all four code hashes. The

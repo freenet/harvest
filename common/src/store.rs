@@ -1097,7 +1097,7 @@ pub struct StoreStateV1 {
     /// retirement is the tombstone) or its slot is cut by the store-wide
     /// bound; it need not name a backing the store holds, since it may
     /// arrive first. See
-    /// [`crate::custody`] and [`StoreStateV1::normalize_backings`].
+    /// [`crate::custody`] and `StoreStateV1::normalize_backings`.
     #[serde(
         default,
         skip_serializing_if = "SignedSetV1::<crate::custody::AuthorizedCopy>::is_empty"
@@ -1106,7 +1106,7 @@ pub struct StoreStateV1 {
     /// The seller's despatch of each order, signed by the store key, one per
     /// order the store still holds (harvest#53 Phase B). Outside the order
     /// status lattice on purpose; see [`crate::fulfilment`]. A despatch is
-    /// kept only while its order is ([`StoreStateV1::normalize_fulfilment`]).
+    /// kept only while its order is (`StoreStateV1::normalize_fulfilment`).
     ///
     /// `default` and skipped when empty, like the parts above, so a state
     /// holding no despatch encodes exactly as it did before they existed and
