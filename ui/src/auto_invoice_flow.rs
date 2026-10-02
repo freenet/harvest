@@ -478,6 +478,29 @@ impl AppState {
         )
     }
 
+    /// The part of the window an arm may name (harvest#198): from the
+    /// counter, every address read clear under the build an order would
+    /// name now, up to the first found used. `None` while the reads have not
+    /// settled (an address unread, being read, unreadable, or read under
+    /// another build before any used one): the delegate then keeps the arm
+    /// it has, rather than being told the window shrank to what has been
+    /// read so far. A window found used part-way is armed up to that
+    /// address, so the delegate stops renewing and invoicing on it.
+    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
+        let (network, upcoming) = self.upcoming_unvetted()?;
+        let ids = self.window_contract_ids()?;
+        for (i, (a, id)) in upcoming.iter().zip(ids).enumerate() {
+            match self.auto_invoice.vets.get(&a.script_pubkey) {
+                Some(v) if v.is_clear() && v.contract_id == id => {}
+                Some(v) if v.verdict == VetVerdict::Used => {
+                    return Some((network, &upcoming[..i]));
+                }
+                _ => return None,
+            }
+        }
+        Some((network, upcoming))
+    }
+
     /// [`Self::current_upcoming`] before the address-contract reads.
     fn upcoming_unvetted(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let xpub = self.bitcoin.payment_xpub.as_ref()?;
@@ -842,7 +865,9 @@ impl AppState {
             .as_slice()
             .try_into()
             .ok()?;
-        let (network, upcoming) = self.current_upcoming()?;
+        let (network, upcoming) = self.vetted_window()?;
+        let vetted_scripts: Vec<Vec<u8>> =
+            upcoming.iter().map(|a| a.script_pubkey.clone()).collect();
         let tip_contract_id: [u8; 32] = self
             .bitcoin
             .tip_contract_network
@@ -920,6 +945,10 @@ impl AppState {
             watched_scripts,
             watch_left_ms,
             presence_contract_id: presence_instance_bytes(&store_verifying_key),
+            // Kept whatever the tab's own watch is: what the delegation
+            // renews must not vanish on a tab load before this tab knows its
+            // own watches again (review round 1 of batch 2).
+            vetted_scripts,
         };
         Some((arm, lapses_at_ms))
     }

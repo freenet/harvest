@@ -34875,7 +34875,13 @@ mod buy_flow_tests {
         // then the raise goes out.
         reread(&mut state, 0..10, 250);
         let work = state.queue_auto_invoice(300);
-        assert!(work.arms.is_empty());
+        // The arm names nothing (the first address is used), so the delegate
+        // forgets any window it had (review round 1 of batch 2, item 4).
+        assert!(!work.arms.is_empty());
+        assert!(work
+            .arms
+            .iter()
+            .all(|arm| arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty()));
         assert!(work.raise);
         let raise = work.raise_request.expect("a request id");
         assert!(
@@ -34928,10 +34934,12 @@ mod buy_flow_tests {
         assert_eq!(indexes, (4..14).collect::<Vec<u8>>());
     }
 
-    /// One used address anywhere in the window keeps the whole window out,
-    /// not only the addresses after it: a delegation would let the delegate
-    /// watch the used one by itself. Mutated red by gating on the leading
-    /// clear run.
+    /// One used address anywhere in the window keeps the whole window out
+    /// of the tab's own watch, not only the addresses after it; the arm
+    /// names the clear run before it (review round 1 of batch 2, item 4),
+    /// so the delegate stops before the used one and forgets any window it
+    /// had past it. Mutated red by gating the watch on the leading clear
+    /// run, and by arming past the used address.
     #[test]
     fn a_used_address_in_the_middle_of_the_window_holds_back_all_of_it() {
         let gk = inbox::authority().mint();
@@ -34945,7 +34953,39 @@ mod buy_flow_tests {
         reread(&mut state, 0..10, 150);
         assert!(state.prewatch_wanted(bridge).is_none());
         let work = state.queue_auto_invoice(200);
-        assert!(work.arms.is_empty() && work.raise);
+        assert!(work.raise);
+        assert!(!work.arms.is_empty());
+        for arm in &work.arms {
+            let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
+            assert_eq!(
+                firsts,
+                (0..5).collect::<Vec<u8>>(),
+                "the clear run before the used one"
+            );
+            assert!(arm.watched_scripts.is_empty());
+        }
+    }
+
+    /// Review round 1 of batch 2, item 5: a window read clear is armed as
+    /// vetted before the tab's own watch of it is known (a tab load, a
+    /// prewatch not yet read by the bridge): the delegate keeps renewing
+    /// what it may, rather than being told the window is empty. Mutated red
+    /// by arming the vetted list only with the tab's watched one.
+    #[test]
+    fn a_window_read_clear_is_armed_before_the_tabs_own_watch_is_known() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        let work = state.queue_auto_invoice(200);
+        assert!(!work.arms.is_empty());
+        for arm in &work.arms {
+            assert_eq!(arm.vetted_scripts.len(), 10, "the whole window, read clear");
+            assert!(
+                arm.watched_scripts.is_empty(),
+                "nothing the bridge has read yet"
+            );
+        }
     }
 
     /// A payment seen after an address was cleared, by a late answer to its

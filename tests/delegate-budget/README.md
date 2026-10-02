@@ -311,6 +311,11 @@ because each delegation derived the window twice; it is now derived once
 per wake-up for every delegation, and that row is 43.9% (the catch-up
 wake-ups 50.3-53.4%, from 74.4-76.2%).
 
+Review round 1 of the same branch gives every arm a second list of up to
+25 scripts (`vetted_scripts`, the window read clear), which every arm read
+decodes: the wake-up with full delegations 43.9% to 55.3%, the catch-up
+wake-ups to 58.2-61.3%, the plain wake-up 18.9% to 19.8%.
+
 Secret writes are judged too (`BUDGET_WRITES`, 64 per call): on a node each
 is an encrypted, fsync'd file write that fuel does not see. The most any call
 makes today is 18 (the wake-up with watch delegations: one per arm, and the

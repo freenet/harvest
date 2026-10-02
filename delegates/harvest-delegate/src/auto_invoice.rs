@@ -422,6 +422,51 @@ pub(crate) struct ArmRecord {
     /// When the watch on `arm.watched_scripts` lapses, by this node's clock:
     /// the time of the latest arm plus its `watch_left_ms`.
     pub watched_until_ms: u64,
+    /// When this arm last arrived, by this node's clock. Its scripts (both
+    /// lists) count only within [`VETTED_FOR_MS`] of it. An open tab re-arms
+    /// about every ten minutes and re-reads its window as often, so this is
+    /// within minutes of when the window was last read clear. 0 for a record
+    /// written before the field: it counts for nothing until re-armed.
+    #[serde(default)]
+    pub last_armed_ms: u64,
+}
+
+/// How long after an arm's last arrival its scripts still count, from
+/// either source (harvest#198, review round 1 of batch 2). An armed address
+/// read clear can still be paid after the read (by the seller's own wallet,
+/// which shares the account key, or late), and the chance grows with time;
+/// a week is just under the delegated request horizon
+/// (`watch_delegation::REQUEST_AHEAD_BLOCKS`, nine days), so the delegation
+/// renews about once in a read's life. The cost: a seller who has not opened
+/// Harvest for a week stops taking orders until they do.
+pub(crate) const VETTED_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+impl ArmRecord {
+    /// Whether this arm's scripts may still count at `now_ms`
+    /// ([`VETTED_FOR_MS`]).
+    pub(crate) fn vetted_recently(&self, now_ms: u64) -> bool {
+        now_ms < self.last_armed_ms.saturating_add(VETTED_FOR_MS)
+    }
+}
+
+/// Empty every arm's script lists, keeping the arms: what the payment key's
+/// change means (harvest#198, review round 1 of batch 2). A window read
+/// clear under one key says nothing after the key changes, and changes back
+/// (A to B to A) need not restore it: the seller's own wallet may have paid
+/// one of its addresses meanwhile. Nothing is invoiced until the tab re-arms
+/// under the active key, having read its window; the heartbeat says not
+/// taking orders meanwhile. Called by `bitcoin::save_payment_xpub`, the one
+/// writer of the active key.
+pub(crate) fn forget_armed_scripts<S: SecretStore>(secrets: &mut S) {
+    for mut record in arms(secrets) {
+        if record.arm.watched_scripts.is_empty() && record.arm.vetted_scripts.is_empty() {
+            continue;
+        }
+        record.arm.watched_scripts.clear();
+        record.arm.vetted_scripts.clear();
+        record.arm.watched_until_height = None;
+        save(secrets, &arm_key(&record.arm.store_contract_id), &record);
+    }
 }
 
 /// What this delegate remembers about one store's instant checkout.
@@ -906,8 +951,8 @@ pub(crate) fn arm<S: SecretStore>(
                 .into(),
         );
     }
-    if arm.watched_scripts.len() > harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES as usize
-    {
+    let max = harvest_common::bitcoin_delegate::MAX_UPCOMING_ADDRESSES as usize;
+    if arm.watched_scripts.len() > max || arm.vetted_scripts.len() > max {
         return refuse("too many watched addresses".into());
     }
     if store_key(secrets, &arm.store_verifying_key).is_none() {
@@ -923,6 +968,7 @@ pub(crate) fn arm<S: SecretStore>(
         armed_at_ms: load_arm(secrets, &arm.store_contract_id)
             .map_or(now_ms, |held| held.armed_at_ms),
         watched_until_ms: now_ms.saturating_add(arm.watch_left_ms),
+        last_armed_ms: now_ms,
         arm: arm.clone(),
     };
     if !save(secrets, &arm_key(&arm.store_contract_id), &record) {
@@ -1634,22 +1680,25 @@ fn watch_set_in(
     now_ms: u64,
 ) -> WatchSet {
     let arm = &record.arm;
-    let arm_time_live = now_ms.saturating_add(WATCH_NEEDED_MS) < record.watched_until_ms;
+    let vetted = record.vetted_recently(now_ms);
+    let arm_time_live = vetted && now_ms.saturating_add(WATCH_NEEDED_MS) < record.watched_until_ms;
     let arm_height_live = match (arm.watched_until_height, tip) {
         (Some(until), Some(tip)) => tip.anchor.height.saturating_add(WATCH_NEEDED_BLOCKS) <= until,
         _ => true,
     };
     // The delegation renews, it does not extend (harvest#198): its watches
-    // count only for a script this store's arm names. The tab arms only a
-    // window whose address contracts it has read clear, so nothing the
-    // delegate invoices on is an address nobody read; with the tab closed
-    // the store stops at the end of that window (`NoWatchedAddress`, and its
-    // heartbeat says so) rather than invoicing addresses past it.
+    // count only for a script the tab read clear and armed
+    // (`vetted_scripts`), and only within `VETTED_FOR_MS` of that arm, so
+    // nothing the delegate invoices on is an address nobody read recently;
+    // with the tab closed the store stops at the end of that window
+    // (`NoWatchedAddress`, and its heartbeat says so) rather than invoicing
+    // addresses past it. A change of payment key empties the arms
+    // (`forget_armed_scripts`).
     let delegated = tip.map_or_else(Vec::new, |tip| {
         delegations
             .watched(arm.network, &arm.trusted_bridges, tip.anchor.height)
             .into_iter()
-            .filter(|(script, _)| arm.watched_scripts.contains(script))
+            .filter(|(script, _)| vetted && arm.vetted_scripts.contains(script))
             .collect()
     });
     WatchSet {
@@ -3527,9 +3576,11 @@ mod tests {
                 watch_left_ms: WATCH_NEEDED_MS + 3_600_000,
                 watched_until_height: None,
                 presence_contract_id: Some([9; 32]),
+                vetted_scripts: (0..5).map(script_at).collect(),
             },
             armed_at_ms: NOW - 1_000,
             watched_until_ms: NOW + WATCH_NEEDED_MS + 3_600_000,
+            last_armed_ms: NOW - 1_000,
         };
         save(
             &mut secrets,
@@ -5869,6 +5920,7 @@ mod tests {
         f.record.arm.trusted_bridges = vec![wd::bridge()];
         f.record.watched_until_ms = NOW;
         f.record.arm.watched_scripts = (100..110).map(script_at).collect();
+        f.record.arm.vetted_scripts = (100..110).map(script_at).collect();
         let entry = Buyer::new(81).request(&jam(), 1, 1, 12_000);
         let refused = run(&mut f, std::slice::from_ref(&entry));
         assert!(refused.orders.is_empty());
@@ -5878,10 +5930,99 @@ mod tests {
             open_now(&f, NOW),
             (Some(Refusal::WatchLapsed.explain()), false)
         );
-        f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
         let decided = run(&mut f, &[entry]);
         assert_eq!(decided.orders.len(), 1, "{:?}", decided.refused);
         assert_eq!(decided.orders[0].order.payment_script_pubkey, script_at(0));
+    }
+
+    /// Review round 1 of batch 2 (#198 route 1): A to B to A. The tab had
+    /// armed A's window and the delegation watches it; the seller switches
+    /// to B and back to A without the tab re-reading A's window (an address
+    /// of it may have been paid by the seller's own wallet meanwhile).
+    /// Nothing is invoiced until the tab re-arms under A: every key change
+    /// empties the arms. A write of the same key (a raised counter) does
+    /// not. Mutated red by not forgetting on a key change, and by
+    /// forgetting on every write.
+    #[test]
+    fn a_key_round_trip_invoices_only_what_the_current_arm_names() {
+        use crate::watch_delegation::test_support as wd;
+        let mut secrets = wd::delegated();
+        wd::send_read_confirm(&mut secrets, wd::TIP, NOW);
+        let mut f = fixture();
+        f.secrets = secrets;
+        f.record.arm.trusted_bridges = vec![wd::bridge()];
+        f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
+        let id = f.record.arm.store_contract_id.clone();
+        save(&mut f.secrets, &arm_key(&id), &f.record);
+        let a = crate::bitcoin::load_payment_xpub(&f.secrets).unwrap();
+        // The same key written again (a raised counter) keeps the window.
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &a).unwrap();
+        assert_eq!(
+            load_arm(&f.secrets, &id).unwrap().arm.vetted_scripts.len(),
+            10
+        );
+
+        let mut b = a.clone();
+        b.xpub = format!(" {}", a.xpub);
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &b).unwrap();
+        crate::bitcoin::save_payment_xpub(&mut f.secrets, &a).unwrap();
+        f.record = load_arm(&f.secrets, &id).unwrap();
+        assert!(f.record.arm.vetted_scripts.is_empty() && f.record.arm.watched_scripts.is_empty());
+        let entry = Buyer::new(83).request(&jam(), 1, 1, 12_000);
+        let refused = run(&mut f, std::slice::from_ref(&entry));
+        assert!(refused.orders.is_empty(), "nothing from A's old window");
+        assert!(!taking_orders(
+            &f.secrets,
+            &f.record,
+            NOW,
+            &upcoming(&f.secrets)
+        ));
+        // The tab re-arms under A, having read the window again.
+        f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
+        f.record.last_armed_ms = NOW;
+        assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
+    }
+
+    /// Review round 1 of batch 2: an arm's scripts count, from either
+    /// source, only within `VETTED_FOR_MS` of its last arrival; past it the
+    /// store waits for the seller (`WatchLapsed`), and its heartbeat says
+    /// so. Mutated red by dropping the bound from the arm source, and from
+    /// the delegated source.
+    #[test]
+    fn a_window_read_a_week_ago_counts_for_nothing() {
+        use crate::watch_delegation::test_support as wd;
+        let entry = Buyer::new(84).request(&jam(), 1, 1, 12_000);
+        // The tab's own watch.
+        let mut f = fixture();
+        f.record.last_armed_ms = NOW - VETTED_FOR_MS;
+        assert_eq!(
+            run(&mut f, std::slice::from_ref(&entry)).refused[0].1,
+            Refusal::WatchLapsed
+        );
+        f.record.last_armed_ms = NOW - VETTED_FOR_MS + 1;
+        assert_eq!(run(&mut f, std::slice::from_ref(&entry)).orders.len(), 1);
+        // The delegation's.
+        let mut secrets = wd::delegated();
+        wd::send_read_confirm(&mut secrets, wd::TIP, NOW);
+        let mut f = fixture();
+        f.secrets = secrets;
+        f.record.arm.trusted_bridges = vec![wd::bridge()];
+        f.record.watched_until_ms = NOW;
+        f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
+        f.record.last_armed_ms = NOW - VETTED_FOR_MS;
+        assert_eq!(
+            run(&mut f, std::slice::from_ref(&entry)).refused[0].1,
+            Refusal::WatchLapsed
+        );
+        assert!(!taking_orders(
+            &f.secrets,
+            &f.record,
+            NOW,
+            &upcoming(&f.secrets)
+        ));
+        f.record.last_armed_ms = NOW;
+        assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
     }
 
     /// harvest#183 / #198 with the tab closed: the counter was reset over a
@@ -5907,6 +6048,7 @@ mod tests {
         f.record.arm.trusted_bridges = vec![wd::bridge()];
         f.record.watched_until_ms = NOW;
         f.record.arm.watched_scripts = (0..10).map(script_at).collect();
+        f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
         save(
             &mut f.secrets,
             &arm_key(&f.record.arm.store_contract_id),

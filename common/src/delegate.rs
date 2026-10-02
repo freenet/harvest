@@ -737,6 +737,16 @@ pub struct AutoInvoiceArm {
     /// presence: no heartbeat is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_contract_id: Option<[u8; 32]>,
+    /// The next addresses whose address contracts the tab has read clear, in
+    /// order from the counter, cut before the first found used (harvest#198).
+    /// What the delegate's own delegated watches may count for and renew;
+    /// [`Self::watched_scripts`] is what the tab itself had watched. Two
+    /// lists, because the second must stay exactly what the bridge was asked
+    /// for while the first must survive a tab load before the tab knows its
+    /// own watches again. Empty from an older UI: the delegation then counts
+    /// for nothing (fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vetted_scripts: Vec<Vec<u8>>,
 }
 
 /// How auto-invoicing stands for one store: see
@@ -2343,6 +2353,7 @@ mod tests {
             Q::ListKeptPurchases,
             Q::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
+                    vetted_scripts: Vec::new(),
                     store_contract_id: store(),
                     store_verifying_key: [5u8; 32],
                     mailbox_contract_id: [6u8; 32],

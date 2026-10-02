@@ -1057,11 +1057,16 @@ fn refill_scripts_from<S: SecretStore>(
                     && r.arm.watched_scripts.contains(script)
             })
     };
-    // Only what an armed store names (harvest#198): the delegation renews
-    // the tab's read-clear window, it never reaches past it.
+    // Only what an armed store read clear recently (harvest#198,
+    // `ArmRecord::vetted_recently`): the delegation renews the tab's window,
+    // it never reaches past it.
     let pool: Vec<&Vec<u8>> = pool
         .iter()
-        .filter(|s| armed.iter().any(|r| r.arm.watched_scripts.contains(s)))
+        .filter(|s| {
+            armed
+                .iter()
+                .any(|r| r.vetted_recently(now_ms) && r.arm.vetted_scripts.contains(s))
+        })
         .collect();
     if pool.iter().take(REFILL_BELOW).all(|s| fresh(s)) {
         return Vec::new();
@@ -1930,12 +1935,14 @@ pub(crate) mod test_support {
                 trusted_bridges: vec![bridge()],
                 address_code_hash: [5; 32],
                 watched_scripts: (0..MAX_UPCOMING_ADDRESSES).map(script_at).collect(),
+                vetted_scripts: (0..MAX_UPCOMING_ADDRESSES).map(script_at).collect(),
                 watch_left_ms: 0,
                 watched_until_height: None,
                 presence_contract_id: None,
             },
             armed_at_ms: NOW - 1_000,
             watched_until_ms: NOW,
+            last_armed_ms: NOW - 1_000,
         };
         save(
             &mut secrets,
@@ -1952,6 +1959,7 @@ pub(crate) mod test_support {
         record.arm.watched_scripts = (from..from + MAX_UPCOMING_ADDRESSES)
             .map(script_at)
             .collect();
+        record.arm.vetted_scripts = record.arm.watched_scripts.clone();
         save(secrets, &arm_key(&[1; 32]), &record);
     }
 
@@ -2645,7 +2653,7 @@ mod tests {
     fn the_refill_asks_only_for_scripts_an_arm_names() {
         let mut secrets = delegated();
         let mut record = arm_record(&secrets);
-        record.arm.watched_scripts = (0..5).map(script_at).collect();
+        record.arm.vetted_scripts = (0..5).map(script_at).collect();
         save(
             &mut secrets,
             &crate::auto_invoice::arm_key(&[1; 32]),
@@ -2656,7 +2664,16 @@ mod tests {
             refill_scripts(&secrets, &h, TIP, NOW),
             (0..5).map(script_at).collect::<Vec<_>>()
         );
-        record.arm.watched_scripts = (100..110).map(script_at).collect();
+        record.arm.vetted_scripts = (100..110).map(script_at).collect();
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &record,
+        );
+        assert!(refill_scripts(&secrets, &h, TIP, NOW).is_empty());
+        // Read clear more than `VETTED_FOR_MS` ago: nothing asked either.
+        record.arm.vetted_scripts = (0..5).map(script_at).collect();
+        record.last_armed_ms = NOW - crate::auto_invoice::VETTED_FOR_MS;
         save(
             &mut secrets,
             &crate::auto_invoice::arm_key(&[1; 32]),

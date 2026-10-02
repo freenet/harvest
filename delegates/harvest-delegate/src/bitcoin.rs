@@ -253,6 +253,15 @@ pub(crate) fn save_payment_xpub<S: SecretStore>(
 ) -> Result<(), String> {
     let bytes = to_cbor(&Some(status.clone()))
         .map_err(|e| format!("could not encode the payment key record: {e}"))?;
+    // A different key (or the first): every armed window was read under
+    // something else, and is forgotten (`auto_invoice::forget_armed_scripts`).
+    // Before the write, so a key never becomes active beside a window read
+    // under another one.
+    let key_changes = load_payment_xpub(store)
+        .is_none_or(|held| held.xpub != status.xpub || held.network != status.network);
+    if key_changes {
+        crate::auto_invoice::forget_armed_scripts(store);
+    }
     if !store.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes) {
         return Err(
             "the node refused to store the payment key record, so no address was issued -- \

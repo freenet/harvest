@@ -670,6 +670,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         "ArmAutoInvoice",
         cbor(&HarvestDelegateRequest::ArmAutoInvoice {
             arm: Box::new(AutoInvoiceArm {
+                vetted_scripts: watched.clone(),
                 store_contract_id: store_contract.to_vec(),
                 store_verifying_key: store,
                 mailbox_contract_id: mailbox_contract,
@@ -714,6 +715,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "ArmAutoInvoice (filling to the cap)",
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
+                vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: mailbox,
@@ -983,6 +985,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "ArmAutoInvoice (re-arm, full ledger)",
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
+                vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: *mailbox,
@@ -1222,6 +1225,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             &format!("ArmAutoInvoice (re-arm, {delegations})"),
             cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
+                vetted_scripts: watched.clone(),
                     store_contract_id: contract.to_vec(),
                     store_verifying_key: *store_key,
                     mailbox_contract_id: *mailbox,
@@ -1776,6 +1780,7 @@ impl InstantStore<'_> {
     fn arm(&self, watched_scripts: Vec<Vec<u8>>) -> Vec<u8> {
         cbor(&HarvestDelegateRequest::ArmAutoInvoice {
             arm: Box::new(AutoInvoiceArm {
+                vetted_scripts: watched_scripts.clone(),
                 store_contract_id: self.contract.to_vec(),
                 store_verifying_key: self.verifying_key,
                 mailbox_contract_id: self.mailbox,
