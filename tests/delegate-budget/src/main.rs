@@ -60,8 +60,8 @@ const BUDGET_SECONDS: f64 = 1.0;
 /// The most secret writes and removals one call may make. Fuel does not
 /// see them, and on a node each is an encrypted file write with an fsync
 /// (`secrets_store/store.rs`): 5-30 ms on slow storage, so 64 is up to about
-/// two seconds there. The most measured today is 17 (a wake-up or an export
-/// with every arm taken: one write per arm).
+/// two seconds there. The most measured today is 18 (the wake-up with watch
+/// delegations: one write per arm, and the delegation it reads for).
 const BUDGET_WRITES: u64 = 64;
 
 /// How many store keys to derive subkeys for. `GetStoreSubkeys` cost used to
@@ -225,19 +225,20 @@ impl Runner {
             .map_err(|e| anyhow!("{name}: the delegate returned an error: {e}"))
     }
 
-    /// The answer to a GET the delegate sent (here with no context: what an
-    /// arm's own tip read carries). Delivered with no origin, like a
-    /// notification.
+    /// The answer to a GET the delegate sent, carrying the context the GET
+    /// carried (empty for an arm's own tip read). Delivered with no origin,
+    /// like a notification.
     fn get_answer(
         &mut self,
         name: &str,
         contract: [u8; 32],
         state: Vec<u8>,
+        context: Vec<u8>,
     ) -> Result<Vec<OutboundDelegateMsg>> {
         let msg = InboundDelegateMsg::GetContractResponse(GetContractResponse {
             contract_id: ContractInstanceId::new(contract),
             state: Some(WrappedState::new(state)),
-            context: DelegateContext::default(),
+            context: DelegateContext::new(context),
         });
         let timing = self.time(None, &msg)?;
         let outcome = self.host.call(None, &msg)?;
@@ -852,53 +853,29 @@ fn scenario(r: &mut Runner) -> Result<()> {
     }
 
     // The byte cap again, each message's plaintext written to cost the most
-    // to decode rather than a text: a valid message with an extra field of
-    // one-byte integers, which the decoder walks one by one. Anyone can
-    // encrypt their own plaintext to a store's inbox.
-    let hostile: Vec<harvest_common::mailbox::EncryptedMessage> = sizes
-        .iter()
-        .enumerate()
-        .map(|(i, &len)| {
-            let mut seed = [0xA0u8; 32];
-            seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
-            let buyer = StaticSecret::from(seed);
-            let tag = *PublicKey::from(&buyer).as_bytes();
-            let shared = buyer.diffie_hellman(&PublicKey::from(inbox)).to_bytes();
-            let key = harvest_common::mailbox::conversation_key_from_dh(
-                &shared,
-                harvest_common::mailbox::MessageDirection::BuyerToSeller,
-            );
-            let id = harvest_common::mailbox::ConversationId([(i % 251) as u8; 32]);
-            let plaintext = Value::Map(vec![
-                (
-                    Value::Text("conversation_id".into()),
-                    Value::Array(id.0.iter().map(|b| Value::Integer((*b).into())).collect()),
-                ),
-                (
-                    Value::Text("content".into()),
-                    Value::Map(vec![(
-                        Value::Text("Text".into()),
-                        Value::Text(String::new()),
-                    )]),
-                ),
-                (
-                    Value::Text("pad".into()),
-                    Value::Array(vec![Value::Integer(0.into()); len.saturating_sub(64)]),
-                ),
-            ]);
-            fixtures::encrypt_bytes_seeded(
-                &cbor(&plaintext),
-                &id,
-                &tag,
-                &key,
-                r.host.state.now - chrono::Duration::seconds(i as i64),
-                20_000 + i as u64,
-            )
-        })
-        .collect();
-    let hostile_state = mailbox_state(hostile)?;
+    // to decode rather than a text ([`hostile_mailbox`]).
+    let hostile_state = mailbox_state(hostile_mailbox(
+        &sizes,
+        inbox,
+        0xA0,
+        20_000,
+        r.host.state.now,
+    )?)?;
     if hostile_state.messages.len() != big_state.messages.len() {
         bail!("the hostile mailbox is not the byte-cap mailbox's shape");
+    }
+    // The ledger's seen list is already at `SEEN_CAP` here, so its length
+    // cannot show whether this scan recorded anything (eviction is FIFO and
+    // keeps it at the cap). Its contents can: every hostile message's digest
+    // must be in it afterwards, and none was before.
+    let seen_before = ledger_seen_digests(r, &ledger)?;
+    let hostile_digests: Vec<[u8; 32]> = hostile_state
+        .messages
+        .iter()
+        .map(harvest_common::mailbox::entry_digest)
+        .collect();
+    if hostile_digests.iter().any(|d| seen_before.contains(d)) {
+        bail!("a hostile message was recorded as read before it was sent: update the harness");
     }
     drain_mailbox(
         r,
@@ -907,12 +884,13 @@ fn scenario(r: &mut Runner) -> Result<()> {
         store_contract,
         cbor(&hostile_state),
     )?;
-    let seen_hostile = ledger_seen(r, &ledger)?;
-    if seen_hostile != (seen_after + new).min(seen_cap) {
-        bail!(
-            "the hostile mailbox scan recorded {} of its {new} messages as read",
-            seen_hostile.saturating_sub(seen_after)
-        );
+    let seen_hostile = ledger_seen_digests(r, &ledger)?;
+    let recorded = hostile_digests
+        .iter()
+        .filter(|d| seen_hostile.contains(d))
+        .count();
+    if recorded != new {
+        bail!("the hostile mailbox scan recorded {recorded} of its {new} messages as read");
     }
 
     // Every other arm's ledger at its caps, in the delegate's own encoding
@@ -920,6 +898,23 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // and the export decode each arm's ledger.
     let now_ms = r.host.state.now.timestamp_millis() as u64;
     let issued = delegate_cap("auto_invoice.rs", "MAX_PER_DAY")? - 1;
+    let ledger_caps = LedgerCaps {
+        seen: seen_cap,
+        answered: delegate_cap("auto_invoice.rs", "ANSWERED_CAP")?,
+        sales: delegate_cap("auto_invoice.rs", "SALES_CAP")?,
+        gap_orders: delegate_cap("auto_invoice.rs", "GAP_ORDERS_CAP")?,
+    };
+    // The first store's ledger is the delegate's own writing (the scans
+    // above): the mirror must have exactly its fields.
+    let mirror_ledger: Value = ciborium::from_reader(
+        cbor(&fixtures::full_ledger(0, now_ms, issued, &ledger_caps)).as_slice(),
+    )
+    .context("the mirrored ledger is not CBOR")?;
+    same_fields(
+        "instant-checkout ledger",
+        &secret_value(r, ledger.as_bytes())?,
+        &mirror_ledger,
+    )?;
     for (n, (contract, _, _)) in extra_arms.iter().enumerate() {
         r.host.state.secrets.insert(
             format!(
@@ -931,12 +926,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 n as u32,
                 now_ms,
                 issued,
-                &LedgerCaps {
-                    seen: delegate_cap("auto_invoice.rs", "SEEN_CAP")?,
-                    answered: delegate_cap("auto_invoice.rs", "ANSWERED_CAP")?,
-                    sales: delegate_cap("auto_invoice.rs", "SALES_CAP")?,
-                    gap_orders: delegate_cap("auto_invoice.rs", "GAP_ORDERS_CAP")?,
-                },
+                &ledger_caps,
             )),
         );
     }
@@ -1024,6 +1014,50 @@ fn scenario(r: &mut Runner) -> Result<()> {
             all_arms.len()
         );
     }
+    // One of those reads answered, carrying the context the wake-up gave it
+    // (`auto_invoice::mailbox_retries`): the first store's mailbox at the
+    // byte cap, every plaintext built to be slow and none of it read yet.
+    // The answer is decided as a mailbox change is (`on_mailbox_retry`).
+    let retry_read = woke_waiting
+        .iter()
+        .find_map(|m| match m {
+            OutboundDelegateMsg::GetContractRequest(get)
+                if get.contract_id == ContractInstanceId::new(mailbox_contract) =>
+            {
+                Some(get.context.as_ref().to_vec())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "the wake-up with every mailbox waiting asked nothing of the first store's mailbox"
+            )
+        })?;
+    let retry_state = mailbox_state(hostile_mailbox(
+        &sizes,
+        inbox,
+        0xC0,
+        30_000,
+        r.host.state.now,
+    )?)?;
+    let retry_digests: Vec<[u8; 32]> = retry_state
+        .messages
+        .iter()
+        .map(harvest_common::mailbox::entry_digest)
+        .collect();
+    r.get_answer(
+        "GetContractResponse: mailbox retry read (byte cap, slow plaintexts)",
+        mailbox_contract,
+        cbor(&retry_state),
+        retry_read,
+    )?;
+    let seen_now = ledger_seen_digests(r, &ledger)?;
+    if !retry_digests.iter().any(|d| seen_now.contains(d)) {
+        bail!(
+            "the answered mailbox retry read recorded none of its messages as read: it was \
+             refused or ignored, so its cost was not measured"
+        );
+    }
     set_retry(r, &all_arms, false)?;
 
     // --- delegated watches (`watch_delegation`) -------------------------------
@@ -1073,25 +1107,35 @@ fn scenario(r: &mut Runner) -> Result<()> {
         + delegate_u32("watch_delegation.rs", "RENEW_MARGIN_BLOCKS")?
         - 1;
     let now_ms = r.host.state.now.timestamp_millis() as u64;
+    let delegation_key = |bridge: &freenet_bitcoin_common::BridgeId| {
+        format!(
+            "harvest:auto:watchdeleg:{}",
+            bs58::encode(bridge.0).into_string()
+        )
+        .into_bytes()
+    };
+    let mut mirror_delegation = None;
     for (n, bridge) in trusted.iter().enumerate() {
-        r.host.state.secrets.insert(
-            format!(
-                "harvest:auto:watchdeleg:{}",
-                bs58::encode(bridge.0).into_string()
-            )
-            .into_bytes(),
-            cbor(&fixtures::full_delegation(
-                n as u32,
-                *bridge,
-                &ghost,
-                watch_key,
-                &pool,
-                until_height,
-                now_ms,
-                &delegation_caps,
-            )),
-        );
+        let seeded = cbor(&fixtures::full_delegation(
+            n as u32,
+            *bridge,
+            &ghost,
+            watch_key,
+            &pool,
+            until_height,
+            now_ms,
+            &delegation_caps,
+        ));
+        if mirror_delegation.is_none() {
+            mirror_delegation = Some(
+                ciborium::from_reader::<Value, _>(seeded.as_slice())
+                    .context("the mirrored delegation is not CBOR")?,
+            );
+        }
+        r.host.state.secrets.insert(delegation_key(bridge), seeded);
     }
+    let mirror_delegation =
+        mirror_delegation.ok_or_else(|| anyhow!("MAX_DELEGATIONS is 0: update the harness"))?;
     let delegations = format!(
         "{max_delegations} delegations x {} watches",
         delegation_caps.watched
@@ -1104,6 +1148,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         &format!("GetContractResponse: bridge tip ({delegations})"),
         tip_contract,
         tip_bytes,
+        Vec::new(),
     )?;
     let mut counted = 0;
     for m in &statuses {
@@ -1210,6 +1255,35 @@ fn scenario(r: &mut Runner) -> Result<()> {
             "the node start rewrote {rewritten} secrets, fewer than the {max_delegations} \
              delegations: it did not walk them, so its cost was not measured"
         );
+    }
+    // The node start rewrote each delegation in the delegate's own encoding
+    // (`watch_delegation::store_held`): the mirror must have exactly its
+    // fields, down to a watch's, and the lists the start keeps are still at
+    // their caps (it clears only the subscriptions).
+    let rewritten_held = secret_value(r, &delegation_key(&trusted[0]))?;
+    same_fields("watch delegation", &rewritten_held, &mirror_delegation)?;
+    let first_watch = |v: &Value| -> Result<Value> {
+        match field(v, &["watched"])? {
+            Value::Array(w) => w
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("a delegation with no watches")),
+            other => bail!("a delegation's watches are not a list: {}", brief(other)),
+        }
+    };
+    same_fields(
+        "delegated watch",
+        &first_watch(&rewritten_held)?,
+        &first_watch(&mirror_delegation)?,
+    )?;
+    for (list, cap) in [
+        ("watched", delegation_caps.watched),
+        ("ever_subscribed", delegation_caps.ever_subscribed),
+    ] {
+        let got = list_len(&rewritten_held, &[list])?;
+        if got != cap {
+            bail!("the rewritten delegation holds {got} {list}, not the cap {cap}");
+        }
     }
 
     // --- the buyer's half ---------------------------------------------------
@@ -1338,7 +1412,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
     // tag misses and the scan of every conversation runs to the end before
     // the keep is refused.
     let stranger = *PublicKey::from(&StaticSecret::from([0x5Au8; 32])).as_bytes();
-    r.app(
+    let stranger_answer = r.app(
         "KeepPurchase (a conversation not held, store full)",
         cbor(&HarvestDelegateRequest::KeepPurchase {
             keep: Box::new(PurchaseToKeep {
@@ -1350,6 +1424,16 @@ fn scenario(r: &mut Runner) -> Result<()> {
         }),
         "KeepPurchaseRefused",
     )?;
+    // Refused for the reason this step is here for (the scan of every
+    // conversation came up empty), not an earlier, cheaper check.
+    match field(&stranger_answer, &["KeepPurchaseRefused", "reason"])? {
+        Value::Text(why) if why.contains("does not hold the conversation") => {}
+        other => bail!(
+            "the stranger's keep was refused for another reason ({}), so the scan of every \
+             conversation was not measured",
+            brief(other)
+        ),
+    }
     let kept = r.app(
         &format!("ListKeptPurchases ({KEPT_PURCHASES})"),
         cbor(&HarvestDelegateRequest::ListKeptPurchases),
@@ -1411,7 +1495,9 @@ fn scenario(r: &mut Runner) -> Result<()> {
             .get(&key(b))
             .cloned()
             .ok_or_else(|| anyhow!("no seeded ledger to import"))?;
-        r.app(
+        let incoming_value: Value =
+            ciborium::from_reader(incoming.as_slice()).context("a seeded ledger is not CBOR")?;
+        let answer = r.app(
             "ImportMigratedSecret (full ledger into a full ledger)",
             cbor(&HarvestDelegateRequest::ImportMigratedSecret {
                 predecessor: [0x29; 32],
@@ -1420,6 +1506,51 @@ fn scenario(r: &mut Runner) -> Result<()> {
             }),
             "MigratedSecretImported",
         )?;
+        // The answer carries an outcome, not a `result`, so `check_answer`
+        // cannot see a refusal: a ledger refused (or found already merged)
+        // costs a decode at most, not the merge.
+        let outcome = field(&answer, &["MigratedSecretImported", "outcome"])?;
+        if *outcome != Value::Text("Written".into()) {
+            bail!(
+                "the ledger import answered {}, not Written: the merge was not done, so its \
+                 cost was not measured",
+                brief(outcome)
+            );
+        }
+        // And what it wrote is the merge: the delegate's encoding with the
+        // mirror's fields, every capped list at its cap, and the incoming
+        // ledger's newest sale in it.
+        let merged = secret_value(r, &key(a))?;
+        same_fields("merged instant-checkout ledger", &merged, &mirror_ledger)?;
+        for (list, cap) in [
+            ("sales", ledger_caps.sales),
+            ("gap_orders", ledger_caps.gap_orders),
+        ] {
+            let got = list_len(&merged, &[list])?;
+            if got != cap {
+                bail!("the merged ledger holds {got} {list}, not the cap {cap}");
+            }
+        }
+        let order_of = |sale: &Value| field(sale, &["order"]).cloned();
+        let newest = match field(&incoming_value, &["sales"])? {
+            Value::Array(sales) => sales
+                .last()
+                .map(order_of)
+                .ok_or_else(|| anyhow!("the incoming ledger has no sales"))??,
+            other => bail!(
+                "the incoming ledger's sales are not a list: {}",
+                brief(other)
+            ),
+        };
+        let found = match field(&merged, &["sales"])? {
+            Value::Array(sales) => sales.iter().any(|s| order_of(s).is_ok_and(|o| o == newest)),
+            _ => false,
+        };
+        if !found {
+            bail!(
+                "the merged ledger holds none of the incoming ledger's sales: nothing was merged"
+            );
+        }
     }
 
     // --- the migration export, last: it disarms instant checkout -----------
@@ -1481,6 +1612,73 @@ fn drain_mailbox(
     bail!("{name}: still not done after 32 runs; the delegate's per-run bound makes no progress")
 }
 
+/// A byte-cap mailbox whose plaintexts are written to cost the most to
+/// decode rather than a text: a valid message with an extra field of
+/// one-byte integers, which the decoder walks one by one. Anyone can encrypt
+/// their own plaintext to a store's inbox. `sizes` gives each message's
+/// length (as the byte-cap mailbox's), `tag` and `nonce_base` keep its
+/// senders and nonces apart from any other mailbox's.
+///
+/// Each message is decrypted here, natively, with the key and associated
+/// data the delegate will use, and must decode as a `PlaintextMessage`: a
+/// fixture the delegate cannot open (or opens and cannot decode) is refused
+/// cheaply, and the scan would pass the budget for the wrong reason.
+fn hostile_mailbox(
+    sizes: &[usize],
+    inbox: [u8; 32],
+    tag: u8,
+    nonce_base: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<harvest_common::mailbox::EncryptedMessage>> {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let mut seed = [tag; 32];
+            seed[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            let buyer = StaticSecret::from(seed);
+            let sender = *PublicKey::from(&buyer).as_bytes();
+            let shared = buyer.diffie_hellman(&PublicKey::from(inbox)).to_bytes();
+            let key = harvest_common::mailbox::conversation_key_from_dh(
+                &shared,
+                harvest_common::mailbox::MessageDirection::BuyerToSeller,
+            );
+            let id = harvest_common::mailbox::ConversationId([(i % 251) as u8; 32]);
+            let plaintext = Value::Map(vec![
+                (
+                    Value::Text("conversation_id".into()),
+                    Value::Array(id.0.iter().map(|b| Value::Integer((*b).into())).collect()),
+                ),
+                (
+                    Value::Text("content".into()),
+                    Value::Map(vec![(
+                        Value::Text("Text".into()),
+                        Value::Text(String::new()),
+                    )]),
+                ),
+                (
+                    Value::Text("pad".into()),
+                    Value::Array(vec![Value::Integer(0.into()); len.saturating_sub(64)]),
+                ),
+            ]);
+            let message = fixtures::encrypt_bytes_seeded(
+                &cbor(&plaintext),
+                &id,
+                &sender,
+                &key,
+                now - chrono::Duration::seconds(i as i64),
+                nonce_base + i as u64,
+            );
+            let opened = harvest_common::sealed::decrypt_message(&message, &key)
+                .map_err(|e| anyhow!("hostile message {i} does not open with its own key: {e}"))?;
+            if opened.conversation_id != id {
+                bail!("hostile message {i} decodes to another conversation: update the harness");
+            }
+            Ok(message)
+        })
+        .collect()
+}
+
 /// A mailbox state as a node delivers it: in the contract's canonical order
 /// (by nonce, so effectively random in time) and passing its own `verify`.
 /// The delegate sorts what it is given, and a fixture already in time order
@@ -1513,7 +1711,6 @@ fn count_array_somewhere(v: &Value) -> usize {
     }
 }
 
-/// How many message digests the instant-checkout ledger records as read.
 /// Flag every store's mailbox as waiting to be re-read, or clear the flag:
 /// in the ledger (`Ledger::retry_pending`, which every generation keeps and
 /// main's wake-up reads) and beside it (`auto_invoice::retry_key`, which a
@@ -1561,18 +1758,73 @@ fn status_watched(status: &Value) -> Result<i128> {
     }
 }
 
+/// How many message digests the instant-checkout ledger records as read.
 fn ledger_seen(r: &Runner, key: &str) -> Result<usize> {
-    let bytes = r
-        .host
-        .state
-        .secrets
-        .get(key.as_bytes())
-        .ok_or_else(|| anyhow!("no instant-checkout ledger was written"))?;
-    let v: Value = ciborium::from_reader(bytes.as_slice()).context("ledger is not CBOR")?;
+    Ok(ledger_seen_digests(r, key)?.len())
+}
+
+/// The message digests the instant-checkout ledger records as read
+/// (`Ledger::seen`, each `harvest_common::mailbox::entry_digest`).
+fn ledger_seen_digests(r: &Runner, key: &str) -> Result<Vec<[u8; 32]>> {
+    let v = secret_value(r, key.as_bytes())?;
     match field(&v, &["seen"])? {
-        Value::Array(items) => Ok(items.len()),
+        Value::Array(items) => items.iter().map(bytes32).collect(),
         other => bail!("ledger seen is not a list: {}", brief(other)),
     }
+}
+
+/// A secret the delegate holds, decoded as CBOR.
+fn secret_value(r: &Runner, key: &[u8]) -> Result<Value> {
+    let bytes = r.host.state.secrets.get(key).ok_or_else(|| {
+        anyhow!(
+            "the delegate holds no secret {}",
+            String::from_utf8_lossy(key)
+        )
+    })?;
+    ciborium::from_reader(bytes.as_slice())
+        .with_context(|| format!("secret {} is not CBOR", String::from_utf8_lossy(key)))
+}
+
+/// The field names of a CBOR map, sorted.
+fn map_keys(v: &Value) -> Result<Vec<String>> {
+    let Value::Map(entries) = v else {
+        bail!("not a map: {}", brief(v));
+    };
+    let mut keys = entries
+        .iter()
+        .map(|(k, _)| match k {
+            Value::Text(t) => Ok(t.clone()),
+            other => bail!("a non-text field name: {}", brief(other)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    keys.sort();
+    Ok(keys)
+}
+
+/// The length of the list at `path` in `v`.
+fn list_len(v: &Value, path: &[&str]) -> Result<usize> {
+    match field(v, path)? {
+        Value::Array(items) => Ok(items.len()),
+        other => bail!("{} is not a list: {}", path.join("."), brief(other)),
+    }
+}
+
+/// The delegate's own encoding of a crate-private type has exactly the
+/// fields the harness's mirror has. Most of the delegate's fields are
+/// `serde(default)`, so a mirror missing one still decodes, and a field the
+/// delegate added would never be filled: a fixture that silently no longer
+/// reaches the delegate's worst case.
+fn same_fields(what: &str, delegate: &Value, mirror: &Value) -> Result<()> {
+    let (d, m) = (map_keys(delegate)?, map_keys(mirror)?);
+    if d != m {
+        let only_d: Vec<_> = d.iter().filter(|k| !m.contains(k)).collect();
+        let only_m: Vec<_> = m.iter().filter(|k| !d.contains(k)).collect();
+        bail!(
+            "the delegate's {what} has fields the harness's mirror lacks ({only_d:?}) or the \
+             mirror has fields the delegate does not write ({only_m:?}): update `fixtures.rs`"
+        );
+    }
+    Ok(())
 }
 
 /// `Vec<u8>` from either a CBOR byte string or an array of integers.

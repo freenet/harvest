@@ -208,8 +208,10 @@ pub fn encrypt_bytes_seeded(
 
 /// The instant-checkout ledger as the delegate stores it
 /// (`delegates/harvest-delegate/src/auto_invoice.rs`, `Ledger`, `Sale`): a
-/// crate-private type, mirrored field for field. A drift is caught where it is
-/// used (a re-arm must read the seeded issued count back), not silently.
+/// crate-private type, mirrored field for field. Most of its fields are
+/// `serde(default)`, so a drifted mirror would still decode: the scenario
+/// compares this mirror's field names with a ledger the delegate wrote
+/// (`same_fields`), and a re-arm must read the seeded issued count back.
 #[derive(serde::Serialize)]
 struct Ledger {
     seen: Vec<[u8; 32]>,
@@ -321,9 +323,10 @@ const DELEGATION_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-watch-delegation/v1\0";
 
 /// A watch delegation as the Harvest delegate holds it
 /// (`delegates/harvest-delegate/src/watch_delegation.rs`, `Held`, `Watched`): a
-/// crate-private type, mirrored field for field, as [`Ledger`] is. A drift is
-/// caught where it is used (each status must count the delegation's watches,
-/// and the wake-up must read for it), not silently.
+/// crate-private type, mirrored field for field, as [`Ledger`] is. The
+/// scenario compares this mirror's field names (and a watch's) with a
+/// delegation the delegate rewrote (`same_fields`); each status must also
+/// count the delegation's watches, and the wake-up must read for it.
 #[derive(serde::Serialize)]
 struct Held {
     network: BitcoinNetwork,
