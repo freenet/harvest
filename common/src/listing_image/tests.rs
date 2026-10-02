@@ -254,6 +254,9 @@ fn a_description_may_not_hide_characters() {
         "zero\u{200B}width",
         "\u{2066}isolate\u{2069}",
         "bom\u{FEFF}",
+        "mongolian\u{180E}vs",
+        "deprecated\u{206A}format",
+        "nominal\u{206F}digits",
         "nul\0",
     ] {
         assert!(with_alt(hidden).is_some(), "{hidden:?} must be refused");
