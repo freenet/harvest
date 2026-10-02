@@ -580,6 +580,29 @@ mod tests {
         secrets
     }
 
+    /// #206: a conversation filed under a key that does not end in its own
+    /// tag (none this delegate files, but a key is only a name) is still
+    /// found, by the scan the tag lookup falls back to. Mutated red by
+    /// dropping the fallback.
+    #[test]
+    fn a_conversation_filed_under_another_name_is_still_found() {
+        let mut secrets = MemSecrets::default();
+        let record = crate::messaging::BuyerConversationRecord {
+            secret: harvest_common::delegate::ConversationSecret(conversation_secret(1)),
+            seller_public_key: [5u8; 32],
+            conversation_id: [1; 32],
+            created_at: 1_700_000_000,
+            backed_up: false,
+            imported: false,
+        };
+        assert!(secrets.set_secret(
+            &crate::messaging::buyer_conversation_key(&[3u8; 32], &conversation(2)),
+            &to_cbor(&record).expect("encode"),
+        ));
+        assert_eq!(conversation_seed(&secrets, &conversation(1)), Some(seed(1)));
+        assert_eq!(conversation_seed(&secrets, &conversation(2)), None);
+    }
+
     /// **The buyer keeps the seller-signed terms before paying, with the
     /// receipt seed the delegate derived** (`docs/complaint-threat-model.md`
     /// section 3.1). Red if the seed is taken from anywhere but the held

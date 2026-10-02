@@ -164,7 +164,9 @@ pub(crate) fn decode_mailbox(bytes: &[u8]) -> Option<MailboxStateV1> {
     if n > bytes.len() {
         return None;
     }
-    let mut messages = Vec::with_capacity(n);
+    // Reserved for no more than a mailbox can hold: the count is the
+    // sender's word until every message has been read.
+    let mut messages = Vec::with_capacity(n.min(harvest_common::mailbox::MAX_MESSAGES));
     for _ in 0..n {
         let fields = r.head(5)?;
         let mut conversation_id = None;
@@ -256,15 +258,19 @@ mod tests {
     }
 
     fn message(i: usize, len: usize) -> EncryptedMessage {
+        // Whole seconds, milliseconds (what a client writes), and arbitrary
+        // nanoseconds: chrono writes each differently.
+        let nanos = match i % 3 {
+            0 => 0,
+            1 => (i as u32 % 1_000) * 1_000_000,
+            _ => (i as u32) * 1_000_003 % 1_000_000_000,
+        };
         EncryptedMessage {
             conversation_id: ConversationId([i as u8; 32]),
             sender_public_key: bytes(32, i as u8),
             ciphertext: bytes(len, i as u8 ^ 0x55),
             timestamp: chrono::Utc
-                .timestamp_opt(
-                    1_790_000_000 + i as i64,
-                    (i as u32) * 1_000_003 % 1_000_000_000,
-                )
+                .timestamp_opt(1_790_000_000 + i as i64, nanos)
                 .unwrap(),
             nonce: bytes(24, i as u8).try_into().unwrap(),
         }
@@ -284,6 +290,16 @@ mod tests {
         };
         let bytes = harvest_common::to_cbor(&state).unwrap();
         assert_eq!(decode_mailbox(&bytes), Some(state));
+        // A full mailbox: the message count's head is three bytes long.
+        let full = MailboxStateV1 {
+            messages: (0..harvest_common::mailbox::MAX_MESSAGES)
+                .map(|i| message(i, 40 + i % 300))
+                .collect(),
+        };
+        assert_eq!(
+            decode_mailbox(&harvest_common::to_cbor(&full).unwrap()),
+            Some(full)
+        );
         let empty = harvest_common::to_cbor(&MailboxStateV1::default()).unwrap();
         assert_eq!(decode_mailbox(&empty), Some(MailboxStateV1::default()));
     }
@@ -309,11 +325,55 @@ mod tests {
         let at = bad
             .windows(2)
             .position(|w| w == [0x18, 0x55 ^ 2])
-            .map(|p| p + 1);
-        if let Some(at) = at {
-            bad[at] = 3;
-            assert_eq!(decode_mailbox(&bad), None);
-        }
+            .expect("a two-byte ciphertext byte")
+            + 1;
+        bad[at] = 3;
+        assert_eq!(decode_mailbox(&bad), None);
+        // One message's fields edited as CBOR values: a field twice, a field
+        // missing, a 31-byte conversation id.
+        type Fields = Vec<(ciborium::Value, ciborium::Value)>;
+        let edited = |edit: &dyn Fn(&mut Fields)| {
+            let mut value = ciborium::Value::serialized(&MailboxStateV1 {
+                messages: vec![message(4, 30)],
+            })
+            .unwrap();
+            let ciborium::Value::Map(top) = &mut value else {
+                panic!()
+            };
+            let ciborium::Value::Array(messages) = &mut top[0].1 else {
+                panic!()
+            };
+            let ciborium::Value::Map(fields) = &mut messages[0] else {
+                panic!()
+            };
+            edit(fields);
+            let mut out = Vec::new();
+            ciborium::into_writer(&value, &mut out).unwrap();
+            out
+        };
+        assert!(decode_mailbox(&edited(&|_| {})).is_some(), "unedited");
+        assert_eq!(
+            decode_mailbox(&edited(&|f| f.push(f[2].clone()))),
+            None,
+            "a field twice"
+        );
+        assert_eq!(
+            decode_mailbox(&edited(&|f| {
+                f.pop();
+            })),
+            None,
+            "a field missing"
+        );
+        assert_eq!(
+            decode_mailbox(&edited(&|f| {
+                let ciborium::Value::Array(id) = &mut f[0].1 else {
+                    panic!()
+                };
+                id.pop();
+            })),
+            None,
+            "a 31-byte id"
+        );
         // A message with one field renamed (so one missing, one unknown).
         let mut renamed = good.clone();
         let at = renamed
@@ -325,11 +385,13 @@ mod tests {
         // Whatever ciborium makes of a mangled state, this never decodes it
         // to something different.
         for i in 0..good.len() {
-            let mut m = good.clone();
-            m[i] ^= 0x40;
-            if let Some(fast) = decode_mailbox(&m) {
-                let slow: Option<MailboxStateV1> = harvest_common::from_cbor(&m).ok();
-                assert_eq!(Some(fast), slow, "flip at {i}");
+            for bit in 0..8 {
+                let mut m = good.clone();
+                m[i] ^= 1 << bit;
+                if let Some(fast) = decode_mailbox(&m) {
+                    let slow: Option<MailboxStateV1> = harvest_common::from_cbor(&m).ok();
+                    assert_eq!(Some(fast), slow, "flip of bit {bit} at {i}");
+                }
             }
         }
     }

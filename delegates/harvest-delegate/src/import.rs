@@ -327,16 +327,24 @@ pub(crate) fn import_secret<S: SecretStore>(
         Family::AutoLedger => {
             let held = store.get_secret(key);
             match crate::auto_invoice::merge_ledger_bytes(held.as_deref(), value) {
-                Ok(None) => SecretImport::AlreadyAuthoritative,
-                Ok(Some((bytes, retry_pending))) => {
-                    let ok = store.set_secret(key, &bytes);
-                    // The wake-up reads this flag rather than the ledger.
-                    if ok {
-                        if let Some(flag) = crate::auto_invoice::retry_key_for_ledger(key) {
-                            crate::auto_invoice::sync_retry_flag(store, &flag, retry_pending);
-                        }
+                // The wake-up reads the flag beside the ledger, not the
+                // ledger (`auto_invoice::save_ledger`): written pending
+                // first, cleared after, and repaired on a re-import that
+                // finds the ledger already merged.
+                Ok((merged, retry_pending)) => {
+                    let flag = crate::auto_invoice::retry_key_for_ledger(key)
+                        .expect("a ledger key names its store");
+                    if retry_pending && !crate::auto_invoice::sync_retry_flag(store, &flag, true) {
+                        return SecretImport::Retryable("the retry flag was not saved".into());
                     }
-                    written(ok)
+                    let outcome = match merged {
+                        None => SecretImport::AlreadyAuthoritative,
+                        Some(bytes) => written(store.set_secret(key, &bytes)),
+                    };
+                    if !retry_pending {
+                        crate::auto_invoice::sync_retry_flag(store, &flag, false);
+                    }
+                    outcome
                 }
                 Err(why) if held.is_some() && why.contains("own") => SecretImport::Retryable(why),
                 Err(why) => SecretImport::Permanent(why),
@@ -1032,6 +1040,45 @@ mod tests {
             SecretImport::Written
         ));
         assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // Held pending, incoming not: still pending, whatever arrives.
+        let quiet = crate::auto_invoice::Ledger::default();
+        import_secret(&mut store, &key, &cbor(&quiet));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // A flag gone wrong is put right by a re-import that finds the
+        // ledger already merged.
+        store.set_secret(&flag, b"0");
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::AlreadyAuthoritative
+        ));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // Neither pending: the flag says so.
+        let mut fresh = MemSecrets::default();
+        import_secret(&mut fresh, &key, &cbor(&quiet));
+        assert_eq!(fresh.get_secret(&flag).as_deref(), Some(b"0".as_slice()));
+    }
+
+    /// A pending flag that cannot be written is reported, so the migration
+    /// does not seal a predecessor whose retry was lost. Mutated red by
+    /// ignoring the flag write.
+    #[test]
+    fn an_unwritten_retry_flag_is_retryable() {
+        let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
+        let mut store = MemSecrets::refusing_writes_under(
+            crate::auto_invoice::retry_key_for_ledger(&key).unwrap(),
+        );
+        let pending = crate::auto_invoice::Ledger {
+            retry_pending: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::Retryable(_)
+        ));
+        assert!(
+            store.get_secret(&key).is_none(),
+            "nor is the ledger written"
+        );
     }
 
     /// A predecessor list that does not decode is refused; this delegate's

@@ -521,9 +521,10 @@ mod tests {
     }
 
     /// The export this delegate answers is the crate's, byte for byte, for
-    /// the same store, origin and scope, store keys hidden; and it refuses
-    /// what the crate refuses. Mutated red by changing the scope, or by
-    /// dropping the store-key filter.
+    /// the same store, origin and scope; it carries no store key; and it
+    /// refuses what the crate refuses. Mutated red by changing the scope.
+    /// (Both sides read through the same filter, so the store keys' absence
+    /// is checked on its own.)
     #[test]
     fn the_fast_export_is_the_crates_export() {
         let mut s = store();
@@ -546,10 +547,14 @@ mod tests {
         let OutboundDelegateMsg::ApplicationMessage(m) = &crates[0] else {
             panic!("an application message");
         };
-        assert_eq!(
-            export_payload(&wrapped, Some(&harvest_origin()), &policy, 29).unwrap(),
-            m.payload
-        );
+        let payload = export_payload(&wrapped, Some(&harvest_origin()), &policy, 29).unwrap();
+        assert_eq!(payload, m.payload);
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        assert!(!exported.secrets.is_empty());
+        assert!(exported
+            .secrets
+            .iter()
+            .all(|(key, _)| !key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())));
         assert!(export_payload(&wrapped, None, &policy, 29).is_err());
     }
 

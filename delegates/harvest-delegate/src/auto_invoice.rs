@@ -124,21 +124,30 @@ pub(crate) fn retry_key_for_ledger(ledger_key: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Bring a [`retry_key`] in line with a ledger's flag, writing only when it
-/// differs (each write is an fsync on a node).
-pub(crate) fn sync_retry_flag<S: SecretStore>(secrets: &mut S, key: &[u8], pending: bool) {
+/// differs (each write is an fsync on a node). Whether it now says so.
+pub(crate) fn sync_retry_flag<S: SecretStore>(secrets: &mut S, key: &[u8], pending: bool) -> bool {
     let want: &[u8] = if pending { b"1" } else { b"0" };
-    if secrets.get_secret(key).as_deref() != Some(want) {
-        secrets.set_secret(key, want);
-    }
+    secrets.get_secret(key).as_deref() == Some(want) || secrets.set_secret(key, want)
 }
 
 /// Save a store's ledger, and its [`retry_key`] beside it. Every ledger
-/// write goes through here.
+/// write goes through here (`every_ledger_write_goes_through_save_ledger`).
+///
+/// The two writes are ordered so that a failure or a call stopped between
+/// them errs toward a retry: a pending flag is written BEFORE the ledger
+/// (left alone, it only costs a re-read), and a cleared one after it. A
+/// pending flag that cannot be written fails the save.
 fn save_ledger<S: SecretStore>(secrets: &mut S, store_contract_id: &[u8], ledger: &Ledger) -> bool {
+    let flag = retry_key(store_contract_id);
+    if ledger.retry_pending && !sync_retry_flag(secrets, &flag, true) {
+        return false;
+    }
     if !save(secrets, &ledger_key(store_contract_id), ledger) {
         return false;
     }
-    sync_retry_flag(secrets, &retry_key(store_contract_id), ledger.retry_pending);
+    if !ledger.retry_pending {
+        sync_retry_flag(secrets, &flag, false);
+    }
     true
 }
 
@@ -153,7 +162,7 @@ pub(crate) fn is_ledger_key(key: &[u8]) -> bool {
 pub(crate) fn merge_ledger_bytes(
     held: Option<&[u8]>,
     incoming: &[u8],
-) -> Result<Option<(Vec<u8>, bool)>, String> {
+) -> Result<(Option<Vec<u8>>, bool), String> {
     let incoming: Ledger =
         from_cbor(incoming).map_err(|_| "the ledger did not decode".to_string())?;
     let mut ledger: Ledger = match held {
@@ -163,10 +172,10 @@ pub(crate) fn merge_ledger_bytes(
         }
     };
     if !merge_ledgers(&mut ledger, incoming) {
-        return Ok(None);
+        return Ok((None, ledger.retry_pending));
     }
     to_cbor(&ledger)
-        .map(|bytes| Some((bytes, ledger.retry_pending)))
+        .map(|bytes| (Some(bytes), ledger.retry_pending))
         .map_err(|e| e.to_string())
 }
 
@@ -311,8 +320,10 @@ pub(crate) struct Ledger {
     /// seller is told for [`CAPPED_SHOWN_MS`] (`AutoInvoiceStatus::capped`).
     #[serde(default)]
     pub capped: Option<(u64, String)>,
-    /// A store or mailbox update this delegate sent was refused, so some
-    /// requests are undecided again and wait for a run to answer them.
+    /// Requests are waiting for a run to answer them: an update this
+    /// delegate sent was refused, so some are undecided again, or the last
+    /// mailbox run left messages unopened or unbatched (`OPEN_BUDGET`,
+    /// `MAX_BATCH`). Mirrored by [`retry_key`], which the wake-up reads.
     #[serde(default)]
     pub retry_pending: bool,
 }
@@ -507,8 +518,8 @@ struct PendingReplies {
 const BATCH_MAGIC: [u8; 8] = *b"hvauto01";
 const RETRY_MAGIC: [u8; 8] = *b"hvretry1";
 
-/// Carried through a mailbox read a wake-up asks for when a refused update
-/// left requests undecided (`Ledger::retry_pending`).
+/// Carried through a mailbox read a wake-up asks for when requests are
+/// waiting (`Ledger::retry_pending`, read from its [`retry_key`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct MailboxRetry {
     magic: [u8; 8],
@@ -518,7 +529,10 @@ struct MailboxRetry {
 /// A mailbox read for every armed store with requests left undecided by a
 /// refused update: the wake-up's way to answer them without waiting for the
 /// mailbox to change (codex on harvest#177).
-pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelegateMsg> {
+pub(crate) fn mailbox_retries<S: SecretStore>(
+    secrets: &S,
+    now_ms: u64,
+) -> Vec<OutboundDelegateMsg> {
     if secrets.has_secret(EXPORTED_KEY) {
         return Vec::new();
     }
@@ -531,6 +545,18 @@ pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelega
                 .get_secret(&retry_key(&record.arm.store_contract_id))
                 .as_deref()
                 == Some(b"1")
+        })
+        // Not while the store is turned away for a reason only the seller
+        // lifts (a lapsed watch, a missing key): the run would stop before
+        // reading anything, and the flag would bring the read back at every
+        // wake-up. Kept, so the first wake-up after it lifts reads. A tip
+        // too old is not such a reason: this wake-up fetches a new one.
+        .filter(|record| {
+            let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
+            !matches!(
+                global_refusal(secrets, record, tip.as_ref(), now_ms),
+                Err(why) if why != Refusal::NoFreshTip
+            )
         })
         .filter_map(|record| {
             let context = to_cbor(&MailboxRetry {
@@ -546,8 +572,8 @@ pub(crate) fn mailbox_retries<S: SecretStore>(secrets: &S) -> Vec<OutboundDelega
         .collect()
 }
 
-/// The mailbox read [`mailbox_retries`] asked for: the retry flag cleared,
-/// and the mailbox decided as if it had just changed.
+/// The mailbox read [`mailbox_retries`] asked for: the mailbox decided as
+/// if it had just changed, which settles the retry flag.
 fn on_mailbox_retry<S: SecretStore>(
     secrets: &mut S,
     store_contract_id: &[u8],
@@ -560,11 +586,9 @@ fn on_mailbox_retry<S: SecretStore>(
     let Some(state) = state else {
         return Vec::new();
     };
-    let mut ledger = load_ledger(secrets, store_contract_id);
-    if ledger.retry_pending {
-        ledger.retry_pending = false;
-        save_ledger(secrets, store_contract_id, &ledger);
-    }
+    // The run settles the flag once it has read the ledger (`on_mailbox`);
+    // one turned away before that (no fresh tip yet, say) leaves it for the
+    // next wake-up.
     on_mailbox(secrets, &record, state, now_ms)
 }
 const REPLIES_MAGIC: [u8; 8] = *b"hvrepl01";
@@ -1865,6 +1889,12 @@ struct OpenedRequest {
     instant: InstantSelection,
 }
 
+/// Whether a request made at `at_ms` (the buyer's clock) is within the day
+/// `decide` answers.
+fn within_request_age(at_ms: i64, now_ms: u64) -> bool {
+    at_ms >= 0 && now_ms.abs_diff(at_ms as u64) <= REQUEST_MAX_AGE_MS
+}
+
 fn within_age(message: &EncryptedMessage, now_ms: u64) -> bool {
     let at = message.timestamp.timestamp_millis();
     at >= 0 && now_ms.abs_diff(at as u64) <= REQUEST_MAX_AGE_MS
@@ -1872,11 +1902,15 @@ fn within_age(message: &EncryptedMessage, now_ms: u64) -> bool {
 
 /// How much opening one mailbox run may do, in bytes of ciphertext plus
 /// [`OPEN_FIXED_COST`] per message (#206). Opening a message is an X25519
-/// agreement and an AES-GCM pass over it; under the node's fuel metering that
-/// is about 3.1 million units each plus about 760 a byte, so this is about
-/// one billion units, a quarter of a call's budget. A full mailbox of short
-/// texts is about two runs; one filled to its byte cap is about five.
-pub(crate) const OPEN_BUDGET: usize = 1_310_720;
+/// agreement, an AES-GCM pass over it and a decode of what it says; under
+/// the node's fuel metering that is about 3.1 million units each plus about
+/// 760 a byte for a text, and up to about 1,500 a byte for a plaintext built
+/// to be slow to decode (a long list of one-byte integers), which anyone can
+/// send. Sized so that a run over a mailbox at its byte cap of such messages
+/// stays within half a call's budget (49%, `tests/delegate-budget`); a full
+/// mailbox of short texts is about four runs, one at its byte cap about
+/// seven.
+pub(crate) const OPEN_BUDGET: usize = 851_968;
 
 /// The X25519 agreement in [`OPEN_BUDGET`]'s units: about 4 KiB of AES-GCM.
 pub(crate) const OPEN_FIXED_COST: usize = 4096;
@@ -1884,14 +1918,16 @@ pub(crate) const OPEN_FIXED_COST: usize = 4096;
 /// Fresh randomness from the node, for [`open_within_budget`]'s order.
 fn random_seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
-    // Falling back to zeros only makes the order predictable, never wrong.
+    // The source registered in `lib.rs` cannot fail. Were it to, the order
+    // would be predictable, which is the starvation the random order is
+    // there to prevent, though never a wrong answer.
     let _ = getrandom::getrandom(&mut seed);
     seed
 }
 
-/// One message a run opened: its digest, the message, and whether it is an
-/// instant request this store can open.
-type Opened<'a> = ([u8; 32], &'a EncryptedMessage, bool);
+/// One message a run opened: its digest, the message, and, when it is an
+/// instant request this store can open, when the buyer says they asked.
+type Opened<'a> = ([u8; 32], &'a EncryptedMessage, Option<i64>);
 
 /// Open `candidates` in an order drawn from `seed` until [`OPEN_BUDGET`] is
 /// spent, skipping any message that would not fit (so smaller ones behind it
@@ -1911,10 +1947,16 @@ type Opened<'a> = ([u8; 32], &'a EncryptedMessage, bool);
 /// budget's share of what is waiting (a third or more even at the byte cap,
 /// and nearly all of it for a buyer's short request, which also fits where a
 /// large message does not). Junk opened once is never opened again (it is
-/// recorded as seen), so the backlog only shrinks between the attacker's
-/// writes. A real request is therefore reached within a few runs whatever the
-/// attacker does, where before this every run opened everything and a full
-/// mailbox could put the run past the node's limit, which reached no one.
+/// recorded as seen), and so is an instant request outside the day `decide`
+/// answers, so the backlog shrinks between the attacker's writes; the one
+/// exception is a valid request waiting out a store-wide refusal (a store
+/// limit), which stays unseen until the limit lifts and is opened again each
+/// run meanwhile, bounded like everything else. A real request is therefore
+/// reached within a few runs whatever the attacker does, where before this
+/// every run opened everything and a full mailbox could put the run past the
+/// node's limit, which reached no one. The batch is then chosen in the same
+/// order (`on_mailbox`), so an attacker's own valid requests, dated early,
+/// cannot take its slots ahead of a buyer's either.
 fn open_within_budget<'a>(
     store_sk: &SigningKey,
     mut candidates: Vec<([u8; 32], &'a EncryptedMessage)>,
@@ -1931,7 +1973,9 @@ fn open_within_budget<'a>(
             continue;
         }
         left -= cost;
-        opened.push((digest, message, open_instant(store_sk, message).is_some()));
+        let requested_at = open_instant(store_sk, message)
+            .map(|(_, _, _, request)| request.instant.requested_at_ms);
+        opened.push((digest, message, requested_at));
     }
     (opened, backlog)
 }
@@ -1941,6 +1985,17 @@ fn on_mailbox<S: SecretStore>(
     record: &ArmRecord,
     state: &[u8],
     now_ms: u64,
+) -> Vec<OutboundDelegateMsg> {
+    on_mailbox_ordered(secrets, record, state, now_ms, random_seed())
+}
+
+/// [`on_mailbox`], with the run's order drawn from `seed`.
+fn on_mailbox_ordered<S: SecretStore>(
+    secrets: &mut S,
+    record: &ArmRecord,
+    state: &[u8],
+    now_ms: u64,
+    seed: [u8; 32],
 ) -> Vec<OutboundDelegateMsg> {
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     if global_refusal(secrets, record, tip.as_ref(), now_ms).is_err() {
@@ -1968,50 +2023,69 @@ fn on_mailbox<S: SecretStore>(
         .map(|m| (entry_digest(m), m))
         .filter(|(digest, _)| !ledger.seen.contains(digest))
         .collect();
-    let (opened, backlog) = open_within_budget(&store_sk, candidates, random_seed());
-    for (digest, _, instant) in &opened {
-        if !instant {
-            // Not an instant request this store can open: a reply, a text, a
-            // quote request, or junk. Looked at once.
-            ledger.saw(*digest);
-            ledger_changed = true;
-        }
-    }
-    // What did not fit this run is looked at by the next one: the next
-    // mailbox change, or the wake-up, which re-reads a mailbox whose ledger
-    // says so (`mailbox_retries`).
-    // A run with nothing left over is what a retry asks for (a full read of
-    // what is waiting: `on_mailbox_retry` clears the flag and runs this), so
-    // it settles the flag either way.
-    if ledger.retry_pending != backlog {
-        ledger.retry_pending = backlog;
-        ledger_changed = true;
-    }
-    // The instant requests in the order they were made (oldest first, as
-    // before this module bounded its work), into one batch.
-    let mut instants: Vec<([u8; 32], &EncryptedMessage)> = opened
-        .iter()
-        .filter(|(_, _, instant)| *instant)
-        .map(|(digest, message, _)| (*digest, *message))
-        .collect();
-    instants.sort_by(|a, b| (a.1.timestamp, a.0).cmp(&(b.1.timestamp, b.0)));
+    let (opened, mut backlog) = open_within_budget(&store_sk, candidates, seed);
     let mut batch: Vec<EncryptedMessage> = Vec::new();
     // What the context can carry, less room for its own framing.
     let budget = DelegateContext::MAX_SIZE - 1024;
     let mut used = 0usize;
-    for (digest, message) in instants {
-        let size = to_cbor(message).map_or(usize::MAX, |b| b.len());
-        if size > budget {
-            // Can never be carried; the seller answers it.
-            ledger.saw(digest);
-            ledger_changed = true;
-        } else if batch.len() < MAX_BATCH && used + size <= budget {
-            used += size;
-            batch.push(message.clone());
+    // In the order opened, which is the run's random order, NOT the order
+    // the requests claim to have been made: a writer chooses the envelope
+    // timestamp, so oldest-first would let a pile of their own valid
+    // requests, dated early, take every slot ahead of a real buyer's.
+    for (digest, message, requested_at) in &opened {
+        match requested_at {
+            // Not an instant request this store can open: a reply, a text, a
+            // quote request, or junk. Looked at once.
+            None => {
+                ledger.saw(*digest);
+                ledger_changed = true;
+            }
+            // Outside the day `decide` answers, it would refuse it unseen
+            // forever: settled here, before it can hold a batch slot.
+            Some(at) if !within_request_age(*at, now_ms) => {
+                ledger.saw(*digest);
+                ledger_changed = true;
+            }
+            Some(_) if batch.len() < MAX_BATCH => {
+                let size = to_cbor(*message).map_or(usize::MAX, |b| b.len());
+                if size > budget {
+                    // Can never be carried; the seller answers it.
+                    ledger.saw(*digest);
+                    ledger_changed = true;
+                } else if used + size <= budget {
+                    used += size;
+                    batch.push((*message).clone());
+                } else {
+                    backlog = true;
+                }
+            }
+            // A request opened and left out of a full batch is still
+            // waiting: the next run must come back for it.
+            Some(_) => backlog = true,
         }
+    }
+    // The batch is decided oldest first (`decide` sorts it), as before this
+    // module bounded its work.
+    batch.sort_by_key(|m| (m.timestamp, entry_digest(m)));
+    // What this run left -- unopened, or opened and not batched -- is looked
+    // at by the next run: the next mailbox change, or the wake-up, which
+    // re-reads a mailbox whose flag says so (`mailbox_retries`). A run that
+    // left nothing has done what a retry asks for, so it settles the flag
+    // either way.
+    if ledger.retry_pending != backlog {
+        ledger.retry_pending = backlog;
+        ledger_changed = true;
     }
     if ledger_changed {
         save_ledger(secrets, &record.arm.store_contract_id, &ledger);
+    } else {
+        // Nothing to write, but a flag left wrong by an earlier failure is
+        // put right.
+        sync_retry_flag(
+            secrets,
+            &retry_key(&record.arm.store_contract_id),
+            ledger.retry_pending,
+        );
     }
     if batch.is_empty() {
         return Vec::new();
@@ -2082,8 +2156,8 @@ pub(crate) fn on_store_update_answer<S: SecretStore>(
                 // one that did not land is released after `NOT_LANDED_MS`
                 // anyway. A request made undecided here is answered at the
                 // store's next run, which the next mailbox change starts;
-                // `retry_pending` is what a run started some other way (a
-                // wake-up, next PR) looks at.
+                // `retry_pending` is what a run started some other way (the
+                // wake-up's `mailbox_retries`) looks at.
                 ledger.retry_pending = true;
                 save_ledger(secrets, &pending.store_contract_id, &ledger);
             }
@@ -2957,6 +3031,20 @@ mod tests {
             total: u64,
             at_ms: u64,
         ) -> EncryptedMessage {
+            self.request_dated(listing, quantity, nonce, total, at_ms, at_ms)
+        }
+
+        /// A request whose envelope says `sent_ms` and whose own date says
+        /// `at_ms`: a writer chooses both.
+        fn request_dated(
+            &self,
+            listing: &Listing,
+            quantity: u32,
+            nonce: u8,
+            total: u64,
+            at_ms: u64,
+            sent_ms: u64,
+        ) -> EncryptedMessage {
             harvest_common::sealed::seal(
                 &self.keys().0,
                 &self.tag(),
@@ -2976,7 +3064,7 @@ mod tests {
                         requested_at_ms: at_ms as i64,
                     }),
                 },
-                chrono::DateTime::from_timestamp_millis(at_ms as i64).unwrap(),
+                chrono::DateTime::from_timestamp_millis(sent_ms as i64).unwrap(),
             )
             .unwrap()
         }
@@ -3280,7 +3368,7 @@ mod tests {
                 pending,
                 "the flag beside the ledger says what the ledger says"
             );
-            assert_eq!(mailbox_retries(&f.secrets).len(), usize::from(pending));
+            assert_eq!(mailbox_retries(&f.secrets, NOW).len(), usize::from(pending));
             if !pending {
                 break;
             }
@@ -3327,7 +3415,7 @@ mod tests {
                 let candidates = waiting.iter().map(|m| (entry_digest(m), *m)).collect();
                 let (opened, _) =
                     open_within_budget(&store_sk(), candidates, [seed.wrapping_add(runs); 32]);
-                if opened.iter().any(|(_, _, instant)| *instant) {
+                if opened.iter().any(|(_, _, at)| at.is_some()) {
                     break;
                 }
                 let done: Vec<[u8; 32]> = opened.iter().map(|(d, _, _)| *d).collect();
@@ -4328,7 +4416,7 @@ mod tests {
         let mut new = fixture();
         counted(&mut new, 3);
         let key = ledger_key(&new.record.arm.store_contract_id);
-        let (merged, _) = merge_ledger_bytes(None, &exported).unwrap().unwrap();
+        let merged = merge_ledger_bytes(None, &exported).unwrap().0.unwrap();
         new.secrets.set_secret(&key, &merged);
         publish(&mut new, &first);
         with_status(&mut new, &first.orders[0].order.id, OrderStatus::Paid);
@@ -5462,5 +5550,283 @@ mod tests {
         // And it is: the next run answers it.
         let again = run(&mut f, &[entry]);
         assert_eq!(again.orders.len(), 1, "{:?}", again.refused);
+    }
+
+    /// The requests a mailbox run put into its batch.
+    fn batched(out: &[OutboundDelegateMsg]) -> Vec<EncryptedMessage> {
+        match out {
+            [] => Vec::new(),
+            [OutboundDelegateMsg::GetContractRequest(get)] => {
+                from_cbor::<PendingBatch>(get.context.as_ref())
+                    .unwrap()
+                    .entries
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn flag(f: &Fixture) -> Option<Vec<u8>> {
+        f.secrets
+            .get_secret(&retry_key(&f.record.arm.store_contract_id))
+    }
+
+    /// #206: a buyer's request behind a pile of an attacker's own valid
+    /// instant requests, all dated earlier and all fitting one run, still
+    /// gets batch slots: the batch is chosen in the run's random order, not
+    /// by the date the writer chose. 200 such requests against 16 slots, so
+    /// about one seed in twelve batches the buyer's; oldest first, none
+    /// would. Mutated red by choosing the batch oldest first.
+    #[test]
+    fn a_request_behind_older_valid_requests_gets_a_batch_slot() {
+        let attacker = Buyer::new(77);
+        let buyer = Buyer::new(40);
+        let real = buyer.request(&jam(), 1, 1, 12_000);
+        let mut messages: Vec<EncryptedMessage> = (0..200u8)
+            .map(|n| attacker.request_at(&jam(), 1, n, 12_000, NOW - 23 * 3_600_000))
+            .collect();
+        messages.push(real.clone());
+        let state = to_cbor(&MailboxStateV1 { messages }).unwrap();
+        let mut reached = 0;
+        for seed in 0..64u8 {
+            let mut f = fixture();
+            let batch = batched(&on_mailbox_ordered(
+                &mut f.secrets,
+                &f.record.clone(),
+                &state,
+                NOW,
+                [seed; 32],
+            ));
+            assert_eq!(batch.len(), MAX_BATCH, "seed {seed}");
+            assert!(
+                batch.windows(2).all(|w| w[0].timestamp <= w[1].timestamp),
+                "decided oldest first"
+            );
+            reached += usize::from(batch.contains(&real));
+        }
+        assert!(
+            reached >= 2,
+            "the buyer's request reached {reached} of 64 batches"
+        );
+    }
+
+    /// #206: the mailbox run takes its order from the node's randomness:
+    /// two runs over the same backlog open different messages. Mutated red
+    /// by a fixed seed.
+    #[test]
+    fn each_mailbox_run_draws_its_own_order() {
+        assert_ne!(random_seed(), random_seed());
+        let messages: Vec<EncryptedMessage> = (0..400).map(|i| junk(i, 600)).collect();
+        let state = to_cbor(&MailboxStateV1 { messages }).unwrap();
+        let opened = || {
+            let mut f = fixture();
+            on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+            load_ledger(&f.secrets, &f.record.arm.store_contract_id).seen
+        };
+        assert_ne!(opened(), opened());
+    }
+
+    /// #206: requests opened but left out of a full batch are still waiting,
+    /// so the run keeps the retry flag, including one a refused update set
+    /// before it. Mutated red by not counting the unbatched as backlog.
+    #[test]
+    fn requests_left_out_of_a_full_batch_keep_the_retry() {
+        let mut f = fixture();
+        let mut ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        ledger.retry_pending = true;
+        save_ledger(&mut f.secrets, &f.record.arm.store_contract_id, &ledger);
+        let messages: Vec<EncryptedMessage> = (0..20u8)
+            .map(|n| Buyer::new(40).request(&jam(), 1, n, 12_000))
+            .collect();
+        let state = to_cbor(&MailboxStateV1 { messages }).unwrap();
+        let batch = batched(&on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW));
+        assert_eq!(batch.len(), MAX_BATCH);
+        assert!(load_ledger(&f.secrets, &f.record.arm.store_contract_id).retry_pending);
+        assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()));
+        assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1);
+    }
+
+    /// #206: an instant request older than the day `decide` answers is
+    /// settled as seen when opened, rather than reopened by every run and
+    /// holding a batch slot. Mutated red by batching it.
+    #[test]
+    fn an_expired_request_is_seen_not_batched() {
+        let mut f = fixture();
+        let old = Buyer::new(40).request_dated(
+            &jam(),
+            1,
+            1,
+            12_000,
+            NOW - REQUEST_MAX_AGE_MS - 1,
+            NOW - 5_000,
+        );
+        let state = to_cbor(&MailboxStateV1 {
+            messages: vec![old.clone()],
+        })
+        .unwrap();
+        // Within the mailbox's own age, so the run looks at it at all.
+        assert!(within_age(&old, NOW));
+        assert!(batched(&on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW)).is_empty());
+        assert!(load_ledger(&f.secrets, &f.record.arm.store_contract_id)
+            .seen
+            .contains(&entry_digest(&old)));
+    }
+
+    /// The wake-up reads a waiting mailbox when the store can take orders,
+    /// or lacks only a fresh tip (which this wake-up fetches), and not while
+    /// it is turned away for a reason only the seller lifts; the flag is
+    /// kept for when it does. Mutated red by dropping the refusal filter
+    /// and by filtering out a stale tip too.
+    #[test]
+    fn the_wakeup_reads_a_waiting_mailbox_only_when_a_run_could_answer() {
+        let mut f = fixture();
+        let mut ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        ledger.retry_pending = true;
+        save_ledger(&mut f.secrets, &f.record.arm.store_contract_id, &ledger);
+        assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1, "taking orders");
+        let tip: TipCache = load(&f.secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        let mut old = tip.clone();
+        old.block_time = 1;
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &old);
+        assert_eq!(mailbox_retries(&f.secrets, NOW).len(), 1, "a stale tip");
+        save(&mut f.secrets, &tip_key(BitcoinNetwork::Signet), &tip);
+        let mut lapsed = f.record.clone();
+        lapsed.watched_until_ms = 0;
+        lapsed.arm.watch_left_ms = 0;
+        lapsed.arm.watched_scripts.clear();
+        save(
+            &mut f.secrets,
+            &arm_key(&lapsed.arm.store_contract_id),
+            &lapsed,
+        );
+        assert!(
+            global_refusal(&f.secrets, &lapsed, Some(&tip), NOW).is_err(),
+            "the fixture is lapsed"
+        );
+        assert!(mailbox_retries(&f.secrets, NOW).is_empty(), "lapsed");
+        assert_eq!(flag(&f).as_deref(), Some(b"1".as_slice()), "kept");
+    }
+
+    /// A refused store update reaches the wake-up through the flag, and the
+    /// run it starts settles it. Mutated red by saving that ledger without
+    /// its flag.
+    #[test]
+    fn a_refused_update_reaches_the_wakeup_and_its_run_clears_it() {
+        let mut f = fixture();
+        let entry = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        let out = decided.into_messages(&f.record.arm);
+        let [OutboundDelegateMsg::UpdateContractRequest(update)] = out.as_slice() else {
+            panic!("{out:?}")
+        };
+        let context = update.context.as_ref().to_vec();
+        on_store_update_answer(&mut f.secrets, &Err("refused".into()), &context);
+        let retries = mailbox_retries(&f.secrets, NOW);
+        let [OutboundDelegateMsg::GetContractRequest(get)] = retries.as_slice() else {
+            panic!("{retries:?}")
+        };
+        let state = to_cbor(&MailboxStateV1 {
+            messages: vec![entry],
+        })
+        .unwrap();
+        let context: MailboxRetry = from_cbor(get.context.as_ref()).unwrap();
+        let out = on_mailbox_retry(
+            &mut f.secrets,
+            &context.store_contract_id,
+            Some(&state),
+            NOW,
+        );
+        assert_eq!(batched(&out).len(), 1, "the request is batched again");
+        assert_eq!(flag(&f).as_deref(), Some(b"0".as_slice()));
+        assert!(mailbox_retries(&f.secrets, NOW).is_empty());
+    }
+
+    /// A flag left saying "waiting" by an earlier failure is put right by
+    /// the next run that reads the ledger, even one with nothing to write.
+    /// Mutated red by syncing only on a write.
+    #[test]
+    fn a_wrong_flag_is_put_right_by_the_next_run() {
+        let mut f = fixture();
+        f.secrets
+            .set_secret(&retry_key(&f.record.arm.store_contract_id), b"1");
+        let state = to_cbor(&MailboxStateV1::default()).unwrap();
+        on_mailbox(&mut f.secrets, &f.record.clone(), &state, NOW);
+        assert_eq!(flag(&f).as_deref(), Some(b"0".as_slice()));
+    }
+
+    /// A pending flag that cannot be written fails the ledger's save rather
+    /// than leaving a ledger that waits with nothing to wake it. Mutated red
+    /// by writing the flag after the ledger, or ignoring its result.
+    #[test]
+    fn a_pending_flag_is_written_before_its_ledger() {
+        let mut secrets = MemSecrets::refusing_writes_under(retry_key(&[1; 32]));
+        let ledger = Ledger {
+            retry_pending: true,
+            ..Default::default()
+        };
+        assert!(!save_ledger(&mut secrets, &[1; 32], &ledger));
+        assert!(secrets.get_secret(&ledger_key(&[1; 32])).is_none());
+    }
+
+    /// Every ledger write outside the tests goes through `save_ledger`, so
+    /// the flag the wake-up reads cannot fall behind the ledger. Mutated red
+    /// by a bare `save` of a ledger.
+    #[test]
+    fn every_ledger_write_goes_through_save_ledger() {
+        let src = include_str!("auto_invoice.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = |name: &str| {
+            let at = code.find(name).unwrap();
+            &code[at..at + code[at..].find("\n}\n").unwrap()]
+        };
+        let outside = code.replace(body("fn save_ledger<"), "");
+        for (n, line) in outside.lines().enumerate() {
+            let bare = line.contains("save(") && !line.contains("save_ledger(");
+            assert!(
+                !(bare && line.contains("ledger_key")),
+                "line {}: a ledger saved without its flag: {line}",
+                n + 1
+            );
+            assert!(
+                !line.contains(&format!("set_secret(&{}", "ledger_key")),
+                "line {}: {line}",
+                n + 1
+            );
+        }
+        // And a multi-line `save(` whose next line names the ledger key.
+        let lines: Vec<&str> = outside.lines().collect();
+        for w in lines.windows(3) {
+            if w[0].trim_end().ends_with("save(") {
+                assert!(
+                    !w[1..].iter().any(|l| l.contains("ledger_key")),
+                    "a ledger saved without its flag: {w:?}"
+                );
+            }
+        }
+    }
+
+    /// The hand decoder takes the mailboxes clients actually write (sealed
+    /// requests and texts); anything else still reaches the run through the
+    /// generic decoder. Mutated red by dropping the fallback.
+    #[test]
+    fn real_mailboxes_decode_fast_and_others_still_decode() {
+        let request = Buyer::new(40).request(&jam(), 1, 1, 12_000);
+        let mailbox = MailboxStateV1 {
+            messages: vec![junk(1, 30), request, junk(2, 3000)],
+        };
+        let canonical = to_cbor(&mailbox).unwrap();
+        assert_eq!(
+            crate::fast_cbor::decode_mailbox(&canonical),
+            Some(mailbox.clone())
+        );
+        // The same state with its message list as an indefinite-length array.
+        let mut indefinite = canonical.clone();
+        let at = indefinite.iter().position(|b| *b == 0x83).unwrap();
+        indefinite[at] = 0x9f;
+        indefinite.push(0xff);
+        assert_eq!(crate::fast_cbor::decode_mailbox(&indefinite), None);
+        assert_eq!(from_cbor::<MailboxStateV1>(&indefinite).unwrap(), mailbox);
+        let mut f = fixture();
+        let out = on_mailbox(&mut f.secrets, &f.record.clone(), &indefinite, NOW);
+        assert_eq!(batched(&out).len(), 1);
     }
 }

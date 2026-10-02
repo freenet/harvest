@@ -207,7 +207,8 @@ pub extern "C" fn process(parameters: i64, origin: i64, inbound: i64) -> i64 {
 
 /// `freenet_stdlib::prelude::DelegateInterfaceResult`'s layout (`#[repr(C)]`,
 /// fields private there): where the result's bytes start and how many.
-#[cfg(feature = "freenet-main-delegate")]
+/// Pinned against the stdlib's own by `raw_result_is_the_stdlibs_layout`.
+#[cfg_attr(not(feature = "freenet-main-delegate"), allow(dead_code))]
 #[repr(C)]
 struct RawResult {
     ptr: i64,
@@ -381,5 +382,33 @@ mod tests {
                 freenet_stdlib::prelude::bincode::serialize(&case).unwrap()
             );
         }
+    }
+
+    /// The result struct handed to the node is laid out as the stdlib's own,
+    /// and the stdlib's points at exactly the bytes `encode_result` writes.
+    /// Mutated red by reordering or resizing `RawResult`'s fields.
+    #[test]
+    fn raw_result_is_the_stdlibs_layout() {
+        use freenet_stdlib::prelude::{
+            ApplicationMessage, DelegateInterfaceResult, OutboundDelegateMsg,
+        };
+        assert_eq!(
+            std::mem::size_of::<RawResult>(),
+            std::mem::size_of::<DelegateInterfaceResult>()
+        );
+        assert_eq!(
+            std::mem::align_of::<RawResult>(),
+            std::mem::align_of::<DelegateInterfaceResult>()
+        );
+        let result = Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(vec![7; 100]).processed(true),
+        )]);
+        let want = encode_result(&result);
+        let theirs = DelegateInterfaceResult::from(result);
+        // SAFETY: same size and alignment, asserted above; both are plain
+        // `#[repr(C)]` integer pairs.
+        let raw: RawResult = unsafe { std::mem::transmute(theirs) };
+        let bytes = unsafe { std::slice::from_raw_parts(raw.ptr as *const u8, raw.size as usize) };
+        assert_eq!(bytes, want.as_slice());
     }
 }

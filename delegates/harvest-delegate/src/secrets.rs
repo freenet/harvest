@@ -101,6 +101,9 @@ pub(crate) struct MemSecrets {
     /// the case where "forget this conversation" must report a failure rather
     /// than a success the buyer would rely on.
     pub(crate) removals_fail: bool,
+    /// Set to make writes of keys under this prefix fail, and only those:
+    /// a host that refuses one write of several.
+    pub(crate) refused_prefix: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -122,7 +125,12 @@ impl SecretStore for MemSecrets {
     }
 
     fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
-        if self.writes_fail {
+        if self.writes_fail
+            || self
+                .refused_prefix
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+        {
             return false;
         }
         self.map.insert(key.to_vec(), value.to_vec());
@@ -150,6 +158,14 @@ impl MemSecrets {
     pub(crate) fn refusing_writes() -> Self {
         Self {
             writes_fail: true,
+            ..Self::default()
+        }
+    }
+
+    /// A store whose host refuses writes of keys under `prefix` only.
+    pub(crate) fn refusing_writes_under(prefix: Vec<u8>) -> Self {
+        Self {
+            refused_prefix: Some(prefix),
             ..Self::default()
         }
     }
