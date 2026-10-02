@@ -30,6 +30,12 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 futures = "0.3"
+# `read-flags`: the node's secrets-store encryption (freenet-core
+# `wasm_runtime/secrets_store/store.rs`), to read the successor's
+# unexported `harvest:auto:retry:*` flags off the rehearsal node's disk.
+hkdf = "0.13"
+sha2 = "0.11"
+chacha20poly1305 = "0.10"
 
 [build-dependencies]
 # The same codegen ui/build.rs runs, over the same legacy/*.toml, so the probe

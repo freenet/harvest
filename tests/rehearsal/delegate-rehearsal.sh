@@ -42,7 +42,9 @@
 #             delegate allows (`delegate seed-ledgers`, harvest#206): the
 #             largest export and import there is. The successor must then
 #             export each one unchanged (merged into nothing), and the
-#             predecessor's own export is timed after the walk.
+#             predecessor's own export is timed after the walk, and the
+#             successor's retry flag beside each ledger is read off the
+#             stopped node's disk (unexported, and no request reads it).
 #
 # In both the walk must report the seeded generation `imported`, must reach a
 # verdict on every generation (no "stopped", "current delegate unavailable",
@@ -169,6 +171,18 @@ scenario() {
   peers=$(cat "$d"/node/log/*.log 2>/dev/null | grep -c "Adding connection to peer" || true)
   [ "$peers" = 0 ] || { echo "   FAIL: the node connected to $peers peer(s); it was not isolated"; ok=0; }
   stop_node
+  if [ "$name" = newest ]; then
+    # The retry flag beside each ledger is unexported and no request reads it,
+    # so it is read off the stopped node's disk with the node's own KEK.
+    local successor
+    successor=$(grep -oE "^registered delegate [1-9A-HJ-NP-Za-km-z]+" "$d/check.txt" | head -1 | cut -d' ' -f3)
+    if "$HARNESS" read-flags "$d/node/data/secrets" "$successor" "$d/seeded.json" > "$d/flags.txt" 2>&1; then
+      echo "   $(tail -1 "$d/flags.txt")"
+    else
+      grep -E "^FAIL|panicked" "$d/flags.txt" | sed 's/^/   /'
+      echo "   FAIL: the successor's retry flags are not as seeded (see $d/flags.txt)"; ok=0
+    fi
+  fi
   if [ "$ok" = 1 ]; then echo "   PASS"; else FAILED=1; fi
 }
 

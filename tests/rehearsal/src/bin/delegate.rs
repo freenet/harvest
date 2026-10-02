@@ -49,6 +49,12 @@
 //!   delegate time-export <ws-url-with-authToken> <delegate.wasm> <generation-number>
 //!     (the wall time of that generation's `ExportSecrets` as a client sees
 //!      it, and what it exported; run after the walk, since an export disarms)
+//!   delegate read-flags <secrets-dir> <delegate-key-bs58> <seeded.json>
+//!     (no node API: decrypt the successor's `harvest:auto:retry:*` flag for
+//!      each seeded ledger off the stopped node's disk, with the node's own
+//!      KEK; the flag is unexported and no request reads it. The ledger itself
+//!      is decrypted the same way and compared, so a wrong derivation fails
+//!      rather than reading as an absent flag)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
@@ -1028,6 +1034,61 @@ async fn time_export(url: &str, wasm: &[u8], generation: u32) {
     );
 }
 
+/// Decrypt one secret of `delegate` the way the node's secrets store does
+/// (freenet-core 0.2.140 `secrets_store/store.rs`): the DEK is
+/// HKDF-SHA256(salt = the delegate key's bs58, ikm = the node KEK, info =
+/// `freenet-delegate-dek-v1`), the file is named by the bs58 of BLAKE3(key)
+/// and holds `[0x01][24-byte nonce][XChaCha20-Poly1305 ciphertext]`. `None`
+/// when no file is there.
+fn read_node_secret(secrets_dir: &std::path::Path, delegate: &str, key: &[u8]) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let kek = std::fs::read(secrets_dir.join("node_kek")).expect("the node KEK (FILE backend)");
+    assert_eq!(kek.len(), 32, "a 32-byte KEK");
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(delegate.as_bytes()), &kek);
+    let mut dek = [0u8; 32];
+    hk.expand(b"freenet-delegate-dek-v1", &mut dek).unwrap();
+    let name = bs58::encode(blake3::hash(key).as_bytes()).into_string();
+    let blob = std::fs::read(secrets_dir.join(delegate).join(name)).ok()?;
+    assert_eq!(blob.first(), Some(&0x01), "a version-1 secret file");
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new_from_slice(&dek).unwrap();
+    Some(
+        cipher
+            .decrypt(chacha20poly1305::XNonce::from_slice(&blob[1..25]), &blob[25..])
+            .expect("the secret decrypts under the derived DEK"),
+    )
+}
+
+/// The successor's retry flag beside each seeded ledger: `1` for the one
+/// seeded with `retry_pending`, `0` for the rest (harvest#206).
+fn read_flags(secrets_dir: &str, delegate: &str, seeded: &str) {
+    let seeded: Seeded = serde_json::from_slice(&std::fs::read(seeded).unwrap()).unwrap();
+    let dir = std::path::Path::new(secrets_dir);
+    let mut failed = 0;
+    for ledger in &seeded.ledgers {
+        let flag_key = ledger.key.replacen("harvest:auto:ledger:", "harvest:auto:retry:", 1);
+        // The derivation is checked on the ledger first: it must decrypt to
+        // the CBOR value seeded, or nothing read below means anything.
+        let held = read_node_secret(dir, delegate, ledger.key.as_bytes());
+        let ledger_ok = held.as_deref().map(cbor_value) == Some(cbor_value(&hex::decode(&ledger.value_hex).unwrap()));
+        let flag = read_node_secret(dir, delegate, flag_key.as_bytes());
+        let want: &[u8] = if ledger.retry_pending { b"1" } else { b"0" };
+        let ok = ledger_ok && flag.as_deref() == Some(want);
+        println!(
+            "{} {flag_key}: {} (want {}), ledger on disk {}",
+            if ok { "OK  " } else { "FAIL" },
+            flag.as_deref().map_or("absent".to_string(), |f| String::from_utf8_lossy(f).into_owned()),
+            String::from_utf8_lossy(want),
+            if ledger_ok { "matches" } else { "DOES NOT MATCH" },
+        );
+        failed += usize::from(!ok);
+    }
+    if failed > 0 {
+        println!("RETRY FLAGS: {failed} wrong");
+        std::process::exit(1);
+    }
+    println!("RETRY FLAGS: all {} as seeded", seeded.ledgers.len());
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1046,6 +1107,7 @@ async fn main() {
         Some("time-export") => {
             time_export(&args[2], &std::fs::read(&args[3]).unwrap(), args[4].parse().expect("a generation number")).await
         }
+        Some("read-flags") => read_flags(&args[2], &args[3], &args[4]),
         Some("seed-convo") => seed_convo(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         _ => {
             eprintln!("usage: delegate seed|touch|check ... (see the module docs)");
