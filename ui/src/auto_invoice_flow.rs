@@ -130,6 +130,9 @@ pub struct AutoInvoiceUi {
     /// The address requests that are such raises, not invoices: their
     /// answers are dropped quietly.
     pub raise_requests: std::collections::HashSet<u64>,
+    /// Until when no raise is started, after one whose catch-up could not
+    /// finish (#206), so it is not started again at once.
+    pub raise_held_until_ms: Option<u64>,
     /// The used addresses this session has asked the delegate to move past,
     /// recorded when each raise is sent (so a sale the delegate made
     /// and a buyer paid, which also shows up as a payment, is not counted).
@@ -544,7 +547,14 @@ impl AppState {
         let recent = self.auto_invoice.raise_sent.is_some_and(|(counter, at)| {
             counter == xpub.next_index && now_ms.saturating_sub(at) < RAISE_RETRY_MS
         });
-        used_ahead && !recent
+        // Not while the delegate does not hold this tab's scripts, used
+        // addresses included (they are sent as additions, #206), nor while a
+        // raise that could not finish is held off.
+        let held = self
+            .auto_invoice
+            .raise_held_until_ms
+            .is_some_and(|until| now_ms < until);
+        used_ahead && !recent && !held && self.scripts_synced()
     }
 
     /// The scripts of addresses found used by [`AddressVet`]: published as

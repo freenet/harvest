@@ -131,6 +131,10 @@ fn handle_contract_response(response: ContractResponse) {
             {
                 let mut app = APP_STATE.write();
                 app.on_contract_state(contract_id, state_bytes);
+                // A store of ours may have new orders: their payment scripts
+                // go to the delegate (#206).
+                #[cfg(target_arch = "wasm32")]
+                app.send_due_script_additions();
             }
 
             // Subscribe to the reputation contract if we found one

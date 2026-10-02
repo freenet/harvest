@@ -159,46 +159,33 @@ pub async fn configure_bridge(_endpoint: BridgeEndpoint) -> Result<(), String> {
 /// Record the seller's account xpub, so invoices can each be given a fresh
 /// payment address.
 ///
-/// The request is `AppState::set_payment_xpub_request`, which carries the
-/// store's published payment scripts so the count the delegate reports back
-/// already accounts for them. Built there so tests execute it.
+/// Built by `AppState::begin_payment_key`: every published script goes to
+/// the delegate as additions first, and the key after them, once they are
+/// held (`AppState::requests_after_sync`). Built there so tests execute it.
 #[cfg(target_arch = "wasm32")]
-pub async fn set_payment_xpub(
-    xpub: String,
-    network: freenet_bitcoin_common::BitcoinNetwork,
-) -> Result<(), String> {
-    send_request_from_state(|state, request_id| {
-        state.set_payment_xpub_request(request_id, xpub, network)
-    })
-    .await
+pub fn set_payment_xpub(xpub: String, network: freenet_bitcoin_common::BitcoinNetwork) {
+    let requests = {
+        let mut state = APP_STATE.write();
+        let mut requests = state.begin_payment_key(xpub, network);
+        requests.extend(state.requests_after_sync());
+        requests
+    };
+    crate::state::spawn_bitcoin_requests(requests);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn set_payment_xpub(
-    _xpub: String,
-    _network: freenet_bitcoin_common::BitcoinNetwork,
-) -> Result<(), String> {
-    Err("bitcoin operations require WASM".into())
-}
+pub fn set_payment_xpub(_xpub: String, _network: freenet_bitcoin_common::BitcoinNetwork) {}
 
-/// Send the payment key again, under an id the CALLER allocated, while the
-/// delegate catches its counter up with the published orders (harvest#206).
-/// The request is `AppState::payment_key_resend_request`: the same key and
-/// network, and every published script.
+/// Send a request `AppState` built and registered (#206: script additions,
+/// a payment key, address requests that waited for the scripts).
 #[cfg(target_arch = "wasm32")]
-pub async fn resend_payment_xpub(request_id: u64) -> Result<(), String> {
-    let (delegate_key, request) = {
-        let mut state = APP_STATE.write();
-        let key = state
-            .harvest_delegate_key
-            .clone()
-            .ok_or("harvest delegate not yet registered")?;
-        let request = state
-            .payment_key_resend_request(request_id)
-            .ok_or("no payment key held for that request")?;
-        (key, request)
-    };
-    let payload = to_cbor(&request).map_err(|e| format!("serialize SetPaymentXpub: {e}"))?;
+pub async fn send_built(request: &BitcoinDelegateRequest) -> Result<(), String> {
+    let delegate_key = APP_STATE
+        .read()
+        .harvest_delegate_key
+        .clone()
+        .ok_or("harvest delegate not yet registered")?;
+    let payload = to_cbor(request).map_err(|e| format!("serialize bitcoin request: {e}"))?;
     super::send_delegate_message(&delegate_key, payload).await
 }
 

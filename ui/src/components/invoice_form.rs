@@ -555,35 +555,44 @@ pub fn PayoutWallet() -> Element {
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
-            state.catch_up_line(),
+            [
+                crate::state::CatchUpKind::Key,
+                crate::state::CatchUpKind::Address,
+            ]
+            .into_iter()
+            .filter_map(|kind| state.catch_up_line(kind).map(|line| (kind, line)))
+            .collect::<Vec<_>>(),
         )
     };
     rsx! {
-        PaymentKeyPanel { xpub, xpub_loaded, catching_up }
+        // Above the panel, not instead of it (U1): the key on file and the
+        // way to change it stay where they are.
+        for (kind, line) in catching_up {
+            p { class: "text-muted text-italic", "{line}" }
+            p { class: "text-muted", {catch_up_note(kind)} }
+        }
+        PaymentKeyPanel { xpub, xpub_loaded }
     }
 }
 
-/// Show the configured payment key, or take one. While the delegate is
-/// catching its address count up with the seller's earlier orders
-/// (harvest#206), says so: a key entered then is not in use until it has.
-#[component]
-fn PaymentKeyPanel(
-    xpub: Option<harvest_common::PaymentXpubStatus>,
-    xpub_loaded: bool,
-    catching_up: Option<String>,
-) -> Element {
-    let mut editing = use_signal(|| false);
-
-    if let Some(line) = catching_up {
-        return rsx! {
-            p { class: "text-muted text-italic", "{line}" }
-            p { class: "text-muted",
-                "Harvest is checking which addresses from your key your stores' orders \
-                 already use, a few hundred at a time, and carries on by itself. There is \
-                 nothing you need to do. A new key is used once this has finished."
-            }
-        };
+/// What a catch-up means for the seller, by what it is for (harvest#206).
+fn catch_up_note(kind: crate::state::CatchUpKind) -> &'static str {
+    match kind {
+        crate::state::CatchUpKind::Key => {
+            "Harvest carries on by itself, a few hundred addresses at a time. The key on \
+             file, if any, stays in use until the new one is saved."
+        }
+        crate::state::CatchUpKind::Address => {
+            "Harvest carries on by itself, a few hundred addresses at a time; invoices wait \
+             until it has finished."
+        }
     }
+}
+
+/// Show the configured payment key, or take one.
+#[component]
+fn PaymentKeyPanel(xpub: Option<harvest_common::PaymentXpubStatus>, xpub_loaded: bool) -> Element {
+    let mut editing = use_signal(|| false);
 
     // Not "no key configured" -- we have not asked yet. Prompting here would
     // tell a seller who already has one that they do not.
@@ -708,18 +717,9 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
 }
 
 fn save_payment_key(xpub: String, network: BitcoinNetwork) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network).await {
-            dioxus::logger::tracing::error!("Failed to send the payment key: {e}");
-            APP_STATE
-                .write()
-                .notifications
-                .push(format!("Could not save your payment key: {e}"));
-        }
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (xpub, network, bitcoin_ops::set_payment_xpub);
+    // Every send it makes reports its own failure, and withdraws what it
+    // registered (`state::spawn_bitcoin_requests`).
+    bitcoin_ops::set_payment_xpub(xpub, network);
 }
 
 /// The confirmations a seller typed, or why an order may not require that
