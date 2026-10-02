@@ -185,6 +185,9 @@ struct Runner {
     origin: MessageOrigin,
     calibrate_reps: usize,
     measured: Vec<Measured>,
+    /// Whether this is the committed delegate (no `--wasm`): it must take
+    /// every request the harness sends, so no step may be skipped for it.
+    committed: bool,
 }
 
 impl Runner {
@@ -1283,7 +1286,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
     set_retry(r, &all_arms, false)?;
-    wakeup_catch_up(r, &wakeup)?;
+    wakeup_catch_up(r, &wakeup, &all_arms)?;
     // A node start forgets every delegation's subscriptions, rewriting each.
     r.background(
         &format!("Background: NodeStarted ({delegations})"),
@@ -1813,7 +1816,7 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             anyhow!("the instant request asked nothing of the store: it was not batched")
         })?;
 
-    let name = format!("GetContractResponse: store, {n} paid orders (instant decide)");
+    let name = format!("{DECIDE_ROW} {n} paid orders (instant decide)");
     let counter = |r: &Runner| -> Result<u64> {
         let v = secret_value(r, XPUB_KEY)?;
         match field(&v, &["next_index"])? {
@@ -1822,6 +1825,7 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         }
     };
     let mut count = counter(r)?;
+    let mut cursor = active_cursor(r)?.unwrap_or(count);
     let want = chain.script_at(next).map_err(|e| anyhow!("{e}"))?;
     for _ in 0..=n {
         let out = r.get_answer(&name, at.contract, store_bytes.clone(), context.clone())?;
@@ -1859,7 +1863,19 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
                      the decide was not measured"
                 );
             }
+            // And every refused run moved the scan on (the counter, or the
+            // cursor past it), so a delegate stuck catching up fails here
+            // rather than running out the loop.
+            let now_cursor = active_cursor(r)?.unwrap_or(now_at);
+            if now_at < count || (now_at, now_cursor) <= (count, cursor) || now_at > u64::from(next)
+            {
+                bail!(
+                    "{name}: a refused run took the scan from {count}/{cursor} to \
+                     {now_at}/{now_cursor}: it made no progress"
+                );
+            }
             count = now_at;
+            cursor = now_cursor;
             continue;
         }
         let scripts = published
@@ -2003,7 +2019,10 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
     let snapshot = r.host.state.secrets.clone();
     let chain = fixture_chain()?;
     let start = counter_now(r, &chain)?;
-    let additions = takes_additions(r)?;
+    let additions = takes_additions(
+        r,
+        "the published-script steps send the scripts with each request instead",
+    )?;
     r.host.state.secrets = snapshot.clone();
     let per_store = harvest_common::store::MAX_ORDERS;
     let gap = harvest_common::bitcoin_delegate::PUBLISHED_INDEX_GAP;
@@ -2068,6 +2087,7 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
             "PaymentXpubSet",
             n,
             cap,
+            &mut (u64::from(start), u64::from(start)),
         )?;
         if let Some(answer) = answer {
             let count = field(&answer, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
@@ -2096,6 +2116,7 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
             "OrderAddress",
             n,
             cap,
+            &mut (u64::from(start), u64::from(start)),
         )?;
         // One past the last published script: neither an address a
         // published order already uses nor one beyond it.
@@ -2117,7 +2138,14 @@ fn published_scripts(r: &mut Runner, caps: &Caps) -> Result<()> {
 
 /// Whether the delegate takes `AddPublishedScripts` (#216 on); asked with
 /// none, so nothing is held. The caller puts the secrets back.
-fn takes_additions(r: &mut Runner) -> Result<bool> {
+///
+/// Only one answer means "no": the delegate's own refusal of a request it
+/// cannot decode (V29's `payload is neither a HarvestDelegateRequest nor a
+/// BitcoinDelegateRequest`). Anything else that is not a clean
+/// `PublishedScriptsAdded` fails the run, and so does "no" from the
+/// committed delegate, so a step is never skipped for a delegate that
+/// should have run it. A skip is printed.
+fn takes_additions(r: &mut Runner, step: &str) -> Result<bool> {
     let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(cbor(
         &BitcoinDelegateRequest::AddPublishedScripts {
             request_id: 413,
@@ -2125,14 +2153,27 @@ fn takes_additions(r: &mut Runner) -> Result<bool> {
         },
     )));
     let origin = r.origin.clone();
-    let Ok(outbound) = r.host.call(Some(&origin), &msg)?.result else {
-        return Ok(false);
-    };
-    let Some(answer) = first_app_payload(&outbound) else {
-        return Ok(false);
-    };
-    let value: Value = ciborium::from_reader(answer.as_slice()).context("not CBOR")?;
-    Ok(check_answer("AddPublishedScripts", &value, "PublishedScriptsAdded").is_ok())
+    match r.host.call(Some(&origin), &msg)?.result {
+        Err(e) if e.contains("neither a HarvestDelegateRequest nor a BitcoinDelegateRequest") => {
+            if r.committed {
+                bail!(
+                    "the committed delegate does not take AddPublishedScripts ({e}): {step} \
+                     cannot be skipped for it"
+                );
+            }
+            println!("  ({step}: this delegate does not take AddPublishedScripts)");
+            Ok(false)
+        }
+        Err(e) => bail!("AddPublishedScripts: the delegate returned an error: {e}"),
+        Ok(outbound) => {
+            let answer = first_app_payload(&outbound)
+                .ok_or_else(|| anyhow!("AddPublishedScripts: no application message"))?;
+            let value: Value = ciborium::from_reader(answer.as_slice())
+                .context("AddPublishedScripts: not CBOR")?;
+            check_answer("AddPublishedScripts", &value, "PublishedScriptsAdded")?;
+            Ok(true)
+        }
+    }
 }
 
 /// Send `scripts` as `AddPublishedScripts` requests of at most
@@ -2172,11 +2213,11 @@ fn active_counter(r: &Runner) -> Result<u64> {
 /// none of them scanned. The counter must move on. Skipped for a delegate
 /// without `AddPublishedScripts`, which holds no scripts. The secrets are put
 /// back after.
-fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
+fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8], stores: &[[u8; 32]]) -> Result<()> {
     let snapshot = r.host.state.secrets.clone();
     let chain = fixture_chain()?;
     let start = counter_now(r, &chain)?;
-    if !takes_additions(r)? {
+    if !takes_additions(r, "SKIPPED the wake-up catch-up")? {
         r.host.state.secrets = snapshot;
         return Ok(());
     }
@@ -2199,7 +2240,18 @@ fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
     let mut done = None;
     for n in 1..=wakeups {
         r.host.state.now += chrono::Duration::minutes(5);
-        r.background(catching, wakeup)?;
+        if n == 1 {
+            // The first with every store's mailbox waiting too: its reads
+            // and the catch-up in one wake-up.
+            set_retry(r, stores, true)?;
+            r.background(
+                "Background: heartbeat wake-up (payment counter catching up, every mailbox waiting)",
+                wakeup,
+            )?;
+            set_retry(r, stores, false)?;
+        } else {
+            r.background(catching, wakeup)?;
+        }
         let counter = active_counter(r)?;
         let at = active_cursor(r)?.unwrap_or(counter);
         if (counter, at) <= last || counter > end {
@@ -2226,7 +2278,8 @@ fn wakeup_catch_up(r: &mut Runner, wakeup: &[u8]) -> Result<()> {
         "Background: heartbeat wake-up (payment counter caught up)",
         wakeup,
     )?;
-    let after = (active_counter(r)?, active_cursor(r)?.unwrap_or(0));
+    let counter = active_counter(r)?;
+    let after = (counter, active_cursor(r)?.unwrap_or(counter));
     if after != last {
         bail!("a wake-up after the catch-up was complete moved it from {last:?} to {after:?}");
     }
@@ -2290,7 +2343,7 @@ fn held_key(r: &Runner, key: &[u8]) -> Result<Option<String>> {
 /// put back after.
 fn pending_key(r: &mut Runner) -> Result<()> {
     let snapshot = r.host.state.secrets.clone();
-    if !takes_additions(r)? {
+    if !takes_additions(r, "SKIPPED the new-device (pending key) steps")? {
         r.host.state.secrets = snapshot;
         return Ok(());
     }
@@ -2316,6 +2369,8 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         })
     };
     let name = format!("SetPaymentXpub ({label})");
+    // A new key's scan starts at 0.
+    let mut stood = (0, 0);
     // One call: still catching up, the new key held pending and the old one
     // still active.
     if catch_up(
@@ -2326,6 +2381,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         "PaymentXpubSet",
         per_store,
         Some(1),
+        &mut stood,
     )?
     .is_some()
     {
@@ -2345,6 +2401,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         "PaymentXpubSet",
         per_store,
         None,
+        &mut stood,
     )?
     .ok_or_else(|| anyhow!("{name}: never finished"))?;
     let count = field(&done, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
@@ -2371,6 +2428,10 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         "PaymentXpubSet",
     )?;
     let out = r.send("SetPaymentXpub (a stale resume)", set(&new, true))?;
+    let wrote = r.measured.last().map_or(u64::MAX, |m| m.host_writes);
+    if wrote != 0 {
+        bail!("a stale resume wrote {wrote} secrets: it must write nothing");
+    }
     let answer: Value = ciborium::from_reader(
         first_app_payload(&out)
             .ok_or_else(|| anyhow!("a stale resume answered nothing"))?
@@ -2408,10 +2469,13 @@ const SPACED_CALLS: usize = 32;
 /// `FLOOR_SCAN_BUDGET` indices a call, keeps how far it got, and answers an
 /// `Err` starting `CATCHING_UP_PREFIX` and the count; the web app asks again.
 /// The refusal names the counter and the scan's cursor: the cursor must move
-/// on every call (the counter only when the scan matched), and with no
+/// on every call, past `last` on the first (the caller seeds it with where
+/// the scan stood, so a single call is checked too), the counter only when
+/// the scan matched; with no
 /// `max_calls` the requests are bounded by `bound` + 2, far more than a scan
 /// budget of a single index needs, so a delegate that never finishes fails
 /// the run. A delegate without the bound answers at once.
+#[allow(clippy::too_many_arguments)]
 fn catch_up(
     r: &mut Runner,
     name: &str,
@@ -2420,10 +2484,10 @@ fn catch_up(
     expect: &str,
     bound: usize,
     max_calls: Option<usize>,
+    last: &mut (u64, u64),
 ) -> Result<Option<Value>> {
     let limit = max_calls.unwrap_or(bound.saturating_add(2)).max(1);
     let prefix = harvest_common::bitcoin_delegate::CATCHING_UP_PREFIX;
-    let mut last: Option<(u64, u64)> = None;
     for call in 0..limit {
         let payload = if call == 0 { first } else { again };
         let outbound = r.send(name, payload.to_vec())?;
@@ -2450,16 +2514,17 @@ fn catch_up(
         let [counter, cursor] = figures[..] else {
             bail!("{name}: a catch-up refusal is not counter/cursor: {refusal}");
         };
-        // The cursor moves on every call; the counter only on a match.
-        if let Some((last_counter, last_cursor)) = last {
-            if cursor <= last_cursor || counter < last_counter {
-                bail!(
-                    "{name}: the catch-up went from {last_counter}/{last_cursor} to \
-                     {counter}/{cursor}: it makes no progress"
-                );
-            }
+        // The cursor moves on every call, the first included (past the
+        // caller's baseline: where the scan stood before); the counter only
+        // on a match.
+        let (last_counter, last_cursor) = *last;
+        if cursor <= last_cursor || counter < last_counter {
+            bail!(
+                "{name}: the catch-up went from {last_counter}/{last_cursor} to \
+                 {counter}/{cursor}: it makes no progress"
+            );
         }
-        last = Some((counter, cursor));
+        *last = (counter, cursor);
     }
     if max_calls.is_some() {
         return Ok(None);
@@ -2791,10 +2856,14 @@ fn default_wasm() -> PathBuf {
 fn run() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     let mut wasm_path = default_wasm();
+    let mut committed = true;
     let mut calibrate_reps = 0usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--wasm" => wasm_path = args.next().ok_or_else(|| anyhow!("--wasm PATH"))?.into(),
+            "--wasm" => {
+                wasm_path = args.next().ok_or_else(|| anyhow!("--wasm PATH"))?.into();
+                committed = false;
+            }
             "--calibrate" => calibrate_reps = 3,
             n if calibrate_reps > 0 && n.parse::<usize>().is_ok() => {
                 calibrate_reps = n.parse().unwrap()
@@ -2828,9 +2897,25 @@ fn run() -> Result<bool> {
         origin,
         calibrate_reps,
         measured: Vec::new(),
+        committed,
     };
     let scenario_result = scenario(&mut runner);
 
+    // A renamed decide row would escape its tighter ceiling unnoticed.
+    let scenario_result = scenario_result.and_then(|()| {
+        if runner
+            .measured
+            .iter()
+            .any(|m| m.name.starts_with(DECIDE_ROW))
+        {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "no row is named `{DECIDE_ROW}...`: instant decide was not measured under its \
+                 ceiling"
+            ))
+        }
+    });
     let ok = report(&runner.measured, &hash, scenario_result.as_ref().err())?;
     // A call past the fuel ceiling also stops the scenario; that is an
     // over-budget result (exit 1), not a harness failure (exit 2).
@@ -2925,8 +3010,9 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     writeln!(
         md,
         "Delegate `{}`, budget **{}** fuel per call (about {BUDGET_SECONDS} s of work; the \
-         node stops a call at 5 s). Fuel is deterministic: these numbers are the same on every \
-         run and every machine.",
+         node stops a call at 5 s). A row is judged against its ceiling, a share of that \
+         budget: 100% unless the README says otherwise. Fuel is deterministic: these numbers \
+         are the same on every run and every machine.",
         &hash[..16.min(hash.len())],
         group(BUDGET_FUEL)
     )
@@ -2934,32 +3020,33 @@ fn report(measured: &[Measured], hash: &str, failure: Option<&anyhow::Error>) ->
     writeln!(md).ok();
     writeln!(
         md,
-        "| call | calls | fuel (max) | of budget | host calls | writes | |"
+        "| call | calls | fuel (max) | of budget | ceiling | host calls | writes | |"
     )
     .ok();
-    writeln!(md, "|---|---:|---:|---:|---:|---:|---|").ok();
+    writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---|").ok();
     println!();
     println!(
-        "{:<52} {:>5} {:>18} {:>9} {:>10} {:>6}",
-        "call", "calls", "fuel (max)", "budget", "host calls", "writes"
+        "{:<52} {:>5} {:>18} {:>9} {:>7} {:>10} {:>6}",
+        "call", "calls", "fuel (max)", "budget", "ceiling", "host calls", "writes"
     );
     for r in &rows {
         let pct = r.fuel.map_or("-".into(), |f| {
             format!("{:.1}%", f as f64 * 100.0 / BUDGET_FUEL as f64)
         });
         let fuel = r.fuel.map_or("past the ceiling".into(), group);
+        let ceil = format!("{}%", ceiling(&r.name) * 100 / BUDGET_FUEL);
         let flag = if over_budget(&r.name, r.fuel) || r.host_writes > BUDGET_WRITES {
             "OVER"
         } else {
             ""
         };
         println!(
-            "{:<52} {:>5} {fuel:>18} {pct:>9} {:>10} {:>6} {flag}",
+            "{:<52} {:>5} {fuel:>18} {pct:>9} {ceil:>7} {:>10} {:>6} {flag}",
             r.name, r.calls, r.host_calls, r.host_writes
         );
         writeln!(
             md,
-            "| {} | {} | {fuel} | {pct} | {} | {} | {} |",
+            "| {} | {} | {fuel} | {pct} | {ceil} | {} | {} | {} |",
             r.name,
             r.calls,
             r.host_calls,

@@ -131,12 +131,33 @@ pub struct Host {
     next_id: i64,
 }
 
+/// The node's linear-memory reservation: `DEFAULT_MAX_MEMORY_PAGES` (4096)
+/// pages of `WASM_PAGE_SIZE` (64 KiB), 256 MiB
+/// (`wasm_runtime/engine.rs`, `engine/wasmtime_engine.rs::create_engine`).
+const NODE_MEMORY_RESERVATION: u64 = MAX_MEMORY_BYTES as u64;
+/// The node's guard region after linear memory: one wasm page.
+const NODE_MEMORY_GUARD: u64 = 65536;
+/// The node's guest stack (`WASM_STACK_SIZE`).
+const NODE_WASM_STACK: usize = 8 * 1024 * 1024;
+
 fn node_config() -> Config {
     let mut config = Config::new();
     // freenet-core compiles guest code with Cranelift at OptLevel::None
     // (`engine/wasmtime_engine.rs::create_engine`). Fuel counts do not depend
     // on it, but the calibration's wall-clock times do, so match it.
     config.cranelift_opt_level(OptLevel::None);
+    // And its memory layout: a 256 MiB reservation with a 64 KiB guard and
+    // no room to grow in place, rather than wasmtime's 4 GiB + 32 MiB. With
+    // so small a guard Cranelift compiles explicit bounds checks on memory
+    // accesses, which the default layout elides: no change to fuel, but
+    // part of the node's wall-clock time.
+    config.memory_reservation(NODE_MEMORY_RESERVATION);
+    config.memory_guard_size(NODE_MEMORY_GUARD);
+    config.memory_reservation_for_growth(0);
+    // As the node sets them; wasmtime refuses a stack larger than its
+    // async stack, used or not.
+    config.max_wasm_stack(NODE_WASM_STACK);
+    config.async_stack_size(NODE_WASM_STACK * 2);
     config
 }
 
