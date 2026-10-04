@@ -1905,6 +1905,7 @@ h4 {
 }
 .photo-frame {
   width: 100%;
+  aspect-ratio: 1 / 1;
   border-radius: 6px;
   overflow: hidden;
   border: 1px solid var(--border, #d9cfbd);
@@ -1913,7 +1914,7 @@ h4 {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
 }
 .photo-cover {
   position: absolute;
@@ -1930,11 +1931,39 @@ h4 {
   flex-wrap: wrap;
   gap: 0.3rem;
 }
+.photo-actions .btn {
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
 .photo-alt {
   font-size: 0.85rem;
 }
+/* The file input itself is visually hidden (still focusable); its label,
+   `.photo-add`, is the visible control. */
 .photo-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.photo-add {
+  display: inline-block;
   margin-top: 0.4rem;
+  cursor: pointer;
+}
+.photo-input:focus-visible + .photo-add {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.photo-add-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 .form-fieldset {
   border: none;

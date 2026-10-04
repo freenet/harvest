@@ -219,11 +219,7 @@ pub(crate) fn PhotoEditor(
 
     rsx! {
         div { class: "form-group photo-editor",
-            if room > 0 && !disabled {
-                label { class: "form-label", r#for: "listing-photo-input", "Photos (optional)" }
-            } else {
-                p { class: "form-label", "Photos (optional)" }
-            }
+            p { class: "form-label", "Photos (optional)" }
             p { class: "text-muted small",
                 "Up to {MAX_IMAGES_UI}. The first is the cover. Photos are made smaller on this device and saved without location or camera details."
             }
@@ -239,8 +235,6 @@ pub(crate) fn PhotoEditor(
                             hash: draft.full.hash.0,
                             preview: draft.preview.clone(),
                             colour: draft.colour,
-                            width: draft.full.width,
-                            height: draft.full.height,
                             alt: draft.alt.clone(),
                             local: draft.full_bytes.is_some(),
                             // A published cover's thumbnail is fetched too: the
@@ -282,6 +276,15 @@ pub(crate) fn PhotoEditor(
                         let _ = (message, busy, next_key);
                     },
                 }
+                // The input is hidden and this label is what the seller sees
+                // and clicks: the browser's own file control does not match
+                // anything else in the app. The input stays focusable, so the
+                // keyboard reaches it and the label shows its focus.
+                label {
+                    class: if busy() > 0 { "btn btn-outline btn-sm photo-add photo-add-disabled" } else { "btn btn-outline btn-sm photo-add" },
+                    r#for: "listing-photo-input",
+                    if count == 0 { "Add photos" } else { "Add more photos" }
+                }
             } else if room == 0 {
                 p { class: "text-muted small", "That's the most photos a listing can have." }
             }
@@ -306,8 +309,6 @@ fn PhotoTile(
     hash: [u8; 32],
     preview: Option<String>,
     colour: [u8; 3],
-    width: u16,
-    height: u16,
     alt: String,
     /// The photo's bytes are on this device (added or added again here).
     local: bool,
@@ -317,7 +318,7 @@ fn PhotoTile(
     let n = index + 1;
     rsx! {
         li { class: "photo-tile",
-            PhotoPreview { hash, cover_thumb, preview, colour, width, height, alt: alt.clone(), local }
+            PhotoPreview { hash, cover_thumb, preview, colour, alt: alt.clone(), local }
             if index == 0 {
                 span { class: "photo-cover", "Cover" }
             }
@@ -325,7 +326,7 @@ fn PhotoTile(
                 class: "form-input photo-alt",
                 r#type: "text",
                 maxlength: "{MAX_ALT_CHARS}",
-                placeholder: "Describe this photo (optional)",
+                placeholder: "Describe this photo",
                 aria_label: "Describe photo {n}",
                 disabled,
                 value: "{alt}",
@@ -349,7 +350,7 @@ fn PhotoTile(
                             }
                         })
                     },
-                    "Move earlier"
+                    "Earlier"
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -362,7 +363,7 @@ fn PhotoTile(
                             }
                         })
                     },
-                    "Move later"
+                    "Later"
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -399,14 +400,11 @@ fn PhotoPreview(
     cover_thumb: Option<[u8; 32]>,
     preview: Option<String>,
     colour: [u8; 3],
-    width: u16,
-    height: u16,
     alt: String,
     /// Its bytes are on this device, so it is uploaded when the form saves.
     local: bool,
 ) -> Element {
     let [r, g, b] = colour;
-    let ratio = format!("{} / {}", width.max(1), height.max(1));
     #[cfg(target_arch = "wasm32")]
     let (src, missing) = {
         let has_preview = preview.is_some();
@@ -467,7 +465,9 @@ fn PhotoPreview(
     rsx! {
         div {
             class: "photo-frame",
-            style: "background-color: rgb({r}, {g}, {b}); aspect-ratio: {ratio};",
+            // Square, whatever the photo's shape, so tiles line up; the whole
+            // photo shows, on its mean colour.
+            style: "background-color: rgb({r}, {g}, {b});",
             if let Some(src) = src {
                 img { class: "photo-img", src: "{src}", alt: "{alt}" }
             } else if missing && !local {
@@ -513,14 +513,14 @@ fn add_picked_files(
         // the first is not overwritten by what happened to the second.
         let mut notes: Vec<String> = Vec::new();
         for file in files {
+            // Named, so a refusal in a batch says which file it was about.
+            let name = file.name();
             let result = crate::image_pipeline::encode_file(file).await;
             busy -= 1;
             let p = match result {
                 Ok(p) => p,
                 Err(e) => {
-                    if !notes.contains(&e) {
-                        notes.push(e);
-                    }
+                    notes.push(format!("{name}: {e}"));
                     continue;
                 }
             };
