@@ -1446,6 +1446,7 @@ mod availability_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([n; 32]),

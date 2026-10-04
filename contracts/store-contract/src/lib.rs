@@ -494,6 +494,7 @@ mod tests {
         let seller = seller_key();
         let make = |title: &str| {
             let listing = Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([0u8; 32]),
@@ -706,6 +707,7 @@ mod tests {
         };
         for title in titles {
             let listing = Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([0u8; 32]),

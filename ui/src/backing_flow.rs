@@ -1401,6 +1401,7 @@ pub(crate) mod tests {
             .my_stores
             .insert(FINGERPRINT.to_string(), vec![legacy_registration()]);
         let listing = harvest_common::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: harvest_common::listing::ListingId([0; 32]),
@@ -1569,6 +1570,7 @@ pub(crate) mod tests {
         const BACKER: u8 = 0x41;
         let listing = |title: &str| {
             harvest_common::listing::Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: harvest_common::listing::ListingId([0; 32]),

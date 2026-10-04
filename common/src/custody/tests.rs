@@ -138,6 +138,7 @@ fn the_current_scope_is_harvests_webapp_id() {
 
 fn listing() -> crate::Listing {
     crate::Listing {
+        images: Vec::new(),
         checkout: None,
         choices: Vec::new(),
         id: crate::ListingId([0; 32]),

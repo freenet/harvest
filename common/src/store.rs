@@ -410,6 +410,7 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
     ) -> Result<(), String> {
         for authorized in &self.listings {
             authorized.verify(owner_key(parent_state)?)?;
+            crate::listing_image::check_listing_images(&authorized.listing)?;
         }
         // Canonical form: strictly ascending by id, which also means no id
         // twice. `apply_delta` only ever produces this, but a state can reach
@@ -488,6 +489,7 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
                     continue; // already have this listing
                 }
                 listing.verify(owner_key(parent_state)?)?;
+                crate::listing_image::check_listing_images(&listing.listing)?;
                 to_add.push(listing.clone());
             }
             self.listings.extend(to_add);
@@ -3971,6 +3973,7 @@ mod order_tests {
     fn make_listing(signer: &SigningKey, title: &str) -> AuthorizedListing {
         let ts = timestamp(1_700_000_000);
         let listing = crate::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
@@ -4019,6 +4022,84 @@ mod order_tests {
             .apply_delta(&parent(), &p, &Some(vec![good.clone()]))
             .expect("the valid listing alone must apply");
         assert_eq!(state.listings.len(), 1);
+    }
+
+    /// The store refuses a listing whose photos break the caps
+    /// (`crate::listing_image`), on BOTH ways in: a delta adding it, and a
+    /// whole state holding it. Signed by the right key, so the photos are the
+    /// only thing wrong.
+    #[test]
+    fn a_listing_with_too_many_photos_is_refused_by_delta_and_by_state() {
+        use crate::listing_image::{ImageBlob, ListingImage, MAX_IMAGES_HARD};
+        use freenet_scaffold::ComposableState;
+
+        let seller = seller_key();
+        let p = params(&seller);
+        let with_photos = |n: usize| {
+            let mut a = make_listing(&seller, "Photographed");
+            a.listing.images = (0..n)
+                .map(|i| ListingImage {
+                    full: ImageBlob {
+                        hash: Bytes32([i as u8 + 1; 32]),
+                        len: 1000,
+                        width: 800,
+                        height: 600,
+                    },
+                    thumb: (i == 0).then_some(ImageBlob {
+                        hash: Bytes32([200; 32]),
+                        len: 100,
+                        width: 400,
+                        height: 300,
+                    }),
+                    colour: [0, 0, 0],
+                    alt: String::new(),
+                })
+                .collect();
+            a.listing = a.listing.clone().with_derived_id();
+            let (scoped_payload, signature) = sign_scoped(&seller, &a.listing);
+            a.scoped_payload = scoped_payload;
+            a.signature = signature;
+            a
+        };
+        let too_many = with_photos(MAX_IMAGES_HARD + 1);
+        let fine = with_photos(MAX_IMAGES_HARD);
+
+        let mut state = ListingsV1::default();
+        let err = state
+            .apply_delta(&parent(), &p, &Some(vec![too_many.clone()]))
+            .expect_err("a delta adding a listing with nine photos must be refused");
+        assert!(err.contains("photos"), "{err}");
+        assert!(state.listings.is_empty());
+        state
+            .apply_delta(&parent(), &p, &Some(vec![fine.clone()]))
+            .expect("eight photos apply");
+
+        let whole = ListingsV1 {
+            listings: vec![too_many],
+        };
+        let err = whole
+            .verify(&parent(), &p)
+            .expect_err("a state holding a listing with nine photos must not verify");
+        assert!(err.contains("photos"), "{err}");
+        let whole = ListingsV1 {
+            listings: vec![fine],
+        };
+        whole.verify(&parent(), &p).expect("eight photos verify");
+
+        // The photos are inside the signed terms: swapping one on a signed
+        // listing, even for another valid reference, breaks its signature.
+        let mut swapped = with_photos(2);
+        swapped.listing.images[1].full.hash = Bytes32([250; 32]);
+        swapped.listing = swapped.listing.clone().with_derived_id();
+        let err = ListingsV1 {
+            listings: vec![swapped],
+        }
+        .verify(&parent(), &p)
+        .expect_err("a listing whose photos were changed after signing must not verify");
+        assert!(
+            !err.contains("photos"),
+            "refused for its signature, not a cap: {err}"
+        );
     }
 
     /// A delta naming the same listing twice must not store it twice.
@@ -5668,6 +5749,7 @@ mod listing_status_tests {
             Some(crate::backing::StoreKeyMessage::ListingStatus)
         );
         let listing = crate::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0; 32]),

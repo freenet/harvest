@@ -49,6 +49,7 @@ fn signed_listing(title: &str) -> AuthorizedListing {
     // would make every fixture here unmergeable. Distinct titles still give
     // distinct listings, which is all these tests identify them by.
     let listing = Listing {
+        images: Vec::new(),
         checkout: None,
         choices: Vec::new(),
         id: ListingId([0u8; 32]),
@@ -339,6 +340,9 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the delegated watch key; moves only because
                 // `harvest-common` is compiled into it.
                 "31f745898fb8f8a7a76586422b671cc878ea55d1de6abc9d73843cf79e802f52",
+                // V25, from `git show d73fb6c:ui/public/contracts/store_contract.wasm`,
+                // unchanged through #216. Superseded by listing photos.
+                "baa0eb562d0fd5041eed38c481492e052428549c4fd649e302b29e94a92f341f",
             ],
         ),
         (
@@ -414,6 +418,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V19, from `git show e275bae:ui/public/contracts/reputation_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "7fee9e1480aa99aec42e0044b4c7b30050ad6bb36670d2cc1d011fcd2b445847",
+                // V20, from `git show d73fb6c:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "86d20b95428ae8d7b648598c7b8b3d75c0aeabdf72da0fca0e042ca30bfd9c94",
             ],
         ),
         (
@@ -477,6 +485,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V18, from `git show e275bae:ui/public/contracts/mailbox_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "537f95a7f8678ef0c4255e11d2cd427b2ce9c4c048f96d1d45b4ec7e46062d89",
+                // V19, from `git show d73fb6c:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "0d22546419ee511415a03d2ce5a36ba0a293a74f7209747aef0d934b643331d6",
             ],
         ),
         (
@@ -506,6 +518,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V6, from `git show e275bae:ui/public/contracts/index_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "80b868743aa48c6c0ec9791c7a75a125615ea9ae30aa2d2eb6993da7d621d114",
+                // V7, from `git show d73fb6c:ui/public/contracts/index_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a",
             ],
         ),
     ];
@@ -639,6 +655,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the generation harvest#203 shipped. Superseded by bounded
             // per-call work (harvest#206).
             "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03".to_string(),
+            // V30, from `git show d0fede7:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#216 shipped. Superseded by listing photos;
+            // no logic change (the delegate decodes the store state).
+            "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72".to_string(),
         ],
     );
 }
@@ -1172,6 +1192,8 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // V24: always-open stores (`e275bae`). Still the store key's code,
         // 29B.
         (24, Code),
+        // V25: the delegated watch key (`d73fb6c`). Still the store code, 29B.
+        (25, Code),
     ]
 };
 
@@ -1502,6 +1524,7 @@ fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     };
     foreign.listings.listings = vec![{
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
