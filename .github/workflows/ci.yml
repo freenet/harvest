@@ -42,6 +42,16 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace
 
+      # Broken intra-doc links point readers at items that do not exist under
+      # that name. --document-private-items so the private helpers' docs are
+      # checked too, and the whole workspace so no crate is left out. Host
+      # target only: the UI's wasm32-only items are not documented here, as
+      # with the host clippy step above.
+      - name: rustdoc (workspace, private items, warnings denied)
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # `harvest-common`'s `address-guard` feature is OFF by default, and
       # deliberately: that crate compiles into all three contracts and the
       # delegate, and adding this code ungated moved all four code hashes. The
@@ -92,7 +102,11 @@ jobs:
       # target of its own, so there is nothing to gain and a hard build error
       # to lose. The same limitation is why `rustfmt` cannot format
       # `tests/rehearsal/src/main.rs` at all.
+      # Warnings are denied so a new one cannot accumulate unnoticed (there
+      # were 27 before they were cleared).
       - name: check the migration rehearsal harness compiles
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo check --locked --manifest-path tests/rehearsal/Cargo.toml
 
   wasm:
@@ -249,3 +263,76 @@ jobs:
             echo "has to be acknowledged, which is the intended order."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
+
+  # WHAT THIS ANSWERS: does any single delegate call do more work than the
+  # node will let it? A node stops a delegate call after 5 s of wall clock,
+  # and the web app then gets an error it cannot attribute and waits forever
+  # (harvest#204). That is how `GetStoreSubkeys` -- an RSA-2048 key generation
+  # per call, 0.85-5+ s depending on the store key -- reached the live network
+  # (fixed in harvest#203): native `cargo test` runs about 7x faster than the
+  # delegate WASM and has no limit, so nothing above could see it.
+  #
+  # The harness runs the COMMITTED `ui/public/contracts/harvest_delegate.wasm`
+  # (the bytes that ship; `wasm-staleness` above ties them to the source)
+  # under wasmtime with fuel metering, drives every handler it knows through
+  # real inputs, and fails if one call burns more than its budget. Fuel counts
+  # instructions, so this is deterministic -- NOT a timing test. The budget,
+  # and how it was calibrated against wall-clock time, is in
+  # `tests/delegate-budget/README.md`.
+  #
+  # A separate cargo workspace, like `tests/rehearsal`, so it can never move a
+  # dependency a contract compiles against.
+  delegate-budget:
+    name: every delegate handler fits the node's per-call limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/delegate-budget -> target
+      # `cargo fmt --all` in the `check` job does not reach a separate
+      # workspace. Formatting needs no build, so it costs nothing here.
+      - name: rustfmt the harness
+        run: cargo fmt --manifest-path tests/delegate-budget/Cargo.toml -- --check
+      - name: clippy the harness
+        run: cargo clippy --release --locked --manifest-path tests/delegate-budget/Cargo.toml -- -D warnings
+      - name: bound each delegate call's work (fuel)
+        run: cargo run --release --locked --manifest-path tests/delegate-budget/Cargo.toml
+
+  # WHAT THIS ANSWERS: does any single contract call a node makes for one
+  # UPDATE do more work than the node will let it? The same 5 s wall-clock
+  # limit applies to every contract call, and an update to a contract at its
+  # caps costs every peer hosting it, for every update. A one-message delta
+  # onto a full mailbox measured 3.4-3.7 s on a node (harvest#226).
+  #
+  # The harness runs the COMMITTED `ui/public/contracts/*_contract.wasm`
+  # under wasmtime with fuel metering: each contract at its caps, a one-item
+  # delta and a full-state merge, through every call the node makes for the
+  # update (validate the incoming state, update_state, validate the merged
+  # state, summarize, the fan-out delta, the idempotency probe). Fuel is
+  # deterministic; the budget and its calibration are in
+  # `tests/contract-budget/README.md`.
+  #
+  # A separate cargo workspace, like `tests/delegate-budget`.
+  contract-budget:
+    name: every contract update call fits the node's per-call limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/contract-budget -> target
+      - name: rustfmt the harness
+        run: cargo fmt --manifest-path tests/contract-budget/Cargo.toml -- --check
+      - name: clippy the harness
+        run: cargo clippy --release --locked --all-targets --manifest-path tests/contract-budget/Cargo.toml -- -D warnings
+      # The gating logic's own tests: which over-budget calls fail the run
+      # and which only warn, and the exit codes.
+      - name: test the harness
+        run: cargo test --release --locked --manifest-path tests/contract-budget/Cargo.toml
+      - name: bound each contract call's work on an update (fuel)
+        run: cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml

@@ -129,7 +129,7 @@ pub enum MessageContent {
     ///
     /// # This is a pointer, not an authority
     ///
-    /// Both parties hold both direction keys (see [`Addressing`]), so nothing
+    /// Both parties hold both direction keys (see `Addressing`), so nothing
     /// about this message proves the seller wrote it. What makes a commitment
     /// the seller's is the ghostkey-scoped signature on the published
     /// [`crate::payment::AuthorizedOrder`], checked against the

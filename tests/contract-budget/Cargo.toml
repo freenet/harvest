@@ -1,0 +1,44 @@
+# Deliberately its own workspace, like `tests/rehearsal` and
+# `tests/delegate-budget`: this harness is NOT a member of the Harvest
+# workspace, so building or locking it can never move a dependency version that
+# the contracts compile against -- and therefore can never re-key an artifact.
+# See README.md.
+[workspace]
+
+[package]
+name = "harvest-contract-budget"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The state, delta and parameter types the contracts decode, so a reshaped
+# type is a compile error here rather than a harness that measures a decode
+# refusal. Fixtures are built with this crate's own merge code
+# (`apply_delta` and friends), so each held state is one the contract would
+# itself have produced.
+harvest-common = { path = "../../common" }
+ghostkey-common = "0.3"
+# The version the contracts are built on: parameters, the update list, the
+# related-contracts map and every result are encoded with THIS crate's
+# bincode layout. No `contract` feature -- that is the guest side.
+freenet-stdlib = { version = "0.8.5" }
+freenet-scaffold = "0.2.2"
+# Genuine SPV fixtures for paid orders, as tests/rehearsal builds them.
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main", features = ["test-support"] }
+# The runtime freenet-core runs contracts on (47.x). Fuel metering is what
+# makes the check deterministic; see README.md.
+wasmtime = { version = "47", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
+anyhow = "1"
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+blake3 = "1"
+# Seeded, so every fixture is the same bytes on every run.
+rand_chacha = "0.3"
+rand_core = "0.6"
+# The feedback-token RSA keys the reputation and store types carry.
+rsa = "0.9"
+sha2 = "0.10"
+bs58 = { version = "0.5", features = ["check"] }

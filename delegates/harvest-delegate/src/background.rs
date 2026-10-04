@@ -54,6 +54,10 @@ pub(crate) fn on_background<S: SecretStore>(
                 return Vec::new();
             }
             crate::auto_invoice::note_wakeup(secrets, now_ms);
+            // The payment counter's catch-up goes on with no tab open
+            // (#206), before the heartbeats say whether the store is taking
+            // orders.
+            crate::bitcoin::advance_on_wakeup(secrets);
             // The delegated watch's one read (the bridge inbox, or an
             // address contract) first in the list. Order in the list is not
             // order of execution: the node handles a run's GETs first, then
@@ -69,8 +73,10 @@ pub(crate) fn on_background<S: SecretStore>(
             // one.
             let mut out = crate::watch_delegation::on_wakeup(secrets, now_ms);
             out.extend(crate::auto_invoice::heartbeats(secrets, now_ms));
-            // The mailbox re-reads last (rare: only after a refused update).
-            out.extend(crate::auto_invoice::mailbox_retries(secrets));
+            // The mailbox re-reads last: after a refused update, or a run
+            // that left messages for later (`auto_invoice::OPEN_BUDGET`),
+            // one GET per store with requests waiting.
+            out.extend(crate::auto_invoice::mailbox_retries(secrets, now_ms));
             out
         }
         // A tag this generation did not declare (a successor's, say): nothing.

@@ -244,8 +244,14 @@ pub(crate) enum Family {
     /// The payment key and its derivation counter: the counter is raised to
     /// the higher of the two when both sides hold the same key.
     PaymentXpub,
-    /// A buyer's kept conversation: capped.
+    /// A buyer's kept conversation: capped; where this delegate holds the
+    /// same conversation, the two records' sent digests are merged and the
+    /// later seen time kept.
     BuyerConversation,
+    /// A seller's sent digests for one store
+    /// (`messaging::seller_sent_key`): merged, the predecessor's entries
+    /// taken as older, capped, and refused past the store cap.
+    SellerSent,
     /// A remembered store: capped.
     KnownStore,
     /// A buyer's kept purchase (harvest#53 Phase C): capped, and re-checked
@@ -257,6 +263,13 @@ pub(crate) enum Family {
     /// An instant-checkout ledger: merged by order id and request id, so the
     /// sales a predecessor issued still come off the stock when paid.
     AutoLedger,
+    /// The published scripts the delegate holds (`published_set`): merged,
+    /// so neither side's are lost and every scan starts again over both.
+    PublishedScripts,
+    /// The payment key held pending (`bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`):
+    /// into its own slot, never as the active key, and only where this
+    /// delegate holds none (an emptied slot counts as none).
+    PendingPaymentXpub,
     /// Everything else: written only if absent.
     Standalone,
 }
@@ -282,10 +295,28 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::Watches
     } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY {
         Family::PaymentXpub
+    } else if key == crate::bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY {
+        Family::PendingPaymentXpub
+    } else if key == crate::published_set::PUBLISHED_KEY {
+        Family::PublishedScripts
+    } else if key == crate::published_set::PUBLISHED_META_KEY
+        // Retired before release (review of 36bb41b): the addresses the
+        // active key had handed out, once dropped from the held scripts. A
+        // predecessor of this branch that wrote it is refused, not held.
+        || key == RETIRED_ISSUED_KEY
+        || key == crate::published_set::CURSOR_ACTIVE_KEY
+        || key == crate::published_set::CURSOR_PENDING_KEY
+    {
+        // Derived from the list, or describing this node's own scans and
+        // addresses: rebuilt here, and losing them only restarts a scan
+        // (`published_set`).
+        Family::Refused
     } else if key.starts_with(b"harvest:rsa_sk:") || key.starts_with(b"harvest:rsa_pk:") {
         Family::RsaHalf
     } else if key.starts_with(crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes()) {
         Family::BuyerConversation
+    } else if key.starts_with(crate::messaging::SELLER_SENT_PREFIX_STR.as_bytes()) {
+        Family::SellerSent
     } else if key.starts_with(crate::known_stores::KNOWN_STORE_PREFIX.as_bytes()) {
         Family::KnownStore
     } else if key.starts_with(crate::kept_purchases::KEPT_PURCHASE_PREFIX.as_bytes()) {
@@ -327,8 +358,26 @@ pub(crate) fn import_secret<S: SecretStore>(
         Family::AutoLedger => {
             let held = store.get_secret(key);
             match crate::auto_invoice::merge_ledger_bytes(held.as_deref(), value) {
-                Ok(None) => SecretImport::AlreadyAuthoritative,
-                Ok(Some(bytes)) => written(store.set_secret(key, &bytes)),
+                // The wake-up reads the flag beside the ledger, not the
+                // ledger (`auto_invoice::save_ledger`): written pending
+                // first, cleared after, and repaired on a re-import that
+                // finds the ledger already merged.
+                Ok((merged, retry_pending)) => {
+                    let Some(flag) = crate::auto_invoice::retry_key_for_ledger(key) else {
+                        return SecretImport::Permanent("a ledger key that names no store".into());
+                    };
+                    if retry_pending && !crate::auto_invoice::sync_retry_flag(store, &flag, true) {
+                        return SecretImport::Retryable("the retry flag was not saved".into());
+                    }
+                    let outcome = match merged {
+                        None => SecretImport::AlreadyAuthoritative,
+                        Some(bytes) => written(store.set_secret(key, &bytes)),
+                    };
+                    if !retry_pending {
+                        crate::auto_invoice::sync_retry_flag(store, &flag, false);
+                    }
+                    outcome
+                }
                 Err(why) if held.is_some() && why.contains("own") => SecretImport::Retryable(why),
                 Err(why) => SecretImport::Permanent(why),
             }
@@ -381,13 +430,28 @@ pub(crate) fn import_secret<S: SecretStore>(
         ),
         Family::RsaHalf => import_rsa_half(store, key, value),
         Family::PaymentXpub => import_payment_xpub(store, key, value),
-        Family::BuyerConversation => copy_within_cap(
-            store,
-            key,
-            value,
-            crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
-            crate::messaging::MAX_BUYER_CONVERSATIONS,
-        ),
+        Family::PendingPaymentXpub => {
+            if store.get_secret(key).is_some_and(|held| !held.is_empty()) {
+                SecretImport::AlreadyAuthoritative
+            } else {
+                written(store.set_secret(key, value))
+            }
+        }
+        Family::PublishedScripts => import_published(store, value),
+        Family::BuyerConversation => {
+            match crate::messaging::merge_held_conversation(store, key, value) {
+                Some(outcome) => outcome,
+                None => copy_within_cap(
+                    store,
+                    key,
+                    &crate::messaging::capped_incoming_conversation(value)
+                        .unwrap_or_else(|| value.to_vec()),
+                    crate::messaging::BUYER_CONVERSATION_PREFIX_STR.as_bytes(),
+                    crate::messaging::MAX_BUYER_CONVERSATIONS,
+                ),
+            }
+        }
+        Family::SellerSent => import_seller_sent(store, key, value),
         Family::KnownStore => crate::known_stores::import(store, key, value),
         Family::KeptPurchase => crate::kept_purchases::import(store, key, value),
         // Only reached if a caller bypasses `import`; staging needs the
@@ -494,6 +558,80 @@ fn import_payment_xpub<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) 
     match to_cbor(&Some(merged)) {
         Ok(bytes) => written(store.set_secret(key, &bytes)),
         Err(_) => SecretImport::Retryable("could not encode the payment key".into()),
+    }
+}
+
+/// A predecessor's seller-sent digests for one store, merged into this
+/// delegate's: its entries this delegate lacks go before its own (they are
+/// older), the newest `MAX_SELLER_SENT_PER_STORE` kept. A held value that
+/// does not read is never written over.
+fn import_seller_sent<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) -> SecretImport {
+    use crate::messaging::{decode_seller_sent, encode_seller_sent, seller_sent_has_room};
+    let Some(incoming) = decode_seller_sent(value) else {
+        return SecretImport::Permanent("the predecessor's sent messages did not decode".into());
+    };
+    let held = match store.get_secret(key) {
+        None => Vec::new(),
+        Some(bytes) => match decode_seller_sent(&bytes) {
+            Some(held) => held,
+            None => {
+                return SecretImport::Retryable(
+                    "this delegate's own sent messages did not decode".into(),
+                )
+            }
+        },
+    };
+    if !seller_sent_has_room(store, key) {
+        // Permanent: nothing this delegate does frees a store's slot, so a
+        // retry would fail the same way for ever.
+        return SecretImport::Permanent(format!(
+            "this delegate already keeps sent messages for {} stores",
+            harvest_common::delegate::MAX_SELLER_SENT_STORES
+        ));
+    }
+    let mut merged: Vec<[u8; 64]> = incoming
+        .into_iter()
+        .filter(|entry| !held.contains(entry))
+        .collect();
+    if merged.is_empty() && store.has_secret(key) {
+        return SecretImport::AlreadyAuthoritative;
+    }
+    merged.extend(held);
+    written(store.set_secret(key, &encode_seller_sent(&merged)))
+}
+
+/// The retired key of the issued-address list (`published_set` module
+/// docs): refused on import.
+const RETIRED_ISSUED_KEY: &[u8] = b"harvest:bitcoin:issued:v1";
+
+/// A predecessor's published scripts, merged into this delegate's: every
+/// digest it held that this one does not is added, as sent before any of
+/// this delegate's own (so eviction takes them first), which also starts
+/// every scan again over them. A held list that does not read is never
+/// written over.
+fn import_published<S: SecretStore>(store: &mut S, value: &[u8]) -> SecretImport {
+    use crate::published_set::{DigestList, PUBLISHED_KEY};
+    let Some(incoming) = DigestList::decode(value.to_vec()) else {
+        return SecretImport::Permanent(
+            "the predecessor's published scripts did not decode".into(),
+        );
+    };
+    let Ok(mut held) = DigestList::load(store, PUBLISHED_KEY) else {
+        return SecretImport::Retryable(
+            "this delegate's own published scripts did not decode".into(),
+        );
+    };
+    match held.insert_as_oldest(&incoming.digests()) {
+        (0, _) => SecretImport::AlreadyAuthoritative,
+        // A list full of this delegate's own, newer, scripts keeps none or
+        // only some of the predecessor's, which count as older: said as it
+        // is, and nothing written, rather than reported written (#206
+        // review).
+        (added, kept) if kept < added => SecretImport::Permanent(format!(
+            "the held published scripts are full of newer ones: only {kept} of the \
+             predecessor's {added} would be kept, so none were"
+        )),
+        _ => written(crate::published_set::save_published(store, &held)),
     }
 }
 
@@ -945,6 +1083,122 @@ mod tests {
         );
     }
 
+    /// #206 (D4): a predecessor's pending payment key lands in a slot this
+    /// delegate emptied (its own catch-up finished), and never over one it
+    /// still holds. Mutated red by treating an emptied slot as held, and by
+    /// writing over a held one.
+    #[test]
+    fn a_pending_key_is_imported_into_an_emptied_slot_only() {
+        let key = crate::bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY;
+        let mut emptied = MemSecrets::default();
+        emptied.set_secret(key, &[]);
+        assert_eq!(
+            import_secret(&mut emptied, key, &xpub("vpubA", 4)),
+            SecretImport::Written
+        );
+        assert_eq!(emptied.get_secret(key), Some(xpub("vpubA", 4)));
+        assert_eq!(
+            import_secret(&mut emptied, key, &xpub("vpubB", 9)),
+            SecretImport::AlreadyAuthoritative
+        );
+        assert_eq!(emptied.get_secret(key), Some(xpub("vpubA", 4)));
+    }
+
+    /// #206: a predecessor's published scripts are merged into this
+    /// delegate's, neither side's lost, and a scan over them starts again;
+    /// they count as sent before this delegate's own, so eviction takes them
+    /// first. Mutated red by importing them as a standalone secret, and as
+    /// the newest.
+    #[test]
+    fn published_scripts_are_merged() {
+        use crate::published_set::{digest, DigestList, PUBLISHED_KEY};
+        let mut theirs = DigestList::empty();
+        theirs.insert(&[digest(b"a"), digest(b"b")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+
+        let mut store = MemSecrets::default();
+        let mut ours = DigestList::empty();
+        ours.insert(&[digest(b"b"), digest(b"c")]);
+        crate::published_set::save_published(&mut store, &ours);
+        let before = ours.generation();
+        assert_eq!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::Written
+        );
+        let merged = DigestList::load(&store, PUBLISHED_KEY).unwrap();
+        assert_eq!(merged.len(), 3);
+        for s in [b"a", b"b", b"c"] {
+            assert!(merged.contains(&digest(s)));
+        }
+        assert!(merged.generation() > before, "scans start again");
+        assert_eq!(
+            crate::published_set::published_meta(&store),
+            Some((merged.generation(), 3))
+        );
+        assert_eq!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::AlreadyAuthoritative
+        );
+        // The import counts as sent before this delegate's own, so eviction
+        // takes it first. (Mutated red by importing as the newest.)
+        assert_eq!(merged.by_age()[0], digest(b"a"));
+    }
+
+    /// #206 review: an import into a held list full of this delegate's own
+    /// (newer) scripts keeps none of the predecessor's, and says so rather
+    /// than reporting them written; nothing is written. Mutated red by
+    /// answering `Written`.
+    #[test]
+    fn an_import_into_a_full_list_says_none_was_kept() {
+        use crate::published_set::{digest, DigestList, MAX_HELD, PUBLISHED_KEY};
+        let mut full = DigestList::empty();
+        let own: Vec<_> = (0..MAX_HELD as u32)
+            .map(|n| digest(&n.to_le_bytes()))
+            .collect();
+        full.insert(&own);
+        let mut store = MemSecrets::default();
+        crate::published_set::save_published(&mut store, &full);
+        let mut theirs = DigestList::empty();
+        theirs.insert(&[digest(b"theirs")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+        let before = store.get_secret(PUBLISHED_KEY);
+        assert!(matches!(
+            import_secret(&mut store, PUBLISHED_KEY, &value),
+            SecretImport::Permanent(_)
+        ));
+        assert_eq!(store.get_secret(PUBLISHED_KEY), before, "nothing written");
+    }
+
+    /// #206 review: an import into a nearly full list that would keep only
+    /// some of the predecessor's scripts keeps none and says so, rather than
+    /// reporting them written. Mutated red by writing what fits.
+    #[test]
+    fn a_partial_import_says_so_and_writes_nothing() {
+        use crate::published_set::{digest, DigestList, MAX_HELD, PUBLISHED_KEY};
+        let mut nearly = DigestList::empty();
+        let own: Vec<_> = (0..MAX_HELD as u32 - 1)
+            .map(|n| digest(&n.to_le_bytes()))
+            .collect();
+        nearly.insert(&own);
+        let mut store = MemSecrets::default();
+        crate::published_set::save_published(&mut store, &nearly);
+        let mut theirs = DigestList::empty();
+        theirs.insert(&[digest(b"a"), digest(b"b")]);
+        let mut theirs_store = MemSecrets::default();
+        theirs.save(&mut theirs_store, PUBLISHED_KEY);
+        let value = theirs_store.get_secret(PUBLISHED_KEY).unwrap();
+        let before = store.get_secret(PUBLISHED_KEY);
+        match import_secret(&mut store, PUBLISHED_KEY, &value) {
+            SecretImport::Permanent(why) => assert!(why.contains("only 1 of"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(store.get_secret(PUBLISHED_KEY), before, "nothing written");
+    }
+
     /// Every key shape this delegate writes has a family decided on purpose.
     /// A new shape fails here until somebody says which rule it needs.
     #[test]
@@ -957,6 +1211,9 @@ mod tests {
             Family::Watches,
             Family::Standalone, // bridge config
             Family::PaymentXpub,
+            // A payment key still catching up: into its own slot, never as
+            // the active key (`bitcoin::BITCOIN_PAYMENT_XPUB_PENDING_KEY`).
+            Family::PendingPaymentXpub,
             Family::Standalone, // migration and notice markers
             Family::BuyerConversation,
             Family::KnownStore,
@@ -966,8 +1223,17 @@ mod tests {
             Family::KeptPurchase,
             Family::Refused,    // instant-checkout arm
             Family::AutoLedger, // instant-checkout ledger
+            Family::Refused,    // instant-checkout retry flag
             Family::Refused,    // instant-checkout tip
             Family::Refused,    // instant-checkout exported marker
+            Family::Refused,    // instant-checkout catching-up mark
+            Family::Refused,    // instant-checkout fed scripts
+            Family::Refused,    // instant-checkout store read (closed, not ours)
+            Family::SellerSent, // a seller's sent digests for one store
+            Family::PublishedScripts,
+            Family::Refused, // published scripts' count
+            Family::Refused, // the active key's scan cursor
+            Family::Refused, // the pending key's scan cursor
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(
@@ -1004,6 +1270,64 @@ mod tests {
             import_secret(&mut store, &key, &cbor(&ledger(2))),
             SecretImport::AlreadyAuthoritative
         ));
+    }
+
+    /// #206: an imported ledger that has requests to retry sets the flag the
+    /// wake-up reads instead of the ledger, so the retry is not lost across
+    /// the re-key. Mutated red by not writing the flag on import.
+    #[test]
+    fn an_imported_ledgers_retry_reaches_the_wakeup() {
+        let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
+        let flag = crate::auto_invoice::retry_key_for_ledger(&key).unwrap();
+        let mut store = MemSecrets::default();
+        let pending = crate::auto_invoice::Ledger {
+            retry_pending: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::Written
+        ));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // Held pending, incoming not: still pending, whatever arrives.
+        let quiet = crate::auto_invoice::Ledger::default();
+        import_secret(&mut store, &key, &cbor(&quiet));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // A flag gone wrong is put right by a re-import that finds the
+        // ledger already merged.
+        store.set_secret(&flag, b"0");
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::AlreadyAuthoritative
+        ));
+        assert_eq!(store.get_secret(&flag).as_deref(), Some(b"1".as_slice()));
+        // Neither pending: the flag says so.
+        let mut fresh = MemSecrets::default();
+        import_secret(&mut fresh, &key, &cbor(&quiet));
+        assert_eq!(fresh.get_secret(&flag).as_deref(), Some(b"0".as_slice()));
+    }
+
+    /// A pending flag that cannot be written is reported, so the migration
+    /// does not seal a predecessor whose retry was lost. Mutated red by
+    /// ignoring the flag write.
+    #[test]
+    fn an_unwritten_retry_flag_is_retryable() {
+        let key = crate::auto_invoice::ledger_key(&[5u8; 32]);
+        let mut store = MemSecrets::refusing_writes_under(
+            crate::auto_invoice::retry_key_for_ledger(&key).unwrap(),
+        );
+        let pending = crate::auto_invoice::Ledger {
+            retry_pending: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            import_secret(&mut store, &key, &cbor(&pending)),
+            SecretImport::Retryable(_)
+        ));
+        assert!(
+            store.get_secret(&key).is_none(),
+            "nor is the ledger written"
+        );
     }
 
     /// A predecessor list that does not decode is refused; this delegate's

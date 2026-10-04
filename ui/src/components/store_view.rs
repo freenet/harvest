@@ -144,7 +144,7 @@ pub(crate) struct OwnStoreStatus {
 pub(crate) enum Needs {
     Nothing,
     /// Counted (`my_store::SellerStore::needs_you`, the header's count):
-    /// "<n> need(s) you".
+    /// "`<n> need(s) you`".
     Count(usize),
     /// Nothing counted, but the Home tab's "Needs you" card lists something
     /// all the same (`my_store::overview_needs`): "Needs you".
@@ -718,15 +718,16 @@ fn LoadedStore(
                 if !store.certificate_status.is_verified() {
                     p { class: "text-warning", "{certificate_warning(&store.certificate_status)}" }
                 }
-                // Said plainly: a closed store's key may be in someone
-                // else's hands, so nothing on this page can be bought, and
-                // the record stays visible (harvest#93, 6.4). Otherwise why
-                // it is not open, for which Buy now is withheld.
+                // Said plainly: nothing on a closed store can be bought, and
+                // the record stays visible (harvest#93, 6.4). No reason is
+                // given: a seller closes a store whose key may be in someone
+                // else's hands, and also a second store on one Ghost Key
+                // (harvest#181). Otherwise why it is not open, for which Buy
+                // now is withheld.
                 if store.closed {
                     p { class: "text-warning",
-                        "This store has closed. Its seller closed it because its key may be in \
-                         someone else\u{2019}s hands, so nothing here can be bought. Its record \
-                         stays visible."
+                        "This store has closed for good, so nothing here can be bought. Its \
+                         record stays visible."
                     }
                 } else if cannot_take {
                     p { class: "text-warning", "{cannot_take_orders_line(&store.certificate_status)}" }
@@ -1001,11 +1002,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     let test = super::pay_card::is_test_network(network);
     // "Sold out" is said once, by the name.
     let stock = availability_words(&availability, false).filter(|w| w != "Sold out");
-    let sold_out = matches!(
-        availability,
-        harvest_common::listing::ListingAvailability::SoldOut
-            | harvest_common::listing::ListingAvailability::Available { quantity: Some(0) }
-    );
+    let sold_out = is_sold_out(&availability);
     let delivery = price_lines(&l).map(|(_, delivery)| delivery);
     // Why nothing can be bought here, in one line, in place of the form.
     let why_not = if offer.is_some() || own_preview {
@@ -1268,8 +1265,18 @@ fn visible_listings(
     // What can be bought first, in the seller's order within each group:
     // a sold-out listing first pushed the only Buy now below a phone's fold
     // (round-6 critique). Stable, so the seller's order is kept.
-    shown.sort_by_key(|(_, availability)| *availability == ListingAvailability::SoldOut);
+    shown.sort_by_key(|(_, availability)| is_sold_out(availability));
     shown
+}
+
+/// Sold out, said or counted: marked sold out, or on sale with none left.
+/// What the item page says by the name, what [`availability_words`] says,
+/// and what [`visible_listings`] puts last.
+fn is_sold_out(availability: &ListingAvailability) -> bool {
+    matches!(
+        availability,
+        ListingAvailability::SoldOut | ListingAvailability::Available { quantity: Some(0) }
+    )
 }
 
 /// What an unverified backing means for the person reading the page.
@@ -1332,8 +1339,9 @@ fn buyable(
     if owned {
         return None;
     }
-    // A closed store's key may be in someone else's hands (harvest#93): an
-    // order from it could be anybody's, so nothing here is bought.
+    // A store closed for good sells nothing: its key may be in someone
+    // else's hands (harvest#93), or it was a second store on one Ghost Key
+    // (harvest#181), and an order from it could be anybody's.
     if store.closed {
         return None;
     }
@@ -1345,16 +1353,14 @@ fn buyable(
 }
 
 /// What a listing's top corner says (after the mockup): "Closed" while the
-/// store is, "Sold out", "<n> left" when the seller counts its stock, and
+/// store is, "Sold out", "`<n> left`" when the seller counts its stock, and
 /// nothing for one on sale with no count.
 fn availability_words(availability: &ListingAvailability, store_closed: bool) -> Option<String> {
     if store_closed {
         return Some("Closed".to_string());
     }
     match availability {
-        ListingAvailability::Available { quantity: Some(0) } | ListingAvailability::SoldOut => {
-            Some("Sold out".to_string())
-        }
+        a if is_sold_out(a) => Some("Sold out".to_string()),
         ListingAvailability::Available { quantity: Some(n) } => Some(format!("{n} left")),
         _ => None,
     }
@@ -1562,6 +1568,7 @@ mod availability_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([n; 32]),
@@ -1626,6 +1633,21 @@ mod availability_tests {
             .map(|(l, _)| l.listing.id.0[0])
             .collect();
         assert_eq!(order, vec![2, 3, 1]);
+        // None left counts as sold out too. Red with the sort on SoldOut only.
+        let mut none_left = crate::state::BrowsingStore {
+            listings: vec![listing(1), listing(2)],
+            ..Default::default()
+        };
+        with_status(
+            &mut none_left,
+            1,
+            ListingAvailability::Available { quantity: Some(0) },
+        );
+        let order: Vec<u8> = visible_listings(&none_left)
+            .into_iter()
+            .map(|(l, _)| l.listing.id.0[0])
+            .collect();
+        assert_eq!(order, vec![2, 1]);
     }
 
     /// The Buy control is offered only on a listing still on sale, by the

@@ -9,3 +9,5 @@ dist/
 /tests/merge-laws/corpus*/
 /tests/merge-laws/results*/
 /tests/merge-laws/gen/target/
+/tests/delegate-budget/target/
+/tests/contract-budget/target/

@@ -70,7 +70,7 @@ that is a different mechanism from this one. **Anything whose authenticity
 matters must carry its own signature and must not rest on which key decrypted
 it.** The UI labels a message "You" only when this device sent it; a message
 in your own direction that this device did not send (your own from another
-device or from before a reload, or one the other party sealed as yours) is
+device or past what the delegate keeps across a reload, or one the other party sealed as yours) is
 kept in its place in time but drawn on neither side (full width, dashed,
 on a neutral background), labelled "Not confirmed as yours", never as your
 own bubble, and never counted as a message; one line under the

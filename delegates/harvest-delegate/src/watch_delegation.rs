@@ -13,6 +13,15 @@
 //! to a key this delegate holds (the watch key), and the delegate then signs
 //! its own requests with it. The bridge acts on them as the Ghost Key's own.
 //!
+//! # It renews, it does not extend (harvest#198)
+//!
+//! A request asks only for scripts an armed store names ([`refill_scripts`]),
+//! and a confirmed watch counts for a store only for a script its arm names
+//! (`auto_invoice::watch_set_in`). The tab arms only a window whose address
+//! contracts it read clear, so the delegate never watches or invoices an
+//! address nobody read: with the tab closed a store stops at the end of its
+//! window rather than reaching a paid address past it after a counter reset.
+//!
 //! # The one rule: never credit a horizon the bridge may not have applied
 //!
 //! The bridge answers nothing. It reads and removes, without acting, a request
@@ -741,23 +750,21 @@ pub(crate) fn update_delegation<S: SecretStore>(
     Ok(status_of(secrets, &held, now_ms))
 }
 
-/// The delegation this store's arm can use, as the tab is told it.
-pub(crate) fn status_for_arm<S: SecretStore>(
-    secrets: &S,
-    arm: &AutoInvoiceArm,
-    now_ms: u64,
-) -> Option<WatchDelegationStatus> {
-    all_held(secrets)
-        .into_iter()
-        .find(|h| h.network == arm.network && arm.trusted_bridges.contains(&h.bridge))
-        .map(|h| status_of(secrets, &h, now_ms))
+fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDelegationStatus {
+    let pool = pool(secrets, held.network);
+    status_with(secrets, held, &Vouching::new(secrets, held), &pool, now_ms)
 }
 
-fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDelegationStatus {
+fn status_with<S: SecretStore>(
+    secrets: &S,
+    held: &Held,
+    vouching: &Vouching,
+    pool: &[Vec<u8>],
+    now_ms: u64,
+) -> WatchDelegationStatus {
     let watched = fresh_tip(secrets, held.network, now_ms).map_or(0, |tip| {
-        pool(secrets, held.network)
-            .iter()
-            .take_while(|s| covers(secrets, held, s, tip.anchor.height))
+        pool.iter()
+            .take_while(|s| covers(vouching, held, s, tip.anchor.height))
             .count() as u32
     });
     WatchDelegationStatus {
@@ -774,11 +781,11 @@ fn status_of<S: SecretStore>(secrets: &S, held: &Held, now_ms: u64) -> WatchDele
 
 /// Whether the bridge is confirmed watching `script` for this delegation
 /// through a horizon an invoice issued at `tip_height` can rely on.
-fn covers<S: SecretStore>(secrets: &S, held: &Held, script: &[u8], tip_height: u32) -> bool {
+fn covers(vouching: &Vouching, held: &Held, script: &[u8], tip_height: u32) -> bool {
     held.watched.iter().any(|w| {
         w.script == script
             && tip_height.saturating_add(WATCH_NEEDED_BLOCKS) <= w.until_height
-            && vouched(secrets, held, w)
+            && vouched(vouching, w)
     })
 }
 
@@ -786,34 +793,112 @@ fn covers<S: SecretStore>(secrets: &S, held: &Held, script: &[u8], tip_height: u
 /// now watches (it entered the pool, or an arm names it) would find it
 /// scanned whether or not this delegation still stands (codex, round 5 of
 /// #179), so such a watch no longer counts.
-fn vouched<S: SecretStore>(secrets: &S, held: &Held, w: &Watched) -> bool {
-    !canary_compromised(secrets, held, w.canary_index, &w.canary)
+fn vouched(vouching: &Vouching, w: &Watched) -> bool {
+    !vouching.compromised(w.canary_index, &w.canary)
 }
 
-/// I7's second source: the scripts this delegate's own confirmed requests
-/// have the bridge watching far enough past `tip_height`, each with the
-/// horizon asked, for a store on `network` trusting `bridges`: the union
-/// across every delegation it holds for them. A stalled delegation still
-/// counts what its probes keep finding scanned; a probe that finds it not
-/// scanned clears it; and a watch whose canary can no longer vouch for it
-/// ([`vouched`]) does not count.
+/// [`Delegations::watched`], reading the delegations for one store.
+#[cfg(test)]
 pub(crate) fn delegated_watched<S: SecretStore>(
     secrets: &S,
     network: BitcoinNetwork,
     bridges: &[BridgeId],
     tip_height: u32,
 ) -> Vec<(Vec<u8>, u32)> {
-    all_held(secrets)
-        .iter()
-        .filter(|h| h.network == network && bridges.contains(&h.bridge))
-        .flat_map(|h| {
-            h.watched
-                .iter()
-                .filter(|w| covers(secrets, h, &w.script, tip_height))
-                .map(|w| (w.script.clone(), w.until_height))
-                .collect::<Vec<_>>()
+    Delegations::read(secrets).watched(network, bridges, tip_height)
+}
+
+/// Every delegation held, each with what vouches for its watches, read once
+/// for a run that asks about many stores (a wake-up's heartbeats, a tip
+/// read's statuses): asked per store, each read every delegation and, per
+/// delegation, every arm again (#206).
+pub(crate) struct Delegations {
+    held: Vec<(Held, Vouching)>,
+    xpub: Option<harvest_common::PaymentXpubStatus>,
+    upcoming: std::cell::OnceCell<Vec<harvest_common::DerivedAddress>>,
+}
+
+impl Delegations {
+    pub(crate) fn read<S: SecretStore>(secrets: &S) -> Self {
+        let xpub = crate::bitcoin::load_payment_xpub(secrets);
+        let next_index = xpub.as_ref().map(|xpub| xpub.next_index);
+        let arms = arms(secrets);
+        Delegations {
+            held: all_held(secrets)
+                .into_iter()
+                .map(|h| {
+                    let vouching = Vouching::of(next_index, &arms, &h);
+                    (h, vouching)
+                })
+                .collect(),
+            xpub,
+            upcoming: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The addresses instant checkout would issue next
+    /// (`auto_invoice::upcoming`), derived on first use and then kept.
+    pub(crate) fn upcoming(&self) -> &[harvest_common::DerivedAddress] {
+        self.upcoming.get_or_init(|| {
+            self.xpub
+                .as_ref()
+                .and_then(|xpub| {
+                    crate::bitcoin::upcoming_addresses(xpub, MAX_UPCOMING_ADDRESSES).ok()
+                })
+                .unwrap_or_default()
         })
-        .collect()
+    }
+
+    /// [`pool`], from what was read.
+    fn pool(&self, network: BitcoinNetwork) -> Vec<Vec<u8>> {
+        match &self.xpub {
+            Some(xpub) if xpub.network == network => self
+                .upcoming()
+                .iter()
+                .map(|a| a.script_pubkey.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// I7's second source: the scripts this delegate's own confirmed requests
+    /// have the bridge watching far enough past `tip_height`, each with the
+    /// horizon asked, for a store on `network` trusting `bridges`: the union
+    /// across every delegation it holds for them. A stalled delegation still
+    /// counts what its probes keep finding scanned; a probe that finds it not
+    /// scanned clears it; and a watch whose canary can no longer vouch for it
+    /// ([`vouched`]) does not count.
+    pub(crate) fn watched(
+        &self,
+        network: BitcoinNetwork,
+        bridges: &[BridgeId],
+        tip_height: u32,
+    ) -> Vec<(Vec<u8>, u32)> {
+        self.held
+            .iter()
+            .filter(|(h, _)| h.network == network && bridges.contains(&h.bridge))
+            .flat_map(|(h, vouching)| {
+                h.watched
+                    .iter()
+                    .filter(|w| covers(vouching, h, &w.script, tip_height))
+                    .map(|w| (w.script.clone(), w.until_height))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The delegation this store's arm can use, as the tab is told it.
+    pub(crate) fn status_for_arm<S: SecretStore>(
+        &self,
+        secrets: &S,
+        arm: &AutoInvoiceArm,
+        now_ms: u64,
+    ) -> Option<WatchDelegationStatus> {
+        self.held
+            .iter()
+            .find(|(h, _)| h.network == arm.network && arm.trusted_bridges.contains(&h.bridge))
+            .map(|(h, vouching)| status_with(secrets, h, vouching, &self.pool(h.network), now_ms))
+    }
 }
 
 /// The delegate's next addresses, as scripts, from the counter on.
@@ -866,12 +951,45 @@ fn canary_floor(next_index: u32) -> u32 {
 /// into the tab's pool, or an arm names it. Its watermark then shows nothing
 /// about this delegate's request.
 fn canary_compromised<S: SecretStore>(secrets: &S, held: &Held, index: u32, script: &[u8]) -> bool {
-    let in_pool = crate::bitcoin::load_payment_xpub(secrets)
-        .is_none_or(|xpub| index < xpub.next_index.saturating_add(MAX_UPCOMING_ADDRESSES));
-    in_pool
-        || armed_for(secrets, held)
-            .iter()
-            .any(|r| r.arm.watched_scripts.iter().any(|s| s == script))
+    Vouching::new(secrets, held).compromised(index, script)
+}
+
+/// What [`canary_compromised`] reads, read once for every watch of one
+/// delegation: the counter and the scripts its armed stores name. Read per
+/// watch, a delegation's 64 watches each decoded the payment key and every
+/// arm, and [`covers`] asks per watch of every watch, so a status or a
+/// wake-up decoded them thousands of times over (#206).
+pub(crate) struct Vouching {
+    next_index: Option<u32>,
+    armed_scripts: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Vouching {
+    pub(crate) fn new<S: SecretStore>(secrets: &S, held: &Held) -> Self {
+        let next_index = crate::bitcoin::load_payment_xpub(secrets).map(|xpub| xpub.next_index);
+        Vouching::of(next_index, &arms(secrets), held)
+    }
+
+    /// From the counter and the arms, already read.
+    fn of(next_index: Option<u32>, arms: &[ArmRecord], held: &Held) -> Self {
+        Vouching {
+            next_index,
+            armed_scripts: arms
+                .iter()
+                .filter(|r| {
+                    r.arm.network == held.network && r.arm.trusted_bridges.contains(&held.bridge)
+                })
+                .flat_map(|r| r.arm.watched_scripts.iter().cloned())
+                .collect(),
+        }
+    }
+
+    fn compromised(&self, index: u32, script: &[u8]) -> bool {
+        let in_pool = self
+            .next_index
+            .is_none_or(|next| index < next.saturating_add(MAX_UPCOMING_ADDRESSES));
+        in_pool || self.armed_scripts.contains(script)
+    }
 }
 
 fn fresh_tip<S: SecretStore>(
@@ -902,6 +1020,25 @@ fn refill_scripts<S: SecretStore>(
     tip_height: u32,
     now_ms: u64,
 ) -> Vec<Vec<u8>> {
+    refill_scripts_from(
+        secrets,
+        held,
+        &pool(secrets, held.network),
+        tip_height,
+        now_ms,
+    )
+}
+
+/// [`refill_scripts`], with the pool already derived: a wake-up derives it
+/// once for every delegation, rather than once each (the window is
+/// `MAX_UPCOMING_ADDRESSES` derivations, a few million fuel apiece).
+fn refill_scripts_from<S: SecretStore>(
+    secrets: &S,
+    held: &Held,
+    pool: &[Vec<u8>],
+    tip_height: u32,
+    now_ms: u64,
+) -> Vec<Vec<u8>> {
     let armed = armed_for(secrets, held);
     if armed.is_empty() {
         return Vec::new();
@@ -909,24 +1046,48 @@ fn refill_scripts<S: SecretStore>(
     let threshold = tip_height
         .saturating_add(WATCH_NEEDED_BLOCKS)
         .saturating_add(RENEW_MARGIN_BLOCKS);
+    let vouching = Vouching::new(secrets, held);
     let fresh = |script: &Vec<u8>| {
-        held.watched.iter().any(|w| {
-            w.script == *script && w.until_height >= threshold && vouched(secrets, held, w)
-        }) || armed.iter().any(|r| {
-            now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
-                && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
-                && r.arm.watched_scripts.contains(script)
-        })
+        held.watched
+            .iter()
+            .any(|w| w.script == *script && w.until_height >= threshold && vouched(&vouching, w))
+            || armed.iter().any(|r| {
+                now_ms.saturating_add(WATCH_NEEDED_MS) < r.watched_until_ms
+                    && r.arm.watched_until_height.is_some_and(|h| h >= threshold)
+                    && r.arm.watched_scripts.contains(script)
+            })
     };
-    let pool = pool(secrets, held.network);
-    if pool.iter().take(REFILL_BELOW).all(fresh) {
+    // Only what an armed store read clear recently (harvest#198,
+    // `ArmRecord::vetted_recently`): the delegation renews the tab's window,
+    // it never reaches past it.
+    let pool: Vec<&Vec<u8>> = pool
+        .iter()
+        .filter(|s| {
+            armed
+                .iter()
+                .any(|r| r.vetted_recently(now_ms) && r.arm.vetted_scripts.contains(s))
+        })
+        .collect();
+    if pool.iter().take(REFILL_BELOW).all(|s| fresh(s)) {
         return Vec::new();
     }
     pool.into_iter()
         .filter(|s| !fresh(s))
         // Room for the canary.
         .take(MAX_SCRIPTS_PER_REQUEST - 1)
+        .cloned()
         .collect()
+}
+
+/// [`refill_scripts`], for other modules' tests.
+#[cfg(test)]
+pub(crate) fn refill_scripts_for_test<S: SecretStore>(
+    secrets: &S,
+    held: &Held,
+    tip_height: u32,
+    now_ms: u64,
+) -> Vec<Vec<u8>> {
+    refill_scripts(secrets, held, tip_height, now_ms)
 }
 
 /// The address contract the bridge publishes `script`'s watermark to: the
@@ -953,10 +1114,13 @@ pub(crate) fn address_params(
     }
 }
 
-/// What this delegation should read now, if anything.
+/// What this delegation should read now, if anything. `pool` is the next
+/// addresses ([`pool`]) for this delegation's network, derived once by the
+/// wake-up.
 fn due_read<S: SecretStore>(
     secrets: &S,
     held: &Held,
+    pool: &[Vec<u8>],
     now_ms: u64,
 ) -> Option<([u8; 32], ReadContext)> {
     let context = |kind, script: Vec<u8>, index| ReadContext {
@@ -980,11 +1144,19 @@ fn due_read<S: SecretStore>(
     }
     let tip = fresh_tip(secrets, held.network, now_ms)?;
     // The probe runs stalled or not: it is what withdraws the watches.
-    let next = pool(secrets, held.network).into_iter().next();
+    let next = pool.first().cloned();
     let probe = next.and_then(|next| {
         held.watched
             .iter()
-            .find(|w| w.script == next && covers(secrets, held, &w.script, tip.anchor.height))
+            .find(|w| {
+                w.script == next
+                    && covers(
+                        &Vouching::new(secrets, held),
+                        held,
+                        &w.script,
+                        tip.anchor.height,
+                    )
+            })
             .map(|w| w.canary.clone())
     });
     if let Some(canary) = probe {
@@ -997,7 +1169,7 @@ fn due_read<S: SecretStore>(
     }
     if !held.may_send(now_ms)
         || held.defer_until_ms.is_some_and(|until| now_ms < until)
-        || refill_scripts(secrets, held, tip.anchor.height, now_ms).is_empty()
+        || refill_scripts_from(secrets, held, pool, tip.anchor.height, now_ms).is_empty()
     {
         return None;
     }
@@ -1073,6 +1245,8 @@ pub(crate) fn on_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<Out
         return Vec::new();
     }
     let mut due: Vec<(Held, [u8; 32], ReadContext)> = Vec::new();
+    // The pool per network, derived once for every delegation.
+    let mut pools: Vec<(BitcoinNetwork, Vec<Vec<u8>>)> = Vec::new();
     for mut held in all_held(secrets) {
         // A store unarmed since: what was waiting cannot be read or credited
         // any more. Dropped, not counted as a failure.
@@ -1084,7 +1258,14 @@ pub(crate) fn on_wakeup<S: SecretStore>(secrets: &mut S, now_ms: u64) -> Vec<Out
             store_held(secrets, &held);
             continue;
         }
-        if let Some((id, context)) = due_read(secrets, &held, now_ms) {
+        if !pools.iter().any(|(n, _)| *n == held.network) {
+            pools.push((held.network, pool(secrets, held.network)));
+        }
+        let pool = pools
+            .iter()
+            .find(|(n, _)| *n == held.network)
+            .map_or(&[][..], |(_, p)| p.as_slice());
+        if let Some((id, context)) = due_read(secrets, &held, pool, now_ms) {
             due.push((held, id, context));
         }
     }
@@ -1733,7 +1914,10 @@ pub(crate) mod test_support {
     }
 
     /// A delegate with a payment key at index 0, a tip at [`TIP`], and one
-    /// store armed on the test bridge whose tab watches nothing.
+    /// store armed on the test bridge naming the tab's whole window (the
+    /// next `MAX_UPCOMING_ADDRESSES`, read clear), whose own watch of them
+    /// has lapsed: the delegation renews only what an arm names
+    /// (harvest#198).
     pub fn armed() -> MemSecrets {
         let mut secrets = MemSecrets::default();
         let store_sk = SigningKey::from_bytes(&[0x51; 32]);
@@ -1750,13 +1934,15 @@ pub(crate) mod test_support {
                 tip_contract_id: [3; 32],
                 trusted_bridges: vec![bridge()],
                 address_code_hash: [5; 32],
-                watched_scripts: Vec::new(),
+                watched_scripts: (0..MAX_UPCOMING_ADDRESSES).map(script_at).collect(),
+                vetted_scripts: (0..MAX_UPCOMING_ADDRESSES).map(script_at).collect(),
                 watch_left_ms: 0,
                 watched_until_height: None,
                 presence_contract_id: None,
             },
             armed_at_ms: NOW - 1_000,
             watched_until_ms: NOW,
+            last_armed_ms: NOW - 1_000,
         };
         save(
             &mut secrets,
@@ -1764,6 +1950,17 @@ pub(crate) mod test_support {
             &record,
         );
         secrets
+    }
+
+    /// The tab having armed the window from `from` (the next
+    /// `MAX_UPCOMING_ADDRESSES`), as it does once the counter moves.
+    pub fn arm_window(secrets: &mut MemSecrets, from: u32) {
+        let mut record = arm_record(secrets);
+        record.arm.watched_scripts = (from..from + MAX_UPCOMING_ADDRESSES)
+            .map(script_at)
+            .collect();
+        record.arm.vetted_scripts = record.arm.watched_scripts.clone();
+        save(secrets, &arm_key(&[1; 32]), &record);
     }
 
     pub fn arm_record(secrets: &MemSecrets) -> ArmRecord {
@@ -1843,7 +2040,13 @@ pub(crate) mod test_support {
         let mut h = held(secrets);
         h.subscribed.clear();
         h.note_subscribed(INBOX, 0);
-        for index in 0..48 {
+        // The pool, the canaries from the first one on, and index 30 (a
+        // canary some tests build by hand): within `SUBSCRIBED_CAP`.
+        let first_canary = MAX_UPCOMING_ADDRESSES + CANARY_MARGIN;
+        let indices = (0..MAX_UPCOMING_ADDRESSES)
+            .chain([30])
+            .chain(first_canary..first_canary + 30);
+        for index in indices {
             h.note_subscribed(
                 address_contract(&h.clone(), &arm, &script_at(index)).unwrap(),
                 0,
@@ -2023,6 +2226,12 @@ mod tests {
     use super::*;
     use crate::secrets::MemSecrets;
 
+    /// The tab's pool: the next `MAX_UPCOMING_ADDRESSES` from the counter.
+    const P: u32 = MAX_UPCOMING_ADDRESSES;
+    /// The first canary with the counter at 0: past the pool by
+    /// `CANARY_MARGIN`.
+    const C: u32 = MAX_UPCOMING_ADDRESSES + CANARY_MARGIN;
+
     /// The request `entry` carries, as the bridge opens it.
     fn opened(entry: &WireEntry) -> InboxRequest {
         freenet_bitcoin_inbox::seal::unseal(
@@ -2186,7 +2395,7 @@ mod tests {
         let request = opened(&entry);
         assert_eq!(request.action, Action::Watch);
         assert_eq!(request.network, BitcoinNetwork::Signet);
-        assert_eq!(scripts(&entry), with_canary(0..10, 20));
+        assert_eq!(scripts(&entry), with_canary(0..P, C));
         assert_eq!(request.watch_until_height, Some(TIP + REQUEST_AHEAD_BLOCKS));
         assert_eq!(request.made_at_ms, NOW + 501, "above the tab's last");
         assert_eq!(request.revoke_watch_keys_through, None);
@@ -2195,10 +2404,10 @@ mod tests {
         assert_eq!(held.own_made_at_ms, NOW + 501);
         let sent = held.outstanding.expect("recorded as outstanding");
         assert_eq!(sent.entry_key, entry.entry.key());
-        assert_eq!(sent.canary, script_at(20));
-        assert_eq!(sent.canary_index, 20);
+        assert_eq!(sent.canary, script_at(C));
+        assert_eq!(sent.canary_index, C);
         assert_eq!(sent.until_height, TIP + REQUEST_AHEAD_BLOCKS);
-        assert_eq!(held.canary_next, 21, "a canary is used once");
+        assert_eq!(held.canary_next, C + 1, "a canary is used once");
     }
 
     /// Review round 2 of #179, P1: a request the bridge IGNORED credits
@@ -2213,13 +2422,13 @@ mod tests {
         let mut secrets = delegated();
         let key = crate::auto_invoice::arm_key(&[1; 32]);
         let mut record = arm_record(&secrets);
-        record.arm.watched_scripts = (0..10).map(script_at).collect();
+        record.arm.watched_scripts = (0..P).map(script_at).collect();
         record.watched_until_ms = NOW + 30 * 24 * 60 * 60 * 1000;
         save(&mut secrets, &key, &record);
 
         let mut inbox = open_inbox();
         let (delta, entry) = submitted(&wake_and_read(&mut secrets, &inbox, NOW));
-        assert_eq!(scripts(&entry).last(), Some(&script_at(20)), "the canary");
+        assert_eq!(scripts(&entry).last(), Some(&script_at(C)), "the canary");
         inbox.apply_delta(&params(), &delta).unwrap();
         // Read and removed, with no effect.
         bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
@@ -2228,7 +2437,7 @@ mod tests {
         let get = wake(&mut secrets, NOW + 10 * MINUTE);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(20)).as_slice(),
+            address_id(&secrets, &script_at(C)).as_slice(),
             "the canary is what is read, not the first script"
         );
         // As live: the canary's address contract was never created.
@@ -2262,34 +2471,35 @@ mod tests {
         let get = got_read(&out);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(20)).as_slice(),
+            address_id(&secrets, &script_at(C)).as_slice(),
             "past the pool of ten by a margin of ten"
         );
         let out = answer(&mut secrets, &get, None, NOW);
         assert_eq!(got_read(&out).contract_id.as_bytes(), INBOX.as_slice());
 
         let mut secrets = delegated();
-        let out = wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW);
+        let out = wake_and_scan(&mut secrets, &script_at(C), Some(TIP), NOW);
         assert!(out.is_empty(), "no inbox read for a scanned canary");
-        assert_eq!(held(&secrets).canary_next, 21);
+        assert_eq!(held(&secrets).canary_next, C + 1);
         assert!(held(&secrets).canary.is_none());
 
-        // One the tab names is never a canary.
+        // One the tab names is never a canary. (The arm names its window as
+        // well: the delegation renews only what an arm names.)
         let key = crate::auto_invoice::arm_key(&[1; 32]);
         let mut record = arm_record(&secrets);
-        record.arm.watched_scripts = vec![script_at(21)];
+        record.arm.watched_scripts = (0..P).chain([C + 1]).map(script_at).collect();
         save(&mut secrets, &key, &record);
         let get = wake(&mut secrets, NOW + MINUTE);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(22)).as_slice()
+            address_id(&secrets, &script_at(C + 2)).as_slice()
         );
 
         let mut secrets = delegated();
         for i in 0..MAX_CANARY_TRIES {
             wake_and_scan(
                 &mut secrets,
-                &script_at(20 + i),
+                &script_at(C + i),
                 Some(TIP),
                 NOW + u64::from(i),
             );
@@ -2313,8 +2523,8 @@ mod tests {
         inbox.apply_delta(&params(), &delta).unwrap();
         bridge_reads(&mut inbox, &entry.entry.key(), entry.entry.mainnet_height);
         assert!(wake_and_read(&mut secrets, &inbox, NOW + 5 * MINUTE).is_empty());
-        set_counter(&mut secrets, 11);
-        wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW + 10 * MINUTE);
+        set_counter(&mut secrets, P + 1);
+        wake_and_scan(&mut secrets, &script_at(C), Some(TIP), NOW + 10 * MINUTE);
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.watched.is_empty() && h.failures == 0);
     }
@@ -2330,8 +2540,8 @@ mod tests {
         let mut secrets = delegated();
         send_read_confirm(&mut secrets, TIP, NOW);
         let watched = watched_now(&secrets, TIP);
-        assert_eq!(watched, (0..10).map(script_at).collect::<Vec<_>>());
-        assert!(!watched.contains(&script_at(20)), "the canary is evidence");
+        assert_eq!(watched, (0..P).map(script_at).collect::<Vec<_>>());
+        assert!(!watched.contains(&script_at(C)), "the canary is evidence");
         let h = held(&secrets);
         assert!(
             refill_scripts(&secrets, &h, TIP, NOW).is_empty(),
@@ -2339,9 +2549,10 @@ mod tests {
         );
         // An arm (a tab) names the canary: the scripts are unsold, but the
         // canary no longer vouches for them, so they stop counting and are
-        // refilled.
+        // refilled (the arm still names its window, which is all a refill
+        // asks for).
         let mut record = arm_record(&secrets);
-        record.arm.watched_scripts = vec![script_at(20)];
+        record.arm.watched_scripts = (0..P).chain([C]).map(script_at).collect();
         save(
             &mut secrets,
             &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
@@ -2357,7 +2568,7 @@ mod tests {
             "refilled"
         );
         // Nor is the next address probed through that canary.
-        let probe_id = address_id(&secrets, &script_at(20));
+        let probe_id = address_id(&secrets, &script_at(C));
         assert!(!on_wakeup(&mut secrets, NOW + 2 * PROBE_EVERY_MS)
             .iter()
             .any(|m| matches!(m, OutboundDelegateMsg::GetContractRequest(r)
@@ -2369,8 +2580,8 @@ mod tests {
             &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
             &record,
         );
-        assert_eq!(watched_now(&secrets, TIP).len(), 10);
-        set_counter(&mut secrets, 11);
+        assert_eq!(watched_now(&secrets, TIP).len(), P as usize);
+        set_counter(&mut secrets, P + 1);
         assert!(watched_now(&secrets, TIP).is_empty());
     }
 
@@ -2386,19 +2597,22 @@ mod tests {
         let inbox = open_inbox();
         let get = wake(&mut secrets, NOW);
         answer(&mut secrets, &get, None, NOW);
-        assert_eq!(held(&secrets).canary.as_ref().map(|c| c.index), Some(20));
+        assert_eq!(held(&secrets).canary.as_ref().map(|c| c.index), Some(C));
         set_counter(&mut secrets, 3);
         let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
         let (_, entry) = submitted(&out);
+        // 3..10, not 3..=10: index 10 is past the window the arm names, and
+        // the delegation renews only that window (harvest#198).
         assert_eq!(
             scripts(&entry),
-            (3..=10).chain([20]).map(script_at).collect::<Vec<_>>()
+            (3..P).chain([C]).map(script_at).collect::<Vec<_>>()
         );
 
         let mut secrets = delegated();
         let get = wake(&mut secrets, NOW);
         answer(&mut secrets, &get, None, NOW);
-        set_counter(&mut secrets, 11);
+        set_counter(&mut secrets, P + 1);
+        arm_window(&mut secrets, P + 1);
         let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
         assert!(
             !out.iter()
@@ -2411,14 +2625,16 @@ mod tests {
             "forgotten, so a fresh one is picked"
         );
         // A canary outside the pool that cannot vouch for every script the
-        // next addresses need (counter 7: it covers up to 10, the next five
-        // run to 11; counter 10, the pool's very edge: it covers only 10) is
+        // next addresses need (with a pool of P: it covers up to index P,
+        // and from counter P - REFILL_BELOW + 2 the next REFILL_BELOW run one
+        // past it; counter P, the pool's very edge: it covers only P) is
         // forgotten rather than used for a partial request.
-        for counter in [7, 10] {
+        for counter in [P - REFILL_BELOW as u32 + 2, P] {
             let mut secrets = delegated();
             let get = wake(&mut secrets, NOW);
             answer(&mut secrets, &get, None, NOW);
             set_counter(&mut secrets, counter);
+            arm_window(&mut secrets, counter);
             let out = wake_and_read(&mut secrets, &inbox, NOW + MINUTE);
             assert!(
                 !out.iter()
@@ -2427,6 +2643,43 @@ mod tests {
             );
             assert_eq!(held(&secrets).canary, None, "counter {counter}");
         }
+    }
+
+    /// harvest#198: the refill asks only for scripts an armed store names,
+    /// so the delegation renews the window the tab read clear and never
+    /// reaches past it; with no arm naming the pool, nothing is asked.
+    /// Mutated red by dropping the filter in `refill_scripts`.
+    #[test]
+    fn the_refill_asks_only_for_scripts_an_arm_names() {
+        let mut secrets = delegated();
+        let mut record = arm_record(&secrets);
+        record.arm.vetted_scripts = (0..5).map(script_at).collect();
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &record,
+        );
+        let h = held(&secrets);
+        assert_eq!(
+            refill_scripts(&secrets, &h, TIP, NOW),
+            (0..5).map(script_at).collect::<Vec<_>>()
+        );
+        record.arm.vetted_scripts = (100..110).map(script_at).collect();
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &record,
+        );
+        assert!(refill_scripts(&secrets, &h, TIP, NOW).is_empty());
+        // Read clear more than `VETTED_FOR_MS` ago: nothing asked either.
+        record.arm.vetted_scripts = (0..5).map(script_at).collect();
+        record.last_armed_ms = NOW - crate::auto_invoice::VETTED_FOR_MS;
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &record,
+        );
+        assert!(refill_scripts(&secrets, &h, TIP, NOW).is_empty());
     }
 
     /// Pruning keeps the list in append order, so every later prune still
@@ -2569,7 +2822,7 @@ mod tests {
             "read, not yet watched"
         );
 
-        let canary = script_at(20);
+        let canary = script_at(C);
         wake_and_scan(&mut secrets, &canary, None, NOW + 10 * MINUTE);
         wake_and_scan(&mut secrets, &canary, Some(TIP - 1), NOW + 15 * MINUTE);
         // Signed by someone other than the bridge.
@@ -2602,12 +2855,12 @@ mod tests {
         // a payment watch (codex, round 5).
         assert_eq!(
             watched_now(&secrets, TIP),
-            (0..10).map(script_at).collect::<Vec<_>>()
+            (0..P).map(script_at).collect::<Vec<_>>()
         );
         let h = held(&secrets);
         assert!(h.unconfirmed.is_none() && h.failures == 0);
         let status = status_of(&secrets, &h, NOW);
-        assert_eq!((status.watched, status.outstanding), (10, false));
+        assert_eq!((status.watched, status.outstanding), (P, false));
         // A re-confirmed script moves to the end of the list, whose order
         // is its recency (`prune_watched` keeps the newest among equal
         // horizons).
@@ -2620,7 +2873,7 @@ mod tests {
         h.unconfirmed = Some(Unconfirmed {
             scripts: vec![script_at(0)],
             canary: canary.clone(),
-            canary_index: 20,
+            canary_index: C,
             canary_contract: address_id(&secrets, &canary),
             until_height: TIP + 1,
             since_tip: TIP,
@@ -2754,7 +3007,7 @@ mod tests {
         let mut secrets = armed();
         let key = get_watch_key(&mut secrets).unwrap();
         set_delegation(&mut secrets, grant_for(key, sender_height(FLOOR), 0), NOW).unwrap();
-        assert_eq!(held(&secrets).canary_next, 20 + CANARY_GENERATION_OFFSET);
+        assert_eq!(held(&secrets).canary_next, C + CANARY_GENERATION_OFFSET);
 
         let mut h = held(&secrets);
         h.canary_next = 500;
@@ -2815,8 +3068,8 @@ mod tests {
         let h = held(&secrets);
         assert!(h.unconfirmed.as_ref().is_some_and(|u| !u.removed));
         assert_eq!(h.failures, 0);
-        wake_and_scan(&mut secrets, &script_at(20), Some(TIP), NOW + 45 * MINUTE);
-        assert_eq!(watched_now(&secrets, TIP).len(), 10);
+        wake_and_scan(&mut secrets, &script_at(C), Some(TIP), NOW + 45 * MINUTE);
+        assert_eq!(watched_now(&secrets, TIP).len(), P as usize);
     }
 
     /// An inbox that stops moving (re-keyed, say) holds the entry for ever;
@@ -2870,30 +3123,25 @@ mod tests {
     fn a_stale_canary_withdraws_the_delegations_watches() {
         let mut secrets = delegated();
         send_read_confirm(&mut secrets, TIP, NOW);
-        assert_eq!(watched_now(&secrets, TIP).len(), 10);
+        assert_eq!(watched_now(&secrets, TIP).len(), P as usize);
         // Probed within the hour of confirming: nothing to read.
         assert!(on_wakeup(&mut secrets, NOW + 30 * MINUTE).is_empty());
         let at = NOW + 10 * MINUTE + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 6, at);
-        wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 6), at);
-        assert_eq!(watched_now(&secrets, TIP + 6).len(), 10, "live");
+        wake_and_scan(&mut secrets, &script_at(C), Some(TIP + 6), at);
+        assert_eq!(watched_now(&secrets, TIP + 6).len(), P as usize, "live");
         let at = at + PROBE_EVERY_MS;
         set_tip_at(&mut secrets, TIP + 20, at);
         // No state: nothing withdrawn.
         let get = wake(&mut secrets, at);
         answer(&mut secrets, &get, None, at);
-        assert_eq!(watched_now(&secrets, TIP + 20).len(), 10);
+        assert_eq!(watched_now(&secrets, TIP + 20).len(), P as usize);
         // Unsettled (the SUBSCRIBE not yet answered Ok): nothing withdrawn.
         on_node_started(&mut secrets);
-        wake_and_scan(&mut secrets, &script_at(20), Some(TIP + 13), at + MINUTE);
-        assert_eq!(watched_now(&secrets, TIP + 20).len(), 10);
+        wake_and_scan(&mut secrets, &script_at(C), Some(TIP + 13), at + MINUTE);
+        assert_eq!(watched_now(&secrets, TIP + 20).len(), P as usize);
         settle_all(&mut secrets);
-        wake_and_scan(
-            &mut secrets,
-            &script_at(20),
-            Some(TIP + 13),
-            at + 2 * MINUTE,
-        );
+        wake_and_scan(&mut secrets, &script_at(C), Some(TIP + 13), at + 2 * MINUTE);
         assert!(watched_now(&secrets, TIP + 20).is_empty(), "withdrawn");
         assert_eq!(held(&secrets).failures, 1);
     }
@@ -2907,7 +3155,7 @@ mod tests {
         send_read_confirm(&mut secrets, TIP, NOW);
         let until = TIP + REQUEST_AHEAD_BLOCKS;
         let last_ok = until - WATCH_NEEDED_BLOCKS;
-        assert_eq!(watched_now(&secrets, last_ok).len(), 10);
+        assert_eq!(watched_now(&secrets, last_ok).len(), P as usize);
         assert!(watched_now(&secrets, last_ok + 1).is_empty());
 
         let mut h = held(&secrets);
@@ -2921,7 +3169,7 @@ mod tests {
             &open_inbox(),
             NOW + 30 * MINUTE,
         ));
-        assert_eq!(scripts(&renewal), with_canary(0..10, 21));
+        assert_eq!(scripts(&renewal), with_canary(0..P, C + 1));
         assert!(
             opened(&renewal).made_at_ms > NOW + 501,
             "above its own last"
@@ -2945,7 +3193,7 @@ mod tests {
         );
         confirm_watched(
             &mut secrets,
-            &(10..16).map(script_at).collect::<Vec<_>>(),
+            &(10..6 + P).map(script_at).collect::<Vec<_>>(),
             u2,
         );
         set_counter(&mut secrets, 6);
@@ -2958,7 +3206,7 @@ mod tests {
             u1 - WATCH_NEEDED_BLOCKS - RENEW_MARGIN_BLOCKS + 1,
         );
         let (_, renewal) = submitted(&wake_and_read(&mut secrets, &open_inbox(), NOW));
-        assert_eq!(scripts(&renewal), with_canary(6..10, 26));
+        assert_eq!(scripts(&renewal), with_canary(6..10, 6 + C));
     }
 
     /// Requests whose canary never shows: each failure waits a doubling
@@ -2976,8 +3224,10 @@ mod tests {
         h.last_failure_ms = Some(NOW);
         h.last_probe_ms = Some(NOW);
         put_held(&mut secrets, &h);
-        // Two of the first five from the counter past what was confirmed.
-        set_counter(&mut secrets, 8);
+        // The first `REFILL_BELOW` from the counter reach past what was
+        // confirmed, the tab having armed the window from there.
+        set_counter(&mut secrets, P - 2);
+        arm_window(&mut secrets, P - 2);
         assert!(on_wakeup(&mut secrets, NOW + FAILURE_BACKOFF_MS - 1).is_empty());
         let at = NOW + FAILURE_BACKOFF_MS;
         set_tip_at(&mut secrets, TIP, at);
@@ -2991,7 +3241,7 @@ mod tests {
         assert!(status_of(&secrets, &h, NOW).stalled);
         assert_eq!(
             watched_now(&secrets, TIP).len(),
-            10,
+            P as usize,
             "what probes confirm still counts"
         );
         set_tip_at(&mut secrets, TIP, at + 10 * FAILURE_BACKOFF_MS);
@@ -3030,8 +3280,201 @@ mod tests {
         let get = got_read(&out[..1]);
         assert_eq!(
             get.contract_id.as_bytes(),
-            address_id(&secrets, &script_at(20)).as_slice()
+            address_id(&secrets, &script_at(C)).as_slice()
         );
+    }
+
+    /// #206: which of a delegation's watches count is decided with one read
+    /// of the payment key and the arms for the delegation, not one per watch
+    /// (per watch of every watch, through `covers`): a full delegation's 64
+    /// watches read them thousands of times in each status and wake-up.
+    /// Mutated red by reading them per watch.
+    #[test]
+    fn a_full_delegation_is_vouched_for_with_one_read_of_the_arms() {
+        let mut secrets = delegated();
+        let mut h = held(&secrets);
+        h.watched = (0..WATCHED_CAP as u32)
+            .map(|i| Watched {
+                script: script_at(i),
+                until_height: TIP + 10_000,
+                canary: script_at(1_000 + i),
+                canary_contract: [0; 32],
+                canary_index: 1_000 + i,
+            })
+            .collect();
+        put_held(&mut secrets, &h);
+        let before = secrets.reads.get();
+        let got = delegated_watched(&secrets, BitcoinNetwork::Signet, &[bridge()], TIP);
+        let reads = secrets.reads.get() - before;
+        assert_eq!(got.len(), WATCHED_CAP, "every watch vouched for");
+        assert!(reads <= 8, "{reads} reads for one delegation");
+    }
+
+    /// #206: a wake-up's heartbeats, and a tip read's statuses, read each
+    /// delegation a bounded number of times however many stores are armed,
+    /// not once per store. Mutated red by reading the delegations per store,
+    /// in either.
+    #[test]
+    fn many_stores_read_each_delegation_a_bounded_number_of_times() {
+        let mut secrets = delegated();
+        let mut record = arm_record(&secrets);
+        // A presence contract, so each store's heartbeat is worked out.
+        record.arm.presence_contract_id = Some([9; 32]);
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&record.arm.store_contract_id),
+            &record,
+        );
+        for n in 2..=16u8 {
+            let mut other = record.clone();
+            other.arm.store_contract_id = vec![n; 32];
+            save(
+                &mut secrets,
+                &crate::auto_invoice::arm_key(&[n; 32]),
+                &other,
+            );
+        }
+        let deleg = format!("{}watchdeleg:", crate::auto_invoice::AUTO_PREFIX).into_bytes();
+        let before = secrets.reads_under(&deleg);
+        let sent = crate::auto_invoice::heartbeats(&mut secrets, NOW);
+        assert_eq!(sent.len(), 16, "a heartbeat for every store");
+        let heartbeats = secrets.reads_under(&deleg) - before;
+        assert!(
+            heartbeats <= 2,
+            "{heartbeats} delegation reads for 16 heartbeats"
+        );
+        // A tip read answers with every store's status.
+        let tip_id = record.arm.tip_contract_id;
+        let before = secrets.reads_under(&deleg);
+        let statuses =
+            crate::auto_invoice::on_get_answer(&mut secrets, &tip_id, None, &[], NOW).unwrap();
+        assert_eq!(statuses.len(), 16, "a status for every store");
+        let reads = secrets.reads_under(&deleg) - before;
+        assert!(reads <= 2, "{reads} delegation reads for 16 statuses");
+    }
+
+    /// #206: a store's delegation status worked out from the delegations
+    /// read once (`Delegations::status_for_arm`, with the shared pool and
+    /// vouching) is the status worked out for it alone (`status_of`): with a
+    /// watch whose canary is in the pool, a watch an arm names as its canary,
+    /// two bridges, and no payment key. Mutated red by a wrong network check
+    /// on the shared pool, and by vouching from every arm.
+    #[test]
+    fn a_status_from_the_delegations_read_once_is_the_status_alone() {
+        use crate::secrets::RemovableSecrets;
+        let check = |secrets: &MemSecrets| {
+            let read = Delegations::read(secrets);
+            for record in crate::auto_invoice::arms(secrets) {
+                let alone = all_held(secrets)
+                    .into_iter()
+                    .find(|h| {
+                        h.network == record.arm.network
+                            && record.arm.trusted_bridges.contains(&h.bridge)
+                    })
+                    .map(|h| status_of(secrets, &h, NOW));
+                assert_eq!(read.status_for_arm(secrets, &record.arm, NOW), alone);
+            }
+            // The delegated watches, by the per-watch reads this replaced:
+            // the counter and the delegation's own armed stores, read for
+            // each watch.
+            for h in all_held(secrets) {
+                let vouched = |w: &Watched| {
+                    let in_pool = crate::bitcoin::load_payment_xpub(secrets).is_none_or(|x| {
+                        w.canary_index < x.next_index.saturating_add(MAX_UPCOMING_ADDRESSES)
+                    });
+                    !in_pool
+                        && !armed_for(secrets, &h)
+                            .iter()
+                            .any(|r| r.arm.watched_scripts.contains(&w.canary))
+                };
+                let alone: Vec<(Vec<u8>, u32)> = h
+                    .watched
+                    .iter()
+                    .filter(|w| {
+                        h.watched.iter().any(|x| {
+                            x.script == w.script
+                                && TIP.saturating_add(WATCH_NEEDED_BLOCKS) <= x.until_height
+                                && vouched(x)
+                        })
+                    })
+                    .map(|w| (w.script.clone(), w.until_height))
+                    .collect();
+                assert_eq!(read.watched(h.network, &[h.bridge], TIP), alone);
+            }
+        };
+        let mut secrets = delegated();
+        // The first store names watch 8's canary: it no longer vouches.
+        let mut first = arm_record(&secrets);
+        first.arm.watched_scripts.push(script_at(1_008));
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[1; 32]),
+            &first,
+        );
+        let mut h = held(&secrets);
+        h.watched = (0..12u32)
+            .map(|i| Watched {
+                script: script_at(i),
+                until_height: TIP + 10_000,
+                canary: script_at(1_000 + i),
+                canary_contract: [0; 32],
+                // One in the pool; the others clean unless an arm names them.
+                canary_index: if i == 5 { 3 } else { 1_000 + i },
+            })
+            .collect();
+        put_held(&mut secrets, &h);
+        check(&secrets);
+        assert!(
+            Delegations::read(&secrets)
+                .status_for_arm(&secrets, &arm_record(&secrets).arm, NOW)
+                .is_some_and(|s| s.watched > 0),
+            "some watches count, so the comparison is not of zeros"
+        );
+        let counted = Delegations::read(&secrets).watched(h.network, &[h.bridge], TIP);
+        assert_eq!(
+            counted.len(),
+            10,
+            "all but the pool's canary and the named one"
+        );
+        // A second bridge, trusted by a second store only.
+        let other = BridgeId(SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes());
+        let mut second = arm_record(&secrets);
+        second.arm.store_contract_id = vec![2; 32];
+        second.arm.trusted_bridges = vec![other];
+        // Names watch 7's canary, but trusts only the other bridge: it says
+        // nothing about the first delegation.
+        second.arm.watched_scripts = vec![script_at(1_007)];
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[2; 32]),
+            &second,
+        );
+        let watch = get_watch_key(&mut secrets).unwrap();
+        let mut grant = grant_on(other, watch, sender_height(FLOOR), 0);
+        grant.inbox_contract_id = [0x2d; 32];
+        set_delegation(&mut secrets, grant, NOW).unwrap();
+        let mut h2 = load_held(&secrets, &other).unwrap();
+        h2.watched = h.watched.clone();
+        put_held(&mut secrets, &h2);
+        check(&secrets);
+        // A delegation, and a store, on a network the payment key is not
+        // on: no pool for it.
+        let mut h3 = load_held(&secrets, &other).unwrap();
+        h3.network = BitcoinNetwork::Testnet4;
+        put_held(&mut secrets, &h3);
+        second.arm.network = BitcoinNetwork::Testnet4;
+        save(
+            &mut secrets,
+            &crate::auto_invoice::arm_key(&[2; 32]),
+            &second,
+        );
+        let tip: TipCache = load(&secrets, &tip_key(BitcoinNetwork::Signet)).unwrap();
+        save(&mut secrets, &tip_key(BitcoinNetwork::Testnet4), &tip);
+        check(&secrets);
+        // No payment key.
+        assert!(secrets.remove_secret(crate::bitcoin::BITCOIN_PAYMENT_XPUB_KEY));
+        assert!(Delegations::read(&secrets).upcoming().is_empty());
+        check(&secrets);
     }
 
     /// Two delegations with work take turns, the least recently read first.
@@ -3283,7 +3726,7 @@ mod tests {
         let mut secrets = delegated();
         let key = crate::auto_invoice::arm_key(&[1; 32]);
         let mut record = arm_record(&secrets);
-        record.arm.watched_scripts = (0..10).map(script_at).collect();
+        record.arm.watched_scripts = (0..P).map(script_at).collect();
         record.arm.watched_until_height = Some(TIP + MAX_WATCH_AHEAD_BLOCKS);
         record.watched_until_ms = NOW + 30 * 24 * 60 * 60 * 1000;
         save(&mut secrets, &key, &record);

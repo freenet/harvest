@@ -1315,6 +1315,15 @@ mod tests {
             closure.contains("ifletErr(e)=result{letmutstate=crate::gateway::APP_STATE.write();state.closes_sent.remove(&owner);"),
             "a close that could not be sent must not hold back the next one"
         );
+        // No notice when the close is handed over: it would outlive the
+        // card's "Closing..." line and sit beside a store shown closed.
+        let sent = &closure[closure.find("submit_close_by_id(").expect("the send")..];
+        let sent = &sent[..sent.find("self.closes_ready").expect("the host branch")];
+        assert_eq!(
+            sent.matches("notifications").count(),
+            1,
+            "only the failure is told: {sent}"
+        );
         let messages = code(include_str!("components/message_view.rs"));
         let counted = &messages[messages
             .find("fnrequests_awaiting_invoice_by_tag(")
@@ -1324,14 +1333,34 @@ mod tests {
             "a closed store's requests are not counted"
         );
         let my_store = code(include_str!("components/my_store.rs"));
+        // Each store's Close button carries its own label (its code beside a
+        // twin's name), in the stores' order.
+        assert!(my_store.contains(".map(|(s,_)|close_button_label(s,&stores))"));
+        assert!(my_store.contains("for((s,this),label)instores.iter().cloned().zip(labels){"));
+        assert!(my_store.contains("move|_|confirming.set(Some(target.clone()))},\"{label}\""));
         assert!(
             my_store.contains(".begin_own_store_creation(fingerprint.clone(),vk_bytes,details);")
         );
         assert!(my_store.contains("}elseiflegacy_movable&&gate_open{"));
         assert!(my_store
             .contains("letgate=APP_STATE.read().store_creation_gate(&fingerprint,&vk_bytes);"));
+        // Every other component file: store opening spans several pages.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/components");
+        let elsewhere: usize = std::fs::read_dir(dir)
+            .expect("components dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "my_store.rs")
+            })
+            .map(|path| {
+                code(&std::fs::read_to_string(path).expect("read component"))
+                    .matches("another_store")
+                    .count()
+            })
+            .sum();
         assert_eq!(
-            my_store.matches("another_store").count(),
+            my_store.matches("another_store").count() + elsewhere,
             1,
             "the UI never asks for a second store on purpose"
         );

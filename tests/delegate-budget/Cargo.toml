@@ -1,0 +1,52 @@
+# Deliberately its own workspace, like `tests/rehearsal`: this harness is NOT a
+# member of the Harvest workspace, so building or locking it can never move a
+# dependency version that the contracts and the delegate compile against --
+# and therefore can never re-key an artifact. See README.md.
+[workspace]
+
+[package]
+name = "harvest-delegate-budget"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The request types the Harvest web app sends, so a renamed or reshaped
+# request is a compile error here rather than a harness that measures an
+# "unknown variant" refusal. `custody` for the wrap/unwrap types.
+harvest-common = { path = "../../common", features = ["custody"] }
+ghostkey-common = "0.3"
+# The version the delegate is built on: the inbound message, the origin and
+# the result are encoded with THIS crate's bincode layout. No `contract`
+# feature -- that is the guest side.
+freenet-stdlib = { version = "0.8.5" }
+# Genuine SPV fixtures for a paid order (KeepPurchase), as tests/rehearsal
+# builds them.
+freenet-bitcoin-common = { git = "https://github.com/freenet/freenet-bitcoin", branch = "main", features = ["test-support"] }
+# The runtime freenet-core runs delegates on (47.x). Fuel metering is what
+# makes the check deterministic; see README.md.
+wasmtime = { version = "47", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
+anyhow = "1"
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Seeded, so every run hands the delegate the same "random" bytes and the fuel
+# numbers are identical run to run.
+rand_chacha = "0.3"
+rand_core = "0.6"
+bs58 = { version = "0.5", features = ["check"] }
+blake3 = "1"
+# Mailbox fixtures, encrypted as `harvest_common::sealed` does but with a
+# seeded nonce (see `fixtures::encrypt_message_seeded`).
+aes-gcm = "0.10"
+# The delegate's own BIP-32 derivation (`delegates/harvest-delegate/src/bip32.rs`,
+# compiled in by path), so published-script fixtures are the addresses the
+# configured account key really derives. Same versions and features as the
+# delegate's.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hmac = { version = "0.12", default-features = false }
+ripemd = { version = "0.1", default-features = false }
+sha2 = "0.10"
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }

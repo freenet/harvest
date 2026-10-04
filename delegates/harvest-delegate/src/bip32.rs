@@ -224,7 +224,7 @@ impl AccountXpub {
 /// one more derivation.
 ///
 /// Exists so that recovering the derivation counter from a store's published
-/// orders (see `crate::bitcoin::apply_published_floor`) pays one child
+/// orders (see `crate::bitcoin::advance_scan`) pays one child
 /// derivation per index scanned instead of two.
 pub struct ExternalChain {
     key: [u8; 33],

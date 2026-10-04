@@ -321,14 +321,25 @@ pub(crate) fn invoices_issued_by(
 /// The payout wallet, as the seller's Settings shows it.
 #[component]
 pub fn PayoutWallet() -> Element {
-    let (xpub, xpub_loaded) = {
+    let (xpub, xpub_loaded, catching_up) = {
         let state = APP_STATE.read();
         (
             state.bitcoin.payment_xpub.clone(),
             state.bitcoin.payment_xpub_loaded,
+            !state.catch_up_lines().is_empty(),
         )
     };
     rsx! {
+        // What it means, above the panel (U1); the progress itself is in the
+        // notification bar, shown once (#206 review).
+        if catching_up {
+            p { class: "text-muted",
+                "Harvest is checking your key against your earlier orders, a few hundred \
+                 addresses at a time, and carries on by itself: keep this page open until it \
+                 has finished. The key on file, if any, stays in use until a new one is saved, \
+                 and invoices wait."
+            }
+        }
         PaymentKeyPanel { xpub, xpub_loaded }
     }
 }
@@ -461,18 +472,9 @@ fn PaymentKeyForm(replacing: bool, on_done: EventHandler<()>) -> Element {
 }
 
 fn save_payment_key(xpub: String, network: BitcoinNetwork) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = bitcoin_ops::set_payment_xpub(xpub, network).await {
-            dioxus::logger::tracing::error!("Failed to send the payment key: {e}");
-            APP_STATE
-                .write()
-                .notifications
-                .push(format!("Could not save your payout wallet: {e}"));
-        }
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (xpub, network, bitcoin_ops::set_payment_xpub);
+    // Every send it makes reports its own failure, and withdraws what it
+    // registered (`state::spawn_bitcoin_requests`).
+    bitcoin_ops::set_payment_xpub(xpub, network);
 }
 
 /// The confirmations a seller typed, or why an order may not require that

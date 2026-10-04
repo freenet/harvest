@@ -2059,6 +2059,7 @@ mod tests {
             kind: harvest_common::listing::ListingKind::Sale,
             price: None,
             created_at: chrono::DateTime::UNIX_EPOCH,
+            images: Vec::new(),
         };
         assert_eq!(
             missing_choice(&listing, &["".into(), "Blue".into()], false).as_deref(),

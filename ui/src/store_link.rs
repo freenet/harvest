@@ -245,7 +245,7 @@ pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
 }
 
 /// Fetch the store with this address with a subscription, giving up after
-/// [`LINK_LOAD_TIMEOUT_MS`] so a page showing it never waits for good. For a
+/// `LINK_LOAD_TIMEOUT_MS` so a page showing it never waits for good. For a
 /// store whose code this node does not know, too. Called when a page that
 /// shows the store opens (`components::app::load_store_for_page`).
 pub fn fetch_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {

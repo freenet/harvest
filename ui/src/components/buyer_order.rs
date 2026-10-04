@@ -636,8 +636,12 @@ pub(crate) fn ReportPage(at: OrderAt, order: OrderId) -> Element {
         h2 { class: "page-h", "Report a problem" }
         p { class: "page-meta",
             "{item}"
-            // Not when the item is already named by its store.
-            if let Some(ref name) = store_name.as_ref().filter(|n| !item.contains(n.as_str())) {
+            // Not when the item is already named by its store ("An order
+            // from {store}"); a store name inside an item's own name is not.
+            if let Some(ref name) = store_name
+                .as_ref()
+                .filter(|n| item.as_str() != super::purchases_view::unnamed_order(Some(n.as_str())).as_str())
+            {
                 " \u{00b7} {name}"
             }
         }

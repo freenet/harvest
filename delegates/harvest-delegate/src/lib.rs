@@ -4,6 +4,7 @@ mod auto_invoice;
 mod background;
 mod bip32;
 mod bitcoin;
+mod fast_cbor;
 mod handlers;
 mod import;
 mod kept_purchases;
@@ -13,6 +14,7 @@ mod messaging;
 mod migration;
 mod node_glue;
 mod origin;
+mod published_set;
 mod secrets;
 mod store_keys;
 mod watch_delegation;
@@ -512,6 +514,7 @@ mod boundary_tests {
             xpub: A_VALID_ZPUB.to_string(),
             network: BitcoinNetwork::Bitcoin,
             published_scripts: Vec::new(),
+            resume: false,
         })
         .expect("cbor");
 
@@ -695,6 +698,7 @@ mod boundary_tests {
             // peek reads the seller's next payment addresses.
             to_cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(harvest_common::delegate::AutoInvoiceArm {
+                    vetted_scripts: Vec::new(),
                     store_contract_id: vec![3u8; 32],
                     store_verifying_key: [5u8; 32],
                     mailbox_contract_id: [6u8; 32],

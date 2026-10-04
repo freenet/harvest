@@ -145,9 +145,16 @@ fn held<S: SecretStore>(store: &S, key: &[u8]) -> Option<KeptPurchase> {
 /// The receipt seed of the conversation with public key `conversation`, if
 /// this delegate holds it.
 fn conversation_seed<S: SecretStore>(store: &S, conversation: &[u8; 32]) -> Option<[u8; 32]> {
-    crate::messaging::held_conversation_secrets(store)
-        .into_iter()
-        .find(|secret| PublicKey::from(&StaticSecret::from(*secret)).as_bytes() == conversation)
+    // By its key first; the scan of every conversation only when that finds
+    // nothing, which no conversation this delegate files can cause.
+    crate::messaging::conversation_secret_for_tag(store, conversation)
+        .or_else(|| {
+            crate::messaging::held_conversation_secrets(store)
+                .into_iter()
+                .find(|secret| {
+                    PublicKey::from(&StaticSecret::from(*secret)).as_bytes() == conversation
+                })
+        })
         .map(|secret| harvest_common::mailbox::buyer_receipt_seed_from_secret(&secret))
 }
 
@@ -344,6 +351,8 @@ pub(crate) mod fixtures {
             created_at: 1_700_000_000,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         assert!(store.set_secret(
             &crate::messaging::buyer_conversation_key(&[3u8; 32], &conversation(c)),
@@ -413,7 +422,7 @@ pub(crate) mod fixtures {
 
     /// A bridge-signed proof that `order` was paid; `seed` varies the block,
     /// so two seeds are two different, equally valid proofs.
-    fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
+    pub(crate) fn proof(order: &Order, seed: u8) -> OrderPaymentProof {
         let bridge = bridge_key();
         let (spv, txid, block_hash) = payment_proof(
             &order.payment_script_pubkey,
@@ -571,6 +580,31 @@ mod tests {
         let mut secrets = MemSecrets::default();
         hold_conversation(&mut secrets, c);
         secrets
+    }
+
+    /// #206: a conversation filed under a key that does not end in its own
+    /// tag (none this delegate files, but a key is only a name) is still
+    /// found, by the scan the tag lookup falls back to. Mutated red by
+    /// dropping the fallback.
+    #[test]
+    fn a_conversation_filed_under_another_name_is_still_found() {
+        let mut secrets = MemSecrets::default();
+        let record = crate::messaging::BuyerConversationRecord {
+            secret: harvest_common::delegate::ConversationSecret(conversation_secret(1)),
+            seller_public_key: [5u8; 32],
+            conversation_id: [1; 32],
+            created_at: 1_700_000_000,
+            backed_up: false,
+            imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
+        };
+        assert!(secrets.set_secret(
+            &crate::messaging::buyer_conversation_key(&[3u8; 32], &conversation(2)),
+            &to_cbor(&record).expect("encode"),
+        ));
+        assert_eq!(conversation_seed(&secrets, &conversation(1)), Some(seed(1)));
+        assert_eq!(conversation_seed(&secrets, &conversation(2)), None);
     }
 
     /// **The buyer keeps the seller-signed terms before paying, with the

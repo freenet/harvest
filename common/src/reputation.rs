@@ -148,7 +148,7 @@ pub struct ComplaintTerms {
 ///   same terms. Neither can change what the buyer signed -- the order, the
 ///   category and the block -- and the tie-break ranks what the buyer signed
 ///   first, so they choose only among copies of ONE buyer statement
-///   ([`Complaint::canonical_rank`]).
+///   (`Complaint::canonical_rank`).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Complaint {
     /// The order, at `Paid`, with its seller-signed terms and its evidence.
@@ -477,7 +477,7 @@ impl ReputationStateV1 {
     /// # At most [`MAX_COMPLAINTS`]
     ///
     /// Each order keeps its lowest-ranked complaint
-    /// ([`Complaint::canonical_rank`]), and of those, the `MAX_COMPLAINTS`
+    /// (`Complaint::canonical_rank`), and of those, the `MAX_COMPLAINTS`
     /// nearest their payment stay, the order id breaking ties (R5-C). That
     /// is "the first N orders of one total order over complaints", which is
     /// a function of the union of everything ever merged,

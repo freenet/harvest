@@ -33,7 +33,7 @@
 //!   single-app acknowledgement for that reason. Harvest's delegate does serve
 //!   one app, but the prefix is free and stays correct if that changes.
 
-use freenet_migrate::{ExportRequest, ExportScope, OriginPolicy, SecretStore};
+use freenet_migrate::{ExportScope, OriginPolicy, SecretStore};
 use freenet_stdlib::prelude::{DelegateCtx, DelegateError, MessageOrigin, OutboundDelegateMsg};
 use harvest_common::migration::{HarvestMigrationRequest, SECRET_KEY_PREFIX};
 
@@ -72,8 +72,8 @@ fn export_scope() -> ExportScope {
 /// export can reach.
 struct WithoutStoreKeys<'a, S>(&'a S);
 
-/// Store keys, which custody recovers, and instant checkout's state that
-/// describes only this node (its arms, which the UI re-arms, its tip cache and
+/// Store keys, which custody recovers, the payment scans' node-local state,
+/// and instant checkout's state that describes only this node (its arms, which the UI re-arms, its tip cache and
 /// its exported marker). Instant checkout's LEDGERS do go: they hold the
 /// sales whose payments are still to come off the stock
 /// (`auto_invoice::Ledger::sales`).
@@ -81,6 +81,12 @@ fn is_store_key(key: &[u8]) -> bool {
     key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())
         || (key.starts_with(crate::auto_invoice::AUTO_PREFIX.as_bytes())
             && !crate::auto_invoice::is_ledger_key(key))
+        // The published list's count and this node's scan cursors: a
+        // successor rebuilds or does without them
+        // (`published_set`). The list itself goes.
+        || key == crate::published_set::PUBLISHED_META_KEY
+        || key == crate::published_set::CURSOR_ACTIVE_KEY
+        || key == crate::published_set::CURSOR_PENDING_KEY
 }
 
 impl<S: SecretStore> SecretStore for WithoutStoreKeys<'_, S> {
@@ -119,16 +125,56 @@ fn export<S: SecretStore + crate::secrets::RemovableSecrets>(
     source_generation: u32,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let policy = origin_policy()?;
-    let out = freenet_migrate::handle_export_request(
+    let payload = export_payload(
         &WithoutStoreKeys(&*store),
         origin,
         &policy,
-        &export_scope(),
-        &ExportRequest { source_generation },
+        source_generation,
     )
     .map_err(|e| DelegateError::Other(format!("export refused: {e:?}")))?;
     crate::auto_invoice::disarm_all(store);
-    Ok(out)
+    Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+        freenet_stdlib::prelude::ApplicationMessage::new(payload).processed(true),
+    )])
+}
+
+/// What `freenet_migrate::handle_export_request` answers for this
+/// delegate's scope, byte for byte, with the encoding done by
+/// [`crate::fast_cbor::encode_exported`] (#206: ciborium's encoding of a full
+/// export ran to twice a call's budget).
+///
+/// The crate's steps, in its order: authorize the origin (fail closed), refuse
+/// when the host's whole-scope enumeration is at its cap (a truncated listing
+/// may have dropped keys under the prefix), list the prefix, read each value.
+/// The crate also drops its reserved `\0freenet-migrate/` markers; none can
+/// match the `harvest:` prefix this export uses, so none appear here.
+/// `the_fast_export_is_the_crates_export` pins the equality.
+fn export_payload<S: SecretStore>(
+    store: &S,
+    origin: Option<&MessageOrigin>,
+    policy: &OriginPolicy,
+    source_generation: u32,
+) -> Result<Vec<u8>, freenet_migrate::MigrateError> {
+    policy.authorize(origin)?;
+    let all = store.list_secrets(b"");
+    if all.len() >= freenet_migrate::HOST_ENUMERATION_CAP {
+        return Err(freenet_migrate::MigrateError::TruncatedExport {
+            returned: all.len(),
+            cap: freenet_migrate::HOST_ENUMERATION_CAP,
+        });
+    }
+    let ExportScope::Prefix(prefix) = export_scope() else {
+        unreachable!("this delegate exports by prefix")
+    };
+    let secrets: Vec<(Vec<u8>, Vec<u8>)> = store
+        .list_secrets(&prefix)
+        .into_iter()
+        .filter_map(|key| store.get_secret(&key).map(|value| (key, value)))
+        .collect();
+    Ok(crate::fast_cbor::encode_exported(
+        source_generation,
+        &secrets,
+    ))
 }
 
 /// Handle a migration request from a successor generation.
@@ -156,7 +202,7 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_migrate::MigrateError;
+    use freenet_migrate::{ExportRequest, MigrateError};
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::collections::BTreeMap;
 
@@ -478,5 +524,184 @@ mod tests {
                 String::from_utf8_lossy(&key)
             );
         }
+    }
+
+    /// The export this delegate answers is the crate's, byte for byte, for
+    /// the same store, origin and scope; it carries no store key; and it
+    /// refuses what the crate refuses. Mutated red by changing the scope.
+    /// (Both sides read through the same filter, so the store keys' absence
+    /// is checked on its own.)
+    #[test]
+    fn the_fast_export_is_the_crates_export() {
+        let mut s = store();
+        s.0.insert(
+            format!("{}abc", crate::store_keys::STORE_KEY_PREFIX).into_bytes(),
+            vec![1; 32],
+        );
+        let wrapped = WithoutStoreKeys(&s);
+        let policy = origin_policy().unwrap();
+        let crates = freenet_migrate::handle_export_request(
+            &wrapped,
+            Some(&harvest_origin()),
+            &policy,
+            &export_scope(),
+            &ExportRequest {
+                source_generation: 29,
+            },
+        )
+        .unwrap();
+        let OutboundDelegateMsg::ApplicationMessage(m) = &crates[0] else {
+            panic!("an application message");
+        };
+        let payload = export_payload(&wrapped, Some(&harvest_origin()), &policy, 29).unwrap();
+        assert_eq!(payload, m.payload);
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        assert!(!exported.secrets.is_empty());
+        assert!(exported
+            .secrets
+            .iter()
+            .all(|(key, _)| !key.starts_with(crate::store_keys::STORE_KEY_PREFIX.as_bytes())));
+        assert!(export_payload(&wrapped, None, &policy, 29).is_err());
+    }
+
+    /// #206: a migration of an instant-checkout state at its caps -- sixteen
+    /// ledgers each full, one with a retry pending -- goes through this
+    /// delegate's export and its successor's import whole: every ledger
+    /// arrives equal, and the retry reaches the flag the wake-up reads. The
+    /// export's bytes are the crate's (`the_fast_export_is_the_crates_export`)
+    /// so an export from before this change imports the same way. Mutated
+    /// red by dropping a ledger from the export.
+    #[test]
+    fn full_ledgers_migrate_whole() {
+        use crate::auto_invoice::{ledger_key, Ledger, Sale};
+        use harvest_common::listing::ListingId;
+        use harvest_common::payment::OrderId;
+        let id = |tag: u8, i: usize| {
+            let mut b = [tag; 32];
+            b[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            b
+        };
+        let mut s = store();
+        let mut ledgers = Vec::new();
+        for arm in 0..16u8 {
+            let ledger = Ledger {
+                seen: (0..1024).map(|i| id(arm, i)).collect(),
+                answered: (0..1024).map(|i| id(arm ^ 0x40, i)).collect(),
+                issued_at_ms: (0..99).collect(),
+                sales: (0..2048)
+                    .map(|i| Sale {
+                        order: OrderId(id(arm ^ 0x80, i)),
+                        listing: ListingId(id(arm ^ 0xc0, i % 64)),
+                        quantity: 1,
+                        issued_at_ms: 1,
+                        anchor_height: 1,
+                        decremented: None,
+                    })
+                    .collect(),
+                settled: (0..1024).map(|i| OrderId(id(arm ^ 0x20, i))).collect(),
+                gap_orders: (0..1500)
+                    .map(|i| (OrderId(id(arm ^ 0x10, i)), i as u32))
+                    .collect(),
+                retry_pending: arm == 3,
+                ..Default::default()
+            };
+            let key = ledger_key(&[arm; 32]);
+            s.set_secret(&key, &harvest_common::to_cbor(&ledger).unwrap());
+            ledgers.push((key, ledger));
+        }
+        let payload = export_payload(
+            &WithoutStoreKeys(&s),
+            Some(&harvest_origin()),
+            &origin_policy().unwrap(),
+            29,
+        )
+        .unwrap();
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        let mut successor = crate::secrets::MemSecrets::default();
+        for (key, value) in &exported.secrets {
+            let _ = crate::import::import_secret(&mut successor, key, value);
+        }
+        for (key, ledger) in &ledgers {
+            let held: Ledger =
+                harvest_common::from_cbor(&successor.get_secret(key).expect("imported")).unwrap();
+            assert_eq!(&held, ledger);
+            let flag = crate::auto_invoice::retry_key_for_ledger(key).unwrap();
+            let want: &[u8] = if ledger.retry_pending { b"1" } else { b"0" };
+            assert_eq!(successor.get_secret(&flag).as_deref(), Some(want));
+        }
+    }
+
+    /// What the buyer and the seller noted on their conversations (sent
+    /// digests, the buyer's seen time) reaches the successor through the
+    /// export and its import. Mutated red by refusing either family on
+    /// import, or hiding it from the export.
+    #[test]
+    fn sent_digests_and_seen_times_migrate() {
+        use crate::messaging::{
+            list_buyer_conversations, list_seller_sent, mark_conversation_seen, note_buyer_sent,
+            note_seller_sent, store_buyer_conversation, BuyerConversationRecord,
+        };
+        use harvest_common::{ConversationSecret, HarvestDelegateResponse as R};
+        let id = [3u8; 32];
+        let secret = x25519_dalek::StaticSecret::from([5u8; 32]);
+        let tag = *x25519_dalek::PublicKey::from(&secret).as_bytes();
+        let mut predecessor = crate::secrets::MemSecrets::default();
+        store_buyer_conversation(
+            &mut predecessor,
+            1,
+            &id,
+            &BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: [9u8; 32],
+                conversation_id: [1u8; 32],
+                created_at: 1,
+                backed_up: false,
+                imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
+            },
+        );
+        note_buyer_sent(&mut predecessor, 2, &id, &tag, &[7u8; 32]);
+        mark_conversation_seen(&mut predecessor, 3, &id, &tag, 1_234);
+        note_seller_sent(&mut predecessor, 4, &[2u8; 32], &[1u8; 32], &[8u8; 32]);
+        let payload = export_payload(
+            &WithoutStoreKeys(&predecessor),
+            Some(&harvest_origin()),
+            &origin_policy().unwrap(),
+            30,
+        )
+        .unwrap();
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        let mut successor = crate::secrets::MemSecrets::default();
+        for (key, value) in &exported.secrets {
+            let _ = crate::import::import_secret(&mut successor, key, value);
+        }
+        let R::BuyerConversationList { conversations, .. } =
+            list_buyer_conversations(&successor, 5, &id)
+        else {
+            panic!("a list")
+        };
+        assert_eq!(conversations[0].sent_digests, vec![[7u8; 32]]);
+        assert_eq!(conversations[0].seen_ms, Some(1_234));
+        let R::SellerSent { result, .. } = list_seller_sent(&successor, 6, &[2u8; 32]) else {
+            panic!("a list")
+        };
+        assert_eq!(result, Ok(vec![([1u8; 32], [8u8; 32])]));
+    }
+
+    /// At the host's enumeration cap the export is refused, as the crate
+    /// refuses it, rather than shipping a list that may be missing keys.
+    /// Mutated red by dropping the check.
+    #[test]
+    fn a_full_scope_is_refused_not_truncated() {
+        let mut s = store();
+        for i in 0..freenet_migrate::HOST_ENUMERATION_CAP {
+            s.0.insert(format!("harvest:filler:{i}").into_bytes(), vec![1]);
+        }
+        let policy = origin_policy().unwrap();
+        assert!(matches!(
+            export_payload(&WithoutStoreKeys(&s), Some(&harvest_origin()), &policy, 29),
+            Err(freenet_migrate::MigrateError::TruncatedExport { .. })
+        ));
     }
 }

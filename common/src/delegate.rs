@@ -246,6 +246,62 @@ pub enum HarvestDelegateRequest {
         buyer_public_key: [u8; 32],
     },
 
+    /// Record that THIS browser sent the mailbox entry with `digest`
+    /// ([`crate::mailbox::entry_digest`]) in one kept conversation, so "You"
+    /// survives a reload: the digest is the authorship record, and a tab
+    /// forgets it. Kept in the conversation's own record, at most
+    /// [`MAX_SENT_DIGESTS`] of them (the oldest go), and handed back on
+    /// [`RecalledConversation::sent_digests`]. A digest reveals nothing the
+    /// conversation's keys do not. Answered with
+    /// [`HarvestDelegateResponse::BuyerConversationUpdated`].
+    NoteBuyerSent {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        /// Which conversation, by routing tag.
+        buyer_public_key: [u8; 32],
+        digest: [u8; 32],
+    },
+
+    /// Record when the buyer last looked at one kept conversation: the time,
+    /// in unix milliseconds, of the newest message they have seen in it. A
+    /// store's reply newer than this is a "New reply". Never lowered (the
+    /// later of the held and the sent time is kept), so two tabs cannot
+    /// make a seen reply new again. A message's time is its writer's to
+    /// choose, so the UI clamps what it sends to `PRESENCE_SKEW_MS` past its
+    /// own clock: a reply dated far ahead cannot pin this. Handed back on
+    /// [`RecalledConversation::seen_ms`]; held in the conversation's record,
+    /// so it is capped with it and goes when it is forgotten or evicted.
+    /// Fire-and-forget: answered with
+    /// [`HarvestDelegateResponse::BuyerConversationUpdated`].
+    MarkConversationSeen {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
+        seen_ms: u64,
+    },
+
+    /// The seller's half of [`Self::NoteBuyerSent`]: this seller's browser
+    /// sent the mailbox entry with `digest` in the conversation with routing
+    /// tag `conversation`, for the store whose verifying key is `store_key`.
+    /// By the store KEY, not the contract id: the key outlives a store
+    /// contract's re-key, and what was sent before one is still this
+    /// seller's. Kept per store, the newest [`MAX_SELLER_SENT_PER_STORE`]
+    /// across its conversations, for at most [`MAX_SELLER_SENT_STORES`]
+    /// stores. Answered with [`HarvestDelegateResponse::SellerSentNoted`].
+    NoteSellerSent {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        conversation: [u8; 32],
+        digest: [u8; 32],
+    },
+
+    /// Every digest [`Self::NoteSellerSent`] kept for one store. Answered
+    /// with [`HarvestDelegateResponse::SellerSent`].
+    ListSellerSent {
+        request_id: RequestId,
+        store_key: [u8; 32],
+    },
+
     // === Listing Management ===
     /// Create and sign a new listing using the seller's ghostkey.
     CreateListing {
@@ -681,6 +737,16 @@ pub struct AutoInvoiceArm {
     /// presence: no heartbeat is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_contract_id: Option<[u8; 32]>,
+    /// The next addresses whose address contracts the tab has read clear, in
+    /// order from the counter, cut before the first found used (harvest#198).
+    /// What the delegate's own delegated watches may count for and renew;
+    /// [`Self::watched_scripts`] is what the tab itself had watched. Two
+    /// lists, because the second must stay exactly what the bridge was asked
+    /// for while the first must survive a tab load before the tab knows its
+    /// own watches again. Empty from an older UI: the delegation then counts
+    /// for nothing (fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vetted_scripts: Vec<Vec<u8>>,
 }
 
 /// How auto-invoicing stands for one store: see
@@ -713,7 +779,13 @@ pub struct AutoInvoiceStatus {
     /// listed for two weeks from when it was found.
     #[serde(default)]
     pub oversold: Vec<crate::payment::OrderId>,
-    /// Why the next request would wait for the seller, if it would.
+    /// Why the store is not taking orders, if it is not: the reason the
+    /// delegate would turn every Buy now away (a lapsed watch, no payment
+    /// key or one for another network, no recent block, every watched
+    /// address used, the store closed or not this seller's, the payment
+    /// counter catching up or not saved, an unreadable ledger), in its own
+    /// words. `None` exactly when the store's heartbeat says taking orders,
+    /// apart from an unreadable ledger, which a heartbeat does not read.
     pub paused: Option<String>,
     /// When, in the last two weeks, a buyer paid an address past a run of 20
     /// or more unpaid ones: a wallet with the usual gap limit may not show
@@ -987,6 +1059,32 @@ pub enum HarvestDelegateResponse {
         result: Result<bool, String>,
     },
 
+    /// The answer to [`HarvestDelegateRequest::NoteBuyerSent`] and
+    /// [`HarvestDelegateRequest::MarkConversationSeen`]: `Ok(false)` when
+    /// this delegate holds no such conversation (nothing is created), `Err`
+    /// when the node refused the write.
+    BuyerConversationUpdated {
+        request_id: RequestId,
+        store_contract_id: Vec<u8>,
+        buyer_public_key: [u8; 32],
+        result: Result<bool, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::NoteSellerSent`].
+    SellerSentNoted {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        result: Result<(), String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::ListSellerSent`]: each kept
+    /// `(conversation tag, entry digest)`, oldest first.
+    SellerSent {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        result: Result<Vec<SellerSentEntry>, String>,
+    },
+
     /// Whether a conversation was actually removed.
     ///
     /// `Ok(())` means the record is gone from the node's secret store, not
@@ -1193,7 +1291,7 @@ pub enum HarvestDelegateResponse {
 /// message read as a reply -- see [`crate::mailbox::MessageDirection`].
 ///
 /// `Debug` prints the peer key and redacts both conversation keys; see
-/// [`Redacted`].
+/// `Redacted`.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct ConversationKey {
     /// The buyer ephemeral public key these were derived against, echoed back
@@ -1215,7 +1313,7 @@ pub struct ConversationKey {
 /// `the_secret_never_leaves_the_delegate`.
 ///
 /// The two direction keys are still secrets -- each reads or forges one side
-/// of the thread -- so `Debug` redacts them; see [`Redacted`].
+/// of the thread -- so `Debug` redacts them; see `Redacted`.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RecalledConversation {
     /// The conversation's routing tag, which is what matches it to messages
@@ -1293,7 +1391,39 @@ pub struct RecalledConversation {
     /// but the user saying so can clear it. See
     /// [`HarvestDelegateRequest::MarkConversationBackedUp`].
     pub backed_up: bool,
+    /// The entries this buyer's browsers sent in this conversation
+    /// ([`HarvestDelegateRequest::NoteBuyerSent`]), oldest first, at most
+    /// [`MAX_SENT_DIGESTS`]: what "You" is given to after a reload.
+    /// `serde(default)`: an older delegate's answer has none.
+    #[serde(default)]
+    pub sent_digests: Vec<[u8; 32]>,
+    /// When the buyer last looked at this conversation, in unix ms
+    /// ([`HarvestDelegateRequest::MarkConversationSeen`]). `None` when never
+    /// recorded, and from an older delegate.
+    #[serde(default)]
+    pub seen_ms: Option<u64>,
 }
+
+/// The most sent-entry digests one kept conversation holds
+/// ([`HarvestDelegateRequest::NoteBuyerSent`]): past it the oldest go, and
+/// the buyer's oldest messages read "Not confirmed as yours" after a reload.
+/// A mailbox holds at most 512 entries across every conversation
+/// ([`crate::mailbox::MAX_MESSAGES`]), and one buyer writing more than this
+/// many into one conversation is far past ordinary use.
+pub const MAX_SENT_DIGESTS: usize = 128;
+
+/// The most `(conversation, digest)` pairs the delegate keeps for one store
+/// ([`HarvestDelegateRequest::NoteSellerSent`]): past it the oldest go.
+/// Twice what one mailbox can hold.
+pub const MAX_SELLER_SENT_PER_STORE: usize = 1024;
+
+/// One digest the seller's side keeps ([`HarvestDelegateResponse::SellerSent`]):
+/// the conversation's routing tag, then the sent entry's digest.
+pub type SellerSentEntry = ([u8; 32], [u8; 32]);
+
+/// The most stores [`HarvestDelegateRequest::NoteSellerSent`] keeps digests
+/// for; a note for one more store is refused.
+pub const MAX_SELLER_SENT_STORES: usize = 64;
 
 /// A conversation the delegate discarded to stay under its cap.
 ///
@@ -1500,6 +1630,8 @@ impl core::fmt::Debug for RecalledConversation {
             .field("created_at", &self.created_at)
             .field("imported", &self.imported)
             .field("backed_up", &self.backed_up)
+            .field("sent_digests", &self.sent_digests.len())
+            .field("seen_ms", &self.seen_ms)
             .finish()
     }
 }
@@ -1743,9 +1875,13 @@ mod tests {
             R::WatchKey { .. } => (31, false),
             // A delegation, which is published in the bridge's inbox.
             R::WatchDelegation { .. } => (32, false),
+            R::BuyerConversationUpdated { .. } => (33, false),
+            R::SellerSentNoted { .. } => (34, false),
+            // Digests of ciphertexts the seller already published.
+            R::SellerSent { .. } => (35, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 33;
+    const RESPONSE_VARIANTS: usize = 36;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1791,9 +1927,13 @@ mod tests {
             // the bridge's inbox.
             Q::SetWatchDelegation { .. } => (30, false),
             Q::UpdateWatchDelegation { .. } => (31, false),
+            Q::NoteBuyerSent { .. } => (32, false),
+            Q::MarkConversationSeen { .. } => (33, false),
+            Q::NoteSellerSent { .. } => (34, false),
+            Q::ListSellerSent { .. } => (35, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 32;
+    const REQUEST_VARIANTS: usize = 36;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -1811,6 +1951,8 @@ mod tests {
             created_at: 1_700_000_000,
             imported: false,
             backed_up: true,
+            sent_digests: vec![[19u8; 32]],
+            seen_ms: Some(20),
         }
     }
 
@@ -2031,6 +2173,22 @@ mod tests {
                 bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
                 result: Ok(watch_delegation_status()),
             },
+            R::BuyerConversationUpdated {
+                request_id: 21,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+                result: Ok(true),
+            },
+            R::SellerSentNoted {
+                request_id: 22,
+                store_key: [3u8; 32],
+                result: Ok(()),
+            },
+            R::SellerSent {
+                request_id: 23,
+                store_key: [3u8; 32],
+                result: Ok(vec![([1u8; 32], [19u8; 32])]),
+            },
         ]
     }
 
@@ -2109,6 +2267,7 @@ mod tests {
                 request_id: 42,
                 ghostkey_fingerprint: fp(),
                 listing: Listing {
+                    images: Vec::new(),
                     checkout: None,
                     choices: Vec::new(),
                     id: crate::listing::ListingId([17u8; 32]),
@@ -2195,6 +2354,7 @@ mod tests {
             Q::ListKeptPurchases,
             Q::ArmAutoInvoice {
                 arm: Box::new(AutoInvoiceArm {
+                    vetted_scripts: Vec::new(),
                     store_contract_id: store(),
                     store_verifying_key: [5u8; 32],
                     mailbox_contract_id: [6u8; 32],
@@ -2230,6 +2390,28 @@ mod tests {
                 bridge: freenet_bitcoin_common::BridgeId([13u8; 32]),
                 inbox_contract_id: [16u8; 32],
                 last_made_at_ms: 18,
+            },
+            Q::NoteBuyerSent {
+                request_id: 21,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+                digest: [19u8; 32],
+            },
+            Q::MarkConversationSeen {
+                request_id: 22,
+                store_contract_id: store(),
+                buyer_public_key: [1u8; 32],
+                seen_ms: 20,
+            },
+            Q::NoteSellerSent {
+                request_id: 23,
+                store_key: [3u8; 32],
+                conversation: [1u8; 32],
+                digest: [19u8; 32],
+            },
+            Q::ListSellerSent {
+                request_id: 24,
+                store_key: [3u8; 32],
             },
         ]
     }
@@ -2358,9 +2540,10 @@ mod tests {
             B::PaymentXpub { .. } => (7, true),
             B::OrderAddress { .. } => (8, false),
             B::UpcomingAddresses { .. } => (9, false),
+            B::PublishedScriptsAdded { .. } => (10, false),
         }
     }
-    const BITCOIN_RESPONSE_VARIANTS: usize = 10;
+    const BITCOIN_RESPONSE_VARIANTS: usize = 11;
 
     /// Every Bitcoin-surface request variant, as for [`classify_response`].
     fn classify_bitcoin_request(r: &crate::BitcoinDelegateRequest) -> (usize, bool) {
@@ -2377,9 +2560,10 @@ mod tests {
             B::GetPaymentXpub => (7, false),
             B::DeriveOrderAddress { .. } => (8, false),
             B::PeekOrderAddresses { .. } => (9, false),
+            B::AddPublishedScripts { .. } => (10, false),
         }
     }
-    const BITCOIN_REQUEST_VARIANTS: usize = 10;
+    const BITCOIN_REQUEST_VARIANTS: usize = 11;
 
     fn watch() -> crate::WatchedPayment {
         crate::WatchedPayment {
@@ -2457,6 +2641,10 @@ mod tests {
                 request_id: 42,
                 result: Ok(vec![]),
             },
+            B::PublishedScriptsAdded {
+                request_id: 42,
+                result: Ok(()),
+            },
         ]
     }
 
@@ -2495,6 +2683,7 @@ mod tests {
                 xpub: SECRET_TEXT.into(),
                 network: freenet_bitcoin_common::BitcoinNetwork::Signet,
                 published_scripts: vec![vec![2u8; 22]],
+                resume: true,
             },
             B::GetPaymentXpub,
             B::DeriveOrderAddress {
@@ -2504,6 +2693,10 @@ mod tests {
             B::PeekOrderAddresses {
                 request_id: 42,
                 count: 10,
+            },
+            B::AddPublishedScripts {
+                request_id: 42,
+                scripts: vec![vec![2u8; 22]],
             },
         ]
     }

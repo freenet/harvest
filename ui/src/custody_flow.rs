@@ -1349,6 +1349,7 @@ mod tests {
                 pending: crate::state::PendingListing {
                     fingerprint: FINGERPRINT.to_string(),
                     listing: harvest_common::listing::Listing {
+                        images: Vec::new(),
                         checkout: None,
                         choices: Vec::new(),
                         id: harvest_common::listing::ListingId([0; 32]),

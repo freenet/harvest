@@ -822,11 +822,7 @@ fn home_content(state: &AppState, store: &SellerStore) -> HomeContent {
     }
     // A closed store's alerts are about its orders only (an oversold
     // order still needs sending), not its selling cap.
-    let alerts = if store.closed {
-        state.instant_checkout_order_alerts(&id)
-    } else {
-        state.instant_checkout_alerts(&id)
-    };
+    let alerts = state.store_alerts(&id, store.closed);
     for alert in alerts {
         notes.push((alert, None));
     }
@@ -1898,6 +1894,7 @@ mod tests {
                 kind: ListingKind::Sale,
                 price: None,
                 created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                images: Vec::new(),
             },
             scoped_payload: Vec::new(),
             signature: Vec::new(),

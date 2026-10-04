@@ -49,6 +49,7 @@ fn signed_listing(title: &str) -> AuthorizedListing {
     // would make every fixture here unmergeable. Distinct titles still give
     // distinct listings, which is all these tests identify them by.
     let listing = Listing {
+        images: Vec::new(),
         checkout: None,
         choices: Vec::new(),
         id: ListingId([0u8; 32]),
@@ -339,6 +340,13 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by the delegated watch key; moves only because
                 // `harvest-common` is compiled into it.
                 "31f745898fb8f8a7a76586422b671cc878ea55d1de6abc9d73843cf79e802f52",
+                // V25, from `git show d73fb6c:ui/public/contracts/store_contract.wasm`,
+                // unchanged through #216. Superseded by listing photos.
+                "baa0eb562d0fd5041eed38c481492e052428549c4fd649e302b29e94a92f341f",
+                // V26, from `git show 57979f8:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#226; moves only because it links
+                // drop glue for the mailbox's `EncryptedMessage`.
+                "8e95714fed08fb474e6ce75de1408ce1d3437f6a58eed22e583bb9e39da95a45",
             ],
         ),
         (
@@ -414,6 +422,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V19, from `git show e275bae:ui/public/contracts/reputation_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "7fee9e1480aa99aec42e0044b4c7b30050ad6bb36670d2cc1d011fcd2b445847",
+                // V20, from `git show d73fb6c:ui/public/contracts/reputation_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "86d20b95428ae8d7b648598c7b8b3d75c0aeabdf72da0fca0e042ca30bfd9c94",
             ],
         ),
         (
@@ -477,6 +489,14 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V18, from `git show e275bae:ui/public/contracts/mailbox_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "537f95a7f8678ef0c4255e11d2cd427b2ce9c4c048f96d1d45b4ec7e46062d89",
+                // V19, from `git show d73fb6c:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "0d22546419ee511415a03d2ce5a36ba0a293a74f7209747aef0d934b643331d6",
+                // V20, from `git show 57979f8:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#226: the message bytes became CBOR
+                // byte strings (a state-encoding change the fold reads).
+                "64fd7bfe4a33571a2161eb5e8c0cc3f2455c44248052b619675641fc67b2579f",
             ],
         ),
         (
@@ -506,6 +526,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V6, from `git show e275bae:ui/public/contracts/index_contract.wasm`.
                 // Superseded by the delegated watch key.
                 "80b868743aa48c6c0ec9791c7a75a125615ea9ae30aa2d2eb6993da7d621d114",
+                // V7, from `git show d73fb6c:ui/public/contracts/index_contract.wasm`.
+                // Superseded by listing photos; moves only because
+                // `harvest-common` is compiled into it.
+                "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a",
             ],
         ),
     ];
@@ -635,6 +659,24 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the generation harvest#179 shipped. Superseded by store subkeys
             // without the RSA record key (harvest#203).
             "d8088bf5f99b0fa8ea415a256482945d28572e643d6a85536663551bbe4a1e2c".to_string(),
+            // V29, from `git show f8f0c3a:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#203 shipped. Superseded by bounded
+            // per-call work (harvest#206).
+            "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03".to_string(),
+            // V30, from `git show d0fede7:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#216 shipped. Superseded by listing photos;
+            // no logic change (the delegate decodes the store state).
+            "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72".to_string(),
+            // V31, from `git show 57979f8:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#215 shipped. Superseded by a heartbeat
+            // that says not taking orders whenever the delegate would refuse,
+            // refusing twins of a buyer's X25519 tag, sent digests and read
+            // state, and the #198 watch rules.
+            "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0".to_string(),
+            // V32, from `git show b84af10:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#221 shipped. Superseded by harvest#226;
+            // its mailbox decoder reads the byte-string encoding too.
+            "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9".to_string(),
         ],
     );
 }
@@ -1168,6 +1210,10 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         // V24: always-open stores (`e275bae`). Still the store key's code,
         // 29B.
         (24, Code),
+        // V25: the delegated watch key (`d73fb6c`). Still the store code, 29B.
+        (25, Code),
+        // V26: listing photos (`57979f8`). Still the store code.
+        (26, Code),
     ]
 };
 
@@ -1498,6 +1544,7 @@ fn the_owner_fill_in_does_not_reassign_a_store_another_key_owns() {
     };
     foreign.listings.listings = vec![{
         let listing = Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),
@@ -3061,5 +3108,62 @@ fn rsa_generation_parameter_bytes_are_pinned() {
         hex,
         "a2727273615f7075626c69635f6b65795f64657283010203736f776e65725f766572696679696e675f6b6579\
          582070df9e2279adbec6d12bf2921184c9222eb24ed852005bf640139f52e59cd9ae"
+    );
+}
+
+/// harvest#226: a predecessor mailbox (V20 and earlier) holds its message
+/// bytes as CBOR integer arrays. The fold must decode it, merge it, and
+/// forward a state in this generation's encoding, which is the only one the
+/// current contract accepts as canonical.
+#[test]
+fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded() {
+    #[derive(serde::Serialize)]
+    struct Earlier {
+        conversation_id: harvest_common::mailbox::ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        nonce: [u8; 24],
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<Earlier>,
+    }
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let older = [message(40, base), message(41, base + 1)];
+    let raw = harvest_common::to_cbor(&EarlierMailbox {
+        messages: older
+            .iter()
+            .map(|m| Earlier {
+                conversation_id: m.conversation_id.clone(),
+                sender_public_key: m.sender_public_key.clone(),
+                ciphertext: m.ciphertext.clone(),
+                timestamp: m.timestamp,
+                nonce: m.nonce,
+            })
+            .collect(),
+    })
+    .unwrap();
+    let recovered = ops
+        .decode(&raw)
+        .expect("the probe decodes a predecessor's encoding");
+    let local = mailbox_with(vec![message(42, base + 2)]);
+    let folded = ops.merge_with_local(recovered, &local);
+    assert_eq!(folded.messages.len(), 3);
+    let forwarded = harvest_common::to_cbor(&folded).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&folded, &forwarded));
+    // A ciphertext of eight 40s is one contiguous run only in the byte-string
+    // form; the integer-array form writes each as `0x18 0x28`.
+    let run = [40u8; 8];
+    assert!(
+        !raw.windows(8).any(|w| w == run),
+        "the predecessor's form is arrays"
+    );
+    assert!(
+        forwarded.windows(8).any(|w| w == run),
+        "forwarded in the byte-string form, not the integer arrays it arrived in"
     );
 }

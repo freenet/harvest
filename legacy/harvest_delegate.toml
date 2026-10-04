@@ -245,3 +245,31 @@ description = "Superseded by store subkeys without the RSA record key: `GetStore
 date = "2026-09-30"
 code_hash = "d8088bf5f99b0fa8ea415a256482945d28572e643d6a85536663551bbe4a1e2c"
 delegate_key = "959b5b786380d1c7a609e00355a69e8d6e2ed05865b9fdfe918b0e381a24c3a8"
+
+[[entry]]
+version = "V29"
+description = "Superseded by bounded per-call work (harvest#206): with every cap filled, three handlers ran past a call's budget under the node's fuel metering, so on a slower or busy node they could reach its 5 s limit. A mailbox at its byte cap took 2.6x the budget to scan (it is now decoded by hand, each digest computed once, and opened in a randomly ordered, cost-bounded batch per run, the rest flagged for the next run); the heartbeat wake-up decoded every arm's whole ledger twice (1.9x; it now reads none, the retry flag lives beside the ledger as the new unexported secret `harvest:auto:retry:*`); the migration export spent 2x on per-byte serde encoding (the export and every outbound payload are now written directly, byte for byte as before). No request, response or import family changed; an imported ledger sets the retry flag. The parameters are unchanged (empty). The generation the subkeys fix shipped (harvest#203, `f8f0c3a`)."
+date = "2026-10-01"
+code_hash = "cbe71dd9536f8e4605cd2e3b71b9dc147213fef33fbd69685f806f31f27c9b03"
+delegate_key = "1c51568325a171b45ff957bceaf61bc05a686b8b2deab53deddb508e96925c6c"
+
+[[entry]]
+version = "V30"
+description = "Superseded by listing photos (harvest images PR 2), which changed `harvest-common`: `Listing` gained `images` (a list of `ListingImage` references, each naming an image contract by the BLAKE3 hash of its bytes, harvest#212), `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]` so every earlier listing encodes, and so is identified and signed, exactly as before; a new `listing_image` module holds the types and the store's bounds on them. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This delegate's behaviour did not change: it decodes the store state (`auto_invoice.rs`) and so carries the new field's decoder, and it never rewrites a listing, so it cannot drop photos. No secret family, request or import family changed. The parameters are unchanged (empty). The generation harvest#216 shipped (`d0fede7`)."
+date = "2026-10-02"
+code_hash = "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72"
+delegate_key = "b8ccb5678c1260d004b6cbac80aec3b6183c72edac836ec7fd4f22e67d8e67c1"
+
+[[entry]]
+version = "V31"
+description = "Superseded by a heartbeat that says not taking orders whenever the delegate would refuse a Buy now: the heartbeat and the status's `paused` now rest on one check, which adds every watched address used (`NoWatchedAddress`) and the store's own refusals (closed, not this seller's), read from the new unexported secret `harvest:auto:store:*` that every read of the store's state writes (`Refused` on import). `AutoInvoiceStatus::paused` now names every such reason. Also superseded by refusing twins of a buyer's X25519 conversation tag (bit 255 set, u at or above p, off the curve, or outside the prime-order subgroup), which share the tag's shared secret: `DeriveConversationKeys` answers no keys for one, and instant checkout takes no request sent under one (harvest#205 review). Also superseded by sent-message digests and read state kept with conversations: new requests `NoteBuyerSent`, `MarkConversationSeen`, `NoteSellerSent`, `ListSellerSent` (answered `BuyerConversationUpdated`, `SellerSentNoted`, `SellerSent`); the kept buyer conversation gained `sent` and `seen_ms` (`#[serde(default)]`, handed back on `RecalledConversation`), merged on import when both sides hold it; new exported secret `harvest:seller_sent:*`, one per store verifying key (import family `SellerSent`, merged). Also superseded by a heartbeat that tells buyers why it is not taking orders (`presence::Heartbeat::reason`, a coarse `NotTakingReason`), which re-keys the presence contract (no registry row for it). Also superseded by harvest#198: delegated watches count, and are renewed, only for scripts an arm names, and `MAX_UPCOMING_ADDRESSES` is 25 (was 10). No other request, response or wire format changed. The parameters are unchanged (empty). The generation listing photos shipped (harvest#215, `57979f8`)."
+date = "2026-10-04"
+code_hash = "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0"
+delegate_key = "23aaca572e973f2ac9bab50b34996efd6ebb5ea8f513aa49b897819bb8ac9607"
+
+[[entry]]
+version = "V32"
+description = "Superseded by harvest#226, which changed `harvest-common`: `EncryptedMessage`'s byte fields are written as CBOR byte strings and the mailbox normalisation computes each digest once. The delegate's hand-written mailbox decoder (`fast_cbor::decode_mailbox`) now reads both the byte-string and the earlier integer-array form. No secret it stores holds an `EncryptedMessage`; the two round-trip contexts that do (`PendingBatch`, `PendingReplies`) are now written in the byte-string form and, through `serde_bytes`, read either. The generation harvest#221 shipped (`b84af10`)."
+date = "2026-10-04"
+code_hash = "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9"
+delegate_key = "015d5a57f0b6cf9d926ae1bdb0f9ef059e8de3f094cef3b26f23f6106a012c3d"

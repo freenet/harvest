@@ -141,9 +141,7 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         return store.needs_you() > 0
             || store.expired_invoices > 0
             || state.wallet_gap_note_due(&store.contract_id).is_some()
-            || !state
-                .instant_checkout_order_alerts(&store.contract_id)
-                .is_empty();
+            || !state.store_alerts(&store.contract_id, true).is_empty();
     }
     store.needs_you() > 0
         || store.unpriced > 0
@@ -153,7 +151,7 @@ pub(crate) fn overview_needs(store: &SellerStore, state: &AppState) -> bool {
         || (store.details_resolved && !store.certificate.is_verified())
         || store.key_conflict.is_some()
         || store.expired_invoices > 0
-        || !state.instant_checkout_alerts(&store.contract_id).is_empty()
+        || !state.store_alerts(&store.contract_id, false).is_empty()
 }
 
 /// Every store this device can manage, by name.
@@ -774,7 +772,11 @@ fn close_button_label(
     store: &crate::closure_flow::SharingStore,
     all: &[(crate::closure_flow::SharingStore, bool)],
 ) -> String {
-    let twins = all.iter().filter(|(s, _)| s.name == store.name).count() > 1;
+    let twins = all
+        .iter()
+        .filter(|(s, _)| crate::closure_flow::same_store_name(&s.name, &store.name))
+        .count()
+        > 1;
     if twins {
         format!("Close {} ({})\u{2026}", store.name, store.code)
     } else {
@@ -1841,6 +1843,7 @@ mod seller_stores_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([n; 32]),
@@ -1901,13 +1904,9 @@ mod seller_stores_tests {
         assert!(super::super::needs::places(&state).is_empty());
     }
 
-    /// Every item the Home tab's "Needs you" card can list makes a store's
-    /// card on Stores say so (`overview_needs`, shared by both), and a store
-    /// still loading is not flagged for what it has not read yet. Red if
-    /// any branch is dropped. (The wallet-gap and instant-checkout alerts
-    /// come from the delegate's status and are read, not set up here.)
     /// Two stores with one name are told apart on their Close buttons by
-    /// code; distinct names need none. Mutated red by never adding it.
+    /// code; distinct names need none, and names that differ only in case or
+    /// spacing count as one. Mutated red by never adding it.
     #[test]
     fn close_buttons_carry_the_code_only_for_same_named_stores() {
         let store = |name: &str, code: &str| crate::closure_flow::SharingStore {
@@ -1934,8 +1933,21 @@ mod seller_stores_tests {
             close_button_label(&apart[1].0, &apart),
             "Close Tea Shop\u{2026}"
         );
+        let spaced = [
+            (store("Bean Shop", "AAA"), true),
+            (store(" bean shop", "BBB"), false),
+        ];
+        assert_eq!(
+            close_button_label(&spaced[1].0, &spaced),
+            "Close  bean shop (BBB)\u{2026}"
+        );
     }
 
+    /// Every item the Home tab's "Needs you" card can list makes a store's
+    /// card on Stores say so (`overview_needs`, shared by both), and a store
+    /// still loading is not flagged for what it has not read yet. Red if
+    /// any branch is dropped. (The wallet-gap and instant-checkout alerts
+    /// come from the delegate's status and are read, not set up here.)
     #[test]
     fn overview_needs_covers_every_item_the_needs_you_card_lists() {
         let mut state = AppState::default();
