@@ -391,6 +391,7 @@ fn FindStore() -> Element {
 fn visited_row_lines(row: &StoreListRow, collides: bool) -> (String, Option<String>) {
     let closed = match (row.closed, row.closed_for_now) {
         (false, _) => None,
+        (true, _) if row.paused => Some("Closed for now"),
         (true, true) => Some("Closed right now"),
         (true, false) => Some("Closed"),
     };
@@ -630,7 +631,14 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
     // #197: presence alone called a store Open whose Buy controls were all
     // hidden).
     let buyer_open = APP_STATE.read().buyer_open(&contract_id, now);
-    let pill = buyer_open.pill();
+    // Closed by the seller's own pause reads "Closed for now", beside the
+    // buyer line saying the same (step 2).
+    let closed_label = closed_pill(presence);
+    let pill = if buyer_open == BuyerOpen::Closed {
+        closed_label
+    } else {
+        buyer_open.pill()
+    };
     let pill_open = buyer_open == BuyerOpen::Open;
     let is_closed = buyer_open == BuyerOpen::Closed;
     // Presence says open, and yet no order can be taken: why, beside the
@@ -824,6 +832,7 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                             && offered_buy(&store, &contract_id, false, &listing.listing, availability, pill_open)
                                 .is_some(),
                         closed: is_closed,
+                        closed_label,
                     }
                 }
             }
@@ -1119,9 +1128,12 @@ fn ListingCard(
     /// The store is closed: greyed, as a sold-out listing is.
     #[props(default)]
     closed: bool,
+    /// What its corner says while the store is closed (`closed_pill`).
+    #[props(default = "Closed")]
+    closed_label: &'static str,
 ) -> Element {
     let l = &listing.listing;
-    let corner = availability_words(&availability, closed);
+    let corner = availability_words(&availability, closed.then_some(closed_label));
     let sold_out = !availability.is_buyable();
 
     rsx! {
@@ -1193,12 +1205,26 @@ fn ListingCard(
     }
 }
 
-/// What a listing's top corner says (after the mockup): "Closed" while the
-/// store is, "Sold out", "`<n> left`" when the seller counts its stock, and
-/// nothing for one on sale with no count.
-fn availability_words(availability: &ListingAvailability, store_closed: bool) -> Option<String> {
-    if store_closed {
-        return Some("Closed".to_string());
+/// The pill a closed store shows: "Closed for now" when its seller paused it
+/// (step 2), "Closed" for every other reason.
+fn closed_pill(presence: crate::presence_flow::StorePresence) -> &'static str {
+    if presence.is_paused() {
+        "Closed for now"
+    } else {
+        "Closed"
+    }
+}
+
+/// What a listing's top corner says (after the mockup): the store's closed
+/// pill while the store is closed (`store_closed`), "Sold out", "`<n> left`"
+/// when the seller counts its stock, and nothing for one on sale with no
+/// count.
+fn availability_words(
+    availability: &ListingAvailability,
+    store_closed: Option<&str>,
+) -> Option<String> {
+    if let Some(label) = store_closed {
+        return Some(label.to_string());
     }
     match availability {
         ListingAvailability::Available { quantity: Some(0) } | ListingAvailability::SoldOut => {
@@ -1711,7 +1737,40 @@ mod stores_page_tests {
             archived: false,
             closed: false,
             closed_for_now: false,
+            paused: false,
         }
+    }
+
+    /// Step 2: a store its seller paused reads "Closed for now", on its own
+    /// page's pill, on each listing's corner and on its row in Stores; any
+    /// other closed store reads as before. Mutated red by labelling every
+    /// closed store "Closed for now", and by dropping the row's case.
+    #[test]
+    fn a_paused_store_reads_closed_for_now() {
+        use crate::presence_flow::StorePresence;
+        let paused = {
+            let mut state = crate::state::AppState::default();
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+            let store = state.browsing_stores.entry(vec![1; 32]).or_default();
+            store.pause = Some(harvest_common::store_pause::StorePause::new(owner, 1, true));
+            state.store_presence(&[1; 32], 0)
+        };
+        assert!(paused.is_paused());
+        assert_eq!(closed_pill(paused), "Closed for now");
+        assert_eq!(closed_pill(StorePresence::Checking), "Closed");
+        assert_eq!(closed_pill(StorePresence::Open), "Closed");
+        assert_eq!(
+            availability_words(&ListingAvailability::SoldOut, Some(closed_pill(paused))).as_deref(),
+            Some("Closed for now")
+        );
+        let mut r = row(StoreName::Named("Tea".to_string()), Some("Loose tea"));
+        r.closed = true;
+        r.closed_for_now = true;
+        r.paused = true;
+        assert_eq!(
+            visited_row_lines(&r, false).1.as_deref(),
+            Some("Closed for now")
+        );
     }
 
     /// A visited store's row: its name, then its tagline. Its code is the
@@ -2020,18 +2079,21 @@ mod store_page_tests {
     fn a_listing_corner_says_what_a_buyer_can_get() {
         let on_sale = ListingAvailability::Available { quantity: None };
         let three = ListingAvailability::Available { quantity: Some(3) };
-        assert_eq!(availability_words(&three, false).as_deref(), Some("3 left"));
-        assert_eq!(availability_words(&on_sale, false), None);
+        assert_eq!(availability_words(&three, None).as_deref(), Some("3 left"));
+        assert_eq!(availability_words(&on_sale, None), None);
         assert_eq!(
-            availability_words(&ListingAvailability::Available { quantity: Some(0) }, false)
+            availability_words(&ListingAvailability::Available { quantity: Some(0) }, None)
                 .as_deref(),
             Some("Sold out")
         );
         assert_eq!(
-            availability_words(&ListingAvailability::SoldOut, false).as_deref(),
+            availability_words(&ListingAvailability::SoldOut, None).as_deref(),
             Some("Sold out")
         );
-        assert_eq!(availability_words(&three, true).as_deref(), Some("Closed"));
+        assert_eq!(
+            availability_words(&three, Some("Closed")).as_deref(),
+            Some("Closed")
+        );
     }
 
     #[test]

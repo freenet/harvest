@@ -3114,6 +3114,8 @@ pub struct StoreListRow {
     /// taking orders (`presence_flow`), as opposed to closed for good or
     /// unable to take an order at all. Said "Closed right now" only then.
     pub closed_for_now: bool,
+    /// Closed because its seller paused it (step 2): "Closed for now".
+    pub paused: bool,
 }
 
 /// What a store is called on screen.
@@ -4349,6 +4351,9 @@ impl AppState {
                             .is_some_and(|store| store.takes_orders())
                             && self.store_presence(id, now_ms).is_closed()
                     }),
+                    paused: id
+                        .as_ref()
+                        .is_some_and(|id| self.store_presence(id, now_ms).is_paused()),
                 }
             })
             .collect();
@@ -37606,6 +37611,7 @@ mod store_code_tests {
                 archived: false,
                 closed: false,
                 closed_for_now: false,
+                paused: false,
             }]
         );
         let (rows, hidden) = state.store_list_rows(true);

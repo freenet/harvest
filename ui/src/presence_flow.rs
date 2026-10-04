@@ -118,6 +118,14 @@ impl StorePresence {
         matches!(self, StorePresence::Closed(_))
     }
 
+    /// Closed because the seller paused the store (step 2).
+    pub fn is_paused(self) -> bool {
+        matches!(
+            self,
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(NotTakingReason::Paused)))
+        )
+    }
+
     /// The line a buyer reads about a store that is not open, or `None`.
     pub fn buyer_line(self) -> Option<&'static str> {
         match self {
