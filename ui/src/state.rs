@@ -2618,9 +2618,8 @@ impl PaymentBlocker {
             PaymentBlocker::SellerIdentityUnknown => "This store's identity does not check out, \
                  so nothing here can be tied to the seller. Do not pay."
                 .to_string(),
-            PaymentBlocker::StoreClosed => "This store has closed. Its seller closed it because \
-                 its key may be in someone else's hands, so an order from it may not be the \
-                 seller's. Do not pay."
+            PaymentBlocker::StoreClosed => "This store has closed for good, so an order from \
+                 it can no longer be relied on. Do not pay."
                 .to_string(),
             PaymentBlocker::CommitmentNotTheSellers(why) => format!(
                 "The published order is not signed by this store's seller ({why}). Do not pay."
@@ -9315,7 +9314,8 @@ impl AppState {
         use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
 
         // Before anything about the order: a closed store's key may be in
-        // someone else's hands, so no order from it is safe, published or not.
+        // someone else's hands (or it was a second store on one Ghost Key,
+        // harvest#181), so no order from it is safe, published or not.
         if store.closed {
             return vec![PaymentBlocker::StoreClosed];
         }

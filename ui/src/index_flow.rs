@@ -1312,12 +1312,26 @@ mod tests {
             closure.contains("ifletErr(e)=result{letmutstate=crate::gateway::APP_STATE.write();state.closes_sent.remove(&owner);"),
             "a close that could not be sent must not hold back the next one"
         );
+        // No notice when the close is handed over: it would outlive the
+        // card's "Closing..." line and sit beside a store shown closed.
+        let sent = &closure[closure.find("submit_close_by_id(").expect("the send")..];
+        let sent = &sent[..sent.find("self.closes_ready").expect("the host branch")];
+        assert_eq!(
+            sent.matches("notifications").count(),
+            1,
+            "only the failure is told: {sent}"
+        );
         let messages = code(include_str!("components/message_view.rs"));
         assert!(
             messages.contains("ifstore.closed{return0;}count_unanswered("),
             "a closed store's requests are not counted"
         );
         let my_store = code(include_str!("components/my_store.rs"));
+        // Each store's Close button carries its own label (its code beside a
+        // twin's name), in the stores' order.
+        assert!(my_store.contains(".map(|(s,_)|close_button_label(s,&stores))"));
+        assert!(my_store.contains("for((s,this),label)instores.iter().cloned().zip(labels){"));
+        assert!(my_store.contains("\"{label}\""));
         assert!(
             my_store.contains(".begin_own_store_creation(fingerprint.clone(),vk_bytes,details);")
         );

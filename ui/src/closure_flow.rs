@@ -128,6 +128,12 @@ impl KeyConflict {
     }
 }
 
+/// Whether two store names read as the same name to a seller: what decides
+/// that a close names the store by its code as well.
+pub(crate) fn same_store_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
 /// What the seller is told when a close cannot be published.
 pub(crate) const CLOSE_NOT_SAVED: &str =
     "The store could not be closed. Nothing changed; try again.";
@@ -234,7 +240,7 @@ impl AppState {
         self.closing_stores
             .iter()
             .find(|(_, closing)| closing.backer == *backer)
-            .map(|(id, _)| self.store_name_of(id).label())
+            .map(|(id, _)| self.close_label(id))
             .or_else(|| {
                 let now = crate::state::now_ms();
                 self.closes_sent
@@ -247,6 +253,36 @@ impl AppState {
                     .map(|(_, sent)| sent.name.clone())
                     .next()
             })
+    }
+
+    /// The store at `store_contract_id` named as a close names it: by its
+    /// name, with its code when another store the same Ghost Key backs has
+    /// the same name, so "Closing ..." and a failed close say which one.
+    ///
+    /// Reads the backings directly rather than through
+    /// [`Self::stores_sharing_backer`], whose `can_close` asks what close is
+    /// in flight, which asks this.
+    pub(crate) fn close_label(&self, store_contract_id: &[u8]) -> String {
+        let name = self.store_name_of(store_contract_id).label();
+        let Some(view) = self
+            .browsing_stores
+            .get(store_contract_id)
+            .and_then(|s| s.backing.as_ref())
+        else {
+            return name;
+        };
+        let twin = self.browsing_stores.iter().any(|(id, other)| {
+            other.backing.as_ref().is_some_and(|o| {
+                o.backer == view.backer
+                    && o.store != view.store
+                    && o.certificate_status.is_verified()
+            }) && !self.superseded_generation(id)
+                && same_store_name(&self.store_name_of(id).label(), &name)
+        });
+        match ed25519_dalek::VerifyingKey::from_bytes(&view.store) {
+            Ok(key) if twin => format!("{name} ({})", harvest_common::store::store_code(&key)),
+            _ => name,
+        }
     }
 
     /// The store key of a close sent for one of `backer`'s stores whose
@@ -401,10 +437,10 @@ impl AppState {
             .get(store_contract_id)
             .is_some_and(|c| c.attempt == attempt)
         {
+            let label = self.close_label(store_contract_id);
             self.abandon_close(store_contract_id);
             self.notifications.push(format!(
-                "{} (the store key did not answer)",
-                CLOSE_NOT_SAVED
+                "{CLOSE_NOT_SAVED} ({label}: the store key did not answer)"
             ));
         }
     }
@@ -470,14 +506,16 @@ impl AppState {
             .is_some_and(|owner| {
                 retirement.verify(&owner).is_ok() && closure.verify(&owner).is_ok()
             });
+        let name = self.close_label(store_contract_id);
         if !verified {
             self.abandon_close(store_contract_id);
             self.notifications.push(format!(
-                "{CLOSE_NOT_SAVED} (the store key's signature did not check out)"
+                "{CLOSE_NOT_SAVED} ({name}: the store key's signature did not check out)"
             ));
             return;
         }
-        let name = self.store_name_of(store_contract_id).label();
+        #[cfg(target_arch = "wasm32")]
+        let label = name.clone();
         self.abandon_close(store_contract_id);
         // Held until the store's state shows it closed: until then the
         // conflict is still on screen, and a second close must not start.
@@ -505,7 +543,9 @@ impl AppState {
                     let mut state = crate::gateway::APP_STATE.write();
                     state.closes_sent.remove(&owner);
                     dioxus::logger::tracing::error!("Failed to close a store: {e}");
-                    state.notifications.push(format!("{CLOSE_NOT_SAVED} ({e})"));
+                    state
+                        .notifications
+                        .push(format!("{CLOSE_NOT_SAVED} ({label}: {e})"));
                 }
             });
         }
@@ -1007,6 +1047,54 @@ mod tests {
         assert!(state.browsing_stores[&vec![1; 32]]
             .certificate_status
             .is_verified());
+    }
+
+    /// Two stores on one Ghost Key with the same name: what says a close is
+    /// under way, and what is kept for a resend, names the store by code as
+    /// well, so the seller can tell which one went. A distinct name needs
+    /// none. Mutated red by naming by name alone.
+    #[test]
+    fn a_close_of_one_of_two_same_named_stores_names_it_by_code() {
+        fn name(state: &mut AppState, id: u8, store_name: &str) {
+            state.browsing_stores.get_mut(&vec![id; 32]).unwrap().info =
+                Some(harvest_common::store::StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: String::new(),
+                    reputation_contract_id: [0; 32],
+                    store_name: store_name.to_string(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    record_public_key: None,
+                });
+        }
+        let code = harvest_common::store::store_code(&store_key(CLOSED).verifying_key());
+        let mut state = both_ours();
+        name(&mut state, 1, "Bean Shop");
+        name(&mut state, 2, "bean shop ");
+        assert_eq!(state.close_label(&[2; 32]), format!("bean shop ({code})"));
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        assert_eq!(
+            state.close_in_flight_for(&BACKER_VK()),
+            Some(format!("bean shop ({code})"))
+        );
+        answer(&mut state, &Retirement { backer: backer() });
+        answer(
+            &mut state,
+            &StoreClosure {
+                store: store_key(CLOSED).verifying_key(),
+            },
+        );
+        assert_eq!(
+            state.closes_sent[&store_key(CLOSED).verifying_key().to_bytes()].name,
+            format!("bean shop ({code})"),
+            "what a resend names"
+        );
+
+        let mut state = both_ours();
+        name(&mut state, 1, "Bean Shop");
+        name(&mut state, 2, "Tea Shop");
+        assert_eq!(state.close_label(&[2; 32]), "Tea Shop");
     }
 
     /// A sent close whose closed state never arrives (the contract refused

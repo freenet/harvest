@@ -738,15 +738,16 @@ fn LoadedStore(store: crate::state::BrowsingStore, contract_id: Vec<u8>) -> Elem
                     }
                 }
 
-                // Said plainly: a closed store's key may be in someone
-                // else's hands, so nothing on this page can be bought, and
-                // the record stays visible (harvest#93, 6.4). Otherwise why
-                // it is not open, for which Buy now is withheld below.
+                // Said plainly: nothing on a closed store can be bought, and
+                // the record stays visible (harvest#93, 6.4). No reason is
+                // given: a seller closes a store whose key may be in someone
+                // else's hands, and also a second store on one Ghost Key
+                // (harvest#181). Otherwise why it is not open, for which Buy
+                // now is withheld below.
                 if store.closed {
                     p { class: "text-warning",
-                        "This store has closed. Its seller closed it because its key may be \
-                         in someone else's hands, so nothing here can be bought. Its record \
-                         stays visible."
+                        "This store has closed for good, so nothing here can be bought. Its \
+                         record stays visible."
                     }
                 } else if cannot_take {
                     p { class: "text-warning", "{cannot_take_orders_line(&store.certificate_status)}" }
