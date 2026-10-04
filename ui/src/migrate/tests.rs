@@ -3133,7 +3133,7 @@ fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_enco
         params: mailbox_params(&seller_vk()),
     };
     let base = 1_700_000_000;
-    let older = vec![message(40, base), message(41, base + 1)];
+    let older = [message(40, base), message(41, base + 1)];
     let raw = harvest_common::to_cbor(&EarlierMailbox {
         messages: older
             .iter()
