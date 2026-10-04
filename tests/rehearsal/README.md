@@ -33,33 +33,77 @@ artifacts it exists to check.
    demonstrated rather than argued.
 5. **Nothing-to-find seals nothing.** A seller with no predecessor state takes
    the seed-local path, and the seal decision is `Retry`.
+6. **The mailbox lineage** (`REHEARSAL_ONLY=mailbox`, harvest#223). A seller's
+   mailbox with messages at the two newest superseded generations is found
+   and folded into one set holding every message once, compared by a BLAKE3
+   digest of each message's whole encoding. One message is in both
+   generations, and two share a nonce with different bytes (identity is the
+   whole entry). The current contract accepts and holds the set, and a later
+   forward of one generation alone merges in rather than replacing.
+   **6b** plants two generations of padded, bucket-sized messages, each
+   within every cap, that together exceed every size-class cap and the
+   512-message total. The fold must keep exactly what `apply_delta` keeps
+   (the fold is built on it, so this check is the same code twice), and the
+   SHIPPED WASM must accept and hold that, which a stale or diverging
+   `mailbox_contract.wasm` would fail.
+7. **The Ghost Key index lineage** (`REHEARSAL_ONLY=index`, harvest#223). An
+   index whose two newest superseded generations together list 76 stores is
+   folded: one store is in both generations, one is backed differently at
+   each (the clash, kept by the smaller encoding), and the 64 smallest store
+   keys survive the cap. The expectation is worked out without the index's
+   merge. The current contract holds the result, every entry still verifies
+   against the Ghost Key, and a later partial forward merges in.
+
+`REHEARSAL_ONLY=lineages` runs 6 and 7 together; a plain run runs them first
+(it then stops at scenario 1, harvest#142). Re-run both whenever the mailbox
+or index contract re-keys, which is any change to `harvest-common` (it is
+compiled into both). Each scenario uses fixed keys, so run against a fresh
+`--data-dir`: an earlier run's state at the current address would otherwise
+be read back as if forwarded.
+
+Not exercised: the app's forward wiring (`migrate_ops::send_forward`) and its
+seal marker; the harness forwards with its own PUT. Not plantable: a mailbox
+message over `MAX_MESSAGE_BYTES` or an index entry that does not verify,
+because the V18/V19 mailbox and V6/V7 index contracts refuse both, so no
+user holds one. CI only compiles this harness: a green CI says nothing about
+whether a migration works.
 
 ## Running it
 
+Rehearsals run on an **isolated network-mode node**, never `freenet local`
+(see below: a local node cannot answer `NotFound`, so its results do not
+match what users' nodes do; harvest#150). Use a fresh config and data dir
+each run:
+
 ```sh
-freenet local --ws-api-port 7599 \
-  --config-dir /tmp/rehearsal-node/config --data-dir /tmp/rehearsal-node/data &
-cargo run -- ws://127.0.0.1:7599
+freenet network --is-gateway --skip-load-from-network --disable-auto-update \
+  --public-network-address 127.0.0.1 --public-network-port 31698 \
+  --network-port 31698 --ws-api-address 127.0.0.1 --ws-api-port 7698 \
+  --config-dir "$D/config" --data-dir "$D/data" --log-dir "$D/log" &
+REHEARSAL_EXPECT_SEAL=1 REHEARSAL_ONLY=lineages cargo run -- ws://127.0.0.1:7698
 ```
+
+`REHEARSAL_EXPECT_SEAL=1` makes scenarios 6 and 7 fail unless every
+unplanted generation answers NotFound, which an isolated network-mode node
+does; without it, a node answering errors passes with only a note.
 
 The predecessor WASM comes out of git history by hash (the registries record
 hashes, not commits), so no artifacts need to be checked in or passed on the
 command line.
 
-## Read this before pointing it at a network-mode node
+## Check the node is isolated
 
-**`freenet network` rewrites your `gateways.toml`.** Starting a node with
-`gateways = []` in its config dir, expecting an isolated peer, produces a node
-whose gateway file has been replaced with the real bootstrap list and which
-joins the live network -- and whose PUTs are relayed onto it at `htl=10`. That
-happened during the first run of this harness: three rehearsal contracts went
-onto the production network through nova's gateways before anyone noticed.
+**`freenet network` can rewrite your `gateways.toml`.** Starting a node with
+`gateways = []` in its config dir, expecting an isolated peer, once produced a
+node whose gateway file had been replaced with the real bootstrap list and
+which joined the live network -- and whose PUTs were relayed onto it at
+`htl=10`. That happened during the first run of this harness: three rehearsal
+contracts went onto the production network through nova's gateways before
+anyone noticed. `--is-gateway --skip-load-from-network` is what keeps it off.
 
-So: **verify what the node wrote, not what you passed it.** After startup,
+So: **verify what the node wrote, not what you passed it.** After the run,
 `cat <config-dir>/gateways.toml` and check the log for
 `freenet::ring: Adding connection to peer`. No connections means isolated.
-
-`freenet local` does not do this and is the safe default -- at the cost below.
 
 ## Two things this cannot check, and why
 
