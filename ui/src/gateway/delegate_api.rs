@@ -178,7 +178,7 @@ pub async fn put_contract(contract: ContractContainer, state: WrappedState) -> R
 /// retries the message: on the first load after a delegate re-key, the
 /// migration walk stopped ("current delegate unavailable") and a request the
 /// page waits on (the payment key) never got an answer. So what is sent to a
-/// delegate waits for this answer; see [`registered`].
+/// delegate waits for this answer; see `registered()`.
 #[derive(Default)]
 pub struct RegistrationWaiters {
     waiting: std::collections::HashMap<DelegateKey, futures::channel::oneshot::Sender<()>>,
@@ -224,7 +224,7 @@ pub fn acknowledge_registration(key: &DelegateKey) -> bool {
     REGISTRATIONS.with(|r| r.borrow_mut().acknowledge(key))
 }
 
-/// How long [`registered`] waits for the node's answer before going ahead
+/// How long `registered()` waits for the node's answer before going ahead
 /// anyway, as it did before this wait existed.
 pub const REGISTRATION_WAIT_MS: u32 = 30_000;
 // Well above the slowest answer measured (7.1 s in the harvest#162
@@ -262,7 +262,7 @@ pub async fn wait_for_answer(
 }
 
 /// Register a delegate with the Freenet node. What is sent to it afterwards
-/// waits for [`registered`].
+/// waits for `registered()`.
 pub async fn register_delegate(delegate_wasm: &[u8]) -> Result<DelegateKey, String> {
     #[cfg(target_arch = "wasm32")]
     {

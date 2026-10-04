@@ -76,7 +76,7 @@ use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 /// it. So the store ranks every Ghost Key that has a backing OR a
 /// retirement, keeps the [`MAX_BACKINGS`] SMALLEST by bytes, and keeps a
 /// backing or a retirement exactly when its key is kept
-/// ([`StoreStateV1::normalize_backings`]). A retirement need not name a
+/// (`StoreStateV1::normalize_backings`). A retirement need not name a
 /// backing the replica holds: it may arrive first.
 ///
 /// Why this ranking: it depends on the slot (the Ghost Key) alone, never on
@@ -90,7 +90,7 @@ use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 /// What it costs: past the bound, history is dropped (a key's backing and
 /// its retirement together). A dropped slot never returns to a replica that
 /// dropped it, so nothing is ever UN-retired; see
-/// [`StoreStateV1::normalize_backings`]. Retired keys keep their slots, so
+/// `StoreStateV1::normalize_backings`. Retired keys keep their slots, so
 /// a store rotated through many Ghost Keys can reach the bound, and then the
 /// cut falls on the largest keys, which may include the CURRENT backing: the
 /// store is then unbacked and has to be backed again by a key that ranks
@@ -1463,6 +1463,7 @@ mod tests {
         let closure = closure_by(&store_key(), &store_key());
         let listing = {
             let listing = crate::listing::Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: crate::listing::ListingId([0; 32]),
@@ -2123,6 +2124,7 @@ mod tests {
             record_public_key: None,
         };
         let listing = crate::listing::Listing {
+            images: Vec::new(),
             checkout: None,
             choices: Vec::new(),
             id: crate::listing::ListingId([0; 32]),

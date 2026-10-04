@@ -52,3 +52,9 @@ version = "V6"
 description = "Superseded by the delegated watch key (harvest#179), which changed `harvest-common`: `delegate.rs` gained the `GetWatchKey` / `SetWatchDelegation` / `UpdateWatchDelegation` requests and their answers, and `AutoInvoiceStatus` gained `watch_delegation` (`#[serde(default)]`); `freenet-bitcoin` went from d1ce3bb to fda0c40. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This one's merge, validation and state encoding are unchanged, and the parameters are unchanged. The generation always-open stores shipped (harvest#178, `e275bae`)."
 date = "2026-09-27"
 code_hash = "80b868743aa48c6c0ec9791c7a75a125615ea9ae30aa2d2eb6993da7d621d114"
+
+[[entry]]
+version = "V7"
+description = "Superseded by listing photos (harvest images PR 2), which changed `harvest-common`: `Listing` gained `images` (a list of `ListingImage` references, each naming an image contract by the BLAKE3 hash of its bytes, harvest#212), `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]` so every earlier listing encodes, and so is identified and signed, exactly as before (pinned by `a_listing_without_photos_encodes_and_is_identified_as_before`); a new `listing_image` module holds the types and the store's bounds on them. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This one's merge, validation and state encoding are unchanged, and the parameters are unchanged. The generation the delegated watch key shipped (harvest#179)."
+date = "2026-10-01"
+code_hash = "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a"

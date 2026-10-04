@@ -203,7 +203,7 @@ impl GhostKeyIndexV1 {
     /// Fold entries in. Every entry is verified, and the bound checked,
     /// before any of it is merged, so a delta refused for either reason
     /// leaves the index exactly as it was. Never fails on the bound after
-    /// that point: see [`Self::normalize`].
+    /// that point: see `Self::normalize`.
     ///
     /// **One exception, and it is not structural:** `entry_bytes` is called
     /// inside the merge loop and returns `Result`, so an encoding failure

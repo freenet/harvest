@@ -145,7 +145,7 @@ pub(crate) struct OwnStoreStatus {
 pub(crate) enum Needs {
     Nothing,
     /// Counted (`my_store::SellerStore::needs_you`, the header's count):
-    /// "<n> need(s) you".
+    /// "`<n> need(s) you`".
     Count(usize),
     /// Nothing counted, but the Overview's "Needs you" card lists something
     /// all the same (`my_store::overview_needs`): "Needs you".
@@ -1194,7 +1194,7 @@ fn ListingCard(
 }
 
 /// What a listing's top corner says (after the mockup): "Closed" while the
-/// store is, "Sold out", "<n> left" when the seller counts its stock, and
+/// store is, "Sold out", "`<n> left`" when the seller counts its stock, and
 /// nothing for one on sale with no count.
 fn availability_words(availability: &ListingAvailability, store_closed: bool) -> Option<String> {
     if store_closed {
@@ -1446,6 +1446,7 @@ mod availability_tests {
     fn listing(n: u8) -> AuthorizedListing {
         AuthorizedListing {
             listing: Listing {
+                images: Vec::new(),
                 checkout: None,
                 choices: Vec::new(),
                 id: ListingId([n; 32]),

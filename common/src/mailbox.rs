@@ -105,7 +105,7 @@ pub const MAX_MAILBOX_BYTES: usize = 4 * 1024 * 1024;
 /// budget over variable sizes is a knapsack constraint, and a greedy pick
 /// over a fixed ranking is path independent only when the constraint is a
 /// matroid. A count cap per size class, under an overall count cap, is one:
-/// see [`enforce_message_cap`].
+/// see `enforce_message_cap`.
 ///
 /// Text traffic sits in the smallest class, which keeps the whole of
 /// [`MAX_MESSAGES`], so honest use never meets a class cap.
@@ -158,7 +158,7 @@ const _: () = {
 ///   it also occupies mailbox slots the attacker cannot read but can refill
 ///   at will.
 /// * **`timestamp`.** It is the primary key of the eviction ranking (see
-///   [`enforce_message_cap`]), so re-dating a genuine message moves somebody
+///   `enforce_message_cap`), so re-dating a genuine message moves somebody
 ///   else's traffic up or down the order that decides what survives a flood.
 /// * **`sender_public_key`.** The conversation's routing tag.
 /// * **`conversation_id`.** The cleartext copy of the id the ciphertext also
@@ -1044,7 +1044,7 @@ impl MailboxStateV1 {
     /// Age was only ever a proxy for size; the comment this one replaces said
     /// so itself ("pruning resumes the moment a new message arrives, which is
     /// also the only moment the size matters"). [`MAX_MESSAGES`] bounds size
-    /// directly, and [`enforce_message_cap`] chooses what goes by a total
+    /// directly, and `enforce_message_cap` chooses what goes by a total
     /// order over message content, so two replicas holding the same set keep
     /// the same subset and converge as they exchange what the other is
     /// missing.

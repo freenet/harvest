@@ -83,7 +83,7 @@ Two things keep that from happening by accident:
 
 - This prose lives here, not in `src/lib.rs`, so editing the docs moves
   nothing. (`src/lib.rs` includes it with `#![doc = include_str!(...)]`.)
-- [`strip`], which only the seller's upload path calls, lives in
+- [`strip()`], which only the seller's upload path calls, lives in
   `src/strip.rs`. The contract never links it, so changing it moves nothing.
 
 A deliberate change to `src/lib.rs` is a re-key of the image contract: record

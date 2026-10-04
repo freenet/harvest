@@ -275,7 +275,28 @@ impl StoreFx {
     }
 
     fn listing(&self, i: u32) -> AuthorizedListing {
+        // Even-numbered listings carry photos (harvest images PR 2), so every
+        // corpus that holds listings exercises the photo references as well.
+        let blob = |seed: u8, edge: u16| harvest_common::listing_image::ImageBlob {
+            hash: harvest_common::store::Bytes32([seed; 32]),
+            len: 50_000,
+            width: edge,
+            height: edge * 3 / 4,
+        };
+        let images = if i % 2 == 0 {
+            (0..2u8)
+                .map(|k| harvest_common::listing_image::ListingImage {
+                    full: blob(i as u8 * 16 + k, 1600),
+                    thumb: (k == 0).then(|| blob(i as u8 * 16 + k + 8, 400)),
+                    colour: [i as u8, k, 7],
+                    alt: if k == 0 { format!("Item {i}, front") } else { String::new() },
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let listing = Listing {
+            images,
             checkout: None,
             choices: Vec::new(),
             id: ListingId([0u8; 32]),

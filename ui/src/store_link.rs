@@ -229,7 +229,7 @@ pub fn open_store(params: StoreParameters) {
 }
 
 /// Open the store with this address: show its page, and fetch it with a
-/// subscription, giving up after [`LINK_LOAD_TIMEOUT_MS`] so the page never
+/// subscription, giving up after `LINK_LOAD_TIMEOUT_MS` so the page never
 /// waits for good. For a store whose code this node does not know, too
 /// (`components::open_store_page`).
 pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {

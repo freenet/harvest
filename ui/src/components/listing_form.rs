@@ -4,6 +4,7 @@ use harvest_common::listing::{
     ChoiceGroup, DeliveryPrice, FixedCheckout, Listing, ListingId, ListingKind, PriceInfo,
     RegionPrice,
 };
+use harvest_common::listing_image::ListingImage;
 
 /// What every listing this form publishes is: a sale at a fixed price, with
 /// fixed delivery (Ian, 2026-09-26). There is no free-text price, no gift or
@@ -145,6 +146,10 @@ pub fn ListingForm(
                         // The price is the sats price in `checkout`; the old
                         // free-text one is never written again.
                         let price: Option<PriceInfo> = None;
+                        // The photos the new listing carries. This form does not
+                        // edit photos yet, so an edit keeps the ones the listing
+                        // has; they are terms like any other and go into the id.
+                        let images = photos_for_edit(editing.as_ref());
                         // Only the count changed: submit the original, so its
                         // id, and the listing buyers hold, stays the same.
                         if let Some(original) = editing.as_ref() {
@@ -155,6 +160,7 @@ pub fn ListingForm(
                                 &KIND,
                                 &checkout,
                                 &choices,
+                                &images,
                             ) {
                                 on_submit.call((original.clone(), count));
                                 return;
@@ -165,6 +171,7 @@ pub fn ListingForm(
                         let listing = Listing {
                             checkout,
                             choices,
+                            images,
                             // Stamped by `with_derived_id` below, out of the
                             // finished terms: a listing whose id is not the
                             // one its terms give is refused by every peer
@@ -210,7 +217,7 @@ pub fn ListingForm(
 /// a take-down and a new id.
 ///
 /// Every term of `Listing` except `id`, `created_at` and `price` is
-/// compared, so a field added to `Listing` must be added here, or an edit of
+/// compared (`images` included), so a field added to `Listing` must be added here, or an edit of
 /// it alone would keep the old id. `price` is the free-text price listings
 /// carried before every listing had a sats price: the form no longer shows
 /// or writes it, so it is not a term the seller can change here, and a
@@ -225,6 +232,7 @@ pub(crate) fn same_terms(
     kind: &ListingKind,
     checkout: &Option<FixedCheckout>,
     choices: &[ChoiceGroup],
+    images: &[ListingImage],
 ) -> bool {
     let Listing {
         id: _,
@@ -235,12 +243,20 @@ pub(crate) fn same_terms(
         created_at: _,
         checkout: original_checkout,
         choices: original_choices,
+        images: original_images,
     } = original;
     original_title.trim() == title.trim()
         && original_description.trim() == description.trim()
         && original_kind == kind
         && original_checkout == checkout
         && original_choices.as_slice() == choices
+        && original_images.as_slice() == images
+}
+
+/// The photos an edit publishes: the listing's own, since this form cannot
+/// change them yet (the upload path will). None for a new listing.
+pub(crate) fn photos_for_edit(editing: Option<&Listing>) -> Vec<ListingImage> {
+    editing.map(|l| l.images.clone()).unwrap_or_default()
 }
 
 /// The count field: blank is "not counted", anything else a whole number.
@@ -358,6 +374,7 @@ impl TermsForm {
             created_at: chrono::DateTime::UNIX_EPOCH,
             checkout,
             choices,
+            images: Vec::new(),
         };
         if let Some(problem) = probe.checkout_problem().or_else(|| probe.choices_problem()) {
             return Err(sentence(&problem));
@@ -519,6 +536,7 @@ mod tests {
 
     fn original() -> Listing {
         Listing {
+            images: Vec::new(),
             checkout: Some(FixedCheckout {
                 unit_sats: 10_000,
                 delivery: DeliveryPrice::Included,
@@ -533,6 +551,54 @@ mod tests {
         }
     }
 
+    fn a_photo(seed: u8) -> ListingImage {
+        let blob = |s: u8, edge: u16| harvest_common::listing_image::ImageBlob {
+            hash: harvest_common::store::Bytes32([s; 32]),
+            len: 10_000,
+            width: edge,
+            height: edge,
+        };
+        ListingImage {
+            full: blob(seed, 1600),
+            thumb: Some(blob(seed + 100, 400)),
+            colour: [1, 2, 3],
+            alt: String::new(),
+        }
+    }
+
+    /// Photos are a term: a different set is a different listing, so a
+    /// photo-only change never takes the count-only path and republishes the
+    /// original without them.
+    #[test]
+    fn same_terms_notices_the_photos() {
+        let mut o = original();
+        o.images = vec![a_photo(1)];
+        let terms = |images: &[ListingImage]| {
+            same_terms(
+                &o,
+                "Mug",
+                "Blue",
+                &ListingKind::Sale,
+                &o.checkout,
+                &o.choices,
+                images,
+            )
+        };
+        assert!(terms(&o.images));
+        assert!(!terms(&[]));
+        assert!(!terms(&[a_photo(2)]));
+    }
+
+    /// An edit keeps the listing's photos (this form cannot change them yet);
+    /// a new listing has none.
+    #[test]
+    fn an_edit_keeps_the_listings_photos() {
+        let mut o = original();
+        o.images = vec![a_photo(1)];
+        assert_eq!(photos_for_edit(Some(&o)), o.images);
+        assert!(photos_for_edit(None).is_empty());
+    }
+
     /// Each term, changed alone, is a different listing; formatting alone is
     /// not. Mutated red by dropping each comparison in turn.
     #[test]
@@ -543,7 +609,7 @@ mod tests {
                     kind: &ListingKind,
                     checkout,
                     choices: &[ChoiceGroup]| {
-            same_terms(&o, title, description, kind, checkout, choices)
+            same_terms(&o, title, description, kind, checkout, choices, &o.images)
         };
         assert!(same(
             "Mug",
@@ -632,6 +698,7 @@ mod tests {
             "Blue",
             &ListingKind::Sale,
             &old.checkout,
+            &[],
             &[]
         ));
 
@@ -649,7 +716,8 @@ mod tests {
             "Blue",
             &ListingKind::Sale,
             &checkout,
-            &choices
+            &choices,
+            &[]
         ));
     }
 
