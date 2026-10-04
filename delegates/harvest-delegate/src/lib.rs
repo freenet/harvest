@@ -698,6 +698,7 @@ mod boundary_tests {
             // peek reads the seller's next payment addresses.
             to_cbor(&HarvestDelegateRequest::ArmAutoInvoice {
                 arm: Box::new(harvest_common::delegate::AutoInvoiceArm {
+                    vetted_scripts: Vec::new(),
                     store_contract_id: vec![3u8; 32],
                     store_verifying_key: [5u8; 32],
                     mailbox_contract_id: [6u8; 32],

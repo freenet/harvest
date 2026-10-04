@@ -659,6 +659,12 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the generation harvest#216 shipped. Superseded by listing photos;
             // no logic change (the delegate decodes the store state).
             "ed88aa215c98f56b520e8a06c29a715bc81b8e88b5dede8cbe7634c54917ef72".to_string(),
+            // V31, from `git show 57979f8:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#215 shipped. Superseded by a heartbeat
+            // that says not taking orders whenever the delegate would refuse,
+            // refusing twins of a buyer's X25519 tag, sent digests and read
+            // state, and the #198 watch rules.
+            "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0".to_string(),
         ],
     );
 }

@@ -62,6 +62,8 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::auto_invoice::EXPORTED_KEY.to_vec(),
         crate::auto_invoice::catchup_key(&[9u8; 32]),
         crate::auto_invoice::fed_key(&[9u8; 32]),
+        crate::auto_invoice::store_read_key(&[9u8; 32]),
+        crate::messaging::seller_sent_key(&[9u8; 32]),
         crate::published_set::PUBLISHED_KEY.to_vec(),
         crate::published_set::PUBLISHED_META_KEY.to_vec(),
         crate::published_set::CURSOR_ACTIVE_KEY.to_vec(),
@@ -181,6 +183,8 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
                 // and it was opened here rather than restored.
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             },
         ),
 
@@ -188,6 +192,50 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             request_id,
             store_contract_id,
         } => crate::messaging::list_buyer_conversations(store, request_id, &store_contract_id),
+
+        HarvestDelegateRequest::NoteBuyerSent {
+            request_id,
+            store_contract_id,
+            buyer_public_key,
+            digest,
+        } => crate::messaging::note_buyer_sent(
+            store,
+            request_id,
+            &store_contract_id,
+            &buyer_public_key,
+            &digest,
+        ),
+
+        HarvestDelegateRequest::MarkConversationSeen {
+            request_id,
+            store_contract_id,
+            buyer_public_key,
+            seen_ms,
+        } => crate::messaging::mark_conversation_seen(
+            store,
+            request_id,
+            &store_contract_id,
+            &buyer_public_key,
+            seen_ms,
+        ),
+
+        HarvestDelegateRequest::NoteSellerSent {
+            request_id,
+            store_key,
+            conversation,
+            digest,
+        } => crate::messaging::note_seller_sent(
+            store,
+            request_id,
+            &store_key,
+            &conversation,
+            &digest,
+        ),
+
+        HarvestDelegateRequest::ListSellerSent {
+            request_id,
+            store_key,
+        } => crate::messaging::list_seller_sent(store, request_id, &store_key),
 
         // Backup. The export answers the secrets themselves, so its need for
         // the gate is obvious. `MarkConversationsBackedUp` is the one whose

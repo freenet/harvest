@@ -7,16 +7,21 @@
 # NO ROWS, AND THERE NEVER NEED BE ANY. Nothing at an old address is worth
 # carrying forward: the state is one heartbeat signed by the store key, and a
 # heartbeat is worthless `PRESENCE_FRESH_MS` (ten minutes) after it is signed.
-# Nor should readers follow an old address: the delegate heartbeats to the
-# address the seller's tab armed it with, and a Harvest re-key has so far
-# always moved the store and mailbox contracts and the delegate as well. The
-# previous delegate generation keeps heartbeating the previous address, but it
-# serves only the previous store and mailbox, so it cannot take an order
-# placed at the current ones; reading its heartbeat as "open" would be false.
+# Readers follow the current address alone. The delegate heartbeats to the
+# address the seller's tab armed it with, so the previous delegate generation
+# keeps heartbeating the previous address until the seller opens the new
+# Harvest, which arms the new generation with the new address. When a re-key
+# also moved the store and mailbox, that generation could not take an order
+# placed at the current ones, so reading its heartbeat as "open" would be
+# false. When it did not (the re-key after harvest#215 moved only the
+# delegate and presence), it could still take orders at the unchanged store
+# and mailbox, and a reader that does not follow it reads that store closed
+# while it is not: the cost, accepted for one rule that is never wrong in the
+# dangerous direction.
 #
-# The cost, stated plainly: a re-key shows every store as closed until its
-# seller opens the new Harvest (which arms the new delegate generation with
-# the new address), however long that takes.
+# The cost, stated plainly: a presence re-key shows every store as closed to
+# buyers on the new UI until its seller opens the new Harvest, however long
+# that takes.
 #
 # `ui/build.rs` lists this file in `MAY_BE_EMPTY` permanently for that reason,
 # and fails if a row is ever added here without taking it out. The file
