@@ -153,6 +153,11 @@ impl<'a> Reader<'a> {
 
     /// A `#[serde(with = "serde_bytes")]` field: a byte string as ciborium
     /// writes it, or the integer array an earlier generation wrote.
+    ///
+    /// Like every head read here, a byte string's length head is not checked
+    /// for minimal encoding, so a non-minimal one is accepted where ciborium
+    /// would not write it; what is guaranteed is the VALUE, which is always
+    /// the one ciborium decodes (pinned by the bit-flip differentials).
     fn bytes_either(&mut self) -> Option<Vec<u8>> {
         if *self.bytes.get(self.at)? >> 5 == 2 {
             let n = usize::try_from(self.head(2)?).ok()?;
@@ -513,18 +518,6 @@ mod tests {
     /// mailboxes it is handed, and a node may still hold one).
     #[test]
     fn an_earlier_generations_mailbox_is_read_too() {
-        #[derive(serde::Serialize)]
-        struct Earlier {
-            conversation_id: ConversationId,
-            sender_public_key: Vec<u8>,
-            ciphertext: Vec<u8>,
-            timestamp: chrono::DateTime<chrono::Utc>,
-            nonce: [u8; 24],
-        }
-        #[derive(serde::Serialize)]
-        struct EarlierMailbox {
-            messages: Vec<Earlier>,
-        }
         let state = MailboxStateV1 {
             messages: LENGTHS
                 .iter()
@@ -532,20 +525,7 @@ mod tests {
                 .map(|(i, &len)| message(i, len))
                 .collect(),
         };
-        let earlier = EarlierMailbox {
-            messages: state
-                .messages
-                .iter()
-                .map(|m| Earlier {
-                    conversation_id: m.conversation_id.clone(),
-                    sender_public_key: m.sender_public_key.clone(),
-                    ciphertext: m.ciphertext.clone(),
-                    timestamp: m.timestamp,
-                    nonce: m.nonce,
-                })
-                .collect(),
-        };
-        let bytes = harvest_common::to_cbor(&earlier).unwrap();
+        let bytes = earlier_encoding(&state);
         assert_ne!(
             bytes,
             harvest_common::to_cbor(&state).unwrap(),
@@ -570,12 +550,15 @@ mod tests {
         let mut long = good.clone();
         long.push(0);
         assert_eq!(decode_mailbox(&long), None);
-        // A ciphertext byte under 24 written in two bytes.
+        // A NONCE byte under 24 written in two bytes. (The nonce is a fixed
+        // array, still integers; the ciphertext is a byte string since
+        // harvest#226, and the same check for its earlier array form is in
+        // `the_earlier_form_is_declined_as_ciborium_would_be`.)
         let mut bad = good.clone();
         let at = bad
             .windows(2)
             .position(|w| w == [0x18, 0x55 ^ 2])
-            .expect("a two-byte ciphertext byte")
+            .expect("a two-byte nonce byte")
             + 1;
         bad[at] = 3;
         assert_eq!(decode_mailbox(&bad), None);
@@ -634,6 +617,83 @@ mod tests {
         assert_eq!(decode_mailbox(&renamed), None);
         // Whatever ciborium makes of a mangled state, this never decodes it
         // to something different.
+        for i in 0..good.len() {
+            for bit in 0..8 {
+                let mut m = good.clone();
+                m[i] ^= 1 << bit;
+                if let Some(fast) = decode_mailbox(&m) {
+                    let slow: Option<MailboxStateV1> = harvest_common::from_cbor(&m).ok();
+                    assert_eq!(Some(fast), slow, "flip of bit {bit} at {i}");
+                }
+            }
+        }
+    }
+
+    /// `MailboxStateV1` as every generation before harvest#226 encoded it:
+    /// the byte fields left to serde's default, an array of integers.
+    fn earlier_encoding(state: &MailboxStateV1) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Earlier {
+            conversation_id: ConversationId,
+            sender_public_key: Vec<u8>,
+            ciphertext: Vec<u8>,
+            timestamp: chrono::DateTime<chrono::Utc>,
+            nonce: [u8; 24],
+        }
+        #[derive(serde::Serialize)]
+        struct EarlierMailbox {
+            messages: Vec<Earlier>,
+        }
+        harvest_common::to_cbor(&EarlierMailbox {
+            messages: state
+                .messages
+                .iter()
+                .map(|m| Earlier {
+                    conversation_id: m.conversation_id.clone(),
+                    sender_public_key: m.sender_public_key.clone(),
+                    ciphertext: m.ciphertext.clone(),
+                    timestamp: m.timestamp,
+                    nonce: m.nonce,
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    /// The earlier array form gets the same negatives as the current form:
+    /// a non-minimal ciphertext byte is declined, a truncation is declined,
+    /// and whatever ciborium makes of a mangled state, this never decodes it
+    /// to something different.
+    #[test]
+    fn the_earlier_form_is_declined_as_ciborium_would_be() {
+        let mut state = MailboxStateV1 {
+            messages: vec![message(1, 40), message(2, 300)],
+        };
+        // A known first ciphertext byte under 24, so the non-minimal check
+        // below always has something to rewrite.
+        state.messages[0].ciphertext[0] = 3;
+        let good = earlier_encoding(&state);
+        assert_eq!(decode_mailbox(&good), Some(state.clone()));
+        for cut in 0..good.len() {
+            assert_eq!(decode_mailbox(&good[..cut]), None, "cut at {cut}");
+        }
+        // That byte written in two bytes, `0x18 0x03`, which ciborium never
+        // writes.
+        let key = harvest_common::to_cbor(&"ciphertext").unwrap();
+        let at = good
+            .windows(key.len())
+            .position(|w| w == key.as_slice())
+            .expect("a ciphertext field")
+            + key.len();
+        assert_eq!(
+            &good[at..at + 3],
+            &[0x98, 40, 3],
+            "an array of 40, first element 3"
+        );
+        let mut bad = good[..at + 2].to_vec();
+        bad.extend_from_slice(&[0x18, 3]);
+        bad.extend_from_slice(&good[at + 3..]);
+        assert_eq!(decode_mailbox(&bad), None, "a byte under 24 in two bytes");
         for i in 0..good.len() {
             for bit in 0..8 {
                 let mut m = good.clone();
