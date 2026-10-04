@@ -39,12 +39,15 @@ use host::Contract;
 ///
 /// Roughly ONE SECOND of contract work on the reference machine (nova), a
 /// fifth of the node's 5 s per-call limit, at the SLOWEST rate measured
-/// there with the node's engine and memory layout. The margin is for
-/// everything fuel does not see: a slower CPU than the reference, a node
-/// under load (the limit is wall clock), and the bulk-memory undercount
+/// there with the node's engine and memory layout: 2.28 billion fuel/s, the
+/// reputation contract's full-state merge, which moves about 80 MB of state
+/// through memory. Most calls ran at 3.4 to 5.3 billion fuel/s, so for them
+/// this is about 0.4 to 0.65 s. The margin is for everything fuel does not
+/// see: a slower CPU than the reference, a node under load (the limit is
+/// wall clock), host time on the node, and the bulk-memory undercount
 /// (wasmtime charges one unit for a `memory.copy` of any length).
 /// Calibration, and how to redo it: README.md.
-const BUDGET_FUEL: u64 = 3_000_000_000;
+const BUDGET_FUEL: u64 = 2_200_000_000;
 
 /// The seconds of work [`BUDGET_FUEL`] stands for, for the report only.
 const BUDGET_SECONDS: f64 = 1.0;
