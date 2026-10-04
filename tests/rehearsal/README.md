@@ -70,30 +70,36 @@ whether a migration works.
 
 ## Running it
 
+Rehearsals run on an **isolated network-mode node**, never `freenet local`
+(see below: a local node cannot answer `NotFound`, so its results do not
+match what users' nodes do; harvest#150). Use a fresh config and data dir
+each run:
+
 ```sh
-freenet local --ws-api-port 7599 \
-  --config-dir /tmp/rehearsal-node/config --data-dir /tmp/rehearsal-node/data &
-cargo run -- ws://127.0.0.1:7599
+freenet network --is-gateway --skip-load-from-network --disable-auto-update \
+  --public-network-address 127.0.0.1 --public-network-port 31698 \
+  --network-port 31698 --ws-api-address 127.0.0.1 --ws-api-port 7698 \
+  --config-dir "$D/config" --data-dir "$D/data" --log-dir "$D/log" &
+REHEARSAL_ONLY=lineages cargo run -- ws://127.0.0.1:7698
 ```
 
 The predecessor WASM comes out of git history by hash (the registries record
 hashes, not commits), so no artifacts need to be checked in or passed on the
 command line.
 
-## Read this before pointing it at a network-mode node
+## Check the node is isolated
 
-**`freenet network` rewrites your `gateways.toml`.** Starting a node with
-`gateways = []` in its config dir, expecting an isolated peer, produces a node
-whose gateway file has been replaced with the real bootstrap list and which
-joins the live network -- and whose PUTs are relayed onto it at `htl=10`. That
-happened during the first run of this harness: three rehearsal contracts went
-onto the production network through nova's gateways before anyone noticed.
+**`freenet network` can rewrite your `gateways.toml`.** Starting a node with
+`gateways = []` in its config dir, expecting an isolated peer, once produced a
+node whose gateway file had been replaced with the real bootstrap list and
+which joined the live network -- and whose PUTs were relayed onto it at
+`htl=10`. That happened during the first run of this harness: three rehearsal
+contracts went onto the production network through nova's gateways before
+anyone noticed. `--is-gateway --skip-load-from-network` is what keeps it off.
 
-So: **verify what the node wrote, not what you passed it.** After startup,
+So: **verify what the node wrote, not what you passed it.** After the run,
 `cat <config-dir>/gateways.toml` and check the log for
 `freenet::ring: Adding connection to peer`. No connections means isolated.
-
-`freenet local` does not do this and is the safe default -- at the cost below.
 
 ## Two things this cannot check, and why
 
