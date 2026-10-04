@@ -5,6 +5,8 @@
 //! walks is derived by the code that ships. Nothing here is mocked: every GET
 //! and PUT goes to a freenet node over the websocket client API.
 
+// ui/src/migrate.rs is shared with the UI crate, which uses items the rehearsal does not.
+#[allow(dead_code, unused_imports)]
 #[path = "../../../ui/src/migrate.rs"]
 mod migrate;
 // `migrate::ReputationOps::decode` reduces a certificate to what the
@@ -199,7 +201,7 @@ fn scoped_sign<T: serde::Serialize>(sk: &SigningKey, data: &T) -> (Vec<u8>, Vec<
     (bytes, sig)
 }
 
-fn make_listing(sk: &SigningKey, fingerprint: &str, title: &str, at: i64) -> AuthorizedListing {
+fn make_listing(sk: &SigningKey, title: &str, at: i64) -> AuthorizedListing {
     let created_at = ts(at);
     let listing = Listing {
         checkout: None,
@@ -1006,7 +1008,7 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
         migrate::store_candidate_ids(&vk).unwrap().contains(&old_id),
         "the walk must reach the generation state is planted at"
     );
-    let planted_listing = make_listing(&seller, &fp, "newest-listing", 1_758_000_000);
+    let planted_listing = make_listing(&seller, "newest-listing", 1_758_000_000);
     let planted = StoreStateV1 {
         owner: Some(vk),
         info: make_info(&seller, &fp, "Newest Generation Store", 4),
@@ -1057,7 +1059,7 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
     // The current contract takes a listing WITH photos, and refuses one over
     // the cap, through its real `update_state` and `validate_state`.
     let with_photos = |n: usize, title: &str| {
-        let mut a = make_listing(&seller, &fp, title, 1_759_000_000);
+        let mut a = make_listing(&seller, title, 1_759_000_000);
         a.listing.images = (0..n)
             .map(|i| harvest_common::listing_image::ListingImage {
                 full: harvest_common::listing_image::ImageBlob {
@@ -1281,6 +1283,8 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
 
 /// The store lineage as the app records it: the same codegen `ui/build.rs`
 /// runs, from this harness's own build script.
+// The generated file also defines DELEGATE_LINEAGE, which the rehearsal does not read.
+#[allow(dead_code)]
 mod recorded_store_lineage {
     include!(concat!(env!("OUT_DIR"), "/legacy_store_contract.rs"));
 }
@@ -1509,7 +1513,7 @@ async fn main() {
         owner: None,
         info: make_info(&seller, &fp, "Fifth Generation Store", 3),
         listings: harvest_common::store::ListingsV1 {
-            listings: vec![make_listing(&seller, &fp, "gen5-listing", 1_756_000_000)],
+            listings: vec![make_listing(&seller, "gen5-listing", 1_756_000_000)],
         },
         orders: Default::default(),
         // Empty, and so not written out: the bytes are exactly the ones a
@@ -1520,7 +1524,7 @@ async fn main() {
         owner: None,
         info: make_info(&seller, &fp, "Fourth Generation Store", 2),
         listings: harvest_common::store::ListingsV1 {
-            listings: vec![make_listing(&seller, &fp, "gen4-listing", 1_755_000_000)],
+            listings: vec![make_listing(&seller, "gen4-listing", 1_755_000_000)],
         },
         orders: Default::default(),
         // Empty, and so not written out: the bytes are exactly the ones a

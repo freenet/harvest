@@ -102,7 +102,11 @@ jobs:
       # target of its own, so there is nothing to gain and a hard build error
       # to lose. The same limitation is why `rustfmt` cannot format
       # `tests/rehearsal/src/main.rs` at all.
+      # Warnings are denied so a new one cannot accumulate unnoticed (there
+      # were 27 before they were cleared).
       - name: check the migration rehearsal harness compiles
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo check --locked --manifest-path tests/rehearsal/Cargo.toml
 
   wasm:
