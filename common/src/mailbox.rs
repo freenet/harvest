@@ -597,9 +597,20 @@ pub struct EncryptedMessage {
     /// small next to what a public per-store mailbox reveals anyway (entry
     /// count, arrival times, padded sizes), and it is written down in
     /// `docs/messaging-privacy.md` rather than left implicit.
+    ///
+    /// Encoded as a CBOR byte string (`serde_bytes`), as is `ciphertext`:
+    /// serde's default writes a `Vec<u8>` as an array of integers, about two
+    /// bytes per byte and decoded one element at a time, which made an update
+    /// to a full mailbox cost most of the node's 5 s compute limit
+    /// (harvest#226). Decoding still accepts that older array form, so a
+    /// state from an earlier generation reads unchanged; only the encoding
+    /// written is new, and it is the one this generation's contract accepts
+    /// as canonical.
+    #[serde(with = "serde_bytes")]
     pub sender_public_key: Vec<u8>,
     /// Encrypted payload (plaintext format is application-defined).
     /// SHOULD be padded to a size bucket before encryption.
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     /// When the message was created.
     pub timestamp: DateTime<Utc>,
@@ -842,7 +853,9 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// both: removing the two above kills the suite whether or not it is
 /// present.)
 fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
-    messages.sort_by_key(entry_digest);
+    // Cached: `sort_by_key` would hash both messages' whole ciphertext on
+    // every comparison, O(n log n) passes over up to 4 MiB (harvest#226).
+    messages.sort_by_cached_key(entry_digest);
     messages.dedup_by_key(|message| entry_digest(message));
 }
 
@@ -2819,5 +2832,123 @@ mod merge_law_tests {
             .verify()
             .expect_err("more top-class messages than the class cap must not verify");
         assert!(err.contains("size class"), "got: {err}");
+    }
+}
+
+/// harvest#226: the two `Vec<u8>` fields are CBOR byte strings, and a state
+/// written by an earlier generation (as arrays of integers) still decodes.
+/// The migration fold depends on the second half: it decodes a predecessor's
+/// state with today's types and forwards it re-encoded.
+#[cfg(test)]
+mod byte_string_encoding_tests {
+    use super::*;
+
+    /// `EncryptedMessage` as every generation before harvest#226 encoded it:
+    /// the same fields, the byte fields left to serde's default.
+    #[derive(Serialize)]
+    struct EarlierMessage {
+        conversation_id: ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: DateTime<Utc>,
+        nonce: [u8; 24],
+    }
+
+    #[derive(Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<EarlierMessage>,
+    }
+
+    fn mailbox() -> MailboxStateV1 {
+        let messages = (0u8..6)
+            .map(|i| EncryptedMessage {
+                conversation_id: ConversationId([i; 32]),
+                sender_public_key: (0..32).map(|b| b ^ i).collect(),
+                // Byte values both sides of 24, where the array form changes
+                // from one byte per element to two.
+                ciphertext: (0..SIZE_BUCKETS[0] + AEAD_TAG_BYTES)
+                    .map(|b| (b as u8).wrapping_mul(7).wrapping_add(i))
+                    .collect(),
+                timestamp: DateTime::from_timestamp(1_760_000_000 + i64::from(i), 0).unwrap(),
+                nonce: [i; 24],
+            })
+            .collect();
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).unwrap();
+        state
+    }
+
+    fn earlier_bytes(state: &MailboxStateV1) -> Vec<u8> {
+        crate::to_cbor(&EarlierMailbox {
+            messages: state
+                .messages
+                .iter()
+                .map(|m| EarlierMessage {
+                    conversation_id: m.conversation_id.clone(),
+                    sender_public_key: m.sender_public_key.clone(),
+                    ciphertext: m.ciphertext.clone(),
+                    timestamp: m.timestamp,
+                    nonce: m.nonce,
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_earlier_generations_encoding_still_decodes() {
+        let state = mailbox();
+        let old = earlier_bytes(&state);
+        let decoded: MailboxStateV1 =
+            crate::from_cbor(&old).expect("a predecessor's mailbox must decode");
+        assert_eq!(decoded, state, "every message, byte for byte");
+        decoded.verify().expect("and it is a valid mailbox");
+    }
+
+    /// Red if either `#[serde(with = "serde_bytes")]` is removed.
+    #[test]
+    fn the_byte_fields_are_written_as_byte_strings() {
+        let state = mailbox();
+        let new = crate::to_cbor(&state).unwrap();
+        let old = earlier_bytes(&state);
+        let payload: usize = state
+            .messages
+            .iter()
+            .map(|m| m.ciphertext.len() + m.sender_public_key.len())
+            .sum();
+        // A byte string costs its length plus a few bytes of head; the array
+        // form costs nearly two bytes for every byte over 23.
+        assert!(
+            new.len() < payload + 200 * state.messages.len(),
+            "{} encoded bytes for {payload} bytes of payload",
+            new.len()
+        );
+        assert!(old.len() > payload * 3 / 2);
+        for field in ["ciphertext", "sender_public_key"] {
+            let key = crate::to_cbor(&field).unwrap();
+            let at = new
+                .windows(key.len())
+                .position(|w| w == key.as_slice())
+                .expect("the field is encoded")
+                + key.len();
+            assert_eq!(
+                new[at] >> 5,
+                2,
+                "{field} is CBOR major type 2, a byte string"
+            );
+        }
+    }
+
+    /// The current contract accepts only its own encoding as canonical, so a
+    /// predecessor's bytes must be re-encoded before they are forwarded; the
+    /// fold does that, since it forwards what it decoded.
+    #[test]
+    fn an_earlier_encoding_is_not_canonical_and_its_re_encoding_is() {
+        let state = mailbox();
+        let old = earlier_bytes(&state);
+        let decoded: MailboxStateV1 = crate::from_cbor(&old).unwrap();
+        assert!(!crate::is_canonical_cbor(&decoded, &old));
+        let forwarded = crate::to_cbor(&decoded).unwrap();
+        assert!(crate::is_canonical_cbor(&decoded, &forwarded));
     }
 }

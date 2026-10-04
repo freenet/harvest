@@ -15,7 +15,10 @@
 //!   byte as ciborium does (tested against ciborium on edge-case lengths).
 //! * [`decode_mailbox`] reads `MailboxStateV1` as ciborium writes it, and
 //!   returns `None` on anything else, so the caller falls back to the generic
-//!   decoder: it can be slow, never wrong.
+//!   decoder: it can be slow, never wrong. Since harvest#226 the message's
+//!   `sender_public_key` and `ciphertext` are written as CBOR byte strings
+//!   (`serde_bytes`); a mailbox from an earlier generation still has them as
+//!   integer arrays, so both forms are read.
 
 use harvest_common::mailbox::{ConversationId, EncryptedMessage, MailboxStateV1};
 
@@ -146,6 +149,16 @@ impl<'a> Reader<'a> {
             }
         }
         Some(out)
+    }
+
+    /// A `#[serde(with = "serde_bytes")]` field: a byte string as ciborium
+    /// writes it, or the integer array an earlier generation wrote.
+    fn bytes_either(&mut self) -> Option<Vec<u8>> {
+        if *self.bytes.get(self.at)? >> 5 == 2 {
+            let n = usize::try_from(self.head(2)?).ok()?;
+            return Some(self.take(n)?.to_vec());
+        }
+        self.byte_seq()
     }
 }
 
@@ -372,12 +385,12 @@ pub(crate) fn decode_mailbox(bytes: &[u8]) -> Option<MailboxStateV1> {
                     conversation_id = Some(ConversationId(id));
                 }
                 "sender_public_key" if sender_public_key.is_none() => {
-                    sender_public_key = Some(r.byte_seq()?);
+                    sender_public_key = Some(r.bytes_either()?);
                 }
                 "nonce" if nonce.is_none() => {
                     nonce = Some(r.byte_seq()?.try_into().ok()?);
                 }
-                "ciphertext" if ciphertext.is_none() => ciphertext = Some(r.byte_seq()?),
+                "ciphertext" if ciphertext.is_none() => ciphertext = Some(r.bytes_either()?),
                 "timestamp" if timestamp.is_none() => {
                     timestamp = Some(
                         chrono::DateTime::parse_from_rfc3339(r.text()?)
@@ -493,6 +506,52 @@ mod tests {
         );
         let empty = harvest_common::to_cbor(&MailboxStateV1::default()).unwrap();
         assert_eq!(decode_mailbox(&empty), Some(MailboxStateV1::default()));
+    }
+
+    /// A mailbox from before harvest#226, whose byte fields are integer
+    /// arrays, is read by the same route (the delegate decodes predecessor
+    /// mailboxes it is handed, and a node may still hold one).
+    #[test]
+    fn an_earlier_generations_mailbox_is_read_too() {
+        #[derive(serde::Serialize)]
+        struct Earlier {
+            conversation_id: ConversationId,
+            sender_public_key: Vec<u8>,
+            ciphertext: Vec<u8>,
+            timestamp: chrono::DateTime<chrono::Utc>,
+            nonce: [u8; 24],
+        }
+        #[derive(serde::Serialize)]
+        struct EarlierMailbox {
+            messages: Vec<Earlier>,
+        }
+        let state = MailboxStateV1 {
+            messages: LENGTHS
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| message(i, len))
+                .collect(),
+        };
+        let earlier = EarlierMailbox {
+            messages: state
+                .messages
+                .iter()
+                .map(|m| Earlier {
+                    conversation_id: m.conversation_id.clone(),
+                    sender_public_key: m.sender_public_key.clone(),
+                    ciphertext: m.ciphertext.clone(),
+                    timestamp: m.timestamp,
+                    nonce: m.nonce,
+                })
+                .collect(),
+        };
+        let bytes = harvest_common::to_cbor(&earlier).unwrap();
+        assert_ne!(
+            bytes,
+            harvest_common::to_cbor(&state).unwrap(),
+            "a different encoding"
+        );
+        assert_eq!(decode_mailbox(&bytes), Some(state));
     }
 
     /// Anything that is not exactly what ciborium writes is declined, never
