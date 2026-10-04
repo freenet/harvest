@@ -41,7 +41,7 @@ impl Kind {
     /// report-only contract is measured and printed every run, with the
     /// issue that will make it gate, so the number is never out of sight:
     ///
-    /// * the store, until its caps and byte encoding land (sellerbugs step 2);
+    /// * the store, until harvest#230 (its caps and byte strings) lands;
     /// * reputation, until harvest#228 is fixed.
     ///
     /// Flipping one to `true` is part of the change that brings it within
@@ -57,7 +57,7 @@ impl Kind {
     pub fn tracked_by(self) -> &'static str {
         match self {
             Kind::Mailbox | Kind::Index => "",
-            Kind::Store => "store caps and byte strings (sellerbugs step 2)",
+            Kind::Store => "harvest#230 (store caps and byte strings)",
             Kind::Reputation => "harvest#228",
         }
     }

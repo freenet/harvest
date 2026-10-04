@@ -15,7 +15,7 @@
 use anyhow::{bail, Result};
 use harvest_common::mailbox::{
     ConversationId, EncryptedMessage, MailboxParameters, MailboxStateV1, AEAD_TAG_BYTES,
-    MAX_MESSAGES, SENDER_KEY_BYTES, SIZE_BUCKETS, SIZE_CLASS_CAPS,
+    MAX_DELTA_BYTES, MAX_MESSAGES, SENDER_KEY_BYTES, SIZE_BUCKETS, SIZE_CLASS_CAPS,
 };
 
 use super::{array, bytes, cbor, now, signing_key, Case, Kind, Update};
@@ -168,13 +168,28 @@ pub fn cases() -> Result<Vec<Case>> {
     // PUT, a resync or the migration's `send_forward` delivers it.
     let other = at_cap("mailbox/other", 1)?;
 
-    // (c) The largest delta the contract accepts: `MAX_MESSAGES` messages
-    // (it refuses more from the CBOR array head, before decoding), all in
-    // the largest size class, newer than everything held. About 34 MB,
-    // under the node's 50 MiB limit. The class cap keeps 24 of them.
-    let largest: Vec<EncryptedMessage> = (0..MAX_MESSAGES as u64)
-        .map(|i| message("mailbox/largest", i, SIZE_BUCKETS.len() - 1, -1 - i as i64))
-        .collect();
+    // (c) The largest delta the contract accepts: as many messages of the
+    // largest size class, newer than everything held, as encode within
+    // `MAX_DELTA_BYTES` (the contract refuses a longer delta on its length,
+    // before reading it). The class cap keeps 24 of them.
+    let top = |label: &str, n: u64| -> Vec<EncryptedMessage> {
+        (0..n)
+            .map(|i| message(label, i, SIZE_BUCKETS.len() - 1, -1 - i as i64))
+            .collect()
+    };
+    let mut fit = 0u64;
+    while cbor(&top("mailbox/largest", fit + 1)).len() <= MAX_DELTA_BYTES {
+        fit += 1;
+    }
+    let largest = top("mailbox/largest", fit);
+
+    // (c') `MAX_MESSAGES` messages of the largest class, about 34 MB, under
+    // the node's 50 MiB limit: over `MAX_DELTA_BYTES`, so it must be refused
+    // on its length, cheaply.
+    let too_large = top("mailbox/too-large", MAX_MESSAGES as u64);
+    if cbor(&too_large).len() <= MAX_DELTA_BYTES {
+        bail!("the 512-message top-class delta fits MAX_DELTA_BYTES: update the harness");
+    }
 
     // (d) One message more than that, which must be refused, cheaply.
     let too_many: Vec<EncryptedMessage> = (0..MAX_MESSAGES as u64 + 1)
@@ -206,9 +221,14 @@ pub fn cases() -> Result<Vec<Case>> {
             Update::State(cbor(&other)),
         ),
         case(
-            "512 at caps + 512-message top-class delta",
+            &format!("512 at caps + {fit}-message top-class delta (at the byte bound)"),
             &held_bytes,
             Update::Delta(cbor(&largest)),
+        ),
+        case(
+            "512 at caps + 512-message top-class delta (refused)",
+            &held_bytes,
+            Update::RefusedDelta(cbor(&too_large)),
         ),
         case(
             "512 at caps + 513-message delta (refused)",

@@ -130,9 +130,12 @@ caps. The module docs in `src/cases/` say what is at which cap and why.
   * one text message, the smallest bucket, as a delta;
   * a second mailbox at the same caps as a full state, interleaved in time,
     so the merge keeps half of each;
-  * the largest delta the contract accepts: `MAX_MESSAGES` (512) messages,
-    all in the largest size class, about 34 MB, under the node's 50 MiB
-    limit (the class cap keeps 24 of them);
+  * the largest delta the contract accepts: as many messages of the largest
+    size class as encode within `MAX_DELTA_BYTES` (4,227,072 bytes), which
+    is 64 of them (the class cap keeps 24);
+  * `MAX_MESSAGES` (512) messages of the largest size class, about 34 MB,
+    under the node's 50 MiB limit, which the contract must refuse on the
+    delta's length, so the refusal must be cheap;
   * 513 messages, which the contract must refuse from the CBOR array head
     before decoding, so the refusal must be cheap;
   * adversarial ties, as a one-message delta and as a full state: every
@@ -221,8 +224,8 @@ gate: an over-budget call fails the run. The store and reputation are
 call is a `::warning::` naming the issue that will make it gate, and the run
 does not fail on it.
 
-* The store gates once its caps and byte-string encoding land (sellerbugs
-  step 2); its target is both store cases under 100% at the new caps.
+* The store gates once harvest#230 (store caps and byte strings) is fixed;
+  its target is both store cases under 100% at the new caps.
 * Reputation gates once harvest#228 is fixed.
 
 Making a contract gate is part of the change that brings it within budget.
@@ -250,7 +253,8 @@ with main's `harvest-common`, so its fixtures are in main's encoding):
 | | `update_state` | 656.0% | 59.4% | 23.9% |
 | | idempotency probe | 634.7% | 59.4% | 23.8% |
 | | `get_state_delta`, new subscriber | 161.2% | 12.3% | 12.3% |
-| 512-message top-class delta (34 MB) | `update_state` | 3356.9% | 290.4% | **107.3%, over** |
+| 512-message top-class delta (34 MB) | `update_state` | 3356.9% | 290.4% | **107.3%, over** (refused at `5f4cd2b9`: 6.8%) |
+| 64-message top-class delta (at `MAX_DELTA_BYTES`) | `update_state` | | | 24.1% at `5f4cd2b9` |
 | 513-message delta | `update_state` (must refuse) | accepted, 347.2% | accepted, 36.6% | refused, 2.2% |
 | 512 tied + one-message delta | `update_state` | 227.6% | 65.7% | 12.2% |
 | | `validate_state` (merged) | 176.4% | 24.6% | 24.6% |
@@ -264,10 +268,19 @@ state is 24.6% where an untied one is 6.8%, because `verify` checks the
 canonical order pairwise and every pair ties through to two digests; that
 is within budget.
 
-**The largest accepted delta is still over on `4f53c9ef`**: 512 top-class
-messages in one delta cost 2.36 billion fuel in `update_state`, 107.3% of
-the budget (about 0.5 s at the mailbox's calibrated rate below). Anyone can
-send one to an open-write mailbox.
+**The largest accepted delta was still over on `4f53c9ef`**: 512 top-class
+messages in one delta (34 MB) cost 2.36 billion fuel in `update_state`,
+107.3% of the budget. Anyone can send one to an open-write mailbox. The
+mailbox at `5f4cd2b9` (`56334e8`) refuses a delta longer than
+`MAX_DELTA_BYTES` (4,227,072 bytes, `MAX_MAILBOX_BYTES + 512 * 64`) on its
+length, before reading its head or decoding it. The largest delta it
+accepts is then 64 top-class messages: `update_state` 530,037,599 fuel,
+24.1%. Refusing the 34 MB delta costs 148,668,860 fuel (6.8%), against
+49,462,517 (2.2%) for the 513 small messages: the contract's own check is on
+the length, but the stdlib glue decodes the bincode update list, copying all
+34 MB in through the streaming buffer, before the contract sees it. Every
+other mailbox figure at `5f4cd2b9` is the same as at `4f53c9ef`, to within
+a few units of fuel, and every gating call is within budget (exit 0).
 
 The other contracts measured the same on `c8b2dee` as on main, to the unit
 of fuel. That includes the store, whose WASM moved to `35a45555…` with no
