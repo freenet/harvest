@@ -62,6 +62,13 @@
 //!      own `ImportMigratedSecret`, as the next re-key will; then the import
 //!      families #206 added: the published list, the pending-key slot, and
 //!      the keys that must be refused, harvest#206)
+//!   delegate messaging-families <ws-url-with-authToken> <delegate.wasm>
+//!     (after the walk: the families batch 2 added. A buyer conversation's
+//!      sent digests and seen time, and the seller's sent digests filed by
+//!      store key, each noted past its cap on the migrated successor, then
+//!      exported and imported into a twin; an over-cap record arrives cut
+//!      to the cap; the store cap refuses a 65th store; arm and store-read
+//!      records are refused, harvest#221)
 //!   delegate seed-convo <ws-url-with-authToken> <delegate.wasm> <store-code-hash-hex> <out-dir>
 //!     (keep a buyer conversation under the store's id at an EARLIER store
 //!      generation, and write the store code plus the current generation's
@@ -1294,6 +1301,284 @@ async fn published_families(url: &str, wasm: &[u8]) {
     }
 }
 
+/// A twin of `wasm` under `params`, with every secret of `exported` imported
+/// through its own `ImportMigratedSecret` and the source then sealed, as the
+/// walk does. The outcomes, by `Debug` name.
+async fn twin_of(
+    node: &mut Node,
+    wasm: &[u8],
+    params: &[u8],
+    predecessor: [u8; 32],
+    exported: &freenet_migrate::ExportedSecrets,
+) -> (DelegateKey, std::collections::BTreeMap<String, usize>) {
+    let twin = node.register_with(wasm, params).await;
+    let mut outcomes: std::collections::BTreeMap<String, usize> = Default::default();
+    for (k, v) in &exported.secrets {
+        let outcome = import_into(node, &twin, predecessor, k, v.clone()).await;
+        if !matches!(outcome, harvest_common::delegate::SecretImport::Written) {
+            println!("  import of {} into the twin: {outcome:?}", String::from_utf8_lossy(k));
+        }
+        *outcomes.entry(format!("{outcome:?}")).or_default() += 1;
+    }
+    match node
+        .harvest(
+            &twin,
+            HarvestDelegateRequest::RecordPredecessorMarker {
+                predecessor,
+                marker: PredecessorMarkerState::Done { had_data: true },
+            },
+        )
+        .await
+    {
+        HarvestDelegateResponse::PredecessorMarkerRecorded { recorded: true, .. } => {}
+        other => panic!("RecordPredecessorMarker: {other:?}"),
+    }
+    (twin, outcomes)
+}
+
+async fn conversation_of(node: &mut Node, key: &DelegateKey, store: &[u8]) -> (Vec<[u8; 32]>, Option<u64>, [u8; 32]) {
+    match node
+        .harvest(key, HarvestDelegateRequest::ListBuyerConversations { request_id: 70, store_contract_id: store.to_vec() })
+        .await
+    {
+        HarvestDelegateResponse::BuyerConversationList { conversations, .. } => {
+            let c = conversations.first().expect("the conversation");
+            (c.sent_digests.clone(), c.seen_ms, c.buyer_public_key)
+        }
+        other => panic!("ListBuyerConversations: {other:?}"),
+    }
+}
+
+async fn seller_sent_of(node: &mut Node, key: &DelegateKey, store_key: [u8; 32]) -> Result<Vec<([u8; 32], [u8; 32])>, String> {
+    match node.harvest(key, HarvestDelegateRequest::ListSellerSent { request_id: 71, store_key }).await {
+        HarvestDelegateResponse::SellerSent { result, .. } => result,
+        other => panic!("ListSellerSent: {other:?}"),
+    }
+}
+
+/// A conversation record with its `sent` digests replaced (the record is
+/// crate-private; `sent` is a CBOR byte string, `serde_bytes`).
+fn with_sent(record: &[u8], digests: &[[u8; 32]], seen_ms: Option<u64>) -> Vec<u8> {
+    use ciborium::Value;
+    let Value::Map(mut entries) = ciborium::from_reader::<Value, _>(record).unwrap() else {
+        panic!("a conversation record is a map")
+    };
+    let mut replaced = (false, false);
+    for (k, v) in entries.iter_mut() {
+        match k.as_text() {
+            Some("sent") => {
+                *v = Value::Bytes(digests.concat());
+                replaced.0 = true;
+            }
+            Some("seen_ms") => {
+                *v = seen_ms.map_or(Value::Null, |ms| Value::Integer(ms.into()));
+                replaced.1 = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(replaced.0 && replaced.1, "the record names sent and seen_ms");
+    let mut out = Vec::new();
+    ciborium::into_writer(&Value::Map(entries), &mut out).unwrap();
+    out
+}
+
+/// The families batch 2 added, on the successor the walk just migrated.
+async fn messaging_families(url: &str, wasm: &[u8]) {
+    use harvest_common::delegate::{SecretImport, MAX_SELLER_SENT_PER_STORE, MAX_SELLER_SENT_STORES, MAX_SENT_DIGESTS};
+    let mut failures: Vec<String> = Vec::new();
+    let mut verdict = |what: String, ok: bool| {
+        println!("{} {what}", if ok { "OK  " } else { "FAIL" });
+        if !ok {
+            failures.push(what);
+        }
+    };
+    let digest = |tag: u8, i: usize| {
+        let mut d = [tag; 32];
+        d[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+        d
+    };
+    let mut node = Node::connect(url).await;
+    let source = node.register(wasm).await;
+    let predecessor: [u8; 32] = source.bytes().try_into().expect("a 32-byte delegate key");
+
+    // The buyer conversation the walk carried from the seeded generation:
+    // past the digest cap, and seen.
+    let (before, _, tag) = conversation_of(&mut node, &source, &CONV_STORE).await;
+    verdict(format!("the migrated conversation starts with no sent digests ({})", before.len()), before.is_empty());
+    let noted = MAX_SENT_DIGESTS + 5;
+    for i in 0..noted {
+        match node
+            .harvest(
+                &source,
+                HarvestDelegateRequest::NoteBuyerSent {
+                    request_id: 72,
+                    store_contract_id: CONV_STORE.to_vec(),
+                    buyer_public_key: tag,
+                    digest: digest(0xB1, i),
+                },
+            )
+            .await
+        {
+            HarvestDelegateResponse::BuyerConversationUpdated { result: Ok(true), .. } => {}
+            other => panic!("NoteBuyerSent {i}: {other:?}"),
+        }
+    }
+    const SEEN: u64 = 1_700_000_500_000;
+    match node
+        .harvest(
+            &source,
+            HarvestDelegateRequest::MarkConversationSeen {
+                request_id: 73,
+                store_contract_id: CONV_STORE.to_vec(),
+                buyer_public_key: tag,
+                seen_ms: SEEN,
+            },
+        )
+        .await
+    {
+        HarvestDelegateResponse::BuyerConversationUpdated { result: Ok(true), .. } => {}
+        other => panic!("MarkConversationSeen: {other:?}"),
+    }
+    let newest: Vec<[u8; 32]> = (noted - MAX_SENT_DIGESTS..noted).map(|i| digest(0xB1, i)).collect();
+    let (sent, seen, _) = conversation_of(&mut node, &source, &CONV_STORE).await;
+    verdict(
+        format!("{noted} buyer digests noted keep the newest {MAX_SENT_DIGESTS} ({} held), seen {seen:?}", sent.len()),
+        sent == newest && seen == Some(SEEN),
+    );
+
+    // The seller's sent digests, by store key: past the per-store cap.
+    let store_key = [0x5e; 32];
+    let seller_noted = MAX_SELLER_SENT_PER_STORE + 6;
+    for i in 0..seller_noted {
+        match node
+            .harvest(
+                &source,
+                HarvestDelegateRequest::NoteSellerSent {
+                    request_id: 74,
+                    store_key,
+                    conversation: digest(0xC1, i % 7),
+                    digest: digest(0xC2, i),
+                },
+            )
+            .await
+        {
+            HarvestDelegateResponse::SellerSentNoted { result: Ok(()), .. } => {}
+            other => panic!("NoteSellerSent {i}: {other:?}"),
+        }
+    }
+    let seller_newest: Vec<([u8; 32], [u8; 32])> = (seller_noted - MAX_SELLER_SENT_PER_STORE..seller_noted)
+        .map(|i| (digest(0xC1, i % 7), digest(0xC2, i)))
+        .collect();
+    let held = seller_sent_of(&mut node, &source, store_key).await;
+    verdict(
+        format!(
+            "{seller_noted} seller digests noted keep the newest {MAX_SELLER_SENT_PER_STORE} ({:?} held)",
+            held.as_ref().map(|h| h.len())
+        ),
+        held.as_ref() == Ok(&seller_newest),
+    );
+
+    let (exported, _) = export_of(&mut node, &source, 0).await;
+    let conv_key = exported
+        .secrets
+        .iter()
+        .find(|(k, _)| k.starts_with(b"harvest:buyer_conv:"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .expect("the export carries the conversation");
+    let seller_key = format!("harvest:seller_sent:{}", bs58::encode(store_key).into_string()).into_bytes();
+    verdict(
+        "the export carries the seller's digests filed by store key".into(),
+        exported.secrets.iter().any(|(k, _)| *k == seller_key),
+    );
+    let local: Vec<String> = exported
+        .secrets
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"harvest:auto:") && !k.starts_with(b"harvest:auto:ledger:"))
+        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+        .collect();
+    verdict(format!("the export carries no arm, store-read or other node-local instant-checkout record ({local:?})"), local.is_empty());
+
+    // Into a twin, as the next re-key will.
+    let (twin, outcomes) = twin_of(&mut node, wasm, b"rehearsal-twin-msg", predecessor, &exported).await;
+    verdict(
+        format!("every exported secret imported into the twin as Written: {outcomes:?}"),
+        outcomes.len() == 1 && outcomes.contains_key("Written"),
+    );
+    let (twin_sent, twin_seen, _) = conversation_of(&mut node, &twin, &CONV_STORE).await;
+    verdict(
+        format!("the twin's conversation: {} digests, seen {twin_seen:?}", twin_sent.len()),
+        twin_sent == newest && twin_seen == Some(SEEN),
+    );
+    let twin_seller = seller_sent_of(&mut node, &twin, store_key).await;
+    verdict(
+        format!("the twin's seller digests for the store key: {:?}", twin_seller.as_ref().map(|h| h.len())),
+        twin_seller.as_ref() == Ok(&seller_newest),
+    );
+    let again = import_into(&mut node, &twin, predecessor, &seller_key, exported.secrets.iter().find(|(k, _)| *k == seller_key).unwrap().1.clone()).await;
+    verdict(format!("the seller's digests again: {again:?}"), again == SecretImport::AlreadyAuthoritative);
+    // Into a twin already holding the conversation: the later seen time is
+    // kept; the predecessor's digests count as older, so past the cap they go.
+    let later = with_sent(&conv_key.1, &[digest(0xB9, 0), digest(0xB9, 1)], Some(SEEN + 1));
+    let merged = import_into(&mut node, &twin, predecessor, &conv_key.0, later).await;
+    let (merged_sent, merged_seen, _) = conversation_of(&mut node, &twin, &CONV_STORE).await;
+    verdict(
+        format!("a held conversation merges: {merged:?}, seen {merged_seen:?}, {} digests", merged_sent.len()),
+        merged == SecretImport::Written && merged_seen == Some(SEEN + 1) && merged_sent == newest,
+    );
+    let earlier = with_sent(&conv_key.1, &[], Some(SEEN - 1));
+    let not_lowered = import_into(&mut node, &twin, predecessor, &conv_key.0, earlier).await;
+    let (_, still_seen, _) = conversation_of(&mut node, &twin, &CONV_STORE).await;
+    verdict(
+        format!("an earlier seen time does not lower it: {not_lowered:?}, seen {still_seen:?}"),
+        not_lowered == SecretImport::AlreadyAuthoritative && still_seen == Some(SEEN + 1),
+    );
+
+    // An over-cap record, as a predecessor or a hand-built export could
+    // send, arrives cut to the newest MAX_SENT_DIGESTS.
+    let over: Vec<[u8; 32]> = (0..MAX_SENT_DIGESTS + 72).map(|i| digest(0xBA, i)).collect();
+    let fresh = node.register_with(wasm, b"rehearsal-twin-cap").await;
+    let capped = import_into(&mut node, &fresh, predecessor, &conv_key.0, with_sent(&conv_key.1, &over, Some(SEEN))).await;
+    let (capped_sent, capped_seen, _) = conversation_of(&mut node, &fresh, &CONV_STORE).await;
+    verdict(
+        format!("a record of {} digests arrives capped: {capped:?}, {} kept, seen {capped_seen:?}", over.len(), capped_sent.len()),
+        capped == SecretImport::Written && capped_sent == over[over.len() - MAX_SENT_DIGESTS..] && capped_seen == Some(SEEN),
+    );
+    // The store cap: a twin already keeping MAX_SELLER_SENT_STORES stores
+    // refuses a predecessor's 65th.
+    for n in 0..MAX_SELLER_SENT_STORES {
+        let mut other = [0x6a; 32];
+        other[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        match node
+            .harvest(
+                &fresh,
+                HarvestDelegateRequest::NoteSellerSent { request_id: 75, store_key: other, conversation: [1; 32], digest: [2; 32] },
+            )
+            .await
+        {
+            HarvestDelegateResponse::SellerSentNoted { result: Ok(()), .. } => {}
+            other => panic!("NoteSellerSent store {n}: {other:?}"),
+        }
+    }
+    let full = import_into(&mut node, &fresh, predecessor, &seller_key, exported.secrets.iter().find(|(k, _)| *k == seller_key).unwrap().1.clone()).await;
+    verdict(format!("a {}th store's digests are refused: {full:?}", MAX_SELLER_SENT_STORES + 1), matches!(full, SecretImport::Permanent(_)));
+
+    // Arm and store-read records never carry: stale windows must not.
+    for k in [
+        format!("harvest:auto:arm:{}", bs58::encode([0x11u8; 32]).into_string()),
+        format!("harvest:auto:store:{}", bs58::encode([0x11u8; 32]).into_string()),
+    ] {
+        let outcome = import_into(&mut node, &fresh, predecessor, k.as_bytes(), vec![0xa0]).await;
+        verdict(format!("{k} is refused: {outcome:?}"), matches!(outcome, SecretImport::Permanent(_)));
+    }
+    if failures.is_empty() {
+        println!("MESSAGING FAMILIES: all checks passed");
+    } else {
+        println!("MESSAGING FAMILIES: {} failed", failures.len());
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1313,6 +1598,7 @@ async fn main() {
             time_export(&args[2], &std::fs::read(&args[3]).unwrap(), args[4].parse().expect("a generation number")).await
         }
         Some("published-families") => published_families(&args[2], &std::fs::read(&args[3]).unwrap()).await,
+        Some("messaging-families") => messaging_families(&args[2], &std::fs::read(&args[3]).unwrap()).await,
         Some("read-flags") => read_flags(&args[2], &args[3], &args[4]),
         Some("seed-convo") => seed_convo(&args[2], &std::fs::read(&args[3]).unwrap(), &args[4], &args[5]).await,
         _ => {

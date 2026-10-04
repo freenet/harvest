@@ -176,6 +176,13 @@ scenario() {
       grep -E "^FAIL|panicked" "$d/families.txt" | sed 's/^/   /'
       echo "   FAIL: the published-script families (see $d/families.txt)"; ok=0
     fi
+    # The conversation and seller-sent families (batch 2, harvest#221).
+    if "$HARNESS" messaging-families "$URL&authToken=$(token)" "$NEWUI/harvest_delegate.wasm" > "$d/messaging.txt" 2>&1; then
+      echo "   $(tail -1 "$d/messaging.txt")"
+    else
+      grep -E "^FAIL|panicked" "$d/messaging.txt" | sed 's/^/   /'
+      echo "   FAIL: the messaging families (see $d/messaging.txt)"; ok=0
+    fi
   fi
   local peers
   peers=$(cat "$d"/node/log/*.log 2>/dev/null | grep -c "Adding connection to peer" || true)
