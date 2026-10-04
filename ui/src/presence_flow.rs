@@ -126,6 +126,9 @@ impl StorePresence {
             StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
                 NotTakingReason::ClosedForGood,
             ))) => Some("This store is closed for good. You can look, but not buy."),
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(NotTakingReason::Paused))) => {
+                Some("This store is closed for now. You can look, but not buy.")
+            }
             StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
                 NotTakingReason::CatchingUp,
             ))) => Some(
@@ -153,9 +156,10 @@ pub fn not_taking_label(reason: Option<NotTakingReason>) -> &'static str {
     match reason {
         Some(NotTakingReason::ClosedForGood) => "Closed for good",
         Some(NotTakingReason::CatchingUp) => "Back soon",
-        Some(NotTakingReason::Paused | NotTakingReason::Unavailable) | None => {
-            "Not taking orders right now"
-        }
+        // The seller paused it (step 2), as against a lapse they may not
+        // know about.
+        Some(NotTakingReason::Paused) => "Closed for now",
+        Some(NotTakingReason::Unavailable) | None => "Not taking orders right now",
     }
 }
 
@@ -194,6 +198,17 @@ pub fn store_presence(
 impl AppState {
     /// This store's presence, now.
     pub fn store_presence(&self, store_contract_id: &[u8], now_ms: u64) -> StorePresence {
+        // The store's own pause (step 2) is what every device holding its
+        // key reads, so it wins over a heartbeat that has not caught up.
+        if self
+            .browsing_stores
+            .get(store_contract_id)
+            .is_some_and(|store| store.paused())
+        {
+            return StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
+                NotTakingReason::Paused,
+            )));
+        }
         let presence = self
             .browsing_stores
             .get(store_contract_id)
@@ -666,6 +681,42 @@ mod tests {
         );
     }
 
+    /// Step 2: a store whose own state says paused reads "Closed for now" to
+    /// a buyer even while a heartbeat from before the pause still says
+    /// open, and reads open again once it resumes. Mutated red by reading
+    /// presence alone.
+    #[test]
+    fn a_paused_store_is_closed_for_now_whatever_its_heartbeat_says() {
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]).verifying_key();
+        let store_id = vec![0x56u8; 32];
+        let presence = crate::auto_invoice_flow::presence_instance_bytes(&owner.to_bytes())
+            .expect("a presence contract");
+        let mut state = AppState::default();
+        state.presence.states.insert(
+            presence.to_vec(),
+            PresenceStateV1 {
+                heartbeat: Some(signed(NOW - 60_000, true)),
+            },
+        );
+        state
+            .presence
+            .following
+            .insert(presence.to_vec(), ([0u8; 32], NOW));
+        let store = state.browsing_stores.entry(store_id.clone()).or_default();
+        store.owner = Some(owner.to_bytes());
+        assert_eq!(state.store_presence(&store_id, NOW), StorePresence::Open);
+        let paused = |revision, paused| {
+            Some(harvest_common::store_pause::StorePause::new(
+                owner, revision, paused,
+            ))
+        };
+        state.browsing_stores.get_mut(&store_id).unwrap().pause = paused(5, true);
+        let now = state.store_presence(&store_id, NOW);
+        assert_eq!(now.not_taking_label(), Some("Closed for now"));
+        state.browsing_stores.get_mut(&store_id).unwrap().pause = paused(6, false);
+        assert_eq!(state.store_presence(&store_id, NOW), StorePresence::Open);
+    }
+
     /// ONE status, saying what happens to a buyer. Open only when buyers
     /// see it open and this device answers orders; a blocked device says so
     /// even while buyers see it open (a hosted node, review of #190); a
@@ -754,9 +805,10 @@ mod tests {
     }
 
     /// The buyer's words for each reason a heartbeat gives (harvest#219):
-    /// the general line for none, `Unavailable` and `Paused`; "Closed for
-    /// good"; "Back soon"; and nothing for a store that is open or closed
-    /// for another reason. Mutated red by swapping any arm.
+    /// the general line for none and `Unavailable`; "Closed for now" for the
+    /// seller's own pause (step 2); "Closed for good"; "Back soon"; and
+    /// nothing for a store that is open or closed for another reason.
+    /// Mutated red by swapping any arm.
     #[test]
     fn a_buyer_is_told_the_reason_a_store_gives() {
         let label = |r| StorePresence::Closed(ClosedWhy::NotTakingOrders(r)).not_taking_label();
@@ -765,9 +817,11 @@ mod tests {
             label(Some(NotTakingReason::Unavailable)),
             Some("Not taking orders right now")
         );
+        assert_eq!(label(Some(NotTakingReason::Paused)), Some("Closed for now"));
         assert_eq!(
-            label(Some(NotTakingReason::Paused)),
-            Some("Not taking orders right now")
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(NotTakingReason::Paused)))
+                .buyer_line(),
+            Some("This store is closed for now. You can look, but not buy.")
         );
         assert_eq!(
             label(Some(NotTakingReason::ClosedForGood)),

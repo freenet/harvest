@@ -804,6 +804,10 @@ pub struct AppState {
         (Vec<u8>, harvest_common::listing::ListingId),
         crate::listing_status_flow::SentStatus,
     >,
+    /// The highest pause or resume this session sent per store (step 2),
+    /// and whether it is still waiting for the store's state to show it.
+    /// See `crate::pause_flow`.
+    pub store_pause_sent: HashMap<Vec<u8>, crate::listing_status_flow::SentStatus>,
 
     /// New listings on their way to the network, with the notice that says
     /// so, keyed by listing id (harvest#161). See
@@ -1629,6 +1633,12 @@ fn unverified_listings(
 }
 
 impl BrowsingStore {
+    /// Whether the seller has paused this store (step 2). A closed store is
+    /// closed, not paused.
+    pub fn paused(&self) -> bool {
+        !self.closed && self.pause.as_ref().is_some_and(|pause| pause.paused)
+    }
+
     /// Whether this store can take an order at all, whatever its presence:
     /// not closed for good, it publishes a key to seal a buyer's address to,
     /// and its backing identity verified (`seller_verifying_key` is `None`
@@ -1824,6 +1834,8 @@ pub enum PendingSignature {
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
     /// A listing's availability, for the store key (harvest#70).
     ListingStatus(Box<crate::listing_status_flow::PendingListingStatus>),
+    /// The seller pausing or resuming the store, for the store key (step 2).
+    StorePause(Box<crate::pause_flow::PendingStorePause>),
     /// A buyer's Ghost Key vouching for one conversation, so their messages
     /// in it are shown to the seller (`crate::voucher_flow`).
     MessageVoucher(Box<crate::voucher_flow::PendingMessageVoucher>),
@@ -1850,6 +1862,7 @@ impl PendingSignature {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
             PendingSignature::ListingStatus(pending) => harvest_common::to_cbor(&pending.status),
+            PendingSignature::StorePause(pending) => harvest_common::to_cbor(&pending.pause),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
@@ -1882,6 +1895,7 @@ impl PendingSignature {
         match self {
             PendingSignature::Listing(_)
             | PendingSignature::ListingStatus(_)
+            | PendingSignature::StorePause(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
@@ -3243,6 +3257,10 @@ pub struct BrowsingStore {
     /// (`harvest_common::backing::StoreClosure`). Buyers cannot pay a closed
     /// store; see [`PaymentBlocker::StoreClosed`].
     pub closed: bool,
+    /// The seller's pause as the store last said it (step 2;
+    /// `harvest_common::store_pause`): the latest pause or resume. See
+    /// [`Self::paused`].
+    pub pause: Option<harvest_common::store_pause::StorePause>,
     /// Listings whose own certificate did not verify against this store.
     ///
     /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
@@ -5450,6 +5468,12 @@ impl AppState {
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
                     store.backing_state = backing_state;
                     store.closed = closed;
+                    store.pause = store_state
+                        .pause
+                        .records
+                        .values()
+                        .next()
+                        .map(|record| record.pause.clone());
                     store.owner = owner.map(|key| key.to_bytes());
                     store.unverified_listings = unverified_listings;
                     // `Some` even at version 0: `None` means "not loaded yet"
@@ -5480,6 +5504,7 @@ impl AppState {
                     self.refresh_backing_verdicts();
                     // A new listing this state holds is published (harvest#161).
                     self.settle_publishing(&contract_id);
+                    self.settle_store_pause(&contract_id);
                     self.settle_details_publishing(&contract_id);
 
                     // Keep this store's key recoverable from its backing Ghost
@@ -11779,6 +11804,7 @@ impl AppState {
         let what = match &withdrawn {
             Some(PendingSignature::Listing(_)) => "your listing",
             Some(PendingSignature::ListingStatus(_)) => "the change to your listing",
+            Some(PendingSignature::StorePause(_)) => "pausing or resuming your store",
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
@@ -11801,6 +11827,11 @@ impl AppState {
                 "{} ({reason})",
                 crate::listing_status_flow::LISTING_STATUS_NOT_SAVED
             ));
+            return;
+        }
+        if matches!(withdrawn, Some(PendingSignature::StorePause(_))) {
+            self.notifications
+                .push(format!("{} ({reason})", crate::pause_flow::PAUSE_NOT_SAVED));
             return;
         }
         self.notifications.push(format!(
@@ -13677,6 +13708,9 @@ impl AppState {
             }
             Some(PendingSignature::ListingStatus(pending)) => {
                 self.on_listing_status_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::StorePause(pending)) => {
+                self.on_store_pause_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
                 self.details_sent(&pending.store_contract_id, pending.info.version);
@@ -18257,6 +18291,7 @@ mod tests {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
                 PendingSignature::Listing(_)
                 | PendingSignature::ListingStatus(_)
+                | PendingSignature::StorePause(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -18994,6 +19029,7 @@ mod tests {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
                 PendingSignature::Listing(_)
                 | PendingSignature::ListingStatus(_)
+                | PendingSignature::StorePause(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)

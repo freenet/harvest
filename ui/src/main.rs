@@ -19,6 +19,7 @@ mod listing_status_flow;
 mod markdown;
 mod messaging;
 mod migrate;
+mod pause_flow;
 mod presence_flow;
 mod state;
 mod store_link;
