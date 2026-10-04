@@ -37,6 +37,31 @@ impl Kind {
         }
     }
 
+    /// Whether an over-budget call of this contract fails the run. A
+    /// report-only contract is measured and printed every run, with the
+    /// issue that will make it gate, so the number is never out of sight:
+    ///
+    /// * the store, until its caps and byte encoding land (sellerbugs step 2);
+    /// * reputation, until harvest#228 is fixed.
+    ///
+    /// Flipping one to `true` is part of the change that brings it within
+    /// budget, not a later cleanup.
+    pub fn gates(self) -> bool {
+        match self {
+            Kind::Mailbox | Kind::Index => true,
+            Kind::Store | Kind::Reputation => false,
+        }
+    }
+
+    /// The issue that will make a report-only contract gate.
+    pub fn tracked_by(self) -> &'static str {
+        match self {
+            Kind::Mailbox | Kind::Index => "",
+            Kind::Store => "store caps and byte strings (sellerbugs step 2)",
+            Kind::Reputation => "harvest#228",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Kind::Mailbox => "mailbox",

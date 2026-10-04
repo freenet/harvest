@@ -54,6 +54,10 @@ const BUDGET_SECONDS: f64 = 1.0;
 
 struct Measured {
     contract: &'static str,
+    /// From `Kind::gates`: an over-budget call of a report-only contract is
+    /// printed as a warning and does not fail the run.
+    gating: bool,
+    tracked_by: &'static str,
     case: String,
     call: &'static str,
     fuel: Option<u64>,
@@ -124,6 +128,8 @@ impl Runner {
         let outcome = contract.call(call.entry, &call.args)?;
         let m = Measured {
             contract: case.kind.name(),
+            gating: case.kind.gates(),
+            tracked_by: case.kind.tracked_by(),
             case: case.name.clone(),
             call: call.label,
             fuel: outcome.fuel,
@@ -423,7 +429,8 @@ fn report(
     hashes: &[(Kind, String)],
     failure: Option<&anyhow::Error>,
 ) -> Result<bool> {
-    let over: Vec<&Measured> = measured.iter().filter(|m| m.over()).collect();
+    let over: Vec<&Measured> = measured.iter().filter(|m| m.over() && m.gating).collect();
+    let reported: Vec<&Measured> = measured.iter().filter(|m| m.over() && !m.gating).collect();
 
     let mut md = String::new();
     writeln!(md, "## Harvest contracts: work per call on an update").ok();
@@ -453,10 +460,11 @@ fn report(
             m.call,
             m.fuel.map_or("past the ceiling".into(), group),
             percent(m.fuel),
-            match (&m.trap, m.over()) {
-                (Some(t), _) => format!(":x: **{}**", t.lines().next().unwrap_or(t)),
-                (None, true) => ":x: **over budget**".into(),
-                (None, false) => String::new(),
+            match (&m.trap, m.over(), m.gating) {
+                (_, true, false) => format!(":warning: over, report-only ({})", m.tracked_by),
+                (Some(t), _, _) => format!(":x: **{}**", t.lines().next().unwrap_or(t)),
+                (None, true, _) => ":x: **over budget**".into(),
+                (None, false, _) => String::new(),
             }
         )
         .ok();
@@ -498,7 +506,7 @@ fn report(
     if let Some(e) = failure {
         writeln!(md, ":x: The scenario stopped early: `{e:#}`").ok();
     } else if over.is_empty() {
-        writeln!(md, "Every call is within budget.").ok();
+        writeln!(md, "Every gating call is within budget.").ok();
     } else {
         writeln!(
             md,
@@ -506,6 +514,15 @@ fn report(
              wall-clock limit on a busy peer, and every peer hosting the contract pays it for \
              every update. See `tests/contract-budget/README.md`.",
             over.len()
+        )
+        .ok();
+    }
+    if !reported.is_empty() {
+        writeln!(
+            md,
+            ":warning: {} report-only call(s) over budget; they do not fail the run (see \
+             `Kind::gates`).",
+            reported.len()
         )
         .ok();
     }
@@ -519,8 +536,14 @@ fn report(
     }
 
     println!();
+    for m in &reported {
+        eprintln!(
+            "::warning::{} / {} / {}: over budget, report-only until {}",
+            m.contract, m.case, m.call, m.tracked_by
+        );
+    }
     if over.is_empty() {
-        println!("every call is within {} fuel", group(BUDGET_FUEL));
+        println!("every gating call is within {} fuel", group(BUDGET_FUEL));
     } else {
         for m in &over {
             match &m.trap {

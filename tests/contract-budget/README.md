@@ -47,8 +47,8 @@ share of the budget, and `pass` or `FAIL`.
 
 Exit codes:
 
-* 0: every call is within budget.
-* 1: at least one call is over budget, ran past the harness's fuel ceiling,
+* 0: every GATING call is within budget.
+* 1: at least one gating call is over budget, ran past the harness's fuel ceiling,
   or trapped (out of the node's 256 MiB of memory, a panic). On a node the
   update fails there too, so a trap is a failure of the contract, recorded as
   such, and the run goes on to the next case.
@@ -185,6 +185,38 @@ reference hardware: run with `--calibrate 3` (it takes about 20 minutes with
 the store and reputation cases), read the `fuel/s (guest)` column, and set
 `BUDGET_FUEL` in `src/main.rs` to one second at the slowest rate among calls
 that take at least about 50 ms. Update this section.
+
+## Which contracts gate
+
+`Kind::gates` in `src/cases/mod.rs`. The mailbox and the Ghost Key index
+gate: an over-budget call fails the run. The store and reputation are
+**report-only**: they are measured and printed on every run, an over-budget
+call is a `::warning::` naming the issue that will make it gate, and the run
+does not fail on it.
+
+* The store gates once its caps and byte-string encoding land (sellerbugs
+  step 2); its target is both store cases under 100% at the new caps.
+* Reputation gates once harvest#228 is fixed.
+
+Making a contract gate is part of the change that brings it within budget.
+
+## After harvest#226 (mailbox)
+
+The mailbox's byte fields are CBOR byte strings and its dedupe hashes each
+message once. Contracts as built on `fix/mailbox-update-cost` (mailbox
+`70c52ef1…`; the others unchanged):
+
+| case | call | before | after |
+|---|---|---:|---:|
+| 512 at caps + one-message delta | `update_state` | 320.4% | 30.1% |
+| | `validate_state` (merged) | 158.8% | 6.8% |
+| | `summarize_state` / `get_state_delta` | 118% | 11.3% / 11.7% |
+| 512 at caps + another 512-at-caps state | `update_state` | 655.9% | 59.4% |
+| | idempotency probe | | 59.4% |
+
+One delivered message is about 1.32 billion fuel across the four calls a
+node makes, which is 0.6 s at the slowest calibrated rate and nearer 0.3 s at
+the typical one, against 3.4-3.7 s measured on a node before.
 
 ## Results on main
 
