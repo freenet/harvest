@@ -794,6 +794,10 @@ pub const MAX_DELTA_BYTES: usize = MAX_MAILBOX_BYTES + MAX_MESSAGES * 64;
 /// CBOR array head alone, or `None` if the bytes do not start with a
 /// definite-length array.
 ///
+/// Stricter than ciborium, which also reads an indefinite-length array: a
+/// delta in that form is refused, since every honest writer (ciborium, and
+/// this contract's own `get_state_delta`) writes a definite one.
+///
 /// For refusing an oversized delta BEFORE decoding it (harvest#226): only a
 /// state is checked against the caps, so a delta was decoded and merged
 /// whatever its length, and a single delta of many small messages cost the

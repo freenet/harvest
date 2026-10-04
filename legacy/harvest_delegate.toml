@@ -269,7 +269,7 @@ delegate_key = "23aaca572e973f2ac9bab50b34996efd6ebb5ea8f513aa49b897819bb8ac9607
 
 [[entry]]
 version = "V32"
-description = "Superseded by harvest#226, which changed `harvest-common`: `EncryptedMessage`'s byte fields are written as CBOR byte strings and the mailbox dedupe hashes each message once. The delegate's hand-written mailbox decoder (`fast_cbor::decode_mailbox`) now reads both the byte-string and the earlier integer-array form; nothing it stores changes encoding. The generation harvest#221 shipped (`b84af10`)."
+description = "Superseded by harvest#226, which changed `harvest-common`: `EncryptedMessage`'s byte fields are written as CBOR byte strings and the mailbox normalisation computes each digest once. The delegate's hand-written mailbox decoder (`fast_cbor::decode_mailbox`) now reads both the byte-string and the earlier integer-array form. No secret it stores holds an `EncryptedMessage`; the two round-trip contexts that do (`PendingBatch`, `PendingReplies`) are now written in the byte-string form and, through `serde_bytes`, read either. The generation harvest#221 shipped (`b84af10`)."
 date = "2026-10-04"
 code_hash = "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9"
 delegate_key = "015d5a57f0b6cf9d926ae1bdb0f9ef059e8de3f094cef3b26f23f6106a012c3d"

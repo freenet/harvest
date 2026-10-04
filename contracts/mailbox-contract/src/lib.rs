@@ -75,6 +75,11 @@ impl ContractInterface for Contract {
                         continue;
                     }
                     nothing_here = false;
+                    // No byte or count bound here, unlike the `Delta` arm: the
+                    // node runs `validate_state` on an incoming state before
+                    // merging it, and that refuses anything over the caps. If
+                    // that ever stopped being true, this arm would be a wider
+                    // gap than the delta was (harvest#226).
                     let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Everything, and `apply_delta` decides what is already
