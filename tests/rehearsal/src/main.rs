@@ -861,12 +861,13 @@ impl Node {
     /// An `UpdateData::State` UPDATE: the node runs the contract's own
     /// `update_state` merge, then `validate_state` on the result.
     async fn update_state(&mut self, key: ContractKey, state: Vec<u8>) -> Result<(), String> {
+        self.update(key, UpdateData::State(State::from(state))).await
+    }
+
+    async fn update(&mut self, key: ContractKey, data: UpdateData<'static>) -> Result<(), String> {
         let expected = *key.id();
         self.api
-            .send(ClientRequest::ContractOp(ContractRequest::Update {
-                key,
-                data: UpdateData::State(State::from(state)),
-            }))
+            .send(ClientRequest::ContractOp(ContractRequest::Update { key, data }))
             .await
             .map_err(|e| format!("send UPDATE: {e}"))?;
         loop {
@@ -1125,6 +1126,526 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
             );
         }
         other => panic!("current generation did not read back: {other:?}"),
+    }
+}
+
+// --- harvest#223: the mailbox and Ghost Key index lineages ---------------
+
+/// Walk `lineage` for an artifact addressed by `params`, the way the app's
+/// identity migration does (`migrate_ops::start_identity_migration`), and
+/// return what the fold recovered.
+async fn walk<O: freenet_migrate::ProbeStateOps>(
+    node: &mut Node,
+    ops: O,
+    params: &Parameters<'static>,
+    lineage: &'static [freenet_migrate::ContractLineageEntry],
+) -> (Outcome<O::State>, Seal)
+where
+    O::State: Default,
+{
+    let mut session = ProbeSession::start(
+        ops,
+        O::State::default(),
+        params,
+        lineage,
+        migrate::fold_all_policy(),
+    );
+    while let Some(candidate) = session.next_get() {
+        let answer = node.get(candidate).await;
+        match &answer {
+            GetOutcome::State(b) => println!("  GET {candidate} -> state, {} bytes", b.len()),
+            GetOutcome::Absent => println!("  GET {candidate} -> NotFound"),
+            GetOutcome::Unknown(why) => println!("  GET {candidate} -> unknown ({why})"),
+        }
+        match answer {
+            GetOutcome::State(bytes) => session.on_state(candidate, &bytes),
+            GetOutcome::Absent => session.on_absent(candidate),
+            GetOutcome::Unknown(_) => session.on_unknown(candidate),
+        }
+    }
+    session.take_result().expect("probe finished with a result")
+}
+
+/// The seal follows the rule (only a complete, untruncated recovery seals),
+/// and no PLANTED generation is among the unresolved. On an isolated
+/// network-mode node every unplanted generation answers NotFound, so this
+/// seals; on `freenet local` they answer an error, so it does not (see the
+/// README), but a planted generation answering Unknown still fails here.
+fn check_seal<S: std::fmt::Debug>(outcome: &Outcome<S>, seal: Seal, planted: &[ContractInstanceId]) {
+    let Outcome::Recovered {
+        truncated_fold,
+        unresolved,
+        ..
+    } = outcome
+    else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    assert!(!*truncated_fold, "the fold must not be truncated");
+    for id in planted {
+        assert!(!unresolved.contains(id), "planted generation {id} did not answer");
+    }
+    // On the documented isolated network-mode node every unplanted
+    // generation answers NotFound, so set REHEARSAL_EXPECT_SEAL=1 there: a
+    // node answering errors instead would otherwise pass with only a note.
+    if !unresolved.is_empty() && std::env::var("REHEARSAL_EXPECT_SEAL").as_deref() == Ok("1") {
+        panic!(
+            "{} unplanted generation(s) never answered NotFound, and REHEARSAL_EXPECT_SEAL=1",
+            unresolved.len()
+        );
+    }
+    if !unresolved.is_empty() {
+        println!(
+            "  NOTE: {} unplanted generation(s) never answered NotFound, so this cannot seal \
+             (expected on `freenet local`, wrong on an isolated network-mode node)",
+            unresolved.len()
+        );
+    }
+    let expect = if unresolved.is_empty() { Seal::Seal } else { Seal::Retry };
+    assert_eq!(seal, expect, "seal decision must follow the rule");
+}
+
+/// Refuse to rehearse against a build that was never re-keyed: if the
+/// current WASM were a recorded generation, the "forward" would land on the
+/// planted contract and every assertion would pass having moved nothing.
+fn assert_current_is_new(
+    current: &[u8],
+    lineage: &[freenet_migrate::ContractLineageEntry],
+    artifact: &str,
+) {
+    let h = code_hash(current);
+    for e in lineage {
+        assert_ne!(
+            e.code_hash, h,
+            "{artifact}: the current build's hash is recorded as superseded (V{})",
+            e.generation
+        );
+    }
+}
+
+/// The two newest superseded generations of `lineage`, newest first, with
+/// their WASM out of git history.
+fn two_newest(
+    repo: &Path,
+    artifact: &str,
+    lineage: &[freenet_migrate::ContractLineageEntry],
+) -> [(u32, Vec<u8>); 2] {
+    let mut gens: Vec<_> = lineage.iter().collect();
+    gens.sort_by_key(|e| std::cmp::Reverse(e.generation));
+    let pick = |e: &freenet_migrate::ContractLineageEntry| {
+        (e.generation, legacy_wasm_from_git(repo, artifact, &hex::encode(e.code_hash)))
+    };
+    [pick(gens[0]), pick(gens[1])]
+}
+
+fn mailbox_message(nonce: u8, secs: i64, len: usize) -> harvest_common::mailbox::EncryptedMessage {
+    harvest_common::mailbox::EncryptedMessage {
+        conversation_id: harvest_common::mailbox::ConversationId([nonce; 32]),
+        sender_public_key: vec![nonce; 32],
+        // Opaque to the contract, as a real sealed message is; sized like one.
+        ciphertext: (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(nonce)).collect(),
+        timestamp: ts(secs),
+        nonce: [nonce; 24],
+    }
+}
+
+/// Each message's BLAKE3 over its whole encoding, sorted: equal sets of
+/// identical messages give equal lists, and a failure prints hashes rather
+/// than megabytes of ciphertext.
+fn digests(state: &harvest_common::mailbox::MailboxStateV1) -> Vec<String> {
+    let mut d: Vec<String> = state
+        .messages
+        .iter()
+        .map(|m| blake3::hash(&harvest_common::to_cbor(m).unwrap()).to_hex().to_string())
+        .collect();
+    d.sort();
+    d
+}
+
+/// Scenario 6: a seller's mailbox with messages at the two newest superseded
+/// generations (one message in both) is found, folded into one set holding
+/// every message once, accepted by the current contract, and read back
+/// intact.
+async fn scenario_mailbox_lineage(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 6: mailbox lineage (harvest#223) ==");
+    use harvest_common::mailbox::MailboxStateV1;
+    let seller = SigningKey::from_bytes(&[61u8; 32]);
+    let vk = seller.verifying_key();
+    let params = migrate::encode_params(&migrate::mailbox_params(&vk)).unwrap();
+    let [(newest_gen, newest), (older_gen, older)] =
+        two_newest(repo, "mailbox_contract", migrate::mailbox_lineage());
+    let current = read_wasm(&repo.join("ui/public/contracts/mailbox_contract.wasm"));
+    assert_current_is_new(&current, migrate::mailbox_lineage(), "mailbox");
+    let (newest_c, newest_id) = container(&newest, params.clone());
+    let (older_c, older_id) = container(&older, params.clone());
+    let (curr_c, curr_id) = container(&current, params.clone());
+    println!("  V{newest_gen} {newest_id} | V{older_gen} {older_id} | current {curr_id}");
+    assert!(curr_id != newest_id && curr_id != older_id);
+    let ids: Vec<_> = freenet_migrate::predecessor_ids(&params, migrate::mailbox_lineage());
+    assert!(
+        ids.contains(&newest_id) && ids.contains(&older_id),
+        "the walk must reach both generations state is planted at"
+    );
+
+    let shared = mailbox_message(1, 1_759_000_000, 600);
+    let only_newest = mailbox_message(2, 1_759_000_100, 1200);
+    // The same NONCE as `only_newest`, different bytes: identity is the whole
+    // entry (`entry_digest`), never the nonce, so both must survive the fold
+    // and the current contract (the fold once deduped by nonce).
+    let mut nonce_twin = mailbox_message(3, 1_758_000_000, 300);
+    nonce_twin.nonce = only_newest.nonce;
+    let at_newest = MailboxStateV1 {
+        messages: vec![shared.clone(), only_newest.clone()],
+    };
+    let at_older = MailboxStateV1 {
+        messages: vec![shared.clone(), nonce_twin.clone()],
+    };
+    node.put(newest_c, harvest_common::to_cbor(&at_newest).unwrap())
+        .await
+        .expect("PUT at the newest superseded mailbox generation");
+    node.put(older_c, harvest_common::to_cbor(&at_older).unwrap())
+        .await
+        .expect("PUT at the older superseded mailbox generation");
+
+    let (outcome, seal) = walk(
+        node,
+        migrate::MailboxOps {
+            params: migrate::mailbox_params(&vk),
+        },
+        &params,
+        migrate::mailbox_lineage(),
+    )
+    .await;
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    check_seal(&outcome, seal, &[newest_id, older_id]);
+    let Outcome::Recovered { merged, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    let want = MailboxStateV1 {
+        messages: vec![shared.clone(), only_newest.clone(), nonce_twin.clone()],
+    };
+    assert_eq!(digests(merged), digests(&want), "every message once, byte for byte");
+
+    node.put(curr_c, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current mailbox contract accepts the folded state");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: MailboxStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(digests(&held), digests(&want), "the current generation holds them all");
+            println!("  current generation holds {} messages, as planted", held.messages.len());
+        }
+        other => panic!("current mailbox did not read back: {other:?}"),
+    }
+    // A later forward of LESS (one generation's messages alone, as a walk
+    // that met a slow predecessor would send) merges in: nothing is lost and
+    // nothing duplicated. A replace would drop a message here.
+    node.put(
+        container(&current, params.clone()).0,
+        harvest_common::to_cbor(&at_older).unwrap(),
+    )
+    .await
+    .expect("a partial forward PUT is accepted");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: MailboxStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(digests(&held), digests(&want), "merged, not replaced, and no duplicates");
+        }
+        other => panic!("current mailbox did not read back: {other:?}"),
+    }
+    scenario_mailbox_at_the_cap(node, repo).await;
+}
+
+/// Scenario 6b: two generations each near the message cap, so the fold has
+/// to trim. What the current contract holds after the forward must be
+/// exactly what the contract's own `apply_delta` keeps from the same input:
+/// the trimmed set is canonical and accepted, not refused.
+async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 6b: mailbox lineage over the message cap (harvest#223) ==");
+    use harvest_common::mailbox::{MailboxStateV1, MAX_MESSAGES};
+    let seller = SigningKey::from_bytes(&[62u8; 32]);
+    let vk = seller.verifying_key();
+    let params = migrate::encode_params(&migrate::mailbox_params(&vk)).unwrap();
+    let [(_, newest), (_, older)] = two_newest(repo, "mailbox_contract", migrate::mailbox_lineage());
+    let current = read_wasm(&repo.join("ui/public/contracts/mailbox_contract.wasm"));
+    use harvest_common::mailbox::{size_class, AEAD_TAG_BYTES, SIZE_BUCKETS, SIZE_CLASS_CAPS};
+    // Real ciphertexts are a padded bucket plus the AEAD tag. Per class, per
+    // generation: enough that each generation alone is within every cap, and
+    // the two together exceed every class cap AND the 512-message total.
+    const PER_CLASS: [u32; 4] = [270, 80, 40, 15];
+    let many = |base: u32| MailboxStateV1 {
+        messages: PER_CLASS
+            .iter()
+            .enumerate()
+            .flat_map(|(class, &n)| (0..n).map(move |i| (class, base + class as u32 * 1000 + i)))
+            .map(|(class, k)| {
+                let mut m = mailbox_message(
+                    (k % 251) as u8,
+                    1_757_000_000 + i64::from(k) * 60,
+                    SIZE_BUCKETS[class] + AEAD_TAG_BYTES,
+                );
+                m.nonce[..4].copy_from_slice(&k.to_be_bytes());
+                m.conversation_id.0[..4].copy_from_slice(&k.to_be_bytes());
+                m
+            })
+            .collect(),
+    };
+    // Each generation holds what its contract would keep: a real mailbox is
+    // never over a cap, so the planted states go through the merge first.
+    let canonical = |s: MailboxStateV1| {
+        let mut c = MailboxStateV1::default();
+        c.apply_delta(&Some(s.messages)).unwrap();
+        c
+    };
+    let a = canonical(many(0));
+    let b = canonical(many(10_000));
+    let per_class = |s: &MailboxStateV1| {
+        let mut n = [0usize; 4];
+        for m in &s.messages {
+            n[size_class(m).expect("every planted message has a class")] += 1;
+        }
+        n
+    };
+    // Planted as built: nothing trimmed within one generation.
+    assert_eq!(per_class(&a), PER_CLASS.map(|n| n as usize));
+    assert_eq!(per_class(&b), PER_CLASS.map(|n| n as usize));
+    // What the contract keeps from both, worked out locally by its own merge.
+    let mut expected = a.clone();
+    expected.apply_delta(&Some(b.messages.clone())).unwrap();
+    println!(
+        "  planted {} + {}; the contract's merge keeps {}",
+        a.messages.len(),
+        b.messages.len(),
+        expected.messages.len()
+    );
+    // Every cap binds: each class planted over its cap is trimmed, and the
+    // total lands on MAX_MESSAGES. Which messages go is the contract's
+    // ranking; the comparison with the live contract below is what checks it.
+    let kept = per_class(&expected);
+    println!("  kept per size class: {kept:?} (caps {SIZE_CLASS_CAPS:?})");
+    for c in 0..4 {
+        assert!(kept[c] <= SIZE_CLASS_CAPS[c], "class {c} within its cap");
+        assert!(kept[c] < 2 * PER_CLASS[c] as usize, "class {c} actually trimmed");
+    }
+    assert_eq!(expected.messages.len(), MAX_MESSAGES, "and the total at MAX_MESSAGES");
+    node.put(container(&newest, params.clone()).0, harvest_common::to_cbor(&a).unwrap())
+        .await
+        .expect("PUT a near-cap mailbox at the newest generation");
+    node.put(container(&older, params.clone()).0, harvest_common::to_cbor(&b).unwrap())
+        .await
+        .expect("PUT a near-cap mailbox at the older generation");
+    let (outcome, _) = walk(
+        node,
+        migrate::MailboxOps { params: migrate::mailbox_params(&vk) },
+        &params,
+        migrate::mailbox_lineage(),
+    )
+    .await;
+    let Outcome::Recovered { merged, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    // NOT an independent check of the fold: `merge_mailbox` is built on the
+    // same `apply_delta` that computed `expected`, so this only shows the fold
+    // drops and adds nothing of its own. What tests something is below: the
+    // SHIPPED current WASM accepting this state and holding the same set.
+    assert_eq!(digests(merged), digests(&expected), "the fold keeps what apply_delta keeps");
+    let (curr_c, curr_id) = container(&current, params.clone());
+    let started = std::time::Instant::now();
+    node.put(curr_c, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current contract accepts the trimmed fold");
+    println!("  TIMING forward onto empty: {} ms", started.elapsed().as_millis());
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: MailboxStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(digests(&held), digests(&expected));
+            println!("  current generation holds {} messages, as the contract's merge keeps", held.messages.len());
+        }
+        other => panic!("current mailbox did not read back: {other:?}"),
+    }
+    // A later forward of a few of one generation's messages merges in and
+    // changes nothing. A few, not all: merging a large state into a full
+    // mailbox costs close to the node's per-call compute limit, which is a
+    // separate defect with its own budget test (see harvest#226).
+    let few = MailboxStateV1 {
+        messages: b.messages.iter().take(8).cloned().collect(),
+    };
+    node.put(container(&current, params.clone()).0, harvest_common::to_cbor(&few).unwrap())
+        .await
+        .expect("a partial forward PUT is accepted");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: MailboxStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(digests(&held), digests(&expected), "merged, not replaced");
+        }
+        other => panic!("current mailbox did not read back: {other:?}"),
+    }
+}
+
+fn index_entry(
+    ghost: &SigningKey,
+    store_seed: u8,
+    height: u32,
+) -> harvest_common::ghostkey_index::IndexEntry {
+    let store = SigningKey::from_bytes(&[store_seed; 32]).verifying_key();
+    let statement = harvest_common::backing::BackingStatement {
+        store,
+        backer: ghost.verifying_key(),
+        // About the length of a real Ghost Key certificate; the contract
+        // checks only that it is within MAX_CERTIFICATE_PEM_BYTES.
+        certificate_pem: format!(
+            "-----BEGIN GHOSTKEY CERTIFICATE-----\n{}\n-----END GHOSTKEY CERTIFICATE-----",
+            "A".repeat(1400)
+        ),
+        network: BitcoinNetwork::Signet,
+        block: BlockAnchor {
+            height,
+            hash: BlockHash([store_seed; 32]),
+        },
+    };
+    let (scoped_payload, signature) = scoped_sign(ghost, &statement);
+    harvest_common::ghostkey_index::IndexEntry {
+        statement,
+        scoped_payload,
+        signature,
+    }
+}
+
+/// Scenario 7: a Ghost Key's index with a store at each of the two newest
+/// superseded generations (and one store in both) is found and folded, and
+/// the current index contract accepts and holds every entry, each still
+/// signed by the Ghost Key.
+async fn scenario_index_lineage(node: &mut Node, repo: &Path) {
+    println!("\n== scenario 7: Ghost Key index lineage (harvest#223) ==");
+    use harvest_common::ghostkey_index::GhostKeyIndexV1;
+    let ghost = SigningKey::from_bytes(&[71u8; 32]);
+    let vk = ghost.verifying_key();
+    let index_params = migrate::index_params(&vk);
+    let params = migrate::encode_params(&index_params).unwrap();
+    let [(newest_gen, newest), (older_gen, older)] =
+        two_newest(repo, "index_contract", migrate::index_lineage());
+    let current = read_wasm(&repo.join("ui/public/contracts/index_contract.wasm"));
+    assert_current_is_new(&current, migrate::index_lineage(), "index");
+    let (newest_c, newest_id) = container(&newest, params.clone());
+    let (older_c, older_id) = container(&older, params.clone());
+    let (curr_c, curr_id) = container(&current, params.clone());
+    println!("  V{newest_gen} {newest_id} | V{older_gen} {older_id} | current {curr_id}");
+    assert!(curr_id != newest_id && curr_id != older_id);
+    let ids: Vec<_> = freenet_migrate::predecessor_ids(&params, migrate::index_lineage());
+    assert!(
+        ids.contains(&newest_id) && ids.contains(&older_id),
+        "the walk must reach both generations state is planted at"
+    );
+
+    use harvest_common::ghostkey_index::MAX_INDEX_ENTRIES;
+    let shared = index_entry(&ghost, 81, 200_000);
+    let only_newest = index_entry(&ghost, 82, 200_100);
+    let only_older = index_entry(&ghost, 83, 199_000);
+    // A CLASH: the same store backed twice (two block heights), one backing
+    // at each generation, both validly signed. The index keeps the entry
+    // whose encoding is smaller, whichever generation it came from.
+    let clash_newest = index_entry(&ghost, 84, 200_200);
+    let clash_older = index_entry(&ghost, 84, 150_000);
+    let clash_winner = if harvest_common::to_cbor(&clash_newest).unwrap()
+        <= harvest_common::to_cbor(&clash_older).unwrap()
+    {
+        clash_newest.clone()
+    } else {
+        clash_older.clone()
+    };
+    // Filler so the two together exceed MAX_INDEX_ENTRIES: 36 more stores at
+    // each generation (39 per generation, under the cap; 76 stores together,
+    // over it).
+    let filler = |from: u8| -> Vec<_> {
+        (from..from + 36).map(|s| index_entry(&ghost, s, 190_000 + u32::from(s))).collect()
+    };
+    let state = |entries: Vec<harvest_common::ghostkey_index::IndexEntry>| GhostKeyIndexV1 {
+        entries: entries.into_iter().map(|e| (e.slot(), e)).collect(),
+    };
+    let mut newest_entries = vec![shared.clone(), only_newest.clone(), clash_newest.clone()];
+    newest_entries.extend(filler(100));
+    let mut older_entries = vec![shared.clone(), only_older.clone(), clash_older.clone()];
+    older_entries.extend(filler(150));
+    node.put(newest_c, harvest_common::to_cbor(&state(newest_entries.clone())).unwrap())
+        .await
+        .expect("PUT at the newest superseded index generation");
+    node.put(older_c, harvest_common::to_cbor(&state(older_entries.clone())).unwrap())
+        .await
+        .expect("PUT at the older superseded index generation");
+
+    let (outcome, seal) = walk(
+        node,
+        migrate::IndexOps {
+            params: index_params.clone(),
+        },
+        &params,
+        migrate::index_lineage(),
+    )
+    .await;
+    println!("  describe: {}", migrate::describe(&outcome));
+    println!("  seal decision: {seal:?}");
+    check_seal(&outcome, seal, &[newest_id, older_id]);
+    let Outcome::Recovered { merged, .. } = &outcome else {
+        panic!("expected Recovered, got {outcome:?}");
+    };
+    // Expected, worked out WITHOUT the index's merge: one entry per store
+    // (the clash decided by the smaller encoding), then the 64 smallest
+    // store keys.
+    let mut all = std::collections::BTreeMap::new();
+    for e in newest_entries.iter().chain(&older_entries) {
+        all.insert(e.slot(), e.clone());
+    }
+    all.insert(clash_winner.slot(), clash_winner.clone());
+    assert_eq!(all.len(), 76, "4 named stores + 72 filler, before the cap");
+    let want = GhostKeyIndexV1 {
+        entries: all.into_iter().take(MAX_INDEX_ENTRIES).collect(),
+    };
+    // The expectation itself must still exercise both things, whatever the
+    // seeds' keys happen to sort as: the clash slot survives the cap, and so
+    // does at least one store held only at the older generation.
+    assert!(want.entries.contains_key(&clash_winner.slot()), "the clash is inside the cap");
+    let only_at_newest: std::collections::BTreeSet<_> =
+        newest_entries.iter().map(|e| e.slot()).collect();
+    assert!(
+        older_entries
+            .iter()
+            .any(|e| !only_at_newest.contains(&e.slot()) && want.entries.contains_key(&e.slot())),
+        "a store held only at the older generation is inside the cap"
+    );
+    assert_eq!(merged, &want, "one entry per store, the clash resolved, the 64 smallest kept");
+    println!(
+        "  folded 39 + 39 entries (76 stores) to {}; clash slot kept the {} backing",
+        merged.entries.len(),
+        if clash_winner == clash_newest { "newest generation's" } else { "older generation's" }
+    );
+
+    node.put(curr_c, harvest_common::to_cbor(merged).unwrap())
+        .await
+        .expect("the current index contract accepts the folded state");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: GhostKeyIndexV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(held, want, "the current generation holds them all");
+            for e in held.entries.values() {
+                e.verify(&vk).expect("each entry still verifies against the Ghost Key");
+            }
+            println!("  current generation holds {} entries, as planted", held.entries.len());
+        }
+        other => panic!("current index did not read back: {other:?}"),
+    }
+    // A later forward of less merges in, never replaces.
+    node.put(
+        container(&current, params.clone()).0,
+        harvest_common::to_cbor(&state(older_entries[..3].to_vec())).unwrap(),
+    )
+    .await
+    .expect("a partial forward PUT is accepted");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: GhostKeyIndexV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(held, want, "merged, not replaced");
+        }
+        other => panic!("current index did not read back: {other:?}"),
     }
 }
 
@@ -1448,6 +1969,28 @@ async fn main() {
         println!("\nSCENARIO 4 ONLY: PASSED");
         return;
     }
+    // `REHEARSAL_ONLY=mailbox` / `=index` / `=lineages` run the mailbox and
+    // Ghost Key index lineages alone (harvest#223): planted at the two newest
+    // superseded generations, walked, folded and forwarded.
+    match std::env::var("REHEARSAL_ONLY").as_deref() {
+        Ok("mailbox") => {
+            scenario_mailbox_lineage(&mut node, &repo).await;
+            println!("\nSCENARIO 6 ONLY: PASSED");
+            return;
+        }
+        Ok("index") => {
+            scenario_index_lineage(&mut node, &repo).await;
+            println!("\nSCENARIO 7 ONLY: PASSED");
+            return;
+        }
+        Ok("lineages") => {
+            scenario_mailbox_lineage(&mut node, &repo).await;
+            scenario_index_lineage(&mut node, &repo).await;
+            println!("\nSCENARIOS 6 AND 7: PASSED");
+            return;
+        }
+        _ => {}
+    }
     // `REHEARSAL_ONLY=newest` plants a store at the newest superseded
     // generation and folds it into this build (harvest#70's re-key).
     if std::env::var("REHEARSAL_ONLY").as_deref() == Ok("newest") {
@@ -1455,6 +1998,15 @@ async fn main() {
         println!("\nSCENARIO 5 ONLY: PASSED");
         return;
     }
+
+    // Scenarios 6 and 7 first: they need nothing from the store scenarios.
+    scenario_mailbox_lineage(&mut node, &repo).await;
+    scenario_index_lineage(&mut node, &repo).await;
+    println!("\nSCENARIOS 6 AND 7: PASSED");
+    println!(
+        "  (scenario 1 below plants at V4/V5 and is known to fail, harvest#142; \
+         a re-key run should use REHEARSAL_ONLY=lineages)"
+    );
 
     // ================= scenario 1: populated predecessors =================
     println!("\n== scenario 1: populated predecessor generations ==");
