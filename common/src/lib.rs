@@ -161,7 +161,36 @@ pub fn from_cbor<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T,
 /// it -- the #26 defect one layer down (PR #82 review, Should Fix 2). Every
 /// contract now refuses a state that does not re-encode to its own bytes.
 pub fn is_canonical_cbor<T: serde::Serialize>(value: &T, bytes: &[u8]) -> bool {
-    to_cbor(value).is_ok_and(|re| re == bytes)
+    // Compared as it is written, never re-encoded into a second copy (step
+    // 2): a store at its caps is tens of MiB, and the copy ran the store
+    // contract's `validate_state` out of the node's 256 MiB of WASM memory
+    // (freenet-core `DEFAULT_MAX_MEMORY_PAGES`). Stops at the first byte that
+    // differs; the same answer as encoding and comparing (pinned by
+    // `canonical_check_tests`).
+    let mut compare = CompareWriter { rest: bytes };
+    ciborium::into_writer(value, &mut compare).is_ok() && compare.rest.is_empty()
+}
+
+/// A writer that accepts exactly the bytes in `rest`, in order, and refuses
+/// the first that differs (or any past its end).
+struct CompareWriter<'a> {
+    rest: &'a [u8],
+}
+
+impl std::io::Write for CompareWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.rest.strip_prefix(buf) {
+            Some(rest) => {
+                self.rest = rest;
+                Ok(buf.len())
+            }
+            None => Err(std::io::ErrorKind::InvalidData.into()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A seeded, deterministic merge-law checker for the per-state property tests
@@ -318,5 +347,115 @@ pub(crate) mod earlier_encoding {
             }
         }
         count(&crate::from_cbor::<Value>(bytes).expect("CBOR"))
+    }
+}
+
+/// Step 2: `is_canonical_cbor` compares as it encodes. Its verdict is the
+/// one encoding into a copy and comparing gave, kept here as the reference.
+#[cfg(test)]
+mod canonical_check_tests {
+    use super::*;
+
+    fn reference<T: serde::Serialize>(value: &T, bytes: &[u8]) -> bool {
+        to_cbor(value).is_ok_and(|re| re == bytes)
+    }
+
+    #[derive(serde::Serialize)]
+    struct Sample {
+        name: String,
+        bytes: Vec<u8>,
+        n: u64,
+        list: Vec<u32>,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            name: "plum jam".into(),
+            bytes: (0..300u32).map(|i| (i * 7) as u8).collect(),
+            n: 1_700_000_000,
+            list: vec![1, 24, 255, 256, 65_536],
+        }
+    }
+
+    /// Identical bytes pass; a difference at the first, a middle and the last
+    /// byte fails; a strict prefix and trailing bytes fail. Mutated red by
+    /// dropping the length check, and by accepting a short write.
+    #[test]
+    fn exactly_the_encoding_passes() {
+        let value = sample();
+        let bytes = to_cbor(&value).unwrap();
+        assert!(is_canonical_cbor(&value, &bytes));
+        for at in [0, bytes.len() / 2, bytes.len() - 1] {
+            let mut other = bytes.clone();
+            other[at] ^= 0x01;
+            assert!(!is_canonical_cbor(&value, &other), "a difference at {at}");
+        }
+        assert!(
+            !is_canonical_cbor(&value, &bytes[..bytes.len() - 1]),
+            "a prefix"
+        );
+        assert!(!is_canonical_cbor(&value, &[]), "nothing");
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(!is_canonical_cbor(&value, &longer), "trailing bytes");
+    }
+
+    /// The same verdict as the reference over every single-byte change,
+    /// truncation and extension of a sample and of a store holding every
+    /// signed record, and over a store in the earlier encoding (not
+    /// canonical today). Mutated red by a writer that stops early with
+    /// success.
+    #[test]
+    fn the_verdict_is_the_reference_one() {
+        let value = sample();
+        let bytes = to_cbor(&value).unwrap();
+        let mut cases: Vec<Vec<u8>> = vec![bytes.clone()];
+        for at in 0..bytes.len() {
+            let mut other = bytes.clone();
+            other[at] = other[at].wrapping_add(1);
+            cases.push(other);
+            cases.push(bytes[..at].to_vec());
+        }
+        cases.push([bytes.clone(), vec![0xff]].concat());
+        for case in &cases {
+            assert_eq!(
+                is_canonical_cbor(&value, case),
+                reference(&value, case),
+                "{case:?}"
+            );
+        }
+        let store = crate::store::StoreStateV1::default();
+        let encoded = to_cbor(&store).unwrap();
+        assert_eq!(
+            is_canonical_cbor(&store, &encoded),
+            reference(&store, &encoded)
+        );
+        assert!(is_canonical_cbor(&store, &encoded));
+        let earlier = earlier_encoding::of(&to_cbor(&sample_store()).unwrap());
+        let decoded: crate::store::StoreStateV1 = from_cbor(&earlier).unwrap();
+        assert!(!is_canonical_cbor(&decoded, &earlier));
+        assert_eq!(
+            is_canonical_cbor(&decoded, &earlier),
+            reference(&decoded, &earlier)
+        );
+    }
+
+    /// A store with a signed record whose payload is written as bytes, so
+    /// the earlier encoding differs from today's.
+    fn sample_store() -> crate::store::StoreStateV1 {
+        let owner = crate::test_orders::store_key().verifying_key();
+        let mut state = crate::store::StoreStateV1 {
+            owner: Some(owner),
+            ..Default::default()
+        };
+        state.closed.records.insert(
+            crate::store::Bytes32(owner.to_bytes()),
+            crate::backing::AuthorizedClosure {
+                closure: crate::backing::StoreClosure { store: owner },
+                scoped_payload: vec![0x2a; 40],
+                signature: vec![0x2b; 64],
+            },
+        );
+        state
     }
 }
