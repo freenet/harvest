@@ -54,6 +54,10 @@ struct Measured {
     case: String,
     call: &'static str,
     fuel: Option<u64>,
+    /// Why the call stopped without an answer: the fuel ceiling, or a trap
+    /// (out of the node's 256 MiB memory, a panic). Either is a failure: on
+    /// a node the update fails the same way.
+    trap: Option<String>,
     host_calls: u64,
     /// `--calibrate` only: the best unmetered, node-like wall time of the
     /// call, and the part of it spent in the host.
@@ -62,7 +66,7 @@ struct Measured {
 
 impl Measured {
     fn over(&self) -> bool {
-        over_budget(self.fuel)
+        self.trap.is_some() || over_budget(self.fuel)
     }
 }
 
@@ -94,14 +98,18 @@ impl Runner {
     }
 
     /// Run one call metered (and timed, under `--calibrate`), record it, and
-    /// return the bincode result. A trap is a harness failure unless it is
-    /// the fuel ceiling, which is an over-budget result.
+    /// return the bincode result, or `None` if the call trapped or ran past
+    /// the fuel ceiling. Both are recorded as failures and end the case: the
+    /// node's update stops there too.
     fn measure(&mut self, case: &Case, call: Call<'_>) -> Result<Option<Vec<u8>>> {
         let contract = self.contract(case.kind);
         let timing = if self.calibrate_reps > 0 {
             let mut best: Option<(Duration, Duration)> = None;
             for _ in 0..self.calibrate_reps {
-                let t = contract.time_unmetered(call.entry, &call.args)?;
+                // A call that traps has no time worth reporting.
+                let Ok(t) = contract.time_unmetered(call.entry, &call.args) else {
+                    break;
+                };
                 if best.is_none_or(|b| t.0 < b.0) {
                     best = Some(t);
                 }
@@ -116,16 +124,13 @@ impl Runner {
             case: case.name.clone(),
             call: call.label,
             fuel: outcome.fuel,
+            trap: outcome.result.as_ref().err().cloned(),
             host_calls: outcome.host_calls,
             timing,
         };
         print_line(&m);
         self.measured.push(m);
-        match outcome.result {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(_) if outcome.fuel.is_none() => Ok(None),
-            Err(e) => bail!("{} / {}: {} {e}", case.kind.name(), case.name, call.label),
-        }
+        Ok(outcome.result.ok())
     }
 
     /// Run `entry` without recording it: a call made only to get an input
@@ -329,6 +334,12 @@ fn print_line(m: &Measured) {
         percent(m.fuel),
         if m.over() { "FAIL" } else { "pass" }
     );
+    if let Some(trap) = &m.trap {
+        // The trap and the top of the guest backtrace: enough to say where.
+        for line in trap.lines().take(12) {
+            println!("{:>12}{line}", "");
+        }
+    }
 }
 
 /// BLAKE3, as `scripts/check-code-hashes.sh` prints it, so a reader can
@@ -439,7 +450,11 @@ fn report(
             m.call,
             m.fuel.map_or("past the ceiling".into(), group),
             percent(m.fuel),
-            if m.over() { ":x: **over budget**" } else { "" }
+            match (&m.trap, m.over()) {
+                (Some(t), _) => format!(":x: **{}**", t.lines().next().unwrap_or(t)),
+                (None, true) => ":x: **over budget**".into(),
+                (None, false) => String::new(),
+            }
         )
         .ok();
     }
@@ -505,14 +520,23 @@ fn report(
         println!("every call is within {} fuel", group(BUDGET_FUEL));
     } else {
         for m in &over {
-            eprintln!(
-                "::error::{} / {} / {}: {} fuel exceeds the per-call budget of {}",
-                m.contract,
-                m.case,
-                m.call,
-                m.fuel.map_or("past the ceiling".into(), group),
-                group(BUDGET_FUEL)
-            );
+            match &m.trap {
+                Some(trap) => eprintln!(
+                    "::error::{} / {} / {}: {}",
+                    m.contract,
+                    m.case,
+                    m.call,
+                    trap.lines().next().unwrap_or(trap)
+                ),
+                None => eprintln!(
+                    "::error::{} / {} / {}: {} fuel exceeds the per-call budget of {}",
+                    m.contract,
+                    m.case,
+                    m.call,
+                    m.fuel.map_or("past the ceiling".into(), group),
+                    group(BUDGET_FUEL)
+                ),
+            }
         }
     }
     Ok(over.is_empty())
