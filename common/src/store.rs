@@ -410,6 +410,9 @@ impl ListingsV1 {
                 .iter()
                 .map(|l| (l.listing.created_at, l.listing.id.clone()))
                 .collect();
+            // The id tie-break is what the stable sort of id-sorted listings
+            // gives anyway (so a mutation dropping it survives); it is
+            // written out so the order does not rest on the sort above.
             newest.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             newest.truncate(MAX_LISTINGS);
             let kept: std::collections::BTreeSet<ListingId> =

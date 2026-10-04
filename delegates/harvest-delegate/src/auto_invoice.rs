@@ -221,15 +221,21 @@ pub(crate) fn store_read_key(store_contract_id: &[u8]) -> Vec<u8> {
 const STORE_READ_OPEN: &[u8] = b"o";
 const STORE_READ_CLOSED: &[u8] = b"c";
 const STORE_READ_NOT_OURS: &[u8] = b"n";
+const STORE_READ_PAUSED: &[u8] = b"p";
+
+/// What a paused store tells a buyer whose Buy now arrives (step 2).
+const STORE_PAUSED_REASON: &str = "This store is closed for now.";
 
 /// The refusal a store's state gives on its own, as `decide` checks it: not
 /// signed by `owner` (including a store nobody has published to), then
-/// closed.
+/// closed, then paused by the seller (step 2; a closure overrides a pause).
 fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> {
     if store.owner.as_ref() != Some(owner) {
         Some(Refusal::NotOurStore)
     } else if !store.closed.is_empty() {
         Some(Refusal::StoreClosed)
+    } else if store.paused() {
+        Some(Refusal::StorePaused)
     } else {
         None
     }
@@ -237,21 +243,25 @@ fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> 
 
 /// Record what a read of the store's state said ([`store_read_key`]),
 /// written only when it changed: a store notification arrives with every
-/// order and status, and the answer almost never changes.
+/// order and status, and the answer almost never changes. True when it
+/// changed, so the caller can tell buyers at once.
 fn note_store_read<S: SecretStore>(
     secrets: &mut S,
     store_contract_id: &[u8],
     refusal: Option<&Refusal>,
-) {
+) -> bool {
     let value = match refusal {
         Some(Refusal::NotOurStore) => STORE_READ_NOT_OURS,
         Some(Refusal::StoreClosed) => STORE_READ_CLOSED,
+        Some(Refusal::StorePaused) => STORE_READ_PAUSED,
         _ => STORE_READ_OPEN,
     };
     let key = store_read_key(store_contract_id);
-    if secrets.get_secret(&key).as_deref() != Some(value) {
-        secrets.set_secret(&key, value);
+    if secrets.get_secret(&key).as_deref() == Some(value) {
+        return false;
     }
+    secrets.set_secret(&key, value);
+    true
 }
 
 /// The refusal the last read of the store's state gave ([`store_read_key`]).
@@ -262,6 +272,7 @@ fn store_read_refusal<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> 
     {
         Some(STORE_READ_NOT_OURS) => Some(Refusal::NotOurStore),
         Some(STORE_READ_CLOSED) => Some(Refusal::StoreClosed),
+        Some(STORE_READ_PAUSED) => Some(Refusal::StorePaused),
         _ => None,
     }
 }
@@ -1757,6 +1768,11 @@ pub(crate) enum Refusal {
     NoStoreKey,
     NotOurStore,
     StoreClosed,
+    /// The seller paused the store (`StoreStateV1::pause`, step 2). Unlike
+    /// the other store-wide refusals, `decide` answers each Buy now with a
+    /// Decline and marks it seen, so none is invoiced when the store opens
+    /// again, and a buyer whose view of the store is old still hears.
+    StorePaused,
     NoPaymentKey,
     NetworkMismatch,
     NoFreshTip,
@@ -1813,6 +1829,7 @@ impl Refusal {
             Refusal::ClockAhead => Some(
                 "Your computer's clock is ahead of the right time. Set it right, then try again.",
             ),
+            Refusal::StorePaused => Some(STORE_PAUSED_REASON),
             _ => None,
         }
     }
@@ -1821,12 +1838,12 @@ impl Refusal {
     /// taking orders (`harvest_common::presence::Heartbeat::reason`):
     /// coarse, since the buyer needs to know only whether to come back. The
     /// seller sees the detailed reason (`AutoInvoiceStatus::paused`).
-    /// `Paused` is reserved for a whole-store pause, which nothing here
-    /// gives yet.
+    /// `Paused` is the seller's own pause.
     pub(crate) fn for_buyers(&self) -> harvest_common::presence::NotTakingReason {
         use harvest_common::presence::NotTakingReason as R;
         match self {
             Refusal::StoreClosed | Refusal::NotOurStore => R::ClosedForGood,
+            Refusal::StorePaused => R::Paused,
             Refusal::CatchingUp => R::CatchingUp,
             _ => R::Unavailable,
         }
@@ -1848,6 +1865,7 @@ impl Refusal {
                 | Refusal::NoStoreKey
                 | Refusal::NotOurStore
                 | Refusal::StoreClosed
+                | Refusal::StorePaused
                 | Refusal::NoPaymentKey
                 | Refusal::NetworkMismatch
                 | Refusal::NoFreshTip
@@ -1873,6 +1891,7 @@ impl Refusal {
             Refusal::NoStoreKey => "this device does not hold the store's key".into(),
             Refusal::NotOurStore => "the store is not signed by this store key".into(),
             Refusal::StoreClosed => "the store is closed".into(),
+            Refusal::StorePaused => "the store is paused".into(),
             Refusal::NoPaymentKey => "no payment key is set".into(),
             Refusal::NetworkMismatch => "the payment key is for another network".into(),
             Refusal::NoFreshTip => "no recent Bitcoin block has arrived".into(),
@@ -2072,17 +2091,28 @@ fn on_store_change<S: SecretStore>(
         return Vec::new();
     };
     let read = store_refusal(&store, &store_sk.verifying_key());
-    note_store_read(secrets, &record.arm.store_contract_id, read.as_ref());
+    // A change in what the store says (paused, resumed, closed) reaches
+    // buyers now rather than at the next wake-up: the heartbeat goes out
+    // because its reason changed.
+    let mut out: Vec<OutboundDelegateMsg> =
+        if note_store_read(secrets, &record.arm.store_contract_id, read.as_ref()) {
+            heartbeat(secrets, record, now_ms, false)
+                .map(|(_, message)| message)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
     if read == Some(Refusal::NotOurStore) {
-        return Vec::new();
+        return out;
     }
     note_paid_scripts(secrets, &store);
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
-        return Vec::new();
+        return out;
     };
     if ledger.sales.is_empty() && ledger.statuses.is_empty() && ledger.gap_orders.is_empty() {
-        return Vec::new();
+        return out;
     }
     let statuses = settle(
         &mut ledger,
@@ -2094,14 +2124,17 @@ fn on_store_change<S: SecretStore>(
     // Recorded before anything is published: a decrement sent but not
     // recorded would be sent again on the next change, twice off the stock.
     if !save_ledger(secrets, &record.arm.store_contract_id, &ledger) {
-        return Vec::new();
+        return out;
     }
-    Decided {
-        statuses,
-        owner: Some(store_sk.verifying_key()),
-        ..Default::default()
-    }
-    .into_messages(&record.arm)
+    out.extend(
+        Decided {
+            statuses,
+            owner: Some(store_sk.verifying_key()),
+            ..Default::default()
+        }
+        .into_messages(&record.arm),
+    );
+    out
 }
 
 /// Settle the ledger's sales against the store, and return the statuses to
@@ -2379,10 +2412,21 @@ fn decline(
     now_ms: u64,
 ) -> Option<EncryptedMessage> {
     let (tag, from_seller, conversation_id, _) = open_instant(store_sk, message)?;
+    decline_opened(&tag, &from_seller, &conversation_id, reason, now_ms)
+}
+
+/// [`decline`], for a request already opened.
+fn decline_opened(
+    tag: &[u8; 32],
+    from_seller: &[u8; 32],
+    conversation_id: &harvest_common::mailbox::ConversationId,
+    reason: &str,
+    now_ms: u64,
+) -> Option<EncryptedMessage> {
     harvest_common::sealed::seal(
-        &from_seller,
-        &tag,
-        &conversation_id,
+        from_seller,
+        tag,
+        conversation_id,
         MessageContent::Decline {
             reason: reason.to_string(),
         },
@@ -2946,6 +2990,28 @@ pub(crate) fn decide<S: SecretStore>(
         }
         decided.undecided = !entries.is_empty();
     };
+    // Paused by the seller (step 2): checked before everything else, since
+    // a lapsed watch or week would otherwise leave the requests undecided,
+    // to be invoiced when the seller opens Harvest and resumes.
+    if store.closed.is_empty() && store.paused() {
+        if let Some(store_sk) = store_key(secrets, &arm.store_verifying_key)
+            .filter(|sk| store.owner.as_ref() == Some(&sk.verifying_key()))
+        {
+            note_store_read(secrets, &arm.store_contract_id, Some(&Refusal::StorePaused));
+            let Some(mut ledger) = load_ledger_kept(secrets, &arm.store_contract_id) else {
+                refuse_all(&mut decided, Refusal::LedgerUnreadable);
+                return decided;
+            };
+            decline_while_paused(&store_sk, &mut ledger, entries, &mut decided, now_ms);
+            if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
+                return Decided {
+                    undecided: true,
+                    ..Decided::default()
+                };
+            }
+            return decided;
+        }
+    }
     let anchor = match global_refusal(secrets, record, tip.as_ref(), now_ms) {
         Ok(anchor) => anchor,
         Err(why) => {
@@ -3113,6 +3179,40 @@ pub(crate) fn decide<S: SecretStore>(
         };
     }
     decided
+}
+
+/// While the store is paused: answer every Buy now not yet seen, and fresh
+/// enough to answer, with [`STORE_PAUSED_REASON`], and mark every entry
+/// seen. A request that is not a Buy now (a quote request) is left to the
+/// seller, as `decide` leaves it; one older than [`REQUEST_MAX_AGE_MS`] gets
+/// no answer, as `decide` gives it none.
+fn decline_while_paused(
+    store_sk: &SigningKey,
+    ledger: &mut Ledger,
+    entries: &[EncryptedMessage],
+    decided: &mut Decided,
+    now_ms: u64,
+) {
+    let mut ordered: Vec<&EncryptedMessage> = entries.iter().collect();
+    ordered.sort_by_key(|m| (m.timestamp, entry_digest(m)));
+    for message in ordered {
+        let digest = entry_digest(message);
+        if ledger.seen.contains(&digest) {
+            continue;
+        }
+        let reply = open_instant(store_sk, message).and_then(|(tag, from, conv, request)| {
+            let at = request.instant.requested_at_ms;
+            (at >= 0 && now_ms.abs_diff(at as u64) <= REQUEST_MAX_AGE_MS)
+                .then(|| decline_opened(&tag, &from, &conv, STORE_PAUSED_REASON, now_ms))
+                .flatten()
+        });
+        if let Some(reply) = reply {
+            decided.replies.push(reply);
+            decided.declined.push(digest);
+        }
+        decided.refused.push((digest, Refusal::StorePaused));
+        ledger.saw(digest);
+    }
 }
 
 enum Answer {
@@ -7763,6 +7863,179 @@ mod tests {
         assert_eq!(open_now(&f, NOW), (None, true), "read open again");
         f.store = theirs;
         says(&mut f, Refusal::NotOurStore, "not ours, read by decide");
+    }
+
+    /// `store` with the seller's pause (step 2) at `revision`: paused or
+    /// resumed. Unsigned: the delegate reads what the store contract
+    /// verified.
+    fn with_pause(store: &StoreStateV1, revision: u64, paused: bool) -> StoreStateV1 {
+        let owner = store_sk().verifying_key();
+        let mut s = store.clone();
+        s.pause.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::store_pause::AuthorizedStorePause {
+                pause: harvest_common::store_pause::StorePause::new(owner, revision, paused),
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+            },
+        );
+        s
+    }
+
+    /// Step 2: a paused store answers every Buy now with "This store is
+    /// closed for now." and marks it seen, so none is invoiced when the
+    /// seller resumes; the status and heartbeat say Paused; after resuming,
+    /// a new Buy now is invoiced. Mutated red by leaving paused requests
+    /// undecided (the store-wide default), by not marking them seen, and by
+    /// dropping the pause from `store_refusal`.
+    #[test]
+    fn a_paused_store_declines_every_buy_now_and_none_is_invoiced_on_resume() {
+        let mut f = fixture();
+        let open = f.store.clone();
+        f.store = with_pause(&open, 5, true);
+        let (a, b) = (Buyer::new(41), Buyer::new(42));
+        let entries = [
+            a.request(&jam(), 1, 1, 12_000),
+            b.request(&jam(), 1, 1, 12_000),
+        ];
+        let decided = run(&mut f, &entries);
+        assert!(decided.orders.is_empty());
+        assert!(!decided.undecided, "answered, not left for later");
+        for buyer in [&a, &b] {
+            assert_eq!(
+                buyer.read(&decided.replies),
+                vec![MessageContent::Decline {
+                    reason: STORE_PAUSED_REASON.into()
+                }]
+            );
+        }
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::StorePaused.explain()), false)
+        );
+        let record = f.record.clone();
+        let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert_eq!(
+            beat.heartbeat.reason,
+            Some(harvest_common::presence::NotTakingReason::Paused)
+        );
+
+        f.store = with_pause(&open, 6, false);
+        let again = run(&mut f, &entries);
+        assert!(
+            again.orders.is_empty(),
+            "nothing paused is invoiced on resume"
+        );
+        assert!(again.replies.is_empty());
+        assert_eq!(open_now(&f, NOW), (None, true), "taking orders again");
+        assert_eq!(
+            run(&mut f, &[Buyer::new(43).request(&jam(), 1, 1, 12_000)])
+                .orders
+                .len(),
+            1
+        );
+    }
+
+    /// The pause is checked before every other refusal: with the watch
+    /// lapsed (or the week since the seller last opened Harvest), a paused
+    /// store still answers each Buy now, which would otherwise wait,
+    /// undecided, to be invoiced on resume. A closure outranks a pause: a
+    /// closed and paused store is closed for good. A request older than
+    /// `REQUEST_MAX_AGE_MS` is marked seen without an answer. Mutated red by
+    /// checking the pause after `global_refusal`, and by dropping the age
+    /// check.
+    #[test]
+    fn a_pause_outranks_a_lapse_and_a_closure_outranks_a_pause() {
+        let mut f = fixture();
+        f.record.watched_until_ms = NOW;
+        f.store = with_pause(&f.store, 5, true);
+        let a = Buyer::new(44);
+        let stale = Buyer::new(45);
+        let decided = run(
+            &mut f,
+            &[
+                a.request(&jam(), 1, 1, 12_000),
+                stale.request_at(&jam(), 1, 1, 12_000, NOW - REQUEST_MAX_AGE_MS - 1_000),
+            ],
+        );
+        assert!(!decided.undecided);
+        assert_eq!(a.read(&decided.replies).len(), 1);
+        assert!(stale.read(&decided.replies).is_empty(), "too old to answer");
+        assert_eq!(decided.refused.len(), 2, "both seen");
+
+        let mut f = fixture();
+        let owner = store_sk().verifying_key();
+        let mut closed = with_pause(&f.store, 5, true);
+        closed.closed.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::backing::AuthorizedClosure {
+                closure: harvest_common::backing::StoreClosure { store: owner },
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+            },
+        );
+        f.store = closed;
+        let entry = Buyer::new(46).request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        assert_eq!(
+            decided.refused,
+            vec![(entry_digest(&entry), Refusal::StoreClosed)]
+        );
+        let record = f.record.clone();
+        let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert_eq!(
+            beat.heartbeat.reason,
+            Some(harvest_common::presence::NotTakingReason::ClosedForGood)
+        );
+    }
+
+    /// A store notification that pauses or resumes the store sends a
+    /// heartbeat at once (buyers would otherwise read the old answer until
+    /// the next wake-up), and one that changes nothing the heartbeat says
+    /// sends none. Mutated red by not sending it, and by sending one on
+    /// every notification.
+    #[test]
+    fn pausing_or_resuming_tells_buyers_at_once() {
+        let mut f = fixture();
+        let id: [u8; 32] = f.record.arm.store_contract_id.clone().try_into().unwrap();
+        let presence = ContractInstanceId::new(f.record.arm.presence_contract_id.unwrap());
+        let beats = |out: &[OutboundDelegateMsg]| -> Vec<harvest_common::presence::Heartbeat> {
+            out.iter()
+                .filter_map(|m| match m {
+                    OutboundDelegateMsg::UpdateContractRequest(u) if u.contract_id == presence => {
+                        match &u.update {
+                            UpdateData::Delta(d) => {
+                                from_cbor::<harvest_common::presence::SignedHeartbeat>(d.as_ref())
+                                    .ok()
+                                    .map(|s| s.heartbeat)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let notify = |f: &mut Fixture, store: &StoreStateV1| {
+            on_notification(&mut f.secrets, &id, &to_cbor(store).unwrap(), NOW).unwrap()
+        };
+        let open = f.store.clone();
+        // The first read of the store is a change too (nothing was noted).
+        notify(&mut f, &open);
+        let paused = notify(&mut f, &with_pause(&open, 5, true));
+        let said = beats(&paused);
+        assert_eq!(said.len(), 1, "paused: one heartbeat");
+        assert_eq!(
+            said[0].reason,
+            Some(harvest_common::presence::NotTakingReason::Paused)
+        );
+        assert!(
+            beats(&notify(&mut f, &with_pause(&open, 5, true))).is_empty(),
+            "nothing changed: none"
+        );
+        let resumed = beats(&notify(&mut f, &with_pause(&open, 6, false)));
+        assert_eq!(resumed.len(), 1, "resumed: one heartbeat");
+        assert!(resumed[0].taking_orders);
     }
 
     /// What buyers are told for each refusal (harvest#219): closed and not
