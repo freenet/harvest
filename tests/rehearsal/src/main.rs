@@ -1278,6 +1278,8 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // V25: the delegated watch key (`d73fb6c`, harvest#179), unchanged
         // through #212. Superseded by listing photos. Still the store code.
         (25, Code),
+        // V26: listing photos (`57979f8`, harvest#215). Still the store code.
+        (26, Code),
     ]
 };
 

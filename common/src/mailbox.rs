@@ -777,6 +777,34 @@ pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 /// messages, and only what counts as "already held" moved.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
+/// How many messages an encoded [`MailboxDelta`] says it holds, read from the
+/// CBOR array head alone, or `None` if the bytes do not start with a
+/// definite-length array.
+///
+/// For refusing an oversized delta BEFORE decoding it (harvest#226): only a
+/// state is checked against the caps, so a delta was decoded and merged
+/// whatever its length, and a single delta of many small messages cost the
+/// contract more than a full mailbox does. No honest delta holds more than
+/// [`MAX_MESSAGES`]: a writer sends one message, and a co-host's fan-out
+/// delta is at most the state it holds.
+pub fn delta_message_count(bytes: &[u8]) -> Option<u64> {
+    let (&first, rest) = bytes.split_first()?;
+    if first >> 5 != 4 {
+        return None;
+    }
+    let arg = first & 0x1f;
+    let width = match arg {
+        0..=23 => return Some(u64::from(arg)),
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return None,
+    };
+    let head = rest.get(..width)?;
+    Some(head.iter().fold(0u64, |n, &b| (n << 8) | u64::from(b)))
+}
+
 /// Keep one copy of each distinct message.
 ///
 /// # Why this exists at all
@@ -852,12 +880,20 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// (`enforce_message_cap`'s digest tiebreak is a third and is redundant to
 /// both: removing the two above kills the suite whether or not it is
 /// present.)
-fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
-    // Cached: `sort_by_key` would hash both messages' whole ciphertext on
-    // every comparison, O(n log n) passes over up to 4 MiB (harvest#226).
-    messages.sort_by_cached_key(entry_digest);
-    messages.dedup_by_key(|message| entry_digest(message));
+fn dedupe_identical_entries(messages: &mut Vec<Keyed>) {
+    messages.sort_by(|a, b| a.0.cmp(&b.0));
+    messages.dedup_by(|a, b| a.0 == b.0);
 }
+
+/// A message with its [`entry_digest`], computed once.
+///
+/// Every step of [`MailboxStateV1::apply_delta`] (dedupe, cap, canonical
+/// order) orders by the digest, at least on a tie. Computed per comparison,
+/// that is O(n log n) BLAKE3 passes over up to 4 MiB of ciphertext; and the
+/// mailbox is open-write, so anyone can force the tie branches by sending
+/// messages that share a timestamp and a nonce (harvest#226). So the digest
+/// is computed once per message and carried through.
+type Keyed = ([u8; 32], EncryptedMessage);
 
 /// Keep the highest-ranked messages that fit [`MAX_MESSAGES`] and each size
 /// class's cap in [`SIZE_CLASS_CAPS`], which together bound the mailbox
@@ -897,19 +933,19 @@ fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
 /// honest messages of every class
 /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). The class
 /// caps narrow the byte route; they do not close the count route.
-fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
+fn enforce_message_cap(messages: &mut Vec<Keyed>) {
     // Descending by rank. The digest closes the order, since two entries can
     // share a timestamp and a nonce.
-    messages.sort_by(|a, b| {
+    messages.sort_by(|(digest_a, a), (digest_b, b)| {
         b.timestamp
             .cmp(&a.timestamp)
             .then_with(|| b.nonce.cmp(&a.nonce))
-            .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
+            .then_with(|| digest_b.cmp(digest_a))
     });
 
     let mut kept = 0usize;
     let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
-    messages.retain(|message| {
+    messages.retain(|(_, message)| {
         let Some(class) = size_class(message) else {
             // Over `MAX_MESSAGE_BYTES`. `apply_delta` refuses these on the
             // way in and `verify` refuses a state holding one, so this is
@@ -1120,8 +1156,12 @@ impl MailboxStateV1 {
         //
         // It runs before the cap, not after, so a duplicate cannot occupy two
         // of the slots the cap is about to hand out.
-        dedupe_identical_entries(&mut self.messages);
-        enforce_message_cap(&mut self.messages);
+        let mut keyed: Vec<Keyed> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .map(|message| (entry_digest(&message), message))
+            .collect();
+        dedupe_identical_entries(&mut keyed);
+        enforce_message_cap(&mut keyed);
 
         // Normalisation into `canonical_order`, which `verify` requires
         // (harvest#85). Since harvest#85 this sort is the ONLY thing that
@@ -1133,7 +1173,13 @@ impl MailboxStateV1 {
         // comment this replaces described it as one of two mutually redundant
         // mechanisms, which was true before the cap started sorting every
         // time; see the note on `dedupe_identical_entries`.
-        self.messages.sort_by(canonical_order);
+        //
+        // `canonical_order` with the digest already in hand; pinned equal to
+        // it by `the_keyed_orders_are_the_public_ones`.
+        keyed.sort_by(|(digest_a, a), (digest_b, b)| {
+            a.nonce.cmp(&b.nonce).then_with(|| digest_a.cmp(digest_b))
+        });
+        self.messages = keyed.into_iter().map(|(_, message)| message).collect();
 
         Ok(())
     }
@@ -2950,5 +2996,91 @@ mod byte_string_encoding_tests {
         assert!(!crate::is_canonical_cbor(&decoded, &old));
         let forwarded = crate::to_cbor(&decoded).unwrap();
         assert!(crate::is_canonical_cbor(&decoded, &forwarded));
+    }
+}
+
+/// harvest#226: `apply_delta` computes each digest once. These pin that it
+/// still produces exactly the state the per-comparison version produced, on
+/// the inputs where the digest decides the order (shared timestamps and
+/// nonces) and with every cap binding.
+#[cfg(test)]
+mod keyed_order_tests {
+    use super::*;
+
+    /// `apply_delta`'s normalisation as it was before harvest#226, digest
+    /// computed per comparison: the reference.
+    fn reference(mut messages: Vec<EncryptedMessage>) -> Vec<EncryptedMessage> {
+        messages.retain(|m| message_bytes(m) <= MAX_MESSAGE_BYTES);
+        messages.sort_by_key(entry_digest);
+        messages.dedup_by_key(|m| entry_digest(m));
+        messages.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| b.nonce.cmp(&a.nonce))
+                .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
+        });
+        let mut kept = 0usize;
+        let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
+        messages.retain(|m| {
+            let Some(class) = size_class(m) else {
+                return false;
+            };
+            if kept == MAX_MESSAGES || per_class[class] == SIZE_CLASS_CAPS[class] {
+                return false;
+            }
+            per_class[class] += 1;
+            kept += 1;
+            true
+        });
+        messages.sort_by(canonical_order);
+        messages
+    }
+
+    /// Messages with few distinct timestamps and nonces, so ties are the
+    /// rule, over every size class, some repeated, enough to exceed caps.
+    fn tied(count: u32, salt: u8) -> Vec<EncryptedMessage> {
+        (0..count)
+            .map(|i| {
+                let class = (i % 7 % 4) as usize;
+                EncryptedMessage {
+                    conversation_id: ConversationId([salt; 32]),
+                    sender_public_key: vec![(i % 3) as u8; 32],
+                    ciphertext: (0..SIZE_BUCKETS[class] + AEAD_TAG_BYTES)
+                        .map(|b| (b as u8) ^ (i / 2) as u8 ^ salt)
+                        .collect(),
+                    timestamp: DateTime::from_timestamp(1_760_000_000 + i64::from(i % 3), 0)
+                        .unwrap(),
+                    nonce: [(i % 2) as u8; 24],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_keyed_orders_are_the_public_ones() {
+        for (count, salt) in [(9, 1u8), (300, 2), (700, 3)] {
+            let input = tied(count, salt);
+            let mut state = MailboxStateV1::default();
+            state.apply_delta(&Some(input.clone())).unwrap();
+            assert_eq!(
+                crate::to_cbor(&state).unwrap(),
+                crate::to_cbor(&MailboxStateV1 {
+                    messages: reference(input)
+                })
+                .unwrap(),
+                "{count} messages: the same state as the per-comparison version"
+            );
+            state.verify().expect("and a valid one");
+        }
+        // Merging in two halves, in either order, lands on the same state.
+        let (a, b) = (tied(400, 4), tied(400, 5));
+        let mut ab = MailboxStateV1::default();
+        ab.apply_delta(&Some(a.clone())).unwrap();
+        ab.apply_delta(&Some(b.clone())).unwrap();
+        let mut ba = MailboxStateV1::default();
+        ba.apply_delta(&Some(b.clone())).unwrap();
+        ba.apply_delta(&Some(a.clone())).unwrap();
+        assert_eq!(ab, ba);
+        assert_eq!(ab.messages, reference(a.into_iter().chain(b).collect()));
     }
 }
