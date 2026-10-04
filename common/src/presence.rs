@@ -42,14 +42,13 @@
 //! # A re-key
 //!
 //! Nothing at an old address is worth carrying forward: a heartbeat is
-//! worthless ten minutes after it is signed. But a re-key closes the store
-//! until its seller opens the new Harvest. The address the delegate writes to
-//! is the one the seller's tab armed it with, and a Harvest re-key has so far
-//! always moved the store and mailbox contracts and the delegate too, whose
-//! previous generation keeps serving only the previous addresses. So readers
-//! follow the current address alone: a heartbeat at an older one says an
-//! older generation is running, and that generation cannot take an order
-//! placed at the current addresses.
+//! worthless ten minutes after it is signed. Readers follow the current
+//! address alone. The cost: until a seller opens the new Harvest (which arms
+//! the new delegate generation with the new address), their previous
+//! generation keeps heartbeating the previous address, so their store reads
+//! closed to buyers on the new UI, even in a re-key that moved only the
+//! delegate and presence, where that generation could still take orders at
+//! the unchanged store and mailbox (`legacy/presence_contract.toml`).
 
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -153,8 +152,8 @@ pub struct Heartbeat {
     /// heartbeat WITH one (unknown fields are ignored), but re-encodes it
     /// without, so its envelope check refuses it: an old reader sees no
     /// valid not-taking heartbeat, which reads closed, as the heartbeat
-    /// says. Old readers follow the previous presence address in any case
-    /// (`legacy/presence_contract.toml`).
+    /// says. A presence re-key moves the address too, and readers follow
+    /// only the current one (`legacy/presence_contract.toml`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<NotTakingReason>,
 }
