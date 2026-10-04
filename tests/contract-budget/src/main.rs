@@ -17,6 +17,7 @@
 //!
 //! Usage:
 //!   harvest-contract-budget [--wasm-dir DIR] [--calibrate [REPS]]
+//!                           [--only CONTRACT] [--case SUBSTRING]
 
 mod cases;
 mod host;
@@ -61,9 +62,10 @@ struct Measured {
     case: String,
     call: &'static str,
     fuel: Option<u64>,
-    /// Why the call stopped without an answer: the fuel ceiling, or a trap
-    /// (out of the node's 256 MiB memory, a panic). Either is a failure: on
-    /// a node the update fails the same way.
+    /// Why the call, or the update it is part of, failed: the fuel ceiling,
+    /// a trap (out of the node's 256 MiB memory, a panic), or, for a
+    /// report-only contract, a refusal or an unusable answer. Each is a
+    /// failure: on a node the update fails the same way.
     trap: Option<String>,
     host_calls: u64,
     /// `--calibrate` only: the best unmetered, node-like wall time of the
@@ -74,6 +76,32 @@ struct Measured {
 impl Measured {
     fn over(&self) -> bool {
         self.trap.is_some() || over_budget(self.fuel)
+    }
+
+    /// Over, on a contract that gates: this fails the run.
+    fn fails_run(&self) -> bool {
+        self.over() && self.gating
+    }
+
+    /// Over, on a report-only contract: this is a warning.
+    fn warns(&self) -> bool {
+        self.over() && !self.gating
+    }
+}
+
+/// The calls that fail the run.
+fn gating_failures(measured: &[Measured]) -> Vec<&Measured> {
+    measured.iter().filter(|m| m.fails_run()).collect()
+}
+
+/// The process exit code for a run's outcome: 0 when every gating call is
+/// within budget, 1 when one is not, 2 when the harness could not drive the
+/// contracts.
+fn exit_code(outcome: &Result<bool>) -> u8 {
+    match outcome {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => 2,
     }
 }
 
@@ -151,6 +179,23 @@ impl Runner {
             .map_err(|e| anyhow!("{entry} (unmeasured): {e}"))
     }
 
+    /// The update of `case` cannot go on: a refusal, an invalid state, an
+    /// update that changed nothing. On a gating contract the fixture or the
+    /// contract is wrong in a way the budget cannot judge, so the run stops
+    /// (exit 2). On a report-only contract it is recorded against the last
+    /// call measured, with its reason, as a warning, and the run goes on.
+    fn problem(&mut self, case: &Case, e: anyhow::Error) -> Result<()> {
+        if case.kind.gates() {
+            return Err(e);
+        }
+        let reason = format!("{e:#}");
+        println!("{:>12}report-only, not judged further: {reason}", "");
+        if let Some(m) = self.measured.last_mut() {
+            m.trap.get_or_insert(reason);
+        }
+        Ok(())
+    }
+
     /// What a node runs for one UPDATE of `case`'s contract.
     ///
     /// freenet-core's `upsert` path (`executor_impl.rs`): a full incoming
@@ -168,10 +213,36 @@ impl Runner {
         let params = case.parameters.as_slice();
         let held = case.held.as_slice();
         let update = match &case.update {
-            Update::Delta(d) => UpdateData::Delta(StateDelta::from(d.clone())),
+            Update::Delta(d) | Update::RefusedDelta(d) => {
+                UpdateData::Delta(StateDelta::from(d.clone()))
+            }
             Update::State(s) => UpdateData::State(s.clone().into()),
         };
         let updates = bincode::serialize(&vec![update])?;
+
+        if let Update::RefusedDelta(_) = &case.update {
+            let Some(r) = self.measure(
+                case,
+                Call {
+                    entry: "update_state",
+                    label: "update_state (must refuse)",
+                    args: vec![params, held, &updates],
+                },
+            )?
+            else {
+                return Ok(());
+            };
+            let r: Result<UpdateModification<'_>, ContractError> = bincode::deserialize(&r)?;
+            if r.is_ok() {
+                let e = anyhow!(
+                    "{} / {}: update_state accepted a delta it must refuse",
+                    case.kind.name(),
+                    case.name
+                );
+                return self.problem(case, e);
+            }
+            return Ok(());
+        }
 
         if let Update::State(incoming) = &case.update {
             let Some(r) = self.measure(
@@ -185,7 +256,9 @@ impl Runner {
             else {
                 return Ok(());
             };
-            expect_valid(case, "validate_state (incoming state)", &r)?;
+            if let Err(e) = expect_valid(case, "validate_state (incoming state)", &r) {
+                return self.problem(case, e);
+            }
         }
 
         let Some(r) = self.measure(
@@ -199,14 +272,18 @@ impl Runner {
         else {
             return Ok(());
         };
-        let merged = new_state(case, &r)?;
+        let merged = match new_state(case, &r) {
+            Ok(m) => m,
+            Err(e) => return self.problem(case, e),
+        };
         if merged == case.held {
-            bail!(
+            let e = anyhow!(
                 "{} / {}: the update changed nothing, so the node would stop after \
                  update_state and the fixture is not exercising a real update",
                 case.kind.name(),
                 case.name
             );
+            return self.problem(case, e);
         }
 
         let Some(r) = self.measure(
@@ -220,7 +297,9 @@ impl Runner {
         else {
             return Ok(());
         };
-        expect_valid(case, "validate_state (merged state)", &r)?;
+        if let Err(e) = expect_valid(case, "validate_state (merged state)", &r) {
+            return self.problem(case, e);
+        }
 
         let Some(r) = self.measure(
             case,
@@ -234,8 +313,10 @@ impl Runner {
             return Ok(());
         };
         let summary: Result<StateSummary<'_>, ContractError> = bincode::deserialize(&r)?;
-        summary
-            .map_err(|e| anyhow!("{} / {}: summarize_state: {e}", case.kind.name(), case.name))?;
+        if let Err(e) = summary {
+            let e = anyhow!("{} / {}: summarize_state: {e}", case.kind.name(), case.name);
+            return self.problem(case, e);
+        }
 
         // The co-host the fan-out sends to holds the state from before the
         // update: its summary is what it advertised.
@@ -256,16 +337,25 @@ impl Runner {
         else {
             return Ok(());
         };
-        let delta: Result<StateDelta<'_>, ContractError> = bincode::deserialize(&r)?;
-        let delta = delta
-            .map_err(|e| anyhow!("{} / {}: get_state_delta: {e}", case.kind.name(), case.name))?;
-        if delta.as_ref().is_empty() {
-            bail!(
-                "{} / {}: get_state_delta found nothing new for a co-host holding the old \
-                 state, though the state changed",
-                case.kind.name(),
-                case.name
-            );
+        if let Err(e) = nonempty_delta(case, "a co-host holding the old state", &r) {
+            return self.problem(case, e);
+        }
+
+        // A new subscriber has no state: its summary is zero bytes, and the
+        // delta it is sent is the whole state, re-encoded.
+        let Some(r) = self.measure(
+            case,
+            Call {
+                entry: "get_state_delta",
+                label: "get_state_delta (to a new subscriber, empty summary)",
+                args: vec![params, &merged, &[]],
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        if let Err(e) = nonempty_delta(case, "a new subscriber", &r) {
+            return self.problem(case, e);
         }
 
         if matches!(case.update, Update::State(_)) {
@@ -280,10 +370,32 @@ impl Runner {
             else {
                 return Ok(());
             };
-            new_state(case, &r)?;
+            if let Err(e) = new_state(case, &r) {
+                return self.problem(case, e);
+            }
         }
         Ok(())
     }
+}
+
+/// A `get_state_delta` answer that is a non-empty delta.
+fn nonempty_delta(case: &Case, to: &str, bytes: &[u8]) -> Result<()> {
+    let delta: Result<StateDelta<'_>, ContractError> = bincode::deserialize(bytes)?;
+    let delta = delta.map_err(|e| {
+        anyhow!(
+            "{} / {}: get_state_delta to {to}: {e}",
+            case.kind.name(),
+            case.name
+        )
+    })?;
+    if delta.as_ref().is_empty() {
+        bail!(
+            "{} / {}: get_state_delta found nothing to send to {to}, though the state changed",
+            case.kind.name(),
+            case.name
+        );
+    }
+    Ok(())
 }
 
 fn expect_valid(case: &Case, what: &str, bytes: &[u8]) -> Result<()> {
@@ -332,6 +444,17 @@ fn percent(fuel: Option<u64>) -> String {
     })
 }
 
+/// `pass`, `FAIL` (fails the run), or `WARN` (over, report-only).
+fn verdict(m: &Measured) -> &'static str {
+    if m.fails_run() {
+        "FAIL"
+    } else if m.warns() {
+        "WARN"
+    } else {
+        "pass"
+    }
+}
+
 fn print_line(m: &Measured) {
     let fuel = m.fuel.map_or("past the ceiling".into(), group);
     println!(
@@ -341,7 +464,7 @@ fn print_line(m: &Measured) {
         m.call,
         group(BUDGET_FUEL),
         percent(m.fuel),
-        if m.over() { "FAIL" } else { "pass" }
+        verdict(m)
     );
     if let Some(trap) = &m.trap {
         // The trap and the top of the guest backtrace: enough to say where.
@@ -365,15 +488,22 @@ fn run() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     let mut wasm_dir = default_wasm_dir();
     let mut calibrate_reps = 0usize;
+    let mut only: Option<String> = None;
+    let mut case_filter: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--only" => only = Some(args.next().ok_or_else(|| anyhow!("--only CONTRACT"))?),
+            "--case" => case_filter = Some(args.next().ok_or_else(|| anyhow!("--case SUBSTRING"))?),
             "--wasm-dir" => wasm_dir = args.next().ok_or_else(|| anyhow!("--wasm-dir DIR"))?.into(),
             "--calibrate" => calibrate_reps = 3,
             n if calibrate_reps > 0 && n.parse::<usize>().is_ok() => {
                 calibrate_reps = n.parse().unwrap()
             }
             other => {
-                bail!("unknown argument {other}; usage: [--wasm-dir DIR] [--calibrate [REPS]]")
+                bail!(
+                    "unknown argument {other}; usage: [--wasm-dir DIR] [--calibrate [REPS]] \
+                     [--only CONTRACT] [--case SUBSTRING]"
+                )
             }
         }
     }
@@ -406,7 +536,16 @@ fn run() -> Result<bool> {
         measured: Vec::new(),
     };
     let mut failure = None;
-    for case in cases::all()? {
+    if let Some(only) = &only {
+        if !Kind::ALL.iter().any(|k| k.name() == only) {
+            bail!("--only {only}: no such contract");
+        }
+    }
+    let selected = cases::all()?.into_iter().filter(|c| {
+        only.as_deref().is_none_or(|o| c.kind.name() == o)
+            && case_filter.as_deref().is_none_or(|f| c.name.contains(f))
+    });
+    for case in selected {
         if let Err(e) = runner.run_case(&case) {
             failure = Some(e);
             break;
@@ -429,8 +568,8 @@ fn report(
     hashes: &[(Kind, String)],
     failure: Option<&anyhow::Error>,
 ) -> Result<bool> {
-    let over: Vec<&Measured> = measured.iter().filter(|m| m.over() && m.gating).collect();
-    let reported: Vec<&Measured> = measured.iter().filter(|m| m.over() && !m.gating).collect();
+    let over = gating_failures(measured);
+    let reported: Vec<&Measured> = measured.iter().filter(|m| m.warns()).collect();
 
     let mut md = String::new();
     writeln!(md, "## Harvest contracts: work per call on an update").ok();
@@ -461,9 +600,14 @@ fn report(
             m.fuel.map_or("past the ceiling".into(), group),
             percent(m.fuel),
             match (&m.trap, m.over(), m.gating) {
-                (_, true, false) => format!(":warning: over, report-only ({})", m.tracked_by),
-                (Some(t), _, _) => format!(":x: **{}**", t.lines().next().unwrap_or(t)),
-                (None, true, _) => ":x: **over budget**".into(),
+                (Some(t), _, false) => format!(
+                    ":warning: report-only ({}): {}",
+                    m.tracked_by,
+                    t.lines().next().unwrap_or(t)
+                ),
+                (None, true, false) => format!(":warning: over, report-only ({})", m.tracked_by),
+                (Some(t), _, true) => format!(":x: **{}**", t.lines().next().unwrap_or(t)),
+                (None, true, true) => ":x: **over budget**".into(),
                 (None, false, _) => String::new(),
             }
         )
@@ -505,6 +649,13 @@ fn report(
     writeln!(md).ok();
     if let Some(e) = failure {
         writeln!(md, ":x: The scenario stopped early: `{e:#}`").ok();
+        if !over.is_empty() {
+            writeln!(md).ok();
+            writeln!(md, "Gating calls already over budget before it stopped:").ok();
+            for m in &over {
+                writeln!(md, "* {} / {} / {}", m.contract, m.case, m.call).ok();
+            }
+        }
     } else if over.is_empty() {
         writeln!(md, "Every gating call is within budget.").ok();
     } else {
@@ -526,7 +677,9 @@ fn report(
         )
         .ok();
     }
-    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+    // The unit tests call `report` too; they must not write into the CI
+    // step summary of the run that hosts them.
+    if let (false, Ok(path)) = (cfg!(test), std::env::var("GITHUB_STEP_SUMMARY")) {
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
@@ -537,10 +690,20 @@ fn report(
 
     println!();
     for m in &reported {
-        eprintln!(
-            "::warning::{} / {} / {}: over budget, report-only until {}",
-            m.contract, m.case, m.call, m.tracked_by
-        );
+        match &m.trap {
+            Some(t) => eprintln!(
+                "::warning::{} / {} / {}: {} (report-only until {})",
+                m.contract,
+                m.case,
+                m.call,
+                t.lines().next().unwrap_or(t),
+                m.tracked_by
+            ),
+            None => eprintln!(
+                "::warning::{} / {} / {}: over budget, report-only until {}",
+                m.contract, m.case, m.call, m.tracked_by
+            ),
+        }
     }
     if over.is_empty() {
         println!("every gating call is within {} fuel", group(BUDGET_FUEL));
@@ -569,12 +732,100 @@ fn report(
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
-        Err(e) => {
-            eprintln!("::error::contract budget harness failed: {e:#}");
-            ExitCode::from(2)
+    let outcome = run();
+    if let Err(e) = &outcome {
+        eprintln!("::error::contract budget harness failed: {e:#}");
+    }
+    ExitCode::from(exit_code(&outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn measured(gating: bool, fuel: Option<u64>, trap: Option<&str>) -> Measured {
+        Measured {
+            contract: "c",
+            gating,
+            tracked_by: "an issue",
+            case: "case".into(),
+            call: "call",
+            fuel,
+            trap: trap.map(str::to_string),
+            host_calls: 0,
+            timing: None,
         }
+    }
+
+    /// The three ways a call is over: fuel above the budget, past the
+    /// ceiling (`fuel: None`), and a trap or refusal under the budget.
+    fn over_kinds(gating: bool) -> [Measured; 3] {
+        [
+            measured(gating, Some(BUDGET_FUEL + 1), None),
+            measured(gating, None, Some("ran past the fuel ceiling")),
+            measured(gating, Some(1), Some("trapped: out of memory")),
+        ]
+    }
+
+    #[test]
+    fn an_over_call_of_a_gating_contract_fails_the_run() {
+        for m in over_kinds(true) {
+            assert!(m.fails_run() && !m.warns(), "{:?} {:?}", m.fuel, m.trap);
+            assert_eq!(verdict(&m), "FAIL");
+            let ms = [m];
+            assert_eq!(gating_failures(&ms).len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_over_call_of_a_report_only_contract_only_warns() {
+        for m in over_kinds(false) {
+            assert!(m.warns() && !m.fails_run(), "{:?} {:?}", m.fuel, m.trap);
+            assert_eq!(verdict(&m), "WARN");
+            let ms = [m];
+            assert!(gating_failures(&ms).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_call_within_budget_passes_either_way() {
+        for gating in [true, false] {
+            for fuel in [0, BUDGET_FUEL] {
+                let m = measured(gating, Some(fuel), None);
+                assert!(!m.over() && !m.fails_run() && !m.warns());
+                assert_eq!(verdict(&m), "pass");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mixed_run_fails_only_on_its_gating_calls() {
+        let ms = [
+            measured(true, Some(1), None),
+            measured(false, Some(BUDGET_FUEL * 10), None),
+            measured(false, None, Some("trapped")),
+            measured(true, Some(BUDGET_FUEL + 1), None),
+        ];
+        let failing = gating_failures(&ms);
+        assert_eq!(failing.len(), 1);
+        assert_eq!(failing[0].fuel, Some(BUDGET_FUEL + 1));
+    }
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(exit_code(&Ok(true)), 0);
+        assert_eq!(exit_code(&Ok(false)), 1);
+        assert_eq!(exit_code(&Err(anyhow!("harness"))), 2);
+    }
+
+    /// `report` answers `true` exactly when no gating call is over, which
+    /// `exit_code` turns into 0, and a report-only failure does not change
+    /// that.
+    #[test]
+    fn report_passes_a_run_whose_only_failures_are_report_only() {
+        let ok = report(&over_kinds(false), &[], None).expect("report");
+        assert_eq!(exit_code(&Ok(ok)), 0);
+        let ok = report(&over_kinds(true), &[], None).expect("report");
+        assert_eq!(exit_code(&Ok(ok)), 1);
     }
 }

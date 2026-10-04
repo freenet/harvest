@@ -77,6 +77,9 @@ impl Kind {
 pub enum Update {
     Delta(Vec<u8>),
     State(Vec<u8>),
+    /// A delta the contract must REFUSE: only `update_state` runs, and it
+    /// must answer an error. Measures that the refusal is cheap.
+    RefusedDelta(Vec<u8>),
 }
 
 /// One update against one held state.

@@ -83,6 +83,77 @@ fn at_cap(label: &str, offset: i64) -> Result<MailboxStateV1> {
     Ok(state)
 }
 
+/// A message that differs from every other built by this function only in
+/// its ciphertext: one conversation, one sender, one timestamp and one
+/// nonce. Anyone can write such messages to an open-write mailbox, and
+/// they are distinct entries the contract keeps. Every ordering the
+/// contract applies (the cap's rank, the canonical order) ties on
+/// timestamp and nonce and falls through to the entry digest, which a
+/// build that hashes per comparison recomputes on every comparison.
+fn tied(label: &str, i: u64, class: usize) -> EncryptedMessage {
+    EncryptedMessage {
+        conversation_id: ConversationId(array("mailbox/tied/conversation", 0)),
+        sender_public_key: bytes("mailbox/tied/sender", 0, SENDER_KEY_BYTES),
+        ciphertext: bytes(
+            &format!("{label}/ciphertext"),
+            i,
+            SIZE_BUCKETS[class] + AEAD_TAG_BYTES,
+        ),
+        timestamp: now() - chrono::Duration::seconds(60),
+        nonce: array("mailbox/tied/nonce", 0),
+    }
+}
+
+/// [`tied`] messages filling every class cap.
+fn tied_at_cap(label: &str) -> Result<MailboxStateV1> {
+    let mut messages = Vec::new();
+    let mut i = 0u64;
+    for (class, &cap) in SIZE_CLASS_CAPS.iter().enumerate() {
+        let n = if class == 0 {
+            MAX_MESSAGES - SIZE_CLASS_CAPS[1..].iter().sum::<usize>()
+        } else {
+            cap
+        };
+        for _ in 0..n {
+            messages.push(tied(label, i, class));
+            i += 1;
+        }
+    }
+    built(messages, "the tied mailbox fixture")
+}
+
+/// `messages` through `apply_delta` from empty, checked to be at every cap.
+fn built(messages: Vec<EncryptedMessage>, what: &str) -> Result<MailboxStateV1> {
+    let mut state = MailboxStateV1::default();
+    state
+        .apply_delta(&Some(messages))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    state
+        .verify()
+        .map_err(|e| anyhow::anyhow!("{what} fails verify: {e}"))?;
+    if state.messages.len() != MAX_MESSAGES {
+        bail!("{what} holds {} messages", state.messages.len());
+    }
+    Ok(state)
+}
+
+/// The first [`tied`] text message the cap keeps when merged into `held`:
+/// with every rank field tied, whether a newcomer survives is decided by
+/// its digest, so some candidates would change nothing.
+fn kept_tied_message(held: &MailboxStateV1) -> Result<EncryptedMessage> {
+    for i in 0..64 {
+        let m = tied("mailbox/tied/new", i, 0);
+        let mut merged = held.clone();
+        merged
+            .apply_delta(&Some(vec![m.clone()]))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if merged.messages.contains(&m) {
+            return Ok(m);
+        }
+    }
+    bail!("no tied message among 64 candidates is kept by the cap")
+}
+
 pub fn cases() -> Result<Vec<Case>> {
     let owner = signing_key("mailbox/owner", 0).verifying_key();
     let parameters = cbor(&MailboxParameters::new(owner));
@@ -97,20 +168,62 @@ pub fn cases() -> Result<Vec<Case>> {
     // PUT, a resync or the migration's `send_forward` delivers it.
     let other = at_cap("mailbox/other", 1)?;
 
+    // (c) The largest delta the contract accepts: `MAX_MESSAGES` messages
+    // (it refuses more from the CBOR array head, before decoding), all in
+    // the largest size class, newer than everything held. About 34 MB,
+    // under the node's 50 MiB limit. The class cap keeps 24 of them.
+    let largest: Vec<EncryptedMessage> = (0..MAX_MESSAGES as u64)
+        .map(|i| message("mailbox/largest", i, SIZE_BUCKETS.len() - 1, -1 - i as i64))
+        .collect();
+
+    // (d) One message more than that, which must be refused, cheaply.
+    let too_many: Vec<EncryptedMessage> = (0..MAX_MESSAGES as u64 + 1)
+        .map(|i| message("mailbox/too-many", i, 0, -1 - i as i64))
+        .collect();
+
+    // (e), (f) Adversarial ties: see [`tied`].
+    let tied_held = tied_at_cap("mailbox/tied/held")?;
+    let tied_one = vec![kept_tied_message(&tied_held)?];
+    let tied_other = tied_at_cap("mailbox/tied/other")?;
+
+    let tied_bytes = cbor(&tied_held);
+    let case = |name: &str, held: &Vec<u8>, update: Update| Case {
+        kind: Kind::Mailbox,
+        name: name.into(),
+        parameters: parameters.clone(),
+        held: held.clone(),
+        update,
+    };
     Ok(vec![
-        Case {
-            kind: Kind::Mailbox,
-            name: "512 at caps + one-message delta".into(),
-            parameters: parameters.clone(),
-            held: held_bytes.clone(),
-            update: Update::Delta(cbor(&one)),
-        },
-        Case {
-            kind: Kind::Mailbox,
-            name: "512 at caps + another 512-at-caps state".into(),
-            parameters,
-            held: held_bytes,
-            update: Update::State(cbor(&other)),
-        },
+        case(
+            "512 at caps + one-message delta",
+            &held_bytes,
+            Update::Delta(cbor(&one)),
+        ),
+        case(
+            "512 at caps + another 512-at-caps state",
+            &held_bytes,
+            Update::State(cbor(&other)),
+        ),
+        case(
+            "512 at caps + 512-message top-class delta",
+            &held_bytes,
+            Update::Delta(cbor(&largest)),
+        ),
+        case(
+            "512 at caps + 513-message delta (refused)",
+            &held_bytes,
+            Update::RefusedDelta(cbor(&too_many)),
+        ),
+        case(
+            "512 tied at caps + one-message delta",
+            &tied_bytes,
+            Update::Delta(cbor(&tied_one)),
+        ),
+        case(
+            "512 tied at caps + another tied state",
+            &tied_bytes,
+            Update::State(cbor(&tied_other)),
+        ),
     ])
 }

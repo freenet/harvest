@@ -40,23 +40,34 @@ cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml
 cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml -- --wasm-dir path/to/contracts
 # recalibrate (also times each call unmetered, best of N runs):
 cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml -- --calibrate 3
+# one contract, or the cases whose name contains a string:
+cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml -- --only mailbox --case tied
+# the gating logic's own tests:
+cargo test --release --locked --manifest-path tests/contract-budget/Cargo.toml
 ```
 
 Each call prints one line: contract, case, call, fuel used, the budget, the
-share of the budget, and `pass` or `FAIL`.
+share of the budget, and `pass`, `FAIL` (a gating contract's call is over)
+or `WARN` (a report-only contract's call is over; see "Which contracts
+gate").
 
 Exit codes:
 
-* 0: every GATING call is within budget.
-* 1: at least one gating call is over budget, ran past the harness's fuel ceiling,
-  or trapped (out of the node's 256 MiB of memory, a panic). On a node the
-  update fails there too, so a trap is a failure of the contract, recorded as
-  such, and the run goes on to the next case.
+* 0: every call of a gating contract is within budget.
+* 1: at least one gating call is over budget, ran past the harness's fuel
+  ceiling, or trapped (out of the node's 256 MiB of memory, a panic). On a
+  node the update fails there too, so a trap is a failure of the contract,
+  recorded as such, and the run goes on to the next case.
 * 2: the harness could not drive the contracts: a contract imports a host
-  function this host does not provide, a fixture the contract refuses
-  (`validate_state` not `Valid`, `update_state` an `Err` or no new state), an
-  update that changes nothing, or an empty fan-out delta. A refused or no-op
-  update is cheap and would pass the budget for the wrong reason.
+  function this host does not provide, or a gating contract refuses a
+  fixture (`validate_state` not `Valid`, `update_state` an `Err` or no new
+  state), makes no change, sends an empty fan-out delta, or accepts a delta
+  it must refuse. A refused or no-op update is cheap and would pass the
+  budget for the wrong reason.
+
+A report-only contract never causes exit 1 or 2 by itself: its over-budget
+calls, traps and refusals are each a `::warning::` with the reason, the
+reason is kept in the step summary, and the run goes on to the next case.
 
 ## What the host is
 
@@ -70,8 +81,8 @@ Exit codes:
    64 KiB (`STREAMING_BUF_CAP`) holding a `[total_len: u32]` header and as much
    of the argument as fits. The rest is handed over on demand through the one
    import the contracts declare, `freenet_contract_io.__frnt__fill_buffer`,
-   with the node's semantics (`fill_buffer_impl`). A 7 MB state is read in
-   about a hundred refills, as on the node.
+   with the node's semantics (`fill_buffer_impl`). A 3.55 MB mailbox state is
+   read in 54 refills, as on the node.
 4. Parameters, state and summary bytes go in as they are; the update list and
    the related-contracts map are bincode-encoded with freenet-stdlib 0.8.5, as
    the node encodes them (`write_contract_buf_serialized`).
@@ -93,6 +104,8 @@ From freenet-core's upsert path (`contract/executor/runtime/executor_impl.rs`):
 | `validate_state (merged state)` | every update that produced a new state (`fetch_related_for_validation`) |
 | `summarize_state (merged state)` | the changed state is committed and fanned out; the node summarizes it |
 | `get_state_delta (to a co-host holding the old state)` | the fan-out computes each co-host's delta against its summary. The summary of the held state is computed unmetered first |
+| `get_state_delta (to a new subscriber, empty summary)` | a peer that holds nothing summarizes its absent state as zero bytes and is sent the whole state, re-encoded |
+| `update_state (must refuse)` | a delta the contract must refuse; only this call runs, and it must answer an error |
 | `update_state (idempotency probe, 1 in 32)` | a full-state merge is re-run, sampled 1 in 32, with the merged state as the held one (`maybe_probe_idempotency`) |
 
 Each is a separate guest call under the node's 5 s limit, so each is judged
@@ -111,10 +124,24 @@ caps. The module docs in `src/cases/` say what is at which cap and why.
 * **Mailbox** (`cases/mailbox.rs`): 512 messages (`MAX_MESSAGES`), every size
   class at its cap (296, 128, 64, 24), each ciphertext
   `SIZE_BUCKETS[class] + AEAD_TAG_BYTES` bytes, about 3.3 MiB of ciphertext
-  and 6.7 MB of state. The largest classes are the newest, so the merge keeps
-  every class full. Delta: one text message, the smallest bucket. State: a
-  second mailbox at the same caps, interleaved in time, so the merge keeps
-  half of each.
+  and 3.55 MB of state (6.7 MB before harvest#226 made the byte fields CBOR
+  byte strings). The largest classes are the newest, so the merge keeps
+  every class full. Six cases:
+  * one text message, the smallest bucket, as a delta;
+  * a second mailbox at the same caps as a full state, interleaved in time,
+    so the merge keeps half of each;
+  * the largest delta the contract accepts: `MAX_MESSAGES` (512) messages,
+    all in the largest size class, about 34 MB, under the node's 50 MiB
+    limit (the class cap keeps 24 of them);
+  * 513 messages, which the contract must refuse from the CBOR array head
+    before decoding, so the refusal must be cheap;
+  * adversarial ties, as a one-message delta and as a full state: every
+    message shares one timestamp, one nonce, one conversation and one
+    sender, and differs only in its ciphertext. Anyone can write these to
+    an open-write mailbox and the contract keeps all of them. Every
+    ordering the contract applies then falls through to the entry digest,
+    which a build that hashes per comparison recomputes on every
+    comparison.
 * **Store** (`cases/store.rs`): 4096 paid orders (`MAX_ORDERS`), each with a
   genuine one-claim SPV payment proof and one despatch; 64 backing slots
   (`MAX_BACKINGS`) at the 4096-byte certificate cap, 32 retired and 32 with
@@ -202,21 +229,58 @@ Making a contract gate is part of the change that brings it within budget.
 
 ## After harvest#226 (mailbox)
 
-The mailbox's byte fields are CBOR byte strings and its dedupe hashes each
-message once. Contracts as built on `fix/mailbox-update-cost` (mailbox
-`70c52ef1…`; the others unchanged):
+The mailbox's byte fields are CBOR byte strings, each message's digest is
+computed once and carried through dedupe, cap and canonical order, and a
+delta of more than `MAX_MESSAGES` is refused from its array head. Three
+builds of the mailbox, each column one run of this harness (the main column
+with main's `harvest-common`, so its fixtures are in main's encoding):
 
-| case | call | before | after |
-|---|---|---:|---:|
-| 512 at caps + one-message delta | `update_state` | 320.4% | 30.1% |
-| | `validate_state` (merged) | 158.8% | 6.8% |
-| | `summarize_state` / `get_state_delta` | 118% | 11.3% / 11.7% |
-| 512 at caps + another 512-at-caps state | `update_state` | 655.9% | 59.4% |
-| | idempotency probe | | 59.4% |
+* main `b84af10`, mailbox `64fd7bfe…`;
+* `1927e43`, mailbox `70c52ef1…`: byte strings, dedupe hashed once;
+* `c8b2dee`, mailbox `4f53c9ef…`: every digest once, oversized delta refused.
 
-One delivered message is about 1.32 billion fuel across the four calls a
-node makes, which is 0.6 s at the slowest calibrated rate and nearer 0.3 s at
-the typical one, against 3.4-3.7 s measured on a node before.
+| case | call | main | `70c52ef1` | `4f53c9ef` |
+|---|---|---:|---:|---:|
+| one-message delta | `update_state` | 320.3% | 30.1% | 12.4% |
+| | `validate_state` (merged) | 158.7% | 6.8% | 6.8% |
+| | `summarize_state` | 118.4% | 11.3% | 11.3% |
+| | `get_state_delta`, co-host | 118.8% | 11.7% | 11.7% |
+| | `get_state_delta`, new subscriber | 161.2% | 12.3% | 12.3% |
+| another 512-at-caps state | `validate_state` (incoming) | 158.7% | 6.8% | 6.8% |
+| | `update_state` | 656.0% | 59.4% | 23.9% |
+| | idempotency probe | 634.7% | 59.4% | 23.8% |
+| | `get_state_delta`, new subscriber | 161.2% | 12.3% | 12.3% |
+| 512-message top-class delta (34 MB) | `update_state` | 3356.9% | 290.4% | **107.3%, over** |
+| 513-message delta | `update_state` (must refuse) | accepted, 347.2% | accepted, 36.6% | refused, 2.2% |
+| 512 tied + one-message delta | `update_state` | 227.6% | 65.7% | 12.2% |
+| | `validate_state` (merged) | 176.4% | 24.6% | 24.6% |
+| 512 tied + another tied state | `update_state` | 423.3% | **112.7%, over** | 23.5% |
+| | idempotency probe | 409.7% | **104.1%, over** | 23.6% |
+
+The tied cases are the evidence that the per-comparison digest was a real
+cost: on `70c52ef1`, whose dedupe already hashed once, the tied merge is
+still over budget, and on `4f53c9ef` it is 23.5%. `validate_state` on a tied
+state is 24.6% where an untied one is 6.8%, because `verify` checks the
+canonical order pairwise and every pair ties through to two digests; that
+is within budget.
+
+**The largest accepted delta is still over on `4f53c9ef`**: 512 top-class
+messages in one delta cost 2.36 billion fuel in `update_state`, 107.3% of
+the budget (about 0.5 s at the mailbox's calibrated rate below). Anyone can
+send one to an open-write mailbox.
+
+The other contracts measured the same on `c8b2dee` as on main, to the unit
+of fuel. That includes the store, whose WASM moved to `35a45555…` with no
+change of behaviour.
+
+The mailbox at `4f53c9ef` recalibrated on nova on 2026-10-04 (`--calibrate 7
+--only mailbox`, load 27 to 45): 3.4 to 5.4 billion fuel/s, the largest
+delta 4.88 billion fuel/s (489 ms). A `--calibrate 3` run at load 37 to 50
+read as low as 1.67 billion fuel/s on 150 ms calls; with seven runs those
+same calls read 4.1 to 4.9 billion, so the low readings were the load. The
+budget's derivation holds: the mailbox is not slower per unit of fuel than
+the 2.28 billion fuel/s the budget is taken from, so for the mailbox the
+budget is about 0.45 s of work.
 
 ## Results on main
 

@@ -329,6 +329,10 @@ jobs:
       - name: rustfmt the harness
         run: cargo fmt --manifest-path tests/contract-budget/Cargo.toml -- --check
       - name: clippy the harness
-        run: cargo clippy --release --locked --manifest-path tests/contract-budget/Cargo.toml -- -D warnings
+        run: cargo clippy --release --locked --all-targets --manifest-path tests/contract-budget/Cargo.toml -- -D warnings
+      # The gating logic's own tests: which over-budget calls fail the run
+      # and which only warn, and the exit codes.
+      - name: test the harness
+        run: cargo test --release --locked --manifest-path tests/contract-budget/Cargo.toml
       - name: bound each contract call's work on an update (fuel)
         run: cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml
