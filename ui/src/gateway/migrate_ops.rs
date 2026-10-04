@@ -92,6 +92,11 @@ struct Probe {
     /// (`migrate::notice_marker`). A fold only runs inside a step of its own
     /// walk, synchronously, so draining after each step attributes exactly.
     uncarried: Vec<String>,
+    /// Some candidate of this walk was never answered (a deadline, or a GET
+    /// that could not be sent). A walk that ends this way found nothing it
+    /// can vouch for, so "Create a store" must not read it as "no earlier
+    /// store" (harvest#181).
+    any_unknown: bool,
 }
 
 /// The three probe types behind one handle.
@@ -458,6 +463,7 @@ fn start<F>(
         params: params.clone(),
         session: build(&params),
         uncarried: Vec::new(),
+        any_unknown: false,
     };
     PENDING.with(|p| p.borrow_mut().insert(marker.clone(), probe));
 
@@ -534,6 +540,17 @@ fn drop_pending(marker: &str) {
             probe.artifact.as_str(),
             probe.fingerprint
         );
+        // Carried forward already, so the current index is the whole answer
+        // for "Create a store" (harvest#181).
+        if matches!(probe.session, Session::Index(_)) {
+            let fingerprint = probe.fingerprint.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                use dioxus::prelude::WritableExt;
+                super::APP_STATE
+                    .write()
+                    .on_index_walk_end(&fingerprint, crate::index_flow::IndexWalkEnd::Empty);
+            });
+        }
     }
     // The session guard is what stops a later `GhostKeyList` re-asking the
     // delegate about a marker this session has already settled.
@@ -687,6 +704,7 @@ fn deliver_unknown(id: ContractInstanceId) {
     let Some(mut probe) = PROBES.with(|p| p.borrow_mut().remove(&id)) else {
         return;
     };
+    probe.any_unknown = true;
     match &mut probe.session {
         Session::Store(s) => s.on_unknown(id),
         Session::Reputation(s) => s.on_unknown(id),
@@ -787,6 +805,9 @@ fn finish(mut probe: Probe) {
     // returns silently where `AlreadyWalked` logs, so a lineage stuck this way
     // would not announce itself. Nothing would be lost, but nothing would say
     // the migration had not run either.
+    // How the Ghost Key's index walk ended, for "Create a store"
+    // (harvest#181); `None` for every other lineage.
+    let mut index_end = None;
     let (note, seal, forward) = match &mut probe.session {
         Session::Store(s) => match s.take_result() {
             Some((outcome, seal)) => {
@@ -830,12 +851,25 @@ fn finish(mut probe: Probe) {
         Session::Index(s) => match s.take_result() {
             Some((outcome, seal)) => {
                 let note = migrate::describe(&outcome);
-                let forward = match outcome {
-                    freenet_migrate::Outcome::Recovered { merged, .. } => {
-                        encode_forward(&merged, INDEX_CONTRACT_WASM)
+                let (forward, end) = match outcome {
+                    freenet_migrate::Outcome::Recovered {
+                        merged,
+                        truncated_fold,
+                        ..
+                    } => (
+                        encode_forward(&merged, INDEX_CONTRACT_WASM),
+                        crate::index_flow::IndexWalkEnd::Recovered {
+                            index: merged,
+                            complete: !probe.any_unknown && !truncated_fold,
+                        },
+                    ),
+                    freenet_migrate::Outcome::Indeterminate { .. } => {
+                        (None, crate::index_flow::IndexWalkEnd::Unknown)
                     }
-                    _ => None,
+                    _ if probe.any_unknown => (None, crate::index_flow::IndexWalkEnd::Unknown),
+                    _ => (None, crate::index_flow::IndexWalkEnd::Empty),
                 };
+                index_end = Some(end);
                 (note, seal, forward)
             }
             None => return,
@@ -847,6 +881,19 @@ fn finish(mut probe: Probe) {
         probe.artifact.as_str(),
         probe.fingerprint
     );
+
+    // My Store waits for the Ghost Key's index walk before offering "Create a
+    // store" (harvest#181). Deferred: this runs inside a response handler's
+    // call chain, and APP_STATE may be borrowed there.
+    if let Some(end) = index_end {
+        let fingerprint = probe.fingerprint.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            use dioxus::prelude::WritableExt;
+            super::APP_STATE
+                .write()
+                .on_index_walk_end(&fingerprint, end);
+        });
+    }
 
     // Tell the seller what the migration could not carry, BEFORE the early
     // return below. That return is the nothing-was-recovered path, which is
