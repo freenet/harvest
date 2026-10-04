@@ -343,6 +343,14 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V25, from `git show d73fb6c:ui/public/contracts/store_contract.wasm`,
                 // unchanged through #216. Superseded by listing photos.
                 "baa0eb562d0fd5041eed38c481492e052428549c4fd649e302b29e94a92f341f",
+                // V26, from `git show 57979f8:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#226; moves only because it links
+                // drop glue for the mailbox's `EncryptedMessage`.
+                "8e95714fed08fb474e6ce75de1408ce1d3437f6a58eed22e583bb9e39da95a45",
+                // V27, from `git show 48bdbab:ui/public/contracts/store_contract.wasm`,
+                // the generation harvest#229 shipped. Superseded by step 2
+                // (the pause, the listing caps, byte strings).
+                "35a455559d4f9980f4b22bb8a684a2478de932df3eae613bb7c2f35cba6af68f",
             ],
         ),
         (
@@ -422,6 +430,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "86d20b95428ae8d7b648598c7b8b3d75c0aeabdf72da0fca0e042ca30bfd9c94",
+                // V21, from `git show 57979f8:ui/public/contracts/reputation_contract.wasm`,
+                // unchanged through #229. Superseded by step 2: a complaint's
+                // order writes its signed payload and signature as byte strings.
+                "eab59c4e99867d21bce8fdcf7856321380fc92f22f5bbb62bbcbb1932b1bfc8c",
             ],
         ),
         (
@@ -489,6 +501,14 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "0d22546419ee511415a03d2ce5a36ba0a293a74f7209747aef0d934b643331d6",
+                // V20, from `git show 57979f8:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#226: the message bytes became CBOR
+                // byte strings (a state-encoding change the fold reads).
+                "64fd7bfe4a33571a2161eb5e8c0cc3f2455c44248052b619675641fc67b2579f",
+                // V21, from `git show 48bdbab:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by step 2; moves only because `harvest-common`
+                // is compiled into it.
+                "365266a2b37947e5e56506bd6d774412e1161368ef040855b034219c00c89127",
             ],
         ),
         (
@@ -522,6 +542,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a",
+                // V8, from `git show 57979f8:ui/public/contracts/index_contract.wasm`,
+                // unchanged through #229. Superseded by step 2; moves only
+                // because `harvest-common` is compiled into it.
+                "44bcc983a6e6c21896f3cd72aa086ec8832cffcd2085a6ce28630250d4fe8abc",
             ],
         ),
     ];
@@ -666,9 +690,13 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // state, and the #198 watch rules.
             "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0".to_string(),
             // V32, from `git show b84af10:ui/public/contracts/harvest_delegate.wasm`,
-            // the generation harvest#221 shipped. Superseded by one purchases
-            // backup (step 2).
+            // the generation harvest#221 shipped. Superseded by harvest#226;
+            // its mailbox decoder reads the byte-string encoding too.
             "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9".to_string(),
+            // V33, from `git show 48bdbab:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#229 shipped. Superseded by step 2 (the
+            // purchases backup, the pause, the lighter store read).
+            "350dfcec6d297f75063fc842c160f360d50849fbbaa9ba3ad5fc2360300d28d6".to_string(),
         ],
     );
 }
@@ -1204,6 +1232,10 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         (24, Code),
         // V25: the delegated watch key (`d73fb6c`). Still the store code, 29B.
         (25, Code),
+        // V26: listing photos (`57979f8`). Still the store code.
+        (26, Code),
+        // V27: harvest#229 (`48bdbab`). Still the store code.
+        (27, Code),
     ]
 };
 
@@ -3182,4 +3214,60 @@ fn a_complaint_made_before_step_2_is_carried_across() {
     let forwarded = harvest_common::to_cbor(&recovered).unwrap();
     assert!(harvest_common::is_canonical_cbor(&recovered, &forwarded));
     assert_eq!(in_the_earlier_encoding(&forwarded), raw.to_vec());
+}
+/// harvest#226: a predecessor mailbox (V20 and earlier) holds its message
+/// bytes as CBOR integer arrays. The fold must decode it, merge it, and
+/// forward a state in this generation's encoding, which is the only one the
+/// current contract accepts as canonical.
+#[test]
+fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded() {
+    #[derive(serde::Serialize)]
+    struct Earlier {
+        conversation_id: harvest_common::mailbox::ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        nonce: [u8; 24],
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<Earlier>,
+    }
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let older = [message(40, base), message(41, base + 1)];
+    let raw = harvest_common::to_cbor(&EarlierMailbox {
+        messages: older
+            .iter()
+            .map(|m| Earlier {
+                conversation_id: m.conversation_id.clone(),
+                sender_public_key: m.sender_public_key.clone(),
+                ciphertext: m.ciphertext.clone(),
+                timestamp: m.timestamp,
+                nonce: m.nonce,
+            })
+            .collect(),
+    })
+    .unwrap();
+    let recovered = ops
+        .decode(&raw)
+        .expect("the probe decodes a predecessor's encoding");
+    let local = mailbox_with(vec![message(42, base + 2)]);
+    let folded = ops.merge_with_local(recovered, &local);
+    assert_eq!(folded.messages.len(), 3);
+    let forwarded = harvest_common::to_cbor(&folded).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&folded, &forwarded));
+    // A ciphertext of eight 40s is one contiguous run only in the byte-string
+    // form; the integer-array form writes each as `0x18 0x28`.
+    let run = [40u8; 8];
+    assert!(
+        !raw.windows(8).any(|w| w == run),
+        "the predecessor's form is arrays"
+    );
+    assert!(
+        forwarded.windows(8).any(|w| w == run),
+        "forwarded in the byte-string form, not the integer arrays it arrived in"
+    );
 }

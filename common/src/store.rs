@@ -593,8 +593,10 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     const WHAT: &'static str = "listing status";
 }
 
-/// The most listings a store takes (step 2). Like [`MAX_STORE_BYTES`],
-/// enforced by store state (step 2; how is being decided).
+/// The most listings a store keeps (step 2): the newest, by
+/// [`ListingsV1::normalize`]. Every version of a listing counts, since an
+/// edit publishes a new listing and withdraws the old one, so the ones cut
+/// first are usually old versions already taken down.
 ///
 /// Sized by the seller's own delegate, which reads the whole store on every
 /// instant-checkout decision: with [`MAX_ORDERS`] paid orders and listings

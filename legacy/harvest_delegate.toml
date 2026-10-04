@@ -269,7 +269,14 @@ delegate_key = "23aaca572e973f2ac9bab50b34996efd6ebb5ea8f513aa49b897819bb8ac9607
 
 [[entry]]
 version = "V32"
-description = "Superseded by one purchases backup (step 2): new requests `ExportPurchasesBackup` (one page of every kept conversation and kept purchase, about 256 KiB of records, with a cursor), `ImportPurchasesBackup` (at most 16 records a call; never writes over a held record, a purchase merging as a migration merges it; refused past a cap, never evicting) and `MarkBackedUp` (answered `PurchasesBackup`, `PurchasesBackupImported`, `BackedUpMarked`). `KeptPurchase` gained `backed_up` (`#[serde(default, skip_serializing_if)]`, so every earlier record encodes as before; cleared when the order is paid after the backup). No secret family or import family changed. The parameters are unchanged (empty). The generation harvest#221 shipped (`b84af10`)."
+description = "Superseded by harvest#226, which changed `harvest-common`: `EncryptedMessage`'s byte fields are written as CBOR byte strings and the mailbox normalisation computes each digest once. The delegate's hand-written mailbox decoder (`fast_cbor::decode_mailbox`) now reads both the byte-string and the earlier integer-array form. No secret it stores holds an `EncryptedMessage`; the two round-trip contexts that do (`PendingBatch`, `PendingReplies`) are now written in the byte-string form and, through `serde_bytes`, read either. The generation harvest#221 shipped (`b84af10`)."
 date = "2026-10-04"
 code_hash = "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9"
 delegate_key = "015d5a57f0b6cf9d926ae1bdb0f9ef059e8de3f094cef3b26f23f6106a012c3d"
+
+[[entry]]
+version = "V33"
+description = "Superseded by step 2. One purchases backup: new requests `ExportPurchasesBackup` (one page of every kept conversation and kept purchase, about 256 KiB of records, with a cursor), `ImportPurchasesBackup` (at most 16 records a call; never writes over a held record, a purchase merging as a migration merges it; refused past a cap, never evicting) and `MarkBackedUp` (answered `PurchasesBackup`, `PurchasesBackupImported`, `BackedUpMarked`); `KeptPurchase` gained `backed_up` (`#[serde(default, skip_serializing_if)]`, so every earlier record encodes as before). A paused store (the store state's new `pause`) declines every Buy now with \"This store is closed for now.\" and marks it seen, before the other store-wide refusals; its heartbeat says `Paused`; a store notification that changes what the store says sends a heartbeat at once; the store-read record gains a fourth value. The light store read skips each listing's and listing status's signature, signed payload and certificate, and reads only the statuses of listings held. A kept purchase's order writes its outer signed payload and signature as CBOR byte strings; the earlier form still decodes on import. No secret family or import family changed. The parameters are unchanged (empty). The generation harvest#229 shipped (`48bdbab`)."
+date = "2026-10-04"
+code_hash = "350dfcec6d297f75063fc842c160f360d50849fbbaa9ba3ad5fc2360300d28d6"
+delegate_key = "91dcbcc660501c1a967c43b73b35d2d2a744fa61f12f9291a729b2914941ed4e"
