@@ -73,12 +73,6 @@ fn a_published_photo_without_a_thumbnail_cannot_be_the_cover() {
 }
 
 #[test]
-fn at_most_four_photos() {
-    assert!(listing_images(&(1..=4).map(added).collect::<Vec<_>>()).is_ok());
-    assert!(listing_images(&(1..=5).map(added).collect::<Vec<_>>()).is_err());
-}
-
-#[test]
 fn descriptions_are_trimmed_and_checked_by_the_stores_rules() {
     let mut d = added(1);
     d.alt = "  Jar, front  ".into();
@@ -154,8 +148,112 @@ fn a_listings_photos_come_back_as_drafts_in_order() {
 }
 
 #[test]
-fn the_same_photo_is_noticed() {
-    let drafts = vec![added(1)];
-    assert!(already_added(&drafts, &blob(1, 1600)));
-    assert!(!already_added(&drafts, &blob(2, 1600)));
+fn adding_a_photo_already_on_the_form() {
+    let mut drafts = vec![added(1)];
+    assert_eq!(add_photo(&mut drafts, added(1)), Added::Duplicate);
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(add_photo(&mut drafts, added(2)), Added::New);
+    assert_eq!(drafts.len(), 2);
+}
+
+/// The recovery the seller's Listings page asks for: a published photo the
+/// network lost is added again from the device. The same file re-encodes to
+/// the same bytes, so it lands on the existing photo, which then uploads.
+#[test]
+fn adding_a_published_photo_again_restores_its_bytes_in_place() {
+    let mut drafts = vec![published(1, false), published(2, true)];
+    drafts.swap(0, 1);
+    assert!(uploads(&drafts).is_empty());
+    let mut again = added(1);
+    again.key = 77;
+    assert_eq!(add_photo(&mut drafts, again), Added::Restored);
+    assert_eq!(drafts.len(), 2, "no second copy");
+    assert_eq!(drafts[1].key, 1, "it keeps its place and key");
+    let up: Vec<[u8; 32]> = uploads(&drafts).into_iter().map(|(h, _)| h).collect();
+    assert_eq!(up, vec![[1; 32]], "and is uploaded when the form saves");
+    // A published photo added again can now be the cover: it has its
+    // thumbnail.
+    move_earlier(&mut drafts, 1);
+    let images = listing_images(&drafts).unwrap();
+    assert_eq!(images[0].thumb, Some(blob(101, 400)));
+    let up: Vec<[u8; 32]> = uploads(&drafts).into_iter().map(|(h, _)| h).collect();
+    assert_eq!(up, vec![[101; 32], [1; 32]]);
+}
+
+#[test]
+fn the_ui_stops_at_four_photos_but_the_form_saves_more_from_elsewhere() {
+    let mut drafts: Vec<PhotoDraft> = (1..=4).map(added).collect();
+    assert_eq!(add_photo(&mut drafts, added(5)), Added::Full);
+    assert_eq!(drafts.len(), 4);
+    // A listing another client gave six photos still saves (a count
+    // change, say): the store allows up to eight.
+    let mut six: Vec<PhotoDraft> = (1..=6).map(|s| published(s, s == 1)).collect();
+    assert!(listing_images(&six).is_ok());
+    six.extend((7..=9).map(|s| published(s, false)));
+    assert!(
+        listing_images(&six).is_err(),
+        "nine is over the store's limit"
+    );
+}
+
+#[test]
+fn tile_actions_find_their_photo_by_key() {
+    let mut drafts = vec![added(1), added(2), added(3)];
+    assert_eq!(position(&drafts, 2), Some(1));
+    drafts.remove(0);
+    assert_eq!(position(&drafts, 2), Some(0), "found where it now is");
+    assert_eq!(
+        position(&drafts, 1),
+        None,
+        "a removed photo is gone, not replaced"
+    );
+}
+
+/// The publish order: `finish` (sign and publish) runs only after every
+/// upload succeeded, and never after a failure.
+#[test]
+fn the_listing_is_published_only_after_every_upload() {
+    use futures::executor::block_on;
+    use std::cell::RefCell;
+    let calls = RefCell::new(Vec::new());
+    let published = RefCell::new(false);
+    let ok = block_on(publish_after_uploads(
+        vec![([1; 32], vec![1]), ([2; 32], vec![2])],
+        |h, _| {
+            calls.borrow_mut().push(h);
+            async { Ok(()) }
+        },
+        || *published.borrow_mut() = true,
+    ));
+    assert_eq!(ok, Ok(()));
+    assert_eq!(calls.borrow().len(), 2);
+    assert!(*published.borrow());
+
+    let published = RefCell::new(false);
+    let failed = block_on(publish_after_uploads(
+        vec![([1; 32], vec![1]), ([2; 32], vec![2])],
+        |h, _| async move {
+            if h == [2; 32] {
+                Err("refused".to_string())
+            } else {
+                Ok(())
+            }
+        },
+        || *published.borrow_mut() = true,
+    ));
+    assert_eq!(failed, Err("refused".to_string()));
+    assert!(
+        !*published.borrow(),
+        "nothing is published after a failed upload"
+    );
+
+    // Nothing to upload: published at once.
+    let published = RefCell::new(false);
+    block_on(publish_after_uploads(
+        Vec::new(),
+        |_, _| async { Ok(()) },
+        || *published.borrow_mut() = true,
+    ))
+    .unwrap();
+    assert!(*published.borrow());
 }

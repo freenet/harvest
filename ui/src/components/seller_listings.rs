@@ -241,15 +241,28 @@ fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
     let missing = use_resource(move || {
         let hashes = hashes.clone();
         async move {
-            let mut missing = 0usize;
-            for hash in hashes {
-                if crate::gateway::image_ops::fetch_image(hash, true).await
-                    == crate::gateway::image_ops::Fetched::Absent
-                {
-                    missing += 1;
-                }
+            use crate::gateway::image_ops::{fetch_image, Fetched};
+            // All at once, and an absent photo asked again before it is
+            // reported: a GET that dead-ends answers "not found" for a
+            // contract that exists, and one such answer is not worth
+            // telling the seller their photo is gone.
+            let first =
+                futures::future::join_all(hashes.iter().map(|h| fetch_image(*h, true))).await;
+            let absent: Vec<[u8; 32]> = hashes
+                .iter()
+                .zip(first)
+                .filter(|(_, f)| *f == Fetched::Absent)
+                .map(|(h, _)| *h)
+                .collect();
+            if absent.is_empty() {
+                return 0usize;
             }
-            missing
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            futures::future::join_all(absent.iter().map(|h| fetch_image(*h, false)))
+                .await
+                .into_iter()
+                .filter(|f| *f == Fetched::Absent)
+                .count()
         }
     });
     #[cfg(target_arch = "wasm32")]
@@ -262,7 +275,7 @@ fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
     rsx! {
         if missing > 0 {
             p { class: "text-warning small",
-                "Photo missing. Edit this listing and add it again to show it to buyers."
+                "A photo is missing from Freenet, so buyers don't see it. Open Edit and add that photo again from your device."
             }
         }
     }

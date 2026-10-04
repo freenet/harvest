@@ -24,6 +24,16 @@ use futures::channel::oneshot;
 /// The image contract, exactly as built (`scripts/build-contract-wasm.sh`).
 pub const IMAGE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/image_contract.wasm");
 
+/// The image contract's superseded generations (`legacy/image_contract.toml`).
+/// Empty: nothing here looks a photo up under an older generation yet, and
+/// nothing copies a seller's photos forward. A test fails the moment a row
+/// is recorded, so whoever re-keys the image contract builds that first
+/// (images design, section 3.2, "When it does move").
+#[allow(dead_code)]
+mod image_gen {
+    include!(concat!(env!("OUT_DIR"), "/legacy_image_contract.rs"));
+}
+
 /// The image contract instance for a photo whose bytes hash to `hash`.
 pub fn image_contract(hash: [u8; 32]) -> (ContractContainer, ContractInstanceId) {
     let code = Arc::new(ContractCode::from(IMAGE_CONTRACT_WASM.to_vec()));
@@ -104,8 +114,15 @@ impl ImageWaiters {
     /// it settles a waiting PUT too. Returns whether `id` is an image.
     pub fn state(&mut self, id: &ContractInstanceId, bytes: &[u8]) -> bool {
         if let Some(waiting) = self.gets.remove(id) {
+            // An empty state is no image (the contract refuses one), so it
+            // answers as absence, never as a photo that is there.
+            let answer = if bytes.is_empty() {
+                Fetched::Absent
+            } else {
+                Fetched::Bytes(bytes.to_vec())
+            };
             for tx in waiting {
-                let _ = tx.send(Fetched::Bytes(bytes.to_vec()));
+                let _ = tx.send(answer.clone());
             }
         }
         if !bytes.is_empty() {
@@ -167,34 +184,61 @@ pub fn deliver_absent(id: &ContractInstanceId) -> bool {
     WAITERS.with(|w| w.borrow_mut().absent(id))
 }
 
-/// How long a photo's PUT is waited on before the upload is told it failed.
-/// A PUT is answered once the node has stored it, which on the seller's own
-/// node is quick; the rest of the network's copies follow in the background.
-pub const PUT_TIMEOUT_MS: u32 = 30_000;
+/// How long a photo's PUT is waited on. A `PutResponse` may come only once
+/// the PUT has travelled its route, which on a poorly connected peer is slow;
+/// a PUT with no answer by then is checked by a GET (see [`put_image`]).
+pub const PUT_TIMEOUT_MS: u32 = 60_000;
 
 /// How long a GET is waited on.
 pub const GET_TIMEOUT_MS: u32 = 30_000;
 
-/// PUT a photo (its exact bytes, already checked with
-/// `harvest_image::validate`) and subscribe to it, then wait until the node
-/// acknowledges it. The subscription is the seller's local claim on the
-/// photo while this tab is open (images design, section 3.5).
+/// The seller-facing message for any upload that did not go through. The
+/// detail goes to the log; the seller can only try again.
+pub const UPLOAD_FAILED: &str =
+    "A photo could not be uploaded to Freenet. Check that Freenet is running, then save again.";
+
+/// PUT a photo and subscribe to it, then wait until the node has it. The
+/// subscription is the seller's local claim on the photo while this tab is
+/// open (images design, section 3.5).
+///
+/// The (hash, bytes) pair is checked first with the image contract's own
+/// rules, so a mismatch is refused here with a reason rather than by the
+/// node with silence. "The node has it" is a `PutResponse`, or a non-empty
+/// state for the photo from any GET; with neither by the deadline, one GET
+/// settles it, since an identical re-PUT of a photo the node already holds
+/// may not be answered at all.
 pub async fn put_image(hash: [u8; 32], bytes: Vec<u8>) -> Result<(), String> {
+    if let Err(e) = harvest_image::validate(&hash, &bytes) {
+        dioxus::logger::tracing::error!("refusing to upload an invalid photo: {e}");
+        return Err(UPLOAD_FAILED.into());
+    }
     #[cfg(target_arch = "wasm32")]
     {
         use freenet_stdlib::prelude::WrappedState;
         let (container, id) = image_contract(hash);
         let acknowledged = WAITERS.with(|w| w.borrow_mut().register_put(id));
-        super::put_contract(container, WrappedState::new(bytes)).await?;
+        if let Err(e) = super::put_contract(container, WrappedState::new(bytes)).await {
+            dioxus::logger::tracing::warn!("photo PUT could not be sent: {e}");
+            return Err(UPLOAD_FAILED.into());
+        }
         let deadline = gloo_timers::future::TimeoutFuture::new(PUT_TIMEOUT_MS);
         futures::pin_mut!(deadline);
-        match futures::future::select(acknowledged, deadline).await {
-            futures::future::Either::Left((Ok(()), _)) => Ok(()),
-            futures::future::Either::Left((Err(_), _)) => Err("the upload was cancelled".into()),
-            futures::future::Either::Right(_) => Err(format!(
-                "Freenet did not confirm the photo within {} seconds",
-                PUT_TIMEOUT_MS / 1000
-            )),
+        if let futures::future::Either::Left((Ok(()), _)) =
+            futures::future::select(acknowledged, deadline).await
+        {
+            return Ok(());
+        }
+        match fetch_image(hash, false).await {
+            Fetched::Bytes(held) if harvest_image::validate(&hash, &held).is_ok() => Ok(()),
+            other => {
+                let said = match other {
+                    Fetched::Bytes(_) => "bytes that are not this photo",
+                    Fetched::Absent => "not found",
+                    Fetched::TimedOut => "no answer",
+                };
+                dioxus::logger::tracing::warn!("photo PUT unconfirmed; a GET found {said}");
+                Err(UPLOAD_FAILED.into())
+            }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -246,6 +290,46 @@ mod tests {
         assert_ne!(id(5), id(6));
     }
 
+    /// See `image_gen`: re-keying the image contract strands every photo
+    /// until something looks them up under the old generation and copies
+    /// them forward, and nothing does yet.
+    #[test]
+    fn no_image_generation_is_recorded_until_photos_can_be_carried_forward() {
+        assert!(
+            image_gen::LEGACY_IMAGE_CONTRACT.is_empty(),
+            "an image contract generation was recorded: build the buyer's \
+             legacy lookup and the seller's copy-forward first"
+        );
+    }
+
+    /// The response handler offers an answer to the image waiters BEFORE the
+    /// migration probe and the store-state handler, so a photo's bytes are
+    /// never decoded as store state. A source pin: the ordering lives in a
+    /// browser-only match arm no host test can drive.
+    #[test]
+    fn the_handler_offers_answers_to_photos_first() {
+        let src = include_str!("response_handler.rs");
+        let get_arm = &src[src.find("ContractResponse::GetResponse {").unwrap()..];
+        let photo = get_arm
+            .find("image_ops::deliver_state")
+            .expect("photos are offered the state");
+        let probe = get_arm.find("migrate_ops::deliver_state").unwrap();
+        let store = get_arm.find("on_contract_state(").unwrap();
+        assert!(photo < probe && photo < store, "photos must be asked first");
+        let not_found = &src[src
+            .find("ContractResponse::NotFound { instance_id }")
+            .unwrap()..];
+        let photo = not_found
+            .find("image_ops::deliver_absent")
+            .expect("photos hear absence");
+        let probe = not_found.find("migrate_ops::deliver_absent").unwrap();
+        assert!(photo < probe);
+        assert!(
+            src.contains("image_ops::deliver_put_ack"),
+            "photos hear their PUT acknowledged"
+        );
+    }
+
     #[test]
     fn a_put_is_settled_by_its_acknowledgement() {
         let mut w = ImageWaiters::default();
@@ -280,6 +364,22 @@ mod tests {
         assert!(w.absent(&id(2)));
         assert_eq!(found.try_recv(), Ok(Some(Fetched::Bytes(b"jpeg".to_vec()))));
         assert_eq!(missing.try_recv(), Ok(Some(Fetched::Absent)));
+    }
+
+    #[test]
+    fn an_empty_state_answers_a_get_as_absent() {
+        let mut w = ImageWaiters::default();
+        let mut rx = w.register_get(id(1));
+        w.state(&id(1), b"");
+        assert_eq!(rx.try_recv(), Ok(Some(Fetched::Absent)));
+    }
+
+    #[test]
+    fn an_invalid_pair_is_refused_before_anything_is_sent() {
+        let jpeg = include_bytes!("../../../harvest-image/tests/fixtures/chromium-canvas.jpg");
+        let wrong_hash = [7u8; 32];
+        let refused = futures::executor::block_on(put_image(wrong_hash, jpeg.to_vec()));
+        assert_eq!(refused, Err(UPLOAD_FAILED.to_string()));
     }
 
     #[test]

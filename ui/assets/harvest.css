@@ -212,7 +212,7 @@ body::before {
        .seller-listing, .seller-listing-actions, .own-store-banner,
        .pay-ways, .copy-line, .notice-row, .link-btn, .rowcard, .rc-status,
        .find-store, .vrow, .crumb, .harvest-header-right, .record-head,
-       .needs-hit) > * {
+       .needs-hit, .photo-grid, .photo-tile, .photo-actions) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -1935,4 +1935,17 @@ h4 {
 }
 .photo-input {
   margin-top: 0.4rem;
+}
+.form-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.photo-missing {
+  margin: 0;
+  padding: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text, #2c2416);
+  background: rgba(255, 255, 255, 0.75);
 }

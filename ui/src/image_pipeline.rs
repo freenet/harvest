@@ -34,6 +34,11 @@ pub const QUALITIES: [f64; 5] = [0.85, 0.75, 0.65, 0.55, 0.5];
 /// transparency, and an unfilled canvas turns them black): the card colour.
 pub const BACKGROUND: &str = "#f3ede2";
 
+/// The seller-facing message for a photo this browser produced that the
+/// image rules refuse. The detail goes to the log.
+pub const UNUSABLE: &str =
+    "This photo could not be used. Try another photo, or a JPEG or PNG copy of it.";
+
 /// One encoded image, as the browser produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Encoded {
@@ -75,10 +80,14 @@ pub fn prepare(full: &[u8], thumb: &[u8], colour: [u8; 3]) -> Result<PreparedPho
 }
 
 fn named(bytes: &[u8], max_bytes: usize, max_edge: u16) -> Result<(Vec<u8>, ImageBlob), String> {
-    let stripped =
-        harvest_image::strip(bytes).map_err(|e| format!("This photo could not be read ({e})."))?;
-    let info = harvest_image::sniff(&stripped)
-        .map_err(|e| format!("This photo could not be used ({e})."))?;
+    let stripped = harvest_image::strip(bytes).map_err(|e| {
+        dioxus::logger::tracing::warn!("photo refused by strip: {e}");
+        UNUSABLE.to_string()
+    })?;
+    let info = harvest_image::sniff(&stripped).map_err(|e| {
+        dioxus::logger::tracing::warn!("photo refused by sniff: {e}");
+        UNUSABLE.to_string()
+    })?;
     if stripped.len() > max_bytes {
         return Err(format!(
             "This photo is still {} KB after shrinking; the most is {} KB.",
@@ -162,14 +171,30 @@ pub async fn encode_file(file: web_sys::File) -> Result<PreparedPhoto, String> {
         .map_err(|_| unsupported.to_string())?
         .dyn_into()
         .map_err(|_| unsupported.to_string())?;
+    let result = encode_bitmap(&bitmap).await;
+    // Released on every path: a decoded photo is tens of megabytes.
+    bitmap.close();
+    let (full, thumb, colour) = result?;
+    prepare(&full, &thumb, colour)
+}
+
+/// The full photo, the thumbnail and its mean colour. The pixel limit is
+/// checked here, after decoding: a browser exposes no size before it
+/// decodes, so it bounds the canvas work and memory that follow, not the
+/// decode itself (the browser's own decoder bounds that).
+#[cfg(target_arch = "wasm32")]
+async fn encode_bitmap(
+    bitmap: &web_sys::ImageBitmap,
+) -> Result<(Vec<u8>, Vec<u8>, [u8; 3]), String> {
     let (w, h) = (bitmap.width(), bitmap.height());
     if u64::from(w) * u64::from(h) > MAX_INPUT_PIXELS {
         return Err("This photo has too many pixels. Try a smaller one.".into());
     }
-    let (full, _) = encode_at(&bitmap, FULL_EDGE, FULL_TARGET_BYTES).await?;
-    let (thumb, colour) = encode_at(&bitmap, THUMB_EDGE, THUMB_TARGET_BYTES).await?;
-    bitmap.close();
-    prepare(&full, &thumb, colour)
+    let full = encode_at(bitmap, FULL_EDGE, FULL_TARGET_BYTES, false)
+        .await?
+        .0;
+    let (thumb, colour) = encode_at(bitmap, THUMB_EDGE, THUMB_TARGET_BYTES, true).await?;
+    Ok((full, thumb, colour))
 }
 
 /// Draw `bitmap` with its long edge at most `edge`, and encode it as JPEG at
@@ -180,13 +205,16 @@ async fn encode_at(
     bitmap: &web_sys::ImageBitmap,
     edge: u32,
     target: usize,
+    with_colour: bool,
 ) -> Result<(Vec<u8>, [u8; 3]), String> {
     use wasm_bindgen::JsCast;
 
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or("no document")?;
-    let mut limit = edge;
+    // Start no larger than the photo itself, so a small photo that does not
+    // fit the size target shrinks at once instead of redrawing at one size.
+    let mut limit = edge.min(bitmap.width().max(bitmap.height()).max(1));
     loop {
         let (dw, dh) = fit(bitmap.width(), bitmap.height(), limit);
         let canvas: web_sys::HtmlCanvasElement = document
@@ -207,10 +235,15 @@ async fn encode_at(
         ctx.fill_rect(0.0, 0.0, dw as f64, dh as f64);
         ctx.draw_image_with_image_bitmap_and_dw_and_dh(bitmap, 0.0, 0.0, dw as f64, dh as f64)
             .map_err(|_| "This photo could not be drawn.")?;
-        let colour = ctx
-            .get_image_data(0.0, 0.0, dw as f64, dh as f64)
-            .map(|d| mean_colour(&d.data()))
-            .unwrap_or([200, 190, 170]);
+        // Only for the thumbnail: copying a full photo's pixels out to
+        // average them is megabytes of work for one colour.
+        let colour = if with_colour {
+            ctx.get_image_data(0.0, 0.0, dw as f64, dh as f64)
+                .map(|d| mean_colour(&d.data()))
+                .unwrap_or([200, 190, 170])
+        } else {
+            [0, 0, 0]
+        };
         for q in QUALITIES {
             let bytes = to_jpeg(&canvas, q).await?;
             if bytes.len() <= target {

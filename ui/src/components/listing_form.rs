@@ -6,7 +6,9 @@ use harvest_common::listing::{
 };
 use harvest_common::listing_image::ListingImage;
 
-use super::photo_editor::{drafts_from_listing, listing_images, uploads, PhotoEditor};
+use super::photo_editor::{
+    drafts_from_listing, listing_images, publish_after_uploads, uploads, PhotoEditor,
+};
 
 /// What every listing this form publishes is: a sale at a fixed price, with
 /// fixed delivery (Ian, 2026-09-26). There is no free-text price, no gift or
@@ -77,12 +79,17 @@ pub fn ListingForm(
     let built_terms = terms().build();
     let terms_error = built_terms.as_ref().err().cloned();
     let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
+    let preparing = use_signal(|| 0usize);
     let mut uploading = use_signal(|| false);
     let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "card",
             h3 { if initial.is_some() { "Edit listing" } else { "New listing" } }
+            // Everything the seller can change is frozen while the photos
+            // upload: the listing being published was built when Publish
+            // was pressed, and a change now would be silently lost.
+            fieldset { class: "form-fieldset", disabled: uploading(),
 
             div { class: "form-group",
                 label { class: "form-label", "Title" }
@@ -105,7 +112,7 @@ pub fn ListingForm(
                 }
             }
 
-            PhotoEditor { photos }
+            PhotoEditor { photos, busy: preparing, disabled: uploading() }
 
             TermsEditor { terms }
             if let Some(problem) = terms_error.clone() {
@@ -133,10 +140,15 @@ pub fn ListingForm(
                 }
             }
 
+            }
             div { class: "form-actions",
             button {
                 class: "btn btn-primary",
-                disabled: title().trim().is_empty() || quantity_error || terms_error.is_some() || uploading(),
+                disabled: title().trim().is_empty()
+                    || quantity_error
+                    || terms_error.is_some()
+                    || uploading()
+                    || preparing() > 0,
                 onclick: move |_| {
                         // Re-checked here, not only in `disabled`: two clicks
                         // can land before the button re-renders (#80), and the
@@ -153,7 +165,9 @@ pub fn ListingForm(
                         // The price is the sats price in `checkout`; the old
                         // free-text one is never written again.
                         let price: Option<PriceInfo> = None;
-                        if uploading() {
+                        // Not while photos upload or are still being prepared:
+                        // a photo picked a moment ago must not be left out.
+                        if uploading() || preparing() > 0 {
                             return;
                         }
                         // The photos the new listing carries, cover first.
@@ -166,8 +180,33 @@ pub fn ListingForm(
                                 return;
                             }
                         };
+                        // Every photo the listing names that is not yet on
+                        // the network goes up FIRST, and the listing is
+                        // signed only once the node has taken each one
+                        // (`publish_after_uploads`), so a published listing
+                        // never names a photo its own seller's node does not
+                        // hold. Worked out before the count-only check below:
+                        // a missing photo added again changes no term, and
+                        // must still be uploaded.
+                        let pending = uploads(&photos());
+                        let mut photos = photos;
+                        let mut finish = move |listing: Listing| {
+                            title.set(String::new());
+                            description.set(String::new());
+                            quantity.set(String::new());
+                            terms.set(TermsForm::default());
+                            #[cfg(target_arch = "wasm32")]
+                            for d in photos.peek().iter() {
+                                if let Some(url) = &d.preview {
+                                    crate::image_pipeline::revoke_preview(url);
+                                }
+                            }
+                            photos.set(Vec::new());
+                            on_submit.call((listing, count));
+                        };
                         // Only the count changed: submit the original, so its
                         // id, and the listing buyers hold, stays the same.
+                        let mut listing = None;
                         if let Some(original) = editing.as_ref() {
                             if same_terms(
                                 original,
@@ -178,13 +217,12 @@ pub fn ListingForm(
                                 &choices,
                                 &images,
                             ) {
-                                on_submit.call((original.clone(), count));
-                                return;
+                                listing = Some(original.clone());
                             }
                         }
                         let now = Utc::now();
                         let listing_title = title().trim().to_string();
-                        let listing = Listing {
+                        let listing = listing.unwrap_or_else(|| Listing {
                             checkout,
                             choices,
                             images,
@@ -200,44 +238,24 @@ pub fn ListingForm(
                             price,
                             created_at: now,
                         }
-                        .with_derived_id();
+                        .with_derived_id());
 
-                        // Every photo the listing names that is not yet on
-                        // the network goes up FIRST, and the listing is
-                        // signed only once the node has taken each one, so
-                        // a published listing never names a photo its own
-                        // seller's node does not hold.
-                        let pending = uploads(&photos());
-                        let mut photos = photos;
-                        let mut finish = move |listing: Listing| {
-                            title.set(String::new());
-                            description.set(String::new());
-                            quantity.set(String::new());
-                            terms.set(TermsForm::default());
-                            #[cfg(target_arch = "wasm32")]
-                            for d in photos.read().iter() {
-                                if let Some(url) = &d.preview {
-                                    crate::image_pipeline::revoke_preview(url);
-                                }
-                            }
-                            photos.set(Vec::new());
-                            on_submit.call((listing, count));
-                        };
                         if pending.is_empty() {
                             finish(listing);
                             return;
                         }
                         uploading.set(true);
                         spawn(async move {
-                            for (hash, bytes) in pending {
-                                if let Err(e) = crate::gateway::image_ops::put_image(hash, bytes).await {
-                                    photo_error.set(Some(format!("A photo could not be uploaded: {e}. Try again.")));
-                                    uploading.set(false);
-                                    return;
-                                }
-                            }
+                            let result = publish_after_uploads(
+                                pending,
+                                crate::gateway::image_ops::put_image,
+                                move || finish(listing),
+                            )
+                            .await;
                             uploading.set(false);
-                            finish(listing);
+                            if let Err(e) = result {
+                                photo_error.set(Some(e));
+                            }
                         });
                 },
                 if uploading() { "Uploading photos\u{2026}" } else if initial.is_some() { "Save changes" } else { "Publish listing" }

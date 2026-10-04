@@ -57,11 +57,10 @@ pub(crate) fn drafts_from_listing(listing: Option<&Listing>) -> Vec<PhotoDraft> 
 /// thumbnail (a published photo moved to the front), or when a description
 /// breaks the store's rules, so nothing is signed that the store refuses.
 pub(crate) fn listing_images(drafts: &[PhotoDraft]) -> Result<Vec<ListingImage>, String> {
-    if drafts.len() > MAX_IMAGES_UI {
-        return Err(format!(
-            "A listing can have at most {MAX_IMAGES_UI} photos."
-        ));
-    }
+    // The UI's limit applies when a photo is ADDED (`add_photo`), not here:
+    // a listing another client gave more photos (up to the store's 8) must
+    // still be editable, a count change included. The store's own rules
+    // decide below.
     let mut images = Vec::with_capacity(drafts.len());
     for (i, d) in drafts.iter().enumerate() {
         let thumb = if i == 0 {
@@ -117,79 +116,131 @@ pub(crate) fn move_later(drafts: &mut [PhotoDraft], i: usize) {
     }
 }
 
-/// Whether a photo with these bytes is already on the form.
-pub(crate) fn already_added(drafts: &[PhotoDraft], full: &ImageBlob) -> bool {
-    drafts.iter().any(|d| d.full.hash == full.hash)
+/// What adding a photo did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Added {
+    /// A new photo, at the end.
+    New,
+    /// The same photo was already on the form without its bytes (a
+    /// published photo, perhaps one the network lost): its bytes are now
+    /// attached, so saving uploads it again.
+    Restored,
+    /// Already on the form, with its bytes.
+    Duplicate,
+    /// The form already has [`MAX_IMAGES_UI`] photos.
+    Full,
+}
+
+/// Add a freshly encoded photo, or give a photo already on the form back
+/// its bytes. A browser re-encodes the same file to the same bytes, so
+/// adding a published photo again is how a missing one is put back.
+pub(crate) fn add_photo(drafts: &mut Vec<PhotoDraft>, new: PhotoDraft) -> Added {
+    if let Some(existing) = drafts.iter_mut().find(|d| d.full.hash == new.full.hash) {
+        if existing.full_bytes.is_some() {
+            return Added::Duplicate;
+        }
+        existing.full_bytes = new.full_bytes;
+        existing.thumb = new.thumb;
+        existing.thumb_bytes = new.thumb_bytes;
+        if existing.preview.is_none() {
+            existing.preview = new.preview;
+        }
+        return Added::Restored;
+    }
+    if drafts.len() >= MAX_IMAGES_UI {
+        return Added::Full;
+    }
+    drafts.push(new);
+    Added::New
+}
+
+/// Where the photo with `key` is now, if it is still on the form. Every
+/// tile action goes through this rather than a captured position, so two
+/// clicks landing before a re-render act on the photo clicked, or on
+/// nothing, never on whatever slid into its place.
+pub(crate) fn position(drafts: &[PhotoDraft], key: u64) -> Option<usize> {
+    drafts.iter().position(|d| d.key == key)
+}
+
+/// Upload every pending photo, all at once, and call `finish` (which signs
+/// and publishes the listing) only if EVERY upload was acknowledged. A
+/// failure is returned and `finish` is not called, so a listing never names
+/// a photo its seller's node did not take.
+pub(crate) async fn publish_after_uploads<P, Fut, F>(
+    pending: Vec<([u8; 32], Vec<u8>)>,
+    put: P,
+    finish: F,
+) -> Result<(), String>
+where
+    P: Fn([u8; 32], Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+    F: FnOnce(),
+{
+    let results =
+        futures::future::join_all(pending.into_iter().map(|(hash, bytes)| put(hash, bytes))).await;
+    for r in results {
+        r?;
+    }
+    finish();
+    Ok(())
 }
 
 #[component]
-pub(crate) fn PhotoEditor(photos: Signal<Vec<PhotoDraft>>) -> Element {
+pub(crate) fn PhotoEditor(
+    photos: Signal<Vec<PhotoDraft>>,
+    /// Photos still being prepared; the form will not publish while any are.
+    busy: Signal<usize>,
+    /// The form is publishing: nothing here may change.
+    #[props(default)]
+    disabled: bool,
+) -> Element {
     let message = use_signal(|| None::<String>);
-    let busy = use_signal(|| 0usize);
     let next_key = use_signal(|| 1_000u64);
     let count = photos.read().len();
     let room = MAX_IMAGES_UI.saturating_sub(count);
+    // Previews of photos still on the form when it goes (Cancel, or opening
+    // another listing). Saving and Remove revoke theirs as they go.
+    use_drop(move || {
+        #[cfg(target_arch = "wasm32")]
+        for d in photos.peek().iter() {
+            if let Some(url) = &d.preview {
+                crate::image_pipeline::revoke_preview(url);
+            }
+        }
+    });
 
     rsx! {
         div { class: "form-group photo-editor",
-            label { class: "form-label", r#for: "listing-photo-input", "Photos (optional)" }
+            if room > 0 && !disabled {
+                label { class: "form-label", r#for: "listing-photo-input", "Photos (optional)" }
+            } else {
+                p { class: "form-label", "Photos (optional)" }
+            }
             p { class: "text-muted small",
-                "Up to {MAX_IMAGES_UI}. The first is the cover. Photos are shrunk on this device and saved without location or camera details."
+                "Up to {MAX_IMAGES_UI}. The first is the cover. Photos are made smaller on this device and saved without location or camera details."
             }
             if count > 0 {
                 ol { class: "photo-grid",
                     for (i, draft) in photos.read().iter().enumerate() {
-                        li { key: "{draft.key}", class: "photo-tile",
-                            PhotoPreview { draft: draft.clone() }
-                            if i == 0 {
-                                span { class: "photo-cover", "Cover" }
-                            }
-                            input {
-                                class: "form-input photo-alt",
-                                r#type: "text",
-                                maxlength: "{MAX_ALT_CHARS}",
-                                placeholder: "Describe this photo (optional)",
-                                aria_label: "Describe photo {i + 1}",
-                                value: "{draft.alt}",
-                                oninput: move |e| photos.with_mut(|p| p[i].alt = e.value()),
-                            }
-                            div { class: "photo-actions",
-                                button {
-                                    class: "btn btn-sm btn-outline",
-                                    disabled: i == 0,
-                                    aria_label: "Move photo {i + 1} earlier",
-                                    onclick: move |_| photos.with_mut(|p| move_earlier(p, i)),
-                                    "Move earlier"
-                                }
-                                button {
-                                    class: "btn btn-sm btn-outline",
-                                    disabled: i + 1 >= count,
-                                    aria_label: "Move photo {i + 1} later",
-                                    onclick: move |_| photos.with_mut(|p| move_later(p, i)),
-                                    "Move later"
-                                }
-                                button {
-                                    class: "btn btn-sm btn-outline",
-                                    aria_label: "Remove photo {i + 1}",
-                                    onclick: move |_| {
-                                        photos.with_mut(|p| {
-                                            let removed = p.remove(i);
-                                            #[cfg(target_arch = "wasm32")]
-                                            if let Some(url) = removed.preview {
-                                                crate::image_pipeline::revoke_preview(&url);
-                                            }
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            let _ = removed;
-                                        });
-                                    },
-                                    "Remove"
-                                }
-                            }
+                        PhotoTile {
+                            key: "{draft.key}",
+                            photos,
+                            photo_key: draft.key,
+                            index: i,
+                            count,
+                            hash: draft.full.hash.0,
+                            preview: draft.preview.clone(),
+                            colour: draft.colour,
+                            width: draft.full.width,
+                            height: draft.full.height,
+                            alt: draft.alt.clone(),
+                            local: draft.full_bytes.is_some(),
+                            disabled,
                         }
                     }
                 }
             }
-            if room > 0 {
+            if room > 0 && !disabled {
                 input {
                     id: "listing-photo-input",
                     class: "photo-input",
@@ -203,14 +254,106 @@ pub(crate) fn PhotoEditor(photos: Signal<Vec<PhotoDraft>>) -> Element {
                         let _ = (message, busy, next_key);
                     },
                 }
-            } else {
+            } else if room == 0 {
                 p { class: "text-muted small", "That's the most photos a listing can have." }
             }
-            if busy() > 0 {
-                p { class: "text-muted small", "Preparing photos\u{2026}" }
+            div { role: "status", aria_live: "polite",
+                if busy() > 0 {
+                    p { class: "text-muted small", "Preparing photos\u{2026}" }
+                }
+                if let Some(m) = message() {
+                    p { class: "text-warning", "{m}" }
+                }
             }
-            if let Some(m) = message() {
-                p { class: "text-warning", "{m}" }
+        }
+    }
+}
+
+#[component]
+fn PhotoTile(
+    photos: Signal<Vec<PhotoDraft>>,
+    photo_key: u64,
+    index: usize,
+    count: usize,
+    hash: [u8; 32],
+    preview: Option<String>,
+    colour: [u8; 3],
+    width: u16,
+    height: u16,
+    alt: String,
+    /// The photo's bytes are on this device (added or added again here).
+    local: bool,
+    disabled: bool,
+) -> Element {
+    let n = index + 1;
+    rsx! {
+        li { class: "photo-tile",
+            PhotoPreview { hash, preview, colour, width, height, alt: alt.clone(), local }
+            if index == 0 {
+                span { class: "photo-cover", "Cover" }
+            }
+            input {
+                class: "form-input photo-alt",
+                r#type: "text",
+                maxlength: "{MAX_ALT_CHARS}",
+                placeholder: "Describe this photo (optional)",
+                aria_label: "Describe photo {n}",
+                disabled,
+                value: "{alt}",
+                oninput: move |e| {
+                    photos.with_mut(|p| {
+                        if let Some(i) = position(p, photo_key) {
+                            p[i].alt = e.value();
+                        }
+                    })
+                },
+            }
+            div { class: "photo-actions",
+                button {
+                    class: "btn btn-sm btn-outline",
+                    disabled: disabled || index == 0,
+                    aria_label: "Move photo {n} earlier",
+                    onclick: move |_| {
+                        photos.with_mut(|p| {
+                            if let Some(i) = position(p, photo_key) {
+                                move_earlier(p, i);
+                            }
+                        })
+                    },
+                    "Move earlier"
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    disabled: disabled || index + 1 >= count,
+                    aria_label: "Move photo {n} later",
+                    onclick: move |_| {
+                        photos.with_mut(|p| {
+                            if let Some(i) = position(p, photo_key) {
+                                move_later(p, i);
+                            }
+                        })
+                    },
+                    "Move later"
+                }
+                button {
+                    class: "btn btn-sm btn-outline",
+                    disabled,
+                    aria_label: "Remove photo {n}",
+                    onclick: move |_| {
+                        photos.with_mut(|p| {
+                            if let Some(i) = position(p, photo_key) {
+                                let removed = p.remove(i);
+                                #[cfg(target_arch = "wasm32")]
+                                if let Some(url) = removed.preview {
+                                    crate::image_pipeline::revoke_preview(&url);
+                                }
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let _ = removed;
+                            }
+                        })
+                    },
+                    "Remove"
+                }
             }
         }
     }
@@ -218,41 +361,68 @@ pub(crate) fn PhotoEditor(photos: Signal<Vec<PhotoDraft>>) -> Element {
 
 /// A photo's picture: its local preview, or for a published photo, fetched
 /// from the network (the seller's own node holds it); its colour until then.
+/// A published photo the network no longer has says so, since adding it
+/// again is the seller's to do.
 #[component]
-fn PhotoPreview(draft: PhotoDraft) -> Element {
-    let [r, g, b] = draft.colour;
-    let ratio = format!("{} / {}", draft.full.width.max(1), draft.full.height.max(1));
+fn PhotoPreview(
+    hash: [u8; 32],
+    preview: Option<String>,
+    colour: [u8; 3],
+    width: u16,
+    height: u16,
+    alt: String,
+    /// Its bytes are on this device, so it is uploaded when the form saves.
+    local: bool,
+) -> Element {
+    let [r, g, b] = colour;
+    let ratio = format!("{} / {}", width.max(1), height.max(1));
     #[cfg(target_arch = "wasm32")]
-    let fetched = {
-        let hash = draft.full.hash.0;
-        let has_preview = draft.preview.is_some();
-        use_resource(move || async move {
+    let (src, missing) = {
+        let has_preview = preview.is_some();
+        // Ok(url) once fetched; Err(true) when the network has no copy.
+        let fetched = use_resource(move || async move {
             if has_preview {
                 return None;
             }
-            match crate::gateway::image_ops::fetch_image(hash, true).await {
-                crate::gateway::image_ops::Fetched::Bytes(bytes)
-                    if harvest_image::validate(&hash, &bytes).is_ok() =>
-                {
-                    crate::image_pipeline::preview_url(&bytes)
-                }
-                _ => None,
+            Some(
+                match crate::gateway::image_ops::fetch_image(hash, true).await {
+                    crate::gateway::image_ops::Fetched::Bytes(bytes)
+                        if harvest_image::validate(&hash, &bytes).is_ok() =>
+                    {
+                        crate::image_pipeline::preview_url(&bytes).ok_or(false)
+                    }
+                    crate::gateway::image_ops::Fetched::Absent => Err(true),
+                    _ => Err(false),
+                },
+            )
+        });
+        // A fetched preview is this component's to revoke.
+        use_drop(move || {
+            if let Some(Some(Ok(url))) = fetched.peek().as_ref() {
+                crate::image_pipeline::revoke_preview(url);
             }
-        })
+        });
+        let result = fetched.read().clone().flatten();
+        match (&preview, result) {
+            (Some(p), _) => (Some(p.clone()), false),
+            (None, Some(Ok(url))) => (Some(url), false),
+            (None, Some(Err(absent))) => (None, absent),
+            (None, None) => (None, false),
+        }
     };
-    #[cfg(target_arch = "wasm32")]
-    let src = draft
-        .preview
-        .clone()
-        .or_else(|| fetched.read().clone().flatten());
     #[cfg(not(target_arch = "wasm32"))]
-    let src = draft.preview.clone();
+    let (src, missing) = {
+        let _ = hash;
+        (preview.clone(), false)
+    };
     rsx! {
         div {
             class: "photo-frame",
             style: "background-color: rgb({r}, {g}, {b}); aspect-ratio: {ratio};",
             if let Some(src) = src {
-                img { class: "photo-img", src: "{src}", alt: "{draft.alt}" }
+                img { class: "photo-img", src: "{src}", alt: "{alt}" }
+            } else if missing && !local {
+                p { class: "photo-missing", "Missing from Freenet. Add this photo again to put it back." }
             }
         }
     }
@@ -285,48 +455,60 @@ fn add_picked_files(
     // Let the same file be picked again after it is removed.
     input.set_value("");
     message.set(None);
-    let room = MAX_IMAGES_UI.saturating_sub(photos.read().len() + busy());
-    if files.len() > room {
-        message.set(Some(format!(
-            "Only {room} more photo{} can be added.",
-            if room == 1 { "" } else { "s" }
-        )));
-        files.truncate(room);
-    }
-    for file in files {
-        busy += 1;
-        spawn(async move {
+    // One task, in the order picked: the first file picked becomes the
+    // cover, whichever would have finished encoding first. Encoding one at
+    // a time also holds one decoded camera photo in memory, not several.
+    busy += files.len();
+    spawn(async move {
+        for file in files {
             let result = crate::image_pipeline::encode_file(file).await;
             busy -= 1;
-            match result {
-                Ok(p) => {
-                    if already_added(&photos.read(), &p.full_blob) {
-                        message.set(Some("That photo is already on this listing.".into()));
-                        return;
-                    }
-                    if photos.read().len() >= MAX_IMAGES_UI {
-                        return;
-                    }
-                    let key = next_key();
-                    next_key += 1;
-                    let preview = crate::image_pipeline::preview_url(&p.full);
-                    photos.with_mut(|list| {
-                        list.push(PhotoDraft {
-                            key,
-                            full: p.full_blob,
-                            thumb: Some(p.thumb_blob),
-                            colour: p.colour,
-                            alt: String::new(),
-                            full_bytes: Some(p.full),
-                            thumb_bytes: Some(p.thumb),
-                            preview,
-                        })
-                    });
+            let p = match result {
+                Ok(p) => p,
+                Err(e) => {
+                    message.set(Some(e));
+                    continue;
                 }
-                Err(e) => message.set(Some(e)),
+            };
+            let key = next_key();
+            next_key += 1;
+            let preview = crate::image_pipeline::preview_url(&p.full);
+            let draft = PhotoDraft {
+                key,
+                full: p.full_blob,
+                thumb: Some(p.thumb_blob),
+                colour: p.colour,
+                alt: String::new(),
+                full_bytes: Some(p.full),
+                thumb_bytes: Some(p.thumb),
+                preview: preview.clone(),
+            };
+            let outcome = photos.with_mut(|list| add_photo(list, draft));
+            let kept = matches!(outcome, Added::New)
+                || (outcome == Added::Restored
+                    && photos
+                        .peek()
+                        .iter()
+                        .any(|d| d.preview.is_some() && d.preview == preview));
+            if !kept {
+                if let Some(url) = preview {
+                    crate::image_pipeline::revoke_preview(&url);
+                }
             }
-        });
-    }
+            match outcome {
+                Added::New => {}
+                Added::Restored => message.set(Some(
+                    "Added again. It will be uploaded when you save.".into(),
+                )),
+                Added::Duplicate => {
+                    message.set(Some("That photo is already on this listing.".into()))
+                }
+                Added::Full => message.set(Some(format!(
+                    "A listing can have {MAX_IMAGES_UI} photos, so that one was not added."
+                ))),
+            }
+        }
+    });
 }
 
 #[cfg(test)]

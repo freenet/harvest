@@ -16,8 +16,9 @@
 # display path and the seller's upload path, later PRs of the images work)
 # look an image up under the current code hash first and then under each hash
 # recorded here, and the seller's app copies its images forward. Nothing
-# reads this registry yet: `ui/build.rs` generates its constant, and no code
-# includes it until those PRs land. It is load-bearing in a way the presence
+# reads this registry yet. `ui/src/gateway/image_ops.rs` includes the
+# generated constant only to pin it empty: a test fails when a row is added,
+# so the lookup and copy-forward are built before any re-key. It is load-bearing in a way the presence
 # contract's is not: an image is never worthless the way an old heartbeat is.
 #
 # The crate depends on `harvest-image` and `freenet-stdlib` only, never on
