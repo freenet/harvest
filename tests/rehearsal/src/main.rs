@@ -1210,12 +1210,13 @@ fn mailbox_message(nonce: u8, secs: i64, len: usize) -> harvest_common::mailbox:
 }
 
 /// Each message's BLAKE3 over its whole encoding, sorted: equal sets of
-/// identical messages give equal lists, and a failure prints short hashes.
+/// identical messages give equal lists, and a failure prints hashes rather
+/// than megabytes of ciphertext.
 fn digests(state: &harvest_common::mailbox::MailboxStateV1) -> Vec<String> {
     let mut d: Vec<String> = state
         .messages
         .iter()
-        .map(|m| blake3::hash(&harvest_common::to_cbor(m).unwrap()).to_hex()[..16].to_string())
+        .map(|m| blake3::hash(&harvest_common::to_cbor(m).unwrap()).to_hex().to_string())
         .collect();
     d.sort();
     d
@@ -1328,11 +1329,22 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
     let params = migrate::encode_params(&migrate::mailbox_params(&vk)).unwrap();
     let [(_, newest), (_, older)] = two_newest(repo, "mailbox_contract", migrate::mailbox_lineage());
     let current = read_wasm(&repo.join("ui/public/contracts/mailbox_contract.wasm"));
-    let many = |base: u32, n: u32| MailboxStateV1 {
-        messages: (0..n)
-            .map(|i| {
-                let k = base + i;
-                let mut m = mailbox_message((k % 251) as u8, 1_757_000_000 + i64::from(k) * 60, 120 + (k as usize % 7) * 400);
+    use harvest_common::mailbox::{size_class, AEAD_TAG_BYTES, SIZE_BUCKETS, SIZE_CLASS_CAPS};
+    // Real ciphertexts are a padded bucket plus the AEAD tag. Per class, per
+    // generation: enough that each generation alone is within every cap, and
+    // the two together exceed every class cap AND the 512-message total.
+    const PER_CLASS: [u32; 4] = [270, 80, 40, 15];
+    let many = |base: u32| MailboxStateV1 {
+        messages: PER_CLASS
+            .iter()
+            .enumerate()
+            .flat_map(|(class, &n)| (0..n).map(move |i| (class, base + class as u32 * 1000 + i)))
+            .map(|(class, k)| {
+                let mut m = mailbox_message(
+                    (k % 251) as u8,
+                    1_757_000_000 + i64::from(k) * 60,
+                    SIZE_BUCKETS[class] + AEAD_TAG_BYTES,
+                );
                 m.nonce[..4].copy_from_slice(&k.to_be_bytes());
                 m.conversation_id.0[..4].copy_from_slice(&k.to_be_bytes());
                 m
@@ -1346,9 +1358,18 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
         c.apply_delta(&Some(s.messages)).unwrap();
         c
     };
-    let per = (MAX_MESSAGES as u32) * 6 / 10;
-    let a = canonical(many(0, per));
-    let b = canonical(many(10_000, per));
+    let a = canonical(many(0));
+    let b = canonical(many(10_000));
+    let per_class = |s: &MailboxStateV1| {
+        let mut n = [0usize; 4];
+        for m in &s.messages {
+            n[size_class(m).expect("every planted message has a class")] += 1;
+        }
+        n
+    };
+    // Planted as built: nothing trimmed within one generation.
+    assert_eq!(per_class(&a), PER_CLASS.map(|n| n as usize));
+    assert_eq!(per_class(&b), PER_CLASS.map(|n| n as usize));
     // What the contract keeps from both, worked out locally by its own merge.
     let mut expected = a.clone();
     expected.apply_delta(&Some(b.messages.clone())).unwrap();
@@ -1358,10 +1379,16 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
         b.messages.len(),
         expected.messages.len()
     );
-    assert!(
-        expected.messages.len() < a.messages.len() + b.messages.len(),
-        "the scenario must actually trim"
-    );
+    // Every cap binds: each class planted over its cap is trimmed, and the
+    // total lands on MAX_MESSAGES. Which messages go is the contract's
+    // ranking; the comparison with the live contract below is what checks it.
+    let kept = per_class(&expected);
+    println!("  kept per size class: {kept:?} (caps {SIZE_CLASS_CAPS:?})");
+    for c in 0..4 {
+        assert!(kept[c] <= SIZE_CLASS_CAPS[c], "class {c} within its cap");
+        assert!(kept[c] < 2 * PER_CLASS[c] as usize, "class {c} actually trimmed");
+    }
+    assert_eq!(expected.messages.len(), MAX_MESSAGES, "and the total at MAX_MESSAGES");
     node.put(container(&newest, params.clone()).0, harvest_common::to_cbor(&a).unwrap())
         .await
         .expect("PUT a near-cap mailbox at the newest generation");
@@ -1391,6 +1418,17 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
         }
         other => panic!("current mailbox did not read back: {other:?}"),
     }
+    // A later forward of one generation alone merges in and changes nothing.
+    node.put(container(&current, params.clone()).0, harvest_common::to_cbor(&b).unwrap())
+        .await
+        .expect("a partial forward PUT is accepted");
+    match node.get(curr_id).await {
+        GetOutcome::State(bytes) => {
+            let held: MailboxStateV1 = harvest_common::from_cbor(&bytes).unwrap();
+            assert_eq!(digests(&held), digests(&expected), "merged, not replaced");
+        }
+        other => panic!("current mailbox did not read back: {other:?}"),
+    }
 }
 
 fn index_entry(
@@ -1402,7 +1440,12 @@ fn index_entry(
     let statement = harvest_common::backing::BackingStatement {
         store,
         backer: ghost.verifying_key(),
-        certificate_pem: "-----BEGIN GHOSTKEY CERTIFICATE-----rehearsal-----END-----".into(),
+        // About the length of a real Ghost Key certificate; the contract
+        // checks only that it is within MAX_CERTIFICATE_PEM_BYTES.
+        certificate_pem: format!(
+            "-----BEGIN GHOSTKEY CERTIFICATE-----\n{}\n-----END GHOSTKEY CERTIFICATE-----",
+            "A".repeat(1400)
+        ),
         network: BitcoinNetwork::Signet,
         block: BlockAnchor {
             height,
@@ -1443,16 +1486,39 @@ async fn scenario_index_lineage(node: &mut Node, repo: &Path) {
         "the walk must reach both generations state is planted at"
     );
 
+    use harvest_common::ghostkey_index::MAX_INDEX_ENTRIES;
     let shared = index_entry(&ghost, 81, 200_000);
     let only_newest = index_entry(&ghost, 82, 200_100);
     let only_older = index_entry(&ghost, 83, 199_000);
+    // A CLASH: the same store backed twice (two block heights), one backing
+    // at each generation, both validly signed. The index keeps the entry
+    // whose encoding is smaller, whichever generation it came from.
+    let clash_newest = index_entry(&ghost, 84, 200_200);
+    let clash_older = index_entry(&ghost, 84, 150_000);
+    let clash_winner = if harvest_common::to_cbor(&clash_newest).unwrap()
+        <= harvest_common::to_cbor(&clash_older).unwrap()
+    {
+        clash_newest.clone()
+    } else {
+        clash_older.clone()
+    };
+    // Filler so the two together exceed MAX_INDEX_ENTRIES: 36 more stores at
+    // each generation (39 per generation, under the cap; 76 stores together,
+    // over it).
+    let filler = |from: u8| -> Vec<_> {
+        (from..from + 36).map(|s| index_entry(&ghost, s, 190_000 + u32::from(s))).collect()
+    };
     let state = |entries: Vec<harvest_common::ghostkey_index::IndexEntry>| GhostKeyIndexV1 {
         entries: entries.into_iter().map(|e| (e.slot(), e)).collect(),
     };
-    node.put(newest_c, harvest_common::to_cbor(&state(vec![shared.clone(), only_newest.clone()])).unwrap())
+    let mut newest_entries = vec![shared.clone(), only_newest.clone(), clash_newest.clone()];
+    newest_entries.extend(filler(100));
+    let mut older_entries = vec![shared.clone(), only_older.clone(), clash_older.clone()];
+    older_entries.extend(filler(150));
+    node.put(newest_c, harvest_common::to_cbor(&state(newest_entries.clone())).unwrap())
         .await
         .expect("PUT at the newest superseded index generation");
-    node.put(older_c, harvest_common::to_cbor(&state(vec![shared.clone(), only_older.clone()])).unwrap())
+    node.put(older_c, harvest_common::to_cbor(&state(older_entries.clone())).unwrap())
         .await
         .expect("PUT at the older superseded index generation");
 
@@ -1471,8 +1537,24 @@ async fn scenario_index_lineage(node: &mut Node, repo: &Path) {
     let Outcome::Recovered { merged, .. } = &outcome else {
         panic!("expected Recovered, got {outcome:?}");
     };
-    let want = state(vec![shared.clone(), only_newest, only_older.clone()]);
-    assert_eq!(merged, &want, "every store the Ghost Key backed, once");
+    // Expected, worked out WITHOUT the index's merge: one entry per store
+    // (the clash decided by the smaller encoding), then the 64 smallest
+    // store keys.
+    let mut all = std::collections::BTreeMap::new();
+    for e in newest_entries.iter().chain(&older_entries) {
+        all.insert(e.slot(), e.clone());
+    }
+    all.insert(clash_winner.slot(), clash_winner.clone());
+    assert_eq!(all.len(), 76, "4 named stores + 72 filler, before the cap");
+    let want = GhostKeyIndexV1 {
+        entries: all.into_iter().take(MAX_INDEX_ENTRIES).collect(),
+    };
+    assert_eq!(merged, &want, "one entry per store, the clash resolved, the 64 smallest kept");
+    println!(
+        "  folded 39 + 39 entries (76 stores) to {}; clash slot kept the {} backing",
+        merged.entries.len(),
+        if clash_winner == clash_newest { "newest generation's" } else { "older generation's" }
+    );
 
     node.put(curr_c, harvest_common::to_cbor(merged).unwrap())
         .await
@@ -1491,7 +1573,7 @@ async fn scenario_index_lineage(node: &mut Node, repo: &Path) {
     // A later forward of less merges in, never replaces.
     node.put(
         container(&current, params.clone()).0,
-        harvest_common::to_cbor(&state(vec![shared, only_older])).unwrap(),
+        harvest_common::to_cbor(&state(older_entries[..3].to_vec())).unwrap(),
     )
     .await
     .expect("a partial forward PUT is accepted");

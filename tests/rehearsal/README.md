@@ -34,25 +34,39 @@ artifacts it exists to check.
 5. **Nothing-to-find seals nothing.** A seller with no predecessor state takes
    the seed-local path, and the seal decision is `Retry`.
 6. **The mailbox lineage** (`REHEARSAL_ONLY=mailbox`, harvest#223). A seller's
-   mailbox with messages at the two newest superseded generations, one
-   message in both, is found, folded into one set holding every message once
-   (compared byte for byte), accepted by the current contract, and read back;
-   a repeated forward duplicates nothing.
+   mailbox with messages at the two newest superseded generations is found
+   and folded into one set holding every message once, compared by a BLAKE3
+   digest of each message's whole encoding. One message is in both
+   generations, and two share a nonce with different bytes (identity is the
+   whole entry). The current contract accepts and holds the set, and a later
+   forward of one generation alone merges in rather than replacing.
+   **6b** plants two generations of padded, bucket-sized messages, each
+   within every cap, that together exceed every size-class cap and the
+   512-message total. The fold must keep exactly what `apply_delta` keeps
+   (the fold is built on it, so this check is the same code twice), and the
+   SHIPPED WASM must accept and hold that, which a stale or diverging
+   `mailbox_contract.wasm` would fail.
 7. **The Ghost Key index lineage** (`REHEARSAL_ONLY=index`, harvest#223). An
-   index with a store at each of the two newest superseded generations, one
-   store in both, is found and folded, and the current contract holds every
-   entry, each still verifying against the Ghost Key.
+   index whose two newest superseded generations together list 76 stores is
+   folded: one store is in both generations, one is backed differently at
+   each (the clash, kept by the smaller encoding), and the 64 smallest store
+   keys survive the cap. The expectation is worked out without the index's
+   merge. The current contract holds the result, every entry still verifies
+   against the Ghost Key, and a later partial forward merges in.
 
 `REHEARSAL_ONLY=lineages` runs 6 and 7 together; a plain run runs them first
-(it then stops at scenario 1, harvest#142).
-Scenario 6 also folds two near-cap mailboxes (6b) and checks the current
-contract holds exactly what its own merge keeps. Each scenario uses fixed
-keys, so run it against a fresh `--data-dir`: an earlier run's state at the
-current address would otherwise be read back as if forwarded. What is NOT
-exercised: the app's forward wiring (`migrate_ops::send_forward`) and its
-seal marker; the harness forwards with its own PUT. Both must be re-run whenever
-the mailbox or index contract re-keys, which is any change to
-`harvest-common` (it is compiled into both).
+(it then stops at scenario 1, harvest#142). Re-run both whenever the mailbox
+or index contract re-keys, which is any change to `harvest-common` (it is
+compiled into both). Each scenario uses fixed keys, so run against a fresh
+`--data-dir`: an earlier run's state at the current address would otherwise
+be read back as if forwarded.
+
+Not exercised: the app's forward wiring (`migrate_ops::send_forward`) and its
+seal marker; the harness forwards with its own PUT. Not plantable: a mailbox
+message over `MAX_MESSAGE_BYTES` or an index entry that does not verify,
+because the V18/V19 mailbox and V6/V7 index contracts refuse both, so no
+user holds one. CI only compiles this harness: a green CI says nothing about
+whether a migration works.
 
 ## Running it
 
