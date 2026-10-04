@@ -4930,7 +4930,7 @@ mod voucher_view_tests {
             text([4; 32], Addressing::ToBuyer),
         ]);
         // Reply-direction text left out is not counted: it is as likely the
-        // seller's own reply, after a reload, as a buyer's.
+        // seller's own reply, from another device, as a buyer's.
         assert_eq!(hidden, 0);
         assert_eq!(shown_entries.len(), 5);
         assert!(shown_entries

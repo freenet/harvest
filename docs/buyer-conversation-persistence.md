@@ -664,7 +664,9 @@ change; in Phase 2 they will.
 * **It does not persist `authored_here` itself.** The entry digests of
   messages this tab sent are the only authorship this browser can establish;
   the harvest delegate keeps them with the conversation (#221,
-  `AppState::kept_as_sent`, the newest 128), so "You" survives a reload.
+  `AppState::kept_as_sent`, the newest 128), so "You" survives a reload
+  within the delegate's caps and once the store is recalled (not for a
+  conversation restored from a backup string, which carries no digests).
   "You" is given only to a message whose digest the tab or the delegate holds
   (`components::message_view::who`), so the buyer's own messages from another
   device, or past that cap, stay in their place in time but are drawn full width,
