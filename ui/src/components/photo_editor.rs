@@ -132,8 +132,10 @@ pub(crate) enum Added {
 }
 
 /// Add a freshly encoded photo, or give a photo already on the form back
-/// its bytes. A browser re-encodes the same file to the same bytes, so
-/// adding a published photo again is how a missing one is put back.
+/// its bytes. Restoring needs the SAME bytes, which the same browser
+/// re-encoding the same file usually gives, but a different browser or
+/// device may not; then the photo is added as a new one. So the seller is
+/// told to remove a missing photo and add it again, which always works.
 pub(crate) fn add_photo(drafts: &mut Vec<PhotoDraft>, new: PhotoDraft) -> Added {
     if let Some(existing) = drafts.iter_mut().find(|d| d.full.hash == new.full.hash) {
         if existing.full_bytes.is_some() {
@@ -165,7 +167,9 @@ pub(crate) fn position(drafts: &[PhotoDraft], key: u64) -> Option<usize> {
 /// Upload every pending photo, all at once, and call `finish` (which signs
 /// and publishes the listing) only if EVERY upload was acknowledged. A
 /// failure is returned and `finish` is not called, so a listing never names
-/// a photo its seller's node did not take.
+/// a photo ADDED IN THIS EDIT that the seller's node did not take. Photos
+/// carried over from the published listing are not re-checked here; the
+/// listings page and the editor's tiles report one that has gone missing.
 pub(crate) async fn publish_after_uploads<P, Fut, F>(
     pending: Vec<([u8; 32], Vec<u8>)>,
     put: P,
@@ -235,6 +239,14 @@ pub(crate) fn PhotoEditor(
                             height: draft.full.height,
                             alt: draft.alt.clone(),
                             local: draft.full_bytes.is_some(),
+                            // A published cover's thumbnail is fetched too: the
+                            // listings page warns when it is missing, so the
+                            // tile has to say which photo that is.
+                            cover_thumb: if i == 0 && draft.thumb_bytes.is_none() {
+                                draft.thumb.as_ref().map(|t| t.hash.0)
+                            } else {
+                                None
+                            },
                             disabled,
                         }
                     }
@@ -247,6 +259,8 @@ pub(crate) fn PhotoEditor(
                     r#type: "file",
                     accept: "image/*",
                     multiple: true,
+                    // One batch at a time, so photos land in the order picked.
+                    disabled: busy() > 0,
                     onchange: move |_| {
                         #[cfg(target_arch = "wasm32")]
                         add_picked_files(photos, message, busy, next_key);
@@ -283,12 +297,13 @@ fn PhotoTile(
     alt: String,
     /// The photo's bytes are on this device (added or added again here).
     local: bool,
+    cover_thumb: Option<[u8; 32]>,
     disabled: bool,
 ) -> Element {
     let n = index + 1;
     rsx! {
         li { class: "photo-tile",
-            PhotoPreview { hash, preview, colour, width, height, alt: alt.clone(), local }
+            PhotoPreview { hash, cover_thumb, preview, colour, width, height, alt: alt.clone(), local }
             if index == 0 {
                 span { class: "photo-cover", "Cover" }
             }
@@ -360,12 +375,14 @@ fn PhotoTile(
 }
 
 /// A photo's picture: its local preview, or for a published photo, fetched
-/// from the network (the seller's own node holds it); its colour until then.
-/// A published photo the network no longer has says so, since adding it
-/// again is the seller's to do.
+/// from the network; its colour until then. A published photo (or cover
+/// thumbnail) the network does not have after two answers 5 s apart says
+/// so, since putting it back is the seller's to do.
 #[component]
 fn PhotoPreview(
     hash: [u8; 32],
+    /// A published cover's thumbnail, checked as well as the photo.
+    cover_thumb: Option<[u8; 32]>,
     preview: Option<String>,
     colour: [u8; 3],
     width: u16,
@@ -379,22 +396,40 @@ fn PhotoPreview(
     #[cfg(target_arch = "wasm32")]
     let (src, missing) = {
         let has_preview = preview.is_some();
-        // Ok(url) once fetched; Err(true) when the network has no copy.
+        use crate::gateway::image_ops::{fetch_image, Fetched};
+        // One "not found" is not proof (see `Fetched::Absent`): ask again
+        // after 5 s, as the listings page does, before calling it missing.
+        async fn absent_twice(hash: [u8; 32], first: Fetched) -> Fetched {
+            match first {
+                Fetched::Absent => {
+                    gloo_timers::future::TimeoutFuture::new(5_000).await;
+                    fetch_image(hash, true).await
+                }
+                other => other,
+            }
+        }
+        // Ok(url) once fetched; Err(true) when the network has no copy of
+        // the photo or of the cover's thumbnail.
         let fetched = use_resource(move || async move {
             if has_preview {
                 return None;
             }
-            Some(
-                match crate::gateway::image_ops::fetch_image(hash, true).await {
-                    crate::gateway::image_ops::Fetched::Bytes(bytes)
-                        if harvest_image::validate(&hash, &bytes).is_ok() =>
-                    {
-                        crate::image_pipeline::preview_url(&bytes).ok_or(false)
-                    }
-                    crate::gateway::image_ops::Fetched::Absent => Err(true),
-                    _ => Err(false),
-                },
-            )
+            // Buyers see a cover's thumbnail first, so a missing one counts
+            // as the cover missing.
+            if let Some(thumb) = cover_thumb {
+                let answer = absent_twice(thumb, fetch_image(thumb, true).await).await;
+                if matches!(answer, Fetched::Absent) {
+                    return Some(Err(true));
+                }
+            }
+            let answer = absent_twice(hash, fetch_image(hash, true).await).await;
+            Some(match answer {
+                Fetched::Bytes(bytes) if harvest_image::validate(&hash, &bytes).is_ok() => {
+                    crate::image_pipeline::preview_url(&bytes).ok_or(false)
+                }
+                Fetched::Absent => Err(true),
+                _ => Err(false),
+            })
         });
         // A fetched preview is this component's to revoke.
         use_drop(move || {
@@ -422,7 +457,7 @@ fn PhotoPreview(
             if let Some(src) = src {
                 img { class: "photo-img", src: "{src}", alt: "{alt}" }
             } else if missing && !local {
-                p { class: "photo-missing", "Missing from Freenet. Add this photo again to put it back." }
+                p { class: "photo-missing", "Missing from Freenet. Remove it and add the photo again." }
             }
         }
     }
@@ -460,13 +495,18 @@ fn add_picked_files(
     // a time also holds one decoded camera photo in memory, not several.
     busy += files.len();
     spawn(async move {
+        // Every file's outcome is kept and shown together, so a refusal of
+        // the first is not overwritten by what happened to the second.
+        let mut notes: Vec<String> = Vec::new();
         for file in files {
             let result = crate::image_pipeline::encode_file(file).await;
             busy -= 1;
             let p = match result {
                 Ok(p) => p,
                 Err(e) => {
-                    message.set(Some(e));
+                    if !notes.contains(&e) {
+                        notes.push(e);
+                    }
                     continue;
                 }
             };
@@ -495,18 +535,24 @@ fn add_picked_files(
                     crate::image_pipeline::revoke_preview(&url);
                 }
             }
-            match outcome {
-                Added::New => {}
-                Added::Restored => message.set(Some(
-                    "Added again. It will be uploaded when you save.".into(),
-                )),
-                Added::Duplicate => {
-                    message.set(Some("That photo is already on this listing.".into()))
+            let note = match outcome {
+                Added::New => None,
+                Added::Restored => {
+                    Some("Added again. It will be uploaded when you save.".to_string())
                 }
-                Added::Full => message.set(Some(format!(
+                Added::Duplicate => Some("That photo is already on this listing.".to_string()),
+                Added::Full => Some(format!(
                     "A listing can have {MAX_IMAGES_UI} photos, so that one was not added."
-                ))),
+                )),
+            };
+            if let Some(note) = note {
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
             }
+        }
+        if !notes.is_empty() {
+            message.set(Some(notes.join(" ")));
         }
     });
 }

@@ -53,6 +53,10 @@ pub fn ListingForm(
     /// and blank leaves it sold out.
     #[props(default)]
     sold_out: bool,
+    /// Set while photos are being prepared or uploaded, so the page can stop
+    /// anything that would unmount this form (and drop its upload) meanwhile.
+    #[props(default)]
+    busy_out: Option<Signal<bool>>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let editing = initial.clone();
@@ -81,6 +85,21 @@ pub fn ListingForm(
     let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
     let preparing = use_signal(|| 0usize);
     let mut uploading = use_signal(|| false);
+    use_effect(move || {
+        let busy = uploading() || preparing() > 0;
+        if let Some(mut out) = busy_out {
+            if *out.peek() != busy {
+                out.set(busy);
+            }
+        }
+    });
+    // A form that publishes unmounts with `uploading` still set (the
+    // parent closes it inside `finish`), so the page's flag is cleared here.
+    use_drop(move || {
+        if let Some(mut out) = busy_out {
+            out.set(false);
+        }
+    });
     let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
@@ -183,9 +202,11 @@ pub fn ListingForm(
                         // Every photo the listing names that is not yet on
                         // the network goes up FIRST, and the listing is
                         // signed only once the node has taken each one
-                        // (`publish_after_uploads`), so a published listing
-                        // never names a photo its own seller's node does not
-                        // hold. Worked out before the count-only check below:
+                        // (`publish_after_uploads`), so a photo added in this
+                        // edit is never named before the node has it (photos
+                        // carried over are not re-checked; the listings page
+                        // reports a missing one). Worked out before the
+                        // count-only check below:
                         // a missing photo added again changes no term, and
                         // must still be uploaded.
                         let pending = uploads(&photos());
@@ -262,6 +283,9 @@ pub fn ListingForm(
             }
             button {
                 class: "btn btn-outline",
+                // An upload cannot be called back once sent, and unmounting
+                // the form would drop the task that publishes after it.
+                disabled: uploading() || preparing() > 0,
                 onclick: move |_| on_cancel.call(()),
                 "Cancel"
             }
@@ -318,7 +342,28 @@ pub(crate) fn same_terms(
         && original_kind == kind
         && original_checkout == checkout
         && original_choices.as_slice() == choices
-        && original_images.as_slice() == images
+        && same_photos(original_images, images)
+}
+
+/// The photos match, alt text compared as `listing_images` writes it
+/// (trimmed): a listing another client published with a trailing space in
+/// an alt is not a different listing, and treating it as one would make a
+/// count-only edit publish a new id and take the old one down.
+fn same_photos(original: &[ListingImage], images: &[ListingImage]) -> bool {
+    original.len() == images.len()
+        && original.iter().zip(images).all(|(o, n)| {
+            // Exhaustive, so a field added to `ListingImage` is compared too.
+            let ListingImage {
+                full,
+                thumb,
+                colour,
+                alt,
+            } = o;
+            *full == n.full
+                && *thumb == n.thumb
+                && *colour == n.colour
+                && alt.trim() == n.alt.trim()
+        })
 }
 
 /// The count field: blank is "not counted", anything else a whole number.
@@ -649,6 +694,33 @@ mod tests {
         assert!(terms(&o.images));
         assert!(!terms(&[]));
         assert!(!terms(&[a_photo(2)]));
+        let mut described = a_photo(1);
+        described.alt = "A blue mug".into();
+        assert!(
+            !terms(&[described]),
+            "a changed description of a photo is a change"
+        );
+    }
+
+    /// `listing_images` trims alt text, so a published alt with stray spaces
+    /// (another client's) must still match what the form would sign.
+    #[test]
+    fn same_terms_ignores_spaces_around_a_photo_description() {
+        let mut o = original();
+        let mut spaced = a_photo(1);
+        spaced.alt = " A blue mug ".into();
+        o.images = vec![spaced];
+        let mut trimmed = a_photo(1);
+        trimmed.alt = "A blue mug".into();
+        assert!(same_terms(
+            &o,
+            "Mug",
+            "Blue",
+            &ListingKind::Sale,
+            &o.checkout,
+            &o.choices,
+            &[trimmed]
+        ));
     }
 
     /// Each term, changed alone, is a different listing; formatting alone is

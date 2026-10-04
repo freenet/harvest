@@ -60,6 +60,10 @@ fn change_status(
 pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Element {
     let mut adding = use_signal(|| false);
     let mut editing = use_signal(|| Option::<ListingId>::None);
+    // True while the open form is preparing or uploading photos. Opening
+    // another form would unmount it, and its upload task with it, dropping
+    // the seller's listing without a word, so both ways to do that wait.
+    let form_busy = use_signal(|| false);
     let mut show_taken_down = use_signal(|| false);
     // "Saving" is judged against the clock (`listing_status_pending_at`),
     // which is read only when this renders. Re-render every few seconds, so a
@@ -114,6 +118,7 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                 if !adding() {
                     button {
                         class: "btn btn-sm btn-primary",
+                        disabled: form_busy(),
                         onclick: move |_| {
                             editing.set(None);
                             adding.set(true);
@@ -127,6 +132,7 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                 ListingForm {
                     initial: None,
                     initial_quantity: None,
+                    busy_out: form_busy,
                     on_cancel: move |_| adding.set(false),
                     on_submit: {
                         let store = store_contract_id.clone();
@@ -164,6 +170,7 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                                 _ => None,
                             },
                             sold_out: !availability.is_buyable(),
+                            busy_out: form_busy,
                             on_cancel: move |_| editing.set(None),
                             on_submit: {
                                 let store = store_contract_id.clone();
@@ -184,6 +191,7 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                             listing: listing.clone(),
                             availability: availability.clone(),
                             pending,
+                            edit_locked: form_busy(),
                             on_edit: move |id: ListingId| {
                                 adding.set(false);
                                 editing.set(Some(id));
@@ -275,7 +283,7 @@ fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
     rsx! {
         if missing > 0 {
             p { class: "text-warning small",
-                "A photo is missing from Freenet, so buyers don't see it. Open Edit and add that photo again from your device."
+                "A photo is missing from Freenet, so buyers don't see it. Open Edit, remove that photo and add it again."
             }
         }
     }
@@ -287,6 +295,9 @@ fn SellerListingRow(
     listing: AuthorizedListing,
     availability: ListingAvailability,
     pending: bool,
+    /// Another listing's form is uploading photos; see `form_busy`.
+    #[props(default)]
+    edit_locked: bool,
     on_edit: EventHandler<ListingId>,
 ) -> Element {
     let l = &listing.listing;
@@ -347,6 +358,7 @@ fn SellerListingRow(
                 } else {
                     button {
                         class: "btn btn-sm btn-outline",
+                        disabled: edit_locked,
                         onclick: {
                             let id = id.clone();
                             move |_| on_edit.call(id.clone())

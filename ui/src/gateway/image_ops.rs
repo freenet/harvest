@@ -55,7 +55,9 @@ pub fn image_instance_id(hash: [u8; 32]) -> ContractInstanceId {
 pub enum Fetched {
     /// Its bytes. Not yet checked against anything: the caller does that.
     Bytes(Vec<u8>),
-    /// The node answered that nothing is stored under this id.
+    /// The node answered that nothing is stored under this id. ONE such
+    /// answer is not proof: a GET that dead-ends can answer NotFound for a
+    /// contract that exists. Ask again before concluding a photo is gone.
     Absent,
     /// No answer before the deadline.
     TimedOut,
@@ -109,8 +111,9 @@ impl ImageWaiters {
         self.images.contains(id)
     }
 
-    /// A `GetResponse` (or an update notification) carrying `bytes` for
-    /// `id`. A state for an image just PUT also proves the node holds it, so
+    /// A `GetResponse` carrying `bytes` for `id`. (Update notifications for
+    /// an image are dropped by the handler before reaching here: a photo's
+    /// state never changes, so one carries nothing a waiter needs.) A state for an image just PUT also proves the node holds it, so
     /// it settles a waiting PUT too. Returns whether `id` is an image.
     pub fn state(&mut self, id: &ContractInstanceId, bytes: &[u8]) -> bool {
         if let Some(waiting) = self.gets.remove(id) {
@@ -162,8 +165,8 @@ thread_local! {
     static WAITERS: RefCell<ImageWaiters> = RefCell::default();
 }
 
-/// Called by the response handler for every `GetResponse` and update
-/// notification. True if `id` is an image, which the caller must then NOT
+/// Called by the response handler for every `GetResponse`. True if `id` is
+/// an image, which the caller must then NOT
 /// pass on as store, mailbox or reputation state.
 pub fn deliver_state(id: &ContractInstanceId, bytes: &[u8]) -> bool {
     WAITERS.with(|w| w.borrow_mut().state(id, bytes))
@@ -195,7 +198,7 @@ pub const GET_TIMEOUT_MS: u32 = 30_000;
 /// The seller-facing message for any upload that did not go through. The
 /// detail goes to the log; the seller can only try again.
 pub const UPLOAD_FAILED: &str =
-    "A photo could not be uploaded to Freenet. Check that Freenet is running, then save again.";
+    "A photo could not be uploaded to Freenet. Check that Freenet is running, then try again.";
 
 /// PUT a photo and subscribe to it, then wait until the node has it. The
 /// subscription is the seller's local claim on the photo while this tab is
@@ -228,7 +231,14 @@ pub async fn put_image(hash: [u8; 32], bytes: Vec<u8>) -> Result<(), String> {
         {
             return Ok(());
         }
-        match fetch_image(hash, false).await {
+        // Asked twice before "not found" counts: one absence can be a dead-end
+        // GET, or a stale answer to an earlier GET of the same photo (the
+        // listings page checks photos too) that settled this one.
+        let answer = match fetch_image(hash, false).await {
+            Fetched::Absent => fetch_image(hash, false).await,
+            other => other,
+        };
+        match answer {
             Fetched::Bytes(held) if harvest_image::validate(&hash, &held).is_ok() => Ok(()),
             other => {
                 let said = match other {
@@ -328,6 +338,15 @@ mod tests {
             src.contains("image_ops::deliver_put_ack"),
             "photos hear their PUT acknowledged"
         );
+        // An update notification for a photo stops before the re-GET that
+        // every other contract's notification triggers.
+        let update = &src[src.find("ContractResponse::UpdateNotification {").unwrap()..];
+        let photo = update
+            .find("image_ops::is_image")
+            .expect("photo notifications are recognised");
+        let ret = update[photo..].find("return;").unwrap() + photo;
+        let regets = update.find("get_contract").unwrap_or(usize::MAX);
+        assert!(ret < regets, "and dropped before anything is re-read");
     }
 
     #[test]
@@ -379,6 +398,9 @@ mod tests {
         let jpeg = include_bytes!("../../../harvest-image/tests/fixtures/chromium-canvas.jpg");
         let wrong_hash = [7u8; 32];
         let refused = futures::executor::block_on(put_image(wrong_hash, jpeg.to_vec()));
+        // Off wasm, a pair that passed would reach the native stub and fail
+        // with ITS message, so equality with UPLOAD_FAILED is what shows the
+        // refusal came from validation. Keep the stub's message different.
         assert_eq!(refused, Err(UPLOAD_FAILED.to_string()));
     }
 
@@ -399,9 +421,16 @@ mod tests {
     fn an_id_stays_an_image_after_its_waiters_are_gone() {
         let mut w = ImageWaiters::default();
         drop(w.register_get(id(1)));
+        // A late answer for it is still claimed (true), so the handler does
+        // not pass a photo on as store or mailbox state.
         assert!(w.state(&id(1), b"jpeg"));
+        assert!(w.absent(&id(1)));
         assert!(w.is_image(&id(1)));
         assert!(!w.is_image(&id(2)));
+        assert!(
+            !w.state(&id(2), b"jpeg"),
+            "an id never asked about is not claimed"
+        );
     }
 
     #[test]
