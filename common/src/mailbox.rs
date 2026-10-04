@@ -597,9 +597,20 @@ pub struct EncryptedMessage {
     /// small next to what a public per-store mailbox reveals anyway (entry
     /// count, arrival times, padded sizes), and it is written down in
     /// `docs/messaging-privacy.md` rather than left implicit.
+    ///
+    /// Encoded as a CBOR byte string (`serde_bytes`), as is `ciphertext`:
+    /// serde's default writes a `Vec<u8>` as an array of integers, about two
+    /// bytes per byte and decoded one element at a time, which made an update
+    /// to a full mailbox cost most of the node's 5 s compute limit
+    /// (harvest#226). Decoding still accepts that older array form, so a
+    /// state from an earlier generation reads unchanged; only the encoding
+    /// written is new, and it is the one this generation's contract accepts
+    /// as canonical.
+    #[serde(with = "serde_bytes")]
     pub sender_public_key: Vec<u8>,
     /// Encrypted payload (plaintext format is application-defined).
     /// SHOULD be padded to a size bucket before encryption.
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     /// When the message was created.
     pub timestamp: DateTime<Utc>,
@@ -766,6 +777,51 @@ pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 /// messages, and only what counts as "already held" moved.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
+/// The most bytes an encoded [`MailboxDelta`] may be (harvest#226).
+///
+/// A delta can never usefully carry more than a mailbox can hold, and the
+/// size-class caps bound that: the largest state that verifies (every class
+/// at its cap, every message at its class's size limit) encodes in about
+/// 3.58 MB. `MAX_MAILBOX_BYTES` is above that by construction, and each
+/// message's encoding exceeds its [`message_bytes`] by at most a few dozen
+/// bytes (field names and heads), so this bound admits every honest delta
+/// (pinned by `the_largest_valid_mailbox_fits_one_delta`) and refuses, from
+/// its length alone, a 34 MB delta of top-class messages that cost more than
+/// the per-call budget to merge.
+pub const MAX_DELTA_BYTES: usize = MAX_MAILBOX_BYTES + MAX_MESSAGES * 64;
+
+/// How many messages an encoded [`MailboxDelta`] says it holds, read from the
+/// CBOR array head alone, or `None` if the bytes do not start with a
+/// definite-length array.
+///
+/// Stricter than ciborium, which also reads an indefinite-length array: a
+/// delta in that form is refused, since every honest writer (ciborium, and
+/// this contract's own `get_state_delta`) writes a definite one.
+///
+/// For refusing an oversized delta BEFORE decoding it (harvest#226): only a
+/// state is checked against the caps, so a delta was decoded and merged
+/// whatever its length, and a single delta of many small messages cost the
+/// contract more than a full mailbox does. No honest delta holds more than
+/// [`MAX_MESSAGES`]: a writer sends one message, and a co-host's fan-out
+/// delta is at most the state it holds.
+pub fn delta_message_count(bytes: &[u8]) -> Option<u64> {
+    let (&first, rest) = bytes.split_first()?;
+    if first >> 5 != 4 {
+        return None;
+    }
+    let arg = first & 0x1f;
+    let width = match arg {
+        0..=23 => return Some(u64::from(arg)),
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return None,
+    };
+    let head = rest.get(..width)?;
+    Some(head.iter().fold(0u64, |n, &b| (n << 8) | u64::from(b)))
+}
+
 /// Keep one copy of each distinct message.
 ///
 /// # Why this exists at all
@@ -841,10 +897,20 @@ pub type MailboxDelta = Vec<EncryptedMessage>;
 /// (`enforce_message_cap`'s digest tiebreak is a third and is redundant to
 /// both: removing the two above kills the suite whether or not it is
 /// present.)
-fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
-    messages.sort_by_key(entry_digest);
-    messages.dedup_by_key(|message| entry_digest(message));
+fn dedupe_identical_entries(messages: &mut Vec<Keyed>) {
+    messages.sort_by(|a, b| a.0.cmp(&b.0));
+    messages.dedup_by(|a, b| a.0 == b.0);
 }
+
+/// A message with its [`entry_digest`], computed once.
+///
+/// Every step of [`MailboxStateV1::apply_delta`] (dedupe, cap, canonical
+/// order) orders by the digest, at least on a tie. Computed per comparison,
+/// that is O(n log n) BLAKE3 passes over up to 4 MiB of ciphertext; and the
+/// mailbox is open-write, so anyone can force the tie branches by sending
+/// messages that share a timestamp and a nonce (harvest#226). So the digest
+/// is computed once per message and carried through.
+type Keyed = ([u8; 32], EncryptedMessage);
 
 /// Keep the highest-ranked messages that fit [`MAX_MESSAGES`] and each size
 /// class's cap in [`SIZE_CLASS_CAPS`], which together bound the mailbox
@@ -884,19 +950,19 @@ fn dedupe_identical_entries(messages: &mut Vec<EncryptedMessage>) {
 /// honest messages of every class
 /// (`known_gap_a_funded_flood_still_evicts_every_honest_message`). The class
 /// caps narrow the byte route; they do not close the count route.
-fn enforce_message_cap(messages: &mut Vec<EncryptedMessage>) {
+fn enforce_message_cap(messages: &mut Vec<Keyed>) {
     // Descending by rank. The digest closes the order, since two entries can
     // share a timestamp and a nonce.
-    messages.sort_by(|a, b| {
+    messages.sort_by(|(digest_a, a), (digest_b, b)| {
         b.timestamp
             .cmp(&a.timestamp)
             .then_with(|| b.nonce.cmp(&a.nonce))
-            .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
+            .then_with(|| digest_b.cmp(digest_a))
     });
 
     let mut kept = 0usize;
     let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
-    messages.retain(|message| {
+    messages.retain(|(_, message)| {
         let Some(class) = size_class(message) else {
             // Over `MAX_MESSAGE_BYTES`. `apply_delta` refuses these on the
             // way in and `verify` refuses a state holding one, so this is
@@ -1107,8 +1173,12 @@ impl MailboxStateV1 {
         //
         // It runs before the cap, not after, so a duplicate cannot occupy two
         // of the slots the cap is about to hand out.
-        dedupe_identical_entries(&mut self.messages);
-        enforce_message_cap(&mut self.messages);
+        let mut keyed: Vec<Keyed> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .map(|message| (entry_digest(&message), message))
+            .collect();
+        dedupe_identical_entries(&mut keyed);
+        enforce_message_cap(&mut keyed);
 
         // Normalisation into `canonical_order`, which `verify` requires
         // (harvest#85). Since harvest#85 this sort is the ONLY thing that
@@ -1120,7 +1190,13 @@ impl MailboxStateV1 {
         // comment this replaces described it as one of two mutually redundant
         // mechanisms, which was true before the cap started sorting every
         // time; see the note on `dedupe_identical_entries`.
-        self.messages.sort_by(canonical_order);
+        //
+        // `canonical_order` with the digest already in hand; pinned equal to
+        // it by `the_keyed_orders_are_the_public_ones`.
+        keyed.sort_by(|(digest_a, a), (digest_b, b)| {
+            a.nonce.cmp(&b.nonce).then_with(|| digest_a.cmp(digest_b))
+        });
+        self.messages = keyed.into_iter().map(|(_, message)| message).collect();
 
         Ok(())
     }
@@ -2819,5 +2895,263 @@ mod merge_law_tests {
             .verify()
             .expect_err("more top-class messages than the class cap must not verify");
         assert!(err.contains("size class"), "got: {err}");
+    }
+}
+
+/// harvest#226: the two `Vec<u8>` fields are CBOR byte strings, and a state
+/// written by an earlier generation (as arrays of integers) still decodes.
+/// The migration fold depends on the second half: it decodes a predecessor's
+/// state with today's types and forwards it re-encoded.
+#[cfg(test)]
+mod byte_string_encoding_tests {
+    use super::*;
+
+    /// `EncryptedMessage` as every generation before harvest#226 encoded it:
+    /// the same fields, the byte fields left to serde's default.
+    #[derive(Serialize)]
+    struct EarlierMessage {
+        conversation_id: ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: DateTime<Utc>,
+        nonce: [u8; 24],
+    }
+
+    #[derive(Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<EarlierMessage>,
+    }
+
+    fn mailbox() -> MailboxStateV1 {
+        let messages = (0u8..6)
+            .map(|i| EncryptedMessage {
+                conversation_id: ConversationId([i; 32]),
+                sender_public_key: (0..32).map(|b| b ^ i).collect(),
+                // Byte values both sides of 24, where the array form changes
+                // from one byte per element to two.
+                ciphertext: (0..SIZE_BUCKETS[0] + AEAD_TAG_BYTES)
+                    .map(|b| (b as u8).wrapping_mul(7).wrapping_add(i))
+                    .collect(),
+                timestamp: DateTime::from_timestamp(1_760_000_000 + i64::from(i), 0).unwrap(),
+                nonce: [i; 24],
+            })
+            .collect();
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).unwrap();
+        state
+    }
+
+    fn earlier_bytes(state: &MailboxStateV1) -> Vec<u8> {
+        crate::to_cbor(&EarlierMailbox {
+            messages: state
+                .messages
+                .iter()
+                .map(|m| EarlierMessage {
+                    conversation_id: m.conversation_id.clone(),
+                    sender_public_key: m.sender_public_key.clone(),
+                    ciphertext: m.ciphertext.clone(),
+                    timestamp: m.timestamp,
+                    nonce: m.nonce,
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_earlier_generations_encoding_still_decodes() {
+        let state = mailbox();
+        let old = earlier_bytes(&state);
+        let decoded: MailboxStateV1 =
+            crate::from_cbor(&old).expect("a predecessor's mailbox must decode");
+        assert_eq!(decoded, state, "every message, byte for byte");
+        decoded.verify().expect("and it is a valid mailbox");
+    }
+
+    /// Red if either `#[serde(with = "serde_bytes")]` is removed.
+    #[test]
+    fn the_byte_fields_are_written_as_byte_strings() {
+        let state = mailbox();
+        let new = crate::to_cbor(&state).unwrap();
+        let old = earlier_bytes(&state);
+        let payload: usize = state
+            .messages
+            .iter()
+            .map(|m| m.ciphertext.len() + m.sender_public_key.len())
+            .sum();
+        // A byte string costs its length plus a few bytes of head; the array
+        // form costs nearly two bytes for every byte over 23.
+        assert!(
+            new.len() < payload + 200 * state.messages.len(),
+            "{} encoded bytes for {payload} bytes of payload",
+            new.len()
+        );
+        assert!(old.len() > payload * 3 / 2);
+        for field in ["ciphertext", "sender_public_key"] {
+            let key = crate::to_cbor(&field).unwrap();
+            let at = new
+                .windows(key.len())
+                .position(|w| w == key.as_slice())
+                .expect("the field is encoded")
+                + key.len();
+            assert_eq!(
+                new[at] >> 5,
+                2,
+                "{field} is CBOR major type 2, a byte string"
+            );
+        }
+    }
+
+    /// The current contract accepts only its own encoding as canonical, so a
+    /// predecessor's bytes must be re-encoded before they are forwarded; the
+    /// fold does that, since it forwards what it decoded.
+    #[test]
+    fn an_earlier_encoding_is_not_canonical_and_its_re_encoding_is() {
+        let state = mailbox();
+        let old = earlier_bytes(&state);
+        let decoded: MailboxStateV1 = crate::from_cbor(&old).unwrap();
+        assert!(!crate::is_canonical_cbor(&decoded, &old));
+        let forwarded = crate::to_cbor(&decoded).unwrap();
+        assert!(crate::is_canonical_cbor(&decoded, &forwarded));
+    }
+}
+
+/// harvest#226: `apply_delta` computes each digest once. These pin that it
+/// still produces exactly the state the per-comparison version produced, on
+/// the inputs where the digest decides the order (shared timestamps and
+/// nonces) and with every cap binding.
+#[cfg(test)]
+mod keyed_order_tests {
+    use super::*;
+
+    /// `apply_delta`'s normalisation as it was before harvest#226, digest
+    /// computed per comparison: the reference.
+    fn reference(mut messages: Vec<EncryptedMessage>) -> Vec<EncryptedMessage> {
+        messages.retain(|m| message_bytes(m) <= MAX_MESSAGE_BYTES);
+        messages.sort_by_key(entry_digest);
+        messages.dedup_by_key(|m| entry_digest(m));
+        messages.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| b.nonce.cmp(&a.nonce))
+                .then_with(|| entry_digest(b).cmp(&entry_digest(a)))
+        });
+        let mut kept = 0usize;
+        let mut per_class = [0usize; SIZE_CLASS_CAPS.len()];
+        messages.retain(|m| {
+            let Some(class) = size_class(m) else {
+                return false;
+            };
+            if kept == MAX_MESSAGES || per_class[class] == SIZE_CLASS_CAPS[class] {
+                return false;
+            }
+            per_class[class] += 1;
+            kept += 1;
+            true
+        });
+        messages.sort_by(canonical_order);
+        messages
+    }
+
+    /// Messages with few distinct timestamps and nonces, so ties are the
+    /// rule, over every size class, some repeated, enough to exceed caps.
+    fn tied(count: u32, salt: u8) -> Vec<EncryptedMessage> {
+        (0..count)
+            .map(|i| {
+                let class = (i % 7 % 4) as usize;
+                EncryptedMessage {
+                    conversation_id: ConversationId([salt; 32]),
+                    sender_public_key: vec![(i % 3) as u8; 32],
+                    ciphertext: (0..SIZE_BUCKETS[class] + AEAD_TAG_BYTES)
+                        .map(|b| (b as u8) ^ (i / 2) as u8 ^ salt)
+                        .collect(),
+                    timestamp: DateTime::from_timestamp(1_760_000_000 + i64::from(i % 3), 0)
+                        .unwrap(),
+                    nonce: [(i % 2) as u8; 24],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_keyed_orders_are_the_public_ones() {
+        for (count, salt) in [(9, 1u8), (300, 2), (700, 3)] {
+            let input = tied(count, salt);
+            let mut state = MailboxStateV1::default();
+            state.apply_delta(&Some(input.clone())).unwrap();
+            assert_eq!(
+                crate::to_cbor(&state).unwrap(),
+                crate::to_cbor(&MailboxStateV1 {
+                    messages: reference(input)
+                })
+                .unwrap(),
+                "{count} messages: the same state as the per-comparison version"
+            );
+            state.verify().expect("and a valid one");
+        }
+        // Merging in two halves, in either order, lands on the same state.
+        let (a, b) = (tied(400, 4), tied(400, 5));
+        let mut ab = MailboxStateV1::default();
+        ab.apply_delta(&Some(a.clone())).unwrap();
+        ab.apply_delta(&Some(b.clone())).unwrap();
+        let mut ba = MailboxStateV1::default();
+        ba.apply_delta(&Some(b.clone())).unwrap();
+        ba.apply_delta(&Some(a.clone())).unwrap();
+        assert_eq!(ab, ba);
+        assert_eq!(ab.messages, reference(a.into_iter().chain(b).collect()));
+    }
+}
+
+/// harvest#226: `MAX_DELTA_BYTES` admits every honest delta.
+#[cfg(test)]
+mod delta_bound_tests {
+    use super::*;
+
+    /// The largest mailbox that verifies: every size class at its cap (class
+    /// 0 taking what `MAX_MESSAGES` leaves), every message at its class's
+    /// size limit, every field at its widest encoding. A co-host answering a
+    /// new subscriber sends all of it as one delta, so it must fit.
+    #[test]
+    fn the_largest_valid_mailbox_fits_one_delta() {
+        let mut messages = Vec::new();
+        let mut k = 0u32;
+        for (class, &cap) in SIZE_CLASS_CAPS.iter().enumerate() {
+            let n = if class == 0 {
+                MAX_MESSAGES - SIZE_CLASS_CAPS[1..].iter().sum::<usize>()
+            } else {
+                cap
+            };
+            for _ in 0..n {
+                k += 1;
+                let mut nonce = [0xffu8; 24];
+                nonce[..4].copy_from_slice(&k.to_be_bytes());
+                messages.push(EncryptedMessage {
+                    conversation_id: ConversationId([0xff; 32]),
+                    sender_public_key: vec![0xff; SENDER_KEY_BYTES],
+                    ciphertext: vec![
+                        0xff;
+                        size_class_limit(class)
+                            - MESSAGE_ENVELOPE_BYTES
+                            - SENDER_KEY_BYTES
+                    ],
+                    timestamp: DateTime::from_timestamp(4_000_000_000 + i64::from(k), 999_999_999)
+                        .unwrap(),
+                    nonce,
+                });
+            }
+        }
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).unwrap();
+        state.verify().unwrap();
+        assert_eq!(state.messages.len(), MAX_MESSAGES, "every cap binds");
+        let delta = crate::to_cbor(&state.messages).unwrap();
+        assert!(
+            delta.len() <= MAX_DELTA_BYTES,
+            "{} bytes, bound {MAX_DELTA_BYTES}",
+            delta.len()
+        );
+        // And the bound is not loose by more than a fifth: it is what keeps
+        // the cost of a delta within the per-call budget.
+        assert!(MAX_DELTA_BYTES < delta.len() * 6 / 5);
     }
 }

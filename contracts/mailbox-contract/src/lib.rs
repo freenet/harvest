@@ -75,6 +75,11 @@ impl ContractInterface for Contract {
                         continue;
                     }
                     nothing_here = false;
+                    // No byte or count bound here, unlike the `Delta` arm: the
+                    // node runs `validate_state` on an incoming state before
+                    // merging it, and that refuses anything over the caps. If
+                    // that ever stopped being true, this arm would be a wider
+                    // gap than the delta was (harvest#226).
                     let new_state = from_reader::<MailboxStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     // Everything, and `apply_delta` decides what is already
@@ -112,6 +117,34 @@ impl ContractInterface for Contract {
                         continue;
                     }
                     nothing_here = false;
+                    // Refused before decoding: see `MAX_DELTA_BYTES` and
+                    // `delta_message_count`.
+                    if d.as_ref().len() > harvest_common::mailbox::MAX_DELTA_BYTES {
+                        return Err(ContractError::InvalidUpdateWithInfo {
+                            reason: format!(
+                                "a mailbox delta of {} bytes; the most one may be is {}",
+                                d.as_ref().len(),
+                                harvest_common::mailbox::MAX_DELTA_BYTES
+                            ),
+                        });
+                    }
+                    match harvest_common::mailbox::delta_message_count(d.as_ref()) {
+                        Some(n) if n <= harvest_common::mailbox::MAX_MESSAGES as u64 => {}
+                        Some(n) => {
+                            return Err(ContractError::InvalidUpdateWithInfo {
+                                reason: format!(
+                                    "a mailbox delta of {n} messages; the most one may carry is {}",
+                                    harvest_common::mailbox::MAX_MESSAGES
+                                ),
+                            })
+                        }
+                        None => {
+                            return Err(ContractError::InvalidUpdateWithInfo {
+                                reason: "a mailbox delta must be a definite-length CBOR array"
+                                    .into(),
+                            })
+                        }
+                    }
                     let delta = from_reader::<MailboxDelta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     mailbox_state.apply_delta(&Some(delta)).map_err(|e| {
@@ -303,6 +336,119 @@ mod tests {
         );
         assert!(merged.messages.contains(&confession));
         assert!(merged.messages.contains(&retraction));
+    }
+
+    /// harvest#226: this generation writes the message bytes as CBOR byte
+    /// strings and accepts only that as canonical. A predecessor's state, in
+    /// the integer-array form, is refused as it stands (so it can never be
+    /// forwarded raw), and accepted once decoded and re-encoded, which is
+    /// what the migration fold forwards.
+    #[test]
+    fn a_predecessors_encoding_is_refused_raw_and_accepted_re_encoded() {
+        #[derive(serde::Serialize)]
+        struct Earlier {
+            conversation_id: ConversationId,
+            sender_public_key: Vec<u8>,
+            ciphertext: Vec<u8>,
+            timestamp: chrono::DateTime<chrono::Utc>,
+            nonce: [u8; 24],
+        }
+        #[derive(serde::Serialize)]
+        struct EarlierMailbox {
+            messages: Vec<Earlier>,
+        }
+        let state = MailboxStateV1 {
+            messages: vec![message([7u8; 24], &[200u8; 100], 1_700_000_000)],
+        };
+        let mut raw = vec![];
+        into_writer(
+            &EarlierMailbox {
+                messages: state
+                    .messages
+                    .iter()
+                    .map(|m| Earlier {
+                        conversation_id: m.conversation_id.clone(),
+                        sender_public_key: m.sender_public_key.clone(),
+                        ciphertext: m.ciphertext.clone(),
+                        timestamp: m.timestamp,
+                        nonce: m.nonce,
+                    })
+                    .collect(),
+            },
+            &mut raw,
+        )
+        .expect("encode");
+        let validate = |bytes: Vec<u8>| {
+            <Contract as ContractInterface>::validate_state(
+                parameters(),
+                State::from(bytes),
+                RelatedContracts::default(),
+            )
+        };
+        assert!(
+            validate(raw.clone()).is_err(),
+            "the earlier encoding, raw, is refused"
+        );
+        let decoded: MailboxStateV1 = from_reader(raw.as_slice()).expect("but it decodes");
+        assert!(matches!(
+            validate(encoded(&decoded)),
+            Ok(ValidateResult::Valid)
+        ));
+    }
+
+    /// harvest#226: a delta of more than `MAX_MESSAGES` messages is refused,
+    /// from its array head, before it is decoded; one of exactly that many is
+    /// merged.
+    #[test]
+    fn a_delta_over_the_message_cap_is_refused_before_decoding() {
+        use harvest_common::mailbox::MAX_MESSAGES;
+        let many = |n: usize| -> Vec<EncryptedMessage> {
+            (0..n)
+                .map(|i| {
+                    let mut nonce = [0u8; 24];
+                    nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    message(nonce, b"x", 1_700_000_000 + i as i64)
+                })
+                .collect()
+        };
+        let held = MailboxStateV1::default();
+        let delta = |messages: Vec<EncryptedMessage>| {
+            let mut bytes = vec![];
+            into_writer(&messages, &mut bytes).expect("encode");
+            vec![UpdateData::Delta(StateDelta::from(bytes))]
+        };
+        let refused = <Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(encoded(&held)),
+            delta(many(MAX_MESSAGES + 1)),
+        );
+        assert!(
+            matches!(&refused, Err(ContractError::InvalidUpdateWithInfo { reason }) if reason.contains("the most one may carry")),
+            "{refused:?}"
+        );
+        // Not decodable past the head, so a refusal there is from the head.
+        let mut truncated = vec![];
+        into_writer(&many(MAX_MESSAGES + 1), &mut truncated).expect("encode");
+        truncated.truncate(8);
+        assert!(<Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(encoded(&held)),
+            vec![UpdateData::Delta(StateDelta::from(truncated))],
+        )
+        .is_err_and(|e| e.to_string().contains("the most one may carry")));
+        let merged = update(&held, delta(many(MAX_MESSAGES)));
+        assert_eq!(merged.messages.len(), MAX_MESSAGES);
+
+        // Over `MAX_DELTA_BYTES`, refused on its length before anything is
+        // read: a one-element array head followed by bytes nothing decodes.
+        let mut oversized = vec![0x81u8];
+        oversized.resize(harvest_common::mailbox::MAX_DELTA_BYTES + 1, 0xff);
+        assert!(<Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(encoded(&held)),
+            vec![UpdateData::Delta(StateDelta::from(oversized))],
+        )
+        .is_err_and(|e| e.to_string().contains("the most one may be")));
     }
 
     /// A merge of a state this peer already holds entirely changes nothing,
