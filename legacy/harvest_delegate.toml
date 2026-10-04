@@ -266,3 +266,10 @@ description = "Superseded by a heartbeat that says not taking orders whenever th
 date = "2026-10-04"
 code_hash = "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0"
 delegate_key = "23aaca572e973f2ac9bab50b34996efd6ebb5ea8f513aa49b897819bb8ac9607"
+
+[[entry]]
+version = "V32"
+description = "Superseded by one purchases backup (step 2): new requests `ExportPurchasesBackup` (one page of every kept conversation and kept purchase, about 256 KiB of records, with a cursor), `ImportPurchasesBackup` (at most 16 records a call; never writes over a held record, a purchase merging as a migration merges it; refused past a cap, never evicting) and `MarkBackedUp` (answered `PurchasesBackup`, `PurchasesBackupImported`, `BackedUpMarked`). `KeptPurchase` gained `backed_up` (`#[serde(default, skip_serializing_if)]`, so every earlier record encodes as before; cleared when the order is paid after the backup). No secret family or import family changed. The parameters are unchanged (empty). The generation harvest#221 shipped (`b84af10`)."
+date = "2026-10-04"
+code_hash = "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9"
+delegate_key = "015d5a57f0b6cf9d926ae1bdb0f9ef059e8de3f094cef3b26f23f6106a012c3d"
