@@ -112,7 +112,17 @@ impl ContractInterface for Contract {
                         continue;
                     }
                     nothing_here = false;
-                    // Refused before decoding: see `delta_message_count`.
+                    // Refused before decoding: see `MAX_DELTA_BYTES` and
+                    // `delta_message_count`.
+                    if d.as_ref().len() > harvest_common::mailbox::MAX_DELTA_BYTES {
+                        return Err(ContractError::InvalidUpdateWithInfo {
+                            reason: format!(
+                                "a mailbox delta of {} bytes; the most one may be is {}",
+                                d.as_ref().len(),
+                                harvest_common::mailbox::MAX_DELTA_BYTES
+                            ),
+                        });
+                    }
                     match harvest_common::mailbox::delta_message_count(d.as_ref()) {
                         Some(n) if n <= harvest_common::mailbox::MAX_MESSAGES as u64 => {}
                         Some(n) => {
@@ -423,6 +433,17 @@ mod tests {
         .is_err_and(|e| e.to_string().contains("the most one may carry")));
         let merged = update(&held, delta(many(MAX_MESSAGES)));
         assert_eq!(merged.messages.len(), MAX_MESSAGES);
+
+        // Over `MAX_DELTA_BYTES`, refused on its length before anything is
+        // read: a one-element array head followed by bytes nothing decodes.
+        let mut oversized = vec![0x81u8];
+        oversized.resize(harvest_common::mailbox::MAX_DELTA_BYTES + 1, 0xff);
+        assert!(<Contract as ContractInterface>::update_state(
+            parameters(),
+            State::from(encoded(&held)),
+            vec![UpdateData::Delta(StateDelta::from(oversized))],
+        )
+        .is_err_and(|e| e.to_string().contains("the most one may be")));
     }
 
     /// A merge of a state this peer already holds entirely changes nothing,

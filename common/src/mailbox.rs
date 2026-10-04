@@ -777,6 +777,19 @@ pub type MailboxSummaryV2 = BTreeSet<[u8; 32]>;
 /// messages, and only what counts as "already held" moved.
 pub type MailboxDelta = Vec<EncryptedMessage>;
 
+/// The most bytes an encoded [`MailboxDelta`] may be (harvest#226).
+///
+/// A delta can never usefully carry more than a mailbox can hold, and the
+/// size-class caps bound that: the largest state that verifies (every class
+/// at its cap, every message at its class's size limit) encodes in about
+/// 3.58 MB. `MAX_MAILBOX_BYTES` is above that by construction, and each
+/// message's encoding exceeds its [`message_bytes`] by at most a few dozen
+/// bytes (field names and heads), so this bound admits every honest delta
+/// (pinned by `the_largest_valid_mailbox_fits_one_delta`) and refuses, from
+/// its length alone, a 34 MB delta of top-class messages that cost more than
+/// the per-call budget to merge.
+pub const MAX_DELTA_BYTES: usize = MAX_MAILBOX_BYTES + MAX_MESSAGES * 64;
+
 /// How many messages an encoded [`MailboxDelta`] says it holds, read from the
 /// CBOR array head alone, or `None` if the bytes do not start with a
 /// definite-length array.
@@ -3082,5 +3095,59 @@ mod keyed_order_tests {
         ba.apply_delta(&Some(a.clone())).unwrap();
         assert_eq!(ab, ba);
         assert_eq!(ab.messages, reference(a.into_iter().chain(b).collect()));
+    }
+}
+
+/// harvest#226: `MAX_DELTA_BYTES` admits every honest delta.
+#[cfg(test)]
+mod delta_bound_tests {
+    use super::*;
+
+    /// The largest mailbox that verifies: every size class at its cap (class
+    /// 0 taking what `MAX_MESSAGES` leaves), every message at its class's
+    /// size limit, every field at its widest encoding. A co-host answering a
+    /// new subscriber sends all of it as one delta, so it must fit.
+    #[test]
+    fn the_largest_valid_mailbox_fits_one_delta() {
+        let mut messages = Vec::new();
+        let mut k = 0u32;
+        for (class, &cap) in SIZE_CLASS_CAPS.iter().enumerate() {
+            let n = if class == 0 {
+                MAX_MESSAGES - SIZE_CLASS_CAPS[1..].iter().sum::<usize>()
+            } else {
+                cap
+            };
+            for _ in 0..n {
+                k += 1;
+                let mut nonce = [0xffu8; 24];
+                nonce[..4].copy_from_slice(&k.to_be_bytes());
+                messages.push(EncryptedMessage {
+                    conversation_id: ConversationId([0xff; 32]),
+                    sender_public_key: vec![0xff; SENDER_KEY_BYTES],
+                    ciphertext: vec![
+                        0xff;
+                        size_class_limit(class)
+                            - MESSAGE_ENVELOPE_BYTES
+                            - SENDER_KEY_BYTES
+                    ],
+                    timestamp: DateTime::from_timestamp(4_000_000_000 + i64::from(k), 999_999_999)
+                        .unwrap(),
+                    nonce,
+                });
+            }
+        }
+        let mut state = MailboxStateV1::default();
+        state.apply_delta(&Some(messages)).unwrap();
+        state.verify().unwrap();
+        assert_eq!(state.messages.len(), MAX_MESSAGES, "every cap binds");
+        let delta = crate::to_cbor(&state.messages).unwrap();
+        assert!(
+            delta.len() <= MAX_DELTA_BYTES,
+            "{} bytes, bound {MAX_DELTA_BYTES}",
+            delta.len()
+        );
+        // And the bound is not loose by more than a fifth: it is what keeps
+        // the cost of a delta within the per-call budget.
+        assert!(MAX_DELTA_BYTES < delta.len() * 6 / 5);
     }
 }
