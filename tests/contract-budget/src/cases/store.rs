@@ -30,23 +30,23 @@
 //!   of `MAX_CHOICE_OPTIONS` options, `MAX_DELIVERY_REGIONS` regions, every
 //!   name `MAX_TERM_NAME_CHARS` long.
 //!
+//! * **Listings: `MAX_LISTINGS` (512)**, each at `MAX_LISTING_BYTES` (32
+//!   KiB) as it encodes (step 2): every field above at its largest, then
+//!   the description padded until one more character would not fit, so the
+//!   store keeps it. The two stores share 504 listings and each has 8 the
+//!   other lacks; the merge keeps the 512 newest.
+//! * **The pause**: one record, signed.
+//!
 //! What has NO cap in the contract, and the size chosen:
 //!
-//! * **Listings** ([`LISTINGS`] = 64) and **listing statuses** (one per
-//!   listing). Nothing in the contract bounds either. What bounds them here
-//!   is the node's own `MAX_STATE_SIZE` (50 MiB, freenet-core
-//!   `wasm_runtime/state_store.rs`): the capped parts alone encode to about
-//!   41 MB (the 4096 paid orders are about 34 MB of it, since every
-//!   `Vec<u8>` and byte array in an order is a CBOR integer array), and a
-//!   listing at the sizes below is about 115 KB, so 64 of them, and the 72
-//!   the merge produces, keep every state here under the node's limit. A
-//!   state over it is one no node stores, so measuring it would prove
-//!   nothing. [`cases`] checks every state against that limit.
-//! * **A listing's title** (200 characters) and **description**
-//!   ([`DESCRIPTION_BYTES`] = 16 KiB), and the store's own name and
-//!   description. 16 KiB is the UI markdown renderer's `MAX_SOURCE_BYTES`:
-//!   it shows no more than that, so a longer description is bytes nobody
-//!   reads.
+//! * **Listing statuses** (one per listing here). Nothing bounds them: a
+//!   status outlives the cut of its listing. Every state here stays under
+//!   the node's own `MAX_STATE_SIZE` (50 MiB, freenet-core
+//!   `wasm_runtime/state_store.rs`), which [`cases`] checks: a state over it
+//!   is one no node stores, so measuring it would prove nothing.
+//! * **A listing's title** (200 characters), and the store's own name and
+//!   description ([`DESCRIPTION_BYTES`] = 16 KiB, the UI markdown renderer's
+//!   `MAX_SOURCE_BYTES`, which shows no more than that).
 //! * **The store's certificate PEM**, sized like a backing's (4096).
 //!
 //! Each state is built by `StoreStateV1::apply_delta` from the empty store,
@@ -95,7 +95,7 @@ use harvest_common::store::{
 use super::{array, bytes, cbor, now, signing_key, Case, Kind, Update};
 
 /// Listings in each at-cap store. The contract has no listing cap.
-const LISTINGS: u64 = 64;
+const LISTINGS: u64 = harvest_common::store::MAX_LISTINGS as u64;
 
 /// How many of its listings the second store holds that the first does not.
 /// The rest are the same listings, as two replicas of one shop share most of
@@ -199,6 +199,47 @@ impl Shop {
     /// Listing `i`, every field at its largest. `label` decides its terms,
     /// so two stores that share a label share the listing.
     fn listing(&self, label: &str, i: u64) -> Result<AuthorizedListing> {
+        self.listing_at(
+            label,
+            i,
+            now() - chrono::Duration::days(30) + chrono::Duration::minutes(i as i64),
+        )
+    }
+
+    /// Listing `i` at the store's per-listing bound
+    /// ([`harvest_common::store::MAX_LISTING_BYTES`], step 2): every field
+    /// at its largest, the description padded until one more character would
+    /// not fit, so the store keeps it.
+    fn listing_at(
+        &self,
+        label: &str,
+        i: u64,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AuthorizedListing> {
+        let fits =
+            |l: &AuthorizedListing| cbor(l).len() <= harvest_common::store::MAX_LISTING_BYTES;
+        if !fits(&self.listing_sized(label, i, created_at, 0)?) {
+            bail!("a listing with every field at its largest does not fit the listing bound");
+        }
+        let (mut lo, mut hi) = (0usize, DESCRIPTION_BYTES);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if fits(&self.listing_sized(label, i, created_at, mid)?) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        self.listing_sized(label, i, created_at, lo)
+    }
+
+    fn listing_sized(
+        &self,
+        label: &str,
+        i: u64,
+        created_at: chrono::DateTime<chrono::Utc>,
+        description: usize,
+    ) -> Result<AuthorizedListing> {
         let name = |what: &str, j: u64| {
             text(
                 &format!("{label}/{what}"),
@@ -242,7 +283,7 @@ impl Shop {
         let listing = Listing {
             id: ListingId([0u8; 32]),
             title: text(&format!("{label}/title"), i, TITLE_CHARS, true),
-            description: text(&format!("{label}/description"), i, DESCRIPTION_BYTES, true),
+            description: text(&format!("{label}/description"), i, description, true),
             kind: ListingKind::Sale,
             price: Some(PriceInfo {
                 amount: "0.00125000".into(),
@@ -476,6 +517,17 @@ impl Shop {
         })
     }
 
+    /// The seller's pause (step 2), at `revision`.
+    fn pause(&self, revision: u64) -> Result<harvest_common::store_pause::AuthorizedStorePause> {
+        let pause = harvest_common::store_pause::StorePause::new(self.owner(), revision, true);
+        let (scoped_payload, signature) = self.sign(&pause)?;
+        Ok(harvest_common::store_pause::AuthorizedStorePause {
+            pause,
+            scoped_payload,
+            signature,
+        })
+    }
+
     fn closure(&self) -> Result<AuthorizedClosure> {
         let closure = StoreClosure {
             store: self.owner(),
@@ -553,6 +605,7 @@ impl Shop {
             copies: Some(copies),
             fulfilment: Some(fulfilment),
             listing_statuses: Some(listing_statuses),
+            pause: Some(vec![self.pause(u64::from(version))?]),
         };
         let mut state = StoreStateV1::default();
         state
@@ -604,7 +657,10 @@ impl Shop {
                 .listings
                 .iter()
                 .all(|l| l.listing.images.len() == MAX_IMAGES_HARD)
-            && state.listing_statuses.records.len() == state.listings.listings.len();
+            && state.listings.listings.len() == harvest_common::store::MAX_LISTINGS
+            // A status outlives the cut of its listing (step 2).
+            && state.listing_statuses.records.len() >= state.listings.listings.len()
+            && state.pause.records.len() == 1;
         if !full {
             bail!(
                 "{what} is not at its caps: {} orders, {} despatches, {} backing slots, \
@@ -632,7 +688,8 @@ pub fn cases() -> Result<Vec<Case>> {
     // listing, every other part absent.
     let one = StoreStateV1Delta {
         owner: Some(shop.owner()),
-        listings: Some(vec![shop.listing("store/new-listing", 0)?]),
+        // The newest, so the store's cut keeps it and drops its oldest.
+        listings: Some(vec![shop.listing_at("store/new-listing", 0, now())?]),
         ..Default::default()
     };
 

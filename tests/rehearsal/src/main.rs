@@ -1018,7 +1018,7 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
         },
         ..Default::default()
     };
-    node.put(old_container, harvest_common::to_cbor(&planted).unwrap())
+    node.put(old_container, store_bytes_for(newest.generation, &planted))
         .await
         .expect("PUT at the newest superseded generation");
     let (outcome, seal) = run_probe(node, &vk, migrate::store_candidates(&vk).unwrap()).await;
@@ -1235,6 +1235,57 @@ fn two_newest(
         (e.generation, legacy_wasm_from_git(repo, artifact, &hex::encode(e.code_hash)))
     };
     [pick(gens[0]), pick(gens[1])]
+}
+
+/// The last store generation that wrote its signed records' signed payload
+/// and signature as CBOR integer arrays; step 2 made them byte strings, and
+/// a generation's contract accepts only its own encoding as canonical.
+const LAST_ARRAY_FORM_STORE_GENERATION: u32 = 27;
+
+/// A store state as the contract of `generation` writes it (the mailbox's
+/// `mailbox_bytes_for`, for the store): today's encoding with every signed
+/// record's outer byte fields as integer arrays up to
+/// [`LAST_ARRAY_FORM_STORE_GENERATION`].
+fn store_bytes_for(generation: u32, state: &StoreStateV1) -> Vec<u8> {
+    let bytes = harvest_common::to_cbor(state).unwrap();
+    if generation > LAST_ARRAY_FORM_STORE_GENERATION {
+        return bytes;
+    }
+    use ciborium::Value;
+    const FIELDS: [&str; 8] = [
+        "scoped_payload",
+        "signature",
+        "backer_scoped_payload",
+        "backer_signature",
+        "acceptance_scoped_payload",
+        "acceptance_signature",
+        "status_scoped_payload",
+        "status_signature",
+    ];
+    fn rewrite(value: Value) -> Value {
+        match value {
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let named = matches!(&k, Value::Text(t) if FIELDS.contains(&t.as_str()));
+                        let v = match v {
+                            Value::Bytes(b) if named => Value::Array(
+                                b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                            ),
+                            other => rewrite(other),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(rewrite).collect()),
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(rewrite(*inner))),
+            other => other,
+        }
+    }
+    let value: Value = harvest_common::from_cbor(&bytes).unwrap();
+    harvest_common::to_cbor(&rewrite(value)).unwrap()
 }
 
 /// The last mailbox generation that wrote its message bytes as CBOR integer

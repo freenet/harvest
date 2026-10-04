@@ -148,12 +148,12 @@ caps. The module docs in `src/cases/` say what is at which cap and why.
 * **Store** (`cases/store.rs`): 4096 paid orders (`MAX_ORDERS`), each with a
   genuine one-claim SPV payment proof and one despatch; 64 backing slots
   (`MAX_BACKINGS`) at the 4096-byte certificate cap, 32 retired and 32 with
-  `MAX_SCOPES_PER_BACKER` copies; the closure; 64 listings with 8 photos
-  each (`MAX_IMAGES_HARD`) and 16 KiB descriptions. The contract caps neither
-  the listing count nor description length; 64 listings keep every state
-  under the node's 50 MiB `MAX_STATE_SIZE` (the orders alone are about 34
-  MB). Delta: one new listing, as the UI sends it. State: a diverged replica
-  of the same store.
+  `MAX_SCOPES_PER_BACKER` copies; the closure; the pause; 512 listings
+  (`MAX_LISTINGS`) each at `MAX_LISTING_BYTES` (32 KiB) with every field at
+  its largest (8 photos, full choices and regions) and the description
+  padded to the bound. Every state stays under the node's 50 MiB
+  `MAX_STATE_SIZE`. Delta: one new listing, the newest, as the UI sends it.
+  State: a diverged replica of the same store.
 * **Index** (`cases/index.rs`): 64 entries (`MAX_INDEX_ENTRIES`), each with
   the genuine 1634-byte Ghost Key certificate. Delta: one entry the cap
   keeps. State: a second index at the cap.
@@ -364,6 +364,31 @@ What these say:
   certificate padded to the 4096-byte bound (which only the Ghost Key's
   holder can write), the full-state merge was 1.51 billion and the probe
   1.60 billion, still within.
+
+## The store at step 2's caps
+
+Step 2 (`feat/store-pause-one-backup`) caps a store's listings (512, each at
+most 32 KiB as encoded), writes every signed record's signed payload and
+signature as a CBOR byte string, verifies each payment proof's signed tip once
+per distinct tip, and has `is_canonical_cbor` compare without copying the
+state. The store fixture follows: 512 listings at the per-listing bound, every
+field at its largest, and the pause. One run, store case only (report-only):
+
+| case | call | fuel | of budget |
+|---|---|---:|---:|
+| 4096 paid orders, 512 listings + one-listing delta | `update_state` | 9,068,670,705 | 412.2% |
+| | `validate_state` (merged) | 63,004,974,814 | 2863.9% |
+| | `summarize_state` | 10,132,725,316 | 460.6% |
+| | `get_state_delta` (co-host) | 10,198,398,557 | 463.6% |
+| | `get_state_delta` (new subscriber) | | **trapped: out of memory** |
+| same + another at-caps state | `validate_state` (incoming) | 63,002,853,934 | 2863.8% |
+| | `update_state` | | **trapped: out of memory** |
+
+The node caps a contract's linear memory at 256 MiB (freenet-core
+`DEFAULT_MAX_MEMORY_PAGES`, 4,096 pages of 64 KiB, `wasm_runtime/engine.rs`).
+Before the copy-free check, `validate_state` itself ran out of it at these
+caps. Measured on the same orders by listing count at 32 KiB: with 256
+listings only the full merge runs out; with 128 every call completes.
 
 ## What it does not cover
 
