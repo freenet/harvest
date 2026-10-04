@@ -5514,7 +5514,6 @@ impl AppState {
                     self.refresh_backing_verdicts();
                     // A new listing this state holds is published (harvest#161).
                     self.settle_publishing(&contract_id);
-                    self.settle_store_pause(&contract_id);
                     self.settle_details_publishing(&contract_id);
 
                     // Keep this store's key recoverable from its backing Ghost
@@ -35153,6 +35152,40 @@ mod buy_flow_tests {
                 "the clear run before the used one"
             );
             assert!(arm.watched_scripts.is_empty());
+        }
+    }
+
+    /// Step 2 (the money lens's two Lows): after a newly paid address the
+    /// empty arm still goes out when the bridge inbox is not known, and for
+    /// a store that has since stopped selling by Buy now. Neither could
+    /// reach an invoice (the delegate holds the paid script), but each left
+    /// the delegate's window stale. Mutated red by requiring the inbox
+    /// again, and by planning only the stores that sell.
+    #[test]
+    fn the_empty_arm_goes_out_without_the_inbox_and_for_a_store_that_stopped_selling() {
+        for case in ["no inbox", "stopped selling"] {
+            let gk = inbox::authority().mint();
+            let mut state = a_seller_with_a_lost_counter(&gk);
+            let work = state.queue_auto_invoice(100);
+            settle_absent_except(&mut state, &work, &[], 100);
+            let armed = state.queue_auto_invoice(200);
+            assert!(!armed.arms.is_empty(), "{case}: armed first");
+            let (paid, _) = address_states_paid_and_scanned();
+            assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
+            match case {
+                "no inbox" => state.bitcoin.inbox = None,
+                _ => {
+                    for store in state.browsing_stores.values_mut() {
+                        store.listings.clear();
+                    }
+                    assert!(state.instant_checkout_stores().is_empty());
+                }
+            }
+            let emptied = state.queue_auto_invoice(300);
+            assert!(!emptied.arms.is_empty(), "{case}: the empty arm goes out");
+            for arm in &emptied.arms {
+                assert!(arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty());
+            }
         }
     }
 

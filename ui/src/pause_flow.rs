@@ -173,17 +173,6 @@ impl AppState {
             sent.waiting_since_ms = None;
         }
     }
-
-    /// A store's state arrived holding `revision` (or none): a sent pause it
-    /// covers is no longer waiting.
-    pub(crate) fn settle_store_pause(&mut self, store_contract_id: &[u8]) {
-        let held = self.held_pause_revision(store_contract_id);
-        if let Some(sent) = self.store_pause_sent.get_mut(store_contract_id) {
-            if held.is_some_and(|held| held >= sent.revision) {
-                sent.waiting_since_ms = None;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -216,7 +205,6 @@ mod tests {
         let owner = state.work_store_key(STORE).unwrap();
         let store = state.browsing_stores.entry(STORE.to_vec()).or_default();
         store.pause = Some(StorePause::new(owner, revision, paused));
-        state.settle_store_pause(STORE);
     }
 
     fn queued(state: &AppState) -> Vec<StorePause> {
