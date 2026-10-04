@@ -808,6 +808,16 @@ pub struct AppState {
     /// and whether it is still waiting for the store's state to show it.
     /// See `crate::pause_flow`.
     pub store_pause_sent: HashMap<Vec<u8>, crate::listing_status_flow::SentStatus>,
+    /// A purchases backup being assembled from the delegate's pages (step
+    /// 2; `crate::backup_flow`).
+    pub backup_export: Option<crate::backup_flow::BackupExport>,
+    /// A finished backup file, (name, text), waiting to be offered as a
+    /// download.
+    pub backup_file_ready: Option<(String, String)>,
+    /// A restore being sent a chunk at a time.
+    pub backup_restore: Option<crate::backup_flow::BackupRestore>,
+    /// What the purchases backup last said, shown under its buttons.
+    pub backup_message: Option<String>,
 
     /// New listings on their way to the network, with the notice that says
     /// so, keyed by listing id (harvest#161). See
@@ -13347,6 +13357,18 @@ impl AppState {
                 store_key,
                 result,
             } => self.on_seller_sent(request_id, store_key, result),
+            HarvestDelegateResponse::PurchasesBackup { request_id, result } => {
+                let next = self.on_purchases_backup(request_id, result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::PurchasesBackupImported { request_id, result } => {
+                let next = self.on_purchases_backup_imported(request_id, result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::BackedUpMarked { result, .. } => {
+                let next = self.on_backed_up_marked(result);
+                crate::backup_flow::send_all(next);
+            }
 
             HarvestDelegateResponse::StoreRegistered {
                 ghostkey_fingerprint,

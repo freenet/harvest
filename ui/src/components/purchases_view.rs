@@ -57,6 +57,181 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
     rows
 }
 
+/// A string as a JavaScript literal, for the few lines `eval` runs.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn js_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Offer `text` as a file named `name`.
+#[cfg(target_arch = "wasm32")]
+fn download(name: &str, text: &str) {
+    let _ = document::eval(&format!(
+        "const a = document.createElement('a');\
+         a.href = URL.createObjectURL(new Blob([{}], {{ type: 'text/plain' }}));\
+         a.download = {};\
+         document.body.appendChild(a); a.click(); a.remove();",
+        js_string(text),
+        js_string(name)
+    ));
+}
+
+/// The id of the hidden file input "Restore from a backup" opens.
+const RESTORE_INPUT: &str = "purchases-backup-file";
+
+/// One backup for every purchase on this device, and restoring one (step
+/// 2; `crate::backup_flow`).
+#[component]
+fn BackupCard() -> Element {
+    let mut pasting = use_signal(|| false);
+    let mut paste = use_signal(String::new);
+    let (not_backed_up, message, busy, ready) = {
+        let state = APP_STATE.read();
+        (
+            state.purchases_not_backed_up(),
+            state.backup_message.clone(),
+            state.backup_export.is_some() || state.backup_restore.is_some(),
+            state.backup_file_ready.clone(),
+        )
+    };
+    // A finished file is offered once, as soon as it is made.
+    use_effect(move || {
+        let ready = APP_STATE.read().backup_file_ready.clone();
+        #[cfg(target_arch = "wasm32")]
+        if let Some((name, text)) = &ready {
+            download(name, text);
+        }
+        let _ = ready;
+    });
+    let restore = |text: String| {
+        let out = APP_STATE.write().start_restore(&text);
+        crate::backup_flow::send_all(out);
+    };
+    rsx! {
+        div { class: "card",
+            h3 { "Back up your purchases" }
+            p { class: "text-muted small",
+                "One file with every purchase and conversation on this device, to restore on "
+                "another computer or after losing this one."
+            }
+            if not_backed_up > 0 {
+                p { class: "text-warning",
+                    if not_backed_up == 1 {
+                        "1 purchase isn\u{2019}t in your backup yet."
+                    } else {
+                        "{not_backed_up} purchases aren\u{2019}t in your backup yet."
+                    }
+                }
+            }
+            p { class: "text-muted small", "{crate::backup_flow::KEEP_IT_PRIVATE}" }
+            div { class: "row",
+                button {
+                    class: "btn btn-primary",
+                    disabled: busy,
+                    onclick: move |_| {
+                        let out = APP_STATE.write().start_backup_export();
+                        crate::backup_flow::send_all(out);
+                    },
+                    "Make a backup file"
+                }
+                if let Some((_, text)) = ready.clone() {
+                    button {
+                        class: "btn btn-outline",
+                        onclick: move |_| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let _ = document::eval(&format!(
+                                    "navigator.clipboard.writeText({});",
+                                    js_string(&text)
+                                ));
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let _ = &text;
+                        },
+                        "Copy as text"
+                    }
+                }
+                button {
+                    class: "btn btn-outline",
+                    disabled: busy,
+                    onclick: move |_| {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let _ = document::eval(&format!(
+                                "document.getElementById({}).click();",
+                                js_string(RESTORE_INPUT)
+                            ));
+                        }
+                    },
+                    "Restore from a backup"
+                }
+                button {
+                    class: "link-btn",
+                    onclick: move |_| pasting.toggle(),
+                    "Paste instead"
+                }
+            }
+            input {
+                id: RESTORE_INPUT,
+                r#type: "file",
+                accept: ".txt,text/plain",
+                style: "display: none;",
+                onchange: move |_| {
+                    #[cfg(target_arch = "wasm32")]
+                    spawn(async move {
+                        let mut read = document::eval(&format!(
+                            "const input = document.getElementById({});\
+                             const file = input.files && input.files[0];\
+                             if (file) {{ file.text().then(t => {{ input.value = ''; dioxus.send(t); }}); }}",
+                            js_string(RESTORE_INPUT)
+                        ));
+                        if let Ok(text) = read.recv::<String>().await {
+                            restore(text);
+                        }
+                    });
+                },
+            }
+            if pasting() {
+                div { class: "form-group",
+                    textarea {
+                        class: "form-input",
+                        rows: "4",
+                        placeholder: "Paste the whole backup file here.",
+                        value: "{paste}",
+                        oninput: move |e| paste.set(e.value()),
+                    }
+                    button {
+                        class: "btn",
+                        disabled: busy || paste().trim().is_empty(),
+                        onclick: move |_| {
+                            restore(paste());
+                            paste.set(String::new());
+                        },
+                        "Restore"
+                    }
+                }
+            }
+            if let Some(message) = message {
+                p { class: "small", "{message}" }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn MyPurchases() -> Element {
     // The stores this device has used, loaded in the background, since only
@@ -106,8 +281,9 @@ pub fn MyPurchases() -> Element {
             h2 { "Purchases" }
             p { class: "text-muted small",
                 "Kept by the Freenet node on this device, not in the network, so they do not follow "
-                "you to another computer. A conversation can be backed up from inside it."
+                "you to another computer unless you back them up."
             }
+            BackupCard {}
             if loading {
                 p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }
             }

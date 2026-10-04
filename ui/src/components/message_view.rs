@@ -242,7 +242,8 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
                     p { class: "text-warning", style: "font-size: 0.85rem;",
                         "{unsaved} of them exist on this device and nowhere else. If you lose "
                         "this machine you lose the conversation, and anything the seller sent "
-                        "you in it. Make a backup you can keep somewhere else."
+                        "you in it. Back up your purchases from Purchases to keep a copy "
+                        "somewhere else."
                     }
                 }
             }
@@ -261,16 +262,12 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
                             }
                             if backed_up {
                                 p { class: "text-muted", style: "font-size: 0.8rem;",
-                                    "You have said you hold a copy of this elsewhere."
+                                    "In a backup you made."
                                 }
                             } else {
                                 p { class: "text-warning", style: "font-size: 0.8rem;",
                                     "On this device only."
                                 }
-                            }
-                            ConversationBackupControl {
-                                store_contract_id: store_contract_id.clone(),
-                                tag: tag,
                             }
                             if confirming() == Some(tag) {
                                 p { class: "text-warning", style: "font-size: 0.85rem;",
@@ -304,97 +301,6 @@ fn KeptConversations(store_contract_id: Vec<u8>, kept: Vec<([u8; 32], i64, bool)
             }
 
             Restore {}
-        }
-    }
-}
-
-/// Saving ONE conversation, and saying you have.
-///
-/// # What the string is
-///
-/// It holds the secret itself -- that is what makes it work on another
-/// machine, and what makes it worth exactly as much as the conversation it
-/// restores. Anyone who has it can read that conversation and, once a
-/// seller's reply carries a pre-signed statement, file the complaint it
-/// authorizes as though they were the buyer. That is said beside the string
-/// rather than in a tooltip, because it is the whole basis on which a person
-/// decides where to put it.
-///
-/// # Why one conversation at a time
-///
-/// A store-wide backup is too easy to leave out of date: taken on Monday,
-/// silently incomplete on Tuesday, with nothing about the artefact saying
-/// which conversations it covered. And a "saved" marker set from a store-wide
-/// export would falsely cover a conversation created after it. Per
-/// conversation the marker means something checkable: THIS one exists in more
-/// than one place.
-///
-/// # Why "I have saved this" is a separate button
-///
-/// Showing a backup is not saving one. A buyer who opens the panel, reads the
-/// string and closes the tab has saved nothing, so revealing it must not
-/// clear the warning -- only the buyer saying they have it does. The delegate
-/// gates that marker for the same reason: the party that benefits from the
-/// warning stopping is not the party that loses the conversation.
-#[component]
-fn ConversationBackupControl(store_contract_id: Vec<u8>, tag: [u8; 32]) -> Element {
-    // The string, once the delegate has answered, and only for THIS
-    // conversation -- one is on screen at a time and it must never appear
-    // under another conversation's heading.
-    let backup = APP_STATE
-        .read()
-        .conversation_backup_on_screen
-        .as_ref()
-        .filter(|backup| {
-            backup.store_contract_id == store_contract_id && backup.buyer_public_key == tag
-        })
-        .map(|backup| backup.text().to_string());
-
-    rsx! {
-        if let Some(backup) = backup {
-            p { class: "text-warning", style: "font-size: 0.85rem;",
-                "Save this somewhere only you can reach. Anyone who has it can read this "
-                "conversation, and can use it to complain about this seller as though they "
-                "were you. It is not a password you can change: it is the conversation."
-            }
-            // Also a value to copy rather than a field to edit, and the one
-            // here matters most: a mistyped character makes the backup
-            // useless, and nothing would say so until it was needed. Shown
-            // whole, wrapping, with Copy (Ian, 2026-09-29): the old 3-row
-            // box scrolled, so nobody could see all 520 characters at once.
-            super::pay_card::CopyField {
-                label: "Your backup",
-                value: backup.clone(),
-                salt: "backup".to_string(),
-            }
-            button {
-                class: "btn btn-primary",
-                onclick: {
-                    let store_contract_id = store_contract_id.clone();
-                    move |_| {
-                        let mut app = APP_STATE.write();
-                        app.mark_conversation_backed_up(&store_contract_id, &tag);
-                        app.conversation_backup_on_screen = None;
-                    }
-                },
-                "I have saved this"
-            }
-            button {
-                class: "btn",
-                onclick: move |_| {
-                    APP_STATE.write().conversation_backup_on_screen = None;
-                },
-                "Hide it"
-            }
-        } else {
-            button {
-                class: "btn",
-                onclick: {
-                    let store_contract_id = store_contract_id.clone();
-                    move |_| APP_STATE.write().export_conversation(&store_contract_id, &tag)
-                },
-                "Back up this conversation"
-            }
         }
     }
 }

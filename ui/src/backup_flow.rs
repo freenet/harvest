@@ -1,0 +1,789 @@
+//! One backup for all of a buyer's purchases (step 2).
+//!
+//! # The file
+//!
+//! `harvest-purchases-<date>.txt`: a few lines a person can read (what it is,
+//! when it was made, how many purchases and conversations, which stores,
+//! and to keep it private), then one line
+//! `harvest-backup-v3:<base64 of the CBOR bundle>:<BLAKE3 of the CBOR, hex>`.
+//! The bundle names each store by its code, which a store keeps across
+//! re-keys, so a restore files each conversation under the store's address
+//! today, and remembers the store, with no code typed. The id a store had
+//! when the file was made rides along for a store whose code this device
+//! did not know.
+//!
+//! The file is not encrypted. It holds every conversation's secret and
+//! every purchase's receipt seed, so anyone with it can read the threads
+//! and file complaints as the buyer; the page says so in those words.
+//!
+//! # Making it
+//!
+//! The delegate answers a page at a time (`ExportPurchasesBackup`, each
+//! within one call's budget); this module asks for each page in turn,
+//! assembles the file, offers it as a download, and then marks exactly the
+//! items the file holds as backed up (`MarkBackedUp`), so a purchase made
+//! or paid later is shown as not in a backup yet.
+//!
+//! # Restoring it
+//!
+//! From a chosen file or pasted text. The bundle is sent in chunks of
+//! `BACKUP_IMPORT_ITEMS` (`ImportPurchasesBackup`), each item kept by the
+//! delegate's own rules: what this device already holds stays, a cap
+//! refuses rather than evicts. The counts are reported at the end. An old
+//! one-conversation string (`harvest-conv-backup-v2:`) is not a bundle: it
+//! names no store code, so it is restored from its store's page, as before.
+
+use std::collections::VecDeque;
+
+use harvest_common::delegate::{
+    BackupConversation, BackupItemOutcome, KeptPurchase, PurchasesBackupPage, BACKUP_IMPORT_ITEMS,
+    BACKUP_MARK_ITEMS,
+};
+use harvest_common::store::StoreParameters;
+use serde::{Deserialize, Serialize};
+
+use crate::state::AppState;
+
+/// The prefix of the bundle's line.
+pub(crate) const BUNDLE_PREFIX: &str = "harvest-backup-v3:";
+
+/// The prefix of an old one-conversation backup string.
+pub(crate) const CONVERSATION_STRING_PREFIX: &str = "harvest-conv-backup-v2:";
+
+/// Said beside the button that makes the file.
+pub(crate) const KEEP_IT_PRIVATE: &str = "Keep this file private, like a password: anyone with \
+     it can read your messages and report problems as you.";
+
+/// One store in a bundle.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BundleStore {
+    /// The store's code, when this device knew it: what its address today
+    /// is derived from.
+    pub code: Option<String>,
+    /// What the store was called, for the file's header and the restore
+    /// report. An unsigned label: a wrong one only mislabels.
+    pub name: String,
+    /// The store's address when the file was made.
+    pub contract_id_at_export: Vec<u8>,
+}
+
+/// One conversation in a bundle, and the store it is with.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BundleConversation {
+    /// Index into [`Bundle::stores`].
+    pub store: u32,
+    pub conversation: BackupConversation,
+}
+
+/// What a purchases backup holds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Bundle {
+    pub version: u32,
+    pub made_at_ms: u64,
+    pub stores: Vec<BundleStore>,
+    pub conversations: Vec<BundleConversation>,
+    pub purchases: Vec<KeptPurchase>,
+}
+
+/// The bundle's format version.
+pub(crate) const BUNDLE_VERSION: u32 = 3;
+
+// --- base64 (standard alphabet, padded) ------------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u32> { B64.iter().position(|b| *b == c).map(|p| p as u32) };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for (i, chunk) in text.chunks(4).enumerate() {
+        let last = i == text.len() / 4 - 1;
+        let pad = chunk.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (j, c) in chunk.iter().enumerate() {
+            let v = if j >= 4 - pad { 0 } else { value(*c)? };
+            n = (n << 6) | v;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+// --- the file ---------------------------------------------------------------
+
+/// The file's name for a bundle made at `made_at_ms`.
+pub(crate) fn file_name(made_at_ms: u64) -> String {
+    let date = chrono::DateTime::from_timestamp_millis(made_at_ms as i64)
+        .unwrap_or_default()
+        .format("%Y-%m-%d");
+    format!("harvest-purchases-{date}.txt")
+}
+
+/// The file's text for `bundle`.
+pub(crate) fn encode_file(bundle: &Bundle) -> Result<String, String> {
+    let cbor = harvest_common::to_cbor(bundle).map_err(|e| format!("encode the backup: {e}"))?;
+    let made = chrono::DateTime::from_timestamp_millis(bundle.made_at_ms as i64)
+        .unwrap_or_default()
+        .format("%-d %B %Y, %H:%M UTC");
+    let mut names: Vec<&str> = bundle.stores.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut text = String::new();
+    text.push_str("Harvest: a backup of your purchases\n");
+    text.push_str(&format!("Made {made}.\n"));
+    text.push_str(&format!(
+        "{} purchase{} and {} conversation{}",
+        bundle.purchases.len(),
+        if bundle.purchases.len() == 1 { "" } else { "s" },
+        bundle.conversations.len(),
+        if bundle.conversations.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+    ));
+    if !names.is_empty() {
+        text.push_str(&format!(", with {}", names.join(", ")));
+    }
+    text.push_str(".\n");
+    text.push_str(KEEP_IT_PRIVATE);
+    text.push_str("\nTo restore: open Harvest, go to Purchases, and choose Restore.\n\n");
+    text.push_str(BUNDLE_PREFIX);
+    text.push_str(&base64_encode(&cbor));
+    text.push(':');
+    text.push_str(&blake3::hash(&cbor).to_hex());
+    text.push('\n');
+    Ok(text)
+}
+
+/// The bundle a file's (or pasted) text holds.
+pub(crate) fn decode_file(text: &str) -> Result<Bundle, String> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(BUNDLE_PREFIX))
+        .ok_or("This is not a Harvest purchases backup.")?;
+    let (body, sum) = line
+        .rsplit_once(':')
+        .ok_or("This backup is damaged: its check is missing.")?;
+    let cbor = base64_decode(body.trim()).ok_or("This backup is damaged: it does not decode.")?;
+    if blake3::hash(&cbor).to_hex().as_str() != sum.trim() {
+        return Err("This backup is damaged: it does not match its check.".into());
+    }
+    let bundle: Bundle = harvest_common::from_cbor(&cbor)
+        .map_err(|e| format!("This backup could not be read: {e}"))?;
+    if bundle.version != BUNDLE_VERSION {
+        return Err(format!(
+            "This backup is version {}, and this Harvest reads version {BUNDLE_VERSION}.",
+            bundle.version
+        ));
+    }
+    Ok(bundle)
+}
+
+// --- state ------------------------------------------------------------------
+
+/// A backup being assembled from the delegate's pages.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BackupExport {
+    pub request_id: u64,
+    pub conversations: Vec<BackupConversation>,
+    pub purchases: Vec<KeptPurchase>,
+}
+
+/// A restore being sent a chunk at a time.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BackupRestore {
+    pub request_id: u64,
+    pub chunks: VecDeque<(Vec<BackupConversation>, Vec<KeptPurchase>)>,
+    pub restored: usize,
+    pub already: usize,
+    pub refused: Vec<String>,
+}
+
+/// What a request to the delegate this module wants sent.
+pub(crate) type Outgoing = Vec<harvest_common::HarvestDelegateRequest>;
+
+/// The buyer's X25519 public key for a conversation's secret: its routing
+/// tag, which a conversation is marked by.
+fn tag_of(secret: &harvest_common::ConversationSecret) -> [u8; 32] {
+    let secret = x25519_dalek::StaticSecret::from(secret.0);
+    *x25519_dalek::PublicKey::from(&secret).as_bytes()
+}
+
+impl AppState {
+    /// How many kept purchases are not in a backup the buyer holds.
+    pub fn purchases_not_backed_up(&self) -> usize {
+        self.kept_purchases.iter().filter(|k| !k.backed_up).count()
+    }
+
+    /// The code of the store at `contract_id`, if this device knows it.
+    fn code_of_store(&self, contract_id: &[u8]) -> Option<String> {
+        if let Some(code) = self.store_codes.get(contract_id) {
+            return Some(code.clone());
+        }
+        if let Some(code) = self.remembered_stores.iter().flatten().find_map(|s| {
+            let id = StoreParameters::from_code(&s.store_code)
+                .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())?;
+            (id.as_bytes() == contract_id).then(|| s.store_code.clone())
+        }) {
+            return Some(code);
+        }
+        let owner = self.browsing_stores.get(contract_id)?.owner?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&owner).ok()?;
+        Some(StoreParameters::new(key).code().to_string())
+    }
+
+    /// Start making a backup: ask for its first page.
+    pub(crate) fn start_backup_export(&mut self) -> Outgoing {
+        if self.backup_export.is_some() {
+            return Vec::new();
+        }
+        let request_id = self.next_messaging_request_id();
+        self.backup_export = Some(BackupExport {
+            request_id,
+            ..Default::default()
+        });
+        self.backup_message = Some("Making your backup\u{2026}".into());
+        vec![
+            harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
+                request_id,
+                after: None,
+            },
+        ]
+    }
+
+    /// A page of the backup arrived: ask for the next, or, after the last,
+    /// make the file and mark what it holds.
+    pub(crate) fn on_purchases_backup(
+        &mut self,
+        request_id: u64,
+        result: Result<PurchasesBackupPage, String>,
+    ) -> Outgoing {
+        let Some(export) = self.backup_export.as_mut() else {
+            return Vec::new();
+        };
+        if export.request_id != request_id {
+            return Vec::new();
+        }
+        let page = match result {
+            Ok(page) => page,
+            Err(why) => {
+                self.backup_export = None;
+                self.backup_message = Some(format!("The backup could not be made: {why}"));
+                return Vec::new();
+            }
+        };
+        export.conversations.extend(page.conversations);
+        export.purchases.extend(page.purchases);
+        if let Some(after) = page.next {
+            return vec![
+                harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
+                    request_id,
+                    after: Some(after),
+                },
+            ];
+        }
+        let export = self.backup_export.take().unwrap_or_default();
+        let made_at_ms = crate::state::now_ms();
+        let bundle = self.bundle_of(export, made_at_ms);
+        match encode_file(&bundle) {
+            Ok(text) => {
+                self.backup_file_ready = Some((file_name(made_at_ms), text));
+                self.backup_message = Some(format!(
+                    "Your backup holds {} purchase{} and {} conversation{}.",
+                    bundle.purchases.len(),
+                    if bundle.purchases.len() == 1 { "" } else { "s" },
+                    bundle.conversations.len(),
+                    if bundle.conversations.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ));
+                marks_for(&bundle, request_id)
+            }
+            Err(why) => {
+                self.backup_message = Some(format!("The backup could not be made: {why}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The bundle for what the delegate exported, each conversation's store
+    /// named by its code where this device knows it.
+    pub(crate) fn bundle_of(&self, export: BackupExport, made_at_ms: u64) -> Bundle {
+        let mut stores: Vec<BundleStore> = Vec::new();
+        let index_of = |id: &[u8], stores: &mut Vec<BundleStore>| -> u32 {
+            if let Some(at) = stores.iter().position(|s| s.contract_id_at_export == id) {
+                return at as u32;
+            }
+            stores.push(BundleStore {
+                code: self.code_of_store(id),
+                name: self.store_name_of(id).label(),
+                contract_id_at_export: id.to_vec(),
+            });
+            (stores.len() - 1) as u32
+        };
+        let conversations = export
+            .conversations
+            .into_iter()
+            .map(|conversation| BundleConversation {
+                store: index_of(&conversation.store_contract_id, &mut stores),
+                conversation,
+            })
+            .collect();
+        Bundle {
+            version: BUNDLE_VERSION,
+            made_at_ms,
+            stores,
+            conversations,
+            purchases: export.purchases,
+        }
+    }
+
+    /// Restore from a file's or a pasted text. Answers what to send.
+    pub(crate) fn start_restore(&mut self, text: &str) -> Outgoing {
+        if self.backup_restore.is_some() {
+            return Vec::new();
+        }
+        if text.trim_start().starts_with(CONVERSATION_STRING_PREFIX) {
+            self.backup_message = Some(
+                "That is a backup of one conversation. Open its store and paste it there, under \
+                 \u{201c}Restore a conversation\u{201d}."
+                    .into(),
+            );
+            return Vec::new();
+        }
+        let bundle = match decode_file(text) {
+            Ok(bundle) => bundle,
+            Err(why) => {
+                self.backup_message = Some(why);
+                return Vec::new();
+            }
+        };
+        // Each store at its address today, and remembered, so its page and
+        // My purchases list it.
+        let mut current: Vec<Vec<u8>> = Vec::with_capacity(bundle.stores.len());
+        for store in &bundle.stores {
+            let id = store
+                .code
+                .as_deref()
+                .and_then(StoreParameters::from_code)
+                .and_then(|p| crate::gateway::store_ops::store_instance_id(&p).ok())
+                .map(|id| id.as_bytes().to_vec());
+            if let Some(code) = &store.code {
+                self.remember_store(code);
+            }
+            current.push(id.unwrap_or_else(|| store.contract_id_at_export.clone()));
+        }
+        let conversations: Vec<BackupConversation> = bundle
+            .conversations
+            .into_iter()
+            .map(|c| {
+                let mut conversation = c.conversation;
+                if let Some(id) = current.get(c.store as usize) {
+                    if let Ok(id) = <[u8; 32]>::try_from(id.as_slice()) {
+                        conversation.store_contract_id = id;
+                    }
+                }
+                conversation
+            })
+            .collect();
+        let mut chunks: VecDeque<(Vec<BackupConversation>, Vec<KeptPurchase>)> = VecDeque::new();
+        for chunk in conversations.chunks(BACKUP_IMPORT_ITEMS) {
+            chunks.push_back((chunk.to_vec(), Vec::new()));
+        }
+        for chunk in bundle.purchases.chunks(BACKUP_IMPORT_ITEMS) {
+            chunks.push_back((Vec::new(), chunk.to_vec()));
+        }
+        let request_id = self.next_messaging_request_id();
+        self.backup_restore = Some(BackupRestore {
+            request_id,
+            chunks,
+            ..Default::default()
+        });
+        self.backup_message = Some("Restoring your backup\u{2026}".into());
+        self.next_restore_chunk()
+    }
+
+    fn next_restore_chunk(&mut self) -> Outgoing {
+        let Some(restore) = self.backup_restore.as_mut() else {
+            return Vec::new();
+        };
+        match restore.chunks.pop_front() {
+            Some((conversations, purchases)) => {
+                vec![
+                    harvest_common::HarvestDelegateRequest::ImportPurchasesBackup {
+                        request_id: restore.request_id,
+                        conversations,
+                        purchases,
+                    },
+                ]
+            }
+            None => {
+                let done = self.backup_restore.take().unwrap_or_default();
+                let mut message =
+                    format!("{} restored, {} already here.", done.restored, done.already);
+                if !done.refused.is_empty() {
+                    message.push_str(&format!(
+                        " {} not restored: {}",
+                        done.refused.len(),
+                        done.refused.join("; ")
+                    ));
+                }
+                self.backup_message = Some(message);
+                // What the delegate now holds, shown.
+                vec![harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+            }
+        }
+    }
+
+    /// A chunk of a restore was answered: count it, and send the next.
+    pub(crate) fn on_purchases_backup_imported(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<BackupItemOutcome>, String>,
+    ) -> Outgoing {
+        let Some(restore) = self.backup_restore.as_mut() else {
+            return Vec::new();
+        };
+        if restore.request_id != request_id {
+            return Vec::new();
+        }
+        match result {
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    match outcome {
+                        BackupItemOutcome::Imported => restore.restored += 1,
+                        BackupItemOutcome::AlreadyHeld => restore.already += 1,
+                        BackupItemOutcome::Refused(why) => restore.refused.push(why),
+                    }
+                }
+            }
+            Err(why) => restore.refused.push(why),
+        }
+        self.next_restore_chunk()
+    }
+
+    /// The marks were recorded: show what the delegate now holds.
+    pub(crate) fn on_backed_up_marked(&mut self, result: Result<u32, String>) -> Outgoing {
+        if let Err(why) = result {
+            self.backup_message = Some(format!(
+                "Your backup was made, but this device could not record it: {why}"
+            ));
+        }
+        vec![harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+    }
+}
+
+/// The `MarkBackedUp` requests for exactly what `bundle` holds.
+fn marks_for(bundle: &Bundle, request_id: u64) -> Outgoing {
+    enum Mark {
+        Conversation([u8; 32], [u8; 32]),
+        Order(harvest_common::payment::OrderId),
+    }
+    let items: Vec<Mark> = bundle
+        .conversations
+        .iter()
+        .map(|c| {
+            Mark::Conversation(
+                c.conversation.store_contract_id,
+                tag_of(&c.conversation.secret),
+            )
+        })
+        .chain(
+            bundle
+                .purchases
+                .iter()
+                .map(|p| Mark::Order(p.order.order.id.clone())),
+        )
+        .collect();
+    items
+        .chunks(BACKUP_MARK_ITEMS)
+        .map(
+            |chunk| harvest_common::HarvestDelegateRequest::MarkBackedUp {
+                request_id,
+                conversations: chunk
+                    .iter()
+                    .filter_map(|m| match m {
+                        Mark::Conversation(store, tag) => Some((*store, *tag)),
+                        Mark::Order(_) => None,
+                    })
+                    .collect(),
+                orders: chunk
+                    .iter()
+                    .filter_map(|m| match m {
+                        Mark::Order(id) => Some(id.clone()),
+                        Mark::Conversation(..) => None,
+                    })
+                    .collect(),
+            },
+        )
+        .collect()
+}
+
+/// Send each of `requests` to the delegate.
+pub(crate) fn send_all(requests: Outgoing) {
+    #[cfg(target_arch = "wasm32")]
+    for request in requests {
+        crate::state::spawn_harvest_request(request, "a purchases backup request");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = requests;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Base64 round-trips every length mod 3 and refuses what is not base64.
+    #[test]
+    fn base64_round_trips() {
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let text = base64_encode(&bytes);
+            assert_eq!(base64_decode(&text), Some(bytes), "length {len}");
+        }
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_decode("TWE"), None);
+        assert_eq!(base64_decode("TW=u"), None);
+        assert_eq!(base64_decode("T!Fu"), None);
+    }
+
+    fn conversation(seed: u8) -> BackupConversation {
+        BackupConversation {
+            store_contract_id: [seed; 32],
+            secret: harvest_common::ConversationSecret([seed.wrapping_add(1); 32]),
+            seller_public_key: [5; 32],
+            conversation_id: [seed; 32],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn bundle() -> Bundle {
+        Bundle {
+            version: BUNDLE_VERSION,
+            made_at_ms: 1_760_000_000_000,
+            stores: vec![BundleStore {
+                code: Some("Abc123".into()),
+                name: "Plum Jam Co".into(),
+                contract_id_at_export: vec![3; 32],
+            }],
+            conversations: vec![BundleConversation {
+                store: 0,
+                conversation: conversation(3),
+            }],
+            purchases: Vec::new(),
+        }
+    }
+
+    /// The file says what it is in words, holds the bundle once, and reads
+    /// back; a damaged line is refused with why. Mutated red by dropping the
+    /// check.
+    #[test]
+    fn a_file_reads_back_and_a_damaged_one_is_refused() {
+        let text = encode_file(&bundle()).unwrap();
+        assert!(text.starts_with("Harvest: a backup of your purchases\n"));
+        assert!(text.contains("0 purchases and 1 conversation, with Plum Jam Co."));
+        assert!(text.contains(KEEP_IT_PRIVATE));
+        assert_eq!(decode_file(&text), Ok(bundle()));
+        let line = text.lines().find(|l| l.starts_with(BUNDLE_PREFIX)).unwrap();
+        // One character of the body changed, still base64.
+        let at = BUNDLE_PREFIX.len() + 4;
+        let mut damaged = line.to_string();
+        let swapped = if &damaged[at..at + 1] == "A" {
+            "B"
+        } else {
+            "A"
+        };
+        damaged.replace_range(at..at + 1, swapped);
+        assert!(decode_file(&damaged)
+            .unwrap_err()
+            .contains("does not match its check"));
+        assert!(decode_file("hello").is_err());
+        assert_eq!(
+            file_name(1_760_000_000_000),
+            "harvest-purchases-2025-10-09.txt"
+        );
+    }
+
+    /// Making a backup: each page asks for the next, the last makes the
+    /// file and marks exactly what it holds (each conversation by its store
+    /// and tag, each purchase by its order), and nothing else. Mutated red
+    /// by marking before the last page, and by marking a conversation by
+    /// its secret.
+    #[test]
+    fn a_backup_is_assembled_from_pages_and_marks_what_it_holds() {
+        let mut state = AppState::default();
+        let first = state.start_backup_export();
+        let harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
+            request_id,
+            after: None,
+        } = first[0]
+        else {
+            panic!("{first:?}");
+        };
+        assert!(state.start_backup_export().is_empty(), "one at a time");
+        let next = state.on_purchases_backup(
+            request_id,
+            Ok(PurchasesBackupPage {
+                conversations: vec![conversation(3)],
+                purchases: Vec::new(),
+                next: Some("harvest:buyer_conv:x".into()),
+            }),
+        );
+        assert!(matches!(
+            &next[..],
+            [
+                harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
+                    after: Some(_),
+                    ..
+                }
+            ]
+        ));
+        assert!(state.backup_file_ready.is_none());
+        let marks = state.on_purchases_backup(
+            request_id,
+            Ok(PurchasesBackupPage {
+                conversations: vec![conversation(4)],
+                purchases: Vec::new(),
+                next: None,
+            }),
+        );
+        let (name, text) = state.backup_file_ready.clone().expect("a file");
+        assert!(name.starts_with("harvest-purchases-"));
+        let held = decode_file(&text).unwrap();
+        assert_eq!(held.conversations.len(), 2);
+        assert_eq!(held.stores.len(), 2);
+        match &marks[..] {
+            [harvest_common::HarvestDelegateRequest::MarkBackedUp {
+                conversations,
+                orders,
+                ..
+            }] => {
+                assert_eq!(
+                    conversations,
+                    &vec![
+                        ([3; 32], tag_of(&conversation(3).secret)),
+                        ([4; 32], tag_of(&conversation(4).secret)),
+                    ]
+                );
+                assert!(orders.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Restoring: chunks of at most `BACKUP_IMPORT_ITEMS`, one at a time,
+    /// each conversation filed under its store's address today (derived
+    /// from its code), the counts reported at the end, and an old
+    /// one-conversation string sent to its store's page. Mutated red by
+    /// keeping the address the file was made at when the code is known,
+    /// and by sending every chunk at once.
+    #[test]
+    fn a_restore_goes_a_chunk_at_a_time_to_each_stores_address_today() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]).verifying_key();
+        let code = StoreParameters::new(key).code().to_string();
+        let today = crate::gateway::store_ops::store_instance_id(&StoreParameters::new(key))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let mut file = bundle();
+        file.stores[0].code = Some(code);
+        file.conversations = (0..(BACKUP_IMPORT_ITEMS as u8 + 3))
+            .map(|i| BundleConversation {
+                store: 0,
+                conversation: conversation(i),
+            })
+            .collect();
+        let text = encode_file(&file).unwrap();
+
+        let mut state = AppState::default();
+        let first = state.start_restore(&text);
+        let request_id = match &first[..] {
+            [harvest_common::HarvestDelegateRequest::ImportPurchasesBackup {
+                request_id,
+                conversations,
+                ..
+            }] => {
+                assert_eq!(conversations.len(), BACKUP_IMPORT_ITEMS);
+                assert!(conversations
+                    .iter()
+                    .all(|c| c.store_contract_id.as_slice() == today.as_slice()));
+                *request_id
+            }
+            other => panic!("{other:?}"),
+        };
+        let second = state.on_purchases_backup_imported(
+            request_id,
+            Ok(vec![BackupItemOutcome::Imported; BACKUP_IMPORT_ITEMS]),
+        );
+        assert!(matches!(
+            &second[..],
+            [harvest_common::HarvestDelegateRequest::ImportPurchasesBackup { conversations, .. }]
+                if conversations.len() == 3
+        ));
+        let done = state.on_purchases_backup_imported(
+            request_id,
+            Ok(vec![
+                BackupItemOutcome::AlreadyHeld,
+                BackupItemOutcome::Imported,
+                BackupItemOutcome::Refused("full".into()),
+            ]),
+        );
+        assert!(matches!(
+            &done[..],
+            [harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+        ));
+        assert_eq!(
+            state.backup_message.as_deref(),
+            Some("17 restored, 1 already here. 1 not restored: full")
+        );
+
+        let mut state = AppState::default();
+        assert!(state
+            .start_restore("harvest-conv-backup-v2:abcdef")
+            .is_empty());
+        assert!(state
+            .backup_message
+            .as_deref()
+            .unwrap()
+            .contains("Open its store and paste it there"));
+    }
+}
