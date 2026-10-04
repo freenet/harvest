@@ -825,6 +825,24 @@ mod tests {
         backer().to_bytes()
     }
 
+    /// The header's "needs you" pill names one Ghost Key behind two stores
+    /// once, not once per store (closing either fixes both), and stops once
+    /// a close is on its way. Mutated red by counting it at every store,
+    /// and by counting it while closing.
+    #[test]
+    fn two_stores_on_one_key_is_one_thing_to_do_in_the_header() {
+        let mut state = both_ours();
+        let places = crate::components::needs::places(&state);
+        let conflicts: Vec<_> = places
+            .iter()
+            .filter(|p| p.detail.contains("close one of two stores"))
+            .collect();
+        assert_eq!(conflicts.len(), 1, "{places:?}");
+        assert_eq!(places.iter().map(|p| p.count).sum::<usize>(), 1);
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        assert!(crate::components::needs::places(&state).is_empty());
+    }
+
     /// One close at a time per Ghost Key, from the first request until the
     /// closed store's state shows it: no second close is offered or
     /// accepted meanwhile, so the seller cannot close both stores, and two

@@ -1,9 +1,12 @@
-//! My purchases: every store this device has bought from or written to, in
-//! one place (harvest#93 phase 2). Before this a buyer's orders sat under each
-//! store's own page, so finding one meant remembering which store it was.
+//! Purchases (page structure P6, P7, P9): every order this device has
+//! placed, as one flat list of rows that each open the order's page; every
+//! conversation with a store; and the backup. Before this a buyer's orders
+//! sat in cards per store with their threads inside them.
 
 use dioxus::prelude::*;
 
+use super::order_status::Status;
+use super::router::{go, OrderAt, Page};
 use crate::gateway::APP_STATE;
 use crate::state::AppState;
 
@@ -57,15 +60,142 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
     rows
 }
 
+/// The tabs on Purchases.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurchasesTab {
+    Orders,
+    Messages,
+}
+
+/// One of the buyer's orders, as a row of Purchases (P6).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OrderRow {
+    pub page: Page,
+    /// "Aran skein × 1", or `unnamed_order` when the item can't be named here.
+    pub item: String,
+    pub store: String,
+    pub date: Option<chrono::DateTime<chrono::Utc>>,
+    pub amount: Option<String>,
+    pub status: Status,
+    /// The buyer can pay it now: the row's one quick action, and "needs you".
+    pub to_pay: bool,
+    pub picture: Option<String>,
+}
+
+/// Every order this device has placed or keeps, newest first: the purchases
+/// at every store it has dealt with ([`purchase_rows`]), then the kept
+/// orders those don't already show (`buy_view::kept_purchases_to_list`).
+pub(crate) fn order_rows(state: &AppState) -> Vec<OrderRow> {
+    let mut rows: Vec<OrderRow> = Vec::new();
+    let stores = purchase_rows(state);
+    for store in stores.iter() {
+        let id = &store.store_contract_id;
+        for purchase in state.buyer_purchases(id) {
+            // Not this buyer's: never an order of theirs.
+            if purchase
+                .blockers
+                .iter()
+                .any(|b| matches!(b, crate::state::PaymentBlocker::CommitmentNotForThisBuyer))
+            {
+                continue;
+            }
+            let status = super::order_status::buyer_status(state, id, &purchase);
+            let order = purchase.commitment.as_ref().or(purchase.paid.as_ref());
+            let listing = state.purchase_listing(id, &purchase);
+            rows.push(OrderRow {
+                page: Page::Order {
+                    at: OrderAt::Store(id.clone()),
+                    order: purchase.order_id.clone(),
+                },
+                item: match &listing {
+                    Some((_, Some(title), q)) => format!("{title}\u{a0}\u{00d7}\u{a0}{q}"),
+                    Some((_, None, q)) => format!("An item no longer listed \u{00d7} {q}"),
+                    None => unnamed_order(state.store_name_of(id).name()),
+                },
+                store: store.name.clone(),
+                date: order.map(|o| o.order.created_at),
+                amount: order.map(|o| super::pay_card::money(o.order.amount_sats, o.order.network)),
+                to_pay: super::order_status::can_pay_now(state, id, &purchase),
+                picture: listing.as_ref().and_then(|(l, t, _)| {
+                    super::item_image::listing_image(l, t.as_deref().unwrap_or_default())
+                }),
+                status,
+            });
+        }
+    }
+    let shown = shown_order_ids(state, &stores);
+    for kept in super::buy_view::kept_purchases_to_list(&state.kept_purchases, &shown) {
+        let found = state
+            .browsing_stores
+            .iter()
+            .find(|(_, s)| s.owner == Some(kept.store_key))
+            .map(|(id, _)| state.store_name_of(id));
+        let item = unnamed_order(found.as_ref().and_then(|n| n.name()));
+        let store = found
+            .map(|n| n.label())
+            .unwrap_or_else(|| "A store you have used".to_string());
+        rows.push(OrderRow {
+            page: Page::Order {
+                at: OrderAt::Kept(kept.store_key),
+                order: kept.order.order.id.clone(),
+            },
+            item,
+            store,
+            date: Some(kept.order.order.created_at),
+            amount: Some(super::pay_card::money(
+                kept.order.order.amount_sats,
+                kept.order.order.network,
+            )),
+            status: super::order_status::kept_status(state, &kept),
+            to_pay: false,
+            picture: None,
+        });
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.date));
+    rows
+}
+
+/// The header of both Purchases pages: the title, the Backup button, and the
+/// tabs Orders and Messages.
 #[component]
-pub fn MyPurchases() -> Element {
-    // The stores this device has used, loaded in the background, since only
-    // a loaded store recalls this device's conversations with it.
+fn PurchasesHead(tab: PurchasesTab, new_replies: usize) -> Element {
+    rsx! {
+        div { class: "page-head",
+            h2 { "Purchases" }
+            button { class: "btn btn-sm btn-outline", onclick: move |_| go(Page::Backup), "Backup" }
+        }
+        div { class: "tabs", role: "tablist",
+            button {
+                class: if tab == PurchasesTab::Orders { "tab active" } else { "tab" },
+                role: "tab",
+                aria_selected: if tab == PurchasesTab::Orders { "true" } else { "false" },
+                onclick: move |_| super::router::replace(Page::Purchases),
+                "Orders"
+            }
+            button {
+                class: if tab == PurchasesTab::Messages { "tab active" } else { "tab" },
+                role: "tab",
+                aria_selected: if tab == PurchasesTab::Messages { "true" } else { "false" },
+                onclick: move |_| super::router::replace(Page::PurchaseMessages),
+                "Messages"
+                if new_replies > 0 {
+                    " "
+                    span { class: "tab-needs", "{new_replies}" }
+                }
+            }
+        }
+    }
+}
+
+/// Re-render once the wait for the list of remembered stores runs out (from
+/// the app's start), so "Checking…" cannot outlast it; and ask for every
+/// store this device has used, since only a loaded store recalls this
+/// device's conversations with it. Returns whether that is still under way,
+/// and how many stores could not be reached.
+fn use_purchases_loading() -> (bool, usize) {
     // An effect, so it runs again when the delegate's list of remembered
     // stores arrives after this page opened; loading is idempotent per store.
     use_effect(|| crate::store_link::load_visited_stores(false, true));
-    // Re-rendered once when the wait for the list of remembered stores runs
-    // out (from the app's start), so "Checking…" cannot outlast it.
     #[allow(unused_mut)]
     let mut clock = use_signal(|| 0u32);
     #[cfg(target_arch = "wasm32")]
@@ -83,78 +213,382 @@ pub fn MyPurchases() -> Element {
         }
     });
     let _ = clock();
-    let rows = purchase_rows(&APP_STATE.read());
     // Still being asked for (a GET out, or a retry waiting), and could not be
     // loaded: neither is a confirmed empty history (codex on #197 round 4).
     let (pending, failed) = APP_STATE.read().visited_load_state();
     // Also while the list of remembered stores hasn't arrived: before it,
     // nothing is being loaded yet, and "Nothing yet" would read as "my
-    // orders are gone" (round-6 critique). Bounded by the same wait as the
-    // Stores page's.
+    // orders are gone" (round-6 critique R6-2).
     let loading = pending > 0
         || !APP_STATE.read().background_loads.is_empty()
         || APP_STATE
             .read()
             .remembered_stores_awaited(crate::state::now_ms());
-    let any_kept = !APP_STATE.read().kept_purchases.is_empty();
-    // The orders the store cards below already show, so the kept list does
-    // not show them a second time.
-    let shown = shown_order_ids(&APP_STATE.read(), &rows);
+    (loading, failed)
+}
 
+/// Whether any conversation this device keeps has no backup anywhere else:
+/// the banner that sends the buyer to Backup until there is one.
+pub(crate) fn backup_due(state: &AppState) -> bool {
+    state
+        .browsing_stores
+        .iter()
+        .filter(|(id, _)| state.store_owner_fingerprint(id).is_none())
+        .any(|(_, store)| store.conversations.iter().any(|c| !c.backed_up))
+}
+
+/// P6: every order this device has placed, newest first, with what needs
+/// the buyer on top and ended orders folded at the foot.
+#[component]
+pub fn PurchasesPage() -> Element {
+    let (loading, failed) = use_purchases_loading();
+    let mut show_ended = use_signal(|| false);
+    let (rows, replies, banner) = {
+        let state = APP_STATE.read();
+        (
+            order_rows(&state),
+            // A reply belongs to a conversation, not to one of its orders:
+            // its own row under "Needs you", so the rows there add up to
+            // the header's count (critique C8).
+            conversation_rows(&state)
+                .into_iter()
+                .filter(|row| row.new_reply)
+                .collect::<Vec<_>>(),
+            backup_due(&state),
+        )
+    };
+    let new_replies = replies.len();
+    let (needs, rest): (Vec<&OrderRow>, Vec<&OrderRow>) = rows.iter().partition(|row| row.to_pay);
+    let (ended, earlier): (Vec<&OrderRow>, Vec<&OrderRow>) =
+        rest.into_iter().partition(|row| row.status.ended());
     rsx! {
-        div {
-            h2 { "Purchases" }
-            p { class: "text-muted small",
-                "Kept by the Freenet node on this device, not in the network, so they do not follow "
-                "you to another computer. Back up a conversation from its store\u{2019}s page, under \
-                 Ask the seller a question."
+        PurchasesHead { tab: PurchasesTab::Orders, new_replies }
+        if banner {
+            p { class: "coin-note",
+                "Your purchases are saved on this device only. "
+                button { class: "link-btn", onclick: move |_| go(Page::Backup), "Save a backup" }
+                " so you don\u{2019}t lose them."
             }
-            if loading {
-                p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }
+        }
+        if loading {
+            p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }
+        }
+        if let Some(note) = unreachable_note(failed) {
+            p { class: "text-warning", "{note}" }
+        }
+        if rows.is_empty() && !loading && failed == 0 {
+            div { class: "empty-block",
+                p { "No purchases yet." }
+                p { class: "text-muted small", "When you buy something it is listed here." }
             }
-            if let Some(note) = unreachable_note(failed) {
-                p { class: "text-warning", "{note}" }
+        }
+        if !needs.is_empty() || !replies.is_empty() {
+            h3 { class: "sec-lbl sec-lbl-first", "Needs you" }
+            for row in needs.iter() {
+                OrderRowView { key: "{row.page.fragment()}", row: (*row).clone() }
             }
-            if rows.is_empty() && !loading && failed == 0 && !any_kept {
-                div { class: "card empty-state",
-                    p { "Nothing yet." }
-                    p {
-                        "When you ask a store a question or buy something, it is listed here. "
-                        "Open a store from Stores to start."
+            for row in replies.iter() {
+                button {
+                    key: "{bs58::encode(row.tag).into_string()}",
+                    class: "rowcard",
+                    onclick: {
+                        let page = Page::Conversation { store: row.store.clone(), tag: Some(row.tag) };
+                        move |_| go(page.clone())
+                    },
+                    span { class: "rc-main",
+                        span { class: "rc-name", "{row.name} replied" }
+                        span { class: "rc-sub", "{row.latest}" }
                     }
+                    span { class: "rc-status",
+                        span { class: "pill pill-needs", "New reply" }
+                    }
+                    span { class: "chev", aria_hidden: "true", "\u{203a}" }
                 }
             }
-            for row in rows {
-                div { class: "card purchase-store", key: "{bs58::encode(&row.store_contract_id).into_string()}",
-                    div { class: "row-between",
-                        h3 { class: "purchase-store-name", "{row.name}" }
-                        button {
-                            class: "btn btn-sm btn-outline",
-                            onclick: {
-                                let id = row.store_contract_id.clone();
-                                move |_| super::app::open_store_page(id.clone())
-                            },
-                            "Open store"
-                        }
-                    }
-                    p { class: "text-muted small",
-                        {summary(row.orders, row.ended, row.conversations)}
-                    }
-                    super::buy_view::Purchases { store_contract_id: row.store_contract_id.clone() }
+        }
+        if !earlier.is_empty() {
+            h3 { class: if needs.is_empty() && replies.is_empty() { "sec-lbl sec-lbl-first" } else { "sec-lbl" }, "Earlier" }
+            for row in earlier.iter() {
+                OrderRowView { key: "{row.page.fragment()}", row: (*row).clone() }
+            }
+        }
+        if !ended.is_empty() {
+            button {
+                class: "link-btn",
+                onclick: move |_| show_ended.toggle(),
+                if show_ended() {
+                    "Hide ended orders"
+                } else if ended.len() == 1 {
+                    "Show 1 ended order (expired or cancelled)"
+                } else {
+                    "Show {ended.len()} ended orders (expired or cancelled)"
                 }
             }
-            // Every purchase this node keeps, from the kept records alone
-            // (R5-B of #143), with the complaint control: a store re-keyed
-            // while its seller stays away, or one nobody hosts, still leaves
-            // the buyer these. On this page since the Payments tab became
-            // the footer's diagnostics (harvest#93 phase 2).
-            super::buy_view::KeptPurchases { shown }
+            if show_ended() {
+                for row in ended.iter() {
+                    OrderRowView { key: "{row.page.fragment()}", row: (*row).clone() }
+                }
+            }
         }
     }
 }
 
-/// The kept purchases the store cards on this page already show, with their
-/// complaint control (`AppState::kept_purchases_shown_at` of each row).
+/// One order's row: the whole row opens its page; "Pay now" in place of the
+/// status when the buyer can pay it.
+#[component]
+fn OrderRowView(row: OrderRow) -> Element {
+    let sub = [
+        Some(row.store.clone()),
+        row.date.map(super::order_status::short_date),
+        row.amount.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" \u{00b7} ");
+    rsx! {
+        button {
+            class: if row.status.ended() { "rowcard row-off" } else { "rowcard" },
+            onclick: {
+                let page = row.page.clone();
+                move |_| go(page.clone())
+            },
+            super::item_image::RowThumb { src: row.picture.clone() }
+            span { class: "rc-main",
+                span { class: "rc-name", "{row.item}" }
+                span { class: "rc-sub", "{sub}" }
+            }
+            span { class: "rc-status",
+                // The row's one quick action, drawn as the button it is
+                // (critique C9); the row itself is what is pressed.
+                if row.to_pay {
+                    span { class: "btn btn-sm btn-primary row-action", "Pay now" }
+                } else {
+                    span { class: "{row.status.pill_class()}", "{row.status.label()}" }
+                }
+            }
+            span { class: "chev", aria_hidden: "true", "\u{203a}" }
+        }
+    }
+}
+
+/// One conversation's row on Purchases > Messages.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConversationRow {
+    pub store: Vec<u8>,
+    pub tag: [u8; 32],
+    pub name: String,
+    pub latest: String,
+    pub orders: usize,
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+    pub new_reply: bool,
+}
+
+/// Every conversation this device has with a store that holds a message,
+/// the ones with a new reply first, then newest first.
+pub(crate) fn conversation_rows(state: &AppState) -> Vec<ConversationRow> {
+    let mut rows = Vec::new();
+    for store in purchase_rows(state) {
+        let id = &store.store_contract_id;
+        let Some(browsing) = state.browsing_stores.get(id) else {
+            continue;
+        };
+        let purchases = state.buyer_purchases(id);
+        for conversation in browsing.conversations.iter() {
+            let tag = conversation.buyer_public_key;
+            let Some(summary) = super::message_view::buyer_conversation_summary(state, id, tag)
+            else {
+                continue;
+            };
+            let latest = summary
+                .latest
+                .as_ref()
+                .map(|line| {
+                    let text = match &line.item {
+                        super::message_view::ChatItem::Said(t) => super::seller_pages::one_line(t),
+                        super::message_view::ChatItem::Event(t) => t.clone(),
+                    };
+                    format!("{}: {text}", line.who)
+                })
+                .unwrap_or_else(|| "You: sending\u{2026}".to_string());
+            rows.push(ConversationRow {
+                store: id.clone(),
+                tag,
+                name: store.name.clone(),
+                latest,
+                // Orders still standing, as the store's page counts them
+                // (round-6 R6-1): an expired or cancelled one is not.
+                orders: purchases
+                    .iter()
+                    .filter(|p| p.conversation == tag)
+                    .filter(|p| {
+                        !super::order_status::buyer_status(state, id, p).ended()
+                            && !p.blockers.iter().any(|b| {
+                                matches!(b, crate::state::PaymentBlocker::CommitmentNotForThisBuyer)
+                            })
+                    })
+                    .count(),
+                at: summary.latest_at,
+                new_reply: super::message_view::is_new_reply(&summary, &tag),
+            });
+        }
+    }
+    rows.sort_by_key(|row| (std::cmp::Reverse(row.new_reply), std::cmp::Reverse(row.at)));
+    rows
+}
+
+/// P7: every conversation with a store, including questions asked before
+/// buying.
+#[component]
+pub fn PurchaseMessagesPage() -> Element {
+    let (loading, _) = use_purchases_loading();
+    let rows = conversation_rows(&APP_STATE.read());
+    let new_replies = rows.iter().filter(|r| r.new_reply).count();
+    rsx! {
+        PurchasesHead { tab: PurchasesTab::Messages, new_replies }
+        if loading {
+            p { class: "text-muted text-italic", "Checking the stores you have used\u{2026}" }
+        } else if rows.is_empty() {
+            div { class: "empty-block",
+                p { "No messages." }
+            }
+        }
+        for row in rows.iter() {
+            button {
+                key: "{bs58::encode(row.tag).into_string()}",
+                class: "rowcard",
+                onclick: {
+                    let page = Page::Conversation { store: row.store.clone(), tag: Some(row.tag) };
+                    move |_| go(page.clone())
+                },
+                span { class: "rc-main",
+                    span { class: "rc-name", "{row.name}" }
+                    span { class: "rc-sub",
+                        "{row.latest} \u{00b7} "
+                        if row.orders == 0 {
+                            "question, no order"
+                        } else {
+                            {super::needs::plural(row.orders, "order", "orders")}
+                        }
+                    }
+                }
+                span { class: "rc-status",
+                    if row.new_reply {
+                        span { class: "pill pill-needs", "New reply" }
+                    }
+                    if let Some(at) = row.at {
+                        span { class: "rc-when", "{super::order_status::short_date(at)}" }
+                    }
+                }
+                span { class: "chev", aria_hidden: "true", "\u{203a}" }
+            }
+        }
+        p { class: "text-muted small foot-note",
+            "To ask a store something, open it and choose Message the seller."
+        }
+    }
+}
+
+/// One conversation this device keeps, as Backup lists it: its store, the
+/// store's name, its tag, when it started and whether it is backed up.
+type KeptConversation = (Vec<u8>, String, [u8; 32], i64, bool);
+
+/// P9: keep a copy of the purchases and messages this device holds, and
+/// bring one back on another device.
+///
+/// One backup for everything needs the approved delegate change (one backup
+/// for all purchases); until it lands, each conversation, which holds that
+/// store's orders and messages, is saved on its own, and this page lists
+/// them.
+#[component]
+pub fn BackupPage() -> Element {
+    let kept: Vec<KeptConversation> = {
+        let state = APP_STATE.read();
+        let mut kept = Vec::new();
+        for (id, store) in state.browsing_stores.iter() {
+            if state.store_owner_fingerprint(id).is_some() {
+                continue;
+            }
+            for c in store.conversations.iter() {
+                kept.push((
+                    id.clone(),
+                    state.store_name_of(id).label(),
+                    c.buyer_public_key,
+                    c.created_at,
+                    c.backed_up,
+                ));
+            }
+        }
+        kept.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then(a.3.cmp(&b.3))
+        });
+        kept
+    };
+    let unsaved = kept.iter().filter(|k| !k.4).count();
+    rsx! {
+        super::seller_pages::BackTo { label: "Purchases".to_string(), page: Page::Purchases }
+        h2 { class: "page-h", "Backup" }
+        p { class: "lede",
+            "Your purchases and messages are saved on this device only. A backup lets you see them, \
+             and report a problem, on another device."
+        }
+        section { class: "panel",
+            p { class: "text-muted small",
+                "Each store you have bought from or written to has its own backup, which holds your \
+                 orders and messages with it. Keep it private, like a password: anyone who has it \
+                 can read your messages and report problems as you."
+            }
+            if kept.is_empty() {
+                p { class: "text-muted",
+                    "Nothing to back up yet: you haven\u{2019}t bought from or written to a store on this device."
+                }
+            } else if unsaved == 0 {
+                p { class: "text-muted small", "You have saved a backup of each of them." }
+            } else if unsaved == 1 {
+                p { class: "text-warning", "1 of them exists on this device and nowhere else." }
+            } else {
+                p { class: "text-warning", "{unsaved} of them exist on this device and nowhere else." }
+            }
+            for (store , name , tag , created , backed_up) in kept.iter() {
+                div { key: "{bs58::encode(tag).into_string()}", class: "backup-row",
+                    div { class: "row-between",
+                        span {
+                            strong { "{name}" }
+                            span { class: "text-muted small", " \u{00b7} started {started_on(*created)}" }
+                        }
+                        if *backed_up {
+                            span { class: "pill pill-open", "Saved" }
+                        } else {
+                            span { class: "pill", "Not saved" }
+                        }
+                    }
+                    super::message_view::ConversationBackupControl {
+                        store_contract_id: store.clone(),
+                        tag: *tag,
+                        primary: !*backed_up,
+                    }
+                }
+            }
+        }
+        section { class: "panel",
+            h3 { class: "panel-h", "Restore from a backup" }
+            super::message_view::Restore {}
+        }
+    }
+}
+
+/// "27 Sep", for when a conversation was started (seconds since 1970).
+fn started_on(created_at: i64) -> String {
+    chrono::DateTime::from_timestamp(created_at, 0)
+        .map(super::order_status::short_date)
+        .unwrap_or_else(|| "at an unknown time".to_string())
+}
+
+/// The kept purchases the loaded stores' purchases already show, judged
+/// from the same kept copy (`AppState::kept_purchases_shown_at` of each
+/// store), so a paid order is not listed twice.
 pub(crate) fn shown_order_ids(
     state: &AppState,
     rows: &[PurchaseRow],
@@ -181,29 +615,38 @@ fn unreachable_note(failed: usize) -> Option<String> {
     }
 }
 
-fn summary(orders: usize, ended: usize, conversations: usize) -> String {
-    let orders = match (orders, ended) {
-        (0, 0) => "No orders yet".to_string(),
-        (0, _) => "No orders standing".to_string(),
-        (1, _) => "1 order".to_string(),
-        (n, _) => format!("{n} orders"),
-    };
-    let ended = match ended {
-        0 => String::new(),
-        n => format!(" · {n} ended unpaid"),
-    };
-    let conversations = match conversations {
-        0 => String::new(),
-        1 => " · 1 conversation".to_string(),
-        n => format!(" · {n} conversations"),
-    };
-    format!("{orders}{ended}{conversations}")
+/// What an order is called when this device cannot say what it was for.
+/// The item is named only inside the buyer's conversation with the store
+/// (`Order` carries no listing id, harvest#57), and only for a Buy now
+/// (`AppState::purchase_listing`): an order the seller made by hand, one
+/// from a forgotten conversation, or one restored from a backup has no item
+/// to show. Named by its store when the store's name is known, never by its
+/// code, which says nothing to a person; the code is beside it.
+pub(crate) fn unnamed_order(store: Option<&str>) -> String {
+    match store {
+        Some(store) => format!("An order from {store}"),
+        None => "An order".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::BrowsingStore;
+
+    /// An order this device can't name is named by its store, and only by a
+    /// name the store published, never "Loading…" (review of round 4); never
+    /// by its code. Mutated red by passing `label()` instead of `name()`.
+    #[test]
+    fn an_unnamed_order_is_named_by_its_store_or_not_at_all() {
+        assert_eq!(
+            super::unnamed_order(Some("Bean Shop")),
+            "An order from Bean Shop"
+        );
+        assert_eq!(super::unnamed_order(None), "An order");
+        let loading = crate::state::StoreName::Loading;
+        assert_eq!(super::unnamed_order(loading.name()), "An order");
+    }
 
     fn named(name: &str) -> BrowsingStore {
         BrowsingStore {
@@ -448,18 +891,6 @@ mod tests {
         state.on_contract_state(id.clone(), vec![0xFF, 0x00, 0x13]);
         assert_eq!(state.store_load_failures.get(&id).map(|f| f.0), Some(1));
         assert!(!state.background_load_due(&id, crate::state::now_ms(), false));
-    }
-
-    #[test]
-    fn the_summary_counts_what_there_is() {
-        assert_eq!(summary(0, 0, 1), "No orders yet · 1 conversation");
-        assert_eq!(summary(2, 0, 0), "2 orders");
-        assert_eq!(summary(1, 0, 3), "1 order · 3 conversations");
-        assert_eq!(
-            summary(3, 3, 1),
-            "3 orders · 3 ended unpaid · 1 conversation"
-        );
-        assert_eq!(summary(0, 2, 0), "No orders standing · 2 ended unpaid");
     }
 }
 

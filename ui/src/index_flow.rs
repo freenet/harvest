@@ -1325,8 +1325,11 @@ mod tests {
             "only the failure is told: {sent}"
         );
         let messages = code(include_str!("components/message_view.rs"));
+        let counted = &messages[messages
+            .find("fnrequests_awaiting_invoice_by_tag(")
+            .expect("the count")..];
         assert!(
-            messages.contains("ifstore.closed{return0;}count_unanswered("),
+            counted.contains("ifstore.closed{returnDefault::default();}unanswered_by_tag("),
             "a closed store's requests are not counted"
         );
         let my_store = code(include_str!("components/my_store.rs"));
@@ -1341,8 +1344,23 @@ mod tests {
         assert!(my_store.contains("}elseiflegacy_movable&&gate_open{"));
         assert!(my_store
             .contains("letgate=APP_STATE.read().store_creation_gate(&fingerprint,&vk_bytes);"));
+        // Every other component file: store opening spans several pages.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/components");
+        let elsewhere: usize = std::fs::read_dir(dir)
+            .expect("components dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "my_store.rs")
+            })
+            .map(|path| {
+                code(&std::fs::read_to_string(path).expect("read component"))
+                    .matches("another_store")
+                    .count()
+            })
+            .sum();
         assert_eq!(
-            my_store.matches("another_store").count(),
+            my_store.matches("another_store").count() + elsewhere,
             1,
             "the UI never asks for a second store on purpose"
         );

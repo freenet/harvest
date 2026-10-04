@@ -92,8 +92,8 @@ pub(crate) fn creation_refusal(gate: &crate::index_flow::CreationGate) -> Option
              so use a different Ghost Key for another"
         )),
         CreationGate::ListsUnloadedStore(code) => Some(format!(
-            "this Ghost Key already has a store (code {code}). One Ghost Key can back only one \
-             store, so use a different Ghost Key for another"
+            "this Ghost Key already has a store (code {code}) that Harvest can\u{2019}t reach \
+             right now. Try again later, or use a different Ghost Key"
         )),
     }
 }
@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
         assert!(
             creation_refusal(&CreationGate::ListsUnloadedStore("abc".into()))
                 .unwrap()
-                .contains("(code abc)")
+                .contains("(code abc) that Harvest can\u{2019}t reach right now. Try again later")
         );
     }
 

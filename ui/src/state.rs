@@ -35,6 +35,8 @@ pub enum SellerRequest {
 /// ([`AppState::seller_order_request`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SellerOrderRequest {
+    /// The listing the buyer asked for.
+    pub listing_id: Option<harvest_common::listing::ListingId>,
     /// The listing's title, while the store still lists it.
     pub title: Option<String>,
     pub quantity: u32,
@@ -1352,7 +1354,7 @@ pub(crate) fn spawn_bitcoin_requests(requests: Vec<harvest_common::BitcoinDelega
                     state.abandon_payment_key_request(request_id);
                     state
                         .notifications
-                        .push(format!("Could not save your payment key: {e}"));
+                        .push(format!("Could not save your payout wallet: {e}"));
                 }
                 Req::DeriveOrderAddress { request_id, .. } => {
                     state.abandon_address_request(request_id);
@@ -1493,6 +1495,10 @@ pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
 // Longer than a delegate usually takes to answer (seconds, even on a loaded
 // node), short enough that "Checking" does not look like a hang.
 const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
+
+/// Why nothing is invoiced at a store closed for good (harvest#181).
+pub(crate) const STORE_CLOSED_INVOICE: &str =
+    "this store is closed for good, so it can't take orders any more";
 
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
@@ -7820,6 +7826,7 @@ impl AppState {
                     Some((
                         answering.order.id.clone(),
                         SellerOrderRequest {
+                            listing_id: Some(listing_id.clone()),
                             title: listing.map(|l| l.title.clone()),
                             quantity: *quantity,
                             shipping: shipping.clone(),
@@ -7887,6 +7894,17 @@ impl AppState {
         store_contract_id: &[u8],
         purchase: &BuyerPurchase,
     ) -> Option<(Option<String>, u32)> {
+        self.purchase_listing(store_contract_id, purchase)
+            .map(|(_, title, quantity)| (title, quantity))
+    }
+
+    /// [`Self::purchase_item`] with the listing the buyer asked for, which a
+    /// purchase's row and page show the item's picture by, when it has one.
+    pub fn purchase_listing(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<(harvest_common::listing::ListingId, Option<String>, u32)> {
         use crate::messaging::{Addressing, MessageContent};
         let store = self.browsing_stores.get(store_contract_id)?;
         let conversation = store
@@ -7927,7 +7945,64 @@ impl AppState {
             .iter()
             .find(|l| l.listing.id == listing_id)
             .map(|l| l.listing.title.clone());
-        Some((title, quantity))
+        Some((listing_id, title, quantity))
+    }
+
+    /// Where the buyer asked for `purchase` to be sent, as they typed it in
+    /// their own request: the address, the note, and the region and picks
+    /// (named by their group). The order page shows it under "Sending to".
+    /// `None` when the request is not in this device's thread, or two
+    /// requests under the order's id disagree.
+    pub fn purchase_ship_to(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<SellerOrderRequest> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)?;
+        let asked: Vec<SellerOrderRequest> = conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    shipping,
+                    note,
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&purchase.conversation)
+                        .is_some_and(|request| request.order_id() == purchase.order_id) =>
+                {
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == listing_id)
+                        .map(|l| &l.listing);
+                    Some(SellerOrderRequest {
+                        title: listing.map(|l| l.title.clone()),
+                        listing_id: Some(listing_id),
+                        quantity,
+                        shipping,
+                        note,
+                        region: selection.region.clone(),
+                        choices: labelled_choices(
+                            listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                            &selection.choices,
+                        ),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let first = asked.first()?.clone();
+        asked.iter().all(|other| *other == first).then_some(first)
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for
@@ -12075,6 +12150,16 @@ impl AppState {
                 "this store belongs to {owner}, so only that identity can issue invoices \
                  on it"
             ));
+        }
+        // Closing for good is permanent and buyers refuse to pay a closed
+        // store (`PaymentBlocker::StoreClosed`), so nothing is issued there
+        // (harvest#181).
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_some_and(|store| store.closed)
+        {
+            return Err(STORE_CLOSED_INVOICE.to_string());
         }
         // A listing its seller took down is not one to start a fresh sale of
         // (harvest#70). An invoice answering a buyer's request is allowed
@@ -21795,6 +21880,24 @@ mod invoice_tests {
         );
     }
 
+    /// A store closed for good issues nothing (harvest#181): buyers refuse
+    /// to pay it, and closing is permanent. Mutated red by dropping the
+    /// closed check in `issue_invoice`.
+    #[test]
+    fn a_store_closed_for_good_cannot_issue_an_invoice() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .entry(STORE_ID.to_vec())
+            .or_default()
+            .closed = true;
+        assert_eq!(
+            state.issue_invoice(invoice()),
+            Err(STORE_CLOSED_INVOICE.to_string())
+        );
+        assert!(state.pending_invoices.is_empty());
+    }
+
     /// **A seller who cannot see the chain issues nothing at all.**
     ///
     /// The alternative is worse than it looks: an unanchored invoice is one
@@ -27389,7 +27492,7 @@ mod buy_flow_tests {
         );
     }
 
-    /// **My store's overview counts the orders a seller must reissue, and
+    /// **The seller's Home tab counts the orders a seller must reissue, and
     /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
     /// fresh one and a cancelled one do not. Pins the composition in
     /// `my_store::seller_stores` (seller filter, `needs_reissue`, and

@@ -194,7 +194,17 @@ pub fn open_store_from_url() {
         }
         return;
     };
-    open_store(params);
+    // In place of the link's own fragment, so Back does not return to it.
+    let Ok(store_id) = crate::gateway::store_ops::store_instance_id(&params) else {
+        return;
+    };
+    crate::gateway::APP_STATE
+        .write()
+        .note_store_code(store_id.as_bytes().to_vec(), params.code().to_string());
+    crate::components::router::replace(crate::components::router::Page::Store {
+        store: store_id.as_bytes().to_vec(),
+        tab: crate::components::router::StoreTab::Items,
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -228,14 +238,19 @@ pub fn open_store(params: StoreParameters) {
     open_store_id(store_id);
 }
 
-/// Open the store with this address: show its page, and fetch it with a
-/// subscription, giving up after `LINK_LOAD_TIMEOUT_MS` so the page never
-/// waits for good. For a store whose code this node does not know, too
-/// (`components::open_store_page`).
+/// Open the store with this address: show its page, which fetches it
+/// (`components::app::load_store_for_page`, then [`fetch_store_id`]).
 pub fn open_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
+    crate::components::show_store(store_id.as_bytes().to_vec());
+}
+
+/// Fetch the store with this address with a subscription, giving up after
+/// `LINK_LOAD_TIMEOUT_MS` so a page showing it never waits for good. For a
+/// store whose code this node does not know, too. Called when a page that
+/// shows the store opens (`components::app::load_store_for_page`).
+pub fn fetch_store_id(store_id: freenet_stdlib::prelude::ContractInstanceId) {
     use dioxus::prelude::WritableExt;
     let contract_id = store_id.as_bytes().to_vec();
-    crate::components::show_store(contract_id.clone());
     // `false` when its GET is already out, with its own wait: only shown.
     let started = crate::gateway::APP_STATE
         .write()

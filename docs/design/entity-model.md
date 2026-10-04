@@ -751,6 +751,8 @@ source for a value, or removes a cross-contract check.
 
 ## 4. UI structure
 
+> **Superseded 2026-10-01.** The seller's "My store > Overview" tab drawn below, with its order cards that expand into message threads, was replaced by one page per thing: the store header with the tabs Home, Orders, Messages, Listings and Settings, an order page and a conversation page (see PR #214, `ui/src/components/router.rs` and `seller_pages.rs`). The record below is kept as written.
+
 ### Navigation
 
 ```
