@@ -775,6 +775,13 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
     // waiting for an invoice, or a paid order waiting to be sent. Never an
     // unpaid Buy now.
     let orders_needs = store.needs_you();
+    let (paused_now, pause_pending) = {
+        let state = APP_STATE.read();
+        (
+            state.store_paused(&store.contract_id),
+            state.store_pause_pending(&store.contract_id),
+        )
+    };
 
     let current = tab();
 
@@ -782,6 +789,18 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
         div { class: "dashboard",
         div { class: "dashboard-head",
             h2 { class: "dashboard-title", "{store.label}" }
+            if paused_now {
+                span { class: "pill", "Paused" }
+                button {
+                    class: "link-btn",
+                    disabled: pause_pending,
+                    onclick: {
+                        let id = store.contract_id.clone();
+                        move |_| set_paused(id.clone(), false)
+                    },
+                    if pause_pending { "Saving\u{2026}" } else { "Resume" }
+                }
+            }
             if stores.len() > 1 {
                 select {
                     class: "form-select store-switcher",
@@ -845,6 +864,86 @@ fn StoreDashboard(stores: Vec<SellerStore>) -> Element {
     }
 }
 
+/// Pause or resume one of our stores (step 2; `crate::pause_flow`). A
+/// second click before the first shows is dropped, as a listing's is.
+fn set_paused(store_contract_id: Vec<u8>, paused: bool) {
+    let mut state = APP_STATE.write();
+    if state.store_pause_pending(&store_contract_id) {
+        return;
+    }
+    if let Err(e) = state.queue_store_pause(store_contract_id, paused) {
+        state.notifications.push(format!(
+            "Could not {} your store: {e}",
+            if paused { "pause" } else { "resume" }
+        ));
+    }
+}
+
+/// "Taking orders" in Settings: pause the store, or resume it (step 2).
+/// Nothing for a closed store, which a pause cannot reopen.
+#[component]
+fn PauseCard(store_contract_id: Vec<u8>) -> Element {
+    // "Saving" is judged against the clock, as a listing's is
+    // (`SellerListings`): re-render now and then so a pause whose echo never
+    // came stops saying so when its window ends.
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            clock += 1;
+        }
+    });
+    let _ = clock();
+    let (closed, paused, pending) = {
+        let state = APP_STATE.read();
+        (
+            state
+                .browsing_stores
+                .get(&store_contract_id)
+                .is_some_and(|s| s.closed),
+            state.store_paused(&store_contract_id),
+            state.store_pause_pending(&store_contract_id),
+        )
+    };
+    if closed {
+        return rsx! {};
+    }
+    rsx! {
+        section { class: "card",
+            h3 { "Taking orders" }
+            if paused {
+                p {
+                    "Your store is paused. Buyers see \u{201c}Closed for now\u{201d} and can\u{2019}t "
+                    "use Buy now. Invoices you send by hand still go out, and payments for "
+                    "invoices already sent are still watched."
+                }
+            } else {
+                p { class: "text-muted",
+                    "Pause your store to stop Buy now for a while, for a holiday or while you "
+                    "restock. Buyers see \u{201c}Closed for now\u{201d} until you resume."
+                }
+            }
+            button {
+                class: "btn btn-outline",
+                disabled: pending,
+                onclick: {
+                    let id = store_contract_id.clone();
+                    move |_| set_paused(id.clone(), !paused)
+                },
+                if pending {
+                    "Saving\u{2026}"
+                } else if paused {
+                    "Resume"
+                } else {
+                    "Pause store"
+                }
+            }
+        }
+    }
+}
+
 /// The page of My store that is showing, for one store.
 #[component]
 fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
@@ -873,6 +972,7 @@ fn StoreBody(store: SellerStore, tab: Signal<Tab>) -> Element {
                     super::message_view::MessageView { store_contract_id: store.contract_id.clone() }
                 },
                 Tab::Settings => rsx! {
+                    PauseCard { store_contract_id: store.contract_id.clone() }
                     Settings { store: store.clone(), editing_details }
                 },
             }

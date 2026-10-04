@@ -1349,6 +1349,8 @@ pub fn AcceptRequest(
     let confirmations_read = super::invoice_form::parse_required_confirmations(&confirmations());
     let parsed_confirmations = confirmations_read.as_ref().ok().copied();
     let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
+    // Paused (step 2): Buy now is stopped, an answer by hand is not.
+    let paused = APP_STATE.read().store_paused(&store_contract_id);
 
     if accepted() {
         return rsx! {
@@ -1375,6 +1377,9 @@ pub fn AcceptRequest(
     rsx! {
         div { style: "margin-top: 0.75rem;",
             h5 { style: "margin-bottom: 0.25rem;", "{quantity} x {listing_title}" }
+            if paused {
+                p { class: "text-muted small", "{crate::pause_flow::PAUSED_INVOICE_NOTE}" }
+            }
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
                 "carries the amount, the payment address, a recent block, the confirmations you "

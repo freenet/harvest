@@ -34,6 +34,11 @@ use harvest_common::listing::{
 
 use crate::state::{AppState, PendingSignature};
 
+/// Said when a listing would be over the store's size bound once signed
+/// (step 2).
+pub(crate) const LISTING_TOO_LONG: &str =
+    "This listing is too long to publish: shorten the description.";
+
 /// How long a sent status holds its row at "Saving" waiting for the store's
 /// state to show it. The seller's own node applies its own update at once,
 /// so this is only reached when something went wrong without saying so.
@@ -236,6 +241,63 @@ impl AppState {
         )
     }
 
+    /// Why `listing` must not be published to this store, if it must not
+    /// (step 2): the store would drop it, being over
+    /// [`harvest_common::store::MAX_LISTING_BYTES`] once signed; or the store
+    /// already holds [`harvest_common::store::MAX_LISTINGS`] listings and
+    /// keeping this new one would cut the oldest that is still up (on sale
+    /// or sold out; a taken-down one, or the one being replaced, may go).
+    /// Every version of a listing counts, since an edit publishes a new one.
+    pub(crate) fn listing_cap_refusal(
+        &self,
+        store_contract_id: &[u8],
+        fingerprint: &str,
+        listing: &Listing,
+        replacing: Option<&ListingId>,
+    ) -> Option<String> {
+        // The certificate it will carry, or room for a typical one while it
+        // is still on its way.
+        let stand_in = "x".repeat(2048);
+        let certificate = self
+            .certificates
+            .get(fingerprint)
+            .map_or(stand_in.as_str(), |pem| pem.as_str());
+        if !harvest_common::store::listing_fits_once_signed(listing, certificate) {
+            return Some(LISTING_TOO_LONG.to_string());
+        }
+        let store = self.browsing_stores.get(store_contract_id)?;
+        if store.listings.iter().any(|l| l.listing.id == listing.id)
+            || store.listings.len() < harvest_common::store::MAX_LISTINGS
+        {
+            return None;
+        }
+        // What the store's cut drops first: the oldest by (created_at, id).
+        let oldest = store
+            .listings
+            .iter()
+            .map(|l| &l.listing)
+            .chain(std::iter::once(listing))
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            })?;
+        let still_up = oldest.id != listing.id
+            && Some(&oldest.id) != replacing
+            && !matches!(
+                store.availability(&oldest.id),
+                ListingAvailability::Withdrawn
+            );
+        still_up.then(|| {
+            format!(
+                "Your store has {} listings. Publishing this one would remove \u{2018}{}\u{2019}; \
+                 take it down first.",
+                harvest_common::store::MAX_LISTINGS,
+                oldest.title
+            )
+        })
+    }
+
     /// Publish a new listing to one of our stores, with a count when the
     /// seller gave one.
     ///
@@ -257,6 +319,7 @@ impl AppState {
             fingerprint,
             listing,
             availability,
+            None,
         )?;
         // The same terms published again: one notice, not an orphaned one.
         self.end_publishing(&id);
@@ -348,7 +411,13 @@ impl AppState {
         fingerprint: String,
         listing: Listing,
         availability: ListingAvailability,
+        replacing: Option<&ListingId>,
     ) -> Result<(), String> {
+        if let Some(why) =
+            self.listing_cap_refusal(&store_contract_id, &fingerprint, &listing, replacing)
+        {
+            return Err(why);
+        }
         let id = listing.id.clone();
         self.queue_listing_signature(store_contract_id.clone(), fingerprint, listing)?;
         // No status is the same as on sale and uncounted, so that one is
@@ -383,7 +452,13 @@ impl AppState {
             return self.queue_listing_status(store_contract_id, old, wanted);
         }
         let new_id = edited.id.clone();
-        self.publish_listing_as(store_contract_id.clone(), fingerprint, edited, wanted)?;
+        self.publish_listing_as(
+            store_contract_id.clone(),
+            fingerprint,
+            edited,
+            wanted,
+            Some(&old),
+        )?;
         self.withdraw_after_publish
             .insert(new_id, (store_contract_id, old, now_ms()));
         Ok(())
@@ -514,6 +589,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::state::{test_store_key, BrowsingStore};
+    use harvest_common::listing::AuthorizedListing;
     use harvest_common::StoreRegistration;
 
     const STORE: [u8; 32] = [7u8; 32];
@@ -1284,5 +1360,102 @@ mod tests {
             state.listing_status_pending(&STORE, &id),
             "still saving until the store's state shows it"
         );
+    }
+
+    /// Step 2: a listing the store would drop for its size is refused before
+    /// it is signed, with the words the seller acts on. Mutated red by
+    /// dropping the check.
+    #[test]
+    fn a_listing_too_long_to_keep_is_refused_before_signing() {
+        let mut state = seller_state();
+        let mut long = listing("Long");
+        long.description = "d".repeat(harvest_common::store::MAX_LISTING_BYTES);
+        let long = long.with_derived_id();
+        assert_eq!(
+            state.publish_new_listing(STORE.to_vec(), FINGERPRINT.to_string(), long, None),
+            Err(LISTING_TOO_LONG.to_string())
+        );
+        assert!(state.pending_signatures.is_empty());
+        assert!(state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                listing("Jam"),
+                None
+            )
+            .is_ok());
+    }
+
+    /// Step 2: at `MAX_LISTINGS` a new listing is refused when keeping it
+    /// would cut the oldest listing still up, named; allowed when the
+    /// oldest is taken down, and when the edit replaces the oldest. Mutated
+    /// red by naming the newest, and by ignoring what is taken down.
+    #[test]
+    fn at_the_cap_a_listing_that_would_cut_one_still_up_is_refused() {
+        let mut state = seller_state();
+        let held: Vec<AuthorizedListing> = (0..harvest_common::store::MAX_LISTINGS)
+            .map(|i| {
+                let mut l = listing(&format!("Item {i}"));
+                l.created_at =
+                    chrono::DateTime::from_timestamp(1_600_000_000 + i as i64, 0).unwrap();
+                AuthorizedListing {
+                    listing: l.with_derived_id(),
+                    scoped_payload: Vec::new(),
+                    signature: Vec::new(),
+                    certificate_pem: String::new(),
+                }
+            })
+            .collect();
+        let oldest = held[0].listing.id.clone();
+        state
+            .browsing_stores
+            .get_mut(STORE.as_slice())
+            .unwrap()
+            .listings = held;
+        let refused = state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                listing("New"),
+                None,
+            )
+            .unwrap_err();
+        assert!(refused.contains("\u{2018}Item 0\u{2019}"), "{refused}");
+        assert!(state.pending_signatures.is_empty());
+
+        // An edit of the oldest replaces it: allowed.
+        assert!(state
+            .replace_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                oldest.clone(),
+                listing("Item 0, edited"),
+                None,
+            )
+            .is_ok());
+        state.pending_signatures.clear();
+
+        // The oldest taken down: allowed.
+        state
+            .browsing_stores
+            .get_mut(STORE.as_slice())
+            .unwrap()
+            .listing_statuses
+            .insert(
+                oldest.clone(),
+                ListingStatus {
+                    listing: oldest,
+                    revision: 1,
+                    availability: ListingAvailability::Withdrawn,
+                },
+            );
+        assert!(state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                listing("New"),
+                None
+            )
+            .is_ok());
     }
 }
