@@ -1529,6 +1529,20 @@ images: the image contract" above).
 | Image contract re-key | Nothing looks a photo up under an older image generation or copies photos forward. | **Pinned** -- `no_image_generation_is_recorded_until_photos_can_be_carried_forward` fails the moment `legacy/image_contract.toml` gains a row. |
 | The current store WASM | Accepts a four-photo listing and refuses a nine-photo one, and carries a pre-photo listing from V25 with its id unchanged. | **By hand** -- `tests/rehearsal` scenario 5 on an isolated network-mode node, 2026-10-01. Not in CI. |
 
+## Contract work per update (added 2026-10-04, harvest#226)
+
+A node stops a contract call after 5 s of wall clock. `tests/contract-budget`
+meters every call a node makes for one update, under fuel, against the
+committed WASM (README there).
+
+| Where | Claim | Caught? |
+|---|---|---|
+| `EncryptedMessage` byte fields | Written as CBOR byte strings; a predecessor's integer-array form still decodes and is refused raw by the current contract. | **Yes** -- `byte_string_encoding_tests` (red without the attribute), `a_predecessors_encoding_is_refused_raw_and_accepted_re_encoded`, `a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded`. |
+| `MailboxStateV1::apply_delta` | Each message's digest is computed once, and the state is byte-identical to the per-comparison version. | **Identity: Yes** -- `the_keyed_orders_are_the_public_ones` (red when the tie-break is reversed). **Cost: only the budget harness**, whose tied-mailbox cases fail on the per-comparison build (1927e43); no unit test can see a performance property. |
+| mailbox `update_state` `Delta` arm | Refuses a delta over `MAX_DELTA_BYTES`, over `MAX_MESSAGES` messages, or not a definite array, before decoding; admits every honest delta. | **Yes** -- `a_delta_over_the_message_cap_is_refused_before_decoding`, `the_largest_valid_mailbox_fits_one_delta`. |
+| mailbox `update_state` `State` arm | Unbounded itself; relies on the node validating an incoming state first. | **No**: a property of freenet-core, stated in the arm's comment. |
+| `tests/contract-budget` `Kind::gates` | Mailbox and index fail CI over budget; store and reputation only warn. | **Yes** for the logic (the harness's own tests). The store and reputation are KNOWN over budget and cannot fail CI until flipped: store by the store re-key with caps, reputation by harvest#228. |
+
 ## The four that matter
 
 Ranked by what breaks if the claim turns out to be false, not by how easy the

@@ -1237,6 +1237,45 @@ fn two_newest(
     [pick(gens[0]), pick(gens[1])]
 }
 
+/// The last mailbox generation that wrote its message bytes as CBOR integer
+/// arrays; harvest#226 made them byte strings, and a generation's contract
+/// accepts only its own encoding as canonical.
+const LAST_ARRAY_FORM_MAILBOX_GENERATION: u32 = 20;
+
+/// A mailbox state as the contract of `generation` writes it: what a node
+/// running that generation actually holds, so what the walk will find.
+fn mailbox_bytes_for(generation: u32, state: &harvest_common::mailbox::MailboxStateV1) -> Vec<u8> {
+    if generation > LAST_ARRAY_FORM_MAILBOX_GENERATION {
+        return harvest_common::to_cbor(state).unwrap();
+    }
+    #[derive(serde::Serialize)]
+    struct Earlier {
+        conversation_id: harvest_common::mailbox::ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: DateTime<Utc>,
+        nonce: [u8; 24],
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<Earlier>,
+    }
+    harvest_common::to_cbor(&EarlierMailbox {
+        messages: state
+            .messages
+            .iter()
+            .map(|m| Earlier {
+                conversation_id: m.conversation_id.clone(),
+                sender_public_key: m.sender_public_key.clone(),
+                ciphertext: m.ciphertext.clone(),
+                timestamp: m.timestamp,
+                nonce: m.nonce,
+            })
+            .collect(),
+    })
+    .unwrap()
+}
+
 fn mailbox_message(nonce: u8, secs: i64, len: usize) -> harvest_common::mailbox::EncryptedMessage {
     harvest_common::mailbox::EncryptedMessage {
         conversation_id: harvest_common::mailbox::ConversationId([nonce; 32]),
@@ -1299,10 +1338,10 @@ async fn scenario_mailbox_lineage(node: &mut Node, repo: &Path) {
     let at_older = MailboxStateV1 {
         messages: vec![shared.clone(), nonce_twin.clone()],
     };
-    node.put(newest_c, harvest_common::to_cbor(&at_newest).unwrap())
+    node.put(newest_c, mailbox_bytes_for(newest_gen, &at_newest))
         .await
         .expect("PUT at the newest superseded mailbox generation");
-    node.put(older_c, harvest_common::to_cbor(&at_older).unwrap())
+    node.put(older_c, mailbox_bytes_for(older_gen, &at_older))
         .await
         .expect("PUT at the older superseded mailbox generation");
 
@@ -1366,7 +1405,8 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
     let seller = SigningKey::from_bytes(&[62u8; 32]);
     let vk = seller.verifying_key();
     let params = migrate::encode_params(&migrate::mailbox_params(&vk)).unwrap();
-    let [(_, newest), (_, older)] = two_newest(repo, "mailbox_contract", migrate::mailbox_lineage());
+    let [(newest_gen, newest), (older_gen, older)] =
+        two_newest(repo, "mailbox_contract", migrate::mailbox_lineage());
     let current = read_wasm(&repo.join("ui/public/contracts/mailbox_contract.wasm"));
     use harvest_common::mailbox::{size_class, AEAD_TAG_BYTES, SIZE_BUCKETS, SIZE_CLASS_CAPS};
     // Real ciphertexts are a padded bucket plus the AEAD tag. Per class, per
@@ -1428,10 +1468,10 @@ async fn scenario_mailbox_at_the_cap(node: &mut Node, repo: &Path) {
         assert!(kept[c] < 2 * PER_CLASS[c] as usize, "class {c} actually trimmed");
     }
     assert_eq!(expected.messages.len(), MAX_MESSAGES, "and the total at MAX_MESSAGES");
-    node.put(container(&newest, params.clone()).0, harvest_common::to_cbor(&a).unwrap())
+    node.put(container(&newest, params.clone()).0, mailbox_bytes_for(newest_gen, &a))
         .await
         .expect("PUT a near-cap mailbox at the newest generation");
-    node.put(container(&older, params.clone()).0, harvest_common::to_cbor(&b).unwrap())
+    node.put(container(&older, params.clone()).0, mailbox_bytes_for(older_gen, &b))
         .await
         .expect("PUT a near-cap mailbox at the older generation");
     let (outcome, _) = walk(
@@ -1799,6 +1839,8 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         // V25: the delegated watch key (`d73fb6c`, harvest#179), unchanged
         // through #212. Superseded by listing photos. Still the store code.
         (25, Code),
+        // V26: listing photos (`57979f8`, harvest#215). Still the store code.
+        (26, Code),
     ]
 };
 

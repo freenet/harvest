@@ -300,3 +300,39 @@ jobs:
         run: cargo clippy --release --locked --manifest-path tests/delegate-budget/Cargo.toml -- -D warnings
       - name: bound each delegate call's work (fuel)
         run: cargo run --release --locked --manifest-path tests/delegate-budget/Cargo.toml
+
+  # WHAT THIS ANSWERS: does any single contract call a node makes for one
+  # UPDATE do more work than the node will let it? The same 5 s wall-clock
+  # limit applies to every contract call, and an update to a contract at its
+  # caps costs every peer hosting it, for every update. A one-message delta
+  # onto a full mailbox measured 3.4-3.7 s on a node (harvest#226).
+  #
+  # The harness runs the COMMITTED `ui/public/contracts/*_contract.wasm`
+  # under wasmtime with fuel metering: each contract at its caps, a one-item
+  # delta and a full-state merge, through every call the node makes for the
+  # update (validate the incoming state, update_state, validate the merged
+  # state, summarize, the fan-out delta, the idempotency probe). Fuel is
+  # deterministic; the budget and its calibration are in
+  # `tests/contract-budget/README.md`.
+  #
+  # A separate cargo workspace, like `tests/delegate-budget`.
+  contract-budget:
+    name: every contract update call fits the node's per-call limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/contract-budget -> target
+      - name: rustfmt the harness
+        run: cargo fmt --manifest-path tests/contract-budget/Cargo.toml -- --check
+      - name: clippy the harness
+        run: cargo clippy --release --locked --all-targets --manifest-path tests/contract-budget/Cargo.toml -- -D warnings
+      # The gating logic's own tests: which over-budget calls fail the run
+      # and which only warn, and the exit codes.
+      - name: test the harness
+        run: cargo test --release --locked --manifest-path tests/contract-budget/Cargo.toml
+      - name: bound each contract call's work on an update (fuel)
+        run: cargo run --release --locked --manifest-path tests/contract-budget/Cargo.toml

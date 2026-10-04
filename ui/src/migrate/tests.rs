@@ -343,6 +343,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // V25, from `git show d73fb6c:ui/public/contracts/store_contract.wasm`,
                 // unchanged through #216. Superseded by listing photos.
                 "baa0eb562d0fd5041eed38c481492e052428549c4fd649e302b29e94a92f341f",
+                // V26, from `git show 57979f8:ui/public/contracts/store_contract.wasm`.
+                // Superseded by harvest#226; moves only because it links
+                // drop glue for the mailbox's `EncryptedMessage`.
+                "8e95714fed08fb474e6ce75de1408ce1d3437f6a58eed22e583bb9e39da95a45",
             ],
         ),
         (
@@ -489,6 +493,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "0d22546419ee511415a03d2ce5a36ba0a293a74f7209747aef0d934b643331d6",
+                // V20, from `git show 57979f8:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#226: the message bytes became CBOR
+                // byte strings (a state-encoding change the fold reads).
+                "64fd7bfe4a33571a2161eb5e8c0cc3f2455c44248052b619675641fc67b2579f",
             ],
         ),
         (
@@ -665,6 +673,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // refusing twins of a buyer's X25519 tag, sent digests and read
             // state, and the #198 watch rules.
             "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0".to_string(),
+            // V32, from `git show b84af10:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#221 shipped. Superseded by harvest#226;
+            // its mailbox decoder reads the byte-string encoding too.
+            "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9".to_string(),
         ],
     );
 }
@@ -1200,6 +1212,8 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         (24, Code),
         // V25: the delegated watch key (`d73fb6c`). Still the store code, 29B.
         (25, Code),
+        // V26: listing photos (`57979f8`). Still the store code.
+        (26, Code),
     ]
 };
 
@@ -3094,5 +3108,62 @@ fn rsa_generation_parameter_bytes_are_pinned() {
         hex,
         "a2727273615f7075626c69635f6b65795f64657283010203736f776e65725f766572696679696e675f6b6579\
          582070df9e2279adbec6d12bf2921184c9222eb24ed852005bf640139f52e59cd9ae"
+    );
+}
+
+/// harvest#226: a predecessor mailbox (V20 and earlier) holds its message
+/// bytes as CBOR integer arrays. The fold must decode it, merge it, and
+/// forward a state in this generation's encoding, which is the only one the
+/// current contract accepts as canonical.
+#[test]
+fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded() {
+    #[derive(serde::Serialize)]
+    struct Earlier {
+        conversation_id: harvest_common::mailbox::ConversationId,
+        sender_public_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        nonce: [u8; 24],
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierMailbox {
+        messages: Vec<Earlier>,
+    }
+    let ops = MailboxOps {
+        params: mailbox_params(&seller_vk()),
+    };
+    let base = 1_700_000_000;
+    let older = [message(40, base), message(41, base + 1)];
+    let raw = harvest_common::to_cbor(&EarlierMailbox {
+        messages: older
+            .iter()
+            .map(|m| Earlier {
+                conversation_id: m.conversation_id.clone(),
+                sender_public_key: m.sender_public_key.clone(),
+                ciphertext: m.ciphertext.clone(),
+                timestamp: m.timestamp,
+                nonce: m.nonce,
+            })
+            .collect(),
+    })
+    .unwrap();
+    let recovered = ops
+        .decode(&raw)
+        .expect("the probe decodes a predecessor's encoding");
+    let local = mailbox_with(vec![message(42, base + 2)]);
+    let folded = ops.merge_with_local(recovered, &local);
+    assert_eq!(folded.messages.len(), 3);
+    let forwarded = harvest_common::to_cbor(&folded).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&folded, &forwarded));
+    // A ciphertext of eight 40s is one contiguous run only in the byte-string
+    // form; the integer-array form writes each as `0x18 0x28`.
+    let run = [40u8; 8];
+    assert!(
+        !raw.windows(8).any(|w| w == run),
+        "the predecessor's form is arrays"
+    );
+    assert!(
+        forwarded.windows(8).any(|w| w == run),
+        "forwarded in the byte-string form, not the integer arrays it arrived in"
     );
 }
