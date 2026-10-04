@@ -120,6 +120,11 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                         class: "btn btn-sm btn-primary",
                         disabled: form_busy(),
                         onclick: move |_| {
+                            // Re-checked: `disabled` is only as fresh as the
+                            // last render, and the flag is set synchronously.
+                            if form_busy() {
+                                return;
+                            }
                             editing.set(None);
                             adding.set(true);
                         },
@@ -193,6 +198,9 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
                             pending,
                             edit_locked: form_busy(),
                             on_edit: move |id: ListingId| {
+                                if form_busy() {
+                                    return;
+                                }
                                 adding.set(false);
                                 editing.set(Some(id));
                             },

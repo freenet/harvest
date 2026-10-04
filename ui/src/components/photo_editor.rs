@@ -197,6 +197,10 @@ pub(crate) fn PhotoEditor(
     /// The form is publishing: nothing here may change.
     #[props(default)]
     disabled: bool,
+    /// The page's "a form is busy" flag, set the moment photos start being
+    /// prepared rather than after the next render (see `ListingForm`).
+    #[props(default)]
+    page_busy: Option<Signal<bool>>,
 ) -> Element {
     let message = use_signal(|| None::<String>);
     let next_key = use_signal(|| 1_000u64);
@@ -262,8 +266,18 @@ pub(crate) fn PhotoEditor(
                     // One batch at a time, so photos land in the order picked.
                     disabled: busy() > 0,
                     onchange: move |_| {
+                        if let Some(mut page) = page_busy {
+                            page.set(true);
+                        }
                         #[cfg(target_arch = "wasm32")]
                         add_picked_files(photos, message, busy, next_key);
+                        // Nothing picked (or nothing readable): no work began,
+                        // and the form's effect would not run to clear it.
+                        if let Some(mut page) = page_busy {
+                            if *busy.peek() == 0 {
+                                page.set(false);
+                            }
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
                         let _ = (message, busy, next_key);
                     },

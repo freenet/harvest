@@ -85,6 +85,8 @@ pub fn ListingForm(
     let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
     let preparing = use_signal(|| 0usize);
     let mut uploading = use_signal(|| false);
+    // Set at the moment work starts (above and in `PhotoEditor`); this
+    // effect is what clears it when the work ends.
     use_effect(move || {
         let busy = uploading() || preparing() > 0;
         if let Some(mut out) = busy_out {
@@ -131,7 +133,7 @@ pub fn ListingForm(
                 }
             }
 
-            PhotoEditor { photos, busy: preparing, disabled: uploading() }
+            PhotoEditor { photos, busy: preparing, disabled: uploading(), page_busy: busy_out }
 
             TermsEditor { terms }
             if let Some(problem) = terms_error.clone() {
@@ -266,6 +268,11 @@ pub fn ListingForm(
                             return;
                         }
                         uploading.set(true);
+                        // Now, not after the next render: a click on another
+                        // row's Edit queued behind this one must find it set.
+                        if let Some(mut page) = busy_out {
+                            page.set(true);
+                        }
                         spawn(async move {
                             let result = publish_after_uploads(
                                 pending,
@@ -286,7 +293,14 @@ pub fn ListingForm(
                 // An upload cannot be called back once sent, and unmounting
                 // the form would drop the task that publishes after it.
                 disabled: uploading() || preparing() > 0,
-                onclick: move |_| on_cancel.call(()),
+                onclick: move |_| {
+                    // Re-checked here: `disabled` is only as fresh as the
+                    // last render.
+                    if uploading() || preparing() > 0 {
+                        return;
+                    }
+                    on_cancel.call(())
+                },
                 "Cancel"
             }
             }
