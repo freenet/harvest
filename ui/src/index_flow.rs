@@ -1331,7 +1331,7 @@ mod tests {
         // twin's name), in the stores' order.
         assert!(my_store.contains(".map(|(s,_)|close_button_label(s,&stores))"));
         assert!(my_store.contains("for((s,this),label)instores.iter().cloned().zip(labels){"));
-        assert!(my_store.contains("\"{label}\""));
+        assert!(my_store.contains("move|_|confirming.set(Some(target.clone()))},\"{label}\""));
         assert!(
             my_store.contains(".begin_own_store_creation(fingerprint.clone(),vk_bytes,details);")
         );

@@ -1095,8 +1095,9 @@ fn buyable(
     if owned {
         return None;
     }
-    // A closed store's key may be in someone else's hands (harvest#93): an
-    // order from it could be anybody's, so nothing here is bought.
+    // A store closed for good sells nothing: its key may be in someone
+    // else's hands (harvest#93), or it was a second store on one Ghost Key
+    // (harvest#181), and an order from it could be anybody's.
     if store.closed {
         return None;
     }

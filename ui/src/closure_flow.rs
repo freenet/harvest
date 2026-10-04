@@ -1091,6 +1091,23 @@ mod tests {
             "what a resend names"
         );
 
+        // A close the store key never answers says which store failed.
+        let mut state = both_ours();
+        name(&mut state, 1, "Bean Shop");
+        name(&mut state, 2, "Bean Shop");
+        state.close_store_for_good(&[2; 32]).expect("asked");
+        let attempt = state.closing_stores[&vec![2; 32]].attempt;
+        state.on_close_deadline(&[2; 32], attempt);
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.starts_with(CLOSE_NOT_SAVED)
+                    && n.contains(&format!("Bean Shop ({code})"))),
+            "{:?}",
+            state.notifications
+        );
+
         let mut state = both_ours();
         name(&mut state, 1, "Bean Shop");
         name(&mut state, 2, "Tea Shop");
