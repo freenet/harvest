@@ -35103,9 +35103,56 @@ mod buy_flow_tests {
             let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
             assert_eq!(firsts, vec![0, 1, 2], "no wider than the last arm");
         }
-        // Another key: the stale window says nothing about it.
-        state.auto_invoice.upcoming_key = Some("another key".into());
-        assert!(state.vetted_window_for_test().is_none());
+        assert_eq!(state.vetted_window_for_test(), Some(5));
+        // The stale window is cut from only while it is still the window of
+        // the key, network, counter and build this tab holds, and only
+        // because of a payment (codex, round 3): each case below arms
+        // nothing from it.
+        let fallback = |change: &dyn Fn(&mut AppState)| {
+            let mut s = state.clone();
+            change(&mut s);
+            s.vetted_window_for_test()
+        };
+        assert_eq!(fallback(&|_| {}), Some(5), "the same window");
+        assert_eq!(
+            fallback(&|s| s.bitcoin.payment_xpub.as_mut().unwrap().xpub = "another key".into()),
+            None,
+            "another key"
+        );
+        assert_eq!(
+            fallback(&|s| {
+                // Signet and testnet4 derive the same scripts from one key.
+                s.bitcoin.payment_xpub.as_mut().unwrap().network =
+                    freenet_bitcoin_common::BitcoinNetwork::Testnet4
+            }),
+            None,
+            "another network, the same key"
+        );
+        assert_eq!(
+            fallback(&|s| s.bitcoin.payment_xpub.as_mut().unwrap().next_index += 1),
+            None,
+            "the counter moved"
+        );
+        assert_eq!(
+            fallback(&|s| {
+                s.bitcoin.address_generation = crate::bitcoin_generation::Generation(Ok([0x99; 32]))
+            }),
+            None,
+            "another address-contract build"
+        );
+        assert_eq!(
+            fallback(&|s| s.auto_invoice.stale_by_payment = false),
+            None,
+            "stale for another reason than a payment"
+        );
+        // A clear verdict before the used one read under another build (the
+        // build moved between reads) is not relied on either.
+        let first = lost_address(0).script_pubkey;
+        assert_eq!(
+            fallback(&|s| s.auto_invoice.vets.get_mut(&first).unwrap().contract_id = [0x77; 32]),
+            None,
+            "a clear verdict under another build"
+        );
     }
 
     /// Review round 3 of batch 2: a store paused for a lapsed week says

@@ -83,10 +83,16 @@ pub struct AutoInvoiceUi {
     /// spends one itself.
     pub upcoming: Vec<DerivedAddress>,
     pub upcoming_for: Option<(String, u64)>,
-    /// The payment key `upcoming` was read under. Unlike `upcoming_for` it
-    /// is kept while the window waits to be read again, so a window cut
-    /// while stale is still bound to its key (review round 3 of batch 2).
-    pub upcoming_key: Option<String>,
+    /// The payment key and network `upcoming` was read under. Unlike
+    /// `upcoming_for` it is kept while the window waits to be read again, so
+    /// a window cut while stale is still bound to where it came from (review
+    /// round 3 of batch 2).
+    pub upcoming_from: Option<(String, BitcoinNetwork)>,
+    /// Set when the window was made stale by an address in it found paid,
+    /// and only then: the one case [`AppState::vetted_window`]'s stale
+    /// branch may cut an arm from it. Cleared when a window arrives and when
+    /// the key changes (codex, round 3).
+    pub stale_by_payment: bool,
     /// When `PeekOrderAddresses` was last sent.
     pub peek_sent_ms: Option<u64>,
     /// The last arm sent for each store (with `watch_left_ms` zeroed, since
@@ -502,13 +508,23 @@ impl AppState {
     /// shrink.
     fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress], bool)> {
         let Some((network, upcoming)) = self.upcoming_unvetted() else {
-            // Stale: bound to the key it was read under, and read under the
-            // build an order would name now.
+            // Stale only because an address in it was found paid, and still
+            // the window of the key, network and counter this tab holds,
+            // read under the build an order would name now (codex, round 3).
+            if !self.auto_invoice.stale_by_payment {
+                return None;
+            }
             let xpub = self.bitcoin.payment_xpub.as_ref()?;
-            if self.auto_invoice.upcoming_key.as_deref() != Some(xpub.xpub.as_str()) {
+            // The network is also in every verdict's contract id (checked
+            // below), so a network change fails both checks; this one says
+            // it outright.
+            if self.auto_invoice.upcoming_from != Some((xpub.xpub.clone(), xpub.network)) {
                 return None;
             }
             let upcoming = self.auto_invoice.upcoming.as_slice();
+            if upcoming.first().is_none_or(|a| a.index < xpub.next_index) {
+                return None;
+            }
             let ids = self.contract_ids_of(xpub.network, upcoming)?;
             let used = upcoming.iter().zip(&ids).position(|(a, id)| {
                 self.auto_invoice
@@ -706,6 +722,7 @@ impl AppState {
                             },
                         );
                         self.auto_invoice.upcoming_for = None;
+                        self.auto_invoice.stale_by_payment = true;
                         self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                     }
                 }
@@ -737,6 +754,7 @@ impl AppState {
                     // Read the window again, by a peek sent from now on,
                     // before believing it.
                     self.auto_invoice.upcoming_for = None;
+                    self.auto_invoice.stale_by_payment = true;
                     self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                 }
             }
@@ -1540,6 +1558,7 @@ impl AppState {
             // Read the new key's window at once, not after the retry minute.
             self.auto_invoice.stale_from_peek = Some(floor);
             self.auto_invoice.upcoming_for = None;
+            self.auto_invoice.stale_by_payment = false;
         }
     }
 
@@ -1591,7 +1610,8 @@ impl AppState {
             (Ok(upcoming), Some(xpub)) => {
                 self.auto_invoice.stale_from_peek = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
-                self.auto_invoice.upcoming_key = Some(xpub.xpub.clone());
+                self.auto_invoice.upcoming_from = Some((xpub.xpub.clone(), xpub.network));
+                self.auto_invoice.stale_by_payment = false;
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();
             }
