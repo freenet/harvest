@@ -43,7 +43,14 @@ artifacts it exists to check.
    store in both, is found and folded, and the current contract holds every
    entry, each still verifying against the Ghost Key.
 
-`REHEARSAL_ONLY=lineages` runs 6 and 7 together. Both must be re-run whenever
+`REHEARSAL_ONLY=lineages` runs 6 and 7 together; a plain run runs them first
+(it then stops at scenario 1, harvest#142).
+Scenario 6 also folds two near-cap mailboxes (6b) and checks the current
+contract holds exactly what its own merge keeps. Each scenario uses fixed
+keys, so run it against a fresh `--data-dir`: an earlier run's state at the
+current address would otherwise be read back as if forwarded. What is NOT
+exercised: the app's forward wiring (`migrate_ops::send_forward`) and its
+seal marker; the harness forwards with its own PUT. Both must be re-run whenever
 the mailbox or index contract re-keys, which is any change to
 `harvest-common` (it is compiled into both).
 
