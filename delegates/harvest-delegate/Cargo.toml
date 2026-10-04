@@ -32,6 +32,8 @@ freenet-stdlib = { workspace = true }
 # permanently unrecoverable -- see src/migration.rs.
 freenet-migrate = { workspace = true, features = ["delegate"] }
 serde = { workspace = true }
+# The kept conversation's sent digests, as one CBOR byte string.
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 chrono = { workspace = true }
 rsa = { workspace = true }
@@ -60,6 +62,9 @@ bs58 = { workspace = true, features = ["check"] }
 # `getrandom` implementation rather than through `rand_core::OsRng`, so there
 # is one entropy source rather than two.
 x25519-dalek = { version = "2.0", default-features = false, features = ["alloc", "static_secrets"] }
+# The subgroup half of `messaging::is_canonical_tag` (harvest#205 review, S1):
+# already in the build through x25519-dalek, no feature added.
+curve25519-dalek = { workspace = true }
 # Bech32 encoding for the P2WPKH addresses derivation produces. The address
 # string and the scriptPubKey are derived together here, in one place, because
 # an Order carries both and they must denote the same output.

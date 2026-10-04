@@ -33,9 +33,11 @@
 //! its bridge watch requests to the delegate's watch key
 //! ([`AppState::plan_watch_delegation`]): the vault signs a
 //! `freenet_bitcoin_inbox::DelegationBody` and the delegate keeps it
-//! (`SetWatchDelegation`). From then on the delegate asks the bridge to watch
-//! its next addresses itself, on its five-minute wake-ups, so the store keeps
-//! taking orders with Harvest closed. This tab keeps the delegate told which
+//! (`SetWatchDelegation`). From then on the delegate keeps the bridge
+//! watching the addresses this tab armed (the window it read clear) itself,
+//! on its five-minute wake-ups, so the store keeps taking orders with Harvest
+//! closed until that window is used; it never watches or invoices past it
+//! (harvest#198). This tab keeps the delegate told which
 //! inbox the bridge serves and the latest `made_at_ms` it has sent
 //! (`UpdateWatchDelegation`), and dates its own requests above the
 //! delegate's: the two share one timeline per Ghost Key.
@@ -81,6 +83,13 @@ pub struct AutoInvoiceUi {
     /// spends one itself.
     pub upcoming: Vec<DerivedAddress>,
     pub upcoming_for: Option<(String, u64)>,
+    /// Set when an address in the window was newly found paid, and cleared
+    /// when the next window arrives (or the key changes): until then every
+    /// arm goes out EMPTY, so the delegate stops renewing and invoicing on
+    /// the window at once, and the next peek re-reads and re-arms it.
+    /// Instant checkout pauses meanwhile (round 4 of batch 2: this replaced a
+    /// trim of the stale window that kept needing more checks).
+    pub paid_since_read: bool,
     /// When `PeekOrderAddresses` was last sent.
     pub peek_sent_ms: Option<u64>,
     /// The last arm sent for each store (with `watch_left_ms` zeroed, since
@@ -439,13 +448,11 @@ impl AppState {
     /// delegation with it (a re-key or a new device), so the case #183 hit
     /// has nothing to withdraw at first.
     ///
-    /// Nor can it see past the window. Once the window is clear and the
-    /// delegation sent, the delegate watches and invoices from its own
-    /// counter onward, past the ten addresses read here (with the tab closed,
-    /// or between two re-reads). A lost counter whose old history has ten or
-    /// more unpaid addresses before a paid one reads clear here and the
-    /// delegate can then reach the paid one. Closing that needs the delegate
-    /// to read addresses itself: harvest#198.
+    /// The delegate does not reach past the window (harvest#198): its own
+    /// delegated watches count only for scripts an arm names, and it renews
+    /// only those, so with the tab closed instant checkout stops at the end
+    /// of the window read here (its heartbeat then says not taking orders)
+    /// rather than invoicing an address nobody read.
     fn current_upcoming(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
         let (network, upcoming) = self.upcoming_unvetted()?;
         // Read under the address contract an order would name NOW: a verdict
@@ -476,6 +483,29 @@ impl AppState {
                 .map(|a| address_instance_id(network, &a.script_pubkey, &bridges, code_hash))
                 .collect(),
         )
+    }
+
+    /// The part of the window an arm may name (harvest#198): from the
+    /// counter, every address read clear under the build an order would
+    /// name now, up to the first found used. `None` while the reads have not
+    /// settled (an address unread, being read, unreadable, or read under
+    /// another build before any used one): the delegate then keeps the arm
+    /// it has, rather than being told the window shrank to what has been
+    /// read so far. A window found used part-way is armed up to that
+    /// address, so the delegate stops renewing and invoicing on it.
+    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
+        let (network, upcoming) = self.upcoming_unvetted()?;
+        let ids = self.window_contract_ids()?;
+        for (i, (a, id)) in upcoming.iter().zip(ids).enumerate() {
+            match self.auto_invoice.vets.get(&a.script_pubkey) {
+                Some(v) if v.is_clear() && v.contract_id == id => {}
+                Some(v) if v.verdict == VetVerdict::Used => {
+                    return Some((network, &upcoming[..i]));
+                }
+                _ => return None,
+            }
+        }
+        Some((network, upcoming))
     }
 
     /// [`Self::current_upcoming`] before the address-contract reads.
@@ -623,6 +653,7 @@ impl AppState {
                             },
                         );
                         self.auto_invoice.upcoming_for = None;
+                        self.auto_invoice.paid_since_read = true;
                         self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                     }
                 }
@@ -654,6 +685,7 @@ impl AppState {
                     // Read the window again, by a peek sent from now on,
                     // before believing it.
                     self.auto_invoice.upcoming_for = None;
+                    self.auto_invoice.paid_since_read = true;
                     self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                 }
             }
@@ -842,7 +874,15 @@ impl AppState {
             .as_slice()
             .try_into()
             .ok()?;
-        let (network, upcoming) = self.current_upcoming()?;
+        // After a newly paid address in the window, the arm names nothing
+        // until the window is read again (`paid_since_read`).
+        let (network, upcoming) = if self.auto_invoice.paid_since_read {
+            (self.bitcoin.payment_xpub.as_ref()?.network, &[][..])
+        } else {
+            self.vetted_window()?
+        };
+        let vetted_scripts: Vec<Vec<u8>> =
+            upcoming.iter().map(|a| a.script_pubkey.clone()).collect();
         let tip_contract_id: [u8; 32] = self
             .bitcoin
             .tip_contract_network
@@ -920,6 +960,10 @@ impl AppState {
             watched_scripts,
             watch_left_ms,
             presence_contract_id: presence_instance_bytes(&store_verifying_key),
+            // Kept whatever the tab's own watch is: what the delegation
+            // renews must not vanish on a tab load before this tab knows its
+            // own watches again (review round 1 of batch 2).
+            vetted_scripts,
         };
         Some((arm, lapses_at_ms))
     }
@@ -1442,6 +1486,7 @@ impl AppState {
             // Read the new key's window at once, not after the retry minute.
             self.auto_invoice.stale_from_peek = Some(floor);
             self.auto_invoice.upcoming_for = None;
+            self.auto_invoice.paid_since_read = false;
         }
     }
 
@@ -1493,6 +1538,7 @@ impl AppState {
             (Ok(upcoming), Some(xpub)) => {
                 self.auto_invoice.stale_from_peek = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
+                self.auto_invoice.paid_since_read = false;
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();
             }
@@ -1553,8 +1599,47 @@ impl AppState {
             Some(Err(why)) => format!("Your store can't take orders on this device: {why}."),
             // The state line alone: the alerts (oversold, capped) are said
             // separately, in "Needs you", whether or not the store is open.
+            Some(Ok(status)) if status.paused.as_deref() == Some(NOT_VETTED_REASON) => {
+                format!(
+                    "{NOT_VETTED_LINE} {}",
+                    self.rearm_progress(store_contract_id, now_ms)
+                )
+            }
             Some(Ok(status)) => instant_checkout_state_line(status, now_ms),
         })
+    }
+
+    /// What re-arming a store paused for a lapsed week still waits for,
+    /// from what this tab holds: the delegate's next addresses and their
+    /// reads, what an arm needs, and whether that arm has gone out. The
+    /// delegate's answer to the arm replaces the paused status, so this is
+    /// not asked once the store is re-armed and accepted.
+    pub fn rearm_progress(&self, store_contract_id: &[u8], now_ms: u64) -> &'static str {
+        let Some((_, window)) = self.vetted_window() else {
+            return "Harvest is checking your next payment addresses before it can renew it.";
+        };
+        if window.is_empty() {
+            return "Your next payment address has been paid before, so Harvest is moving past it \
+                    first.";
+        }
+        let arm = self
+            .instant_checkout_stores()
+            .into_iter()
+            .find(|(_, r)| r.store_contract_id == store_contract_id)
+            .and_then(|(fingerprint, r)| self.auto_invoice_arm(&fingerprint, &r, now_ms));
+        let Some((arm, _)) = arm else {
+            return "Harvest is still connecting to the Bitcoin bridge before it can renew it.";
+        };
+        let sent = self
+            .auto_invoice
+            .sent
+            .get(store_contract_id)
+            .is_some_and(|(held, _, _)| held.vetted_scripts == arm.vetted_scripts);
+        if sent {
+            "Harvest has renewed it and is waiting for this device\u{2019}s Freenet to confirm."
+        } else {
+            "Harvest is about to renew it."
+        }
     }
 
     /// Whether this device answers buyers' orders for one of our stores, for
@@ -1725,6 +1810,21 @@ pub(crate) const WATCH_LAPSED_REASON: &str =
     "the watch on its payment addresses would lapse before a buyer could pay; open Harvest to \
      renew it";
 
+/// The harvest delegate's reason for a store paused because Harvest has not
+/// been opened on this device for a week (`Refusal::NotVettedRecently` in
+/// `delegates/harvest-delegate/src/auto_invoice.rs`, `VETTED_FOR_MS`),
+/// exactly as it sends it. Matched like [`WATCH_LAPSED_REASON`].
+pub(crate) const NOT_VETTED_REASON: &str =
+    "paused: Harvest has not been opened on this device for 7 days; open Harvest to keep taking \
+     orders";
+
+/// What the store page says for [`NOT_VETTED_REASON`] on its own; the store
+/// page adds what re-arming still waits for
+/// (`AppState::rearm_progress`), and promises nothing about when orders
+/// start again (review round 3 of batch 2).
+pub(crate) const NOT_VETTED_LINE: &str = "Your store paused because Harvest hadn\u{2019}t been \
+     opened on this device for 7 days. Open Harvest at least once a week to keep taking orders.";
+
 /// This device's line about taking orders: the reason buyers can't buy,
 /// said under the store's status while they can't (`presence_flow::
 /// seller_status`). The alerts that stand whether or not the store is open
@@ -1736,6 +1836,11 @@ pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> S
         // The delegate's own words for a lapsed watch end "open Harvest to
         // renew it", said here to someone who has Harvest open (the
         // 2026-09-30 critique). This tab renews it (module doc), so say that.
+        // Said to someone who has just opened Harvest: this tab re-arms at
+        // once, which lifts the pause (review round 2 of batch 2).
+        if why == NOT_VETTED_REASON {
+            return NOT_VETTED_LINE.into();
+        }
         if why == WATCH_LAPSED_REASON {
             return "Your store isn't taking orders right now: the watch on its payment \
                     addresses has lapsed. Harvest renews it while it\u{2019}s open here, and \

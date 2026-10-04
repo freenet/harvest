@@ -29,8 +29,8 @@
 use std::collections::{HashMap, HashSet};
 
 use harvest_common::presence::{
-    presence_verdict, ClosedWhy, Presence, PresenceParameters, PresenceStateV1, SignedHeartbeat,
-    HEARTBEAT_EVERY_MS, HEARTBEAT_MIN_GAP_MS, PRESENCE_FRESH_MS,
+    presence_verdict, ClosedWhy, NotTakingReason, Presence, PresenceParameters, PresenceStateV1,
+    SignedHeartbeat, HEARTBEAT_EVERY_MS, HEARTBEAT_MIN_GAP_MS, PRESENCE_FRESH_MS,
 };
 
 use crate::state::AppState;
@@ -123,7 +123,16 @@ impl StorePresence {
         match self {
             StorePresence::Open => None,
             StorePresence::Checking => Some("Checking whether this store is open\u{2026}"),
-            StorePresence::Closed(ClosedWhy::NotTakingOrders) => Some(
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
+                NotTakingReason::ClosedForGood,
+            ))) => Some("This store is closed for good. You can look, but not buy."),
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
+                NotTakingReason::CatchingUp,
+            ))) => Some(
+                "This store is back soon: it is catching up and will take orders again \
+                 shortly. You can look, but not buy yet.",
+            ),
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(_)) => Some(
                 "This store is closed: it isn\u{2019}t taking orders right now. You can look, \
                  but not buy.",
             ),
@@ -131,6 +140,34 @@ impl StorePresence {
                 "This store is closed: the seller\u{2019}s computer isn\u{2019}t online right \
                  now. You can look, but not buy. Try again later.",
             ),
+        }
+    }
+}
+
+/// The few words a buyer is shown for a store whose seller says it is not
+/// taking orders, by the reason its heartbeat gives (a pill, a store row).
+/// A heartbeat with no reason (an older delegate) reads as the general
+/// case. The seller's own screen says the detailed reason
+/// (`AutoInvoiceStatus::paused`).
+pub fn not_taking_label(reason: Option<NotTakingReason>) -> &'static str {
+    match reason {
+        Some(NotTakingReason::ClosedForGood) => "Closed for good",
+        Some(NotTakingReason::CatchingUp) => "Back soon",
+        Some(NotTakingReason::Paused | NotTakingReason::Unavailable) | None => {
+            "Not taking orders right now"
+        }
+    }
+}
+
+impl StorePresence {
+    /// [`not_taking_label`] for a store whose seller said it is not taking
+    /// orders; `None` for any other presence.
+    pub fn not_taking_label(self) -> Option<&'static str> {
+        match self {
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(reason)) => {
+                Some(not_taking_label(reason))
+            }
+            _ => None,
         }
     }
 }
@@ -538,7 +575,7 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
             why_not: None,
         },
         StorePresence::Closed(why_closed) => {
-            let line = if why_closed == ClosedWhy::NotTakingOrders || blocked.is_some() {
+            let line = if matches!(why_closed, ClosedWhy::NotTakingOrders(_)) || blocked.is_some() {
                 "Buyers can\u{2019}t buy from your store right now."
             } else {
                 "Buyers can\u{2019}t reach your store right now."
@@ -558,7 +595,7 @@ pub fn seller_status(presence: StorePresence, wakeups: bool, local: &LocalSellin
                             "This computer\u{2019}s clock is ahead of the buyers\u{2019}. Check \
                              that its date and time are set correctly."
                         }
-                        ClosedWhy::NotTakingOrders => {
+                        ClosedWhy::NotTakingOrders(_) => {
                             "Your store told buyers it can\u{2019}t take orders yet. This \
                              usually clears within a few minutes."
                         }
@@ -625,7 +662,7 @@ mod tests {
         };
         assert_eq!(
             store_presence(Some(&not_taking), Some(NOW), NOW),
-            StorePresence::Closed(ClosedWhy::NotTakingOrders)
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(None))
         );
     }
 
@@ -674,7 +711,7 @@ mod tests {
         );
 
         let closed = seller_status(
-            StorePresence::Closed(ClosedWhy::NotTakingOrders),
+            StorePresence::Closed(ClosedWhy::NotTakingOrders(None)),
             true,
             &hosted,
         );
@@ -716,6 +753,40 @@ mod tests {
         assert_eq!(checking.why_not, None);
     }
 
+    /// The buyer's words for each reason a heartbeat gives (harvest#219):
+    /// the general line for none, `Unavailable` and `Paused`; "Closed for
+    /// good"; "Back soon"; and nothing for a store that is open or closed
+    /// for another reason. Mutated red by swapping any arm.
+    #[test]
+    fn a_buyer_is_told_the_reason_a_store_gives() {
+        let label = |r| StorePresence::Closed(ClosedWhy::NotTakingOrders(r)).not_taking_label();
+        assert_eq!(label(None), Some("Not taking orders right now"));
+        assert_eq!(
+            label(Some(NotTakingReason::Unavailable)),
+            Some("Not taking orders right now")
+        );
+        assert_eq!(
+            label(Some(NotTakingReason::Paused)),
+            Some("Not taking orders right now")
+        );
+        assert_eq!(
+            label(Some(NotTakingReason::ClosedForGood)),
+            Some("Closed for good")
+        );
+        assert_eq!(label(Some(NotTakingReason::CatchingUp)), Some("Back soon"));
+        assert_eq!(StorePresence::Open.not_taking_label(), None);
+        assert_eq!(
+            StorePresence::Closed(ClosedWhy::NoHeartbeat).not_taking_label(),
+            None
+        );
+        assert!(StorePresence::Closed(ClosedWhy::NotTakingOrders(Some(
+            NotTakingReason::ClosedForGood
+        )))
+        .buyer_line()
+        .unwrap()
+        .contains("closed for good"));
+    }
+
     #[test]
     fn a_buyer_is_told_why_a_store_is_not_open() {
         assert_eq!(StorePresence::Open.buyer_line(), None);
@@ -723,7 +794,7 @@ mod tests {
             .buyer_line()
             .unwrap()
             .contains("isn\u{2019}t online"));
-        assert!(StorePresence::Closed(ClosedWhy::NotTakingOrders)
+        assert!(StorePresence::Closed(ClosedWhy::NotTakingOrders(None))
             .buyer_line()
             .unwrap()
             .contains("isn\u{2019}t taking orders"));

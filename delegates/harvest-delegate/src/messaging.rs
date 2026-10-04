@@ -190,6 +190,66 @@ pub(crate) fn derive_conversation_keys<S: SecretStore>(
     conversation_keys_from(request_id, ghostkey_fingerprint, &secret, peer_public_keys)
 }
 
+/// Whether `tag` is a conversation tag a seller derives keys for: the
+/// canonical 32-byte encoding (bit 255 clear, u below p = 2^255 - 19) of a
+/// point on Curve25519 in its prime-order subgroup.
+///
+/// X25519 gives every buyer key twins with the SAME shared secret, and so
+/// the same conversation keys and listing tags:
+///
+/// * encoding twins: X25519 ignores bit 255 and reduces u modulo p, so the
+///   same bytes with bit 255 set (and, for u < 19, u + p) are the same key;
+/// * torsion twins: the seller's scalar is clamped to a multiple of 8, so
+///   for each of the 7 non-trivial points Q of order dividing 8, P + Q gives
+///   the same secret as P. These are canonical and pass the contributory
+///   check.
+///
+/// Whoever holds a conversation's keys could write under any twin, and a
+/// reader keyed by tag would see a second conversation with the first one's
+/// keys, one that claims the first one's paid orders by listing tag. An
+/// honest buyer's tag is always b·G, canonical and torsion-free, so refusing
+/// twins costs nobody anything; the subgroup check also refuses points on
+/// the twist. The UI's `messaging::is_canonical_tag` (harvest#205) is the
+/// same rule. Applied wherever this delegate derives conversation keys from a
+/// buyer's tag: [`derive_conversation_keys`] and instant checkout's opening
+/// of a request (`auto_invoice::open_instant`).
+///
+/// Here rather than in harvest-common, which the UI could share: the shared
+/// WASM build unifies features, so a curve25519-dalek dependency in
+/// harvest-common moved all five contracts' code hashes. The subgroup check
+/// costs one scalar multiplication.
+pub(crate) fn is_canonical_tag(tag: &[u8]) -> bool {
+    let Ok(key) = <[u8; 32]>::try_from(tag) else {
+        return false;
+    };
+    canonical_encoding(&key)
+        && curve25519_dalek::montgomery::MontgomeryPoint(key)
+            .to_edwards(0)
+            .is_some_and(|point| torsion_free(&point))
+}
+
+/// `point.is_torsion_free()`, in variable time: `[ℓ]P` is the identity, as
+/// `[ℓ - 1]P + P` (ℓ - 1 is a scalar `Scalar` holds, ℓ itself reduces to 0).
+/// A tag is public, so nothing is gained by the constant-time
+/// multiplication, which cost about 1.7 X25519 agreements under the node's
+/// fuel metering and put `DeriveConversationKeys` for 512 peers at 100.6% of
+/// a call (`tests/delegate-budget`). Pinned against `is_torsion_free` by
+/// `the_fast_torsion_check_is_dalek_s`.
+fn torsion_free(point: &curve25519_dalek::edwards::EdwardsPoint) -> bool {
+    use curve25519_dalek::traits::IsIdentity;
+    use curve25519_dalek::{EdwardsPoint, Scalar};
+    (EdwardsPoint::vartime_double_scalar_mul_basepoint(&-Scalar::ONE, point, &Scalar::ZERO) + point)
+        .is_identity()
+}
+
+/// Whether `key` is the canonical encoding of a u-coordinate: bit 255 clear
+/// and below p. Below 2^255, the values at or above p are p..=2^255-1: 0x7f
+/// in the top byte, 0xff in bytes 1 to 30, and at least 0xed in byte 0.
+fn canonical_encoding(key: &[u8; 32]) -> bool {
+    let at_least_p = key[31] == 0x7f && key[1..31].iter().all(|b| *b == 0xff) && key[0] >= 0xed;
+    key[31] & 0x80 == 0 && !at_least_p
+}
+
 /// The conversation keys `secret` shares with each well-formed peer key.
 fn conversation_keys_from(
     request_id: RequestId,
@@ -200,6 +260,14 @@ fn conversation_keys_from(
     let derived = peer_public_keys
         .iter()
         .filter_map(|peer| {
+            // A twin of a buyer's tag (bit 255 set, u + p, or the tag plus a
+            // small-torsion point) has the same shared secret as the tag
+            // itself, so answering it would give a second conversation the
+            // first one's keys ([`is_canonical_tag`]). Checked first: the
+            // subgroup test is the dearer of the two.
+            if !is_canonical_tag(peer) {
+                return None;
+            }
             let bytes: [u8; 32] = peer.as_slice().try_into().ok()?;
             let shared = secret.diffie_hellman(&PublicKey::from(bytes));
             // A low-order point makes the shared secret all zeros, so the
@@ -371,6 +439,18 @@ pub(crate) struct BuyerConversationRecord {
     /// evict.
     #[serde(default)]
     pub(crate) imported: bool,
+    /// The entries this buyer's browsers sent in this conversation
+    /// (`HarvestDelegateRequest::NoteBuyerSent`): their digests, 32 bytes
+    /// each, oldest first, at most `MAX_SENT_DIGESTS`. One byte string
+    /// rather than a list of arrays, which CBOR would write a byte at a
+    /// time. In the value, like `backed_up`, so it goes with the
+    /// conversation. `serde(default)`: an older record has none.
+    #[serde(default, with = "serde_bytes")]
+    pub(crate) sent: Vec<u8>,
+    /// When the buyer last looked at this conversation, in unix ms
+    /// (`HarvestDelegateRequest::MarkConversationSeen`); never lowered.
+    #[serde(default)]
+    pub(crate) seen_ms: Option<u64>,
 }
 
 /// Every conversation the delegate holds, with whichever store, as
@@ -453,13 +533,21 @@ pub(crate) fn store_buyer_conversation<S: SecretStore + RemovableSecrets>(
         )));
     }
 
-    let bytes = match harvest_common::to_cbor(record) {
+    let buyer_public_key = *PublicKey::from(&StaticSecret::from(record.secret.0)).as_bytes();
+    let key = buyer_conversation_key(store_contract_id, &buyer_public_key);
+
+    // A re-store of a conversation already kept carries what was noted on it
+    // (its sent digests, when it was last seen): the UI re-stores whenever
+    // it re-sends into a thread, and must not wipe "You" by doing so.
+    let mut record = record.clone();
+    if let Some(held) = load_record(store, &key).filter(|held| held.secret == record.secret) {
+        record.sent = held.sent;
+        record.seen_ms = held.seen_ms;
+    }
+    let bytes = match harvest_common::to_cbor(&record) {
         Ok(bytes) => bytes,
         Err(e) => return stored(Err(format!("could not serialize the conversation: {e}"))),
     };
-
-    let buyer_public_key = *PublicKey::from(&StaticSecret::from(record.secret.0)).as_bytes();
-    let key = buyer_conversation_key(store_contract_id, &buyer_public_key);
 
     // Only a NEW key consumes a slot. Re-storing the same conversation --
     // which the UI does whenever it re-sends into a thread it already has --
@@ -652,6 +740,12 @@ fn recall(record: &BuyerConversationRecord) -> Option<RecalledConversation> {
         created_at: record.created_at,
         imported: record.imported,
         backed_up: record.backed_up,
+        sent_digests: record
+            .sent
+            .chunks_exact(32)
+            .map(|d| d.try_into().expect("32 bytes"))
+            .collect(),
+        seen_ms: record.seen_ms,
     })
 }
 
@@ -842,7 +936,7 @@ pub(crate) fn export_buyer_conversation<S: SecretStore>(
         )));
     };
 
-    let Some(conversation) = store
+    let Some(mut conversation) = store
         .get_secret(&buyer_conversation_key(store_contract_id, buyer_public_key))
         .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
     else {
@@ -854,6 +948,13 @@ pub(crate) fn export_buyer_conversation<S: SecretStore>(
         ));
     };
 
+    // Not what was noted on it (its sent digests, its seen time): a backup
+    // string is bounded (`MAX_BACKUP_STRING_BYTES`), and a full set of
+    // digests would put it past that, so it would not restore. A migration
+    // carries them (`import::Family::BuyerConversation`); a restored
+    // conversation shows the buyer's own messages as not confirmed.
+    conversation.sent.clear();
+    conversation.seen_ms = None;
     exported(
         encode_backup(&BuyerConversationBackupV2 {
             store_contract_id: id,
@@ -1016,6 +1117,300 @@ pub(crate) fn mark_conversation_backed_up<S: SecretStore>(
         request_id,
         store_contract_id: store_contract_id.to_vec(),
         buyer_public_key: *buyer_public_key,
+        result,
+    }
+}
+
+/// One kept conversation's record, if it is held and decodes.
+fn load_record<S: SecretStore>(store: &S, key: &[u8]) -> Option<BuyerConversationRecord> {
+    store
+        .get_secret(key)
+        .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
+}
+
+/// Add `digest` to `sent` (32-byte digests, oldest first) unless it is there,
+/// dropping the oldest past `cap`. Whether `sent` changed.
+pub(crate) fn note_digest(sent: &mut Vec<u8>, digest: &[u8; 32], cap: usize) -> bool {
+    if sent.chunks_exact(32).any(|held| held == digest) {
+        return false;
+    }
+    sent.extend_from_slice(digest);
+    let excess = (sent.len() / 32).saturating_sub(cap);
+    sent.drain(..excess * 32);
+    true
+}
+
+/// Change one kept conversation's record with `change` (which answers
+/// whether it changed anything) and write it back: `Ok(false)` when this
+/// node does not hold that conversation, which creates nothing; `Err` when
+/// the node refused the write.
+fn update_buyer_conversation<S: SecretStore>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    buyer_public_key: &[u8; 32],
+    change: impl FnOnce(&mut BuyerConversationRecord) -> bool,
+) -> HarvestDelegateResponse {
+    let key = buyer_conversation_key(store_contract_id, buyer_public_key);
+    let result = match load_record(store, &key) {
+        None => Ok(false),
+        Some(mut record) => {
+            if !change(&mut record) {
+                Ok(true)
+            } else {
+                match harvest_common::to_cbor(&record) {
+                    Ok(bytes) if store.set_secret(&key, &bytes) => Ok(true),
+                    _ => Err("the node refused to update this conversation's record".to_string()),
+                }
+            }
+        }
+    };
+    HarvestDelegateResponse::BuyerConversationUpdated {
+        request_id,
+        store_contract_id: store_contract_id.to_vec(),
+        buyer_public_key: *buyer_public_key,
+        result,
+    }
+}
+
+/// A migration import of a conversation this delegate already holds: the
+/// predecessor's sent digests that this record lacks are added as older than
+/// its own (the newest `MAX_SENT_DIGESTS` kept), and the later seen time is
+/// kept; everything else of the held record stands. `None` when this
+/// delegate holds no readable record under `key` (the caller copies the
+/// incoming one within the cap). An incoming record for another secret, or
+/// one that does not decode, leaves the held one as it is.
+pub(crate) fn merge_held_conversation<S: SecretStore>(
+    store: &mut S,
+    key: &[u8],
+    value: &[u8],
+) -> Option<harvest_common::delegate::SecretImport> {
+    use harvest_common::delegate::SecretImport;
+    let mut held = load_record(store, key)?;
+    let Ok(incoming) = harvest_common::from_cbor::<BuyerConversationRecord>(value) else {
+        return Some(SecretImport::AlreadyAuthoritative);
+    };
+    if incoming.secret != held.secret {
+        return Some(SecretImport::AlreadyAuthoritative);
+    }
+    let mut sent = Vec::new();
+    for digest in incoming.sent.chunks_exact(32) {
+        if !held.sent.chunks_exact(32).any(|h| h == digest) {
+            sent.extend_from_slice(digest);
+        }
+    }
+    let seen_ms = held.seen_ms.max(incoming.seen_ms);
+    if sent.is_empty() && seen_ms == held.seen_ms {
+        return Some(SecretImport::AlreadyAuthoritative);
+    }
+    sent.extend_from_slice(&held.sent);
+    let excess = (sent.len() / 32).saturating_sub(harvest_common::delegate::MAX_SENT_DIGESTS);
+    sent.drain(..excess * 32);
+    held.sent = sent;
+    held.seen_ms = seen_ms;
+    Some(match harvest_common::to_cbor(&held) {
+        Ok(bytes) if store.set_secret(key, &bytes) => SecretImport::Written,
+        _ => SecretImport::Retryable("the node refused the merged conversation".into()),
+    })
+}
+
+/// A predecessor's conversation record as this delegate keeps it: its sent
+/// digests cut to the newest `MAX_SENT_DIGESTS`, which a predecessor (or a
+/// hand-built export) need not have kept to. `None` when it does not decode,
+/// so the caller copies it as it is (and recall then skips it, as before).
+pub(crate) fn capped_incoming_conversation(value: &[u8]) -> Option<Vec<u8>> {
+    let mut record = harvest_common::from_cbor::<BuyerConversationRecord>(value).ok()?;
+    let cap = harvest_common::delegate::MAX_SENT_DIGESTS * 32;
+    let mut changed = false;
+    if record.sent.len() % 32 != 0 {
+        // Not a list of digests: none is kept.
+        record.sent.clear();
+        changed = true;
+    }
+    if record.sent.len() > cap {
+        let excess = record.sent.len() - cap;
+        record.sent.drain(..excess);
+        changed = true;
+    }
+    // Re-encoded whenever anything was repaired or cut, so the caller never
+    // copies the original bytes past either (review round 2 of batch 2).
+    if !changed {
+        return None;
+    }
+    harvest_common::to_cbor(&record).ok()
+}
+
+/// `HarvestDelegateRequest::NoteBuyerSent`: keep the digest of an entry this
+/// buyer sent in one kept conversation, at most
+/// [`harvest_common::delegate::MAX_SENT_DIGESTS`] (the oldest go).
+pub(crate) fn note_buyer_sent<S: SecretStore>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    buyer_public_key: &[u8; 32],
+    digest: &[u8; 32],
+) -> HarvestDelegateResponse {
+    update_buyer_conversation(
+        store,
+        request_id,
+        store_contract_id,
+        buyer_public_key,
+        |record| {
+            note_digest(
+                &mut record.sent,
+                digest,
+                harvest_common::delegate::MAX_SENT_DIGESTS,
+            )
+        },
+    )
+}
+
+/// `HarvestDelegateRequest::MarkConversationSeen`: raise the conversation's
+/// seen time to `seen_ms`, never lower it.
+pub(crate) fn mark_conversation_seen<S: SecretStore>(
+    store: &mut S,
+    request_id: RequestId,
+    store_contract_id: &[u8],
+    buyer_public_key: &[u8; 32],
+    seen_ms: u64,
+) -> HarvestDelegateResponse {
+    update_buyer_conversation(
+        store,
+        request_id,
+        store_contract_id,
+        buyer_public_key,
+        |record| {
+            if record.seen_ms.is_some_and(|held| held >= seen_ms) {
+                return false;
+            }
+            record.seen_ms = Some(seen_ms);
+            true
+        },
+    )
+}
+
+/// The seller's sent digests for one store
+/// (`HarvestDelegateRequest::NoteSellerSent`):
+/// `harvest:seller_sent:{store verifying key, base58}`. Exported, and merged on import
+/// (`import::Family::SellerSent`).
+pub(crate) const SELLER_SENT_PREFIX_STR: &str = "harvest:seller_sent:";
+
+pub(crate) fn seller_sent_key(store_key: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "{SELLER_SENT_PREFIX_STR}{}",
+        bs58::encode(store_key).into_string()
+    )
+    .into_bytes()
+}
+
+/// The first byte of a [`seller_sent_key`] value: its format. Each entry
+/// after it is 64 bytes, the conversation's tag then the entry's digest,
+/// oldest first. A format byte, so another per-conversation note (a "no
+/// reply needed" mark, say) can be added as a second format rather than a
+/// re-key's worth of guessing.
+pub(crate) const SELLER_SENT_V1: u8 = 1;
+
+/// A [`seller_sent_key`] value's entries, `None` when it does not read.
+pub(crate) fn decode_seller_sent(value: &[u8]) -> Option<Vec<[u8; 64]>> {
+    let (&format, rest) = value.split_first()?;
+    if format != SELLER_SENT_V1 || rest.len() % 64 != 0 {
+        return None;
+    }
+    Some(
+        rest.chunks_exact(64)
+            .map(|c| c.try_into().expect("64 bytes"))
+            .collect(),
+    )
+}
+
+/// `entries` as a [`seller_sent_key`] value, keeping the newest
+/// [`harvest_common::delegate::MAX_SELLER_SENT_PER_STORE`].
+pub(crate) fn encode_seller_sent(entries: &[[u8; 64]]) -> Vec<u8> {
+    let keep = harvest_common::delegate::MAX_SELLER_SENT_PER_STORE;
+    let entries = &entries[entries.len().saturating_sub(keep)..];
+    let mut value = Vec::with_capacity(1 + entries.len() * 64);
+    value.push(SELLER_SENT_V1);
+    for entry in entries {
+        value.extend_from_slice(entry);
+    }
+    value
+}
+
+/// Whether one more store may hold seller-sent digests: at most
+/// [`harvest_common::delegate::MAX_SELLER_SENT_STORES`].
+pub(crate) fn seller_sent_has_room<S: SecretStore>(store: &S, key: &[u8]) -> bool {
+    store.has_secret(key)
+        || store.list_secrets(SELLER_SENT_PREFIX_STR.as_bytes()).len()
+            < harvest_common::delegate::MAX_SELLER_SENT_STORES
+}
+
+/// `HarvestDelegateRequest::NoteSellerSent`.
+pub(crate) fn note_seller_sent<S: SecretStore>(
+    store: &mut S,
+    request_id: RequestId,
+    store_key: &[u8; 32],
+    conversation: &[u8; 32],
+    digest: &[u8; 32],
+) -> HarvestDelegateResponse {
+    let answer = |result| HarvestDelegateResponse::SellerSentNoted {
+        request_id,
+        store_key: *store_key,
+        result,
+    };
+    let key = seller_sent_key(store_key);
+    if !seller_sent_has_room(store, &key) {
+        return answer(Err(format!(
+            "this node keeps sent messages for at most {} stores",
+            harvest_common::delegate::MAX_SELLER_SENT_STORES
+        )));
+    }
+    let mut entries = match store.get_secret(&key) {
+        None => Vec::new(),
+        // Never written over: what it holds would be lost.
+        Some(value) => match decode_seller_sent(&value) {
+            Some(entries) => entries,
+            None => return answer(Err("this store's sent-message record does not read".into())),
+        },
+    };
+    let mut entry = [0u8; 64];
+    entry[..32].copy_from_slice(conversation);
+    entry[32..].copy_from_slice(digest);
+    if entries.contains(&entry) {
+        return answer(Ok(()));
+    }
+    entries.push(entry);
+    if store.set_secret(&key, &encode_seller_sent(&entries)) {
+        answer(Ok(()))
+    } else {
+        answer(Err("the node refused to keep this sent message".into()))
+    }
+}
+
+/// `HarvestDelegateRequest::ListSellerSent`.
+pub(crate) fn list_seller_sent<S: SecretStore>(
+    store: &S,
+    request_id: RequestId,
+    store_key: &[u8; 32],
+) -> HarvestDelegateResponse {
+    let result = match store.get_secret(&seller_sent_key(store_key)) {
+        None => Ok(Vec::new()),
+        Some(value) => decode_seller_sent(&value)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e[..32].try_into().expect("32 bytes"),
+                            e[32..].try_into().expect("32 bytes"),
+                        )
+                    })
+                    .collect()
+            })
+            .ok_or_else(|| "this store's sent-message record does not read".to_string()),
+    };
+    HarvestDelegateResponse::SellerSent {
+        request_id,
+        store_key: *store_key,
         result,
     }
 }
@@ -1280,6 +1675,58 @@ mod tests {
         }
     }
 
+    /// A buyer's tag and every twin of it with the same shared secret:
+    /// bit 255 set, each small-torsion twin (`EIGHT_TORSION`), a point on
+    /// the twist, and u + p for u < 19. Only the canonical tag is answered
+    /// (harvest#205 review, S1). Mutated red by dropping either half of
+    /// `is_canonical_tag` or the check here.
+    #[test]
+    fn only_the_canonical_tag_of_a_buyer_key_is_answered() {
+        let mut store = MemSecrets::default();
+        init_encryption_key(&mut store, FP, false);
+        let answered = |peers: &[[u8; 32]]| {
+            let peers: Vec<Vec<u8>> = peers.iter().map(|p| p.to_vec()).collect();
+            keys(&derive_conversation_keys(&store, 1, FP, &peers, None))
+                .into_iter()
+                .map(|k| k.peer_public_key)
+                .collect::<Vec<_>>()
+        };
+        let real = *PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        assert_eq!(answered(&[real]), vec![real.to_vec()], "the canonical tag");
+
+        let mut high = real;
+        high[31] |= 0x80;
+        assert!(answered(&[high]).is_empty(), "the bit-255 twin");
+
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .expect("a real key is on the curve");
+        let mut twins = 0;
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            assert_ne!(twin, real);
+            assert_eq!(twin[31] & 0x80, 0, "precondition: canonical bytes");
+            assert!(answered(&[twin]).is_empty(), "a torsion twin");
+            twins += 1;
+        }
+        assert_eq!(twins, 7);
+
+        // u = 2 is not on Curve25519: a point on the twist.
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(answered(&[twist]).is_empty(), "a twist point");
+
+        // u + p for every u < 19: the same u to X25519, never canonical.
+        for u in 0u8..19 {
+            let mut over = [0xffu8; 32];
+            over[31] = 0x7f;
+            over[0] = 0xed + u;
+            assert!(answered(&[over]).is_empty(), "u + p for u = {u}");
+        }
+        // And the canonical tag still answered beside them all.
+        assert_eq!(answered(&[high, twist, real]), vec![real.to_vec()]);
+    }
+
     /// A low-order peer point makes X25519 produce an all-zero shared secret,
     /// so the "conversation key" is a constant anyone can compute. Refusing
     /// it costs one branch.
@@ -1393,6 +1840,8 @@ mod buyer_conversation_tests {
                 created_at: 1_700_000_000 + seed as i64,
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             },
             seller,
         }
@@ -1744,6 +2193,8 @@ mod buyer_conversation_tests {
                 created_at: 1_700_000_000 + i as i64,
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             };
             if i == 0 {
                 oldest = buyer_public_key;
@@ -1808,6 +2259,8 @@ mod buyer_conversation_tests {
                 created_at: 1_700_000_000 + i as i64,
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             };
             store_buyer_conversation(&mut store, i as u64, STORE, &record);
         }
@@ -1826,6 +2279,8 @@ mod buyer_conversation_tests {
             created_at: 1_700_000_000 + MAX_BUYER_CONVERSATIONS as i64 - 1,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         stored(&store_buyer_conversation(&mut store, 999, STORE, &record))
             .as_ref()
@@ -1868,6 +2323,8 @@ mod buyer_conversation_tests {
                 created_at: 1_700_000_000 + i as i64,
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             };
             store_buyer_conversation(&mut store, i as u64, STORE, &record);
         }
@@ -1881,6 +2338,8 @@ mod buyer_conversation_tests {
             created_at: 1_800_000_000,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         stored(&store_buyer_conversation(&mut store, 1, STORE, &record))
             .as_ref()
@@ -1950,6 +2409,8 @@ mod buyer_conversation_backup_tests {
                 created_at: 1_700_000_000 + seed as i64,
                 backed_up: false,
                 imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
             },
         )
     }
@@ -2706,6 +3167,8 @@ mod buyer_conversation_backup_tests {
             created_at: 1,
             backed_up: false,
             imported: false,
+            sent: Vec::new(),
+            seen_ms: None,
         };
         store.set_secret(
             &buyer_conversation_key(&[1; 32], &tag),
@@ -2721,5 +3184,491 @@ mod buyer_conversation_backup_tests {
             &harvest_common::to_cbor(&record(secret)).unwrap(),
         );
         assert_eq!(conversation_secret_for_tag(&store, &tag), Some(secret));
+    }
+}
+
+#[cfg(test)]
+mod canonical_tag_tests {
+    use super::{canonical_encoding, is_canonical_tag};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// The rule itself, over the twins a buyer's tag has: bit 255, p and
+    /// above (u + p for u < 19), each small-torsion twin, a twist point and
+    /// a short slice refused; the real key and p - 1's encoding accepted.
+    /// Each twin is checked to give the real key's shared secret, so the
+    /// test is about twins and not arbitrary bytes. Mutated red by dropping
+    /// either half.
+    #[test]
+    fn only_canonical_prime_order_tags_are_tags() {
+        let real = *PublicKey::from(&StaticSecret::from([7u8; 32])).as_bytes();
+        let seller = StaticSecret::from([9u8; 32]);
+        let secret = |key: [u8; 32]| seller.diffie_hellman(&PublicKey::from(key)).to_bytes();
+        assert!(is_canonical_tag(&real));
+        assert!(!is_canonical_tag(&real[..31]));
+
+        let mut high = real;
+        high[31] |= 0x80;
+        assert_eq!(secret(high), secret(real), "precondition: a twin");
+        assert!(!is_canonical_tag(&high));
+
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        for u in 0u8..19 {
+            let mut over = p;
+            over[0] = 0xed + u;
+            assert!(!canonical_encoding(&over), "u + p for u = {u}");
+            assert!(!is_canonical_tag(&over));
+        }
+        let mut below_p = p;
+        below_p[0] = 0xec;
+        assert!(canonical_encoding(&below_p), "p - 1 is canonical");
+
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(real)
+            .to_edwards(0)
+            .unwrap();
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            assert_eq!(secret(twin), secret(real), "precondition: a twin");
+            assert!(canonical_encoding(&twin), "precondition: canonical bytes");
+            assert!(!is_canonical_tag(&twin), "a torsion twin");
+        }
+
+        let mut twist = [0u8; 32];
+        twist[0] = 2;
+        assert!(canonical_encoding(&twist));
+        assert!(!is_canonical_tag(&twist), "a twist point");
+    }
+
+    /// The variable-time check answers as `is_torsion_free` does, for points
+    /// in the subgroup, each of them plus every small-torsion point, and the
+    /// torsion points alone. Mutated red by dropping the `+ point`.
+    #[test]
+    fn the_fast_torsion_check_is_dalek_s() {
+        use curve25519_dalek::constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION};
+        use curve25519_dalek::Scalar;
+        let mut checked = 0;
+        for seed in 1u8..=40 {
+            let p = ED25519_BASEPOINT_POINT * Scalar::from_bytes_mod_order([seed; 32]);
+            for q in EIGHT_TORSION.iter() {
+                for point in [p + q, *q] {
+                    assert_eq!(
+                        super::torsion_free(&point),
+                        point.is_torsion_free(),
+                        "seed {seed}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 40 * 8 * 2);
+    }
+}
+
+/// Sent digests and read state kept with a conversation, both sides
+/// (the #205 follow-up: "You" and "New reply" survive a reload).
+#[cfg(test)]
+mod sent_and_seen_tests {
+    use super::*;
+    use crate::secrets::MemSecrets;
+    use harvest_common::delegate::{
+        MAX_SELLER_SENT_PER_STORE, MAX_SELLER_SENT_STORES, MAX_SENT_DIGESTS,
+    };
+    use harvest_common::SecretImport;
+
+    const STORE: &[u8] = &[3u8; 32];
+    const STORE_KEY: &[u8; 32] = &[3u8; 32];
+
+    fn record(seed: u8) -> ([u8; 32], BuyerConversationRecord) {
+        let secret = StaticSecret::from([seed; 32]);
+        (
+            *PublicKey::from(&secret).as_bytes(),
+            BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: *PublicKey::from(&StaticSecret::from([9u8; 32])).as_bytes(),
+                conversation_id: [seed; 32],
+                created_at: 1_700_000_000,
+                backed_up: false,
+                imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
+            },
+        )
+    }
+
+    fn kept(seed: u8) -> (MemSecrets, [u8; 32]) {
+        let mut store = MemSecrets::default();
+        let (tag, r) = record(seed);
+        store_buyer_conversation(&mut store, 1, STORE, &r);
+        (store, tag)
+    }
+
+    fn updated(response: HarvestDelegateResponse) -> Result<bool, String> {
+        match response {
+            HarvestDelegateResponse::BuyerConversationUpdated { result, .. } => result,
+            other => panic!("expected BuyerConversationUpdated, got {other:?}"),
+        }
+    }
+
+    fn recalled(store: &MemSecrets, tag: &[u8; 32]) -> RecalledConversation {
+        match list_buyer_conversations(store, 1, STORE) {
+            HarvestDelegateResponse::BuyerConversationList { conversations, .. } => conversations
+                .into_iter()
+                .find(|c| &c.buyer_public_key == tag)
+                .expect("recalled"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn digest(i: usize) -> [u8; 32] {
+        let mut d = [0xd0u8; 32];
+        d[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        d
+    }
+
+    /// A buyer's sent digests come back on recall, oldest first, each once,
+    /// the newest `MAX_SENT_DIGESTS` past the cap; a re-store of the same
+    /// conversation keeps them, and so does marking it backed up.
+    /// Mutated red by not deduplicating, by not dropping past the cap (or
+    /// dropping the newest), by not carrying them over a re-store, and by
+    /// not handing them back.
+    #[test]
+    fn a_buyers_sent_digests_survive_and_are_capped() {
+        let (mut store, tag) = kept(1);
+        assert_eq!(
+            updated(note_buyer_sent(&mut store, 2, STORE, &tag, &digest(0))),
+            Ok(true)
+        );
+        assert_eq!(
+            updated(note_buyer_sent(&mut store, 3, STORE, &tag, &digest(0))),
+            Ok(true)
+        );
+        assert_eq!(recalled(&store, &tag).sent_digests, vec![digest(0)], "once");
+
+        store_buyer_conversation(&mut store, 4, STORE, &record(1).1);
+        mark_conversation_backed_up(&mut store, 5, STORE, &tag);
+        assert_eq!(
+            recalled(&store, &tag).sent_digests,
+            vec![digest(0)],
+            "kept over a re-store"
+        );
+
+        for i in 1..MAX_SENT_DIGESTS + 5 {
+            note_buyer_sent(&mut store, 6, STORE, &tag, &digest(i));
+        }
+        let sent = recalled(&store, &tag).sent_digests;
+        assert_eq!(sent.len(), MAX_SENT_DIGESTS);
+        assert_eq!(sent[0], digest(5), "the oldest went");
+        assert_eq!(sent[MAX_SENT_DIGESTS - 1], digest(MAX_SENT_DIGESTS + 4));
+    }
+
+    /// The seen time is raised, never lowered, and comes back on recall. A
+    /// conversation this node does not hold answers `Ok(false)` and creates
+    /// nothing; a refused write is an `Err`. Mutated red by lowering it, by
+    /// creating a record for an unknown conversation, and by answering `Ok`
+    /// for a refused write.
+    #[test]
+    fn the_seen_time_only_rises_and_nothing_is_created() {
+        let (mut store, tag) = kept(1);
+        assert_eq!(recalled(&store, &tag).seen_ms, None);
+        assert_eq!(
+            updated(mark_conversation_seen(&mut store, 2, STORE, &tag, 500)),
+            Ok(true)
+        );
+        mark_conversation_seen(&mut store, 3, STORE, &tag, 400);
+        assert_eq!(recalled(&store, &tag).seen_ms, Some(500), "never lowered");
+        mark_conversation_seen(&mut store, 4, STORE, &tag, 900);
+        assert_eq!(recalled(&store, &tag).seen_ms, Some(900));
+        store_buyer_conversation(&mut store, 5, STORE, &record(1).1);
+        assert_eq!(
+            recalled(&store, &tag).seen_ms,
+            Some(900),
+            "kept over a re-store"
+        );
+
+        let (stranger, _) = record(2);
+        let before = store.list_secrets(b"").len();
+        assert_eq!(
+            updated(mark_conversation_seen(&mut store, 6, STORE, &stranger, 1)),
+            Ok(false)
+        );
+        assert_eq!(
+            updated(note_buyer_sent(&mut store, 7, STORE, &stranger, &digest(1))),
+            Ok(false)
+        );
+        assert_eq!(store.list_secrets(b"").len(), before, "nothing created");
+
+        store.writes_fail = true;
+        assert!(updated(mark_conversation_seen(&mut store, 8, STORE, &tag, 1_000)).is_err());
+        assert!(updated(note_buyer_sent(&mut store, 9, STORE, &tag, &digest(9))).is_err());
+    }
+
+    /// Forgetting a conversation takes its digests and seen time with it:
+    /// they are in its record. Red if they were kept beside it.
+    #[test]
+    fn forgetting_a_conversation_forgets_what_was_noted_on_it() {
+        let (mut store, tag) = kept(1);
+        note_buyer_sent(&mut store, 2, STORE, &tag, &digest(1));
+        mark_conversation_seen(&mut store, 3, STORE, &tag, 5);
+        forget_buyer_conversation(&mut store, 4, STORE, &tag);
+        assert!(
+            store.list_secrets(b"harvest:").is_empty(),
+            "{:?}",
+            store.list_secrets(b"")
+        );
+    }
+
+    fn seller_sent(
+        store: &MemSecrets,
+        id: &[u8; 32],
+    ) -> Result<Vec<harvest_common::delegate::SellerSentEntry>, String> {
+        match list_seller_sent(store, 1, id) {
+            HarvestDelegateResponse::SellerSent { result, .. } => result,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn noted(response: HarvestDelegateResponse) -> Result<(), String> {
+        match response {
+            HarvestDelegateResponse::SellerSentNoted { result, .. } => result,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A seller's digests, per store and conversation: each once, oldest
+    /// first, the newest `MAX_SELLER_SENT_PER_STORE` past the cap, stores
+    /// apart. A note for one store past `MAX_SELLER_SENT_STORES` is refused,
+    /// and a record that does not read is never written over. Mutated red by dropping each guard.
+    #[test]
+    fn a_sellers_sent_digests_are_kept_per_store_and_capped() {
+        let mut store = MemSecrets::default();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert_eq!(
+            noted(note_seller_sent(&mut store, 1, STORE_KEY, &a, &digest(0))),
+            Ok(())
+        );
+        assert_eq!(
+            noted(note_seller_sent(&mut store, 2, STORE_KEY, &b, &digest(1))),
+            Ok(())
+        );
+        assert_eq!(
+            noted(note_seller_sent(&mut store, 3, STORE_KEY, &a, &digest(0))),
+            Ok(())
+        );
+        assert_eq!(
+            seller_sent(&store, STORE_KEY),
+            Ok(vec![(a, digest(0)), (b, digest(1))])
+        );
+        assert_eq!(
+            seller_sent(&store, &[4u8; 32]),
+            Ok(Vec::new()),
+            "stores apart"
+        );
+
+        for i in 2..MAX_SELLER_SENT_PER_STORE + 3 {
+            note_seller_sent(&mut store, 4, STORE_KEY, &a, &digest(i));
+        }
+        let held = seller_sent(&store, STORE_KEY).unwrap();
+        assert_eq!(held.len(), MAX_SELLER_SENT_PER_STORE);
+        assert_eq!(held[0], (a, digest(3)), "the oldest went");
+        assert_eq!(
+            held.last(),
+            Some(&(a, digest(MAX_SELLER_SENT_PER_STORE + 2)))
+        );
+
+        let mut full = MemSecrets::default();
+        for s in 0..MAX_SELLER_SENT_STORES {
+            let id = [s as u8; 32];
+            assert_eq!(
+                noted(note_seller_sent(&mut full, 6, &id, &a, &digest(0))),
+                Ok(())
+            );
+        }
+        assert!(noted(note_seller_sent(&mut full, 7, &[0xee; 32], &a, &digest(0))).is_err());
+        assert_eq!(
+            noted(note_seller_sent(&mut full, 8, &[0u8; 32], &a, &digest(1))),
+            Ok(()),
+            "a store already held still takes notes"
+        );
+
+        let mut damaged = MemSecrets::default();
+        damaged.set_secret(&seller_sent_key(STORE_KEY), b"\x02junk");
+        assert!(noted(note_seller_sent(&mut damaged, 9, STORE_KEY, &a, &digest(0))).is_err());
+        assert_eq!(
+            damaged.get_secret(&seller_sent_key(STORE_KEY)).as_deref(),
+            Some(&b"\x02junk"[..])
+        );
+        assert!(seller_sent(&damaged, STORE_KEY).is_err());
+    }
+
+    /// A migration import of a conversation the successor already holds
+    /// merges what was noted on it: the predecessor's digests the successor
+    /// lacks, as older; the later seen time. Another secret under the same
+    /// key, or a record that does not decode, leaves the held one alone.
+    /// Mutated red by keeping the held record whole (the old rule), by
+    /// taking the earlier seen time, and by merging another secret's.
+    #[test]
+    fn an_imported_conversation_merges_what_was_noted_on_it() {
+        let (tag, mut theirs) = record(1);
+        theirs.sent = [digest(1), digest(2)].concat();
+        theirs.seen_ms = Some(900);
+        let key = buyer_conversation_key(STORE, &tag);
+        let value = harvest_common::to_cbor(&theirs).unwrap();
+
+        let (mut store, _) = kept(1);
+        note_buyer_sent(&mut store, 2, STORE, &tag, &digest(2));
+        note_buyer_sent(&mut store, 3, STORE, &tag, &digest(3));
+        mark_conversation_seen(&mut store, 4, STORE, &tag, 500);
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::Written
+        );
+        let back = recalled(&store, &tag);
+        assert_eq!(back.sent_digests, vec![digest(1), digest(2), digest(3)]);
+        assert_eq!(back.seen_ms, Some(900));
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::AlreadyAuthoritative,
+            "nothing new the second time"
+        );
+
+        let (_, mut other) = record(2);
+        other.sent = digest(7).to_vec();
+        other.seen_ms = Some(10_000);
+        let other = harvest_common::to_cbor(&other).unwrap();
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &other),
+            SecretImport::AlreadyAuthoritative
+        );
+        assert_eq!(
+            recalled(&store, &tag).seen_ms,
+            Some(900),
+            "another secret's is ignored"
+        );
+
+        let mut empty = MemSecrets::default();
+        assert_eq!(
+            crate::import::import_secret(&mut empty, &key, &value),
+            SecretImport::Written
+        );
+        assert_eq!(
+            recalled(&empty, &tag).sent_digests,
+            vec![digest(1), digest(2)]
+        );
+    }
+
+    /// Review round 1 of batch 2 (blocking): a conversation's backup string
+    /// carries neither its sent digests nor its seen time, so one at the
+    /// digest cap still fits `MAX_BACKUP_STRING_BYTES` and restores. Mutated
+    /// red by exporting the record as it is.
+    #[test]
+    fn a_full_digest_list_still_backs_up_and_restores() {
+        let (mut store, tag) = kept(1);
+        for i in 0..MAX_SENT_DIGESTS {
+            note_buyer_sent(&mut store, 2, STORE, &tag, &digest(i));
+        }
+        mark_conversation_seen(&mut store, 3, STORE, &tag, 9);
+        let HarvestDelegateResponse::BuyerConversationExported {
+            result: Ok(backup), ..
+        } = export_buyer_conversation(&store, 4, STORE, &tag)
+        else {
+            panic!("exported")
+        };
+        let mut fresh = MemSecrets::default();
+        let HarvestDelegateResponse::BuyerConversationImported { result, .. } =
+            import_buyer_conversation(&mut fresh, 5, &backup.0)
+        else {
+            panic!("an import answer")
+        };
+        assert!(
+            matches!(result, Ok(ImportedConversation::Imported { .. })),
+            "{result:?}"
+        );
+        assert!(recalled(&fresh, &tag).sent_digests.is_empty());
+    }
+
+    /// A predecessor's record for a conversation this delegate does not hold
+    /// is cut to the newest `MAX_SENT_DIGESTS` on import. Mutated red by
+    /// copying it as it is.
+    #[test]
+    fn an_imported_conversation_is_capped() {
+        let (tag, mut theirs) = record(1);
+        theirs.sent = (0..MAX_SENT_DIGESTS + 7).flat_map(digest).collect();
+        let key = buyer_conversation_key(STORE, &tag);
+        let mut store = MemSecrets::default();
+        let value = harvest_common::to_cbor(&theirs).unwrap();
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::Written
+        );
+        let sent = recalled(&store, &tag).sent_digests;
+        assert_eq!(sent.len(), MAX_SENT_DIGESTS);
+        assert_eq!(sent[0], digest(7), "the newest kept");
+
+        // A misaligned list longer than the cap is not copied as it is
+        // (review round 2): nothing of it is kept.
+        theirs.sent.push(0xff);
+        let value = harvest_common::to_cbor(&theirs).unwrap();
+        let mut store = MemSecrets::default();
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::Written
+        );
+        let held: BuyerConversationRecord =
+            harvest_common::from_cbor(&store.get_secret(&key).unwrap()).unwrap();
+        assert!(held.sent.is_empty(), "{} bytes kept", held.sent.len());
+    }
+
+    /// A seller's digests migrate merged: the predecessor's that the
+    /// successor lacks go first (older), the cap keeps the newest, and the
+    /// store cap and an unreadable held record are respected. Mutated red
+    /// by keeping the held value whole, by putting the predecessor's last,
+    /// and by writing over an unreadable record.
+    #[test]
+    fn a_sellers_sent_digests_migrate_merged() {
+        let a = [1u8; 32];
+        let key = seller_sent_key(STORE_KEY);
+        let mut predecessor = MemSecrets::default();
+        note_seller_sent(&mut predecessor, 1, STORE_KEY, &a, &digest(1));
+        note_seller_sent(&mut predecessor, 2, STORE_KEY, &a, &digest(2));
+        let value = predecessor.get_secret(&key).unwrap();
+
+        let mut successor = MemSecrets::default();
+        note_seller_sent(&mut successor, 3, STORE_KEY, &a, &digest(2));
+        note_seller_sent(&mut successor, 4, STORE_KEY, &a, &digest(3));
+        assert_eq!(
+            crate::import::import_secret(&mut successor, &key, &value),
+            SecretImport::Written
+        );
+        assert_eq!(
+            seller_sent(&successor, STORE_KEY),
+            Ok(vec![(a, digest(1)), (a, digest(2)), (a, digest(3))])
+        );
+        assert_eq!(
+            crate::import::import_secret(&mut successor, &key, &value),
+            SecretImport::AlreadyAuthoritative
+        );
+
+        let mut damaged = MemSecrets::default();
+        damaged.set_secret(&key, b"\x02junk");
+        assert!(matches!(
+            crate::import::import_secret(&mut damaged, &key, &value),
+            SecretImport::Retryable(_)
+        ));
+        assert_eq!(damaged.get_secret(&key).as_deref(), Some(&b"\x02junk"[..]));
+
+        let mut full = MemSecrets::default();
+        for s in 0..MAX_SELLER_SENT_STORES {
+            note_seller_sent(&mut full, 5, &[s as u8 + 100; 32], &a, &digest(0));
+        }
+        assert!(matches!(
+            crate::import::import_secret(&mut full, &key, &value),
+            SecretImport::Permanent(_)
+        ));
+        assert!(matches!(
+            crate::import::import_secret(&mut full, &key, b"\x02"),
+            SecretImport::Permanent(_)
+        ));
     }
 }
