@@ -69,6 +69,11 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
         R::BuyerConversationForgotten { request_id, .. } => {
             ("BuyerConversationForgotten", request(request_id))
         }
+        R::BuyerConversationUpdated { request_id, .. } => {
+            ("BuyerConversationUpdated", request(request_id))
+        }
+        R::SellerSentNoted { request_id, .. } => ("SellerSentNoted", request(request_id)),
+        R::SellerSent { request_id, .. } => ("SellerSent", request(request_id)),
         R::ConversationKeys {
             request_id,
             ghostkey_fingerprint,

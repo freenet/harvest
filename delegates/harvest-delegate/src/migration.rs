@@ -631,6 +631,64 @@ mod tests {
         }
     }
 
+    /// What the buyer and the seller noted on their conversations (sent
+    /// digests, the buyer's seen time) reaches the successor through the
+    /// export and its import. Mutated red by refusing either family on
+    /// import, or hiding it from the export.
+    #[test]
+    fn sent_digests_and_seen_times_migrate() {
+        use crate::messaging::{
+            list_buyer_conversations, list_seller_sent, mark_conversation_seen, note_buyer_sent,
+            note_seller_sent, store_buyer_conversation, BuyerConversationRecord,
+        };
+        use harvest_common::{ConversationSecret, HarvestDelegateResponse as R};
+        let id = [3u8; 32];
+        let secret = x25519_dalek::StaticSecret::from([5u8; 32]);
+        let tag = *x25519_dalek::PublicKey::from(&secret).as_bytes();
+        let mut predecessor = crate::secrets::MemSecrets::default();
+        store_buyer_conversation(
+            &mut predecessor,
+            1,
+            &id,
+            &BuyerConversationRecord {
+                secret: ConversationSecret(secret.to_bytes()),
+                seller_public_key: [9u8; 32],
+                conversation_id: [1u8; 32],
+                created_at: 1,
+                backed_up: false,
+                imported: false,
+                sent: Vec::new(),
+                seen_ms: None,
+            },
+        );
+        note_buyer_sent(&mut predecessor, 2, &id, &tag, &[7u8; 32]);
+        mark_conversation_seen(&mut predecessor, 3, &id, &tag, 1_234);
+        note_seller_sent(&mut predecessor, 4, &[2u8; 32], &[1u8; 32], &[8u8; 32]);
+        let payload = export_payload(
+            &WithoutStoreKeys(&predecessor),
+            Some(&harvest_origin()),
+            &origin_policy().unwrap(),
+            30,
+        )
+        .unwrap();
+        let exported = freenet_migrate::ExportedSecrets::from_bytes(&payload).unwrap();
+        let mut successor = crate::secrets::MemSecrets::default();
+        for (key, value) in &exported.secrets {
+            let _ = crate::import::import_secret(&mut successor, key, value);
+        }
+        let R::BuyerConversationList { conversations, .. } =
+            list_buyer_conversations(&successor, 5, &id)
+        else {
+            panic!("a list")
+        };
+        assert_eq!(conversations[0].sent_digests, vec![[7u8; 32]]);
+        assert_eq!(conversations[0].seen_ms, Some(1_234));
+        let R::SellerSent { result, .. } = list_seller_sent(&successor, 6, &[2u8; 32]) else {
+            panic!("a list")
+        };
+        assert_eq!(result, Ok(vec![([1u8; 32], [8u8; 32])]));
+    }
+
     /// At the host's enumeration cap the export is refused, as the crate
     /// refuses it, rather than shipping a list that may be missing keys.
     /// Mutated red by dropping the check.

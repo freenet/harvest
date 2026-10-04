@@ -300,10 +300,13 @@ pub enum BitcoinDelegateRequest {
     },
 }
 
-/// The most addresses one `PeekOrderAddresses` answers. Also the most
-/// instant-checkout invoices a store can issue between two visits by its
-/// seller, since only a watched address may go on one.
-pub const MAX_UPCOMING_ADDRESSES: u32 = 10;
+/// The most addresses one `PeekOrderAddresses` answers: the window the
+/// seller's tab reads clear and arms. Also the most instant-checkout invoices
+/// a payment key can issue between two visits by its seller, since the
+/// delegate invoices only on an address an arm names (harvest#198). 25 (was
+/// 10): one bridge request (at most 32 scripts) with the delegate's canary,
+/// and 5% of a Ghost Key's 500 watches.
+pub const MAX_UPCOMING_ADDRESSES: u32 = 25;
 
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]

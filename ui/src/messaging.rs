@@ -217,6 +217,14 @@ pub struct BuyerConversation {
     /// All-zeros from a delegate that predates the field means none. A
     /// secret, so it prints as `redacted` ([`ReceiptSeed`]).
     receipt_seed: ReceiptSeed,
+    /// The digests of entries this buyer's browsers sent here, as the harvest
+    /// delegate keeps them (`HarvestDelegateRequest::NoteBuyerSent`), oldest
+    /// first: what "You" is given to after a reload. Empty for one opened in
+    /// this tab until something is sent and noted.
+    pub sent_digests: Vec<[u8; 32]>,
+    /// When the buyer last looked at this conversation, in unix ms, as the
+    /// delegate keeps it (`HarvestDelegateRequest::MarkConversationSeen`).
+    pub seen_ms: Option<u64>,
 }
 
 /// The buyer's receipt-key seed (harvest#53 Phase B). A secret -- it signs
@@ -274,6 +282,8 @@ impl BuyerConversation {
             receipt_seed: ReceiptSeed(harvest_common::mailbox::buyer_receipt_seed_from_secret(
                 &secret.to_bytes(),
             )),
+            sent_digests: Vec::new(),
+            seen_ms: None,
         })
     }
 
@@ -307,6 +317,8 @@ impl BuyerConversation {
             kept_under: None,
             // Carried for the same reason: the secret stayed in the delegate.
             receipt_seed: ReceiptSeed(recalled.buyer_receipt_seed),
+            sent_digests: recalled.sent_digests.clone(),
+            seen_ms: recalled.seen_ms,
         }
     }
 
