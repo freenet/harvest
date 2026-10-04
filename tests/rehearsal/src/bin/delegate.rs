@@ -1235,7 +1235,22 @@ async fn published_families(url: &str, wasm: &[u8]) {
     let again = import_into(&mut node, &twin, predecessor, PUBLISHED, held(PUBLISHED).unwrap()).await;
     verdict(format!("the published list again: {again:?}"), again == SecretImport::AlreadyAuthoritative);
 
-    // The pending-key slot, into its own slot and only where none is held.
+    // What the source held in the pending slot (from batch 2 on, an emptied
+    // slot once its catch-up completed) reached the twin as it was, before
+    // the slot is exercised below.
+    let source_pending = held(PENDING);
+    let (before_pending, _) = export_of(&mut node, &twin, 0).await;
+    let twin_pending = before_pending.secrets.iter().find(|(k, _)| k == PENDING).map(|(_, v)| v.clone());
+    verdict(
+        format!(
+            "the twin holds the source's pending slot as exported ({:?} bytes)",
+            source_pending.as_ref().map(|v| v.len())
+        ),
+        twin_pending == source_pending,
+    );
+
+    // The pending-key slot, into its own slot and only where none is held
+    // (an emptied slot counts as none).
     let pending = |next_index: u32| {
         harvest_common::to_cbor(&Some(harvest_common::bitcoin_delegate::PaymentXpubStatus {
             xpub: signet_vpub(),
@@ -1282,7 +1297,9 @@ async fn published_families(url: &str, wasm: &[u8]) {
     }
     let mut differ = Vec::new();
     for (k, v) in &exported.secrets {
-        if k == PUBLISHED {
+        // The list's stamps differ by design; the pending slot was written
+        // over above, and checked before that.
+        if k == PUBLISHED || k == PENDING {
             continue;
         }
         if twin_held(k).map(|t| cbor_value(&t).ok() == cbor_value(v).ok() || t == *v) != Some(true) {
