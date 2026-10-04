@@ -2,6 +2,7 @@
 
 mod auto_invoice;
 mod background;
+mod backup;
 mod bip32;
 mod bitcoin;
 mod fast_cbor;

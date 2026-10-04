@@ -997,19 +997,31 @@ pub(crate) fn import_buyer_conversation<S: SecretStore + RemovableSecrets>(
         Err(why) => return imported(Err(why)),
     };
 
-    let record = backup.conversation;
-    let store_contract_id = backup.store_contract_id.to_vec();
+    imported(Ok(import_conversation_record(
+        store,
+        backup.store_contract_id,
+        backup.conversation,
+    )))
+}
+
+/// Keep one conversation restored from a backup (a pasted string, or a
+/// purchases backup's record): refused when its keys cannot be derived or
+/// this node is full, never written over one held and readable here. Shared
+/// by both restore paths so they cannot drift.
+pub(crate) fn import_conversation_record<S: SecretStore>(
+    store: &mut S,
+    store_contract_id: [u8; 32],
+    record: BuyerConversationRecord,
+) -> ImportedConversation {
     let secret = StaticSecret::from(record.secret.0);
     let buyer_public_key = *PublicKey::from(&secret).as_bytes();
-    let key = buyer_conversation_key(&backup.store_contract_id, &buyer_public_key);
-    let refused = |why: String| {
-        imported(Ok(ImportedConversation::Refused {
-            store_contract_id: store_contract_id.clone(),
-            buyer_public_key,
-            why,
-        }))
+    let key = buyer_conversation_key(&store_contract_id, &buyer_public_key);
+    let store_contract_id = store_contract_id.to_vec();
+    let refused = |why: String| ImportedConversation::Refused {
+        store_contract_id: store_contract_id.clone(),
+        buyer_public_key,
+        why,
     };
-
     // A record whose keys cannot be derived would occupy a slot and recall
     // nothing, so it is refused where the buyer can see it rather than
     // accepted and silently invisible.
@@ -1032,10 +1044,10 @@ pub(crate) fn import_buyer_conversation<S: SecretStore + RemovableSecrets>(
             .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
             .is_some()
     {
-        return imported(Ok(ImportedConversation::AlreadyHeld {
+        return ImportedConversation::AlreadyHeld {
             store_contract_id,
             buyer_public_key,
-        }));
+        };
     }
 
     if !occupied && held_conversations(store).len() >= MAX_BUYER_CONVERSATIONS {
@@ -1061,10 +1073,10 @@ pub(crate) fn import_buyer_conversation<S: SecretStore + RemovableSecrets>(
         return refused("this conversation could not be re-encoded".to_string());
     };
     if store.set_secret(&key, &bytes) {
-        imported(Ok(ImportedConversation::Imported {
+        ImportedConversation::Imported {
             store_contract_id,
             buyer_public_key,
-        }))
+        }
     } else {
         refused(
             "the node refused the write, so this conversation is still not readable here"

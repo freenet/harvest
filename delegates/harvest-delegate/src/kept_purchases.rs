@@ -190,6 +190,8 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
         receipt_seed,
         order: keep.order,
         complaint: keep.complaint,
+        // A new or upgraded copy is not in any backup yet.
+        backed_up: false,
     };
 
     let next = match held {

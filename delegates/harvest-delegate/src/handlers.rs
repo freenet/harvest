@@ -237,6 +237,22 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_key,
         } => crate::messaging::list_seller_sent(store, request_id, &store_key),
 
+        HarvestDelegateRequest::ExportPurchasesBackup { request_id, after } => {
+            crate::backup::export_page(store, request_id, after)
+        }
+
+        HarvestDelegateRequest::ImportPurchasesBackup {
+            request_id,
+            conversations,
+            purchases,
+        } => crate::backup::import(store, request_id, conversations, purchases),
+
+        HarvestDelegateRequest::MarkBackedUp {
+            request_id,
+            conversations,
+            orders,
+        } => crate::backup::mark(store, request_id, conversations, orders),
+
         // Backup. The export answers the secrets themselves, so its need for
         // the gate is obvious. `MarkConversationsBackedUp` is the one whose
         // need is NOT obvious and matters as much: it silences the warning

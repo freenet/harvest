@@ -33053,6 +33053,7 @@ mod buy_flow_tests {
                 .to_bytes(),
             order: order.clone(),
             complaint: None,
+            backed_up: false,
         }
     }
 

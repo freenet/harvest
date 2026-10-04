@@ -302,6 +302,46 @@ pub enum HarvestDelegateRequest {
         store_key: [u8; 32],
     },
 
+    /// One page of everything a purchases backup carries: the buyer's kept
+    /// conversations and kept purchases, in key order, starting after the
+    /// key `after` (the previous page's `next`; `None` for the first). A
+    /// page holds about [`BACKUP_PAGE_BYTES`] of records (always at least
+    /// one), so a full node's backup is read over several calls, each
+    /// within one call's budget; the UI assembles the file. Answered with
+    /// [`HarvestDelegateResponse::PurchasesBackup`]. The answer carries
+    /// secrets (the conversations' and the receipt seeds).
+    ExportPurchasesBackup {
+        request_id: RequestId,
+        after: Option<String>,
+    },
+
+    /// Restore part of a purchases backup: at most [`BACKUP_IMPORT_ITEMS`]
+    /// records a call. A conversation or purchase this node already holds
+    /// stays as it is (a purchase is merged as a migration merges it: a
+    /// more complete copy wins); past either cap an item is refused and
+    /// named, never making room by evicting. Every purchase is checked as
+    /// a fresh keep is. Answered with
+    /// [`HarvestDelegateResponse::PurchasesBackupImported`], one outcome per
+    /// item, in order.
+    ImportPurchasesBackup {
+        request_id: RequestId,
+        conversations: Vec<BackupConversation>,
+        purchases: Vec<KeptPurchase>,
+    },
+
+    /// Record that the buyer holds a backup of exactly these items: the
+    /// conversations by store id and routing tag, the purchases by order id.
+    /// At most [`BACKUP_MARK_ITEMS`] a call (each is a secret write). An
+    /// item this node does not hold is skipped. A purchase's mark is
+    /// cleared when its order moves on (paid after the backup), so the
+    /// buyer is asked to back it up again. Answered with
+    /// [`HarvestDelegateResponse::BackedUpMarked`].
+    MarkBackedUp {
+        request_id: RequestId,
+        conversations: Vec<([u8; 32], [u8; 32])>,
+        orders: Vec<crate::payment::OrderId>,
+    },
+
     // === Listing Management ===
     /// Create and sign a new listing using the seller's ghostkey.
     CreateListing {
@@ -867,7 +907,68 @@ pub struct KeptPurchase {
     /// section 3.4).
     #[serde(default)]
     pub complaint: Option<KeptComplaint>,
+    /// Whether this copy, as it is now, is in a purchases backup the buyer
+    /// holds ([`HarvestDelegateRequest::MarkBackedUp`]). Cleared when the
+    /// order moves on (paid after the backup was made). Skipped when false,
+    /// so a record without it encodes exactly as before the field existed.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub backed_up: bool,
 }
+
+/// One conversation in a purchases backup: what the buyer's node needs to
+/// read the thread again (the conversation's secret and the seller key it
+/// was opened against), and which store it is with. Not what was noted on
+/// it (sent digests, seen time). The secret prints as `redacted`.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct BackupConversation {
+    pub store_contract_id: [u8; 32],
+    pub secret: ConversationSecret,
+    pub seller_public_key: [u8; 32],
+    pub conversation_id: [u8; 32],
+    pub created_at: i64,
+}
+
+impl core::fmt::Debug for BackupConversation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BackupConversation")
+            .field("store_contract_id", &self.store_contract_id)
+            .field("secret", &Redacted)
+            .field("seller_public_key", &self.seller_public_key)
+            .field("conversation_id", &self.conversation_id)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// One page of a purchases backup
+/// ([`HarvestDelegateRequest::ExportPurchasesBackup`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PurchasesBackupPage {
+    pub conversations: Vec<BackupConversation>,
+    pub purchases: Vec<KeptPurchase>,
+    /// Where the next page starts; `None` when this was the last.
+    pub next: Option<String>,
+}
+
+/// What restoring one backup item did.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum BackupItemOutcome {
+    Imported,
+    /// This node already held it; its own copy stands.
+    AlreadyHeld,
+    /// Not restored, and why (a cap reached, a record that does not check).
+    Refused(String),
+}
+
+/// About how many bytes of stored records one backup page carries.
+pub const BACKUP_PAGE_BYTES: usize = 256 * 1024;
+
+/// The most records one [`HarvestDelegateRequest::ImportPurchasesBackup`]
+/// takes.
+pub const BACKUP_IMPORT_ITEMS: usize = 16;
+
+/// The most items one [`HarvestDelegateRequest::MarkBackedUp`] takes.
+pub const BACKUP_MARK_ITEMS: usize = 48;
 
 impl KeptPurchase {
     /// The filed complaint, as the reputation record holds it.
@@ -885,6 +986,7 @@ impl core::fmt::Debug for KeptPurchase {
             .field("receipt_seed", &Redacted)
             .field("order", &self.order)
             .field("complaint", &self.complaint)
+            .field("backed_up", &self.backed_up)
             .finish()
     }
 }
@@ -1083,6 +1185,26 @@ pub enum HarvestDelegateResponse {
         request_id: RequestId,
         store_key: [u8; 32],
         result: Result<Vec<SellerSentEntry>, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::ExportPurchasesBackup`].
+    PurchasesBackup {
+        request_id: RequestId,
+        result: Result<PurchasesBackupPage, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::ImportPurchasesBackup`]: one
+    /// outcome per item sent, conversations first, then purchases.
+    PurchasesBackupImported {
+        request_id: RequestId,
+        result: Result<Vec<BackupItemOutcome>, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::MarkBackedUp`]: how many
+    /// items were marked (or already were).
+    BackedUpMarked {
+        request_id: RequestId,
+        result: Result<u32, String>,
     },
 
     /// Whether a conversation was actually removed.
@@ -1879,9 +2001,13 @@ mod tests {
             R::SellerSentNoted { .. } => (34, false),
             // Digests of ciphertexts the seller already published.
             R::SellerSent { .. } => (35, false),
+            // Every conversation secret and receipt seed.
+            R::PurchasesBackup { .. } => (36, true),
+            R::PurchasesBackupImported { .. } => (37, false),
+            R::BackedUpMarked { .. } => (38, false),
         }
     }
-    const RESPONSE_VARIANTS: usize = 36;
+    const RESPONSE_VARIANTS: usize = 39;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -1931,9 +2057,13 @@ mod tests {
             Q::MarkConversationSeen { .. } => (33, false),
             Q::NoteSellerSent { .. } => (34, false),
             Q::ListSellerSent { .. } => (35, false),
+            Q::ExportPurchasesBackup { .. } => (36, false),
+            // Conversation secrets and receipt seeds, restored.
+            Q::ImportPurchasesBackup { .. } => (37, true),
+            Q::MarkBackedUp { .. } => (38, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 36;
+    const REQUEST_VARIANTS: usize = 39;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -2136,6 +2266,7 @@ mod tests {
                     receipt_seed: SECRET,
                     order: crate::test_orders::paid(1),
                     complaint: None,
+                    backed_up: false,
                 }],
             },
             R::KeepPurchaseRefused {
@@ -2189,7 +2320,40 @@ mod tests {
                 store_key: [3u8; 32],
                 result: Ok(vec![([1u8; 32], [19u8; 32])]),
             },
+            R::PurchasesBackup {
+                request_id: 24,
+                result: Ok(PurchasesBackupPage {
+                    conversations: vec![backup_conversation()],
+                    purchases: vec![KeptPurchase {
+                        store_key: [17u8; 32],
+                        conversation: [1u8; 32],
+                        receipt_seed: SECRET,
+                        order: crate::test_orders::paid(1),
+                        complaint: None,
+                        backed_up: true,
+                    }],
+                    next: Some("harvest:kept_purchase:00".into()),
+                }),
+            },
+            R::PurchasesBackupImported {
+                request_id: 25,
+                result: Ok(vec![BackupItemOutcome::Imported]),
+            },
+            R::BackedUpMarked {
+                request_id: 26,
+                result: Ok(2),
+            },
         ]
+    }
+
+    fn backup_conversation() -> BackupConversation {
+        BackupConversation {
+            store_contract_id: [3u8; 32],
+            secret: ConversationSecret(SECRET),
+            seller_public_key: [5u8; 32],
+            conversation_id: [6u8; 32],
+            created_at: 7,
+        }
     }
 
     fn watch_delegation_status() -> WatchDelegationStatus {
@@ -2413,6 +2577,20 @@ mod tests {
                 request_id: 24,
                 store_key: [3u8; 32],
             },
+            Q::ExportPurchasesBackup {
+                request_id: 25,
+                after: None,
+            },
+            Q::ImportPurchasesBackup {
+                request_id: 26,
+                conversations: vec![backup_conversation()],
+                purchases: Vec::new(),
+            },
+            Q::MarkBackedUp {
+                request_id: 27,
+                conversations: vec![([3u8; 32], [1u8; 32])],
+                orders: vec![crate::payment::OrderId([4u8; 32])],
+            },
         ]
     }
 
@@ -2495,6 +2673,7 @@ mod tests {
             receipt_seed: [0xff; 32],
             order: paid,
             complaint: Some(KeptComplaint::of(&complaint)),
+            backed_up: false,
         };
         let len = crate::to_cbor(&kept).expect("encodes").len();
         assert!(

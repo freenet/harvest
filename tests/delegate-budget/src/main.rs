@@ -1528,6 +1528,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             receipt_seed,
             order: orders.paid(orders.order(n, receipt_key)),
             complaint: None,
+            backed_up: false,
         };
         let id: String = record
             .order
@@ -1618,6 +1619,92 @@ fn scenario(r: &mut Runner) -> Result<()> {
             }
         ),
     }
+
+    // --- one backup of everything (step 2) -----------------------------------
+    // Every page of the export, with every conversation and purchase at its
+    // cap: each page is one call, measured under one name (the most
+    // expensive is reported). Then one import chunk of
+    // `BACKUP_IMPORT_ITEMS` paid purchases this node does not hold, each
+    // checked as a fresh keep is (the costly case), with the state put
+    // back after.
+    let mut after: Option<String> = None;
+    let (mut exported_conversations, mut exported_purchases, mut pages) = (0usize, 0usize, 0usize);
+    let mut first_purchases: Vec<KeptPurchase> = Vec::new();
+    loop {
+        let answer = r.app(
+            "ExportPurchasesBackup (a page, everything at its caps)",
+            cbor(&HarvestDelegateRequest::ExportPurchasesBackup {
+                request_id: 950,
+                after: after.clone(),
+            }),
+            "PurchasesBackup",
+        )?;
+        pages += 1;
+        let page = field(&answer, &["PurchasesBackup", "result", "Ok"])?;
+        if let Value::Array(c) = field(page, &["conversations"])? {
+            exported_conversations += c.len();
+        }
+        if let Value::Array(p) = field(page, &["purchases"])? {
+            exported_purchases += p.len();
+            for item in p {
+                if first_purchases.len() < harvest_common::delegate::BACKUP_IMPORT_ITEMS {
+                    first_purchases.push(item.deserialized()?);
+                }
+            }
+        }
+        match field(page, &["next"])? {
+            Value::Text(next) => after = Some(next.clone()),
+            _ => break,
+        }
+        if pages > 10_000 {
+            bail!("the backup export never ends");
+        }
+    }
+    if exported_conversations != buyer_conversations || exported_purchases != KEPT_PURCHASES {
+        bail!(
+            "the backup exported {exported_conversations} conversations and \
+             {exported_purchases} purchases, expected {buyer_conversations} and {KEPT_PURCHASES}"
+        );
+    }
+    println!("  (backup: {pages} pages)");
+    let snapshot = r.host.state.secrets.clone();
+    for purchase in &first_purchases {
+        let id: String = purchase
+            .order
+            .order
+            .id
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        r.host
+            .state
+            .secrets
+            .remove(format!("harvest:kept_purchase:{id}").as_bytes());
+    }
+    let imported = r.app(
+        &format!(
+            "ImportPurchasesBackup ({} paid purchases not held)",
+            first_purchases.len()
+        ),
+        cbor(&HarvestDelegateRequest::ImportPurchasesBackup {
+            request_id: 951,
+            conversations: Vec::new(),
+            purchases: first_purchases.clone(),
+        }),
+        "PurchasesBackupImported",
+    )?;
+    match field(&imported, &["PurchasesBackupImported", "result", "Ok"])? {
+        Value::Array(o)
+            if o.len() == first_purchases.len()
+                && o.iter()
+                    .all(|v| matches!(v, Value::Text(t) if t == "Imported")) => {}
+        other => bail!(
+            "the backup import did not restore every purchase: {}",
+            brief(other)
+        ),
+    }
+    r.host.state.secrets = snapshot;
 
     // --- the buyer's remembered stores, to the cap --------------------------
     for i in 0..caps.known_stores {
