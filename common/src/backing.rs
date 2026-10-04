@@ -632,6 +632,8 @@ pub enum StoreKeyMessage {
     Despatch,
     /// The seller is online (`crate::presence`).
     Heartbeat,
+    /// The seller paused or resumed the store (`crate::store_pause`).
+    Pause,
 }
 
 /// Which kind of store-key message `payload` is, or `None` if it is none of
@@ -671,6 +673,10 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
     // anything above from decoding as it.
     } else if is::<crate::presence::Heartbeat>(payload) {
         Some(StoreKeyMessage::Heartbeat)
+    // After the heartbeat, for the same reason; its own one-variant `kind`
+    // tag keeps it apart from everything above.
+    } else if is::<crate::store_pause::StorePause>(payload) {
+        Some(StoreKeyMessage::Pause)
     } else {
         None
     }

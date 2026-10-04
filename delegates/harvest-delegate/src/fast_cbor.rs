@@ -228,12 +228,17 @@ pub(crate) fn map_fields<'a>(bytes: &'a [u8], wanted: &[&str]) -> Option<Vec<(us
 }
 
 /// A store's state as instant checkout reads it (#206): only the fields it
-/// uses (`owner`, `listings`, `orders`, `listing_statuses`, `closed`), each
-/// order with only its terms and status. Everything else -- the store's
-/// info, backings, custody copies, fulfilment, retirements, and each order's
-/// signatures and payment proof (about 4.5 KiB an order, mostly the SPV
-/// proof) -- is passed over by its CBOR heads rather than decoded, and left
-/// empty. `None` for anything that is not such a state (the caller then
+/// uses (`owner`, `listings`, `orders`, `listing_statuses`, `closed`,
+/// `pause`), each order with only its terms and status, each listing and
+/// listing status with only the listing or the status. Everything else -- the store's info, backings, custody
+/// copies, fulfilment, retirements, each order's signatures and payment
+/// proof (about 4.5 KiB an order, mostly the SPV proof), and each listing's
+/// signature, signed payload and certificate (step 2: the signed payload
+/// repeats the listing as a byte string serde reads a byte at a time, which
+/// made a listing cost about 256 instructions a byte; a listing status's
+/// likewise, and statuses are kept for every listing ever published, so a
+/// store that edits often holds many) -- is passed over by
+/// its CBOR heads rather than decoded, and left empty. `None` for anything that is not such a state (the caller then
 /// decodes it whole), including one without `info`, which a whole decode
 /// requires.
 ///
@@ -260,13 +265,33 @@ pub(crate) fn decode_store_light(bytes: &[u8]) -> Option<harvest_common::StoreSt
             store.orders = r.orders_light()?;
             continue;
         }
+        if key == "listings" {
+            store.listings = r.listings_light()?;
+            continue;
+        }
+        if key == "listing_statuses" {
+            // Only the statuses of listings held: nothing else is read, and
+            // statuses are kept for every listing version ever published.
+            // The listings come first as a store writes its fields; if they
+            // have not, every status is kept.
+            let held: Option<std::collections::BTreeSet<harvest_common::listing::ListingId>> =
+                seen.contains(&"listings").then(|| {
+                    store
+                        .listings
+                        .listings
+                        .iter()
+                        .map(|l| l.listing.id.clone())
+                        .collect()
+                });
+            store.listing_statuses = r.statuses_light(held.as_ref())?;
+            continue;
+        }
         r.skip(0)?;
         let value = &bytes[start..r.at];
         match key {
             "owner" => store.owner = from_cbor(value).ok()?,
-            "listings" => store.listings = from_cbor(value).ok()?,
-            "listing_statuses" => store.listing_statuses = from_cbor(value).ok()?,
             "closed" => store.closed = from_cbor(value).ok()?,
+            "pause" => store.pause = from_cbor(value).ok()?,
             _ => {}
         }
     }
@@ -337,6 +362,118 @@ impl Reader<'_> {
             }
         }
         Some(orders)
+    }
+
+    /// `ListingStatusesV1`, each status with only `status` decoded and its
+    /// signature and signed payload passed over, and with `held` only the
+    /// statuses of those listings.
+    fn statuses_light(
+        &mut self,
+        held: Option<&std::collections::BTreeSet<harvest_common::listing::ListingId>>,
+    ) -> Option<harvest_common::store::ListingStatusesV1> {
+        use harvest_common::from_cbor;
+        use harvest_common::listing::AuthorizedListingStatus;
+        use harvest_common::store::Bytes32;
+        let mut statuses = harvest_common::store::ListingStatusesV1::default();
+        let fields = self.head(5)?;
+        let mut seen_records = false;
+        for _ in 0..fields {
+            let key = self.text()?;
+            if key != "records" || seen_records {
+                if key == "records" {
+                    return None;
+                }
+                self.skip(0)?;
+                continue;
+            }
+            seen_records = true;
+            let count = self.head(5)?;
+            for _ in 0..count {
+                let key_at = self.at;
+                self.skip(0)?;
+                let slot: Bytes32 = from_cbor(&self.bytes[key_at..self.at]).ok()?;
+                if held
+                    .is_some_and(|held| !held.contains(&harvest_common::listing::ListingId(slot.0)))
+                {
+                    self.skip(0)?;
+                    continue;
+                }
+                let record_fields = self.head(5)?;
+                let mut status = None;
+                for _ in 0..record_fields {
+                    let name = self.text()?;
+                    let at = self.at;
+                    self.skip(0)?;
+                    match name {
+                        "status" if status.is_none() => {
+                            status = Some(from_cbor(&self.bytes[at..self.at]).ok()?)
+                        }
+                        "status" => return None,
+                        _ => {}
+                    }
+                }
+                let replaced = statuses.records.insert(
+                    slot,
+                    AuthorizedListingStatus {
+                        status: status?,
+                        scoped_payload: Vec::new(),
+                        signature: Vec::new(),
+                    },
+                );
+                if replaced.is_some() {
+                    return None;
+                }
+            }
+        }
+        Some(statuses)
+    }
+
+    /// `ListingsV1`, each listing with only `listing` decoded and its
+    /// signature, signed payload and certificate passed over.
+    fn listings_light(&mut self) -> Option<harvest_common::store::ListingsV1> {
+        use harvest_common::from_cbor;
+        use harvest_common::listing::AuthorizedListing;
+        let mut listings = harvest_common::store::ListingsV1::default();
+        let fields = self.head(5)?;
+        let mut seen_listings = false;
+        for _ in 0..fields {
+            let key = self.text()?;
+            if key != "listings" || seen_listings {
+                if key == "listings" {
+                    return None;
+                }
+                self.skip(0)?;
+                continue;
+            }
+            seen_listings = true;
+            let count = usize::try_from(self.head(4)?).ok()?;
+            if count > self.bytes.len() {
+                return None;
+            }
+            for _ in 0..count {
+                let listing_fields = self.head(5)?;
+                let mut listing = None;
+                for _ in 0..listing_fields {
+                    let name = self.text()?;
+                    let at = self.at;
+                    self.skip(0)?;
+                    match name {
+                        "listing" if listing.is_none() => {
+                            listing = Some(from_cbor(&self.bytes[at..self.at]).ok()?)
+                        }
+                        "listing" => return None,
+                        _ => {}
+                    }
+                }
+                listings.listings.push(AuthorizedListing {
+                    listing: listing?,
+                    scoped_payload: Vec::new(),
+                    signature: Vec::new(),
+                    certificate_pem: String::new(),
+                });
+            }
+        }
+        Some(listings)
     }
 }
 

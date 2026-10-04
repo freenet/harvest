@@ -1736,16 +1736,42 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
 
+    let at = InstantStore {
+        contract: store_contract,
+        verifying_key: store,
+        mailbox: mailbox_contract,
+        inbox,
+        fingerprint: &fingerprint,
+        tip_contract,
+        trusted: &trusted,
+    };
     instant_decide(
         r,
-        &InstantStore {
-            contract: store_contract,
-            verifying_key: store,
-            mailbox: mailbox_contract,
-            inbox,
-            fingerprint: &fingerprint,
-            tip_contract,
-            trusted: &trusted,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: 0,
+            full_mailbox: true,
+        },
+    )?;
+    // Step 2: the same store at both listing caps, the worst case the caps
+    // allow; and with a long status history, which nothing caps.
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: true,
+            statuses: 0,
+            full_mailbox: false,
+        },
+    )?;
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: DECIDE_STATUSES,
+            full_mailbox: false,
         },
     )?;
 
@@ -1852,6 +1878,68 @@ fn scenario(r: &mut Runner) -> Result<()> {
     Ok(())
 }
 
+/// A listing as large as a store keeps ([`harvest_common::store::MAX_LISTING_BYTES`]),
+/// signed for real so its signed payload is its real size: 8 photos with
+/// full alt text, then the description padded until one more character
+/// would not fit. A store at its listing cap holds 512 of these.
+fn listing_at_cap(
+    base: &harvest_common::listing::Listing,
+    i: usize,
+    signer: &SigningKey,
+) -> Result<harvest_common::listing::AuthorizedListing> {
+    use harvest_common::listing_image::{ImageBlob, ListingImage, MAX_ALT_CHARS, MAX_IMAGES_HARD};
+    let build = |desc: usize| -> Result<harvest_common::listing::AuthorizedListing> {
+        let mut l = base.clone();
+        l.title = format!("Listing {i}: a jar of plum jam from the orchard");
+        l.description = "d".repeat(desc);
+        l.images = (0..MAX_IMAGES_HARD as u8)
+            .map(|p| ListingImage {
+                full: ImageBlob {
+                    hash: harvest_common::store::Bytes32([p + 30; 32]),
+                    len: 200_000,
+                    width: 1600,
+                    height: 1200,
+                },
+                thumb: (p == 0).then_some(ImageBlob {
+                    hash: harvest_common::store::Bytes32([99; 32]),
+                    len: 20_000,
+                    width: 400,
+                    height: 300,
+                }),
+                colour: [10, 200, 30],
+                alt: "a".repeat(MAX_ALT_CHARS),
+            })
+            .collect();
+        l.created_at = fixtures::ts(1_600_000_000 + i as i64);
+        let l = l.with_derived_id();
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(signer, cbor(&l))
+                .map_err(|e| anyhow!("{e}"))?;
+        Ok(harvest_common::listing::AuthorizedListing {
+            listing: l,
+            scoped_payload,
+            signature,
+            certificate_pem: String::new(),
+        })
+    };
+    let fits = |a: &harvest_common::listing::AuthorizedListing| {
+        cbor(a).len() <= harvest_common::store::MAX_LISTING_BYTES
+    };
+    let (mut lo, mut hi) = (0usize, harvest_common::store::MAX_LISTING_BYTES);
+    if !fits(&build(0)?) {
+        bail!("a listing with every photo and full alt text does not fit the listing bound");
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&build(mid)?) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    build(lo)
+}
+
 /// The first store's instant-checkout arm, as [`instant_decide`] needs it.
 struct InstantStore<'a> {
     contract: [u8; 32],
@@ -1904,7 +1992,22 @@ impl InstantStore<'_> {
 /// counter has caught up. `decide` does not check an order's signature, so
 /// each is signed by a fixture key at its real size, with a genuine SPV
 /// payment proof.
-fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
+/// How many listing statuses the long-history decide carries: about one per
+/// listing version ever published (an edit publishes a new version).
+const DECIDE_STATUSES: usize = 10_000;
+
+/// What else the store holds beside its `MAX_ORDERS` paid orders (step 2).
+struct DecideShape {
+    /// `MAX_LISTINGS` listings at `MAX_LISTING_BYTES` each: both caps.
+    listings_at_cap: bool,
+    /// Listing statuses, which are not capped: one per listing version ever
+    /// published.
+    statuses: usize,
+    /// Also measure a full mailbox of instant requests (once is enough).
+    full_mailbox: bool,
+}
+
+fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Result<()> {
     use harvest_common::listing::{
         AuthorizedListing, ChoiceGroup, DeliveryPrice, FixedCheckout, Listing, ListingId,
         ListingKind, RegionPrice,
@@ -1961,6 +2064,21 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         },
         ..Default::default()
     };
+    if shape.listings_at_cap {
+        let signer = SigningKey::from_bytes(&[12u8; 32]);
+        // One fewer than the cap, all older than the listing the request
+        // names, so the cut keeps that one (the newest are kept).
+        for i in 0..harvest_common::store::MAX_LISTINGS - 1 {
+            store
+                .listings
+                .listings
+                .push(listing_at_cap(&listing, i, &signer)?);
+        }
+        store.listings.normalize();
+        if store.listings.listings.len() != harvest_common::store::MAX_LISTINGS {
+            bail!("the listings at the cap did not all fit");
+        }
+    }
     for (k, script) in scripts_at(&chain, start..next)?.into_iter().enumerate() {
         let order = fx.paid(fx.order_on(k as u32, script));
         store.orders.orders.insert(order.order.id.clone(), order);
@@ -1971,12 +2089,6 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             store.orders.orders.len()
         );
     }
-    let store_bytes = cbor(&store);
-    println!(
-        "  (full store: {} paid orders, {} KiB)",
-        store.orders.orders.len(),
-        store_bytes.len() / 1024
-    );
 
     // The buyer's instant request, sealed to the store's inbox.
     let buyer = StaticSecret::from([0xD0u8; 32]);
@@ -2011,12 +2123,46 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         now - chrono::Duration::seconds(5),
         40_000,
     );
+    if shape.statuses > 0 {
+        use harvest_common::listing::{
+            AuthorizedListingStatus, ListingAvailability, ListingId, ListingStatus,
+        };
+        let signer = SigningKey::from_bytes(&[12u8; 32]);
+        for i in 0..shape.statuses {
+            let mut id = [0x77u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let status = ListingStatus {
+                listing: ListingId(id),
+                revision: 1_700_000_000_000 + i as u64,
+                availability: ListingAvailability::Withdrawn,
+            };
+            let (scoped_payload, signature) =
+                harvest_common::backing::sign_with_store_key(&signer, cbor(&status))
+                    .map_err(|e| anyhow!("{e}"))?;
+            store.listing_statuses.records.insert(
+                harvest_common::store::Bytes32(id),
+                AuthorizedListingStatus {
+                    status,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        }
+    }
+    let store_bytes = cbor(&store);
+    println!(
+        "  (full store: {} paid orders, {} listings, {} statuses, {} KiB)",
+        store.orders.orders.len(),
+        store.listings.listings.len(),
+        store.listing_statuses.records.len(),
+        store_bytes.len() / 1024
+    );
     // A mailbox full of valid instant requests, each from its own buyer:
     // every one opens and pays the subgroup check on its tag
     // (`messaging::is_canonical_tag`, in `open_instant`), on top of the
     // agreement and the decryption `OPEN_FIXED_COST` stands for. One run
     // (the most one run opens); the delegate's state is put back after.
-    {
+    if shape.full_mailbox {
         let before = r.host.state.secrets.clone();
         let requests: Vec<_> = (0..harvest_common::mailbox::MAX_MESSAGES as u64)
             .map(|i| {
@@ -2090,7 +2236,18 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             anyhow!("the instant request asked nothing of the store: it was not batched")
         })?;
 
-    let name = format!("GetContractResponse: store, {n} paid orders (instant decide)");
+    let mut extra = String::new();
+    if shape.listings_at_cap {
+        extra += &format!(
+            ", {} listings of {} KiB",
+            harvest_common::store::MAX_LISTINGS,
+            harvest_common::store::MAX_LISTING_BYTES / 1024
+        );
+    }
+    if shape.statuses > 0 {
+        extra += &format!(", {} listing statuses", shape.statuses);
+    }
+    let name = format!("GetContractResponse: store, {n} paid orders{extra} (instant decide)");
     let counter = |r: &Runner| -> Result<u64> {
         let v = secret_value(r, XPUB_KEY)?;
         match field(&v, &["next_index"])? {

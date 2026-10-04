@@ -246,3 +246,6 @@ mod tests {
 // artifact movement; it does not prevent it (adding this module moved every
 // contract anyway, harvest images PR 2).
 pub mod listing_image;
+
+// After everything else for the same reason as `listing_image` above.
+pub mod store_pause;

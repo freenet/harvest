@@ -390,11 +390,38 @@ impl ListingsV1 {
     /// whose base may be a predecessor's state written under the old,
     /// permissive `verify` (harvest#26). A stable sort keeps the first of two
     /// equal ids, which is the one already held.
+    ///
+    /// Then the caps (step 2): a listing over [`MAX_LISTING_BYTES`] is
+    /// dropped, and of the rest the [`MAX_LISTINGS`] newest are kept, by
+    /// `created_at` and then id. Both are pure functions of the set held,
+    /// and both commute with merging: the size rule looks at one listing
+    /// alone, and every listing a cut keeps outranks every one it drops, so
+    /// whatever is cut from a part is cut from any union containing it.
+    /// Nothing an order needs is lost: an order carries its own terms and
+    /// proof, and names its listing only by an opaque tag.
     pub fn normalize(&mut self) {
+        self.listings.retain(fits);
         self.listings
             .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         self.listings.dedup_by(|a, b| a.listing.id == b.listing.id);
+        if self.listings.len() > MAX_LISTINGS {
+            let mut newest: Vec<(chrono::DateTime<chrono::Utc>, ListingId)> = self
+                .listings
+                .iter()
+                .map(|l| (l.listing.created_at, l.listing.id.clone()))
+                .collect();
+            newest.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            newest.truncate(MAX_LISTINGS);
+            let kept: std::collections::BTreeSet<ListingId> =
+                newest.into_iter().map(|(_, id)| id).collect();
+            self.listings.retain(|l| kept.contains(&l.listing.id));
+        }
     }
+}
+
+/// Whether one listing is within [`MAX_LISTING_BYTES`] as it encodes.
+fn fits(listing: &AuthorizedListing) -> bool {
+    crate::to_cbor(listing).is_ok_and(|bytes| bytes.len() <= MAX_LISTING_BYTES)
 }
 
 impl freenet_scaffold::ComposableState for ListingsV1 {
@@ -423,6 +450,20 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         // new contract starts empty, and the migration fold builds its state
         // through `apply_delta`, which normalises (see below), so no state
         // this generation holds was written by the old, permissive code.
+        // And within the caps `normalize` keeps (step 2), safe for the same
+        // reason.
+        if self.listings.len() > MAX_LISTINGS {
+            return Err(format!(
+                "store holds {} listings, the most it keeps is {MAX_LISTINGS}",
+                self.listings.len()
+            ));
+        }
+        if let Some(big) = self.listings.iter().find(|l| !fits(l)) {
+            return Err(format!(
+                "listing {} is over {MAX_LISTING_BYTES} bytes",
+                big.listing.id
+            ));
+        }
         for pair in self.listings.windows(2) {
             if pair[0].listing.id >= pair[1].listing.id {
                 return Err(format!(
@@ -527,6 +568,24 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     }
     const WHAT: &'static str = "listing status";
 }
+
+/// The most listings a store takes (step 2). Like [`MAX_STORE_BYTES`],
+/// enforced by store state (step 2; how is being decided).
+///
+/// Sized by the seller's own delegate, which reads the whole store on every
+/// instant-checkout decision: with [`MAX_ORDERS`] paid orders and listings
+/// up to both caps it must stay within one call's budget
+/// (`tests/delegate-budget`).
+pub const MAX_LISTINGS: usize = 512;
+
+/// The most bytes one listing takes, as its signed record encodes (step 2).
+/// A larger listing is dropped by [`ListingsV1::normalize`], as an item rule,
+/// so with [`MAX_LISTINGS`] a store's listings take at most 10 MiB. A cap on
+/// the listings' TOTAL bytes would not do: cutting a ranked list where its
+/// running total passes a budget does not commute with merging (an element
+/// cut in one merge can leave room for a later one that a single merge of
+/// everything would also cut), so replicas could disagree.
+pub const MAX_LISTING_BYTES: usize = 20 * 1024;
 
 /// How many orders one store contract will hold.
 ///
@@ -1123,6 +1182,11 @@ pub struct StoreStateV1 {
     /// state holding none encodes exactly as it did before they existed.
     #[serde(default, skip_serializing_if = "ListingStatusesV1::is_empty")]
     pub listing_statuses: ListingStatusesV1,
+    /// The seller's pause, as the store key last signed it (step 2; see
+    /// [`crate::store_pause`]). Empty, or one record. Skipped when empty, so
+    /// a state never paused encodes exactly as before it existed.
+    #[serde(default, skip_serializing_if = "crate::store_pause::PauseV1::is_empty")]
+    pub pause: crate::store_pause::PauseV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -1149,6 +1213,8 @@ pub struct StoreStateV1Summary {
     pub fulfilment: <crate::fulfilment::FulfilmentV1 as ComposableState>::Summary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listing_statuses: <ListingStatusesV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pause: <crate::store_pause::PauseV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -1182,6 +1248,8 @@ pub struct StoreStateV1Delta {
     pub fulfilment: Option<<crate::fulfilment::FulfilmentV1 as ComposableState>::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_statuses: Option<<ListingStatusesV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<<crate::store_pause::PauseV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -1199,6 +1267,13 @@ impl StoreStateV1 {
             || !self.copies.is_empty()
             || !self.fulfilment.is_empty()
             || !self.listing_statuses.is_empty()
+            || !self.pause.is_empty()
+    }
+
+    /// Whether the seller has paused the store (and not resumed it). A
+    /// closed store is closed whatever this says.
+    pub fn paused(&self) -> bool {
+        crate::store_pause::is_paused(&self.pause)
     }
 
     /// What a reader should take a listing's availability to be: the status
@@ -1412,6 +1487,7 @@ impl StoreStateV1 {
             .apply_delta(&parent, parameters, &delta.fulfilment)?;
         next.listing_statuses
             .apply_delta(&parent, parameters, &delta.listing_statuses)?;
+        next.pause.apply_delta(&parent, parameters, &delta.pause)?;
         next.normalize_backings();
         next.normalize_fulfilment();
         *self = next;
@@ -1493,6 +1569,7 @@ impl ComposableState for StoreStateV1 {
         }
         self.copies.verify(&parent, parameters)?;
         self.listing_statuses.verify(&parent, parameters)?;
+        self.pause.verify(&parent, parameters)?;
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
         self.closed.verify(&parent, parameters)?;
@@ -1529,6 +1606,7 @@ impl ComposableState for StoreStateV1 {
             copies: self.copies.summarize(&parent, parameters),
             fulfilment: self.fulfilment.summarize(&parent, parameters),
             listing_statuses: self.listing_statuses.summarize(&parent, parameters),
+            pause: self.pause.summarize(&parent, parameters),
         }
     }
 
@@ -1576,6 +1654,7 @@ impl ComposableState for StoreStateV1 {
                 parameters,
                 &base.listing_statuses,
             ),
+            pause: self.pause.delta(&parent, parameters, &base.pause),
         };
         if delta.info.is_none()
             && delta.listings.is_none()
@@ -1586,6 +1665,7 @@ impl ComposableState for StoreStateV1 {
             && delta.copies.is_none()
             && delta.fulfilment.is_none()
             && delta.listing_statuses.is_none()
+            && delta.pause.is_none()
         {
             None
         } else {
@@ -5944,5 +6024,268 @@ mod one_order_per_request_tests {
         let mut probe = o.clone();
         probe.id = crate::payment::OrderId([0; 32]);
         assert_eq!(crate::payment::OrderId::from_terms(&probe), o.id);
+    }
+}
+
+#[cfg(test)]
+mod listing_cap_tests {
+    //! Step 2: a store keeps its `MAX_LISTINGS` newest listings, none over
+    //! `MAX_LISTING_BYTES`, as a pure function of the listings it holds.
+    use super::*;
+    use crate::merge_laws::{assert_laws, Rng};
+    use crate::test_orders::{paid, sign_scoped, store_key};
+
+    /// Listing `n`, created at `at` seconds, with `pad` bytes of description.
+    /// Signed by the fixture store key when `signed`.
+    fn listing(n: u32, at: i64, pad: usize, signed: bool) -> AuthorizedListing {
+        let listing = crate::listing::Listing {
+            images: Vec::new(),
+            checkout: None,
+            choices: Vec::new(),
+            id: ListingId([0u8; 32]),
+            title: format!("Listing {n}"),
+            description: "d".repeat(pad),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000 + at, 0).unwrap(),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = if signed {
+            sign_scoped(&store_key(), &listing)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        AuthorizedListing {
+            listing,
+            scoped_payload,
+            signature,
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn held(listings: Vec<AuthorizedListing>) -> ListingsV1 {
+        let mut set = ListingsV1 { listings };
+        set.normalize();
+        set
+    }
+
+    /// Past the cap the newest are kept, ties broken by id; a listing over
+    /// the byte bound is dropped wherever it sits. Mutated red by keeping
+    /// the oldest, by dropping the tie-break, and by dropping the size rule.
+    #[test]
+    fn the_newest_listings_are_kept_and_an_oversized_one_never_is() {
+        // MAX_LISTINGS + 40, two to a second, so ties straddle the cut.
+        let all: Vec<_> = (0..(MAX_LISTINGS as u32 + 40))
+            .map(|n| listing(n, i64::from(n / 2), 0, false))
+            .collect();
+        let kept = held(all.clone());
+        assert_eq!(kept.listings.len(), MAX_LISTINGS);
+        let mut want: Vec<_> = all
+            .iter()
+            .map(|l| (l.listing.created_at, l.listing.id.clone()))
+            .collect();
+        want.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let want: BTreeSet<_> = want
+            .into_iter()
+            .take(MAX_LISTINGS)
+            .map(|(_, id)| id)
+            .collect();
+        let got: BTreeSet<_> = kept.listings.iter().map(|l| l.listing.id.clone()).collect();
+        assert_eq!(got, want);
+
+        let big = listing(9_999, 1_000_000, MAX_LISTING_BYTES, false);
+        let just = {
+            // The largest description that still fits.
+            let mut pad = MAX_LISTING_BYTES - 400;
+            assert!(
+                crate::to_cbor(&listing(9_998, 1_000_000, pad, false))
+                    .unwrap()
+                    .len()
+                    <= MAX_LISTING_BYTES
+            );
+            while crate::to_cbor(&listing(9_998, 1_000_000, pad + 1, false))
+                .unwrap()
+                .len()
+                <= MAX_LISTING_BYTES
+            {
+                pad += 1;
+            }
+            listing(9_998, 1_000_000, pad, false)
+        };
+        let kept = held(vec![big.clone(), just.clone()]);
+        assert_eq!(kept.listings, vec![just], "the one at the bound stays");
+    }
+
+    /// The cut is a pure function of the listings held, so merging in any
+    /// order and grouping gives the same bytes: seeded merge laws over
+    /// states that each sit near the cap and together cross it, with
+    /// oversized listings and tied times in the pool. Merging is what
+    /// `apply_delta` does with a delta of the other's listings (signatures
+    /// are checked there, not here). Mutated red by making the cut depend on
+    /// arrival order (keeping what was held first).
+    #[test]
+    fn merging_states_that_cross_the_cap_obeys_the_merge_laws() {
+        let mut pool: Vec<_> = (0..(MAX_LISTINGS as u32 * 3 / 2))
+            .map(|n| listing(n, i64::from(n % 400), 0, false))
+            .collect();
+        for n in 0..8 {
+            pool.push(listing(50_000 + n, 10_000, MAX_LISTING_BYTES, false));
+        }
+        let mut rng = Rng::new(0x5_12);
+        let mut states = vec![held(Vec::new())];
+        for _ in 0..12 {
+            // A window of 380 to 510 listings at a random offset, wrapping,
+            // so any two states overlap in part and most unions cross.
+            let len = 380 + rng.below(131);
+            let at = rng.below(pool.len());
+            let picked = (0..len)
+                .map(|i| pool[(at + i) % pool.len()].clone())
+                .collect();
+            states.push(ListingsV1 { listings: picked });
+        }
+        for s in &mut states {
+            s.normalize();
+        }
+        assert!(states.iter().all(|s| s.listings.len() <= MAX_LISTINGS));
+        let merge = |a: &ListingsV1, b: &ListingsV1| {
+            let mut out = a.clone();
+            out.listings.extend(b.listings.iter().cloned());
+            out.normalize();
+            out
+        };
+        assert!(
+            states.iter().any(|a| states.iter().any(|b| {
+                let mut union: BTreeSet<_> =
+                    a.listings.iter().map(|l| l.listing.id.clone()).collect();
+                union.extend(b.listings.iter().map(|l| l.listing.id.clone()));
+                union.len() > MAX_LISTINGS
+            })),
+            "the sweep crosses the cap"
+        );
+        assert_laws(&states, 200, &mut rng, merge, |s| {
+            crate::to_cbor(s).unwrap()
+        });
+    }
+
+    /// Through the store's own merge, with signatures checked: three
+    /// signed states that together cross the cap merge to the same store
+    /// whichever way round, and a state over either cap does not verify.
+    #[test]
+    fn the_store_merge_cuts_the_same_way_round_and_verify_holds_the_cap() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let state = |range: std::ops::Range<u32>| {
+            let mut s = StoreStateV1 {
+                owner: Some(store_key().verifying_key()),
+                ..Default::default()
+            };
+            s.apply_delta(
+                &StoreStateV1::default(),
+                &params,
+                &Some(StoreStateV1Delta {
+                    owner: Some(store_key().verifying_key()),
+                    listings: Some(range.map(|n| listing(n, i64::from(n), 0, true)).collect()),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+            s
+        };
+        let (a, b, c) = (state(0..300), state(200..500), state(450..560));
+        let merged = |x: &StoreStateV1, y: &StoreStateV1| {
+            let mut out = x.clone();
+            out.merge(&x.clone(), &params, y).expect("merge");
+            out
+        };
+        let one = merged(&merged(&a, &b), &c);
+        let two = merged(&a, &merged(&c, &b));
+        assert_eq!(crate::to_cbor(&one).unwrap(), crate::to_cbor(&two).unwrap());
+        assert_eq!(one.listings.listings.len(), MAX_LISTINGS);
+        assert!(one.verify(&StoreStateV1::default(), &params).is_ok());
+
+        let mut over = one.clone();
+        over.listings.listings.push(listing(70_000, 0, 0, true));
+        over.listings
+            .listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        assert!(over.verify(&StoreStateV1::default(), &params).is_err());
+        let mut big = a.clone();
+        big.listings
+            .listings
+            .push(listing(70_001, 0, MAX_LISTING_BYTES, true));
+        big.listings
+            .listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        assert!(big.verify(&StoreStateV1::default(), &params).is_err());
+    }
+
+    /// An open order outlives its listing: once the listing an order was
+    /// made for is cut, the order is still held, still verifies with its
+    /// payment proof, and the store still verifies. An order names its
+    /// listing only by an opaque tag and carries its own terms. Red if the
+    /// cut ever reaches into the orders, or if verifying an order needed
+    /// its listing.
+    #[test]
+    fn an_order_outlives_its_cut_listing() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let oldest = listing(0, -1_000, 0, true);
+        let mut order = paid(1);
+        order.order.listing_tag = Some(oldest.listing.id.0);
+        order.order.id = crate::payment::OrderId::from_terms(&order.order);
+        // Re-sign the terms with the tag in them.
+        order = crate::test_orders::authorized(
+            &store_key(),
+            order.order,
+            crate::payment::OrderStatus::Paid,
+        );
+        let mut first = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        first
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params,
+                &Some(StoreStateV1Delta {
+                    owner: Some(store_key().verifying_key()),
+                    listings: Some(vec![oldest.clone()]),
+                    orders: Some(vec![order.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+        let newer: Vec<_> = (1..=MAX_LISTINGS as u32)
+            .map(|n| listing(n, i64::from(n), 0, true))
+            .collect();
+        first
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params,
+                &Some(StoreStateV1Delta {
+                    listings: Some(newer),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+        assert!(
+            !first
+                .listings
+                .listings
+                .iter()
+                .any(|l| l.listing.id == oldest.listing.id),
+            "the order's listing was cut"
+        );
+        let kept = first
+            .orders
+            .orders
+            .get(&order.order.id)
+            .expect("the order stays");
+        assert_eq!(kept, &order);
+        assert!(kept.verify_terms(&store_key().verifying_key()).is_ok());
+        assert!(crate::payment::verify_payment_proof(
+            &kept.order,
+            kept.payment_proof.as_ref().expect("a proof")
+        )
+        .is_ok());
+        assert!(first.verify(&StoreStateV1::default(), &params).is_ok());
     }
 }

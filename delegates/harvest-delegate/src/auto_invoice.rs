@@ -7324,6 +7324,44 @@ mod tests {
             "the photographed listing is in the fixture"
         );
         store.info.scoped_payload = vec![1, 2, 3];
+        // Two listing statuses and a pause (step 2), signatures and all, so
+        // the light read is compared on what it keeps of them.
+        for (i, availability) in [
+            harvest_common::listing::ListingAvailability::SoldOut,
+            harvest_common::listing::ListingAvailability::Available { quantity: Some(3) },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // One for a listing held, one for a listing not held (which the
+            // light read passes over, as decide never reads it).
+            let listing = if i == 0 {
+                store.listings.listings[0].listing.id.clone()
+            } else {
+                harvest_common::listing::ListingId([0x41; 32])
+            };
+            store.listing_statuses.records.insert(
+                harvest_common::store::Bytes32(listing.0),
+                harvest_common::listing::AuthorizedListingStatus {
+                    status: harvest_common::listing::ListingStatus {
+                        listing,
+                        revision: 7 + i as u64,
+                        availability,
+                    },
+                    scoped_payload: vec![0x33; 120],
+                    signature: vec![0x34; 64],
+                },
+            );
+        }
+        let owner = store.owner.expect("an owner");
+        store.pause.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::store_pause::AuthorizedStorePause {
+                pause: harvest_common::store_pause::StorePause::new(owner, 9, true),
+                scoped_payload: vec![0x35; 90],
+                signature: vec![0x36; 64],
+            },
+        );
         store
     }
 
@@ -7338,12 +7376,27 @@ mod tests {
             o.status_scoped_payload = None;
             o.status_signature = None;
         }
+        let mut listings = store.listings.clone();
+        for l in listings.listings.iter_mut() {
+            l.scoped_payload.clear();
+            l.signature.clear();
+            l.certificate_pem.clear();
+        }
+        let mut listing_statuses = store.listing_statuses.clone();
+        listing_statuses
+            .records
+            .retain(|slot, _| listings.listings.iter().any(|l| l.listing.id.0 == slot.0));
+        for s in listing_statuses.records.values_mut() {
+            s.scoped_payload.clear();
+            s.signature.clear();
+        }
         StoreStateV1 {
             owner: store.owner,
-            listings: store.listings.clone(),
+            listings,
             orders,
-            listing_statuses: store.listing_statuses.clone(),
+            listing_statuses,
             closed: store.closed.clone(),
+            pause: store.pause.clone(),
             ..Default::default()
         }
     }
