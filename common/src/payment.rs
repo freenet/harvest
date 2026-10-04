@@ -1566,8 +1566,10 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
 pub struct AuthorizedOrder {
     pub order: Order,
     /// CBOR `ScopedPayload` from the ghostkey delegate, over `order`.
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
     /// Seller's Ed25519 signature over `scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     pub status: OrderStatus,
     /// Evidence for `Paid` / `PaymentReversed`. Absent while awaiting payment.
@@ -1575,7 +1577,9 @@ pub struct AuthorizedOrder {
     /// A party's signature over `(order.id, status)` for the transitions a
     /// party asserts -- today just `Cancelled`, signed by the seller's store
     /// key or by the order's `buyer_receipt_key`.
+    #[serde(with = "serde_bytes")]
     pub status_scoped_payload: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
     pub status_signature: Option<Vec<u8>>,
 }
 

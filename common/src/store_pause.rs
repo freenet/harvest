@@ -62,7 +62,9 @@ impl StorePause {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedStorePause {
     pub pause: StorePause,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 

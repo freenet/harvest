@@ -893,13 +893,22 @@ mod tests {
         }
         let bytes = std::fs::read(FIXTURE).expect("the frozen fixture is committed");
         let state: ReputationStateV1 = crate::from_cbor(&bytes).expect("still decodes");
-        assert_eq!(
-            crate::to_cbor(&state).expect("encodes"),
-            bytes,
-            "still re-encodes to the same bytes"
-        );
         state.verify(&params()).expect("still verifies");
         assert_eq!(state.complaints.len(), 1);
+        // Step 2 writes the signed records' outer byte fields as byte
+        // strings. The frozen bytes are exactly today's encoding with those
+        // fields as integer arrays, so nothing else about the format moved,
+        // and today's encoding is canonical, which is what the migration
+        // fold forwards.
+        let today = crate::to_cbor(&state).expect("encodes");
+        assert_eq!(
+            crate::earlier_encoding::of(&today),
+            bytes,
+            "the only change is the byte fields' encoding"
+        );
+        assert!(crate::earlier_encoding::byte_string_fields(&today) > 0);
+        assert!(crate::is_canonical_cbor(&state, &today));
+        assert!(!crate::is_canonical_cbor(&state, &bytes));
     }
 
     #[test]

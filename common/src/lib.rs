@@ -249,3 +249,74 @@ pub mod listing_image;
 
 // After everything else for the same reason as `listing_image` above.
 pub mod store_pause;
+
+/// The encoding every generation before step 2 wrote (step 2, harvest#227):
+/// the same bytes with each signed record's outer byte fields -- its signed
+/// payload and signature, which `serde_bytes` now writes as CBOR byte
+/// strings -- as arrays of integers, which is how ciborium writes a plain
+/// `Vec<u8>`. Only fields named in [`EARLIER_BYTE_FIELDS`] are rewritten, so
+/// a field that was a byte string all along (`store::Bytes32`) stays one.
+#[cfg(test)]
+pub(crate) mod earlier_encoding {
+    use ciborium::Value;
+
+    /// The fields step 2 moved to byte strings.
+    pub(crate) const EARLIER_BYTE_FIELDS: [&str; 8] = [
+        "scoped_payload",
+        "signature",
+        "backer_scoped_payload",
+        "backer_signature",
+        "acceptance_scoped_payload",
+        "acceptance_signature",
+        "status_scoped_payload",
+        "status_signature",
+    ];
+
+    fn rewrite(value: Value) -> Value {
+        match value {
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let named = matches!(&k, Value::Text(t) if EARLIER_BYTE_FIELDS.contains(&t.as_str()));
+                        let v = match v {
+                            Value::Bytes(b) if named => Value::Array(
+                                b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                            ),
+                            other => rewrite(other),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(rewrite).collect()),
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(rewrite(*inner))),
+            other => other,
+        }
+    }
+
+    /// `bytes` (today's encoding) as an earlier generation wrote them.
+    pub(crate) fn of(bytes: &[u8]) -> Vec<u8> {
+        let value: Value = crate::from_cbor(bytes).expect("CBOR");
+        crate::to_cbor(&rewrite(value)).expect("encodes")
+    }
+
+    /// How many of the named fields `bytes` holds as byte strings.
+    pub(crate) fn byte_string_fields(bytes: &[u8]) -> usize {
+        fn count(value: &Value) -> usize {
+            match value {
+                Value::Map(entries) => entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let named = matches!(k, Value::Text(t) if EARLIER_BYTE_FIELDS.contains(&t.as_str()));
+                        usize::from(named && matches!(v, Value::Bytes(_))) + count(v)
+                    })
+                    .sum(),
+                Value::Array(items) => items.iter().map(count).sum(),
+                Value::Tag(_, inner) => count(inner),
+                _ => 0,
+            }
+        }
+        count(&crate::from_cbor::<Value>(bytes).expect("CBOR"))
+    }
+}

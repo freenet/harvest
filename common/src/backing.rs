@@ -161,12 +161,16 @@ pub struct AuthorizedBacking {
     pub statement: BackingStatement,
     /// `ScopedPayload` from the Ghost Key vault, wrapping the CBOR of
     /// `statement`.
+    #[serde(with = "serde_bytes")]
     pub backer_scoped_payload: Vec<u8>,
     /// The Ghost Key's Ed25519 signature over `backer_scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub backer_signature: Vec<u8>,
     /// `ScopedPayload` wrapping the CBOR of [`BackingAcceptance`].
+    #[serde(with = "serde_bytes")]
     pub acceptance_scoped_payload: Vec<u8>,
     /// The store key's Ed25519 signature over `acceptance_scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub acceptance_signature: Vec<u8>,
 }
 
@@ -223,7 +227,9 @@ pub struct Retirement {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedRetirement {
     pub retirement: Retirement,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -256,7 +262,9 @@ pub struct StoreClosure {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedClosure {
     pub closure: StoreClosure,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 

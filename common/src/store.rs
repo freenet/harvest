@@ -256,8 +256,10 @@ pub struct StoreInfoV1 {
 pub struct AuthorizedStoreInfoV1 {
     pub info: StoreInfoV1,
     /// CBOR-serialized ScopedPayload from the ghostkey delegate's SignResult.
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
     /// Ed25519 signature over the scoped_payload bytes.
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -6290,5 +6292,209 @@ mod listing_cap_tests {
         )
         .is_ok());
         assert!(first.verify(&StoreStateV1::default(), &params).is_ok());
+    }
+}
+
+/// Step 2 (harvest#227): every signed record the store holds writes its
+/// signed payload and signature as CBOR byte strings (`serde_bytes`), which
+/// a store at its order cap carried as arrays of integers, about twice the
+/// bytes and one decode call per byte. The bytes signed are unchanged: only
+/// the outer field's encoding moved. A state written by an earlier
+/// generation still decodes, and its re-encoding is what the migration fold
+/// forwards (the contract accepts only its own canonical encoding).
+#[cfg(test)]
+mod byte_string_encoding_tests {
+    use super::*;
+    use crate::backing::{
+        AuthorizedBacking, AuthorizedClosure, AuthorizedRetirement, BackingStatement, Retirement,
+        StoreClosure,
+    };
+    use crate::earlier_encoding;
+
+    /// Bytes both sides of 24, where the integer-array form goes from one
+    /// byte an element to two.
+    fn bytes(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(11).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A store holding one of every signed record, every byte field filled.
+    /// Unsigned: what is tested is the encoding, not the signatures.
+    fn every_record() -> StoreStateV1 {
+        let owner = crate::test_orders::store_key().verifying_key();
+        let backer = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let mut order = crate::test_orders::paid(1);
+        order.status_scoped_payload = Some(bytes(1, 90));
+        order.status_signature = Some(bytes(2, 64));
+        let mut state = StoreStateV1 {
+            owner: Some(owner),
+            info: AuthorizedStoreInfoV1 {
+                info: StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: String::new(),
+                    reputation_contract_id: [9; 32],
+                    store_name: "Shop".into(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    // Inside the signed details: stays an integer array.
+                    record_public_key: Some(bytes(24, 40)),
+                },
+                scoped_payload: bytes(3, 120),
+                signature: bytes(4, 64),
+            },
+            ..Default::default()
+        };
+        state.listings.listings.push(AuthorizedListing {
+            listing: crate::listing::Listing {
+                images: Vec::new(),
+                checkout: None,
+                choices: Vec::new(),
+                id: ListingId([0; 32]),
+                title: "Jam".into(),
+                description: String::new(),
+                kind: crate::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id(),
+            scoped_payload: bytes(5, 200),
+            signature: bytes(6, 64),
+            certificate_pem: String::new(),
+        });
+        state
+            .orders
+            .orders
+            .insert(order.order.id.clone(), order.clone());
+        let slot = Bytes32(backer.to_bytes());
+        state.backings.records.insert(
+            slot,
+            AuthorizedBacking {
+                statement: BackingStatement {
+                    store: owner,
+                    backer,
+                    certificate_pem: String::new(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    block: freenet_bitcoin_common::BlockAnchor {
+                        height: 1,
+                        hash: freenet_bitcoin_common::BlockHash([7; 32]),
+                    },
+                },
+                backer_scoped_payload: bytes(7, 80),
+                backer_signature: bytes(8, 64),
+                acceptance_scoped_payload: bytes(9, 80),
+                acceptance_signature: bytes(10, 64),
+            },
+        );
+        state.retirements.records.insert(
+            slot,
+            AuthorizedRetirement {
+                retirement: Retirement { backer },
+                scoped_payload: bytes(11, 60),
+                signature: bytes(12, 64),
+            },
+        );
+        state.closed.records.insert(
+            Bytes32(owner.to_bytes()),
+            AuthorizedClosure {
+                closure: StoreClosure { store: owner },
+                scoped_payload: bytes(13, 60),
+                signature: bytes(14, 64),
+            },
+        );
+        state.copies.records.insert(
+            Bytes32([0x21; 32]),
+            crate::custody::AuthorizedCopy {
+                copy: crate::custody::StoreKeyCopy {
+                    store: owner,
+                    backer,
+                    scope: crate::custody::WrapScope([3; 32]),
+                    wrapped: crate::custody::WrappedStoreKey {
+                        scheme: crate::custody::SCHEME_V1,
+                        ciphertext: bytes(15, crate::custody::WRAPPED_LEN_V1),
+                    },
+                },
+                scoped_payload: bytes(16, 100),
+                signature: bytes(17, 64),
+            },
+        );
+        state.fulfilment.records.insert(
+            Bytes32(order.order.id.0),
+            crate::fulfilment::AuthorizedDespatch {
+                despatch: crate::fulfilment::Despatch {
+                    order_id: order.order.id.clone(),
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: 2,
+                        hash: freenet_bitcoin_common::BlockHash([8; 32]),
+                    },
+                },
+                scoped_payload: bytes(18, 70),
+                signature: bytes(19, 64),
+            },
+        );
+        state.listing_statuses.records.insert(
+            Bytes32([0x31; 32]),
+            crate::listing::AuthorizedListingStatus {
+                status: crate::listing::ListingStatus {
+                    listing: ListingId([0x31; 32]),
+                    revision: 1,
+                    availability: crate::listing::ListingAvailability::SoldOut,
+                },
+                scoped_payload: bytes(20, 70),
+                signature: bytes(21, 64),
+            },
+        );
+        state.pause.records.insert(
+            Bytes32(owner.to_bytes()),
+            crate::store_pause::AuthorizedStorePause {
+                pause: crate::store_pause::StorePause::new(owner, 1, true),
+                scoped_payload: bytes(22, 70),
+                signature: bytes(23, 64),
+            },
+        );
+        state
+    }
+
+    /// A state written before step 2 decodes, record for record. Red if any
+    /// field loses the dual read.
+    #[test]
+    fn an_earlier_generations_store_still_decodes() {
+        let state = every_record();
+        let earlier = earlier_encoding::of(&crate::to_cbor(&state).unwrap());
+        let decoded: StoreStateV1 = crate::from_cbor(&earlier).expect("decodes");
+        assert_eq!(decoded, state);
+    }
+
+    /// Every outer byte field of every record is written as a byte string:
+    /// 24 of them in this store. Red if any one `#[serde(with =
+    /// "serde_bytes")]` is removed.
+    #[test]
+    fn every_records_byte_fields_are_byte_strings() {
+        let state = every_record();
+        let today = crate::to_cbor(&state).unwrap();
+        assert_eq!(earlier_encoding::byte_string_fields(&today), 24);
+        let earlier = earlier_encoding::of(&today);
+        assert!(
+            today.len() < earlier.len(),
+            "{} vs {}",
+            today.len(),
+            earlier.len()
+        );
+    }
+
+    /// The earlier bytes are not canonical today, and their re-encoding is:
+    /// the contract refuses the earlier bytes as they are, and the
+    /// migration fold forwards the state re-encoded.
+    #[test]
+    fn an_earlier_encoding_is_not_canonical_and_its_re_encoding_is() {
+        let state = every_record();
+        let earlier = earlier_encoding::of(&crate::to_cbor(&state).unwrap());
+        let decoded: StoreStateV1 = crate::from_cbor(&earlier).unwrap();
+        assert!(!crate::is_canonical_cbor(&decoded, &earlier));
+        assert!(crate::is_canonical_cbor(
+            &decoded,
+            &crate::to_cbor(&decoded).unwrap()
+        ));
     }
 }

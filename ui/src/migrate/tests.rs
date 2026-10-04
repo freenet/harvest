@@ -3100,3 +3100,86 @@ fn rsa_generation_parameter_bytes_are_pinned() {
          582070df9e2279adbec6d12bf2921184c9222eb24ed852005bf640139f52e59cd9ae"
     );
 }
+
+/// `bytes` as a generation before step 2 wrote them (harvest#227): each
+/// signed record's signed payload and signature as an array of integers
+/// rather than a byte string.
+fn in_the_earlier_encoding(bytes: &[u8]) -> Vec<u8> {
+    use ciborium::Value;
+    const FIELDS: [&str; 8] = [
+        "scoped_payload",
+        "signature",
+        "backer_scoped_payload",
+        "backer_signature",
+        "acceptance_scoped_payload",
+        "acceptance_signature",
+        "status_scoped_payload",
+        "status_signature",
+    ];
+    fn rewrite(value: Value) -> Value {
+        match value {
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let named = matches!(&k, Value::Text(t) if FIELDS.contains(&t.as_str()));
+                        let v = match v {
+                            Value::Bytes(b) if named => Value::Array(
+                                b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                            ),
+                            other => rewrite(other),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(rewrite).collect()),
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(rewrite(*inner))),
+            other => other,
+        }
+    }
+    let value: Value = harvest_common::from_cbor(bytes).unwrap();
+    harvest_common::to_cbor(&rewrite(value)).unwrap()
+}
+
+/// Step 2 (harvest#227): a predecessor store holds its records' signed
+/// payloads and signatures as integer arrays. The fold decodes it, merges
+/// it, and forwards the state in this generation's encoding, the only one
+/// the current contract accepts as canonical. Red if the store loses the
+/// dual read, or if the fold forwards what it was handed.
+#[test]
+fn a_predecessor_store_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded() {
+    let ops = store_ops();
+    let older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    let raw = in_the_earlier_encoding(&store_bytes(&older));
+    assert_ne!(raw, store_bytes(&older), "the earlier form differs");
+    let recovered = ops
+        .decode(&raw)
+        .expect("the probe decodes a predecessor's encoding");
+    let folded = ops.merge_with_local(recovered, &store_with(&[signed_listing("Plum")]));
+    assert_eq!(folded.listings.listings.len(), 3);
+    let forwarded = harvest_common::to_cbor(&folded).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&folded, &forwarded));
+    assert!(
+        in_the_earlier_encoding(&forwarded).len() > forwarded.len(),
+        "forwarded with byte strings, not the integer arrays it arrived in"
+    );
+}
+
+/// The frozen complaint (`tests/fixtures/reputation-state-complaint-v1.cbor`,
+/// written before step 2 with integer arrays) is decoded by the reputation
+/// fold and forwards canonically in today's encoding, so a complaint made
+/// before step 2 survives the re-key (`docs/complaint-threat-model.md`
+/// section 8). Red if the order inside a complaint loses the dual read.
+#[test]
+fn a_complaint_made_before_step_2_is_carried_across() {
+    let ops = ReputationOps {
+        params: reputation_params(&store_vk()),
+    };
+    let raw = include_bytes!("../../../tests/fixtures/reputation-state-complaint-v1.cbor");
+    let recovered = ops.decode(raw).expect("decodes");
+    assert_eq!(recovered.complaints.len(), 1);
+    let forwarded = harvest_common::to_cbor(&recovered).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&recovered, &forwarded));
+    assert_eq!(in_the_earlier_encoding(&forwarded), raw.to_vec());
+}

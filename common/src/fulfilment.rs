@@ -66,7 +66,9 @@ pub struct AuthorizedDespatch {
     pub despatch: Despatch,
     /// CBOR `ScopedPayload` over `despatch`, as the store key signs it
     /// (`backing::store_key_envelope`).
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
