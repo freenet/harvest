@@ -580,38 +580,155 @@ fn request(
     Ok(tag)
 }
 
-/// What this buyer has been accepted for at one store, and whether each is
-/// safe to pay.
+/// A buyer's purchases from one store on Purchases, each conversation's
+/// messages under the orders it holds, and any conversation with no order (a
+/// question) on its own (mockup `scrPurchase`, `scrPurchases`; round-6
+/// critique: messages move into each order's screen). One Messages button
+/// per conversation rather than per order: a buyer's next Buy now continues
+/// the same conversation, so two orders can share one thread.
 #[component]
 pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
+    // Which of this store's conversations is open, shared with the
+    // complaint step (msg1 critique MSG-13). A hook, so before any return.
+    use_context_provider(|| super::message_view::BuyerOpenThread(Signal::new(None)));
     // The order a Buy now form on this page is already showing, in place,
     // right under the listing: not listed a second time here.
     let shown_above = SHOWN_IN_BUY_FORM();
     let app_state = APP_STATE.read();
     let purchases = app_state.buyer_purchases(&store_contract_id);
-    let listed: Vec<BuyerPurchase> = purchases_to_list(&purchases, &shown_above)
-        .into_iter()
-        .cloned()
+    let held: Vec<[u8; 32]> = app_state
+        .browsing_stores
+        .get(&store_contract_id)
+        .map(|store| {
+            store
+                .conversations
+                .iter()
+                .map(|conversation| conversation.buyer_public_key)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Grouped over EVERY purchase, the one the Buy now form shows included,
+    // so its conversation keeps its thread here and is never taken for a
+    // question (codex on #205 round 2); only its card is left out.
+    let groups = purchase_groups(&purchases, &shown_above);
+    let questions: Vec<[u8; 32]> = held
+        .iter()
+        .filter(|tag| !groups.iter().any(|(held, _)| held == *tag))
+        .filter(|tag| {
+            super::message_view::buyer_thread_has_messages(
+                &app_state,
+                &store_contract_id,
+                Some(**tag),
+            )
+        })
+        .copied()
         .collect();
-    if listed.is_empty() {
+    if groups.is_empty() && questions.is_empty() {
         return rsx! {};
     }
     let bitcoin = app_state.bitcoin.clone();
+    let store_name = app_state.store_name_of(&store_contract_id).label();
+    // The orders in each conversation, newest first, for its header (msg1
+    // critique MSG-14): every purchase, the one the form shows included.
+    let refs: Vec<([u8; 32], Vec<String>)> = by_conversation(&purchases)
+        .into_iter()
+        .map(|(tag, mut group)| {
+            group.sort_by_key(|p| {
+                std::cmp::Reverse(p.commitment.as_ref().map(|c| c.order.created_at))
+            });
+            (tag, group.iter().map(|p| p.order_id.short()).collect())
+        })
+        .collect();
     drop(app_state);
 
     rsx! {
         div { style: "margin-top: 24px;",
-            h4 { "Your purchases" }
-            for purchase in listed.iter() {
-                PurchaseCard {
-                    key: "{purchase.order_id}",
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
-                    bitcoin: bitcoin.clone(),
+            if !groups.is_empty() {
+                h4 { "Your purchases" }
+            }
+            for (tag , group) in groups.iter() {
+                div { key: "{bs58::encode(tag).into_string()}",
+                    // The conversation first, headed, then its orders: after
+                    // the orders it read as belonging to the last one, often
+                    // an expired order (msg1 critique MSG-6).
+                    // A conversation this node no longer holds cannot be read
+                    // or written: nothing to open.
+                    if held.contains(tag) {
+                        p { class: "order-label", "Messages with {store_name}" }
+                        // Its only order is the one the Buy now form on this
+                        // page shows (round 3 of #205).
+                        if group.is_empty() {
+                            p { class: "text-muted small", "About the order you just placed" }
+                        }
+                        super::message_view::BuyerThread {
+                            store_contract_id: store_contract_id.clone(),
+                            tag: *tag,
+                            orders: refs
+                                .iter()
+                                .find(|(t, _)| t == tag)
+                                .map(|(_, r)| r.clone())
+                                .unwrap_or_default(),
+                        }
+                    }
+                    for purchase in group.iter() {
+                        PurchaseCard {
+                            key: "{purchase.order_id}",
+                            store_contract_id: store_contract_id.clone(),
+                            purchase: purchase.clone(),
+                            bitcoin: bitcoin.clone(),
+                        }
+                    }
+                }
+            }
+            for tag in questions.iter() {
+                div { key: "{bs58::encode(tag).into_string()}", class: "card",
+                    p { class: "text-muted small", "Your question" }
+                    super::message_view::BuyerThread {
+                        store_contract_id: store_contract_id.clone(),
+                        tag: *tag,
+                        open: true,
+                    }
                 }
             }
         }
     }
+}
+
+/// Every conversation `purchases` are filed under, in the order the first of
+/// each appears, with the purchases to show a card for: all but those a Buy
+/// now form on the page already shows (`shown_above`). A conversation whose
+/// every purchase is shown above is still here, with no cards, so its thread
+/// stays with its orders.
+fn purchase_groups(
+    purchases: &[BuyerPurchase],
+    shown_above: &[harvest_common::payment::OrderId],
+) -> Vec<([u8; 32], Vec<BuyerPurchase>)> {
+    by_conversation(purchases)
+        .into_iter()
+        .map(|(tag, group)| {
+            let cards = purchases_to_list(&group, shown_above)
+                .into_iter()
+                .cloned()
+                .collect();
+            (tag, cards)
+        })
+        .collect()
+}
+
+/// `purchases` grouped by the conversation each is filed under, in the order
+/// the first of each appears.
+fn by_conversation(purchases: &[BuyerPurchase]) -> Vec<([u8; 32], Vec<BuyerPurchase>)> {
+    let mut groups: Vec<([u8; 32], Vec<BuyerPurchase>)> = Vec::new();
+    for purchase in purchases {
+        match groups
+            .iter_mut()
+            .find(|(tag, _)| *tag == purchase.conversation)
+        {
+            Some((_, group)) => group.push(purchase.clone()),
+            None => groups.push((purchase.conversation, vec![purchase.clone()])),
+        }
+    }
+    groups
 }
 
 #[component]
@@ -998,17 +1115,42 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
     let order_id = target.order_id();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
+    // One "Report a problem" first, then the step with the choices and the
+    // decided line (round-6 critique 06-5, mockup D4): three permanent-record
+    // buttons inline were the loudest thing on a delivered order.
+    let mut reporting = use_signal(|| false);
+    let mut messaging = use_signal(|| false);
+    // The store's shared open conversation, when this card is on Purchases:
+    // "Message the seller" opens that one rather than a second copy of it
+    // (msg1 critique MSG-13).
+    let shared = try_use_context::<super::message_view::BuyerOpenThread>();
     // The refusal is read only when there is no complaint on record: it ends
     // in a full verification of the complaint (memoised, review round 3
     // P2-D), which a card with nothing to offer does not need.
-    let (on_record, sent, refusal) = {
+    let (on_record, sent, refusal, message_to, store_page, paid_there) = {
         let state = APP_STATE.read();
+        let store_page = target.store_page(&state);
         let on_record = target.on_record(&state);
         let sent = state.complaint_sent(&order_id);
         let refusal = (on_record.is_none() && !sent)
             .then(|| target.refusal(&state))
             .flatten();
-        (on_record, sent, refusal)
+        (
+            on_record,
+            sent,
+            refusal,
+            target.conversation(&state),
+            store_page.clone(),
+            // Whether a message from the store page would go into a paid
+            // conversation, needing no Ghost Key (`compose_tag` continues
+            // the last conversation).
+            store_page.as_ref().is_some_and(|id| {
+                matches!(
+                    state.compose_gate_in(id, None),
+                    crate::voucher_flow::ComposeGate::PaidOrder { .. }
+                )
+            }),
+        )
     };
     let short = order_id.short();
     if let Some(complaint) = on_record {
@@ -1034,6 +1176,20 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
             }
         };
     }
+    if !reporting() {
+        return rsx! {
+            div { class: "form-actions",
+                button {
+                    class: "btn btn-sm btn-outline",
+                    onclick: move |_| {
+                        problem.set(None);
+                        reporting.set(true);
+                    },
+                    "Report a problem"
+                }
+            }
+        };
+    }
     rsx! {
         if let Some(why) = problem() {
             p { class: "text-warning", "{why}" }
@@ -1041,9 +1197,10 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
         match chosen() {
             Some(category) => rsx! {
                 p { class: "text-warning",
-                    "Complain that order {short} was \"{super::reputation_view::category_label(&category)}\"? \
-                     This goes on the seller's public record permanently, cannot be withdrawn, \
-                     and is one per order."
+                    "Report order {short} as {super::reputation_view::category_label(&category)}? \
+                     It goes on the seller's public record for good, showing that choice, the \
+                     order's reference and the month, with no names or messages. You can't \
+                     withdraw it, and there's one per order."
                 }
                 button {
                     class: "btn btn-sm btn-primary",
@@ -1055,7 +1212,7 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                             problem.set(result.err());
                         }
                     },
-                    "Yes, complain"
+                    "Report it"
                 }
                 button {
                     class: "btn btn-sm btn-outline",
@@ -1064,29 +1221,108 @@ fn FileComplaint(target: ComplaintTarget) -> Element {
                 }
             },
             None => rsx! {
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "Something wrong with order {short}? You can put one complaint on the \
-                     seller's public record:"
-                }
-                for category in FeedbackCategory::ALL {
-                    {
-                        let label = super::reputation_view::category_label(&category);
-                        rsx! {
+                p { strong { "{COMPLAINT_LINE}" } }
+                // The way to message the seller, right here: the line asks for
+                // it, and a buyer with a paid order needs no Ghost Key for it.
+                match (message_to.clone(), shared) {
+                    // On Purchases: open the store's one conversation, above
+                    // the orders, and go to it.
+                    (Some((_, tag)), Some(super::message_view::BuyerOpenThread(mut open))) => rsx! {
+                        div { class: "form-actions",
                             button {
-                                class: "btn btn-sm btn-outline",
+                                class: "btn btn-sm btn-primary",
                                 onclick: move |_| {
-                                    problem.set(None);
-                                    chosen.set(Some(category.clone()));
+                                    open.set(Some(tag));
+                                    super::scroll_to_id(super::message_view::buyer_thread_dom_id(&tag));
                                 },
-                                "{label}"
+                                "Message the seller"
+                            }
+                        }
+                    },
+                    // Elsewhere (a kept purchase's row): inline, with the
+                    // thread, so what was just sent shows here (U6).
+                    (Some((store_contract_id, tag)), None) => rsx! {
+                        if messaging() {
+                            super::message_view::OrderThreadInline { store_contract_id, tag }
+                        } else {
+                            div { class: "form-actions",
+                                button {
+                                    class: "btn btn-sm btn-primary",
+                                    onclick: move |_| messaging.set(true),
+                                    "Message the seller"
+                                }
+                            }
+                        }
+                    },
+                    // No conversation held here: the line still says to
+                    // message the seller first, so say where (msg1 critique
+                    // MSG-11).
+                    // Said as it is: this order's conversation is not on this
+                    // device, so a question from the store page starts a new
+                    // one, which needs a Ghost Key (review after b9c727f).
+                    (None, _) => rsx! {
+                        p { class: "text-muted small",
+                            if paid_there {
+                                "This order's messages aren't on this device. You can message the \
+                                 seller from their store page, in your conversation about another \
+                                 order there."
+                            } else {
+                                "This order's messages aren't on this device. You can ask the \
+                                 seller a new question from their store page; that needs a Ghost Key."
+                            }
+                        }
+                        if let Some(id) = store_page.clone().filter(|_| {
+                            super::app::ROUTE() != super::app::Route::Store
+                        }) {
+                            div { class: "form-actions",
+                                button {
+                                    class: "btn btn-sm btn-primary",
+                                    onclick: move |_| super::app::open_store_page(id.clone()),
+                                    "Open their store"
+                                }
+                            }
+                        }
+                    },
+                }
+                h4 { class: "complaint-question", "What went wrong?" }
+                div { class: "form-actions",
+                    for category in FeedbackCategory::ALL {
+                        {
+                            let label = super::reputation_view::category_label(&category);
+                            rsx! {
+                                button {
+                                    class: "btn btn-sm btn-outline",
+                                    onclick: move |_| {
+                                        problem.set(None);
+                                        chosen.set(Some(category.clone()));
+                                    },
+                                    "{label}"
+                                }
                             }
                         }
                     }
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| {
+                            reporting.set(false);
+                            messaging.set(false);
+                        },
+                        "Not now"
+                    }
+                }
+                // Mockup D4's answer to what a new buyer actually asks.
+                p { class: "text-muted small",
+                    "Harvest can't refund you: the payment went straight to the seller. The \
+                     record warns future buyers."
                 }
             },
         }
     }
 }
+
+/// Said on the complaint step before any category (Ian, 2026-09-30).
+pub(crate) const COMPLAINT_LINE: &str =
+    "Complaints are permanent and can't be withdrawn. Message the seller first.";
 
 /// What a complaint control is about: a purchase on a loaded store's page,
 /// or a purchase this node keeps, judged from the kept record alone (review
@@ -1138,6 +1374,63 @@ impl ComplaintTarget {
                 order_id,
             } => state.kept_complaint_refusal(store_key, order_id),
         }
+    }
+
+    /// The store page to send the buyer to when no conversation is held here
+    /// (msg1 critique MSG-11): the purchase's store, or for a kept purchase
+    /// a loaded store under its key.
+    fn store_page(&self, state: &crate::state::AppState) -> Option<Vec<u8>> {
+        match self {
+            Self::AtStore {
+                store_contract_id, ..
+            } => Some(store_contract_id.clone()),
+            Self::Kept { store_key, .. } => state
+                .browsing_stores
+                .iter()
+                .filter(|(_, store)| store.owner == Some(*store_key))
+                .map(|(id, _)| id.clone())
+                .min(),
+        }
+    }
+
+    /// Where the buyer can message the seller about this purchase: its store
+    /// (loaded on this page) and the conversation it is filed under, when this
+    /// node still holds that conversation. For a kept purchase, the loaded
+    /// store whose key it is kept under, if any; otherwise nowhere to offer.
+    fn conversation(&self, state: &crate::state::AppState) -> Option<(Vec<u8>, [u8; 32])> {
+        let (store_contract_id, tag) = match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => (store_contract_id.clone(), purchase.conversation),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => {
+                let kept = state
+                    .kept_purchases
+                    .iter()
+                    .find(|k| k.store_key == *store_key && k.order.order.id == *order_id)?;
+                // The loaded store under this key that holds the kept
+                // conversation, not merely the first under the key: a store
+                // migrated to a new generation has more than one entry.
+                let (id, _) = state.browsing_stores.iter().find(|(_, store)| {
+                    store.owner == Some(*store_key)
+                        && store
+                            .conversations
+                            .iter()
+                            .any(|conversation| conversation.buyer_public_key == kept.conversation)
+                })?;
+                (id.clone(), kept.conversation)
+            }
+        };
+        state
+            .browsing_stores
+            .get(&store_contract_id)?
+            .conversations
+            .iter()
+            .any(|conversation| conversation.buyer_public_key == tag)
+            .then_some((store_contract_id, tag))
     }
 
     fn file(
@@ -1651,6 +1944,126 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A purchase the Buy now form shows keeps its conversation with its
+    /// orders** (codex, round 2 of #205): its card is left out, not its
+    /// conversation, so the thread is not lost or taken for a question.
+    /// Red grouping only the purchases listed.
+    #[test]
+    fn a_purchase_shown_in_the_buy_form_keeps_its_conversation() {
+        let purchase = |n: u8, conversation: u8| BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([n; 32]),
+            conversation: [conversation; 32],
+            commitment: None,
+            blockers: Vec::new(),
+            paid: None,
+        };
+        let all = [purchase(1, 5), purchase(2, 6), purchase(3, 6)];
+        let above = [harvest_common::payment::OrderId([1; 32])];
+        let groups = purchase_groups(&all, &above);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(tag, cards)| (tag[0], cards.len()))
+                .collect::<Vec<_>>(),
+            vec![(5, 0), (6, 2)]
+        );
+    }
+
+    /// **The complaint step's "Message the seller" goes to the purchase's
+    /// own conversation**, and only where this node holds it: at a loaded
+    /// store, and for a kept purchase, at the store under its key that holds
+    /// the kept conversation (not merely the first under that key). Red with
+    /// `conversation` returning None, and with the kept lookup picking the
+    /// first store under the key.
+    #[test]
+    fn the_complaint_step_messages_the_purchases_own_conversation() {
+        let key = [4u8; 32];
+        let held = crate::messaging::BuyerConversation::open(&[9u8; 32]).expect("open");
+        let tag = held.buyer_public_key;
+        let mut state = crate::state::AppState::default();
+        // An older generation of the store under the same key, without the
+        // conversation, and the current one with it.
+        let old_generation = crate::state::BrowsingStore {
+            owner: Some(key),
+            ..Default::default()
+        };
+        let current = crate::state::BrowsingStore {
+            owner: Some(key),
+            conversations: vec![held],
+            ..Default::default()
+        };
+        // Several, so a lookup taking the first store under the key (in
+        // hash order) almost never lands on the right one by luck.
+        for generation in 10u8..20 {
+            state
+                .browsing_stores
+                .insert(vec![generation; 32], old_generation.clone());
+        }
+        state.browsing_stores.insert(vec![2u8; 32], current);
+        let purchase = |conversation: [u8; 32]| BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([7; 32]),
+            conversation,
+            commitment: None,
+            blockers: Vec::new(),
+            paid: None,
+        };
+        let at_store = |conversation| ComplaintTarget::AtStore {
+            store_contract_id: vec![2u8; 32],
+            purchase: Box::new(purchase(conversation)),
+        };
+        assert_eq!(
+            at_store(tag).conversation(&state),
+            Some((vec![2u8; 32], tag))
+        );
+        assert_eq!(
+            at_store([3u8; 32]).conversation(&state),
+            None,
+            "not held here"
+        );
+
+        let kept_order = harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: None,
+                id: harvest_common::payment::OrderId([7; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::Utc::now(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::Paid,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        state
+            .kept_purchases
+            .push(harvest_common::delegate::KeptPurchase {
+                store_key: key,
+                conversation: tag,
+                receipt_seed: [0; 32],
+                order: kept_order,
+                complaint: None,
+            });
+        let kept = ComplaintTarget::Kept {
+            store_key: key,
+            order_id: harvest_common::payment::OrderId([7; 32]),
+        };
+        assert_eq!(kept.conversation(&state), Some((vec![2u8; 32], tag)));
+    }
 
     /// No "waiting for your payment" above a line saying not to pay it
     /// (round 3 of harvest#187). Red without the check.

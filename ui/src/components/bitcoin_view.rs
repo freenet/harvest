@@ -588,6 +588,11 @@ pub(crate) fn OrderCard(
     order: AuthorizedOrder,
     live: Option<AddressView>,
     #[props(default)] buyer: bool,
+    /// More for the bottom of the card, inside its box: the seller's
+    /// "Other orders" put the address and controls here, so they read as
+    /// part of the order (msg1-msg3 screenshots: they sat below the box).
+    #[props(default)]
+    footer: Option<Element>,
 ) -> Element {
     let o = &order.order;
     let destination = DestinationNote::of(o);
@@ -828,6 +833,9 @@ pub(crate) fn OrderCard(
                 // (the 2026-09-27 friction report: "Settled by bridge" under
                 // "Awaiting payment" read as a status).
                 BridgeNote::Recognised => rsx! {},
+            }
+            if let Some(footer) = footer {
+                {footer}
             }
         }
     }

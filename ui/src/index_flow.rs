@@ -1265,7 +1265,10 @@ mod tests {
         // The non-test source, with comment lines dropped (so a call that is
         // commented out does not count), and whitespace squashed.
         let code = |src: &str| -> String {
-            let src = src.find("#[cfg(test)]").map_or(src, |at| &src[..at]);
+            // The first test module, not the first `#[cfg(test)]`:
+            // message_view.rs has a test-only counter far above the code
+            // this reads.
+            let src = src.find("#[cfg(test)]\nmod ").map_or(src, |at| &src[..at]);
             src.lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<String>()
