@@ -1184,6 +1184,15 @@ fn check_seal<S: std::fmt::Debug>(outcome: &Outcome<S>, seal: Seal, planted: &[C
     for id in planted {
         assert!(!unresolved.contains(id), "planted generation {id} did not answer");
     }
+    // On the documented isolated network-mode node every unplanted
+    // generation answers NotFound, so set REHEARSAL_EXPECT_SEAL=1 there: a
+    // node answering errors instead would otherwise pass with only a note.
+    if !unresolved.is_empty() && std::env::var("REHEARSAL_EXPECT_SEAL").as_deref() == Ok("1") {
+        panic!(
+            "{} unplanted generation(s) never answered NotFound, and REHEARSAL_EXPECT_SEAL=1",
+            unresolved.len()
+        );
+    }
     if !unresolved.is_empty() {
         println!(
             "  NOTE: {} unplanted generation(s) never answered NotFound, so this cannot seal \
@@ -1591,6 +1600,18 @@ async fn scenario_index_lineage(node: &mut Node, repo: &Path) {
     let want = GhostKeyIndexV1 {
         entries: all.into_iter().take(MAX_INDEX_ENTRIES).collect(),
     };
+    // The expectation itself must still exercise both things, whatever the
+    // seeds' keys happen to sort as: the clash slot survives the cap, and so
+    // does at least one store held only at the older generation.
+    assert!(want.entries.contains_key(&clash_winner.slot()), "the clash is inside the cap");
+    let only_at_newest: std::collections::BTreeSet<_> =
+        newest_entries.iter().map(|e| e.slot()).collect();
+    assert!(
+        older_entries
+            .iter()
+            .any(|e| !only_at_newest.contains(&e.slot()) && want.entries.contains_key(&e.slot())),
+        "a store held only at the older generation is inside the cap"
+    );
     assert_eq!(merged, &want, "one entry per store, the clash resolved, the 64 smallest kept");
     println!(
         "  folded 39 + 39 entries (76 stores) to {}; clash slot kept the {} backing",

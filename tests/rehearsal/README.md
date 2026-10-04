@@ -80,8 +80,12 @@ freenet network --is-gateway --skip-load-from-network --disable-auto-update \
   --public-network-address 127.0.0.1 --public-network-port 31698 \
   --network-port 31698 --ws-api-address 127.0.0.1 --ws-api-port 7698 \
   --config-dir "$D/config" --data-dir "$D/data" --log-dir "$D/log" &
-REHEARSAL_ONLY=lineages cargo run -- ws://127.0.0.1:7698
+REHEARSAL_EXPECT_SEAL=1 REHEARSAL_ONLY=lineages cargo run -- ws://127.0.0.1:7698
 ```
+
+`REHEARSAL_EXPECT_SEAL=1` makes scenarios 6 and 7 fail unless every
+unplanted generation answers NotFound, which an isolated network-mode node
+does; without it, a node answering errors passes with only a note.
 
 The predecessor WASM comes out of git history by hash (the registries record
 hashes, not commits), so no artifacts need to be checked in or passed on the
