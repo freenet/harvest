@@ -83,6 +83,10 @@ pub struct AutoInvoiceUi {
     /// spends one itself.
     pub upcoming: Vec<DerivedAddress>,
     pub upcoming_for: Option<(String, u64)>,
+    /// The payment key `upcoming` was read under. Unlike `upcoming_for` it
+    /// is kept while the window waits to be read again, so a window cut
+    /// while stale is still bound to its key (review round 3 of batch 2).
+    pub upcoming_key: Option<String>,
     /// When `PeekOrderAddresses` was last sent.
     pub peek_sent_ms: Option<u64>,
     /// The last arm sent for each store (with `watch_left_ms` zeroed, since
@@ -492,36 +496,69 @@ impl AppState {
     /// address at once, rather than one peek later: the delegate must stop
     /// renewing and invoicing on a script just paid (review round 2 of
     /// batch 2). It only ever shrinks while stale.
-    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
+    ///
+    /// The third value says the window is stale: the caller then keeps only
+    /// what it last armed (`auto_invoice_arm`), so a stale window can only
+    /// shrink.
+    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress], bool)> {
         let Some((network, upcoming)) = self.upcoming_unvetted() else {
-            let network = self.bitcoin.payment_xpub.as_ref()?.network;
+            // Stale: bound to the key it was read under, and read under the
+            // build an order would name now.
+            let xpub = self.bitcoin.payment_xpub.as_ref()?;
+            if self.auto_invoice.upcoming_key.as_deref() != Some(xpub.xpub.as_str()) {
+                return None;
+            }
             let upcoming = self.auto_invoice.upcoming.as_slice();
-            let used = upcoming.iter().position(|a| {
+            let ids = self.contract_ids_of(xpub.network, upcoming)?;
+            let used = upcoming.iter().zip(&ids).position(|(a, id)| {
                 self.auto_invoice
                     .vets
                     .get(&a.script_pubkey)
-                    .is_some_and(|v| v.verdict == VetVerdict::Used)
+                    .is_some_and(|v| v.verdict == VetVerdict::Used && v.contract_id == *id)
             })?;
             let before = &upcoming[..used];
-            let clear = before.iter().all(|a| {
+            let clear = before.iter().zip(&ids).all(|(a, id)| {
                 self.auto_invoice
                     .vets
                     .get(&a.script_pubkey)
-                    .is_some_and(|v| v.is_clear())
+                    .is_some_and(|v| v.is_clear() && v.contract_id == *id)
             });
-            return clear.then_some((network, before));
+            return clear.then_some((xpub.network, before, true));
         };
         let ids = self.window_contract_ids()?;
         for (i, (a, id)) in upcoming.iter().zip(ids).enumerate() {
             match self.auto_invoice.vets.get(&a.script_pubkey) {
                 Some(v) if v.is_clear() && v.contract_id == id => {}
                 Some(v) if v.verdict == VetVerdict::Used => {
-                    return Some((network, &upcoming[..i]));
+                    return Some((network, &upcoming[..i], false));
                 }
                 _ => return None,
             }
         }
-        Some((network, upcoming))
+        Some((network, upcoming, false))
+    }
+
+    /// [`Self::vetted_window`], for this crate's tests.
+    #[cfg(test)]
+    pub(crate) fn vetted_window_for_test(&self) -> Option<usize> {
+        self.vetted_window().map(|(_, w, _)| w.len())
+    }
+
+    /// The address contract ids of `upcoming` on `network`, under the
+    /// address generation and bridges an order would name now.
+    fn contract_ids_of(
+        &self,
+        network: BitcoinNetwork,
+        upcoming: &[DerivedAddress],
+    ) -> Option<Vec<[u8; 32]>> {
+        let code_hash = self.bitcoin.address_generation.code_hash()?;
+        let bridges = crate::gateway::bitcoin_config::default_trusted_bridges(network).ok()?;
+        Some(
+            upcoming
+                .iter()
+                .map(|a| address_instance_id(network, &a.script_pubkey, &bridges, code_hash))
+                .collect(),
+        )
     }
 
     /// [`Self::current_upcoming`] before the address-contract reads.
@@ -888,9 +925,18 @@ impl AppState {
             .as_slice()
             .try_into()
             .ok()?;
-        let (network, upcoming) = self.vetted_window()?;
-        let vetted_scripts: Vec<Vec<u8>> =
+        let (network, upcoming, stale) = self.vetted_window()?;
+        let mut vetted_scripts: Vec<Vec<u8>> =
             upcoming.iter().map(|a| a.script_pubkey.clone()).collect();
+        if stale {
+            // Only ever narrower than what was last armed for this store.
+            let last: &[Vec<u8>] = self
+                .auto_invoice
+                .sent
+                .get(&registration.store_contract_id)
+                .map_or(&[], |(arm, _, _)| arm.vetted_scripts.as_slice());
+            vetted_scripts.retain(|s| last.contains(s));
+        }
         let tip_contract_id: [u8; 32] = self
             .bitcoin
             .tip_contract_network
@@ -1545,6 +1591,7 @@ impl AppState {
             (Ok(upcoming), Some(xpub)) => {
                 self.auto_invoice.stale_from_peek = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
+                self.auto_invoice.upcoming_key = Some(xpub.xpub.clone());
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();
             }
@@ -1605,8 +1652,47 @@ impl AppState {
             Some(Err(why)) => format!("Your store can't take orders on this device: {why}."),
             // The state line alone: the alerts (oversold, capped) are said
             // separately, in "Needs you", whether or not the store is open.
+            Some(Ok(status)) if status.paused.as_deref() == Some(NOT_VETTED_REASON) => {
+                format!(
+                    "{NOT_VETTED_LINE} {}",
+                    self.rearm_progress(store_contract_id, now_ms)
+                )
+            }
             Some(Ok(status)) => instant_checkout_state_line(status, now_ms),
         })
+    }
+
+    /// What re-arming a store paused for a lapsed week still waits for,
+    /// from what this tab holds: the delegate's next addresses and their
+    /// reads, what an arm needs, and whether that arm has gone out. The
+    /// delegate's answer to the arm replaces the paused status, so this is
+    /// not asked once the store is re-armed and accepted.
+    pub fn rearm_progress(&self, store_contract_id: &[u8], now_ms: u64) -> &'static str {
+        let Some((_, window, _)) = self.vetted_window() else {
+            return "Harvest is checking your next payment addresses before it can renew it.";
+        };
+        if window.is_empty() {
+            return "Your next payment address has been paid before, so Harvest is moving past it \
+                    first.";
+        }
+        let arm = self
+            .instant_checkout_stores()
+            .into_iter()
+            .find(|(_, r)| r.store_contract_id == store_contract_id)
+            .and_then(|(fingerprint, r)| self.auto_invoice_arm(&fingerprint, &r, now_ms));
+        let Some((arm, _)) = arm else {
+            return "Harvest is still connecting to the Bitcoin bridge before it can renew it.";
+        };
+        let sent = self
+            .auto_invoice
+            .sent
+            .get(store_contract_id)
+            .is_some_and(|(held, _, _)| held.vetted_scripts == arm.vetted_scripts);
+        if sent {
+            "Harvest has renewed it and is waiting for this device\u{2019}s Freenet to confirm."
+        } else {
+            "Harvest is about to renew it."
+        }
     }
 
     /// Whether this device answers buyers' orders for one of our stores, for
@@ -1785,6 +1871,13 @@ pub(crate) const NOT_VETTED_REASON: &str =
     "paused: Harvest has not been opened on this device for 7 days; open Harvest to keep taking \
      orders";
 
+/// What the store page says for [`NOT_VETTED_REASON`] on its own; the store
+/// page adds what re-arming still waits for
+/// (`AppState::rearm_progress`), and promises nothing about when orders
+/// start again (review round 3 of batch 2).
+pub(crate) const NOT_VETTED_LINE: &str = "Your store paused because Harvest hadn\u{2019}t been \
+     opened on this device for 7 days. Open Harvest at least once a week to keep taking orders.";
+
 /// This device's line about taking orders: the reason buyers can't buy,
 /// said under the store's status while they can't (`presence_flow::
 /// seller_status`). The alerts that stand whether or not the store is open
@@ -1799,10 +1892,7 @@ pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> S
         // Said to someone who has just opened Harvest: this tab re-arms at
         // once, which lifts the pause (review round 2 of batch 2).
         if why == NOT_VETTED_REASON {
-            return "Your store paused because Harvest hadn\u{2019}t been opened on this device \
-                    for 7 days. Now that it\u{2019}s open, orders start again within a few \
-                    minutes. Open Harvest at least once a week to keep taking orders."
-                .into();
+            return NOT_VETTED_LINE.into();
         }
         if why == WATCH_LAPSED_REASON {
             return "Your store isn't taking orders right now: the watch on its payment \

@@ -35077,6 +35077,78 @@ mod buy_flow_tests {
         }
     }
 
+    /// Review round 3 of batch 2: a stale window is bound to its key and
+    /// can only shrink: after a key change it arms nothing, and it never
+    /// names a script the last arm sent for the store did not. Mutated red
+    /// by dropping the key check, and the intersection.
+    #[test]
+    fn a_stale_window_is_bound_to_its_key_and_only_shrinks() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        state.queue_auto_invoice(200);
+        // The last arm named the first three and one past the coming cut
+        // (as if sent earlier): the cut keeps only what both name.
+        for (arm, _, _) in state.auto_invoice.sent.values_mut() {
+            let eighth = arm.vetted_scripts[8].clone();
+            arm.vetted_scripts.truncate(3);
+            arm.vetted_scripts.push(eighth);
+        }
+        let (paid, _) = address_states_paid_and_scanned();
+        assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
+        let cut = state.queue_auto_invoice(300);
+        assert!(!cut.arms.is_empty());
+        for arm in &cut.arms {
+            let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
+            assert_eq!(firsts, vec![0, 1, 2], "no wider than the last arm");
+        }
+        // Another key: the stale window says nothing about it.
+        state.auto_invoice.upcoming_key = Some("another key".into());
+        assert!(state.vetted_window_for_test().is_none());
+    }
+
+    /// Review round 3 of batch 2: a store paused for a lapsed week says
+    /// what re-arming still waits for, and never that orders start again
+    /// before the delegate has taken the renewed window. Mutated red by
+    /// saying the same whatever the state.
+    #[test]
+    fn a_week_paused_store_says_what_re_arming_waits_for() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let (_, registration) = state.instant_checkout_stores().into_iter().next().unwrap();
+        let store = registration.store_contract_id.clone();
+        let paused = harvest_common::delegate::AutoInvoiceStatus {
+            armed_at_ms: 0,
+            watched_remaining: 0,
+            invoicing_until_ms: 0,
+            last_background_run_ms: Some(1),
+            issued_last_day: 0,
+            oversold: vec![],
+            paused: Some(crate::auto_invoice_flow::NOT_VETTED_REASON.to_string()),
+            wallet_gap_paid_at_ms: None,
+            wallet_gap_limit: 0,
+            capped: None,
+            last_wakeup_ms: None,
+            watch_delegation: None,
+        };
+        state.auto_invoice.status.insert(store.clone(), Ok(paused));
+        let line = |state: &AppState| state.instant_checkout_notice(&store, 100).unwrap();
+        assert!(
+            line(&state).contains("checking your next payment addresses"),
+            "{}",
+            line(&state)
+        );
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        let line_ready = state.instant_checkout_notice(&store, 150).unwrap();
+        assert!(line_ready.contains("about to renew"), "{line_ready}");
+        state.queue_auto_invoice(200);
+        let line_sent = state.instant_checkout_notice(&store, 200).unwrap();
+        assert!(line_sent.contains("waiting for this device"), "{line_sent}");
+        assert!(!line_sent.contains("start again"), "{line_sent}");
+    }
+
     /// Review round 1 of batch 2, item 5: a window read clear is armed as
     /// vetted before the tab's own watch of it is known (a tab load, a
     /// prewatch not yet read by the bridge): the delegate keeps renewing
@@ -36761,7 +36833,10 @@ mod buy_flow_tests {
             away.contains("hadn\u{2019}t been opened on this device for 7 days"),
             "{away}"
         );
-        assert!(away.contains("orders start again"), "{away}");
+        // It promises nothing about when orders start again: the store page
+        // adds what re-arming waits for (review round 3).
+        assert!(!away.contains("start again"), "{away}");
+        assert!(away.contains("at least once a week"), "{away}");
         assert!(
             joined.contains(&format!(
                 "\"{}\"",

@@ -1184,9 +1184,12 @@ fn not_taking_given<S: SecretStore>(
     now_ms: u64,
 ) -> Option<Refusal> {
     let id = &record.arm.store_contract_id;
-    refusal_given(secrets, record, tip, watched, now_ms)
-        .err()
-        .or_else(|| store_read_refusal(secrets, id))
+    // The store's own refusal first, unlike `decide`: a store closed for
+    // good tells buyers "Closed for good" whatever else is also true (a
+    // lapsed week, a lapsed watch), since nothing the seller does reopens it
+    // (review round 3 of batch 2).
+    store_read_refusal(secrets, id)
+        .or_else(|| refusal_given(secrets, record, tip, watched, now_ms).err())
         .or_else(|| counter_refusal(secrets, id, now_ms))
         .or_else(|| (run() == 0).then_some(Refusal::NoWatchedAddress))
 }
@@ -6025,6 +6028,33 @@ mod tests {
         f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
         f.record.last_armed_ms = NOW;
         assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
+    }
+
+    /// Review round 3 of batch 2: a closed store's heartbeat says closed for
+    /// good even when its week has also lapsed (the heartbeat checks the
+    /// store's own refusal first); `decide` keeps its order. Mutated red by
+    /// checking the store's refusal after the others.
+    #[test]
+    fn a_closed_store_says_closed_for_good_whatever_else_lapsed() {
+        let mut f = fixture();
+        f.record.last_armed_ms = NOW - VETTED_FOR_MS;
+        note_store_read(
+            &mut f.secrets,
+            &f.record.arm.store_contract_id,
+            Some(&Refusal::StoreClosed),
+        );
+        let record = f.record.clone();
+        let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert_eq!(
+            beat.heartbeat.reason,
+            Some(harvest_common::presence::NotTakingReason::ClosedForGood)
+        );
+        let entry = Buyer::new(85).request(&jam(), 1, 1, 12_000);
+        assert_eq!(
+            run(&mut f, &[entry]).refused[0].1,
+            Refusal::NotVettedRecently,
+            "decide's order is unchanged"
+        );
     }
 
     /// Review round 1 of batch 2: an arm's scripts count, from either
