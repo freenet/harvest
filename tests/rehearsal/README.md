@@ -33,6 +33,19 @@ artifacts it exists to check.
    demonstrated rather than argued.
 5. **Nothing-to-find seals nothing.** A seller with no predecessor state takes
    the seed-local path, and the seal decision is `Retry`.
+6. **The mailbox lineage** (`REHEARSAL_ONLY=mailbox`, harvest#223). A seller's
+   mailbox with messages at the two newest superseded generations, one
+   message in both, is found, folded into one set holding every message once
+   (compared byte for byte), accepted by the current contract, and read back;
+   a repeated forward duplicates nothing.
+7. **The Ghost Key index lineage** (`REHEARSAL_ONLY=index`, harvest#223). An
+   index with a store at each of the two newest superseded generations, one
+   store in both, is found and folded, and the current contract holds every
+   entry, each still verifying against the Ghost Key.
+
+`REHEARSAL_ONLY=lineages` runs 6 and 7 together. Both must be re-run whenever
+the mailbox or index contract re-keys, which is any change to
+`harvest-common` (it is compiled into both).
 
 ## Running it
 
