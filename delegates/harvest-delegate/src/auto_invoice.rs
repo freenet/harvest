@@ -455,9 +455,19 @@ impl ArmRecord {
 /// (A to B to A) need not restore it: the seller's own wallet may have paid
 /// one of its addresses meanwhile. Nothing is invoiced until the tab re-arms
 /// under the active key, having read its window; the heartbeat says not
-/// taking orders meanwhile. Called by `bitcoin::save_payment_xpub`, the one
-/// writer of the active key.
-pub(crate) fn forget_armed_scripts<S: SecretStore>(secrets: &mut S) {
+/// taking orders meanwhile.
+///
+/// Called by `bitcoin::save_payment_xpub` before it writes a different key.
+/// The other writer of the key, a migration's `import::import_payment_xpub`,
+/// needs no call: it never changes the key this delegate holds (it writes
+/// only where none is held or the same key is held, raising the counter),
+/// and arms are not migrated. Answers whether every arm that named anything
+/// was written back emptied: the key change is refused otherwise, since an
+/// arm left naming the old window would come back to life on a change back
+/// (review round 2 of batch 2).
+#[must_use]
+pub(crate) fn forget_armed_scripts<S: SecretStore>(secrets: &mut S) -> bool {
+    let mut all = true;
     for mut record in arms(secrets) {
         if record.arm.watched_scripts.is_empty() && record.arm.vetted_scripts.is_empty() {
             continue;
@@ -465,8 +475,9 @@ pub(crate) fn forget_armed_scripts<S: SecretStore>(secrets: &mut S) {
         record.arm.watched_scripts.clear();
         record.arm.vetted_scripts.clear();
         record.arm.watched_until_height = None;
-        save(secrets, &arm_key(&record.arm.store_contract_id), &record);
+        all &= save(secrets, &arm_key(&record.arm.store_contract_id), &record);
     }
+    all
 }
 
 /// What this delegate remembers about one store's instant checkout.
@@ -1726,6 +1737,10 @@ pub(crate) enum Refusal {
     // Store-wide: nothing is answered, and the request is not marked seen, so
     // a later arm may still answer it within `REQUEST_MAX_AGE_MS`.
     WatchLapsed,
+    /// The arm last arrived more than [`VETTED_FOR_MS`] ago: the seller has
+    /// not opened Harvest on this device for a week, and the window it read
+    /// clear is no longer relied on. Opening Harvest re-arms and lifts it.
+    NotVettedRecently,
     NoStoreKey,
     NotOurStore,
     StoreClosed,
@@ -1816,6 +1831,7 @@ impl Refusal {
         matches!(
             self,
             Refusal::WatchLapsed
+                | Refusal::NotVettedRecently
                 | Refusal::NoStoreKey
                 | Refusal::NotOurStore
                 | Refusal::StoreClosed
@@ -1834,6 +1850,11 @@ impl Refusal {
             Refusal::WatchLapsed => {
                 "the watch on its payment addresses would lapse before a buyer could pay; open \
                  Harvest to renew it"
+                    .into()
+            }
+            Refusal::NotVettedRecently => {
+                "paused: Harvest has not been opened on this device for 7 days; open Harvest to \
+                 keep taking orders"
                     .into()
             }
             Refusal::NoStoreKey => "this device does not hold the store's key".into(),
@@ -1884,6 +1905,12 @@ fn refusal_given<S: SecretStore>(
     now_ms: u64,
 ) -> Result<BlockAnchor, Refusal> {
     let arm = &record.arm;
+    // A week since the tab last armed: neither source counts
+    // (`VETTED_FOR_MS`), and the seller is told why in those words rather
+    // than as a lapsed watch (review round 2 of batch 2).
+    if !record.vetted_recently(now_ms) {
+        return Err(Refusal::NotVettedRecently);
+    }
     // Lapsed only when neither source has anything: the delegate's own
     // watches keep a store taking orders after the tab's have lapsed. Not
     // judged without a tip, which the delegate's watches are measured
@@ -5948,8 +5975,9 @@ mod tests {
     /// of it may have been paid by the seller's own wallet meanwhile).
     /// Nothing is invoiced until the tab re-arms under A: every key change
     /// empties the arms. A write of the same key (a raised counter) does
-    /// not. Mutated red by not forgetting on a key change, and by
-    /// forgetting on every write.
+    /// not, and a key change whose arms cannot all be written back emptied
+    /// is refused. Mutated red by not forgetting on a key change, by
+    /// forgetting on every write, and by ignoring a refused arm write.
     #[test]
     fn a_key_round_trip_invoices_only_what_the_current_arm_names() {
         use crate::watch_delegation::test_support as wd;
@@ -5971,6 +5999,15 @@ mod tests {
 
         let mut b = a.clone();
         b.xpub = format!(" {}", a.xpub);
+        // An arm the node will not write back emptied: the key change is
+        // refused, and A stays active with its arm (review round 2).
+        f.secrets.refused_prefix = Some(format!("{AUTO_PREFIX}arm:").into_bytes());
+        assert!(crate::bitcoin::save_payment_xpub(&mut f.secrets, &b).is_err());
+        assert_eq!(
+            crate::bitcoin::load_payment_xpub(&f.secrets).unwrap().xpub,
+            a.xpub
+        );
+        f.secrets.refused_prefix = None;
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &b).unwrap();
         crate::bitcoin::save_payment_xpub(&mut f.secrets, &a).unwrap();
         f.record = load_arm(&f.secrets, &id).unwrap();
@@ -5992,8 +6029,8 @@ mod tests {
 
     /// Review round 1 of batch 2: an arm's scripts count, from either
     /// source, only within `VETTED_FOR_MS` of its last arrival; past it the
-    /// store waits for the seller (`WatchLapsed`), and its heartbeat says
-    /// so. Mutated red by dropping the bound from the arm source, and from
+    /// store waits for the seller (`NotVettedRecently`, which tells the
+    /// seller to open Harvest), and its heartbeat says not taking orders. Mutated red by dropping the bound from the arm source, and from
     /// the delegated source.
     #[test]
     fn a_window_read_a_week_ago_counts_for_nothing() {
@@ -6004,7 +6041,12 @@ mod tests {
         f.record.last_armed_ms = NOW - VETTED_FOR_MS;
         assert_eq!(
             run(&mut f, std::slice::from_ref(&entry)).refused[0].1,
-            Refusal::WatchLapsed
+            Refusal::NotVettedRecently
+        );
+        // The seller is told in those words, not as a lapsed watch.
+        assert_eq!(
+            status_of(&f.secrets, &f.record, NOW).paused,
+            Some(Refusal::NotVettedRecently.explain())
         );
         f.record.last_armed_ms = NOW - VETTED_FOR_MS + 1;
         assert_eq!(run(&mut f, std::slice::from_ref(&entry)).orders.len(), 1);
@@ -6019,7 +6061,7 @@ mod tests {
         f.record.last_armed_ms = NOW - VETTED_FOR_MS;
         assert_eq!(
             run(&mut f, std::slice::from_ref(&entry)).refused[0].1,
-            Refusal::WatchLapsed
+            Refusal::NotVettedRecently
         );
         assert!(!taking_orders(
             &f.secrets,
@@ -7569,6 +7611,7 @@ mod tests {
             (Refusal::NotOurStore, R::ClosedForGood),
             (Refusal::CatchingUp, R::CatchingUp),
             (Refusal::WatchLapsed, R::Unavailable),
+            (Refusal::NotVettedRecently, R::Unavailable),
             (Refusal::NoPaymentKey, R::Unavailable),
             (Refusal::NoFreshTip, R::Unavailable),
             (Refusal::NoWatchedAddress, R::Unavailable),

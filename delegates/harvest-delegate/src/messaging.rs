@@ -1221,14 +1221,22 @@ pub(crate) fn merge_held_conversation<S: SecretStore>(
 pub(crate) fn capped_incoming_conversation(value: &[u8]) -> Option<Vec<u8>> {
     let mut record = harvest_common::from_cbor::<BuyerConversationRecord>(value).ok()?;
     let cap = harvest_common::delegate::MAX_SENT_DIGESTS * 32;
+    let mut changed = false;
     if record.sent.len() % 32 != 0 {
+        // Not a list of digests: none is kept.
         record.sent.clear();
+        changed = true;
     }
-    if record.sent.len() <= cap {
+    if record.sent.len() > cap {
+        let excess = record.sent.len() - cap;
+        record.sent.drain(..excess);
+        changed = true;
+    }
+    // Re-encoded whenever anything was repaired or cut, so the caller never
+    // copies the original bytes past either (review round 2 of batch 2).
+    if !changed {
         return None;
     }
-    let excess = record.sent.len() - cap;
-    record.sent.drain(..excess);
     harvest_common::to_cbor(&record).ok()
 }
 
@@ -3597,6 +3605,19 @@ mod sent_and_seen_tests {
         let sent = recalled(&store, &tag).sent_digests;
         assert_eq!(sent.len(), MAX_SENT_DIGESTS);
         assert_eq!(sent[0], digest(7), "the newest kept");
+
+        // A misaligned list longer than the cap is not copied as it is
+        // (review round 2): nothing of it is kept.
+        theirs.sent.push(0xff);
+        let value = harvest_common::to_cbor(&theirs).unwrap();
+        let mut store = MemSecrets::default();
+        assert_eq!(
+            crate::import::import_secret(&mut store, &key, &value),
+            SecretImport::Written
+        );
+        let held: BuyerConversationRecord =
+            harvest_common::from_cbor(&store.get_secret(&key).unwrap()).unwrap();
+        assert!(held.sent.is_empty(), "{} bytes kept", held.sent.len());
     }
 
     /// A seller's digests migrate merged: the predecessor's that the

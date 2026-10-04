@@ -486,8 +486,31 @@ impl AppState {
     /// it has, rather than being told the window shrank to what has been
     /// read so far. A window found used part-way is armed up to that
     /// address, so the delegate stops renewing and invoicing on it.
+    ///
+    /// While the window waits to be read again after an address in it was
+    /// newly found used (`upcoming_for` cleared), the arm is cut before that
+    /// address at once, rather than one peek later: the delegate must stop
+    /// renewing and invoicing on a script just paid (review round 2 of
+    /// batch 2). It only ever shrinks while stale.
     fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
-        let (network, upcoming) = self.upcoming_unvetted()?;
+        let Some((network, upcoming)) = self.upcoming_unvetted() else {
+            let network = self.bitcoin.payment_xpub.as_ref()?.network;
+            let upcoming = self.auto_invoice.upcoming.as_slice();
+            let used = upcoming.iter().position(|a| {
+                self.auto_invoice
+                    .vets
+                    .get(&a.script_pubkey)
+                    .is_some_and(|v| v.verdict == VetVerdict::Used)
+            })?;
+            let before = &upcoming[..used];
+            let clear = before.iter().all(|a| {
+                self.auto_invoice
+                    .vets
+                    .get(&a.script_pubkey)
+                    .is_some_and(|v| v.is_clear())
+            });
+            return clear.then_some((network, before));
+        };
         let ids = self.window_contract_ids()?;
         for (i, (a, id)) in upcoming.iter().zip(ids).enumerate() {
             match self.auto_invoice.vets.get(&a.script_pubkey) {
@@ -1754,6 +1777,14 @@ pub(crate) const WATCH_LAPSED_REASON: &str =
     "the watch on its payment addresses would lapse before a buyer could pay; open Harvest to \
      renew it";
 
+/// The harvest delegate's reason for a store paused because Harvest has not
+/// been opened on this device for a week (`Refusal::NotVettedRecently` in
+/// `delegates/harvest-delegate/src/auto_invoice.rs`, `VETTED_FOR_MS`),
+/// exactly as it sends it. Matched like [`WATCH_LAPSED_REASON`].
+pub(crate) const NOT_VETTED_REASON: &str =
+    "paused: Harvest has not been opened on this device for 7 days; open Harvest to keep taking \
+     orders";
+
 /// This device's line about taking orders: the reason buyers can't buy,
 /// said under the store's status while they can't (`presence_flow::
 /// seller_status`). The alerts that stand whether or not the store is open
@@ -1765,6 +1796,14 @@ pub fn instant_checkout_state_line(status: &AutoInvoiceStatus, now_ms: u64) -> S
         // The delegate's own words for a lapsed watch end "open Harvest to
         // renew it", said here to someone who has Harvest open (the
         // 2026-09-30 critique). This tab renews it (module doc), so say that.
+        // Said to someone who has just opened Harvest: this tab re-arms at
+        // once, which lifts the pause (review round 2 of batch 2).
+        if why == NOT_VETTED_REASON {
+            return "Your store paused because Harvest hadn\u{2019}t been opened on this device \
+                    for 7 days. Now that it\u{2019}s open, orders start again within a few \
+                    minutes. Open Harvest at least once a week to keep taking orders."
+                .into();
+        }
         if why == WATCH_LAPSED_REASON {
             return "Your store isn't taking orders right now: the watch on its payment \
                     addresses has lapsed. Harvest renews it while it\u{2019}s open here, and \

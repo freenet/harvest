@@ -6703,47 +6703,99 @@ impl AppState {
         }
     }
 
-    /// The requests for the sent digests the delegate keeps for each of
-    /// this seller's stores not yet asked about this session
-    /// (`ListSellerSent`), answered into [`Self::seller_sent`]. Asked when
-    /// the store list arrives, so a reload's own messages read "You".
-    pub fn seller_sent_to_list(&mut self) -> Vec<harvest_common::HarvestDelegateRequest> {
-        let keys: Vec<[u8; 32]> = self
+    /// This seller's store keys whose kept digests this tab has not asked
+    /// for yet (or whose asking failed): what [`Self::list_seller_sent`]
+    /// will ask for. Changes nothing.
+    pub fn seller_sent_unlisted(&self) -> Vec<[u8; 32]> {
+        let mut keys: Vec<[u8; 32]> = self
             .my_stores
             .values()
             .flatten()
             .filter_map(|r| r.store_verifying_key)
+            .filter(|key| !self.seller_sent_listed.contains(key))
             .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// The requests for the sent digests the delegate keeps for each store
+    /// key not yet asked about (`ListSellerSent`), answered into
+    /// [`Self::seller_sent`], each marked as asked. Called when they are
+    /// actually sent, not when they are queued, so a send withheld (the
+    /// delegate migration did not settle) or failed leaves the key to be
+    /// asked again ([`Self::on_seller_sent_unsent`]).
+    pub fn seller_sent_to_list(&mut self) -> Vec<harvest_common::HarvestDelegateRequest> {
         let mut requests = Vec::new();
-        for store_key in keys {
-            if self.seller_sent_listed.insert(store_key) {
-                let request_id = self.next_messaging_request_id();
-                self.seller_sent_pending.insert(request_id, store_key);
-                requests.push(harvest_common::HarvestDelegateRequest::ListSellerSent {
-                    request_id,
-                    store_key,
-                });
-            }
+        for store_key in self.seller_sent_unlisted() {
+            self.seller_sent_listed.insert(store_key);
+            let request_id = self.next_messaging_request_id();
+            self.seller_sent_pending.insert(request_id, store_key);
+            requests.push(harvest_common::HarvestDelegateRequest::ListSellerSent {
+                request_id,
+                store_key,
+            });
         }
         requests
     }
 
-    /// [`Self::seller_sent_to_list`], dispatched once the delegate migration
-    /// has settled, so what a predecessor kept has been imported before it
-    /// is listed.
+    /// A `ListSellerSent` that could not be sent: its key is asked for again
+    /// at the next store list.
+    pub fn on_seller_sent_unsent(&mut self, request_id: u64) {
+        if let Some(key) = self.seller_sent_pending.remove(&request_id) {
+            self.seller_sent_listed.remove(&key);
+        }
+    }
+
+    /// Ask for [`Self::seller_sent_unlisted`] once the delegate migration has
+    /// settled, so what a predecessor kept has been imported first.
+    ///
+    /// Reached from the StoreList answer, while `apply_delegate_response`
+    /// holds `APP_STATE` for writing, and `after_delegate_migration` runs its
+    /// work AT ONCE when the migration has already settled. So the work only
+    /// spawns, and takes the state in the spawned task, after this borrow
+    /// has ended: taking it in the closure itself panics with
+    /// `AlreadyBorrowedMut` (the 2026-09-06 shape; review round 2 of batch
+    /// 2). Pinned by `listing_seller_sent_never_borrows_the_state_in_place`.
     pub fn list_seller_sent(&mut self) {
-        let requests = self.seller_sent_to_list();
+        let nothing_to_ask = self.seller_sent_unlisted().is_empty();
         #[cfg(target_arch = "wasm32")]
-        if !requests.is_empty() {
+        if !nothing_to_ask {
             crate::gateway::delegate_migrate_ops::after_delegate_migration(move || {
-                let mut state = crate::gateway::APP_STATE.write();
-                for request in &requests {
-                    state.send_to_harvest_delegate("read the record of sent messages", request);
-                }
+                wasm_bindgen_futures::spawn_local(async move {
+                    let (requests, delegate) = {
+                        let mut state = crate::gateway::APP_STATE.write();
+                        (
+                            state.seller_sent_to_list(),
+                            state.harvest_delegate_key.clone(),
+                        )
+                    };
+                    for request in requests {
+                        let harvest_common::HarvestDelegateRequest::ListSellerSent {
+                            request_id,
+                            ..
+                        } = request
+                        else {
+                            continue;
+                        };
+                        let sent = match (&delegate, harvest_common::to_cbor(&request)) {
+                            (Some(delegate), Ok(payload)) => {
+                                crate::gateway::send_delegate_message(delegate, payload).await
+                            }
+                            _ => Err("the harvest delegate is not registered".to_string()),
+                        };
+                        if let Err(e) = sent {
+                            warn!("Could not ask for the record of sent messages: {e}");
+                            crate::gateway::APP_STATE
+                                .write()
+                                .on_seller_sent_unsent(request_id);
+                        }
+                    }
+                });
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = requests;
+        let _ = nothing_to_ask;
     }
 
     /// The delegate's answer to `ListSellerSent`: added to what this tab
@@ -24307,12 +24359,25 @@ mod buyer_backup_tests {
             other => panic!("expected NoteSellerSent, got {other:?}"),
         }
         assert!(state.kept_as_sent(&[0xe1; 32]));
+        // Queued, not yet sent: still to be asked (review round 2).
+        state.list_seller_sent();
+        assert_eq!(state.seller_sent_unlisted(), vec![key]);
         let asked = state.seller_sent_to_list();
         assert!(matches!(
             asked.as_slice(),
             [HarvestDelegateRequest::ListSellerSent { store_key, .. }] if *store_key == key
         ));
         assert!(state.seller_sent_to_list().is_empty(), "once per store key");
+        // A send that failed is asked again.
+        let HarvestDelegateRequest::ListSellerSent { request_id, .. } = asked[0] else {
+            unreachable!()
+        };
+        state.on_seller_sent_unsent(request_id);
+        assert_eq!(
+            state.seller_sent_to_list().len(),
+            1,
+            "a failed send is asked again"
+        );
         state.on_delegate_response(HarvestDelegateResponse::SellerSent {
             request_id: 1,
             store_key: key,
@@ -24338,6 +24403,25 @@ mod buyer_backup_tests {
             1,
             "a refused list is asked again"
         );
+    }
+
+    /// Review round 2 of batch 2 (blocking): `list_seller_sent` runs while
+    /// `apply_delegate_response` holds `APP_STATE` for writing, and
+    /// `after_delegate_migration` may run its work at once, so the work must
+    /// spawn before it takes the state. Source pin: in its body, the
+    /// state's write borrow comes only after `spawn_local(`. Red if the
+    /// borrow moves back into the closure.
+    #[test]
+    fn listing_seller_sent_never_borrows_the_state_in_place() {
+        let src = include_str!("state.rs");
+        let at = src
+            .find("    pub fn list_seller_sent(&mut self) {")
+            .unwrap();
+        let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+        let spawn = body.find("spawn_local(").expect("the work spawns");
+        let borrow = body.find("APP_STATE").expect("it takes the state");
+        assert!(spawn < borrow, "the state is taken before the work spawns");
+        assert!(body.find("after_delegate_migration").unwrap() < spawn);
     }
 
     /// **A reload keeps "You".** A fresh state (nothing this tab sent) that
@@ -34876,12 +34960,14 @@ mod buy_flow_tests {
         reread(&mut state, 0..10, 250);
         let work = state.queue_auto_invoice(300);
         // The arm names nothing (the first address is used), so the delegate
-        // forgets any window it had (review round 1 of batch 2, item 4).
-        assert!(!work.arms.is_empty());
-        assert!(work
-            .arms
-            .iter()
-            .all(|arm| arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty()));
+        // forgets any window it had (review round 1 of batch 2, item 4). It
+        // went out as soon as the used verdict landed (round 2).
+        assert!(!state.auto_invoice.sent.is_empty());
+        assert!(state
+            .auto_invoice
+            .sent
+            .values()
+            .all(|(arm, _, _)| arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty()));
         assert!(work.raise);
         let raise = work.raise_request.expect("a request id");
         assert!(
@@ -34954,8 +35040,8 @@ mod buy_flow_tests {
         assert!(state.prewatch_wanted(bridge).is_none());
         let work = state.queue_auto_invoice(200);
         assert!(work.raise);
-        assert!(!work.arms.is_empty());
-        for arm in &work.arms {
+        assert!(!state.auto_invoice.sent.is_empty());
+        for (arm, _, _) in state.auto_invoice.sent.values() {
             let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
             assert_eq!(
                 firsts,
@@ -34963,6 +35049,31 @@ mod buy_flow_tests {
                 "the clear run before the used one"
             );
             assert!(arm.watched_scripts.is_empty());
+        }
+    }
+
+    /// Review round 2 of batch 2: an address in an armed window newly found
+    /// paid cuts the arm before it at once, before the window is read again
+    /// (which waits for a fresh peek). Mutated red by arming nothing while
+    /// the window is stale.
+    #[test]
+    fn a_newly_paid_address_cuts_the_arm_before_the_window_is_read_again() {
+        let gk = inbox::authority().mint();
+        let mut state = a_seller_with_a_lost_counter(&gk);
+        let work = state.queue_auto_invoice(100);
+        settle_absent_except(&mut state, &work, &[], 100);
+        let armed = state.queue_auto_invoice(200);
+        assert!(armed.arms.iter().all(|a| a.vetted_scripts.len() == 10));
+        let (paid, _) = address_states_paid_and_scanned();
+        assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
+        let cut = state.queue_auto_invoice(300);
+        assert!(
+            !cut.arms.is_empty(),
+            "sent at once, not after the next peek"
+        );
+        for arm in &cut.arms {
+            let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
+            assert_eq!(firsts, (0..5).collect::<Vec<u8>>());
         }
     }
 
@@ -36638,6 +36749,25 @@ mod buy_flow_tests {
                 crate::auto_invoice_flow::WATCH_LAPSED_REASON
             )),
             "the delegate no longer sends the watch-lapsed reason Harvest matches"
+        );
+        // A store paused because Harvest was not opened for a week says so,
+        // and that opening it starts orders again (review round 2 of
+        // batch 2); the text matched is the delegate's own.
+        let away = instant_checkout_status_text(
+            &status(Some(1), Some(crate::auto_invoice_flow::NOT_VETTED_REASON)),
+            1,
+        );
+        assert!(
+            away.contains("hadn\u{2019}t been opened on this device for 7 days"),
+            "{away}"
+        );
+        assert!(away.contains("orders start again"), "{away}");
+        assert!(
+            joined.contains(&format!(
+                "\"{}\"",
+                crate::auto_invoice_flow::NOT_VETTED_REASON
+            )),
+            "the delegate no longer sends the not-vetted reason Harvest matches"
         );
         // Paused before any background run says why it is paused.
         let waiting = instant_checkout_status_text(&status(None, Some("no recent block")), 1);

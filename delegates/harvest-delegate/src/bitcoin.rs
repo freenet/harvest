@@ -259,8 +259,13 @@ pub(crate) fn save_payment_xpub<S: SecretStore>(
     // under another one.
     let key_changes = load_payment_xpub(store)
         .is_none_or(|held| held.xpub != status.xpub || held.network != status.network);
-    if key_changes {
-        crate::auto_invoice::forget_armed_scripts(store);
+    if key_changes && !crate::auto_invoice::forget_armed_scripts(store) {
+        return Err(
+            "the node refused to clear the armed instant-checkout windows, so the new payment \
+             key was not made active -- an arm left naming the old key's addresses could \
+             invoice from them again after a change back"
+                .to_string(),
+        );
     }
     if !store.set_secret(BITCOIN_PAYMENT_XPUB_KEY, &bytes) {
         return Err(
