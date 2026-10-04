@@ -544,9 +544,10 @@ pub(crate) fn buyer_chat_lines(
 
 /// Whether a buyer's conversation (or all of them) with a store has any
 /// message to show at all, confirmed as theirs or not: what decides that its
-/// thread, or a question card, is shown, and its button's label. After a
-/// reload the buyer's own messages are not confirmed as theirs, and a
-/// question card holding only those must not disappear.
+/// thread, or a question card, is shown, and its button's label. The buyer's
+/// own messages from another device, or past the delegate's kept digests,
+/// are not confirmed as theirs, and a question card holding only those must
+/// not disappear.
 pub(crate) fn buyer_thread_has_messages(
     state: &crate::state::AppState,
     store_contract_id: &[u8],
@@ -599,8 +600,8 @@ pub(crate) fn BuyerThread(
         None => local(),
     };
     let any = buyer_thread_has_messages(&APP_STATE.read(), &store_contract_id, Some(tag));
-    // No number on the button (msg4 screenshots): after a reload each side
-    // counts only what it can confirm, so the seller and the buyer saw
+    // No number on the button (msg4 screenshots): each side counts only
+    // what it can confirm, so the seller and the buyer saw
     // different numbers for one thread.
     let label = match (shown, any) {
         (true, _) => "Hide messages",
@@ -1152,7 +1153,7 @@ pub(crate) const UNCONFIRMED_WHY: &str = "Messages marked \u{201c}Not confirmed 
 /// * anything else in this side's direction is [`UNCONFIRMED`]: it keeps its
 ///   place in time, but on neither side (full width, dashed, neutral), never
 ///   drawn as this side's word ([`ChatLines`], [`bubble_class`]). It includes this side's
-///   own messages from another device or from before a reload, which is the
+///   own messages from another device or past the delegate's kept digests, which is the
 ///   price of never putting the other party's words under "You".
 fn who(
     role: Role,
@@ -2199,7 +2200,7 @@ pub(crate) fn hidden_unvouched_line(hidden: usize) -> String {
 /// address (a seller is not told about an unpaid Buy now at all, so the
 /// count would grow with every abandoned checkout), a blanked decline
 /// (mostly the store's own answer to one), and reply-direction text left out
-/// (as likely the seller's own, after a reload, as anyone's).
+/// (as likely the seller's own, from another device, as anyone's).
 pub(crate) fn shown_to_seller(
     entries: Vec<MailboxEntry>,
     verifies: impl Fn(&harvest_common::sealed::MessageVoucher, &[u8; 32]) -> bool,
@@ -2456,8 +2457,8 @@ fn shown_given(
                 ..
             } => open,
             // Left out, not counted: in the reply direction it is as likely
-            // the seller's own reply (after a reload this tab no longer knows
-            // it wrote it) as a buyer's, and the count's line blames buyers.
+            // the seller's own reply (from another device, which this tab
+            // cannot tell) as a buyer's, and the count's line blames buyers.
             MailboxEntry::Readable {
                 content: MessageContent::Text(_),
                 addressing: Addressing::ToBuyer,
@@ -3003,7 +3004,7 @@ fn dispatch_reply(_mailbox: Vec<u8>, _sealed: harvest_common::mailbox::Encrypted
 /// inbox (harvest#93 phase 2).
 ///
 /// The same rule the inbox itself uses to offer the accept control
-/// ([`unanswered_requests`]), per conversation, so the count and the controls
+/// ([`unanswered_requests_in`]), per conversation, so the count and the controls
 /// cannot disagree.
 pub(crate) fn requests_awaiting_invoice(
     state: &crate::state::AppState,

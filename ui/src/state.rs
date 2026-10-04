@@ -3304,12 +3304,12 @@ pub struct BrowsingStore {
     /// longer, and it is deliberately not persisted alongside the
     /// conversation secret -- it is not part of what a buyer loses by closing
     /// a tab, since the messages themselves come back out of the mailbox
-    /// after a reload. What IS lost is the label: "You" is given only to a
-    /// message this record holds (`message_view::who`), so after a reload
-    /// this side's own earlier messages stay in time order but are drawn
-    /// dashed as "Not confirmed as yours", on both screens. Keeping the
-    /// digests across a reload would need the delegate to keep them with the
-    /// conversation (a wire change, not made). The record also decides which
+    /// after a reload. The label survives a reload through the harvest
+    /// delegate, which keeps the same digests (#221,
+    /// [`AppState::kept_as_sent`]). A message neither holds (sent from another
+    /// device, or past the delegate's caps) stays in time order but is drawn
+    /// dashed as "Not confirmed as yours" (`message_view::who`), on both
+    /// screens. The record also decides which
     /// messages the seller's inbox exempts from its gate as the seller's own
     /// (`message_view::shown_to_seller`), and which sent messages have not
     /// landed yet.
@@ -9961,9 +9961,9 @@ impl AppState {
     /// That is this. It decides what the seller's inbox exempts from its gate
     /// as the seller's own (`components::message_view::shown_to_seller`);
     /// and it is the only thing that earns a message the "You" label
-    /// (`message_view::who`), so a message this tab did not send, this
-    /// side's own from before a reload included, is shown as "Not confirmed
-    /// as yours".
+    /// (`message_view::who`), with the delegate's kept digests below, so a
+    /// message neither records, this side's own from another device
+    /// included, is shown as "Not confirmed as yours".
     ///
     /// # The identity compared here is the DIGEST, not the nonce
     ///
@@ -9990,9 +9990,10 @@ impl AppState {
     /// `entry_digest`, so a substitute sits beside the original. See
     /// `docs/messaging-privacy.md`.
     ///
-    /// It is per-tab, like everything else about a conversation: a reload
-    /// loses it, and messages this browser really did send then read as
-    /// unattributed, which is the honest direction to be wrong in.
+    /// The tab's own record is per-tab; after a reload the delegate's kept
+    /// digests answer instead. A message neither holds (sent from another
+    /// device, or past the delegate's caps) reads as unattributed, which is
+    /// the honest direction to be wrong in.
     pub fn authored_here(&self, store_contract_id: &[u8], digest: &[u8; 32]) -> bool {
         self.browsing_stores
             .get(store_contract_id)
@@ -33416,6 +33417,7 @@ mod buy_flow_tests {
                 kind: harvest_common::listing::ListingKind::Sale,
                 price: None,
                 created_at: chrono::Utc::now(),
+                images: Vec::new(),
             },
             scoped_payload: Vec::new(),
             signature: Vec::new(),

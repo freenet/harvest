@@ -868,9 +868,9 @@ impl MailboxEntry {
 /// and could take its place under an order card. An honest buyer's tag is
 /// always b·G, canonical and torsion-free, so refusing twins costs nobody
 /// anything; the prime-order check also refuses points on the twist. The
-/// harvest delegate does not check either yet; the UI does not ask it for a
-/// twin's keys (`AppState::conversation_keys_to_request`) and never reads
-/// one ([`read_mailbox`]).
+/// harvest delegate applies the same rule (#221); the UI also never asks it
+/// for a twin's keys (`AppState::conversation_keys_to_request`) and never
+/// reads one ([`read_mailbox`]).
 ///
 /// The subgroup check costs a scalar multiplication and a mailbox holds up
 /// to 512 entries read on every render, so each tag's verdict is remembered.
