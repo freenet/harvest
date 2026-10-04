@@ -980,7 +980,17 @@ pub(crate) fn arm<S: SecretStore>(
             .map_or(now_ms, |held| held.armed_at_ms),
         watched_until_ms: now_ms.saturating_add(arm.watch_left_ms),
         last_armed_ms: now_ms,
-        arm: arm.clone(),
+        arm: {
+            // The tab's own watched list counts only where it also read the
+            // address clear (round 4 of batch 2): an arm's source can never
+            // accept a script outside `vetted_scripts`. The tab sends a
+            // subset anyway; an older UI, which sends no vetted list, arms
+            // nothing.
+            let mut arm = arm.clone();
+            let vetted = arm.vetted_scripts.clone();
+            arm.watched_scripts.retain(|s| vetted.contains(s));
+            arm
+        },
     };
     if !save(secrets, &arm_key(&arm.store_contract_id), &record) {
         return refuse("the node refused to store the arm".into());
@@ -6029,6 +6039,44 @@ mod tests {
         f.record.arm.vetted_scripts = (0..10).map(script_at).collect();
         f.record.last_armed_ms = NOW;
         assert_eq!(run(&mut f, &[entry]).orders.len(), 1);
+    }
+
+    /// Round 4 of batch 2: an arm's own watched list is kept only where it
+    /// was also read clear (`vetted_scripts`), so the arm source cannot
+    /// accept a script outside it; and an EMPTY arm (what the tab sends
+    /// after a newly paid address) leaves the store not taking orders until
+    /// it re-arms. Mutated red by storing the watched list as sent.
+    #[test]
+    fn an_arm_watches_only_what_it_read_clear_and_an_empty_arm_stops_orders() {
+        let mut f = fixture();
+        let mut sent = f.record.arm.clone();
+        sent.watched_scripts = (0..5).map(script_at).collect();
+        sent.vetted_scripts = (0..3).map(script_at).collect();
+        sent.watch_left_ms = WATCH_NEEDED_MS + 3_600_000;
+        arm(&mut f.secrets, sent.clone(), NOW);
+        let held = load_arm(&f.secrets, &sent.store_contract_id).unwrap();
+        assert_eq!(
+            held.arm.watched_scripts,
+            (0..3).map(script_at).collect::<Vec<_>>()
+        );
+        assert!(taking_orders(&f.secrets, &held, NOW, &upcoming(&f.secrets)));
+
+        let mut empty = sent;
+        empty.watched_scripts.clear();
+        empty.vetted_scripts.clear();
+        arm(&mut f.secrets, empty.clone(), NOW + 1);
+        let held = load_arm(&f.secrets, &empty.store_contract_id).unwrap();
+        assert!(!taking_orders(
+            &f.secrets,
+            &held,
+            NOW + 1,
+            &upcoming(&f.secrets)
+        ));
+        let (beat, _) = heartbeat(&mut f.secrets, &held, NOW + 1, true).unwrap();
+        assert!(!beat.heartbeat.taking_orders);
+        let entry = Buyer::new(86).request(&jam(), 1, 1, 12_000);
+        f.record = held;
+        assert!(run(&mut f, &[entry]).orders.is_empty());
     }
 
     /// Review round 3 of batch 2: a closed store's heartbeat says closed for

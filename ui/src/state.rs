@@ -6807,7 +6807,19 @@ impl AppState {
         store_key: [u8; 32],
         result: Result<Vec<harvest_common::delegate::SellerSentEntry>, String>,
     ) {
-        self.seller_sent_pending.remove(&request_id);
+        // Only an answer to a request this tab sent, for the key it asked
+        // about (codex, round 4): an unknown id, or one that names another
+        // key, applies nothing.
+        let Some(asked) = self.seller_sent_pending.remove(&request_id) else {
+            warn!("an answer about sent messages that nothing here asked for");
+            return;
+        };
+        let result = if asked == store_key {
+            result
+        } else {
+            Err("the answer names another store".to_string())
+        };
+        let store_key = asked;
         match result {
             Ok(kept) => {
                 let held = self.seller_sent.entry(store_key).or_default();
@@ -24377,13 +24389,33 @@ mod buyer_backup_tests {
             unreachable!()
         };
         state.on_seller_sent_unsent(request_id);
+        let again = state.seller_sent_to_list();
+        assert_eq!(again.len(), 1, "a failed send is asked again");
+        let HarvestDelegateRequest::ListSellerSent { request_id, .. } = again[0] else {
+            unreachable!()
+        };
+        // Answers are matched to their request (codex, round 4): one nothing
+        // asked for, or naming another key, applies nothing.
+        state.on_delegate_response(HarvestDelegateResponse::SellerSent {
+            request_id: request_id + 1_000,
+            store_key: key,
+            result: Ok(vec![(tag, [0xee; 32])]),
+        });
+        assert!(!state.kept_as_sent(&[0xee; 32]), "an unknown request id");
+        state.on_delegate_response(HarvestDelegateResponse::SellerSent {
+            request_id,
+            store_key: [0x45; 32],
+            result: Ok(vec![(tag, [0xee; 32])]),
+        });
+        assert!(!state.kept_as_sent(&[0xee; 32]), "another store's key");
         assert_eq!(
             state.seller_sent_to_list().len(),
             1,
-            "a failed send is asked again"
+            "a mismatched answer clears the asked key's mark"
         );
+        let request_id = request_id + 1;
         state.on_delegate_response(HarvestDelegateResponse::SellerSent {
-            request_id: 1,
+            request_id,
             store_key: key,
             result: Ok(vec![(tag, [0xe0; 32])]),
         });
@@ -24392,8 +24424,13 @@ mod buyer_backup_tests {
             vec![(tag, [0xe0; 32]), (tag, [0xe1; 32])],
             "the kept ones, then this tab's note"
         );
+        state.seller_sent_listed.remove(&key);
+        let again = state.seller_sent_to_list();
+        let HarvestDelegateRequest::ListSellerSent { request_id, .. } = again[0] else {
+            unreachable!()
+        };
         state.on_delegate_response(HarvestDelegateResponse::SellerSent {
-            request_id: 2,
+            request_id,
             store_key: key,
             result: Err("refused".into()),
         });
@@ -24448,6 +24485,7 @@ mod buyer_backup_tests {
         assert!(!buyer.authored_here(STORE, &[0xb2; 32]));
 
         let mut seller = AppState::default();
+        seller.seller_sent_pending.insert(1, [0x44; 32]);
         seller.on_delegate_response(HarvestDelegateResponse::SellerSent {
             request_id: 1,
             store_key: [0x44; 32],
@@ -35059,12 +35097,12 @@ mod buy_flow_tests {
         }
     }
 
-    /// Review round 2 of batch 2: an address in an armed window newly found
-    /// paid cuts the arm before it at once, before the window is read again
-    /// (which waits for a fresh peek). Mutated red by arming nothing while
-    /// the window is stale.
+    /// Round 4 of batch 2: an address in the armed window newly found paid
+    /// sends an EMPTY arm at once (both lists), and the next window read
+    /// re-arms it. Mutated red by arming the stale window, and by not
+    /// clearing the flag when a window arrives.
     #[test]
-    fn a_newly_paid_address_cuts_the_arm_before_the_window_is_read_again() {
+    fn a_newly_paid_address_empties_the_arm_until_the_window_is_read_again() {
         let gk = inbox::authority().mint();
         let mut state = a_seller_with_a_lost_counter(&gk);
         let work = state.queue_auto_invoice(100);
@@ -35073,93 +35111,24 @@ mod buy_flow_tests {
         assert!(armed.arms.iter().all(|a| a.vetted_scripts.len() == 10));
         let (paid, _) = address_states_paid_and_scanned();
         assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
-        let cut = state.queue_auto_invoice(300);
+        let emptied = state.queue_auto_invoice(300);
         assert!(
-            !cut.arms.is_empty(),
+            !emptied.arms.is_empty(),
             "sent at once, not after the next peek"
         );
-        for arm in &cut.arms {
-            let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
-            assert_eq!(firsts, (0..5).collect::<Vec<u8>>());
+        for arm in &emptied.arms {
+            assert!(arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty());
         }
-    }
-
-    /// Review round 3 of batch 2: a stale window is bound to its key and
-    /// can only shrink: after a key change it arms nothing, and it never
-    /// names a script the last arm sent for the store did not. Mutated red
-    /// by dropping the key check, and the intersection.
-    #[test]
-    fn a_stale_window_is_bound_to_its_key_and_only_shrinks() {
-        let gk = inbox::authority().mint();
-        let mut state = a_seller_with_a_lost_counter(&gk);
-        let work = state.queue_auto_invoice(100);
-        settle_absent_except(&mut state, &work, &[], 100);
-        state.queue_auto_invoice(200);
-        // The last arm named the first three and one past the coming cut
-        // (as if sent earlier): the cut keeps only what both name.
-        for (arm, _, _) in state.auto_invoice.sent.values_mut() {
-            let eighth = arm.vetted_scripts[8].clone();
-            arm.vetted_scripts.truncate(3);
-            arm.vetted_scripts.push(eighth);
+        // The window read again (the delegate has moved past index 5): armed
+        // again once its addresses read clear.
+        state.on_upcoming_addresses(Ok((6..16).map(lost_address).collect()), 400);
+        assert!(!state.auto_invoice.paid_since_read);
+        let work = state.queue_auto_invoice(400);
+        settle_absent_except(&mut state, &work, &[], 400);
+        state.queue_auto_invoice(500);
+        for (arm, _, _) in state.auto_invoice.sent.values() {
+            assert_eq!(arm.vetted_scripts.len(), 10, "re-armed");
         }
-        let (paid, _) = address_states_paid_and_scanned();
-        assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
-        let cut = state.queue_auto_invoice(300);
-        assert!(!cut.arms.is_empty());
-        for arm in &cut.arms {
-            let firsts: Vec<u8> = arm.vetted_scripts.iter().map(|s| s[3]).collect();
-            assert_eq!(firsts, vec![0, 1, 2], "no wider than the last arm");
-        }
-        assert_eq!(state.vetted_window_for_test(), Some(5));
-        // The stale window is cut from only while it is still the window of
-        // the key, network, counter and build this tab holds, and only
-        // because of a payment (codex, round 3): each case below arms
-        // nothing from it.
-        let fallback = |change: &dyn Fn(&mut AppState)| {
-            let mut s = state.clone();
-            change(&mut s);
-            s.vetted_window_for_test()
-        };
-        assert_eq!(fallback(&|_| {}), Some(5), "the same window");
-        assert_eq!(
-            fallback(&|s| s.bitcoin.payment_xpub.as_mut().unwrap().xpub = "another key".into()),
-            None,
-            "another key"
-        );
-        assert_eq!(
-            fallback(&|s| {
-                // Signet and testnet4 derive the same scripts from one key.
-                s.bitcoin.payment_xpub.as_mut().unwrap().network =
-                    freenet_bitcoin_common::BitcoinNetwork::Testnet4
-            }),
-            None,
-            "another network, the same key"
-        );
-        assert_eq!(
-            fallback(&|s| s.bitcoin.payment_xpub.as_mut().unwrap().next_index += 1),
-            None,
-            "the counter moved"
-        );
-        assert_eq!(
-            fallback(&|s| {
-                s.bitcoin.address_generation = crate::bitcoin_generation::Generation(Ok([0x99; 32]))
-            }),
-            None,
-            "another address-contract build"
-        );
-        assert_eq!(
-            fallback(&|s| s.auto_invoice.stale_by_payment = false),
-            None,
-            "stale for another reason than a payment"
-        );
-        // A clear verdict before the used one read under another build (the
-        // build moved between reads) is not relied on either.
-        let first = lost_address(0).script_pubkey;
-        assert_eq!(
-            fallback(&|s| s.auto_invoice.vets.get_mut(&first).unwrap().contract_id = [0x77; 32]),
-            None,
-            "a clear verdict under another build"
-        );
     }
 
     /// Review round 3 of batch 2: a store paused for a lapsed week says

@@ -83,16 +83,13 @@ pub struct AutoInvoiceUi {
     /// spends one itself.
     pub upcoming: Vec<DerivedAddress>,
     pub upcoming_for: Option<(String, u64)>,
-    /// The payment key and network `upcoming` was read under. Unlike
-    /// `upcoming_for` it is kept while the window waits to be read again, so
-    /// a window cut while stale is still bound to where it came from (review
-    /// round 3 of batch 2).
-    pub upcoming_from: Option<(String, BitcoinNetwork)>,
-    /// Set when the window was made stale by an address in it found paid,
-    /// and only then: the one case [`AppState::vetted_window`]'s stale
-    /// branch may cut an arm from it. Cleared when a window arrives and when
-    /// the key changes (codex, round 3).
-    pub stale_by_payment: bool,
+    /// Set when an address in the window was newly found paid, and cleared
+    /// when the next window arrives (or the key changes): until then every
+    /// arm goes out EMPTY, so the delegate stops renewing and invoicing on
+    /// the window at once, and the next peek re-reads and re-arms it.
+    /// Instant checkout pauses meanwhile (round 4 of batch 2: this replaced a
+    /// trim of the stale window that kept needing more checks).
+    pub paid_since_read: bool,
     /// When `PeekOrderAddresses` was last sent.
     pub peek_sent_ms: Option<u64>,
     /// The last arm sent for each store (with `watch_left_ms` zeroed, since
@@ -496,85 +493,19 @@ impl AppState {
     /// it has, rather than being told the window shrank to what has been
     /// read so far. A window found used part-way is armed up to that
     /// address, so the delegate stops renewing and invoicing on it.
-    ///
-    /// While the window waits to be read again after an address in it was
-    /// newly found used (`upcoming_for` cleared), the arm is cut before that
-    /// address at once, rather than one peek later: the delegate must stop
-    /// renewing and invoicing on a script just paid (review round 2 of
-    /// batch 2). It only ever shrinks while stale.
-    ///
-    /// The third value says the window is stale: the caller then keeps only
-    /// what it last armed (`auto_invoice_arm`), so a stale window can only
-    /// shrink.
-    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress], bool)> {
-        let Some((network, upcoming)) = self.upcoming_unvetted() else {
-            // Stale only because an address in it was found paid, and still
-            // the window of the key, network and counter this tab holds,
-            // read under the build an order would name now (codex, round 3).
-            if !self.auto_invoice.stale_by_payment {
-                return None;
-            }
-            let xpub = self.bitcoin.payment_xpub.as_ref()?;
-            // The network is also in every verdict's contract id (checked
-            // below), so a network change fails both checks; this one says
-            // it outright.
-            if self.auto_invoice.upcoming_from != Some((xpub.xpub.clone(), xpub.network)) {
-                return None;
-            }
-            let upcoming = self.auto_invoice.upcoming.as_slice();
-            if upcoming.first().is_none_or(|a| a.index < xpub.next_index) {
-                return None;
-            }
-            let ids = self.contract_ids_of(xpub.network, upcoming)?;
-            let used = upcoming.iter().zip(&ids).position(|(a, id)| {
-                self.auto_invoice
-                    .vets
-                    .get(&a.script_pubkey)
-                    .is_some_and(|v| v.verdict == VetVerdict::Used && v.contract_id == *id)
-            })?;
-            let before = &upcoming[..used];
-            let clear = before.iter().zip(&ids).all(|(a, id)| {
-                self.auto_invoice
-                    .vets
-                    .get(&a.script_pubkey)
-                    .is_some_and(|v| v.is_clear() && v.contract_id == *id)
-            });
-            return clear.then_some((xpub.network, before, true));
-        };
+    fn vetted_window(&self) -> Option<(BitcoinNetwork, &[DerivedAddress])> {
+        let (network, upcoming) = self.upcoming_unvetted()?;
         let ids = self.window_contract_ids()?;
         for (i, (a, id)) in upcoming.iter().zip(ids).enumerate() {
             match self.auto_invoice.vets.get(&a.script_pubkey) {
                 Some(v) if v.is_clear() && v.contract_id == id => {}
                 Some(v) if v.verdict == VetVerdict::Used => {
-                    return Some((network, &upcoming[..i], false));
+                    return Some((network, &upcoming[..i]));
                 }
                 _ => return None,
             }
         }
-        Some((network, upcoming, false))
-    }
-
-    /// [`Self::vetted_window`], for this crate's tests.
-    #[cfg(test)]
-    pub(crate) fn vetted_window_for_test(&self) -> Option<usize> {
-        self.vetted_window().map(|(_, w, _)| w.len())
-    }
-
-    /// The address contract ids of `upcoming` on `network`, under the
-    /// address generation and bridges an order would name now.
-    fn contract_ids_of(
-        &self,
-        network: BitcoinNetwork,
-        upcoming: &[DerivedAddress],
-    ) -> Option<Vec<[u8; 32]>> {
-        let code_hash = self.bitcoin.address_generation.code_hash()?;
-        let bridges = crate::gateway::bitcoin_config::default_trusted_bridges(network).ok()?;
-        Some(
-            upcoming
-                .iter()
-                .map(|a| address_instance_id(network, &a.script_pubkey, &bridges, code_hash))
-                .collect(),
-        )
+        Some((network, upcoming))
     }
 
     /// [`Self::current_upcoming`] before the address-contract reads.
@@ -722,7 +653,7 @@ impl AppState {
                             },
                         );
                         self.auto_invoice.upcoming_for = None;
-                        self.auto_invoice.stale_by_payment = true;
+                        self.auto_invoice.paid_since_read = true;
                         self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                     }
                 }
@@ -754,7 +685,7 @@ impl AppState {
                     // Read the window again, by a peek sent from now on,
                     // before believing it.
                     self.auto_invoice.upcoming_for = None;
-                    self.auto_invoice.stale_by_payment = true;
+                    self.auto_invoice.paid_since_read = true;
                     self.auto_invoice.stale_from_peek = Some(self.bitcoin.next_request_id + 1);
                 }
             }
@@ -943,18 +874,15 @@ impl AppState {
             .as_slice()
             .try_into()
             .ok()?;
-        let (network, upcoming, stale) = self.vetted_window()?;
-        let mut vetted_scripts: Vec<Vec<u8>> =
+        // After a newly paid address in the window, the arm names nothing
+        // until the window is read again (`paid_since_read`).
+        let (network, upcoming) = if self.auto_invoice.paid_since_read {
+            (self.bitcoin.payment_xpub.as_ref()?.network, &[][..])
+        } else {
+            self.vetted_window()?
+        };
+        let vetted_scripts: Vec<Vec<u8>> =
             upcoming.iter().map(|a| a.script_pubkey.clone()).collect();
-        if stale {
-            // Only ever narrower than what was last armed for this store.
-            let last: &[Vec<u8>] = self
-                .auto_invoice
-                .sent
-                .get(&registration.store_contract_id)
-                .map_or(&[], |(arm, _, _)| arm.vetted_scripts.as_slice());
-            vetted_scripts.retain(|s| last.contains(s));
-        }
         let tip_contract_id: [u8; 32] = self
             .bitcoin
             .tip_contract_network
@@ -1558,7 +1486,7 @@ impl AppState {
             // Read the new key's window at once, not after the retry minute.
             self.auto_invoice.stale_from_peek = Some(floor);
             self.auto_invoice.upcoming_for = None;
-            self.auto_invoice.stale_by_payment = false;
+            self.auto_invoice.paid_since_read = false;
         }
     }
 
@@ -1610,8 +1538,7 @@ impl AppState {
             (Ok(upcoming), Some(xpub)) => {
                 self.auto_invoice.stale_from_peek = None;
                 self.auto_invoice.upcoming_for = Some((xpub.xpub.clone(), now_ms));
-                self.auto_invoice.upcoming_from = Some((xpub.xpub.clone(), xpub.network));
-                self.auto_invoice.stale_by_payment = false;
+                self.auto_invoice.paid_since_read = false;
                 self.auto_invoice.upcoming = upcoming;
                 self.prune_vets();
             }
@@ -1688,7 +1615,7 @@ impl AppState {
     /// delegate's answer to the arm replaces the paused status, so this is
     /// not asked once the store is re-armed and accepted.
     pub fn rearm_progress(&self, store_contract_id: &[u8], now_ms: u64) -> &'static str {
-        let Some((_, window, _)) = self.vetted_window() else {
+        let Some((_, window)) = self.vetted_window() else {
             return "Harvest is checking your next payment addresses before it can renew it.";
         };
         if window.is_empty() {
