@@ -266,3 +266,10 @@ description = "Superseded by a heartbeat that says not taking orders whenever th
 date = "2026-10-04"
 code_hash = "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0"
 delegate_key = "23aaca572e973f2ac9bab50b34996efd6ebb5ea8f513aa49b897819bb8ac9607"
+
+[[entry]]
+version = "V32"
+description = "Superseded by harvest#226, which changed `harvest-common`: `EncryptedMessage`'s byte fields are written as CBOR byte strings and the mailbox dedupe hashes each message once. The delegate's hand-written mailbox decoder (`fast_cbor::decode_mailbox`) now reads both the byte-string and the earlier integer-array form; nothing it stores changes encoding. The generation harvest#221 shipped (`b84af10`)."
+date = "2026-10-04"
+code_hash = "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9"
+delegate_key = "015d5a57f0b6cf9d926ae1bdb0f9ef059e8de3f094cef3b26f23f6106a012c3d"

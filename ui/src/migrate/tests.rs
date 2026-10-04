@@ -489,6 +489,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "0d22546419ee511415a03d2ce5a36ba0a293a74f7209747aef0d934b643331d6",
+                // V20, from `git show 57979f8:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by harvest#226: the message bytes became CBOR
+                // byte strings (a state-encoding change the fold reads).
+                "64fd7bfe4a33571a2161eb5e8c0cc3f2455c44248052b619675641fc67b2579f",
             ],
         ),
         (
@@ -665,6 +669,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // refusing twins of a buyer's X25519 tag, sent digests and read
             // state, and the #198 watch rules.
             "0bce50e97f2de493cb52bfb7ecce7860f82a3767bec84176ca79ded66a076ba0".to_string(),
+            // V32, from `git show b84af10:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#221 shipped. Superseded by harvest#226;
+            // its mailbox decoder reads the byte-string encoding too.
+            "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9".to_string(),
         ],
     );
 }
