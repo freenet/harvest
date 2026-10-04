@@ -429,6 +429,25 @@ fn fits(listing: &AuthorizedListing) -> bool {
     crate::to_cbor(listing).is_ok_and(|bytes| bytes.len() <= MAX_LISTING_BYTES)
 }
 
+/// Whether `listing`, once the store key signs it and it carries
+/// `certificate_pem`, is within [`MAX_LISTING_BYTES`]: what the app checks
+/// before asking for a signature, so a listing the store would drop is
+/// never published. Exact: the signed payload is
+/// [`crate::backing::store_key_envelope`] of the listing, which is what the
+/// store key signs, and a signature is 64 bytes.
+pub fn listing_fits_once_signed(listing: &crate::listing::Listing, certificate_pem: &str) -> bool {
+    let Ok(scoped_payload) = crate::to_cbor(listing).and_then(crate::backing::store_key_envelope)
+    else {
+        return false;
+    };
+    fits(&AuthorizedListing {
+        listing: listing.clone(),
+        scoped_payload,
+        signature: vec![0u8; 64],
+        certificate_pem: certificate_pem.to_string(),
+    })
+}
+
 impl freenet_scaffold::ComposableState for ListingsV1 {
     type ParentState = StoreStateV1;
     type Summary = Vec<ListingId>;
@@ -585,12 +604,12 @@ pub const MAX_LISTINGS: usize = 512;
 
 /// The most bytes one listing takes, as its signed record encodes (step 2).
 /// A larger listing is dropped by [`ListingsV1::normalize`], as an item rule,
-/// so with [`MAX_LISTINGS`] a store's listings take at most 10 MiB. A cap on
+/// so with [`MAX_LISTINGS`] a store's listings take at most 16 MiB. A cap on
 /// the listings' TOTAL bytes would not do: cutting a ranked list where its
 /// running total passes a budget does not commute with merging (an element
 /// cut in one merge can leave room for a later one that a single merge of
 /// everything would also cut), so replicas could disagree.
-pub const MAX_LISTING_BYTES: usize = 20 * 1024;
+pub const MAX_LISTING_BYTES: usize = 32 * 1024;
 
 /// How many orders one store contract will hold.
 ///

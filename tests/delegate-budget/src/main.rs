@@ -1879,9 +1879,12 @@ fn scenario(r: &mut Runner) -> Result<()> {
 }
 
 /// A listing as large as a store keeps ([`harvest_common::store::MAX_LISTING_BYTES`]),
-/// signed for real so its signed payload is its real size: 8 photos with
-/// full alt text, then the description padded until one more character
-/// would not fit. A store at its listing cap holds 512 of these.
+/// signed for real so its signed payload is its real size: every field the
+/// listing form offers at its maximum (8 photos with full alt text, 4
+/// choice groups of 12 options, 12 delivery regions, every name at its
+/// longest, a certificate at the backing bound), then the description
+/// padded until one more character would not fit. A store at its listing
+/// cap holds 512 of these.
 fn listing_at_cap(
     base: &harvest_common::listing::Listing,
     i: usize,
@@ -1889,9 +1892,40 @@ fn listing_at_cap(
 ) -> Result<harvest_common::listing::AuthorizedListing> {
     use harvest_common::listing_image::{ImageBlob, ListingImage, MAX_ALT_CHARS, MAX_IMAGES_HARD};
     let build = |desc: usize| -> Result<harvest_common::listing::AuthorizedListing> {
+        use harvest_common::listing::{
+            ChoiceGroup, DeliveryPrice, FixedCheckout, RegionPrice, MAX_CHOICE_GROUPS,
+            MAX_CHOICE_OPTIONS, MAX_DELIVERY_REGIONS, MAX_TERM_NAME_CHARS,
+        };
+        let name = |what: &str, k: usize| {
+            let mut n = format!("{what} {k} ");
+            n.extend(std::iter::repeat_n(
+                'n',
+                MAX_TERM_NAME_CHARS.saturating_sub(n.len()),
+            ));
+            n
+        };
         let mut l = base.clone();
         l.title = format!("Listing {i}: a jar of plum jam from the orchard");
         l.description = "d".repeat(desc);
+        l.choices = (0..MAX_CHOICE_GROUPS)
+            .map(|g| ChoiceGroup {
+                name: name("Choice", g),
+                options: (0..MAX_CHOICE_OPTIONS)
+                    .map(|o| name("Option", g * 100 + o))
+                    .collect(),
+            })
+            .collect();
+        l.checkout = Some(FixedCheckout {
+            unit_sats: 10_000,
+            delivery: DeliveryPrice::ByRegion(
+                (0..MAX_DELIVERY_REGIONS)
+                    .map(|r| RegionPrice {
+                        region: name("Region", r),
+                        sats: 2_000 + r as u64,
+                    })
+                    .collect(),
+            ),
+        });
         l.images = (0..MAX_IMAGES_HARD as u8)
             .map(|p| ListingImage {
                 full: ImageBlob {
@@ -1919,7 +1953,7 @@ fn listing_at_cap(
             listing: l,
             scoped_payload,
             signature,
-            certificate_pem: String::new(),
+            certificate_pem: "c".repeat(harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES),
         })
     };
     let fits = |a: &harvest_common::listing::AuthorizedListing| {
@@ -1936,6 +1970,14 @@ fn listing_at_cap(
         } else {
             hi = mid - 1;
         }
+    }
+    if i == 0 {
+        println!(
+            "  (a listing at every field maximum is {} bytes with no description; the {}-byte \
+             bound leaves it {lo} characters of description)",
+            cbor(&build(0)?).len(),
+            harvest_common::store::MAX_LISTING_BYTES
+        );
     }
     build(lo)
 }
