@@ -1904,6 +1904,7 @@ h4 {
   gap: 0.4rem;
 }
 .photo-frame {
+  position: relative;
   width: 100%;
   aspect-ratio: 1 / 1;
   border-radius: 6px;
@@ -1977,4 +1978,13 @@ h4 {
   font-size: 0.8rem;
   color: var(--text, #2c2416);
   background: rgba(255, 255, 255, 0.75);
+}
+/* Over the picture when there is one (a published cover whose thumbnail is
+   gone still shows its full photo here). */
+.photo-img + .photo-missing {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.92);
 }

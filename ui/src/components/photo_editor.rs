@@ -420,19 +420,26 @@ fn PhotoPreview(
                 other => other,
             }
         }
-        // Ok(url) once fetched; Err(true) when the network has no copy of
-        // the photo or of the cover's thumbnail.
+        // Buyers see a cover's thumbnail first, so a missing one counts as
+        // the cover missing. Its own resource, re-run whenever this tile
+        // becomes or stops being the published cover (a reorder changes
+        // `cover_thumb` without remounting the tile), so the verdict is never
+        // the stale one of the tile's earlier position.
+        let thumb_missing = use_resource(use_reactive!(|(cover_thumb,)| async move {
+            match cover_thumb {
+                Some(thumb) => matches!(
+                    absent_twice(thumb, fetch_image(thumb, true).await).await,
+                    Fetched::Absent
+                ),
+                None => false,
+            }
+        }));
+        // Ok(url) once fetched; Err(true) when the network has no copy. The
+        // photo's hash never changes for a tile (tiles are keyed by draft), so
+        // this runs once.
         let fetched = use_resource(move || async move {
             if has_preview {
                 return None;
-            }
-            // Buyers see a cover's thumbnail first, so a missing one counts
-            // as the cover missing.
-            if let Some(thumb) = cover_thumb {
-                let answer = absent_twice(thumb, fetch_image(thumb, true).await).await;
-                if matches!(answer, Fetched::Absent) {
-                    return Some(Err(true));
-                }
             }
             let answer = absent_twice(hash, fetch_image(hash, true).await).await;
             Some(match answer {
@@ -450,11 +457,12 @@ fn PhotoPreview(
             }
         });
         let result = fetched.read().clone().flatten();
+        let thumb_missing = thumb_missing.read().unwrap_or(false);
         match (&preview, result) {
-            (Some(p), _) => (Some(p.clone()), false),
-            (None, Some(Ok(url))) => (Some(url), false),
-            (None, Some(Err(absent))) => (None, absent),
-            (None, None) => (None, false),
+            (Some(p), _) => (Some(p.clone()), thumb_missing),
+            (None, Some(Ok(url))) => (Some(url), thumb_missing),
+            (None, Some(Err(absent))) => (None, absent || thumb_missing),
+            (None, None) => (None, thumb_missing),
         }
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -470,7 +478,10 @@ fn PhotoPreview(
             style: "background-color: rgb({r}, {g}, {b});",
             if let Some(src) = src {
                 img { class: "photo-img", src: "{src}", alt: "{alt}" }
-            } else if missing && !local {
+            }
+            // Shown over the picture too: a cover whose thumbnail is gone has
+            // a picture here and none in the buyer's list.
+            if missing && !local {
                 p { class: "photo-missing", "Missing from Freenet. Remove it and add the photo again." }
             }
         }
