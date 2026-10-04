@@ -6,6 +6,8 @@ use harvest_common::listing::{
 };
 use harvest_common::listing_image::ListingImage;
 
+use super::photo_editor::{drafts_from_listing, listing_images, uploads, PhotoEditor};
+
 /// What every listing this form publishes is: a sale at a fixed price, with
 /// fixed delivery (Ian, 2026-09-26). There is no free-text price, no gift or
 /// wanted listing, and no "ask the seller for a total": a buyer can always
@@ -74,6 +76,9 @@ pub fn ListingForm(
     });
     let built_terms = terms().build();
     let terms_error = built_terms.as_ref().err().cloned();
+    let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
+    let mut uploading = use_signal(|| false);
+    let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "card",
@@ -99,6 +104,8 @@ pub fn ListingForm(
                     oninput: move |e| description.set(e.value()),
                 }
             }
+
+            PhotoEditor { photos }
 
             TermsEditor { terms }
             if let Some(problem) = terms_error.clone() {
@@ -129,7 +136,7 @@ pub fn ListingForm(
             div { class: "form-actions",
             button {
                 class: "btn btn-primary",
-                disabled: title().trim().is_empty() || quantity_error || terms_error.is_some(),
+                disabled: title().trim().is_empty() || quantity_error || terms_error.is_some() || uploading(),
                 onclick: move |_| {
                         // Re-checked here, not only in `disabled`: two clicks
                         // can land before the button re-renders (#80), and the
@@ -146,10 +153,19 @@ pub fn ListingForm(
                         // The price is the sats price in `checkout`; the old
                         // free-text one is never written again.
                         let price: Option<PriceInfo> = None;
-                        // The photos the new listing carries. This form does not
-                        // edit photos yet, so an edit keeps the ones the listing
-                        // has; they are terms like any other and go into the id.
-                        let images = photos_for_edit(editing.as_ref());
+                        if uploading() {
+                            return;
+                        }
+                        // The photos the new listing carries, cover first.
+                        // They are terms like any other and go into the id.
+                        photo_error.set(None);
+                        let images = match listing_images(&photos()) {
+                            Ok(images) => images,
+                            Err(problem) => {
+                                photo_error.set(Some(problem));
+                                return;
+                            }
+                        };
                         // Only the count changed: submit the original, so its
                         // id, and the listing buyers hold, stays the same.
                         if let Some(original) = editing.as_ref() {
@@ -186,14 +202,45 @@ pub fn ListingForm(
                         }
                         .with_derived_id();
 
-                        title.set(String::new());
-                        description.set(String::new());
-                        quantity.set(String::new());
-                        terms.set(TermsForm::default());
-
-                        on_submit.call((listing, count));
+                        // Every photo the listing names that is not yet on
+                        // the network goes up FIRST, and the listing is
+                        // signed only once the node has taken each one, so
+                        // a published listing never names a photo its own
+                        // seller's node does not hold.
+                        let pending = uploads(&photos());
+                        let mut photos = photos;
+                        let mut finish = move |listing: Listing| {
+                            title.set(String::new());
+                            description.set(String::new());
+                            quantity.set(String::new());
+                            terms.set(TermsForm::default());
+                            #[cfg(target_arch = "wasm32")]
+                            for d in photos.read().iter() {
+                                if let Some(url) = &d.preview {
+                                    crate::image_pipeline::revoke_preview(url);
+                                }
+                            }
+                            photos.set(Vec::new());
+                            on_submit.call((listing, count));
+                        };
+                        if pending.is_empty() {
+                            finish(listing);
+                            return;
+                        }
+                        uploading.set(true);
+                        spawn(async move {
+                            for (hash, bytes) in pending {
+                                if let Err(e) = crate::gateway::image_ops::put_image(hash, bytes).await {
+                                    photo_error.set(Some(format!("A photo could not be uploaded: {e}. Try again.")));
+                                    uploading.set(false);
+                                    return;
+                                }
+                            }
+                            uploading.set(false);
+                            finish(listing);
+                        });
                 },
-                if initial.is_some() { "Save changes" } else { "Publish listing" }
+                if uploading() { "Uploading photos\u{2026}" } else if initial.is_some() { "Save changes" } else { "Publish listing" }
             }
             button {
                 class: "btn btn-outline",
@@ -201,9 +248,12 @@ pub fn ListingForm(
                 "Cancel"
             }
             }
+            if let Some(problem) = photo_error() {
+                p { class: "text-warning", "{problem}" }
+            }
             if initial.is_some() {
                 p { class: "text-muted small",
-                    "Changing the title, description, price, delivery or choices publishes a new listing and "
+                    "Changing the title, description, photos, price, delivery or choices publishes a new listing and "
                     "takes this one down. A buyer who already ordered this one can still see it."
                 }
             }
@@ -251,12 +301,6 @@ pub(crate) fn same_terms(
         && original_checkout == checkout
         && original_choices.as_slice() == choices
         && original_images.as_slice() == images
-}
-
-/// The photos an edit publishes: the listing's own, since this form cannot
-/// change them yet (the upload path will). None for a new listing.
-pub(crate) fn photos_for_edit(editing: Option<&Listing>) -> Vec<ListingImage> {
-    editing.map(|l| l.images.clone()).unwrap_or_default()
 }
 
 /// The count field: blank is "not counted", anything else a whole number.
@@ -587,16 +631,6 @@ mod tests {
         assert!(terms(&o.images));
         assert!(!terms(&[]));
         assert!(!terms(&[a_photo(2)]));
-    }
-
-    /// An edit keeps the listing's photos (this form cannot change them yet);
-    /// a new listing has none.
-    #[test]
-    fn an_edit_keeps_the_listings_photos() {
-        let mut o = original();
-        o.images = vec![a_photo(1)];
-        assert_eq!(photos_for_edit(Some(&o)), o.images);
-        assert!(photos_for_edit(None).is_empty());
     }
 
     /// Each term, changed alone, is a different listing; formatting alone is

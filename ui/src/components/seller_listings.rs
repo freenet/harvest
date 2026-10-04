@@ -224,6 +224,50 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
 pub(crate) const NEEDS_PRICE: &str =
     "Buyers can\u{2019}t buy this until it has a price. Use Edit to give it one.";
 
+/// Every image contract a listing names: each photo, and the cover's
+/// thumbnail.
+pub(crate) fn photo_hashes(listing: &harvest_common::listing::Listing) -> Vec<[u8; 32]> {
+    listing
+        .images
+        .iter()
+        .flat_map(|i| std::iter::once(i.full.hash.0).chain(i.thumb.iter().map(|t| t.hash.0)))
+        .collect()
+}
+
+/// "Photo missing" under a listing whose photos the network no longer has.
+#[component]
+fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
+    #[cfg(target_arch = "wasm32")]
+    let missing = use_resource(move || {
+        let hashes = hashes.clone();
+        async move {
+            let mut missing = 0usize;
+            for hash in hashes {
+                if crate::gateway::image_ops::fetch_image(hash, true).await
+                    == crate::gateway::image_ops::Fetched::Absent
+                {
+                    missing += 1;
+                }
+            }
+            missing
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    let missing = missing.read().unwrap_or(0);
+    #[cfg(not(target_arch = "wasm32"))]
+    let missing = {
+        let _ = hashes;
+        0usize
+    };
+    rsx! {
+        if missing > 0 {
+            p { class: "text-warning small",
+                "Photo missing. Edit this listing and add it again to show it to buyers."
+            }
+        }
+    }
+}
+
 #[component]
 fn SellerListingRow(
     store_contract_id: Vec<u8>,
@@ -265,6 +309,13 @@ fn SellerListingRow(
                 // Edit publishes the priced listing and takes this one down.
                 if !taken_down && !l.offers_instant_checkout() {
                     p { class: "text-warning small", "{NEEDS_PRICE}" }
+                }
+                // Each photo of a listing still on show, looked up (and
+                // subscribed to, which keeps it on this node while the page
+                // is open). One the network no longer has is said here: only
+                // the seller can put it back.
+                if !taken_down && !l.images.is_empty() {
+                    MissingPhotos { hashes: photo_hashes(l) }
                 }
             }
             div { class: "seller-listing-actions",
@@ -346,6 +397,45 @@ fn SellerListingRow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The missing-photo check looks up every image contract the listing
+    /// names, the cover's thumbnail included, and no other.
+    #[test]
+    fn photo_hashes_are_each_photo_and_the_covers_thumbnail() {
+        use harvest_common::listing_image::{ImageBlob, ListingImage};
+        use harvest_common::store::Bytes32;
+        let blob = |s: u8| ImageBlob {
+            hash: Bytes32([s; 32]),
+            len: 10,
+            width: 4,
+            height: 3,
+        };
+        let listing = harvest_common::listing::Listing {
+            images: vec![
+                ListingImage {
+                    full: blob(1),
+                    thumb: Some(blob(9)),
+                    colour: [0; 3],
+                    alt: String::new(),
+                },
+                ListingImage {
+                    full: blob(2),
+                    thumb: None,
+                    colour: [0; 3],
+                    alt: String::new(),
+                },
+            ],
+            id: ListingId([0; 32]),
+            title: "Jam".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout: None,
+            choices: Vec::new(),
+        };
+        assert_eq!(photo_hashes(&listing), vec![[1; 32], [9; 32], [2; 32]]);
+    }
 
     #[test]
     fn labels_say_what_a_buyer_can_do() {

@@ -14,6 +14,7 @@ mod document_title;
 mod fulfilment;
 mod gateway;
 mod ghostkey_cert;
+mod image_pipeline;
 mod index_flow;
 mod listing_status_flow;
 mod markdown;
