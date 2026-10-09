@@ -759,14 +759,29 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     assert_eq!(carried.owner_certificate_pem, CERT, "the certificate is carried");
 
     println!("\n  -- the uncapped record's full state as an UpdateData::State merge into this build --");
-    node.update_state(curr_key, old_bytes.clone()).await.expect("the node accepts the 150-complaint state merge");
+    // In this build's encoding, as a client of this build sends it: the
+    // contract holds its state to canonical CBOR, which the uncapped build's
+    // integer arrays are not (the fold above re-encodes the same way).
+    let old_reencoded = harvest_common::to_cbor(&old_state).unwrap();
+    // A node that validates an incoming state before merging it (freenet
+    // 0.2.142 does) refuses one over the cap; one that merges it must land
+    // on the same 146. Either way the record is the carried one.
+    let over_cap = format!("at most {MAX_COMPLAINTS} complaints");
+    let merged_in = match node.update_state(curr_key, old_reencoded).await {
+        Ok(()) => true,
+        Err(e) if e.contains(&over_cap) => {
+            println!("  refused by the node's validation of the incoming state: {e}");
+            false
+        }
+        Err(e) => panic!("the 150-complaint state merge: {e}"),
+    };
     let after_update = match node.get(curr_id).await {
         GetOutcome::State(bytes) => bytes,
         other => panic!("this build's record did not read back: {other:?}"),
     };
     assert_capped("after the state merge", &after_update, &params, &honest, &farthest);
     assert_eq!(after_update, after_put, "the merge of the full state changes nothing: the same 146");
-    println!("  identical bytes to the carried record: yes");
+    println!("  identical bytes to the carried record: yes (merged in: {merged_in})");
 
     // The same merge into a record that holds none of them yet, so the
     // contract's own `update_state` is what drops the four.
@@ -780,14 +795,22 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
         container(&current, migrate::encode_params(&params2).expect("encode"));
     let curr2_key = curr2_container.key().clone();
     let empty = harvest_common::to_cbor(&ReputationStateV1 { owner_certificate_pem: CERT.into(), complaints: Vec::new() }).unwrap();
-    node.put(curr2_container, empty).await.expect("a certificate-only record");
+    node.put(curr2_container, empty.clone()).await.expect("a certificate-only record");
     let (full2, honest2, farthest2) = over_cap_record(&fx2, CERT);
-    node.update_state(curr2_key, harvest_common::to_cbor(&full2).unwrap())
-        .await
-        .expect("the node accepts the 150-complaint state merge");
+    let merged_in2 = match node.update_state(curr2_key, harvest_common::to_cbor(&full2).unwrap()).await {
+        Ok(()) => true,
+        Err(e) if e.contains(&over_cap) => {
+            println!("  refused by the node's validation of the incoming state: {e}");
+            false
+        }
+        Err(e) => panic!("the 150-complaint state merge: {e}"),
+    };
     match node.get(curr2_id).await {
-        GetOutcome::State(bytes) => {
+        GetOutcome::State(bytes) if merged_in2 => {
             assert_capped("second store after the state merge", &bytes, &params2, &honest2, &farthest2);
+        }
+        GetOutcome::State(bytes) => {
+            assert_eq!(bytes, empty, "a refused merge leaves the certificate-only record");
         }
         other => panic!("the second record did not read back: {other:?}"),
     }
@@ -795,8 +818,9 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     println!(
         "  SCENARIO 4d PASSED: {} complaints under the uncapped build carried to this build's record as {} \
          (cap {MAX_COMPLAINTS}); all {} honest kept, the 4 farthest-dated dropped, verify OK; the full state \
-         as an UpdateData::State merge gives the same {} (and {} into a certificate-only record)",
-        full.complaints.len(), MAX_COMPLAINTS, honest.len(), MAX_COMPLAINTS, MAX_COMPLAINTS
+         as an UpdateData::State merge gives the same {} or is refused by the node, merged in: {merged_in} (into a \
+         certificate-only record, merged in: {merged_in2})",
+        full.complaints.len(), MAX_COMPLAINTS, honest.len(), MAX_COMPLAINTS
     );
 }
 
