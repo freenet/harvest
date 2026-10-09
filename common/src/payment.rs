@@ -1268,6 +1268,12 @@ std::thread_local! {
 /// validation re-checked one signature per paid order that it had already
 /// checked. Only an accepted tip is remembered: a refused one is verified
 /// again, and refused again, every time.
+#[cfg(test)]
+thread_local! {
+    /// How many tips this thread has verified rather than recalled.
+    static TIP_VERIFICATIONS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
 fn verify_tip_once(
     tip: &freenet_bitcoin_common::SignedTipEntry,
     params: &freenet_bitcoin_common::BitcoinTipParameters,
@@ -1287,6 +1293,8 @@ fn verify_tip_once(
     if let Some(body) = VERIFIED_TIPS.with(|held| held.borrow().get(&key).cloned()) {
         return Ok(body);
     }
+    #[cfg(test)]
+    TIP_VERIFICATIONS.with(|n| n.set(n.get() + 1));
     let body = tip.verify(params).map_err(ProofError::BadTip)?;
     VERIFIED_TIPS.with(|held| {
         let mut held = held.borrow_mut();
@@ -3431,17 +3439,22 @@ mod verified_tip_tests {
     use super::*;
     use crate::test_orders::{order, proof};
 
-    /// A tip accepted for an order that trusts its bridge is not accepted
-    /// for one that trusts another bridge (the bridges are part of what is
-    /// remembered), and a tip refused once is refused again. Mutated red by
-    /// keying the memory on the tip alone, and by remembering a refusal as
-    /// an acceptance.
+    /// A tip accepted once is recalled, not verified again; one accepted
+    /// for an order that trusts its bridge is not accepted for one that
+    /// trusts another bridge (the bridges are part of what is remembered),
+    /// and a tip refused once is refused again. Mutated red by keying the
+    /// memory on the tip alone, by remembering a refusal as an acceptance,
+    /// and by never recalling (round 1 of step 2's review: without the
+    /// count this passed with no memory at all).
     #[test]
     fn a_remembered_tip_never_changes_an_answer() {
+        let verifications = || super::TIP_VERIFICATIONS.with(|n| n.get());
         let trusted = order(1);
         let paid = proof(&trusted, 1);
+        let before = verifications();
         assert!(verify_payment_proof(&trusted, &paid).is_ok());
         assert!(verify_payment_proof(&trusted, &paid).is_ok(), "remembered");
+        assert_eq!(verifications() - before, 1, "verified once, then recalled");
 
         // The same proof, for an order whose bridge did not sign it.
         let mut elsewhere = trusted.clone();

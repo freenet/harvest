@@ -182,12 +182,24 @@ pub(crate) fn create<S: SecretStore>(
     }
 }
 
+/// How far ahead of this device's clock a pause's revision may be dated.
+pub(crate) const MAX_PAUSE_LEAD_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The pause `payload` is, if it is one.
+fn pause_in(payload: &[u8]) -> Option<harvest_common::store_pause::StorePause> {
+    (harvest_common::backing::classify_store_key_message(payload)
+        == Some(harvest_common::backing::StoreKeyMessage::Pause))
+    .then(|| harvest_common::from_cbor(payload).ok())
+    .flatten()
+}
+
 /// Sign one of a store's own records with its store key.
 pub(crate) fn sign<S: SecretStore>(
     secrets: &S,
     request_id: RequestId,
     store_verifying_key: [u8; 32],
     payload: Vec<u8>,
+    now_ms: u64,
 ) -> HarvestDelegateResponse {
     let answer = |result| HarvestDelegateResponse::StoreUpdateSigned {
         request_id,
@@ -212,6 +224,17 @@ pub(crate) fn sign<S: SecretStore>(
         return answer(Err(
             "a heartbeat is signed by the node's own schedule, not on request".into(),
         ));
+    }
+    // A pause keeps the highest revision, so one dated far ahead would hold
+    // the store paused (or open) against every later toggle, and one at
+    // `u64::MAX` for good (round 1 of step 2's review). The UI dates one
+    // `max(held + 1, now)`, so a day's lead is room for clocks that differ.
+    if let Some(pause) = pause_in(&payload) {
+        if pause.revision > now_ms.saturating_add(MAX_PAUSE_LEAD_MS) {
+            return answer(Err(
+                "that pause is dated more than a day ahead of this device's clock".into(),
+            ));
+        }
     }
     answer(
         harvest_common::backing::sign_with_store_key(&key, payload).map(
@@ -395,6 +418,7 @@ mod tests {
             1,
             store.to_bytes(),
             harvest_common::to_cbor(&closure).unwrap(),
+            0,
         ))
         .expect("the delegate holds this key");
         verify_scoped_signature(
@@ -421,7 +445,8 @@ mod tests {
             &secrets,
             1,
             stranger.to_bytes(),
-            harvest_common::to_cbor(&retirement).unwrap()
+            harvest_common::to_cbor(&retirement).unwrap(),
+            0
         ))
         .is_err());
     }
@@ -438,7 +463,7 @@ mod tests {
             vec![0xa0], // an empty CBOR map
         ] {
             assert!(
-                signed(sign(&secrets, 1, store.to_bytes(), payload.clone())).is_err(),
+                signed(sign(&secrets, 1, store.to_bytes(), payload.clone(), 0)).is_err(),
                 "signed {payload:?}"
             );
         }
@@ -457,7 +482,33 @@ mod tests {
             harvest_common::backing::classify_store_key_message(&frozen),
             Some(harvest_common::backing::StoreKeyMessage::Heartbeat)
         );
-        assert!(signed(sign(&secrets, 1, store.to_bytes(), frozen)).is_err());
+        assert!(signed(sign(&secrets, 1, store.to_bytes(), frozen, 0)).is_err());
+    }
+
+    /// A pause dated more than a day ahead of this device's clock is not
+    /// signed: the store keeps the highest revision, so it would outrank
+    /// every toggle after it (one at `u64::MAX` for good). One dated now, or
+    /// a day ahead, is. Mutated red by dropping the check.
+    #[test]
+    fn it_refuses_to_sign_a_pause_dated_far_ahead() {
+        use harvest_common::store_pause::StorePause;
+        let mut secrets = MemSecrets::default();
+        let store = created(&mut secrets);
+        let now = 1_760_000_000_000u64;
+        let pause =
+            |revision| harvest_common::to_cbor(&StorePause::new(store, revision, true)).unwrap();
+        assert!(signed(sign(&secrets, 1, store.to_bytes(), pause(now), now)).is_ok());
+        assert!(signed(sign(
+            &secrets,
+            1,
+            store.to_bytes(),
+            pause(now + MAX_PAUSE_LEAD_MS),
+            now
+        ))
+        .is_ok());
+        for far in [now + MAX_PAUSE_LEAD_MS + 1, u64::MAX] {
+            assert!(signed(sign(&secrets, 1, store.to_bytes(), pause(far), now)).is_err());
+        }
     }
 
     #[test]
@@ -596,7 +647,8 @@ mod tests {
             &fresh,
             3,
             store.to_bytes(),
-            harvest_common::to_cbor(&StoreClosure { store }).unwrap()
+            harvest_common::to_cbor(&StoreClosure { store }).unwrap(),
+            0
         ))
         .is_ok());
     }

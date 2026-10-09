@@ -289,7 +289,10 @@ impl Shop {
                 amount: "0.00125000".into(),
                 currency: "BTC".into(),
             }),
-            created_at: now() - chrono::Duration::days(30) + chrono::Duration::minutes(i as i64),
+            // The caller's: the delta's "newest" listing must rank newest, or
+            // the store's cap could cut it and the delta would change nothing
+            // (it ignored this argument before round 2 of step 2).
+            created_at,
             checkout: Some(FixedCheckout {
                 unit_sats: 125_000,
                 delivery: DeliveryPrice::ByRegion(regions),

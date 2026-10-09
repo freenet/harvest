@@ -932,6 +932,207 @@ mod tests {
         ));
     }
 
+    /// A backup with purchases and more items than one mark takes: the
+    /// marks are split `BACKUP_MARK_ITEMS` at a time and together name every
+    /// conversation and every purchase, each purchase with the digest of
+    /// the copy the file holds. A page the delegate refuses ends the backup
+    /// with why; a restore chunk it refuses is counted as not restored and
+    /// the next goes on. Mutated red by dropping the purchases from the
+    /// marks, and by an export that waits on after a refused page.
+    #[test]
+    fn marks_are_split_and_refusals_end_or_count() {
+        let mut state = AppState::default();
+        let first = state.start_backup_export();
+        let harvest_common::HarvestDelegateRequest::ExportPurchasesBackup { request_id, .. } =
+            first[0]
+        else {
+            panic!("{first:?}");
+        };
+        let kept = |n: u8| KeptPurchase {
+            store_key: [3; 32],
+            conversation: [9; 32],
+            receipt_seed: [0; 32],
+            order: harvest_common::payment::AuthorizedOrder {
+                order: harvest_common::payment::Order {
+                    request_id: None,
+                    id: harvest_common::payment::OrderId([n; 32]),
+                    buyer_fingerprint: String::new(),
+                    seller_fingerprint: String::new(),
+                    amount_sats: 1,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    payment_script_pubkey: Vec::new(),
+                    payment_address: String::new(),
+                    required_confirmations: 1,
+                    payment_hash: None,
+                    trusted_bridges: Vec::new(),
+                    bitcoin_address_code_hash: None,
+                    anchor: None,
+                    order_binding: None,
+                    listing_tag: None,
+                    buyer_receipt_key: None,
+                    created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                },
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                status: harvest_common::payment::OrderStatus::AwaitingPayment,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            },
+            complaint: None,
+            backed_up: false,
+        };
+        let purchases: Vec<KeptPurchase> = (0..2).map(kept).collect();
+        assert!(state
+            .on_purchases_backup(
+                request_id,
+                Ok(PurchasesBackupPage {
+                    conversations: (0..50).map(conversation).collect(),
+                    purchases: purchases.clone(),
+                    next: None,
+                }),
+            )
+            .is_empty());
+        let marks = state.backup_saved();
+        let (mut conversations, mut orders) = (0, Vec::new());
+        let mut calls = 0;
+        for request in &marks {
+            if let harvest_common::HarvestDelegateRequest::MarkBackedUp {
+                conversations: c,
+                orders: o,
+                ..
+            } = request
+            {
+                calls += 1;
+                assert!(c.len() + o.len() <= BACKUP_MARK_ITEMS);
+                conversations += c.len();
+                orders.extend(o.iter().cloned());
+            }
+        }
+        assert_eq!(calls, 2);
+        assert_eq!(conversations, 50);
+        assert_eq!(
+            orders,
+            purchases
+                .iter()
+                .map(|p| (p.order.order.id.clone(), p.backup_digest()))
+                .collect::<Vec<_>>()
+        );
+
+        // A refused page ends the export, saying why.
+        let mut state = AppState::default();
+        let first = state.start_backup_export();
+        let harvest_common::HarvestDelegateRequest::ExportPurchasesBackup { request_id, .. } =
+            first[0]
+        else {
+            panic!("{first:?}");
+        };
+        assert!(state
+            .on_purchases_backup(request_id, Err("no".into()))
+            .is_empty());
+        assert!(state.backup_export.is_none());
+        assert!(state.backup_file_ready.is_none());
+        assert_eq!(
+            state.backup_message.as_deref(),
+            Some("The backup could not be made: no")
+        );
+
+        // A refused restore chunk is counted, and the next goes on.
+        let mut file = bundle();
+        file.conversations = (0..(BACKUP_IMPORT_ITEMS as u8 + 1))
+            .map(|i| BundleConversation {
+                store: 0,
+                conversation: conversation(i),
+            })
+            .collect();
+        let mut state = AppState::default();
+        let first = state.start_restore(&encode_file(&file).unwrap());
+        let harvest_common::HarvestDelegateRequest::ImportPurchasesBackup { request_id, .. } =
+            first[0]
+        else {
+            panic!("{first:?}");
+        };
+        let next = state.on_purchases_backup_imported(request_id, Err("busy".into()));
+        assert!(matches!(
+            &next[..],
+            [harvest_common::HarvestDelegateRequest::ImportPurchasesBackup { .. }]
+        ));
+        state.on_purchases_backup_imported(request_id, Ok(vec![BackupItemOutcome::Imported]));
+        assert_eq!(
+            state.backup_message.as_deref(),
+            Some("1 restored, 0 already here. 1 not restored: busy")
+        );
+    }
+
+    /// The order page's backup offer (step 2): an order whose kept copy, as
+    /// it is now, is in no saved backup is offered one; once a backup holds
+    /// it, not. An order with no kept copy follows its conversation's mark.
+    /// Counted for Backup too. Mutated red by reading the store-wide flag,
+    /// and by ignoring the kept copy's mark.
+    #[test]
+    fn an_order_is_offered_a_backup_until_one_holds_it() {
+        let mut state = AppState::default();
+        let order = harvest_common::payment::OrderId([7; 32]);
+        let other = harvest_common::payment::OrderId([8; 32]);
+        let kept = |id: &harvest_common::payment::OrderId, backed_up| KeptPurchase {
+            store_key: [3; 32],
+            conversation: [9; 32],
+            receipt_seed: [0; 32],
+            order: harvest_common::payment::AuthorizedOrder {
+                order: harvest_common::payment::Order {
+                    request_id: None,
+                    id: id.clone(),
+                    buyer_fingerprint: String::new(),
+                    seller_fingerprint: String::new(),
+                    amount_sats: 1,
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    payment_script_pubkey: Vec::new(),
+                    payment_address: String::new(),
+                    required_confirmations: 1,
+                    payment_hash: None,
+                    trusted_bridges: Vec::new(),
+                    bitcoin_address_code_hash: None,
+                    anchor: None,
+                    order_binding: None,
+                    listing_tag: None,
+                    buyer_receipt_key: None,
+                    created_at: chrono::Utc::now(),
+                },
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+                status: harvest_common::payment::OrderStatus::Paid,
+                payment_proof: None,
+                status_scoped_payload: None,
+                status_signature: None,
+            },
+            complaint: None,
+            backed_up,
+        };
+        state.kept_purchases = vec![kept(&order, false), kept(&other, true)];
+        assert!(state.order_not_backed_up(&[1; 32], &order, &[9; 32]));
+        assert!(!state.order_not_backed_up(&[1; 32], &other, &[9; 32]));
+        assert_eq!(state.not_backed_up(), (1, 0));
+        // No kept copy: its conversation's mark decides.
+        let none = harvest_common::payment::OrderId([6; 32]);
+        let mut conversation = crate::messaging::BuyerConversation::open(&[5u8; 32]).expect("open");
+        let tag = conversation.buyer_public_key;
+        state
+            .browsing_stores
+            .entry(vec![1; 32])
+            .or_default()
+            .conversations
+            .push(conversation.clone());
+        assert!(state.order_not_backed_up(&[1; 32], &none, &tag));
+        assert_eq!(state.not_backed_up(), (1, 1));
+        conversation.backed_up = true;
+        state
+            .browsing_stores
+            .get_mut(&vec![1u8; 32])
+            .unwrap()
+            .conversations = vec![conversation];
+        assert!(!state.order_not_backed_up(&[1; 32], &none, &tag));
+    }
+
     /// A delegate `Error` while a backup or a restore waits ends it, saying
     /// why; one whose answer never came stops holding the buttons after
     /// `BACKUP_ANSWER_WAIT_MS`. Mutated red by not ending on `Error`, and by

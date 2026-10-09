@@ -2080,6 +2080,31 @@ mod tests {
         }
     }
 
+    /// Step 2: a store its seller paused says "Paused" on its own pages,
+    /// with what buyers see under it, whatever else would close it; a
+    /// resumed one reads as before. Mutated red by dropping the paused case,
+    /// and by giving it no line.
+    #[test]
+    fn a_paused_own_store_says_paused() {
+        use super::{closed_reason, header_status, PAUSED_LINE};
+        let mut state = one_store();
+        with_wallet(&mut state);
+        loaded(&mut state, vec![listing(1, true)]);
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let pause = |state: &mut AppState, paused| {
+            state.browsing_stores.get_mut(&vec![1u8; 32]).unwrap().pause = Some(
+                harvest_common::store_pause::StorePause::new(owner, 1, paused),
+            );
+        };
+        pause(&mut state, true);
+        assert_eq!(closed_reason(&state, &store_of(&state)), Some("Paused"));
+        let (pill, open, line, _) = header_status(&state, &store_of(&state));
+        assert_eq!((pill, open), ("Paused", false));
+        assert_eq!(line.as_deref(), Some(PAUSED_LINE));
+        pause(&mut state, false);
+        assert_ne!(closed_reason(&state, &store_of(&state)), Some("Paused"));
+    }
+
     /// "Closed" on one of the seller's own stores always says what to fix
     /// (#181 handoff, section D): the store sends no presence until it has
     /// a buyable listing and a payout wallet, so without a reason it read

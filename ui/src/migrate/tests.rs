@@ -3271,3 +3271,93 @@ fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_enco
         "forwarded in the byte-string form, not the integer arrays it arrived in"
     );
 }
+
+/// An order signed by [`seller`] the way the store contract checks one,
+/// made `secs` seconds after an epoch.
+fn signed_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
+    use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+    let order = Order {
+        request_id: None,
+        id: OrderId([0u8; 32]),
+        buyer_fingerprint: String::new(),
+        seller_fingerprint: String::new(),
+        amount_sats: 1_000,
+        network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+        payment_script_pubkey: vec![0u8; 22],
+        payment_hash: None,
+        payment_address: String::new(),
+        required_confirmations: 1,
+        trusted_bridges: Vec::new(),
+        bitcoin_address_code_hash: None,
+        anchor: None,
+        order_binding: None,
+        listing_tag: None,
+        buyer_receipt_key: None,
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("timestamp"),
+    }
+    .with_derived_id();
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&order).expect("serialize order"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped payload");
+    let signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+    AuthorizedOrder {
+        order,
+        scoped_payload,
+        signature,
+        status: OrderStatus::AwaitingPayment,
+        payment_proof: None,
+        status_scoped_payload: None,
+        status_signature: None,
+    }
+}
+
+/// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (500). A
+/// predecessor generation that holds 4096 orders is folded, not refused: the
+/// fold keeps the newest `MAX_ORDERS` by `created_at` and carries every one
+/// of its listings, and the result is a state this generation's contract
+/// accepts. Red if the fold refused the generation wholesale (its listings
+/// lost with its orders), or if it kept more orders than the cap.
+#[test]
+fn a_predecessor_with_4096_orders_is_folded_to_the_cap_with_its_listings() {
+    use harvest_common::store::MAX_ORDERS;
+    let mut older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    for i in 0..4096i64 {
+        let order = signed_order(i);
+        older.orders.orders.insert(order.order.id.clone(), order);
+    }
+    assert_eq!(older.orders.orders.len(), 4096);
+    let local = store_with(&[signed_listing("Plum")]);
+    let folded = merge_store_reporting_discard(
+        local,
+        &older,
+        &store_ops().params,
+        &seller_vk(),
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded, "the generation is folded, not refused");
+    let state = folded.state;
+    assert_eq!(state.listings.listings.len(), 3, "every listing is carried");
+    assert_eq!(state.orders.orders.len(), MAX_ORDERS);
+    let oldest_kept = state
+        .orders
+        .orders
+        .values()
+        .map(|o| o.order.created_at.timestamp())
+        .min()
+        .expect("orders");
+    assert_eq!(
+        oldest_kept,
+        1_700_000_000 + 4096 - MAX_ORDERS as i64,
+        "the newest are kept"
+    );
+    use freenet_scaffold::ComposableState;
+    state
+        .verify(&state, &store_ops().params)
+        .expect("this generation accepts the folded state");
+}

@@ -598,15 +598,18 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
 /// edit publishes a new listing and withdraws the old one, so the ones cut
 /// first are usually old versions already taken down.
 ///
-/// Sized by the seller's own delegate, which reads the whole store on every
-/// instant-checkout decision: with [`MAX_ORDERS`] paid orders and listings
-/// up to both caps it must stay within one call's budget
-/// (`tests/delegate-budget`).
-pub const MAX_LISTINGS: usize = 512;
+/// Sized with [`MAX_ORDERS`], by the node's 5 s limit on one contract call:
+/// on a node, a store of 500 paid orders and 512 listings was refused on
+/// PUT one time in three and on a one-listing delta every time, while 256
+/// listings with 500 orders fitted every run (2026-10-04 wall-time matrix).
+/// 128 leaves room for listings at the per-listing bound. The seller's own
+/// delegate reads the whole store on every instant-checkout decision too,
+/// within one call's budget (`tests/delegate-budget`).
+pub const MAX_LISTINGS: usize = 128;
 
 /// The most bytes one listing takes, as its signed record encodes (step 2).
 /// A larger listing is dropped by [`ListingsV1::normalize`], as an item rule,
-/// so with [`MAX_LISTINGS`] a store's listings take at most 16 MiB. A cap on
+/// so with [`MAX_LISTINGS`] a store's listings take at most 4 MiB. A cap on
 /// the listings' TOTAL bytes would not do: cutting a ranked list where its
 /// running total passes a budget does not commute with merging (an element
 /// cut in one merge can leave room for a later one that a single merge of
@@ -620,9 +623,25 @@ pub const MAX_LISTING_BYTES: usize = 32 * 1024;
 /// claims plus a signed chain tip -- easily hundreds of bytes to a few KB per
 /// order. Without a cap a popular store's state (and, worse, its per-heartbeat
 /// summary -- see `OrdersV1`'s `Summary`) would grow without bound. On
-/// overflow the least-relevant orders are dropped first: see
-/// `enforce_order_cap`.
-pub const MAX_ORDERS: usize = 4096;
+/// overflow the oldest orders are dropped first: see `enforce_order_cap`.
+///
+/// # Why 500
+///
+/// It is a bound on work, and has to hold for PAID orders, which cost
+/// nothing of value on signet. Every call validates every order's proof:
+/// on a node, a store of 1,000 paid orders took 3 to 4 s to PUT and 4 to 6
+/// s for a one-listing delta against the node's 5 s limit, and every PUT of
+/// 4,096 was refused; 500 fitted every run with up to 256 listings
+/// (2026-10-04 wall-time matrix, chosen with [`MAX_LISTINGS`]).
+///
+/// The store is the place an order lives while it is acted on: paid, sent,
+/// and complained about (Ian, 2026-10-09: the store holds an order until
+/// its complaint window closes, and history then lives in each side's
+/// delegate). With honest traffic 500 orders outlast that window up to about
+/// 24 instant orders a day; under Buy-now spam (100 a day, see
+/// `enforce_order_cap`) an order rolls off after about 5 days, which is why
+/// the seller's and the buyer's delegates each keep their own copies.
+pub const MAX_ORDERS: usize = 500;
 
 /// Small state-change fingerprint for one order, used only to let
 /// [`OrdersV1::delta`] detect a same-rank content change (see that impl's
@@ -804,11 +823,16 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// `the_order_cap_obeys_the_merge_laws_at_the_cap`.
 ///
 /// What it costs: an old `Paid` order can now be dropped before a newer
-/// `Cancelled` one. Only the seller can sign an order, so only the seller can
-/// push old orders out, by creating more than `MAX_ORDERS` new ones. An
-/// instant-checkout answer is dated by its buyer's `requested_at`; the
-/// seller's delegate answers only one within a day of its own clock, and a
-/// seller answering by hand is refused one further off.
+/// `Cancelled` one, and before a newer unpaid one. Only the store key signs
+/// an order, but that does not mean only the seller decides how many there
+/// are: instant checkout makes the seller's delegate sign an order for any
+/// Buy now, which needs no Ghost Key and no payment, up to the delegate's
+/// limits (100 a day per store). So anyone can push old orders out, at
+/// about 100 a day: at `MAX_ORDERS` 500, a paid order can roll off about 5
+/// days after it was made. An instant-checkout answer is dated by its
+/// buyer's `requested_at`; the seller's delegate answers only one within a
+/// day of its own clock, and a seller answering by hand is refused one
+/// further off.
 fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     if orders.len() <= MAX_ORDERS {
         return;
@@ -6097,11 +6121,17 @@ mod listing_cap_tests {
 
     /// Past the cap the newest are kept, ties broken by id; a listing over
     /// the byte bound is dropped wherever it sits. Mutated red by keeping
-    /// the oldest, by dropping the tie-break, and by dropping the size rule.
+    /// the oldest, by reversing the tie-break, and by dropping the size
+    /// rule. Dropping the written-out tie-break survives, equivalently: the
+    /// stable sort of id-sorted listings gives the same order.
     #[test]
     fn the_newest_listings_are_kept_and_an_oversized_one_never_is() {
-        // MAX_LISTINGS + 40, two to a second, so ties straddle the cut.
-        let all: Vec<_> = (0..(MAX_LISTINGS as u32 + 40))
+        // MAX_LISTINGS + 41, two to a second, so the cut falls between two
+        // listings of one second (the 41 oldest go: 20 whole seconds and
+        // one of the 21st's pair). With an even count it fell between
+        // seconds, and the tie-break was never exercised (round 1 of step
+        // 2's review).
+        let all: Vec<_> = (0..(MAX_LISTINGS as u32 + 41))
             .map(|n| listing(n, i64::from(n / 2), 0, false))
             .collect();
         let kept = held(all.clone());
@@ -6152,7 +6182,8 @@ mod listing_cap_tests {
     #[test]
     fn merging_states_that_cross_the_cap_obeys_the_merge_laws() {
         let mut pool: Vec<_> = (0..(MAX_LISTINGS as u32 * 3 / 2))
-            .map(|n| listing(n, i64::from(n % 400), 0, false))
+            // Ties: listings `n` and `n + MAX_LISTINGS / 2` share a time.
+            .map(|n| listing(n, i64::from(n % (MAX_LISTINGS as u32 / 2)), 0, false))
             .collect();
         for n in 0..8 {
             pool.push(listing(50_000 + n, 10_000, MAX_LISTING_BYTES, false));
@@ -6160,9 +6191,10 @@ mod listing_cap_tests {
         let mut rng = Rng::new(0x5_12);
         let mut states = vec![held(Vec::new())];
         for _ in 0..12 {
-            // A window of 380 to 510 listings at a random offset, wrapping,
-            // so any two states overlap in part and most unions cross.
-            let len = 380 + rng.below(131);
+            // A window of 3/4 of the cap up to just under it, at a random
+            // offset, wrapping, so any two states overlap in part and most
+            // unions cross.
+            let len = MAX_LISTINGS * 3 / 4 + rng.below(MAX_LISTINGS / 4 - 1);
             let at = rng.below(pool.len());
             let picked = (0..len)
                 .map(|i| pool[(at + i) % pool.len()].clone())

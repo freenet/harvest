@@ -709,7 +709,12 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     assert!(full.complaints.len() > MAX_COMPLAINTS);
 
     println!("  PUT all {} to the uncapped build ...", full.complaints.len());
-    node.put(old_container, full_bytes.clone()).await.expect("the uncapped build accepts 150");
+    // In the encoding that build reads: it predates step 2's byte strings,
+    // and decodes a complaint's order's signed payload and signature only
+    // as integer arrays (round 1 of step 2's review).
+    node.put(old_container, in_array_form(&full_bytes))
+        .await
+        .expect("the uncapped build accepts 150");
     let old_bytes = match node.get(old_id).await {
         GetOutcome::State(bytes) => bytes,
         other => panic!("the uncapped record did not read back: {other:?}"),
@@ -1251,6 +1256,13 @@ fn store_bytes_for(generation: u32, state: &StoreStateV1) -> Vec<u8> {
     if generation > LAST_ARRAY_FORM_STORE_GENERATION {
         return bytes;
     }
+    in_array_form(&bytes)
+}
+
+/// `bytes` with every signed record's outer signed payload and signature as
+/// CBOR integer arrays, as builds before step 2 wrote (and, decoding
+/// `Vec<u8>` as a sequence, read) them.
+fn in_array_form(bytes: &[u8]) -> Vec<u8> {
     use ciborium::Value;
     const FIELDS: [&str; 8] = [
         "scoped_payload",
@@ -1284,7 +1296,7 @@ fn store_bytes_for(generation: u32, state: &StoreStateV1) -> Vec<u8> {
             other => other,
         }
     }
-    let value: Value = harvest_common::from_cbor(&bytes).unwrap();
+    let value: Value = harvest_common::from_cbor(bytes).unwrap();
     harvest_common::to_cbor(&rewrite(value)).unwrap()
 }
 

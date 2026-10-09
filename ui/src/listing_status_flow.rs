@@ -244,10 +244,12 @@ impl AppState {
     /// Why `listing` must not be published to this store, if it must not
     /// (step 2): the store would drop it, being over
     /// [`harvest_common::store::MAX_LISTING_BYTES`] once signed; or the store
-    /// already holds [`harvest_common::store::MAX_LISTINGS`] listings and
-    /// keeping this new one would cut the oldest that is still up (on sale
-    /// or sold out; a taken-down one, or the one being replaced, may go).
-    /// Every version of a listing counts, since an edit publishes a new one.
+    /// would then hold more than [`harvest_common::store::MAX_LISTINGS`]
+    /// listings and its cut, the oldest by (`created_at`, id), would remove
+    /// one still up (on sale or sold out; a taken-down one, or the one being
+    /// replaced, may go), or this very one. Every version of a listing
+    /// counts, since an edit publishes a new one, and so do this tab's
+    /// listings still on their way, which the store will hold too.
     pub(crate) fn listing_cap_refusal(
         &self,
         store_contract_id: &[u8],
@@ -255,9 +257,9 @@ impl AppState {
         listing: &Listing,
         replacing: Option<&ListingId>,
     ) -> Option<String> {
-        // The certificate it will carry, or room for a typical one while it
-        // is still on its way.
-        let stand_in = "x".repeat(2048);
+        // The certificate it will carry, or room for one at the largest a
+        // Ghost Key certificate comes while it is still on its way.
+        let stand_in = "x".repeat(4096);
         let certificate = self
             .certificates
             .get(fingerprint)
@@ -266,36 +268,70 @@ impl AppState {
             return Some(LISTING_TOO_LONG.to_string());
         }
         let store = self.browsing_stores.get(store_contract_id)?;
-        if store.listings.iter().any(|l| l.listing.id == listing.id)
-            || store.listings.len() < harvest_common::store::MAX_LISTINGS
-        {
+        if store.listings.iter().any(|l| l.listing.id == listing.id) {
             return None;
         }
-        // What the store's cut drops first: the oldest by (created_at, id).
-        let oldest = store
+        // On their way from this tab, not yet in the store as it was read:
+        // newer than anything held, so never what the cut takes first, but
+        // each one moves the cut along.
+        let mut in_flight: std::collections::BTreeSet<&ListingId> = self
+            .publishing_listings
+            .iter()
+            .filter(|(_, p)| p.store_contract_id == store_contract_id)
+            .map(|(id, _)| id)
+            .collect();
+        in_flight.extend(self.pending_signatures.iter().filter_map(|p| match p {
+            crate::state::PendingSignature::Listing(p)
+                if p.store_contract_id.as_deref() == Some(store_contract_id) =>
+            {
+                Some(&p.listing.id)
+            }
+            _ => None,
+        }));
+        in_flight.retain(|id| {
+            **id != listing.id && !store.listings.iter().any(|l| l.listing.id == **id)
+        });
+        let after = store.listings.len() + in_flight.len() + 1;
+        let cut = after.checked_sub(harvest_common::store::MAX_LISTINGS)?;
+        if cut == 0 {
+            return None;
+        }
+        // What the store's cut drops: the `cut` oldest by (created_at, id).
+        let mut ranked: Vec<&Listing> = store
             .listings
             .iter()
             .map(|l| &l.listing)
             .chain(std::iter::once(listing))
-            .min_by(|a, b| {
-                a.created_at
-                    .cmp(&b.created_at)
-                    .then_with(|| b.id.cmp(&a.id))
-            })?;
-        let still_up = oldest.id != listing.id
-            && Some(&oldest.id) != replacing
-            && !matches!(
-                store.availability(&oldest.id),
-                ListingAvailability::Withdrawn
-            );
-        still_up.then(|| {
-            format!(
-                "Your store has {} listings. Publishing this one would remove \u{2018}{}\u{2019}; \
-                 take it down first.",
-                harvest_common::store::MAX_LISTINGS,
-                oldest.title
-            )
-        })
+            .collect();
+        ranked.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        for dropped in ranked.into_iter().take(cut) {
+            if dropped.id == listing.id {
+                return Some(format!(
+                    "Your store keeps its {} newest listings, and this one is dated before \
+                     them, so it would be removed as soon as it is published. Check this \
+                     computer\u{2019}s clock.",
+                    harvest_common::store::MAX_LISTINGS
+                ));
+            }
+            let still_up = Some(&dropped.id) != replacing
+                && !matches!(
+                    store.availability(&dropped.id),
+                    ListingAvailability::Withdrawn
+                );
+            if still_up {
+                return Some(format!(
+                    "Your store has {} listings. Publishing this one would remove \
+                     \u{2018}{}\u{2019}; take it down first.",
+                    harvest_common::store::MAX_LISTINGS,
+                    dropped.title
+                ));
+            }
+        }
+        None
     }
 
     /// Publish a new listing to one of our stores, with a count when the
@@ -1384,6 +1420,90 @@ mod tests {
                 None
             )
             .is_ok());
+    }
+
+    /// Step 2 (round 1 of its review): listings this tab is still
+    /// publishing count toward the cap, so two published in quick succession
+    /// at one under it cannot both pass; and a listing dated before every
+    /// held one, which the cut would take at once, is refused. Mutated red by
+    /// counting only the store as read, and by letting the listing itself be
+    /// the one cut.
+    #[test]
+    fn the_cap_counts_listings_on_their_way_and_refuses_one_cut_at_once() {
+        let mut state = seller_state();
+        let held: Vec<AuthorizedListing> = (0..harvest_common::store::MAX_LISTINGS - 1)
+            .map(|i| {
+                let mut l = listing(&format!("Item {i}"));
+                l.created_at =
+                    chrono::DateTime::from_timestamp(1_600_000_000 + i as i64, 0).unwrap();
+                AuthorizedListing {
+                    listing: l.with_derived_id(),
+                    scoped_payload: Vec::new(),
+                    signature: Vec::new(),
+                    certificate_pem: String::new(),
+                }
+            })
+            .collect();
+        state
+            .browsing_stores
+            .get_mut(STORE.as_slice())
+            .unwrap()
+            .listings = held;
+        // One under the cap: the first goes out, and the second, while the
+        // first is still on its way, would cut the oldest.
+        assert!(state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                listing("First"),
+                None
+            )
+            .is_ok());
+        let refused = state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                listing("Second"),
+                None,
+            )
+            .unwrap_err();
+        assert!(refused.contains("\u{2018}Item 0\u{2019}"), "{refused}");
+
+        // Dated before everything held: the cut would take it at once.
+        let mut state = seller_state();
+        let held: Vec<AuthorizedListing> = (0..harvest_common::store::MAX_LISTINGS)
+            .map(|i| {
+                let mut l = listing(&format!("Item {i}"));
+                l.created_at =
+                    chrono::DateTime::from_timestamp(1_600_000_000 + i as i64, 0).unwrap();
+                AuthorizedListing {
+                    listing: l.with_derived_id(),
+                    scoped_payload: Vec::new(),
+                    signature: Vec::new(),
+                    certificate_pem: String::new(),
+                }
+            })
+            .collect();
+        state
+            .browsing_stores
+            .get_mut(STORE.as_slice())
+            .unwrap()
+            .listings = held;
+        let mut early = listing("Early");
+        early.created_at = chrono::DateTime::from_timestamp(1_500_000_000, 0).unwrap();
+        let refused = state
+            .publish_new_listing(
+                STORE.to_vec(),
+                FINGERPRINT.to_string(),
+                early.with_derived_id(),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            refused.contains("removed as soon as it is published"),
+            "{refused}"
+        );
+        assert!(state.pending_signatures.is_empty());
     }
 
     /// Step 2: at `MAX_LISTINGS` a new listing is refused when keeping it

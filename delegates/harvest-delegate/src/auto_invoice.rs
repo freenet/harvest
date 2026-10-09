@@ -245,7 +245,7 @@ fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> 
 /// written only when it changed: a store notification arrives with every
 /// order and status, and the answer almost never changes. True when it
 /// changed, so the caller can tell buyers at once.
-fn note_store_read<S: SecretStore>(
+pub(crate) fn note_store_read<S: SecretStore>(
     secrets: &mut S,
     store_contract_id: &[u8],
     refusal: Option<&Refusal>,
@@ -2149,6 +2149,11 @@ fn on_store_change<S: SecretStore>(
 /// - A sale is forgotten once its outcome cannot change any more: its
 ///   decrement landed, its payment was reversed, it never landed, or its
 ///   payment window closed. Until then a late payment still decrements.
+/// - A listing the store no longer holds (its cap cut it, step 2) has no
+///   stock to take off: its sales are forgotten and its statuses not sent.
+///   Without this, the light store read, which keeps only held listings'
+///   statuses, would never see a status for it land, and would re-send it
+///   on every change (round 1 of step 2's review).
 pub(crate) fn settle(
     ledger: &mut Ledger,
     store: &StoreStateV1,
@@ -2162,6 +2167,13 @@ pub(crate) fn settle(
             .records
             .get(&harvest_common::store::Bytes32(listing.0))
             .map(|s| s.status.revision)
+    };
+    let listing_held = |listing: &ListingId| {
+        store
+            .listings
+            .listings
+            .iter()
+            .any(|l| l.listing.id == *listing)
     };
     ledger
         .oversold
@@ -2198,16 +2210,21 @@ pub(crate) fn settle(
     while ledger.oversold.len() > STATUSES_CAP {
         ledger.oversold.remove(0);
     }
-    // Our own statuses the store now shows, or has moved past, are done.
-    ledger
-        .statuses
-        .retain(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision));
+    // Our own statuses the store now shows, or has moved past, are done, and
+    // so are those of a listing it no longer holds.
+    ledger.statuses.retain(|own| {
+        listing_held(&own.listing)
+            && held_revision(&own.listing).is_none_or(|held| held < own.revision)
+    });
 
     let sales = std::mem::take(&mut ledger.sales);
     for mut sale in sales {
         let order = store.orders.orders.get(&sale.order);
         if let (Some(order), None) = (order, sale.decremented) {
-            if order.status == OrderStatus::Paid {
+            if order.status == OrderStatus::Paid && !listing_held(&sale.listing) {
+                // Cut from the store: nothing to take off.
+                sale.decremented = Some(0);
+            } else if order.status == OrderStatus::Paid {
                 let (revision, availability) = effective_status(store, ledger, &sale.listing);
                 // Paid when published stock could not cover it: its hold ended
                 // (a cancel, or a buyer past the time to start paying) and the
@@ -2254,7 +2271,9 @@ pub(crate) fn settle(
         });
         let done = match (order.map(|o| o.status), sale.decremented) {
             (_, Some(revision)) => {
-                revision == 0 || held_revision(&sale.listing).is_some_and(|held| held >= revision)
+                revision == 0
+                    || !listing_held(&sale.listing)
+                    || held_revision(&sale.listing).is_some_and(|held| held >= revision)
             }
             (Some(OrderStatus::PaymentReversed), None) => true,
             (None, None) => now_ms.saturating_sub(sale.issued_at_ms) >= NOT_LANDED_MS,
@@ -2272,7 +2291,10 @@ pub(crate) fn settle(
     ledger
         .statuses
         .iter()
-        .filter(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision))
+        .filter(|own| {
+            listing_held(&own.listing)
+                && held_revision(&own.listing).is_none_or(|held| held < own.revision)
+        })
         .filter_map(|own| sign_status(store_sk, own.clone()).ok())
         .collect()
 }
@@ -3183,9 +3205,12 @@ pub(crate) fn decide<S: SecretStore>(
 
 /// While the store is paused: answer every Buy now not yet seen, and fresh
 /// enough to answer, with [`STORE_PAUSED_REASON`], and mark every entry
-/// seen. A request that is not a Buy now (a quote request) is left to the
-/// seller, as `decide` leaves it; one older than [`REQUEST_MAX_AGE_MS`] gets
-/// no answer, as `decide` gives it none.
+/// seen, whatever it is, as `decide` marks every entry it refuses for a
+/// reason of its own (not a store-wide one). So nothing seen while paused
+/// is invoiced on resume. A request that is not a Buy now (a quote request)
+/// gets no answer and is left to the seller, as `decide` leaves it; one
+/// older than [`REQUEST_MAX_AGE_MS`] gets no answer, as `decide` gives it
+/// none.
 fn decline_while_paused(
     store_sk: &SigningKey,
     ledger: &mut Ledger,
@@ -5016,6 +5041,49 @@ mod tests {
         assert!(load_ledger(&f.secrets, &f.record.arm.store_contract_id)
             .sales
             .is_empty());
+    }
+
+    /// A listing the store's cap has cut (step 2) has no stock to take off:
+    /// a decrement not yet landed stops going out, and its sale is
+    /// forgotten, rather than re-sent on every change for good (the light
+    /// store read keeps only held listings' statuses, so it would never see
+    /// it land). Mutated red by keeping statuses of listings not held, and by
+    /// keeping the sale. The branch that takes nothing off a sale paid after
+    /// its listing went survives its mutation, equivalently: through the
+    /// light store read the cut listing has no status, so nothing would be
+    /// taken off anyway. It covers the full-decode fallback.
+    #[test]
+    fn a_decrement_for_a_listing_the_store_cut_stops() {
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        assert_eq!(store_change(&mut f).len(), 1);
+        // Lost, and then the listing is cut from the store.
+        f.store
+            .listings
+            .listings
+            .retain(|l| l.listing.id != jam().id);
+        assert!(store_change(&mut f).is_empty());
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.sales.is_empty());
+        assert!(ledger.statuses.is_empty());
+
+        // Paid only after its listing was cut: nothing is taken off.
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        f.store
+            .listings
+            .listings
+            .retain(|l| l.listing.id != jam().id);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        assert!(store_change(&mut f).is_empty());
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.sales.is_empty());
+        assert!(ledger.statuses.is_empty());
     }
 
     /// A migration keeps every sale: the predecessor's ledger is folded

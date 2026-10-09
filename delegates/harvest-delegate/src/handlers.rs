@@ -400,7 +400,13 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             request_id,
             store_verifying_key,
             payload,
-        } => crate::store_keys::sign(store, request_id, store_verifying_key, payload),
+        } => crate::store_keys::sign(
+            store,
+            request_id,
+            store_verifying_key,
+            payload,
+            crate::now_ms(),
+        ),
 
         // Custody (harvest#93 phase 1b). The gate matters as much here: an
         // unwrap writes a store key, and a wrap signs a copy with one.

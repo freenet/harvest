@@ -881,6 +881,59 @@ mod tests {
         assert_eq!(paid_holder.get_secret(&key), held_before);
     }
 
+    /// Step 2 (round 1 of its review): a kept purchase a delegate before
+    /// step 2 wrote, its order's signed payload and signature as integer
+    /// arrays, still decodes, imports through a migration and lists, and is
+    /// written back in this generation's byte strings. Red if the record
+    /// types lose their dual read.
+    #[test]
+    fn a_kept_purchase_in_the_earlier_encoding_is_carried() {
+        use ciborium::Value;
+        fn arrays(value: Value) -> Value {
+            const FIELDS: [&str; 4] = [
+                "scoped_payload",
+                "signature",
+                "status_scoped_payload",
+                "status_signature",
+            ];
+            match value {
+                Value::Map(entries) => Value::Map(
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let named =
+                                matches!(&k, Value::Text(t) if FIELDS.contains(&t.as_str()));
+                            let v = match v {
+                                Value::Bytes(b) if named => Value::Array(
+                                    b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                                ),
+                                other => arrays(other),
+                            };
+                            (k, v)
+                        })
+                        .collect(),
+                ),
+                Value::Array(items) => Value::Array(items.into_iter().map(arrays).collect()),
+                other => other,
+            }
+        }
+        let mut source = holding(1);
+        let kept = purchases(keep(&mut source, to_keep(1, 1, OrderStatus::Paid, 1))).remove(0);
+        let current = to_cbor(&kept).unwrap();
+        let value: Value = from_cbor(&current).unwrap();
+        let earlier = to_cbor(&arrays(value)).unwrap();
+        assert_ne!(earlier, current, "the earlier form differs");
+        assert_eq!(from_cbor::<KeptPurchase>(&earlier).unwrap(), kept);
+        let key = kept_purchase_key(&kept.order.order.id.0);
+        let mut successor = MemSecrets::default();
+        assert!(matches!(
+            import(&mut successor, &key, &earlier),
+            SecretImport::Written
+        ));
+        assert_eq!(purchases(list(&successor)), vec![kept]);
+        assert_eq!(successor.get_secret(&key), Some(current));
+    }
+
     /// No complaint is kept about an unpaid order.
     #[test]
     fn a_complaint_about_an_unpaid_order_is_refused() {
