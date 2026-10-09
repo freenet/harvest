@@ -1081,7 +1081,7 @@ impl OrdersV1 {
 /// batched withdrawal straight to an order's address is a legitimate payment
 /// whose transaction can pass it; the store then keeps the order unpaid and
 /// the seller's and buyer's own copies hold it as paid.
-pub const MAX_PAID_ORDER_BYTES: usize = 64 * 1024;
+pub const MAX_PAID_ORDER_BYTES: usize = 8 * 1024;
 
 /// A record as the store keeps it (step 2): a `Paid` record whose payment
 /// proof is not the canonical minimal one
@@ -2148,6 +2148,133 @@ mod order_tests {
     /// Bitcoin's double SHA-256.
     fn sha2_d(bytes: &[u8]) -> [u8; 32] {
         freenet_bitcoin_common::spv::testing::sha256d_pub(bytes)
+    }
+
+    /// A raw, witness-stripped transaction with `inputs` inputs, each with a
+    /// `script_sig` of the given length (0 for segwit, about 107 for a
+    /// legacy P2PKH signature), paying the order and a P2WPKH change.
+    fn tx_with_inputs(order: &Order, inputs: usize, script_sig: usize) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(inputs as u8);
+        for i in 0..inputs {
+            t.extend_from_slice(&[i as u8 + 1; 32]);
+            t.extend_from_slice(&0u32.to_le_bytes());
+            t.push(script_sig as u8);
+            t.extend(std::iter::repeat_n(0x30u8, script_sig));
+            t.extend_from_slice(&0xffff_fffdu32.to_le_bytes());
+        }
+        let change: Vec<u8> = [vec![0x00, 0x14], vec![0x77; 20]].concat();
+        t.push(2);
+        for (value, script) in [
+            (order.amount_sats, order.payment_script_pubkey.clone()),
+            (1_234_567u64, change),
+        ] {
+            t.extend_from_slice(&value.to_le_bytes());
+            t.push(script.len() as u8);
+            t.extend_from_slice(&script);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t
+    }
+
+    /// A `Paid` record on the minimal proof whose one claim carries `raw_tx`.
+    fn paid_on_tx(
+        seller: &SigningKey,
+        bridge: &SigningKey,
+        order: &Order,
+        raw_tx: Vec<u8>,
+    ) -> AuthorizedOrder {
+        use freenet_bitcoin_common::spv::testing::{mine, sha256d_pub, EASIEST_BITS};
+        use freenet_bitcoin_common::spv::SpvProof;
+        use freenet_bitcoin_common::Txid;
+        let txid = Txid(sha256d_pub(&raw_tx));
+        let merkle_branch: Vec<[u8; 32]> = (0..12u8).map(|d| [d + 5; 32]).collect();
+        let root =
+            freenet_bitcoin_common::spv::merkle_root_from_branch(&txid, &merkle_branch, 1).unwrap();
+        let header = mine([7u8; 32], root, 1_700_000_000, EASIEST_BITS);
+        let anchor = BlockAnchor {
+            height: 100,
+            hash: BlockHash(sha256d_pub(&header.0)),
+        };
+        let claim = SignedClaim::sign(
+            bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch,
+                        tx_index: 1,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let tip = SignedTipEntry::sign(
+            bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height: 100 + order.required_confirmations - 1,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        make_authorized_order(
+            seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(OrderPaymentProof::on_chain(vec![claim], tip)),
+        )
+    }
+
+    /// Step 2: what `MAX_PAID_ORDER_BYTES` admits of honest payments. The
+    /// minimal `Paid` record for a payment whose transaction has 1, 2, 5,
+    /// 10 or 20 inputs (two outputs, a 12-deep Merkle branch: a block of a
+    /// few thousand transactions), segwit (the witness is not part of the
+    /// evidence) and legacy P2PKH. Printed with `--nocapture`; asserted: a
+    /// segwit payment of 20 inputs and a legacy one of 9 are kept paid.
+    /// Measured at 8 KiB (2026-10-09): segwit 3.5 KB at 1 input, 4.5 KB at
+    /// 20 (about 52 bytes an input, so about 89 inputs fit); legacy 4.0 KB
+    /// at 1, 8.3 KB at 10.
+    #[test]
+    fn the_paid_byte_bound_admits_ordinary_payments() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let order = make_order("sizes", 1_700_000_000, &[0x00, 0x14, 0xcc, 0xcc]);
+        let size = |inputs: usize, script_sig: usize| {
+            let record = paid_on_tx(
+                &seller,
+                &bridge,
+                &order,
+                tx_with_inputs(&order, inputs, script_sig),
+            );
+            crate::payment::verify_payment_proof(&order, record.payment_proof.as_ref().unwrap())
+                .expect("a genuine proof");
+            crate::to_cbor(&record).unwrap().len()
+        };
+        for inputs in [1usize, 2, 5, 10, 20] {
+            eprintln!(
+                "PAID-SIZE inputs {inputs}: segwit {} bytes, legacy {} bytes (bound {MAX_PAID_ORDER_BYTES})",
+                size(inputs, 0),
+                size(inputs, 107)
+            );
+        }
+        assert!(size(20, 0) <= MAX_PAID_ORDER_BYTES);
+        assert!(size(9, 107) <= MAX_PAID_ORDER_BYTES);
     }
 
     /// Step 2: a `Paid` record on the minimal proof but past

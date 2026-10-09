@@ -2110,6 +2110,17 @@ fn fill_book(
         choices: vec!["c".repeat(40); 4],
         conversation: book_bytes(b"conversation", n),
     };
+    // Signed as the store key signs an order, so the delegate's checks of
+    // a record the tab sends pass.
+    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    let resign = |mut order: harvest_common::payment::AuthorizedOrder| -> Result<_> {
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(&signer, cbor(&order.order))
+                .map_err(|e| anyhow!("{e}"))?;
+        order.scoped_payload = scoped_payload;
+        order.signature = signature;
+        Ok(order)
+    };
     let record = |order, n| SellerKeptOrder {
         order,
         request: Some(request(n)),
@@ -2128,19 +2139,28 @@ fn fill_book(
             }
         };
         let n = paid_unsent.len() as u64;
-        paid_unsent.push(record(order, n));
+        paid_unsent.push(record(resign(order)?, n));
     }
     let mut open = paid_unsent.clone();
-    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
-        let mut order = fx.paid(fx.order(100_000 + k, [0x5B; 32]));
+    let unpaid = |k: u32| -> Result<harvest_common::payment::AuthorizedOrder> {
+        let mut order = fx.paid(fx.order(k, [0x5B; 32]));
         order.status = harvest_common::payment::OrderStatus::AwaitingPayment;
         order.payment_proof = None;
-        open.push(record(order, 10_000 + u64::from(k)));
+        resign(order)
+    };
+    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
+        open.push(record(unpaid(100_000 + k)?, 10_000 + u64::from(k)));
     }
-    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    // And instant checkout's signed inbox full: what decide and a store
+    // notification read and write.
+    let signed: Vec<SellerKeptOrder> = (0..MAX_SELLER_UNPAID_KEPT as u32)
+        .map(|k| Ok(record(unpaid(400_000 + k)?, 30_000 + u64::from(k))))
+        .collect::<Result<_>>()?;
     let mut done = Vec::new();
     for k in 0..MAX_SELLER_SENT_KEPT as u32 {
-        let order = fx.paid(fx.order(300_000 + k, [0x5B; 32]));
+        // A sent order is kept without its proof (`seller_orders::file`).
+        let mut order = resign(fx.paid(fx.order(300_000 + k, [0x5B; 32])))?;
+        order.payment_proof = None;
         let despatch = harvest_common::fulfilment::Despatch {
             order_id: order.order.id.clone(),
             anchor: freenet_bitcoin_common::BlockAnchor {
@@ -2169,14 +2189,18 @@ fn fill_book(
         done.len(),
         done_bytes.len() / 1024
     );
-    r.host
-        .state
-        .secrets
-        .insert(format!("harvest:seller_orders:open:{key}").into_bytes(), open_bytes);
-    r.host
-        .state
-        .secrets
-        .insert(format!("harvest:seller_orders:done:{key}").into_bytes(), done_bytes);
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:open:{key}").into_bytes(),
+        open_bytes,
+    );
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:done:{key}").into_bytes(),
+        done_bytes,
+    );
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:signed:{key}").into_bytes(),
+        cbor(&signed),
+    );
     Ok(paid_unsent)
 }
 
@@ -2186,6 +2210,19 @@ fn book_calls(
     at: &InstantStore,
     paid_unsent: &[harvest_common::delegate::SellerKeptOrder],
 ) -> Result<()> {
+    let inbox = r
+        .host
+        .state
+        .secrets
+        .get(
+            format!(
+                "harvest:seller_orders:signed:{}",
+                bs58::encode(at.verifying_key).into_string()
+            )
+            .as_bytes(),
+        )
+        .cloned()
+        .ok_or_else(|| anyhow!("no inbox seeded"))?;
     use harvest_common::delegate::SELLER_ORDERS_PER_CALL;
     let signer = SigningKey::from_bytes(&[12u8; 32]);
     // A tab marking orders sent: each moves from the open half to the sent
@@ -2252,6 +2289,31 @@ fn book_calls(
         }
     }
     println!("  (seller's book: {pages} pages)");
+    // A wake-up's sweep of the full book, with instant checkout's inbox full
+    // again to file into it.
+    let key = bs58::encode(at.verifying_key).into_string();
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:signed:{key}").into_bytes(),
+        inbox,
+    );
+    let mut wakeup = vec![0x09, 0, 0, 0];
+    wakeup.extend_from_slice(&9u64.to_le_bytes());
+    wakeup.extend_from_slice(b"heartbeat");
+    r.host.state.now += chrono::Duration::minutes(5);
+    r.background(
+        "Background: heartbeat wake-up (a full seller's book swept, its inbox filed)",
+        &wakeup,
+    )?;
+    let left = r
+        .host
+        .state
+        .secrets
+        .get(format!("harvest:seller_orders:signed:{key}").as_bytes())
+        .cloned()
+        .unwrap_or_default();
+    if left.len() > 8 {
+        bail!("the wake-up did not file instant checkout's inbox into the book");
+    }
     Ok(())
 }
 

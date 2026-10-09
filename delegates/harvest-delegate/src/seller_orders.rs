@@ -73,6 +73,25 @@ pub(crate) fn done_key(store_key: &[u8; 32]) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Where instant checkout puts the orders it signs (with their requests)
+/// until they are filed into the book: a small secret, so a decision and a
+/// store notification never decode the whole book (the delegate budget's
+/// full-book row measured that at 91% of a call).
+pub(crate) fn signed_key(store_key: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "{SELLER_ORDERS_PREFIX}signed:{}",
+        bs58::encode(store_key).into_string()
+    )
+    .into_bytes()
+}
+
+fn load_signed<S: SecretStore>(secrets: &S, store_key: &[u8; 32]) -> Vec<SellerKeptOrder> {
+    secrets
+        .get_secret(&signed_key(store_key))
+        .and_then(|b| from_cbor(&b).ok())
+        .unwrap_or_default()
+}
+
 /// The wake-up sweep's place: the store key it swept last.
 pub(crate) const SWEEP_CURSOR_KEY: &[u8] = b"harvest:seller_orders:cursor";
 
@@ -123,7 +142,8 @@ fn books<S: SecretStore>(secrets: &S) -> std::collections::BTreeSet<Vec<u8>> {
             let rest = key.strip_prefix(SELLER_ORDERS_PREFIX.as_bytes())?;
             let rest = rest
                 .strip_prefix(b"open:")
-                .or_else(|| rest.strip_prefix(b"done:"))?;
+                .or_else(|| rest.strip_prefix(b"done:"))
+                .or_else(|| rest.strip_prefix(b"signed:"))?;
             Some(rest.to_vec())
         })
         .collect()
@@ -323,6 +343,16 @@ fn file(open: &mut OpenBook, done: &mut Vec<SellerKeptOrder>, record: SellerKept
             .sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
     } else {
         open.paid_refused.retain(|r| *r != id);
+        // History: the terms, the despatch and the height it was paid at,
+        // not the proof, which the store held while it mattered and which
+        // would make a sent order as large as its payment's transactions.
+        let mut next = next;
+        if next.order.status == OrderStatus::Paid {
+            next.paid_height = next
+                .paid_height
+                .or_else(|| harvest_common::payment::paid_height(&next.order));
+            next.order.payment_proof = None;
+        }
         done.push(next);
         done.sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
         if done.len() > MAX_SELLER_SENT_KEPT {
@@ -427,30 +457,62 @@ fn file_all<S: SecretStore>(
         );
     };
     let (open_before, done_before) = (open.clone(), done.clone());
+    // What instant checkout signed since, filed first.
+    let signed = load_signed(secrets, store_key);
+    let had_signed = !signed.is_empty();
+    for record in signed {
+        file(&mut open, &mut done, record);
+    }
     let mut kept = 0u32;
     for record in checked_all {
         if file(&mut open, &mut done, record) == Filed::Kept {
             kept += 1;
         }
     }
-    if open == open_before && done == done_before {
+    if open == open_before && done == done_before && !had_signed {
         return Ok(kept);
     }
     if !save(secrets, store_key, &open, &done, done != done_before) {
+        return Err("the node refused to save the kept orders".into());
+    }
+    if had_signed
+        && !secrets.set_secret(
+            &signed_key(store_key),
+            &to_cbor(&Vec::<SellerKeptOrder>::new()).unwrap_or_default(),
+        )
+    {
         return Err("the node refused to save the kept orders".into());
     }
     Ok(kept)
 }
 
 /// Instant checkout's write: the orders it just signed, with the requests
-/// they answer. A record that does not check is skipped, never the batch.
-/// Answers whether the book was written (or had nothing to write).
+/// they answer, into the small signed inbox ([`signed_key`]), at most
+/// [`MAX_SELLER_UNPAID_KEPT`] (the oldest go: unpaid, nothing is owed on
+/// them), filed into the book by the next tab call or wake-up. Answers
+/// whether it was written (or there was nothing to write).
 pub(crate) fn keep_signed<S: SecretStore>(
     secrets: &mut S,
     store_key: &[u8; 32],
     orders: Vec<SellerKeptOrder>,
 ) -> bool {
-    orders.is_empty() || file_all(secrets, store_key, orders, false).is_ok()
+    if orders.is_empty() {
+        return true;
+    }
+    let mut signed = load_signed(secrets, store_key);
+    for record in orders {
+        signed.retain(|r| r.order.order.id != record.order.order.id);
+        signed.push(SellerKeptOrder {
+            request: record.request.map(bounded),
+            ..record
+        });
+    }
+    signed.sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
+    if signed.len() > MAX_SELLER_UNPAID_KEPT {
+        let excess = signed.len() - MAX_SELLER_UNPAID_KEPT;
+        signed.drain(..excess);
+    }
+    to_cbor(&signed).is_ok_and(|bytes| secrets.set_secret(&signed_key(store_key), &bytes))
 }
 
 /// A store notification's write: an open order the store now shows paid is
@@ -462,43 +524,30 @@ pub(crate) fn on_store_statuses<S: SecretStore>(
     store_key: &[u8; 32],
     status_of: impl Fn(&OrderId) -> Option<OrderStatus>,
 ) {
-    if !secrets.has_secret(&open_key(store_key)) {
+    // The signed inbox only: what instant checkout signed and has not yet
+    // been filed. The book itself is the tab's and the wake-up's to write.
+    if !secrets.has_secret(&signed_key(store_key)) {
         return;
     }
-    let Some(mut open) = load_open(secrets, store_key) else {
-        return;
-    };
+    let mut signed = load_signed(secrets, store_key);
     let mut changed = false;
-    let mut unsent = open.orders.iter().filter(|r| is_paid_unsent(r)).count();
-    let mut refused = Vec::new();
-    open.orders.retain_mut(|record| {
-        match (record.order.status, status_of(&record.order.order.id)) {
+    signed.retain_mut(
+        |record| match (record.order.status, status_of(&record.order.order.id)) {
             (OrderStatus::AwaitingPayment, Some(OrderStatus::Cancelled)) => {
                 changed = true;
                 false
             }
             (OrderStatus::AwaitingPayment, Some(OrderStatus::Paid)) => {
-                if unsent >= MAX_SELLER_UNSENT_KEPT {
-                    refused.push(record.order.order.id.clone());
-                    return true;
-                }
                 record.order.status = OrderStatus::Paid;
-                unsent += 1;
                 changed = true;
                 true
             }
             _ => true,
-        }
-    });
-    for id in refused {
-        if !open.paid_refused.contains(&id) {
-            open.paid_refused.push(id);
-            changed = true;
-        }
-    }
+        },
+    );
     if changed {
-        if let Ok(bytes) = to_cbor(&open) {
-            secrets.set_secret(&open_key(store_key), &bytes);
+        if let Ok(bytes) = to_cbor(&signed) {
+            secrets.set_secret(&signed_key(store_key), &bytes);
         }
     }
 }
@@ -523,6 +572,16 @@ pub(crate) fn list<S: SecretStore>(
         return answer(Err("this store's kept orders do not read".into()));
     };
     let mut all: Vec<SellerKeptOrder> = open.orders.into_iter().chain(done).collect();
+    // And what instant checkout signed since, as the book would file it.
+    for record in load_signed(secrets, &store_key) {
+        match all
+            .iter_mut()
+            .find(|r| r.order.order.id == record.order.order.id)
+        {
+            Some(held) => *held = merged(held.clone(), record),
+            None => all.push(record),
+        }
+    }
     all.sort_by(|a, b| a.order.order.id.0.cmp(&b.order.order.id.0));
     if let Some(after) = &after {
         all.retain(|r| r.order.order.id.0 > after.0);
@@ -607,9 +666,20 @@ pub(crate) fn sweep<S: SecretStore>(secrets: &mut S) -> bool {
     ) else {
         return false;
     };
+    // What instant checkout signed since, filed first.
+    let signed = load_signed(secrets, &store_key);
+    let had_signed = !signed.is_empty();
+    let done_len = done.len();
+    for record in signed {
+        file(&mut open, &mut done, record);
+    }
     let lapse = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS
         + harvest_common::payment::PAYMENT_CONFIRMATION_SLACK_BLOCKS;
-    let before = open.orders.len();
+    let before = if had_signed {
+        usize::MAX
+    } else {
+        open.orders.len()
+    };
     open.orders.retain(|r| {
         if r.order.status != OrderStatus::AwaitingPayment {
             return true;
@@ -619,7 +689,7 @@ pub(crate) fn sweep<S: SecretStore>(secrets: &mut S) -> bool {
             _ => true,
         }
     });
-    let mut changed_done = false;
+    let mut changed_done = done.len() != done_len;
     for r in done.iter_mut() {
         if r.request.is_some()
             && tip_of(r.order.order.network).is_some_and(|tip| window_closed(r, tip))
@@ -632,7 +702,12 @@ pub(crate) fn sweep<S: SecretStore>(secrets: &mut S) -> bool {
     if !changed_open && !changed_done {
         return false;
     }
-    save(secrets, &store_key, &open, &done, changed_done)
+    if !save(secrets, &store_key, &open, &done, changed_done) {
+        return false;
+    }
+    !had_signed
+        || to_cbor(&Vec::<SellerKeptOrder>::new())
+            .is_ok_and(|b| secrets.set_secret(&signed_key(&store_key), &b))
 }
 
 /// A predecessor generation's book (a delegate re-key), merged into this
@@ -654,7 +729,10 @@ pub(crate) fn import<S: SecretStore>(
                 return SecretImport::Permanent("the predecessor's book did not decode".into())
             }
         }
-    } else if let Some(name) = rest.strip_prefix(b"done:") {
+    } else if let Some(name) = rest
+        .strip_prefix(b"done:")
+        .or_else(|| rest.strip_prefix(b"signed:"))
+    {
         match from_cbor::<Vec<SellerKeptOrder>>(value) {
             Ok(orders) => (orders, name),
             Err(_) => {
@@ -965,13 +1043,16 @@ pub(crate) mod tests {
     #[test]
     fn a_store_notification_marks_paid_and_drops_cancelled() {
         let mut secrets = seller();
-        kept(
+        // As instant checkout writes them: into the signed inbox.
+        keep_signed(
             &mut secrets,
+            &store_key(),
             vec![
                 record(1, OrderStatus::AwaitingPayment),
                 record(2, OrderStatus::AwaitingPayment),
             ],
         )
+        .then_some(())
         .unwrap();
         let one = signed(1, OrderStatus::AwaitingPayment).order.id;
         let two = signed(2, OrderStatus::AwaitingPayment).order.id;
@@ -988,6 +1069,13 @@ pub(crate) mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].order.status, OrderStatus::Paid);
         assert!(all[0].request.is_some(), "with its ship-to");
+        // A wake-up files it into the book and empties the inbox.
+        assert!(sweep(&mut secrets));
+        assert!(load_signed(&secrets, &store_key()).is_empty());
+        let open: OpenBook =
+            from_cbor(&secrets.get_secret(&open_key(&store_key())).unwrap()).unwrap();
+        assert_eq!(open.orders.len(), 1);
+        assert_eq!(whole(&secrets).0, all);
     }
 
     /// The sweep: an unpaid order past its payment window goes; a sent

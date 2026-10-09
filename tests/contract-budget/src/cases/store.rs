@@ -814,6 +814,20 @@ pub fn cases() -> Result<Vec<Case>> {
         ..Default::default()
     };
 
+    // The delta must change the store, or its row measures a no-op: the
+    // listing it adds is the newest, so the cut keeps it and drops the
+    // oldest (it was dated as the oldest before round 2 of step 2, and at
+    // 128 listings the store cut it on arrival).
+    {
+        let mut after = held.clone();
+        after
+            .apply_delta(&held, &shop.parameters, &Some(one.clone()))
+            .map_err(|e| anyhow!("the one-listing delta applies natively: {e}"))?;
+        if after.listings == held.listings {
+            bail!("the one-listing delta changes nothing: its listing is cut on arrival");
+        }
+    }
+
     // (b) A full state of the same store from a replica that has diverged:
     // later details, eight listings this one lacks and a later status for
     // every shared one, `MAX_ORDERS` different orders interleaved in time
